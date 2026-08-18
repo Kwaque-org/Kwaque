@@ -1,0 +1,10 @@
+exports_files([
+    "c-ares.BUILD",
+    "hwloc.BUILD",
+    "liburing.patch",
+    "lksctp.BUILD",
+    "lz4-namespace-xxhash.patch",
+    "openssl.BUILD",
+    "seastar.BUILD",
+    "unordered_dense.BUILD",
+])

@@ -1,0 +1,8 @@
+Kwaque
+Copyright 2026 The Kwaque Authors
+
+Kwaque's original work is licensed under the Apache License, Version 2.0.
+
+Third-party dependencies are listed in THIRD_PARTY.md and remain subject to
+their respective licenses. Distributed artifacts must include the complete
+license and notice material required by their resolved dependency graph.

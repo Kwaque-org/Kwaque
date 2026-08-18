@@ -1,0 +1,128 @@
+module(
+    name = "kwaque",
+    version = "0.0.0",
+)
+
+bazel_dep(name = "abseil-cpp", version = "20250814.1")
+bazel_dep(name = "bazel_skylib", version = "1.8.2")
+bazel_dep(name = "crc32c", version = "1.1.0")
+bazel_dep(name = "fmt", version = "12.1.0")
+bazel_dep(name = "googletest", version = "1.17.0")
+bazel_dep(name = "liburing", version = "2.14")
+bazel_dep(name = "lz4", version = "1.9.4")
+bazel_dep(name = "platforms", version = "1.0.0")
+bazel_dep(name = "protobuf", version = "33.5")
+bazel_dep(name = "ragel", version = "26.04.0-20260414092900-8841e561489e")
+bazel_dep(name = "rules_cc", version = "0.2.17")
+bazel_dep(name = "rules_foreign_cc", version = "0.15.1")
+bazel_dep(name = "rules_pkg", version = "1.0.1")
+bazel_dep(name = "rules_python", version = "1.7.0")
+bazel_dep(name = "yaml-cpp", version = "0.8.0")
+bazel_dep(
+    name = "rules_boost",
+    repo_name = "com_github_nelhage_rules_boost",
+)
+archive_override(
+    module_name = "rules_boost",
+    integrity = "sha256-wQsxOxZh1tluc6AXj+ncsYhBSl03uC+hPhBrU6JkupI=",
+    strip_prefix = "rules_boost-f5b0f8c904f2487d8f5a9a956d4388724e627210",
+    urls = ["https://github.com/nelhage/rules_boost/archive/f5b0f8c904f2487d8f5a9a956d4388724e627210.tar.gz"],
+)
+
+boost_dependencies = use_extension(
+    "@com_github_nelhage_rules_boost//:boost/repositories.bzl",
+    "non_module_dependencies",
+)
+use_repo(boost_dependencies, "boost")
+
+single_version_override(
+    module_name = "liburing",
+    patch_strip = 1,
+    patches = ["//bazel/thirdparty:liburing.patch"],
+)
+
+single_version_override(
+    module_name = "lz4",
+    patch_strip = 1,
+    patches = ["//bazel/thirdparty:lz4-namespace-xxhash.patch"],
+)
+
+native_dependencies = use_extension("//bazel:extensions.bzl", "native_dependencies")
+use_repo(
+    native_dependencies,
+    "aarch64_sysroot",
+    "c-ares",
+    "hwloc",
+    "lksctp",
+    "openssl",
+    "seastar",
+    "unordered_dense",
+    "x86_64_sysroot",
+)
+
+bazel_dep(name = "toolchains_llvm", version = "1.7.0", dev_dependency = True)
+archive_override(
+    module_name = "toolchains_llvm",
+    integrity = "sha256-moo9nZEm6v8R/gq4audotnJyFLp89pcy4Ic97PUCaN0=",
+    strip_prefix = "toolchains_llvm-98414f360d37e4fc9fb308b357d1bd8df9f92428",
+    urls = ["https://github.com/bazel-contrib/toolchains_llvm/archive/98414f360d37e4fc9fb308b357d1bd8df9f92428.tar.gz"],
+)
+
+llvm = use_extension(
+    "@toolchains_llvm//toolchain/extensions:llvm.bzl",
+    "llvm",
+    dev_dependency = True,
+)
+llvm.toolchain(
+    name = "current_llvm_toolchain",
+    compile_flags = {
+        "linux-aarch64": [
+            "--target=aarch64-unknown-linux-gnu",
+            "-march=armv8-a+crc+crypto",
+            "-U_FORTIFY_SOURCE",
+            "-fstack-protector",
+            "-fno-omit-frame-pointer",
+            "-fcolor-diagnostics",
+            "-Wall",
+            "-Wthread-safety",
+            "-Wself-assign",
+        ],
+        "linux-x86_64": [
+            "--target=x86_64-unknown-linux-gnu",
+            "-march=westmere",
+            "-U_FORTIFY_SOURCE",
+            "-fstack-protector",
+            "-fno-omit-frame-pointer",
+            "-fcolor-diagnostics",
+            "-Wall",
+            "-Wthread-safety",
+            "-Wself-assign",
+        ],
+    },
+    cxx_standard = {"": "c++23"},
+    llvm_version = "23.1.0-rc2",
+    sha256 = {
+        "linux-aarch64": "9e588aeaad2baf5606609053d18f496aa1b5c056f7e12bddac2615f0a1695d11",
+        "linux-x86_64": "ef36b2d7d9a38e6fa7b94b9bd8ef634b90aa312434c1f76a14143004d5497eab",
+    },
+    urls = {
+        "linux-aarch64": ["https://github.com/redpanda-data/llvm-project/releases/download/llvmorg-23.1.0-rc2/llvm-23.1.0-rc2-debian-11-aarch64-2026-07-28.tar.zst"],
+        "linux-x86_64": ["https://github.com/redpanda-data/llvm-project/releases/download/llvmorg-23.1.0-rc2/llvm-23.1.0-rc2-debian-11-x86_64-2026-07-28.tar.zst"],
+    },
+)
+llvm.sysroot(
+    name = "current_llvm_toolchain",
+    label = "@x86_64_sysroot//sysroot:sysroot",
+    targets = ["linux-x86_64"],
+)
+llvm.sysroot(
+    name = "current_llvm_toolchain",
+    label = "@aarch64_sysroot//sysroot:sysroot",
+    targets = ["linux-aarch64"],
+)
+use_repo(llvm, "current_llvm_toolchain", "current_llvm_toolchain_llvm")
+
+register_toolchains(
+    "@current_llvm_toolchain//:all",
+    dev_dependency = True,
+)

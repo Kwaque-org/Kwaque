@@ -1,0 +1,71 @@
+common --registry=https://bcr.bazel.build
+common --extra_toolchains=@current_llvm_toolchain//:all
+common --experimental_repository_downloader_retries=15
+common --http_connector_attempts=24
+common --check_direct_dependencies=error
+common --incompatible_autoload_externally=+@rules_cc
+
+build --features=external_include_paths
+build --host_features=external_include_paths
+build --cxxopt=-std=c++23
+build --host_cxxopt=-std=c++23
+build --copt=-ffile-compilation-dir=.
+build --host_copt=-ffile-compilation-dir=.
+build --incompatible_strict_action_env
+build --sandbox_default_allow_network=false
+build --incompatible_enable_proto_toolchain_resolution
+build --experimental_proto_descriptor_sets_include_source_info
+build --@toolchains_llvm//toolchain/config:libunwind=False
+build --@toolchains_llvm//toolchain/config:compiler-rt=False
+build --linkopt=--unwindlib=libgcc
+
+build:fastbuild --compilation_mode=fastbuild
+
+build:dev-base --config=san-asan-only
+build:dev-base --copt=-Og
+build:dev --config=dev-base
+build:dev --copt=-gline-tables-only
+build:dev --strip=never
+
+build:debugger --compilation_mode=dbg
+build:debugger --config=san-all
+build:debugger --copt=-g
+build:debugger --strip=never
+
+build:debug --config=debugger
+build:debug --copt=-O1
+
+build:heap-profile --@seastar//:heap_profiling=True
+build:heap-profile --@seastar//:system_allocator=False
+
+build:san-base --@seastar//:system_allocator=True
+build:san-base --linkopt=-fsanitize-link-c++-runtime
+build:san-asan-only --config=san-base
+build:san-asan-only --copt=-fsanitize=address
+build:san-asan-only --linkopt=-fsanitize=address
+build:san-all --config=san-base
+build:san-all --copt=-fsanitize=address,undefined,vptr,function,alignment
+build:san-all --linkopt=-fsanitize=address,undefined,vptr,function,alignment
+
+build:fortify-source --copt=-U_FORTIFY_SOURCE
+build:fortify-source --copt=-D_FORTIFY_SOURCE=2
+build:stack-clash --copt=-fstack-clash-protection
+build:stack-protector --copt=-fstack-protector-strong
+build:relro --copt=-fno-plt
+build:relro --linkopt=-Wl,-z,relro,-z,now
+build:secure --config=fortify-source
+build:secure --config=stack-clash
+build:secure --config=stack-protector
+build:secure --config=relro
+
+build:release --compilation_mode=opt
+build:release --config=secure
+build:release --@seastar//:stack_guards=False
+build:release --@seastar//:debug=False
+build:release --copt=-g
+build:release --strip=never
+
+test --test_output=errors
+test --test_verbose_timeout_warnings
+
+try-import %workspace%/user.bazelrc

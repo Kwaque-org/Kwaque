@@ -1,0 +1,1 @@
+# Add narrowly scoped LeakSanitizer suppressions only when a test proves they are required.

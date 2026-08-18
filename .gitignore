@@ -1,3 +1,92 @@
+# Private working directories
 manual_impl/
 manual_notes/
 
+# Bazel output trees and local overrides
+/bazel-*
+/external/
+/build/
+/build-*/
+/.cache/
+MODULE.bazel.lock.tmp
+user.bazelrc
+
+# C/C++ compilation products
+*.a
+*.dylib
+*.dll
+*.gch
+*.la
+*.lai
+*.lo
+*.o
+*.obj
+*.pch
+*.so
+*.slo
+*.wasm
+*.exe
+
+# Generated source and developer indexes
+*_generated.h
+*.pb.cc
+*.pb.h
+compile_commands.json
+.clangd-index/
+.ccls-cache/
+tags
+
+# Test, coverage, benchmark, and crash output
+*.cover
+*.gcda
+*.gcno
+*.profraw
+*.test
+coverage-out/
+coverage.xml
+htmlcov/
+test-results/
+BenchmarkDotNet.Artifacts/
+core
+core.*
+vgcore.*
+
+# Packages and distributions
+/dist/
+/packages/
+*.deb
+*.rpm
+*.tar
+*.tar.gz
+*.zip
+
+# Python tooling used by repository scripts
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.tox/
+.venv/
+venv/
+
+# Local configuration and secrets
+.env
+.env.*
+!.env.example
+*.local
+*.local.yaml
+*.local.yml
+
+# Editors and operating systems
+.idea/
+.vscode/
+*.iml
+*.sublime-*
+.*.sw?
+*~
+.DS_Store
+
+# Logs and temporary files
+*.log
+*.tmp
+*.bak
