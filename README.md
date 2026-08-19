@@ -4,6 +4,11 @@
 
 Kwaque is a high-performance, self-governing distributed log/data-streaming platform built for developers, built in C++ for highest scale. This is what your AI-infrastructure requires.
 
+## Protocol boundary
+
+Protocol Buffers encode versioned, low-volume control schemas. They do not
+define Kwaque's native TCP framing or its raw record-batch representation.
+
 ## Project documents
 
 - [Contributing](CONTRIBUTING.md)

@@ -15,11 +15,14 @@ build --incompatible_strict_action_env
 build --sandbox_default_allow_network=false
 build --incompatible_enable_proto_toolchain_resolution
 build --experimental_proto_descriptor_sets_include_source_info
+build --workspace_status_command=./bazel/stamp_vars.sh
 build --@toolchains_llvm//toolchain/config:libunwind=False
 build --@toolchains_llvm//toolchain/config:compiler-rt=False
 build --linkopt=--unwindlib=libgcc
 
 build:fastbuild --compilation_mode=fastbuild
+
+build:ci --copt=-Werror
 
 build:dev-base --config=san-asan-only
 build:dev-base --copt=-Og
@@ -34,6 +37,11 @@ build:debugger --strip=never
 
 build:debug --config=debugger
 build:debug --copt=-O1
+
+build:fuzz --config=dev-base
+build:fuzz --define=kwaque_fuzz=1
+build:fuzz --copt=-fsanitize=fuzzer-no-link
+test:fuzz --test_arg=-max_total_time=2
 
 build:heap-profile --@seastar//:heap_profiling=True
 build:heap-profile --@seastar//:system_allocator=False
