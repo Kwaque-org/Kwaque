@@ -2,6 +2,9 @@
 
 namespace kwaque::log {
 
-seastar::logger broker("kwaque-broker");
+seastar::logger &broker() {
+  static seastar::logger logger("kwaque-broker");
+  return logger;
+}
 
 } // namespace kwaque::log

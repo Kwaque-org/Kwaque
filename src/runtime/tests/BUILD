@@ -15,3 +15,14 @@ kwaque_cc_seastar_test(
     cpu = 2,
     memory = "128MiB",
 )
+
+kwaque_cc_seastar_test(
+    name = "runtime_service_test",
+    srcs = ["runtime_service_test.cc"],
+    cpu = 2,
+    memory = "128MiB",
+    deps = [
+        "//src/runtime:runtime_service",
+        "//src/runtime:stop_signal",
+    ],
+)
