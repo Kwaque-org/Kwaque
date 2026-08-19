@@ -1,0 +1,10 @@
+# Safe defaults for running one local Kwaque broker.
+kwaque:
+  schema_version: 1
+  node_id: 0
+  data_directory: "./data"
+  admin:
+    address: "127.0.0.1"
+    port: 9644
+  log_level: info
+  developer_mode: true
