@@ -1,4 +1,5 @@
 import io
+import os
 import sys
 import tempfile
 import unittest
@@ -6,10 +7,34 @@ from contextlib import redirect_stderr
 from pathlib import Path
 from unittest.mock import patch
 
-from tools.check_bazel_package_cycles import find_cycle, graph_from_query_xml, main
+from tools.check_bazel_package_cycles import (
+    find_cycle,
+    graph_from_query_xml,
+    main,
+    resolve_workspace,
+)
 
 
 class PackageCycleTest(unittest.TestCase):
+    def test_resolves_relative_workspace_from_bazel_invocation_directory(
+        self,
+    ) -> None:
+        with patch.dict(
+            os.environ,
+            {"BUILD_WORKSPACE_DIRECTORY": "/workspace/kwaque"},
+            clear=False,
+        ):
+            self.assertEqual(
+                resolve_workspace(Path(".")), Path("/workspace/kwaque")
+            )
+            self.assertEqual(
+                resolve_workspace(Path("nested")),
+                Path("/workspace/kwaque/nested"),
+            )
+            self.assertEqual(
+                resolve_workspace(None), Path("/workspace/kwaque")
+            )
+
     def test_accepts_acyclic_graph(self) -> None:
         graph = {
             "//src/broker": {"//src/cluster", "//src/runtime"},
