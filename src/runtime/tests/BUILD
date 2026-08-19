@@ -1,30 +1,17 @@
-load("@rules_cc//cc:cc_test.bzl", "cc_test")
+load("//bazel:test.bzl", "kwaque_cc_seastar_test")
 
-cc_test(
+package(default_visibility = ["//visibility:private"])
+
+kwaque_cc_seastar_test(
     name = "reactor_smoke_test",
-    size = "small",
     srcs = ["reactor_smoke_test.cc"],
-    args = [
-        "--",
-        "--memory=128M",
-        "--overprovisioned",
-        "--smp=1",
-    ],
-    local_defines = ["SEASTAR_TESTING_MAIN"],
-    deps = ["@seastar//:testing"],
+    cpu = 1,
+    memory = "128MiB",
 )
 
-cc_test(
+kwaque_cc_seastar_test(
     name = "runtime_primitives_test",
-    size = "small",
     srcs = ["runtime_primitives_test.cc"],
-    args = [
-        "--",
-        "--memory=128M",
-        "--overprovisioned",
-        "--smp=2",
-    ],
-    local_defines = ["SEASTAR_TESTING_MAIN"],
-    tags = ["cpu:2"],
-    deps = ["@seastar//:testing"],
+    cpu = 2,
+    memory = "128MiB",
 )

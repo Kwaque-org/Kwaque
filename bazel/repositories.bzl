@@ -2,6 +2,7 @@
 
 load("@bazel_tools//tools/build_defs/repo:http.bzl", "http_archive")
 load("@toolchains_llvm//toolchain:sysroot.bzl", "sysroot")
+load("//bazel:versions.bzl", "SEASTAR_REVISION")
 
 def declare_native_dependencies():
     http_archive(
@@ -40,8 +41,8 @@ def declare_native_dependencies():
         name = "seastar",
         build_file = "//bazel/thirdparty:seastar.BUILD",
         sha256 = "5918f72ec59c159a8d2fe36870e7d30c6e61426fde766d7dd6853fa7f9871f7f",
-        strip_prefix = "seastar-a6ac2ff6190a4a9dce5059991355703e1073d11f",
-        url = "https://github.com/redpanda-data/seastar/archive/a6ac2ff6190a4a9dce5059991355703e1073d11f.tar.gz",
+        strip_prefix = "seastar-{}".format(SEASTAR_REVISION),
+        url = "https://github.com/redpanda-data/seastar/archive/{}.tar.gz".format(SEASTAR_REVISION),
     )
 
     http_archive(

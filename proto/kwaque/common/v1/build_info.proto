@@ -1,0 +1,23 @@
+syntax = "proto3";
+
+package kwaque.common.v1;
+
+// Identifies the software build running a Kwaque component.
+//
+// This is a low-volume control schema. It does not define transport framing or
+// raw record-batch encoding.
+message BuildInfo {
+  // Removed field numbers and names must be added to these declarations and
+  // must never be reused. This range is reserved for compatibility probes.
+  reserved 1000 to 1999;
+  reserved "build_sha", "build_type";
+
+  // Human-readable release version.
+  string version = 1;
+
+  // Immutable source revision used for the build.
+  string revision = 2;
+
+  // Build configuration, such as "release" or "debug".
+  string build_mode = 3;
+}

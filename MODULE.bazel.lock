@@ -238,7 +238,7 @@
   "moduleExtensions": {
     "//bazel:extensions.bzl%native_dependencies": {
       "general": {
-        "bzlTransitiveDigest": "xqpb8BZqcU4/R9VTBfviwViyB6oCUoyewv4XmXZX6JE=",
+        "bzlTransitiveDigest": "jeZEJ0/Jm+kD+5nqnFxpJin4DzbyZz00va+2DgVixC4=",
         "usagesDigest": "9YDPLZWwbcujbIwOBv6LCUVfCkkytgvLeWbAXhHLa3Y=",
         "recordedInputs": [
           "REPO_MAPPING:,bazel_tools bazel_tools",

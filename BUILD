@@ -1,6 +1,6 @@
 alias(
     name = "kwaque",
-    actual = "//bazel:kwaque_bootstrap",
+    actual = "//src/broker:kwaque",
     visibility = ["//visibility:public"],
 )
 
@@ -10,6 +10,20 @@ filegroup(
         "lsan_suppressions.txt",
         "ubsan_suppressions.txt",
     ],
+    testonly = True,
+    visibility = ["//visibility:public"],
+)
+
+filegroup(
+    name = "lsan_suppressions",
+    srcs = ["lsan_suppressions.txt"],
+    testonly = True,
+    visibility = ["//visibility:public"],
+)
+
+filegroup(
+    name = "ubsan_suppressions",
+    srcs = ["ubsan_suppressions.txt"],
     testonly = True,
     visibility = ["//visibility:public"],
 )

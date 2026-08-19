@@ -1,0 +1,13 @@
+#pragma once
+
+#include <string_view>
+
+namespace kwaque::build_info::detail {
+
+inline constexpr std::string_view stamped_git_revision =
+    "${STABLE_KWAQUE_GIT_REVISION}";
+inline constexpr bool stamped_git_dirty = ${STABLE_KWAQUE_GIT_DIRTY} != 0;
+inline constexpr std::string_view stamped_build_timestamp =
+    "${STABLE_KWAQUE_BUILD_TIMESTAMP}";
+
+} // namespace kwaque::build_info::detail
