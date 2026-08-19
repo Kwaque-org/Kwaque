@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 import subprocess
 import sys
 import xml.etree.ElementTree as ET
@@ -11,6 +12,7 @@ from collections.abc import Iterable, Mapping
 from pathlib import Path
 
 _FIRST_PARTY_ROOTS = ("//src", "//proto")
+_BAZEL_WORKSPACE_ENV = "BUILD_WORKSPACE_DIRECTORY"
 
 
 def package_for_label(label: str) -> str | None:
@@ -98,6 +100,19 @@ def query_workspace(workspace: Path) -> str:
     return result.stdout
 
 
+def resolve_workspace(workspace: Path | None) -> Path:
+    invocation_workspace = os.environ.get(_BAZEL_WORKSPACE_ENV)
+    if workspace is None:
+        return (
+            Path(invocation_workspace)
+            if invocation_workspace is not None
+            else Path.cwd()
+        )
+    if workspace.is_absolute() or invocation_workspace is None:
+        return workspace
+    return Path(invocation_workspace) / workspace
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -108,8 +123,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--workspace",
         type=Path,
-        default=Path.cwd(),
-        help="workspace in which to run Bazel",
+        help=(
+            "workspace in which to run Bazel; relative paths are resolved from "
+            "the Bazel invocation workspace when run through `bazel run`"
+        ),
     )
     return parser.parse_args()
 
@@ -120,7 +137,7 @@ def main() -> int:
         query_xml = (
             args.query_xml.read_text(encoding="utf-8")
             if args.query_xml is not None
-            else query_workspace(args.workspace)
+            else query_workspace(resolve_workspace(args.workspace))
         )
         cycle = find_cycle(graph_from_query_xml(query_xml))
     except (OSError, subprocess.CalledProcessError, ET.ParseError, ValueError) as error:
