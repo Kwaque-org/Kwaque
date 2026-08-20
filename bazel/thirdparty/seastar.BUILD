@@ -201,7 +201,6 @@ cc_proto_library(
 
 cc_library(
     name = "seastar",
-    linkstatic = True,
     srcs = [
         "include/seastar/core/internal/md5.hh",
         "include/seastar/net/native-stack.hh",
@@ -622,6 +621,7 @@ cc_library(
         "include",
         "src",
     ],
+    linkstatic = True,
     local_defines = [
         "SEASTAR_DEFERRED_ACTION_REQUIRE_NOEXCEPT",
         # This is nested in a `#ifdef SEASTAR_ASAN_ENABLED` so it's safe
@@ -699,12 +699,12 @@ cc_library(
         # needed in the testing library
         "include/seastar/testing/on_internal_error.hh",
     ],
-    includes = [
-        "include",
-    ],
     defines = [
         "BOOST_TEST_DYN_LINK",
         "BOOST_TEST_NO_LIB",
+    ],
+    includes = [
+        "include",
     ],
     visibility = [
         "//visibility:public",

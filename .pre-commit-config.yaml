@@ -1,0 +1,31 @@
+default_language_version:
+  python: python3
+
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v5.0.0
+    hooks:
+      - id: trailing-whitespace
+        exclude: '\.patch$'
+      - id: end-of-file-fixer
+
+  - repo: local
+    hooks:
+      - id: clang-format
+        name: C++ formatting
+        entry: bazel run //tools:format_cpp_changed -- --check
+        language: system
+        files: '\.(c|cc|cpp|cxx|h|hh|hpp|hxx)$'
+
+      - id: buildifier
+        name: Bazel formatting
+        entry: bazel run //tools:buildifier_check
+        language: system
+        files: '(^|/)(BUILD(\.bazel)?|MODULE\.bazel)$|\.(bzl|bazel)$'
+        pass_filenames: false
+
+      - id: generated-artifacts
+        name: Forbidden generated artifacts
+        entry: python3 tools/check_generated_artifacts.py
+        language: system
+        pass_filenames: false

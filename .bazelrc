@@ -4,6 +4,7 @@ common --experimental_repository_downloader_retries=15
 common --http_connector_attempts=24
 common --check_direct_dependencies=error
 common --incompatible_autoload_externally=+@rules_cc
+common:ci --lockfile_mode=error
 
 build --features=external_include_paths
 build --host_features=external_include_paths
@@ -22,7 +23,18 @@ build --linkopt=--unwindlib=libgcc
 
 build:fastbuild --compilation_mode=fastbuild
 
-build:ci --copt=-Werror
+build:ci --per_file_copt=^(bazel|proto|src)/.*@-Werror
+test:ci --local_test_jobs=1
+
+build:ci-debug --config=ci
+build:ci-debug --compilation_mode=dbg
+build:ci-debug --copt=-gline-tables-only
+
+build:ci-release --config=ci
+build:ci-release --config=release
+
+build:ci-sanitizer --config=ci
+build:ci-sanitizer --config=debug
 
 build:dev-base --config=san-asan-only
 build:dev-base --copt=-Og
@@ -40,7 +52,9 @@ build:debug --copt=-O1
 
 build:fuzz --config=dev-base
 build:fuzz --define=kwaque_fuzz=1
+build:fuzz --copt=-O1
 build:fuzz --copt=-fsanitize=fuzzer-no-link
+test:fuzz --cache_test_results=no
 test:fuzz --test_arg=-max_total_time=2
 
 build:heap-profile --@seastar//:heap_profiling=True

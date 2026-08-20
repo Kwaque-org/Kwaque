@@ -16,7 +16,8 @@ namespace {
 
 class lifecycle_probe final {
 public:
-    lifecycle_probe(std::atomic<unsigned>& constructions, std::atomic<unsigned>& stops)
+    lifecycle_probe(
+      std::atomic<unsigned>& constructions, std::atomic<unsigned>& stops)
       : _constructions(constructions)
       , _stops(stops) {
         _constructions.fetch_add(1, std::memory_order_relaxed);
@@ -43,7 +44,8 @@ SEASTAR_TEST_CASE(sharded_service_constructs_and_stops_on_every_shard) {
     co_await service.start(std::ref(constructions), std::ref(stops));
     std::exception_ptr failure;
     try {
-        BOOST_REQUIRE_EQUAL(constructions.load(std::memory_order_relaxed), shard_count);
+        BOOST_REQUIRE_EQUAL(
+          constructions.load(std::memory_order_relaxed), shard_count);
     } catch (...) {
         failure = std::current_exception();
     }
@@ -56,7 +58,8 @@ SEASTAR_TEST_CASE(sharded_service_constructs_and_stops_on_every_shard) {
 }
 
 SEASTAR_TEST_CASE(scheduling_group_can_own_reactor_work) {
-    auto group = co_await seastar::create_scheduling_group("kwaque-runtime-probe", 10.0F);
+    auto group = co_await seastar::create_scheduling_group(
+      "kwaque-runtime-probe", 10.0F);
     std::exception_ptr failure;
 
     try {

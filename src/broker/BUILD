@@ -1,6 +1,6 @@
+load("@rules_python//python:defs.bzl", "py_test")
 load("//bazel:build.bzl", "kwaque_cc_binary", "kwaque_cc_library")
 load("//bazel:test.bzl", "kwaque_cc_seastar_test", "kwaque_cc_test")
-load("@rules_python//python:defs.bzl", "py_test")
 
 package(default_visibility = ["//visibility:private"])
 
@@ -111,12 +111,13 @@ py_test(
         "$(rootpath testdata/alternate.yaml)",
     ],
     data = [
+        "testdata/alternate.yaml",
         ":kwaque",
         "//conf:kwaque_config",
-        "testdata/alternate.yaml",
     ],
     main = "config_cli_test.py",
     tags = [
+        "requires-network",
         "resources:cpu:2",
         "resources:memory:128",
     ],

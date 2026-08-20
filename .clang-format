@@ -1,0 +1,47 @@
+BasedOnStyle: Mozilla
+Language: Cpp
+AccessModifierOffset: -4
+AlignAfterOpenBracket: AlwaysBreak
+AllowAllParametersOfDeclarationOnNextLine: true
+AllowShortBlocksOnASingleLine: false
+AllowShortCaseLabelsOnASingleLine: false
+AllowShortFunctionsOnASingleLine: true
+AllowShortIfStatementsOnASingleLine: true
+AllowShortLoopsOnASingleLine: false
+AlwaysBreakAfterDefinitionReturnType: None
+AlwaysBreakAfterReturnType: None
+BreakBeforeBinaryOperators: All
+BreakBeforeBraces: Attach
+ColumnLimit: 80
+ContinuationIndentWidth: 2
+Cpp11BracedListStyle: true
+FixNamespaceComments: true
+IncludeBlocks: Regroup
+IncludeCategories:
+  - Regex: '^"(src|proto)/'
+    Priority: 1
+  - Regex: '^<seastar/'
+    Priority: 2
+  - Regex: '^<.+/'
+    Priority: 4
+  - Regex: '^<'
+    Priority: 5
+IndentCaseLabels: false
+IndentRequires: false
+IndentWidth: 4
+InsertNewlineAtEOF: true
+KeepEmptyLinesAtTheStartOfBlocks: false
+PenaltyBreakAssignment: 80
+PenaltyBreakBeforeFirstCallParameter: 10
+PenaltyReturnTypeOnItsOwnLine: 60
+PointerAlignment: Left
+QualifierAlignment: Custom
+QualifierOrder: [static, inline, const, type]
+ReferenceAlignment: Left
+RequiresClausePosition: OwnLine
+RequiresExpressionIndentation: OuterScope
+---
+Language: Proto
+BasedOnStyle: Google
+ColumnLimit: 80
+IndentWidth: 4

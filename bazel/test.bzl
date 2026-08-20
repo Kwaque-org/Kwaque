@@ -2,6 +2,7 @@
 
 load("@rules_cc//cc:cc_binary.bzl", "cc_binary")
 load("@rules_cc//cc:cc_test.bzl", "cc_test")
+load("@rules_python//python:defs.bzl", "py_test")
 load(":internal.bzl", "kwaque_copts")
 
 _SANITIZER_DATA = [
@@ -10,15 +11,16 @@ _SANITIZER_DATA = [
     "@current_llvm_toolchain//:llvm-symbolizer",
 ]
 
-_SANITIZER_ENV = {
+_TEST_ENV = {
     "ASAN_OPTIONS": "abort_on_error=1:disable_coredump=0:symbolize=1",
     "ASAN_SYMBOLIZER_PATH": "$(rootpath @current_llvm_toolchain//:llvm-symbolizer)",
+    "KWAQUE_TEST_SEED": "1",
     "LSAN_OPTIONS": "suppressions=$(rootpath //:lsan_suppressions)",
     "UBSAN_OPTIONS": "abort_on_error=1:halt_on_error=1:print_stacktrace=1:report_error_type=1:suppressions=$(rootpath //:ubsan_suppressions):symbolize=1",
 }
 
 def _merged_env(extra):
-    result = dict(_SANITIZER_ENV)
+    result = dict(_TEST_ENV)
     result.update(extra)
     return result
 
@@ -54,7 +56,12 @@ def _reactor_args(cpu, memory, args, dash_dash):
     _parse_memory_mib(memory)
     if _has_reactor_resource_arg(args):
         fail("set reactor CPU and memory with the cpu and memory rule parameters")
-    result = [
+    backend = ["--reactor-backend=epoll"]
+    for arg in args:
+        if arg == "--reactor-backend" or arg.startswith("--reactor-backend="):
+            backend = []
+            break
+    result = backend + [
         "--memory={}".format(memory),
         "--overprovisioned",
         "--smp={}".format(cpu),
@@ -196,26 +203,41 @@ def kwaque_cc_fuzz_test(
         args = [],
         data = [],
         env = {},
+        corpus = [],
         tags = []):
     """Defines a libFuzzer test enabled only by --config=fuzz."""
-    cc_test(
-        name = name,
+    runner_name = name + "_runner"
+    compatibility = select({
+        "//bazel:fuzz_build": [],
+        "//conditions:default": ["@platforms//:incompatible"],
+    })
+    cc_binary(
+        name = runner_name,
         srcs = srcs,
-        args = args,
         copts = kwaque_copts(),
-        data = data + _SANITIZER_DATA,
         deps = deps,
-        env = _merged_env(env),
         features = ["layering_check"],
         linkopts = ["-fsanitize=fuzzer"] + select({
             "@platforms//cpu:x86_64": ["-stdlib=libc++"],
             "//conditions:default": [],
         }),
+        target_compatible_with = compatibility,
+        testonly = True,
+    )
+    py_test(
+        name = name,
+        srcs = ["//bazel:fuzz_test_wrapper.py"],
+        args = [
+            "--binary=$(rootpath :{})".format(runner_name),
+        ] + [
+            "--seed=$(rootpath {})".format(seed)
+            for seed in corpus
+        ] + ["--"] + args,
+        data = [":" + runner_name] + corpus + data + _SANITIZER_DATA,
+        env = _merged_env(env),
+        main = "//bazel:fuzz_test_wrapper.py",
         size = "small",
         tags = ["fuzz"] + tags,
         timeout = "short",
-        target_compatible_with = select({
-            "//bazel:fuzz_build": [],
-            "//conditions:default": ["@platforms//:incompatible"],
-        }),
+        target_compatible_with = compatibility,
     )

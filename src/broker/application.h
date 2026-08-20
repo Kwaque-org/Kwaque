@@ -10,18 +10,18 @@ class application_state;
 
 class application final {
 public:
-  application();
-  ~application();
+    application();
+    ~application();
 
-  application(const application &) = delete;
-  application &operator=(const application &) = delete;
-  application(application &&) = delete;
-  application &operator=(application &&) = delete;
+    application(const application&) = delete;
+    application& operator=(const application&) = delete;
+    application(application&&) = delete;
+    application& operator=(application&&) = delete;
 
-  int run(int argc, char **argv);
+    int run(int argc, char** argv);
 
 private:
-  std::unique_ptr<detail::application_state> state_;
+    std::unique_ptr<detail::application_state> state_;
 };
 
 } // namespace kwaque::broker

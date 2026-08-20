@@ -1,0 +1,9 @@
+kwaque:
+  schema_version: 1
+  node_id: 7
+  data_directory: ./fuzz-data
+  admin:
+    address: 127.0.0.1
+    port: 9644
+  log_level: debug
+  developer_mode: true
