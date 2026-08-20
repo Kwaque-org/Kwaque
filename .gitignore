@@ -1,6 +1,6 @@
 # Private working directories
-manual_impl/
-manual_notes/
+private_one/
+private_two/
 
 # Bazel output trees and local overrides
 /bazel-*

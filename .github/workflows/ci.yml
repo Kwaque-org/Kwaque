@@ -1,0 +1,172 @@
+name: CI
+
+on:
+  merge_group:
+  pull_request:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  workflow-lint:
+    name: Workflow syntax
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Check out source
+        uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # 6.0.1
+        with:
+          persist-credentials: false
+      - name: Run actionlint
+        run: >-
+          docker run --rm
+          --volume "$PWD:/repo"
+          --workdir /repo
+          rhysd/actionlint@sha256:b1934ee5f1c509618f2508e6eb47ee0d3520686341fec936f3b79331f9315667
+
+  build:
+    name: Build (${{ matrix.config }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        config:
+          - ci-debug
+          - ci-release
+    steps:
+      - name: Check out source
+        uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # 6.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/setup-build
+      - name: Build broker
+        run: bazel build --config="${{ matrix.config }}" //:kwaque
+
+  test:
+    name: Unit and smoke tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - name: Check out source
+        uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # 6.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/setup-build
+      - name: Run unit and smoke tests
+        run: >-
+          bazel test --config=ci
+          --test_tag_filters=-fuzz,-manual
+          //...
+
+  sanitizer:
+    name: ASan and UBSan
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - name: Check out source
+        uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # 6.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/setup-build
+      - name: Execute tests with sanitizers
+        run: >-
+          bazel test --config=ci-sanitizer
+          --test_tag_filters=-fuzz,-manual
+          //...
+
+  cpp-format:
+    name: C++ and Bazel formatting
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Check out source
+        uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # 6.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/setup-build
+      - name: Check C++ formatting
+        run: bazel run --lockfile_mode=error //tools:format_cpp_all -- --check
+      - name: Check Bazel formatting
+        run: bazel run --lockfile_mode=error //tools:buildifier_check
+
+  clang-tidy:
+    name: Clang tidy
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - name: Check out source
+        uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # 6.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/setup-build
+      - name: Materialize generated analysis inputs
+        run: bazel build --config=ci-debug //:kwaque
+      - name: Generate compilation database
+        run: >-
+          bazel run --lockfile_mode=error //tools:compile_commands --
+          --config=ci-debug
+      - name: Run baseline checks
+        run: bazel run --lockfile_mode=error //tools:clang_tidy
+      - name: Run strict production checks
+        run: bazel run --lockfile_mode=error //tools:clang_tidy_strict
+
+  repository-checks:
+    name: Repository integrity
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Check out source
+        uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # 6.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/setup-build
+      - name: Check generated artifacts
+        run: bazel run --lockfile_mode=error //tools:check_generated_artifacts
+      - name: Check dependency inventory
+        run: bazel run --lockfile_mode=error //tools:check_dependency_inventory
+      - name: Check package dependency graph
+        run: bazel run --lockfile_mode=error //tools:check_bazel_package_cycles
+      - name: Check module lock
+        run: |
+          bazel mod deps --lockfile_mode=update
+          git diff --exit-code -- MODULE.bazel.lock
+
+  fuzz-smoke:
+    name: Bounded fuzz smoke
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Check out source
+        uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # 6.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/setup-build
+      - name: Run configuration and control-message fuzzers
+        run: >-
+          bazel test --config=ci --config=fuzz
+          //src/config:bootstrap_config_fuzz
+          //proto/kwaque/common/v1:build_info_fuzz
+
+  arm-build:
+    name: Build Linux aarch64 broker
+    needs: build
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 45
+    steps:
+      - name: Check out source
+        uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # 6.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/setup-build
+      - name: Build broker
+        run: bazel build --config=ci-release //:kwaque

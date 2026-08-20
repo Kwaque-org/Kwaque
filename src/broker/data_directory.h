@@ -7,6 +7,6 @@
 namespace kwaque::broker {
 
 [[nodiscard]] seastar::future<>
-prepare_data_directory(const std::filesystem::path &path);
+prepare_data_directory(const std::filesystem::path& path);
 
 } // namespace kwaque::broker

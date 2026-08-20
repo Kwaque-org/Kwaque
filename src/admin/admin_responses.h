@@ -10,8 +10,8 @@
 namespace kwaque::admin {
 
 struct json_response final {
-  std::uint16_t status;
-  std::string body;
+    std::uint16_t status;
+    std::string body;
 };
 
 [[nodiscard]] json_response liveness_response(bool live);
@@ -20,10 +20,11 @@ struct json_response final {
 [[nodiscard]] kwaque::common::v1::BuildInfo current_build_info();
 
 [[nodiscard]] std::string
-build_info_json(const kwaque::common::v1::BuildInfo &info);
+build_info_json(const kwaque::common::v1::BuildInfo& info);
 
-[[nodiscard]] std::string
-error_json(std::string_view code, std::string_view message,
-           std::optional<std::string_view> correlation_id = std::nullopt);
+[[nodiscard]] std::string error_json(
+  std::string_view code,
+  std::string_view message,
+  std::optional<std::string_view> correlation_id = std::nullopt);
 
 } // namespace kwaque::admin

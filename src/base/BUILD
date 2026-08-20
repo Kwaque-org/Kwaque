@@ -1,6 +1,6 @@
 load("//bazel:build.bzl", "kwaque_cc_library")
-load("//bazel:test.bzl", "kwaque_cc_test")
 load("//bazel:stamp_template.bzl", "stamp_template")
+load("//bazel:test.bzl", "kwaque_cc_test")
 load("//bazel:versions.bzl", "KWAQUE_VERSION", "PROTOBUF_VERSION", "SEASTAR_REVISION")
 
 package(default_visibility = ["//visibility:private"])
@@ -19,16 +19,16 @@ kwaque_cc_library(
 
 stamp_template(
     name = "build_stamp",
-    defaults = "build_info.defaults",
     out = "build_stamp.h",
+    defaults = "build_info.defaults",
     template = "build_stamp.h.in",
 )
 
 kwaque_cc_library(
     name = "build_info",
     srcs = [
-        ":build_stamp",
         "build_info.cc",
+        ":build_stamp",
     ],
     hdrs = ["build_info.h"],
     local_defines = [

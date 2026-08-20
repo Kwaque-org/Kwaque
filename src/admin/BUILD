@@ -3,7 +3,10 @@ load("//bazel:test.bzl", "kwaque_cc_test")
 
 package(default_visibility = ["//visibility:private"])
 
-filegroup(name = "package_boundary", srcs = ["README.md"])
+filegroup(
+    name = "package_boundary",
+    srcs = ["README.md"],
+)
 
 kwaque_cc_library(
     name = "admin_state",

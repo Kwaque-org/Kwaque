@@ -4,6 +4,6 @@
 
 namespace kwaque::log {
 
-[[nodiscard]] seastar::logger &broker();
+[[nodiscard]] seastar::logger& broker();
 
 } // namespace kwaque::log

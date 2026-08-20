@@ -1,0 +1,6 @@
+version_tag="\x0a"
+revision_tag="\x12"
+build_mode_tag="\x1a"
+"0.1.0"
+"release"
+"debug"

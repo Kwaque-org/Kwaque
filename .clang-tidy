@@ -1,0 +1,42 @@
+---
+Checks: >-
+  -*,
+  clang-analyzer-core.*,
+  clang-analyzer-deadcode.*,
+  clang-analyzer-security.*,
+  clang-analyzer-unix.*,
+  bugprone-assert-side-effect,
+  bugprone-assignment-in-if-condition,
+  bugprone-dangling-handle,
+  bugprone-sizeof-container,
+  bugprone-stringview-nullptr,
+  bugprone-suspicious-string-compare,
+  bugprone-use-after-move,
+  portability-*,
+  modernize-loop-convert,
+  modernize-redundant-void-arg,
+  modernize-use-nullptr,
+  modernize-use-override,
+  performance-no-automatic-move,
+  readability-container-size-empty,
+  readability-redundant-*
+WarningsAsErrors: >-
+  clang-analyzer-core.*,
+  clang-analyzer-deadcode.*,
+  clang-analyzer-security.*,
+  clang-analyzer-unix.*,
+  bugprone-assert-side-effect,
+  bugprone-assignment-in-if-condition,
+  bugprone-dangling-handle,
+  bugprone-sizeof-container,
+  bugprone-stringview-nullptr,
+  bugprone-suspicious-string-compare,
+  bugprone-use-after-move,
+  portability-*
+HeaderFilterRegex: '^(src|proto|bazel)/'
+ExcludeHeaderFilterRegex: '(^|/)(external|bazel-out)/'
+FormatStyle: file
+CheckOptions:
+  modernize-loop-convert.MaxCopySize: 16
+  modernize-loop-convert.MinConfidence: reasonable
+...

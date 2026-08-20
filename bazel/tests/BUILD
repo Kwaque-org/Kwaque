@@ -9,6 +9,11 @@ kwaque_cc_test(
     srcs = ["pure_cpp_test.cc"],
 )
 
+kwaque_cc_test(
+    name = "deterministic_seed_test",
+    srcs = ["deterministic_seed_test.cc"],
+)
+
 kwaque_cc_seastar_gtest(
     name = "seastar_gtest",
     srcs = ["seastar_gtest.cc"],

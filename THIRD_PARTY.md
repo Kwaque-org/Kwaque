@@ -10,18 +10,22 @@ authoritative.
 | Bazel | 9.1.0 | https://github.com/bazelbuild/bazel | Apache-2.0 | Hermetic build driver |
 | LLVM/Clang toolchain | 23.1.0-rc2 | Hermetic archive declared by the build | Apache-2.0 WITH LLVM-exception | C++23 compiler, linker, and analysis tools |
 | `toolchains_llvm` | 1.7.0, archive override `98414f360d37e4fc9fb308b357d1bd8df9f92428` | https://github.com/bazel-contrib/toolchains_llvm | Apache-2.0 | Bazel LLVM toolchain registration |
-| `platforms` | 1.0.0 | https://github.com/bazelbuild/platforms | Apache-2.0 | Bazel platform constraints |
-| Abseil | 20250814.1 | https://github.com/abseil/abseil-cpp | Apache-2.0 | Common C++ utilities required by the baseline graph |
-| Bazel Skylib | 1.8.2 | https://github.com/bazelbuild/bazel-skylib | Apache-2.0 | Shared Starlark helpers |
+| `platforms` | 1.1.0 | https://github.com/bazelbuild/platforms | Apache-2.0 | Bazel platform constraints |
+| Abseil (`abseil-cpp`) | 20260526.0 | https://github.com/abseil/abseil-cpp | Apache-2.0 | Common C++ utilities required by the baseline graph |
+| Bazel Skylib | 1.9.0 | https://github.com/bazelbuild/bazel-skylib | Apache-2.0 | Shared Starlark helpers |
+| `buildifier_prebuilt` | 8.2.0.2 | https://github.com/keith/buildifier-prebuilt | Apache-2.0 | Hermetic Buildifier formatting and checks |
+| `rhysd/actionlint` | 1.7.12 | https://github.com/rhysd/actionlint | MIT | GitHub Actions workflow validation |
+| `actions/checkout` | 6.0.1 | https://github.com/actions/checkout | MIT | CI source checkout |
+| `bazel-contrib/setup-bazel` | 0.19.0 | https://github.com/bazel-contrib/setup-bazel | Apache-2.0 | Bazel installation and CI caches |
 | `rules_boost` | `f5b0f8c904f2487d8f5a9a956d4388724e627210` | https://github.com/nelhage/rules_boost | Apache-2.0 | Bazel rules for Boost |
 | Boost | 1.84.0 | https://github.com/boostorg/boost | BSL-1.0 | Seastar runtime and test dependencies |
 | CRC32C | 1.1.0 | https://github.com/google/crc32c | BSD-3-Clause | Checksums |
 | fmt | 12.1.0 | https://github.com/fmtlib/fmt | MIT | Type-safe formatting |
-| GoogleTest | 1.17.0 | https://github.com/google/googletest | BSD-3-Clause | C++ unit tests |
+| GoogleTest | 1.17.0.bcr.2 | https://github.com/google/googletest | BSD-3-Clause | C++ unit tests |
 | liburing | 2.14 | https://github.com/axboe/liburing | LGPL-2.1-only OR MIT | Linux io_uring support for Seastar |
 | LZ4 | 1.9.4 | https://github.com/lz4/lz4 | BSD-2-Clause | Compression support required by the Seastar build |
 | Protobuf | 33.5 | https://github.com/protocolbuffers/protobuf | BSD-3-Clause | Control schemas and generated C++; not Kwaque transport framing |
-| `rules_cc` | 0.2.17 | https://github.com/bazelbuild/rules_cc | Apache-2.0 | Bazel C/C++ rules |
+| `rules_cc` | 0.2.18 | https://github.com/bazelbuild/rules_cc | Apache-2.0 | Bazel C/C++ rules |
 | `rules_foreign_cc` | 0.15.1 | https://github.com/bazel-contrib/rules_foreign_cc | Apache-2.0 | Hermetic builds for native libraries without Bazel metadata |
 | `rules_pkg` | 1.0.1 | https://github.com/bazelbuild/rules_pkg | Apache-2.0 | Distribution packages |
 | `rules_python` | 1.7.0 | https://github.com/bazelbuild/rules_python | Apache-2.0 | Repository tooling and test scripts |

@@ -6,25 +6,25 @@ alias(
 
 filegroup(
     name = "test_suppressions",
+    testonly = True,
     srcs = [
         "lsan_suppressions.txt",
         "ubsan_suppressions.txt",
     ],
-    testonly = True,
     visibility = ["//visibility:public"],
 )
 
 filegroup(
     name = "lsan_suppressions",
-    srcs = ["lsan_suppressions.txt"],
     testonly = True,
+    srcs = ["lsan_suppressions.txt"],
     visibility = ["//visibility:public"],
 )
 
 filegroup(
     name = "ubsan_suppressions",
-    srcs = ["ubsan_suppressions.txt"],
     testonly = True,
+    srcs = ["ubsan_suppressions.txt"],
     visibility = ["//visibility:public"],
 )
 
@@ -40,6 +40,10 @@ filegroup(
 
 exports_files(
     [
+        ".clang-format",
+        ".clang-tidy",
+        ".clang-tidy-strict",
+        ".clangd",
         "MODULE.bazel",
         "LICENSE",
         "NOTICE",
