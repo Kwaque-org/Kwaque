@@ -1,6 +1,6 @@
 --- a/BUILD.bazel
 +++ b/BUILD.bazel
-@@ -20,20 +20,31 @@
+@@ -20,19 +20,26 @@
          "src/include/liburing/io_uring_version.h",
      ],
      cmd = """
@@ -35,7 +35,7 @@
 +    ],
      tools = ["configure"],
  )
-@@ -76,6 +87,7 @@
+@@ -76,6 +83,7 @@
          "-Wall",
          "-Wextra",
          "-fno-stack-protector",

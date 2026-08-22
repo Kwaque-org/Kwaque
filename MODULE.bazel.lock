@@ -103,6 +103,8 @@
     "https://bcr.bazel.build/modules/package_metadata/0.0.2/MODULE.bazel": "fb8d25550742674d63d7b250063d4580ca530499f045d70748b1b142081ebb92",
     "https://bcr.bazel.build/modules/package_metadata/0.0.3/MODULE.bazel": "77890552ecea9e284b5424c9de827a58099348763a4359e975c359a83d4faa83",
     "https://bcr.bazel.build/modules/package_metadata/0.0.3/source.json": "742075a428ad12a3fa18a69014c2f57f01af910c6d9d18646c990200853e641a",
+    "https://bcr.bazel.build/modules/patchelf/0.18.0/MODULE.bazel": "15a6beff7e828d585c5bd0f9f93589df117b5594e9d19e43096c77de58b9ae5f",
+    "https://bcr.bazel.build/modules/patchelf/0.18.0/source.json": "57caf6bcaa5ba515c6fb1c2eacee00735afbeb1ffacb34a57553fb139c8e4333",
     "https://bcr.bazel.build/modules/platforms/0.0.10/MODULE.bazel": "8cb8efaf200bdeb2150d93e162c40f388529a25852b332cec879373771e48ed5",
     "https://bcr.bazel.build/modules/platforms/0.0.11/MODULE.bazel": "0daefc49732e227caa8bfa834d65dc52e8cc18a2faf80df25e8caea151a9413f",
     "https://bcr.bazel.build/modules/platforms/0.0.4/MODULE.bazel": "9b328e31ee156f53f3c416a64f8491f7eb731742655a47c9eec4703a71644aee",
@@ -258,7 +260,7 @@
   "moduleExtensions": {
     "//bazel:extensions.bzl%native_dependencies": {
       "general": {
-        "bzlTransitiveDigest": "jeZEJ0/Jm+kD+5nqnFxpJin4DzbyZz00va+2DgVixC4=",
+        "bzlTransitiveDigest": "CQiyTydpizzOGhOWjJuTbGTLzvQeEsM2nu4wRPacgzA=",
         "usagesDigest": "9YDPLZWwbcujbIwOBv6LCUVfCkkytgvLeWbAXhHLa3Y=",
         "recordedInputs": [
           "REPO_MAPPING:,bazel_tools bazel_tools",
@@ -298,6 +300,12 @@
             "repoRuleId": "@@bazel_tools//tools/build_defs/repo:http.bzl%http_archive",
             "attributes": {
               "build_file": "@@//bazel/thirdparty:openssl.BUILD",
+              "patch_args": [
+                "-p1"
+              ],
+              "patches": [
+                "@@//bazel/thirdparty:openssl-reproducible-buildinf.patch"
+              ],
               "sha256": "a8c0d28a529ca480f9f36cf5792e2cd21984552a3c8e4aa11a24aa31aeac98e8",
               "strip_prefix": "openssl-3.5.7",
               "url": "https://vectorized-public.s3.amazonaws.com/dependencies/openssl-3.5.7.tar.gz"

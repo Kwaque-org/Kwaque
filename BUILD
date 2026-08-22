@@ -34,7 +34,20 @@ filegroup(
         "LICENSE",
         "NOTICE",
         "README.md",
+        "THIRD_PARTY.md",
     ],
+    visibility = ["//visibility:public"],
+)
+
+alias(
+    name = "kwaque_tar",
+    actual = "//bazel/packaging:kwaque_tar",
+    visibility = ["//visibility:public"],
+)
+
+alias(
+    name = "kwaque_tar_sha256",
+    actual = "//bazel/packaging:kwaque_tar_sha256",
     visibility = ["//visibility:public"],
 )
 

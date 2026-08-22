@@ -22,6 +22,7 @@ _COMMON_TAGS = [
 py_library(
     name = "broker_test_support",
     srcs = ["broker_test_support.py"],
+    visibility = ["//bazel/packaging:__pkg__"],
 )
 
 [
@@ -40,6 +41,7 @@ py_library(
         "broker_smoke_test",
         "pid_file_smoke_test",
         "sigint_smoke_test",
+        "start_rollback_smoke_test",
         "startup_failure_smoke_test",
     ]
 ]

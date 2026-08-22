@@ -36,6 +36,12 @@ filegroup(
     srcs = glob(["**"]),
 )
 
+filegroup(
+    name = "license",
+    srcs = ["LICENSE.txt"],
+    visibility = ["//visibility:public"],
+)
+
 configure_make(
     name = "openssl_foreign_cc",
     args = [

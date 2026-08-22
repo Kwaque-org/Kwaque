@@ -5,6 +5,12 @@ filegroup(
     srcs = glob(["**"]),
 )
 
+filegroup(
+    name = "license",
+    srcs = ["LICENSE.md"],
+    visibility = ["//visibility:public"],
+)
+
 cmake(
     name = "c-ares",
     cache_entries = {

@@ -1,0 +1,13 @@
+--- a/BUILD.bazel
++++ b/BUILD.bazel
+@@ -1,5 +1,10 @@
+ # SPDX-License-Identifier: Apache-2.0
+ 
+ load("@rules_cc//cc:defs.bzl", "cc_library")
++
++exports_files(
++    ["LICENSE"],
++    visibility = ["//visibility:public"],
++)
+ 
+ # This genrule facilitates the installed kernel headers to configure a

@@ -15,6 +15,12 @@ filegroup(
     srcs = glob(["**"]),
 )
 
+filegroup(
+    name = "license",
+    srcs = ["COPYING"],
+    visibility = ["//visibility:public"],
+)
+
 configure_make(
     name = "hwloc",
     args = ["-j$HWLOC_BUILD_JOBS"],

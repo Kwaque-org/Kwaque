@@ -13,6 +13,7 @@ bazel_dep(name = "fmt", version = "12.1.0")
 bazel_dep(name = "googletest", version = "1.17.0.bcr.2")
 bazel_dep(name = "liburing", version = "2.14")
 bazel_dep(name = "lz4", version = "1.9.4")
+bazel_dep(name = "patchelf", version = "0.18.0")
 bazel_dep(name = "platforms", version = "1.1.0")
 bazel_dep(name = "protobuf", version = "33.5")
 bazel_dep(name = "ragel", version = "26.04.0-20260414092900-8841e561489e")
@@ -28,6 +29,8 @@ bazel_dep(
 archive_override(
     module_name = "rules_boost",
     integrity = "sha256-wQsxOxZh1tluc6AXj+ncsYhBSl03uC+hPhBrU6JkupI=",
+    patch_strip = 1,
+    patches = ["//bazel/thirdparty:rules-boost-license.patch"],
     strip_prefix = "rules_boost-f5b0f8c904f2487d8f5a9a956d4388724e627210",
     urls = ["https://github.com/nelhage/rules_boost/archive/f5b0f8c904f2487d8f5a9a956d4388724e627210.tar.gz"],
 )
@@ -39,15 +42,33 @@ boost_dependencies = use_extension(
 use_repo(boost_dependencies, "boost")
 
 single_version_override(
+    module_name = "crc32c",
+    patch_strip = 1,
+    patches = ["//bazel/thirdparty:crc32c-license.patch"],
+)
+
+single_version_override(
     module_name = "liburing",
     patch_strip = 1,
-    patches = ["//bazel/thirdparty:liburing.patch"],
+    patches = [
+        "//bazel/thirdparty:liburing.patch",
+        "//bazel/thirdparty:liburing-license.patch",
+    ],
 )
 
 single_version_override(
     module_name = "lz4",
     patch_strip = 1,
-    patches = ["//bazel/thirdparty:lz4-namespace-xxhash.patch"],
+    patches = [
+        "//bazel/thirdparty:lz4-namespace-xxhash.patch",
+        "//bazel/thirdparty:lz4-license.patch",
+    ],
+)
+
+single_version_override(
+    module_name = "yaml-cpp",
+    patch_strip = 1,
+    patches = ["//bazel/thirdparty:yaml-cpp-license.patch"],
 )
 
 native_dependencies = use_extension("//bazel:extensions.bzl", "native_dependencies")
