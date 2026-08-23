@@ -1,0 +1,16 @@
+Expose the upstream license for binary-distribution packaging.
+
+--- a/BUILD.bazel
++++ b/BUILD.bazel
+@@ -4,6 +4,11 @@
+ 
+ licenses(["notice"])
+ 
++exports_files(
++    ["LICENSE"],
++    visibility = ["//visibility:public"],
++)
++
+ crc32c_arm64_HDRS = [
+     "src/crc32c_arm64.h",
+ ]

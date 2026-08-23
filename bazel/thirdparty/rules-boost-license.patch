@@ -1,0 +1,16 @@
+Expose Boost's license through the generated external repository BUILD file.
+
+--- a/boost.BUILD
++++ b/boost.BUILD
+@@ -5,6 +5,11 @@
+ 
+ _repo_dir = repository_name().removeprefix("@")
+ 
++exports_files(
++    ["LICENSE_1_0.txt"],
++    visibility = ["//visibility:public"],
++)
++
+ # Hopefully, the need for these OSxCPU config_setting()s will be obviated by a fix to https://github.com/bazelbuild/platforms/issues/36
+ 
+ config_setting(

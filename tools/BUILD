@@ -62,6 +62,11 @@ py_binary(
     visibility = ["//visibility:public"],
 )
 
+py_library(
+    name = "compilation_database_lib",
+    srcs = ["compilation_database.py"],
+)
+
 py_binary(
     name = "format_cpp_all",
     srcs = ["cpp_format.py"],
@@ -137,4 +142,12 @@ py_test(
     srcs = ["check_dependency_inventory_test.py"],
     main = "check_dependency_inventory_test.py",
     deps = [":dependency_inventory_lib"],
+)
+
+py_test(
+    name = "compilation_database_test",
+    size = "small",
+    srcs = ["compilation_database_test.py"],
+    main = "compilation_database_test.py",
+    deps = [":compilation_database_lib"],
 )

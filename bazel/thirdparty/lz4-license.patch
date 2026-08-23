@@ -1,0 +1,13 @@
+--- a/BUILD.bazel
++++ b/BUILD.bazel
+@@ -2,5 +2,10 @@
+ """
+ 
+ load("@rules_cc//cc:defs.bzl", "cc_library")
++
++exports_files(
++    ["LICENSE"],
++    visibility = ["//visibility:public"],
++)
+ 
+ cc_library(

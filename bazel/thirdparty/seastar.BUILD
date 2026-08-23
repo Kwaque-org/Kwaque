@@ -9,6 +9,15 @@ load("@rules_cc//cc:cc_binary.bzl", "cc_binary")
 load("@rules_cc//cc:cc_library.bzl", "cc_library")
 load("@rules_python//python:defs.bzl", "py_binary")
 
+filegroup(
+    name = "license_files",
+    srcs = [
+        "LICENSE",
+        "NOTICE",
+    ],
+    visibility = ["//visibility:public"],
+)
+
 bool_flag(
     name = "stack_guards",
     build_setting_default = False,

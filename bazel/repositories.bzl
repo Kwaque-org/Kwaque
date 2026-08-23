@@ -32,6 +32,8 @@ def declare_native_dependencies():
     http_archive(
         name = "openssl",
         build_file = "//bazel/thirdparty:openssl.BUILD",
+        patch_args = ["-p1"],
+        patches = ["//bazel/thirdparty:openssl-reproducible-buildinf.patch"],
         sha256 = "a8c0d28a529ca480f9f36cf5792e2cd21984552a3c8e4aa11a24aa31aeac98e8",
         strip_prefix = "openssl-3.5.7",
         url = "https://vectorized-public.s3.amazonaws.com/dependencies/openssl-3.5.7.tar.gz",

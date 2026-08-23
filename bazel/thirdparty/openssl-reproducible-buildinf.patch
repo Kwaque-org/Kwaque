@@ -1,0 +1,20 @@
+--- a/util/mkbuildinf.pl
++++ b/util/mkbuildinf.pl
+@@ -12,6 +12,17 @@
+ my $platform = pop @ARGV;
+ my $cflags = join(' ', @ARGV);
+ $cflags =~ s(\\)(\\\\)g;
++
++# The recorded compiler flags are a diagnostic string reported by
++# `openssl version -a`; they are not used to compile anything. Left alone they
++# embed the absolute build directory, which changes on every build and makes
++# this library, and any distribution archive carrying it, unreproducible.
++# Reduce the build root to a relative marker so the embedded string is stable.
++my $build_root = $ENV{'EXT_BUILD_ROOT'};
++if (defined $build_root && $build_root ne '') {
++    $build_root =~ s{/+$}{};
++    $cflags =~ s{\Q$build_root\E}{.}g;
++}
+ $cflags = "compiler: $cflags";
+ 
+ # Use the value of the envvar SOURCE_DATE_EPOCH, even if it's

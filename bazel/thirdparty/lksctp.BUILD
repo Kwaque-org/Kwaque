@@ -1,29 +1,17 @@
 load("@bazel_skylib//rules:expand_template.bzl", "expand_template")
-load("@bazel_skylib//rules:write_file.bzl", "write_file")
 load("@rules_cc//cc:cc_library.bzl", "cc_library")
 
 cc_library(
     name = "lksctp",
-    srcs = [
-        "src/lib/addrs.c",
-        "src/lib/bindx.c",
-        "src/lib/connectx.c",
-        "src/lib/opt_info.c",
-        "src/lib/peeloff.c",
-        "src/lib/recvmsg.c",
-        "src/lib/sendmsg.c",
-        ":conf_header",
-    ],
     hdrs = [":gen_header"],
-    linkstatic = True,
     strip_include_prefix = "src/include",
     visibility = ["//visibility:public"],
 )
 
-write_file(
-    name = "conf_header",
-    out = "config.h",
-    content = [],
+filegroup(
+    name = "license",
+    srcs = ["COPYING.lib"],
+    visibility = ["//visibility:public"],
 )
 
 expand_template(
