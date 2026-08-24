@@ -4,14 +4,13 @@ import unittest
 
 from tools.check_dependency_inventory import (
     archive_dependencies,
-    imported_archive_repositories,
     archive_dependency_errors,
     archive_import_errors,
+    imported_archive_repositories,
     module_dependencies,
     module_dependency_errors,
     workflow_dependency_errors,
 )
-
 
 REPOSITORIES = """
 load("//bazel:versions.bzl", "SEASTAR_REVISION")
@@ -135,7 +134,9 @@ class DependencyInventoryTest(unittest.TestCase):
         self.assertIn("no pinned archive declares", errors[0])
 
     def test_reports_unwired_archive_extension(self) -> None:
-        errors = archive_import_errors("module(name = \"kwaque\")", REPOSITORIES, VERSIONS)
+        errors = archive_import_errors(
+            'module(name = "kwaque")', REPOSITORIES, VERSIONS
+        )
         self.assertEqual(len(errors), 1)
         self.assertIn("does not use the pinned archive extension", errors[0])
 
@@ -147,11 +148,7 @@ if __name__ == "__main__":
 class ExactMatchingTest(unittest.TestCase):
     """A shorter name must not be satisfied by a longer inventoried one."""
 
-    INVENTORY = (
-        "| Dependency | Version |\n"
-        "|---|---|\n"
-        "| foo-tools | 11.2.3 |\n"
-    )
+    INVENTORY = "| Dependency | Version |\n" "|---|---|\n" "| foo-tools | 11.2.3 |\n"
 
     def test_a_shorter_name_does_not_match_a_longer_row(self) -> None:
         module = 'bazel_dep(name = "foo", version = "11.2.3")\n'
@@ -162,11 +159,7 @@ class ExactMatchingTest(unittest.TestCase):
         )
 
     def test_a_shorter_version_does_not_match_a_longer_one(self) -> None:
-        inventory = (
-            "| Dependency | Version |\n"
-            "|---|---|\n"
-            "| foo | 11.2.3 |\n"
-        )
+        inventory = "| Dependency | Version |\n" "|---|---|\n" "| foo | 11.2.3 |\n"
         module = 'bazel_dep(name = "foo", version = "1.2.3")\n'
         errors = module_dependency_errors(module, inventory)
         self.assertEqual(
@@ -204,11 +197,11 @@ class SplitImportTest(unittest.TestCase):
     def test_repositories_from_every_matching_call_are_collected(self) -> None:
         module = self.EXTENSION + (
             'use_repo(native, "alpha")\n'
-            'use_repo(\n'
-            '    native,\n'
+            "use_repo(\n"
+            "    native,\n"
             '    "beta",\n'
             '    "gamma_sysroot",\n'
-            ')\n'
+            ")\n"
         )
         self.assertEqual(
             sorted(imported_archive_repositories(module)),
@@ -217,8 +210,7 @@ class SplitImportTest(unittest.TestCase):
 
     def test_split_declarations_satisfy_the_import_check(self) -> None:
         module = self.EXTENSION + (
-            'use_repo(native, "alpha")\n'
-            'use_repo(native, "beta", "gamma_sysroot")\n'
+            'use_repo(native, "alpha")\n' 'use_repo(native, "beta", "gamma_sysroot")\n'
         )
         self.assertEqual(archive_import_errors(module, REPOSITORIES, VERSIONS), [])
 

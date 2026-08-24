@@ -1,12 +1,9 @@
-#!/usr/bin/env python3
-
 from __future__ import annotations
 
 import os
 import re
 import sys
 from pathlib import Path
-
 
 MODULE_PATTERN = re.compile(r"bazel_dep\((.*?)\)", re.DOTALL)
 NAME_PATTERN = re.compile(r'\bname\s*=\s*"([^"]+)"')
@@ -173,7 +170,9 @@ def module_dependency_errors(module_text: str, inventory_text: str) -> list[str]
     for name, version in module_dependencies(module_text):
         matching = [row for row in rows if normalize(name) in row_identifiers(row[0])]
         if not matching:
-            errors.append(f"direct module dependency {name!r} is missing from THIRD_PARTY.md")
+            errors.append(
+                f"direct module dependency {name!r} is missing from THIRD_PARTY.md"
+            )
             continue
         if version is not None and all(
             version not in row_versions(row[1]) for row in matching
@@ -198,7 +197,9 @@ def archive_dependency_errors(
         elif version is not None and all(
             version not in row_versions(row[1]) for row in matching
         ):
-            errors.append(f"pinned archive {name!r} version {version!r} is not inventoried")
+            errors.append(
+                f"pinned archive {name!r} version {version!r} is not inventoried"
+            )
         if not checksummed:
             errors.append(f"pinned archive {name!r} declares no checksum")
     return errors
@@ -236,7 +237,9 @@ def workflow_dependency_errors(
     errors = []
     for name, revision in sorted(references):
         if not any(normalize(name) in row_identifiers(row[0]) for row in rows):
-            errors.append(f"workflow dependency {name!r} is missing from THIRD_PARTY.md")
+            errors.append(
+                f"workflow dependency {name!r} is missing from THIRD_PARTY.md"
+            )
         if not re.fullmatch(r"[0-9a-fA-F]{40}|sha256:[0-9a-fA-F]{64}", revision):
             errors.append(f"workflow dependency {name!r} is not immutably pinned")
     return errors

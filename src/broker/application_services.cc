@@ -1,6 +1,7 @@
 #include "src/broker/application_internal.h"
 
 #include <seastar/core/coroutine.hh>
+#include <seastar/core/smp.hh>
 
 #include <exception>
 #include <stdexcept>
@@ -17,14 +18,16 @@ void application_state::construct_services(bool install_signal_handlers) {
     lifecycle_ = std::make_unique<service_lifecycle>(
       stop_signal_->abort_source());
     admin_server_ = std::make_unique<admin::admin_server>();
+    runtime_service_
+      = std::make_unique<runtime::sharded_service<runtime::runtime_service>>(
+        seastar::default_smp_service_group());
 }
 
 seastar::future<> application_state::request_service_abort() {
-    if (!abort_sources_started_) {
+    if (!runtime_service_ || !runtime_started_) {
         co_return;
     }
-    co_await service_abort_sources_.invoke_on_all(
-      [](service_abort_source& source) { source.request_abort(); });
+    co_await runtime_service_->request_abort();
 }
 
 seastar::future<> application_state::shutdown() {
@@ -38,7 +41,7 @@ seastar::future<> application_state::shutdown() {
     }
 
     runtime_started_ = false;
-    abort_sources_started_ = false;
+    runtime_service_.reset();
     pid_file_.reset();
     admin_server_.reset();
     lifecycle_.reset();
@@ -51,7 +54,7 @@ seastar::future<> application_state::shutdown() {
 
 bool application_state::services_constructed() const noexcept {
     return stop_signal_ != nullptr && lifecycle_ != nullptr
-           && admin_server_ != nullptr;
+           && admin_server_ != nullptr && runtime_service_ != nullptr;
 }
 
 bool application_state::runtime_started() const noexcept {

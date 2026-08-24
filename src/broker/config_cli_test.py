@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """Verify broker startup, configuration selection, and process locking."""
 
 from __future__ import annotations
@@ -13,7 +12,6 @@ import tempfile
 import time
 import urllib.request
 from pathlib import Path
-
 
 REACTOR_ARGUMENTS = ("--smp=1", "--memory=128M", "--overprovisioned")
 STARTUP_ATTEMPTS = 5
@@ -30,7 +28,7 @@ def write_test_config(
 ) -> None:
     contents = template.read_text(encoding="utf-8")
     contents, directory_count = re.subn(
-        r'(?m)^(\s*data_directory:)\s*.*$',
+        r"(?m)^(\s*data_directory:)\s*.*$",
         rf'\1 "{data_directory}"',
         contents,
     )
@@ -54,15 +52,13 @@ def get(url: str) -> tuple[int, str, str]:
 def version_fields(binary: Path) -> dict[str, str]:
     result = subprocess.run(
         [binary, "--version"],
+        capture_output=True,
         check=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
         text=True,
         timeout=5.0,
     )
     return dict(
-        field.split("=", maxsplit=1)
-        for field in result.stdout.strip().split("\t")
+        field.split("=", maxsplit=1) for field in result.stdout.strip().split("\t")
     )
 
 
@@ -70,9 +66,7 @@ def metric_value(exposition: str, name: str) -> float:
     samples = [
         line
         for line in exposition.splitlines()
-        if line == name
-        or line.startswith(name + "{")
-        or line.startswith(name + " ")
+        if line == name or line.startswith((name + "{", name + " "))
     ]
     if len(samples) != 1:
         raise AssertionError(
@@ -123,9 +117,7 @@ class RunningBroker:
             raise AssertionError(f"broker did not stop after SIGTERM:\n{self.output()}")
         output = self.output()
         if return_code != 0:
-            raise AssertionError(
-                f"broker exited with {return_code}\noutput:\n{output}"
-            )
+            raise AssertionError(f"broker exited with {return_code}\noutput:\n{output}")
         return output
 
     def kill_if_running(self) -> None:
@@ -202,13 +194,14 @@ def main() -> None:
                 "runtime service ready shard=0",
             ):
                 if expected not in output:
-                    raise AssertionError(f"missing startup field {expected!r}:\n{output}")
+                    raise AssertionError(
+                        f"missing startup field {expected!r}:\n{output}"
+                    )
             assert_ordered(
                 output,
                 (
                     "startup stage=data_directory state=ready",
                     "startup stage=pid_file state=ready",
-                    "startup stage=abort_sources state=ready",
                     "startup stage=runtime_service state=ready",
                     "startup stage=admin state=ready",
                 ),

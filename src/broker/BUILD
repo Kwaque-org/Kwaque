@@ -46,6 +46,7 @@ kwaque_cc_library(
         "//src/base:logging",
         "//src/config:bootstrap_config",
         "//src/runtime:runtime_service",
+        "//src/runtime:sharded_service",
         "//src/runtime:stop_signal",
         "@boost//:program_options",
         "@seastar",

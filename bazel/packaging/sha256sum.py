@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """Write a SHA-256 checksum file for one package artifact."""
 
 from __future__ import annotations

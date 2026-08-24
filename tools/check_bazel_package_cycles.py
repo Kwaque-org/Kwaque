@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """Reject package-level dependency cycles across source and schema targets."""
 
 from __future__ import annotations
@@ -18,8 +17,7 @@ _BAZEL_WORKSPACE_ENV = "BUILD_WORKSPACE_DIRECTORY"
 def package_for_label(label: str) -> str | None:
     package = label.split(":", maxsplit=1)[0]
     if not any(
-        package == root or package.startswith(f"{root}/")
-        for root in _FIRST_PARTY_ROOTS
+        package == root or package.startswith(f"{root}/") for root in _FIRST_PARTY_ROOTS
     ):
         return None
     return package

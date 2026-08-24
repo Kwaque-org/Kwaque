@@ -6,15 +6,52 @@ load("//bazel:versions.bzl", "KWAQUE_VERSION", "PROTOBUF_VERSION", "SEASTAR_REVI
 package(default_visibility = ["//visibility:private"])
 
 kwaque_cc_library(
-    name = "base",
+    name = "error",
     srcs = ["error.cc"],
+    hdrs = ["error.h"],
+    visibility = ["//visibility:public"],
+)
+
+kwaque_cc_library(
+    name = "invariant",
+    srcs = ["invariant.cc"],
+    hdrs = ["invariant.h"],
+    defines = select({
+        "//bazel:optimized_build": ["KWAQUE_ENABLE_DEBUG_ASSERTIONS=0"],
+        "//conditions:default": ["KWAQUE_ENABLE_DEBUG_ASSERTIONS=1"],
+    }),
+    local_defines = ["KWAQUE_INVARIANT_TEST_OBSERVER=0"],
+    visibility = ["//visibility:public"],
+)
+
+kwaque_cc_library(
+    name = "invariant_test_support",
+    testonly = True,
+    srcs = ["invariant.cc"],
+    hdrs = [
+        "invariant.h",
+        "invariant_test_observer.h",
+    ],
+    defines = select({
+        "//bazel:optimized_build": ["KWAQUE_ENABLE_DEBUG_ASSERTIONS=0"],
+        "//conditions:default": ["KWAQUE_ENABLE_DEBUG_ASSERTIONS=1"],
+    }),
+    local_defines = ["KWAQUE_INVARIANT_TEST_OBSERVER=1"],
+    visibility = [
+        "//src/runtime:__pkg__",
+        "//src/runtime/tests:__pkg__",
+    ],
+)
+
+kwaque_cc_library(
+    name = "base",
     hdrs = [
         "compiler.h",
-        "error.h",
         "result.h",
         "units.h",
     ],
     visibility = ["//visibility:public"],
+    deps = [":error"],
 )
 
 stamp_template(
@@ -54,7 +91,28 @@ kwaque_cc_library(
 kwaque_cc_test(
     name = "base_test",
     srcs = ["base_test.cc"],
-    deps = [":base"],
+    deps = [
+        ":base",
+        ":error",
+    ],
+)
+
+kwaque_cc_test(
+    name = "error_test",
+    srcs = ["error_test.cc"],
+    deps = [":error"],
+)
+
+kwaque_cc_test(
+    name = "invariant_test",
+    srcs = ["invariant_test.cc"],
+    deps = [":invariant"],
+)
+
+kwaque_cc_test(
+    name = "invariant_observer_test",
+    srcs = ["invariant_observer_test.cc"],
+    deps = [":invariant_test_support"],
 )
 
 kwaque_cc_test(

@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """Expand a template with defaults overridden by Bazel stable-status values."""
 
 from __future__ import annotations

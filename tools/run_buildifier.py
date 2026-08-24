@@ -1,5 +1,3 @@
-#!/usr/bin/env python3
-
 from __future__ import annotations
 
 import argparse
@@ -7,7 +5,6 @@ import os
 import subprocess
 import sys
 from pathlib import Path
-
 
 STARLARK_SUFFIXES = frozenset({".bazel", ".bzl", ".BUILD", ".sky"})
 WORKSPACE_NAMES = frozenset({"WORKSPACE", "WORKSPACE.bzlmod", "WORKSPACE.oss"})
@@ -26,7 +23,9 @@ def resolve_runfile(path: str) -> Path:
     if configured := os.environ.get("RUNFILES_DIR"):
         roots.append(Path(configured))
     roots.extend(
-        parent for parent in Path(__file__).absolute().parents if parent.name.endswith(".runfiles")
+        parent
+        for parent in Path(__file__).absolute().parents
+        if parent.name.endswith(".runfiles")
     )
     for root in roots:
         for base in (root, root.parent):
@@ -41,8 +40,10 @@ def is_starlark_path(path: Path) -> bool:
     return (
         name == "BUILD"
         or name in WORKSPACE_NAMES
-        or name.startswith("BUILD.") and name.endswith(".oss")
-        or name.startswith("WORKSPACE.") and name.endswith(".oss")
+        or name.startswith("BUILD.")
+        and name.endswith(".oss")
+        or name.startswith("WORKSPACE.")
+        and name.endswith(".oss")
         or path.suffix in STARLARK_SUFFIXES
     )
 
@@ -64,7 +65,9 @@ def selected_files(root: Path) -> list[Path]:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Format tracked Bazel and Starlark files")
+    parser = argparse.ArgumentParser(
+        description="Format tracked Bazel and Starlark files"
+    )
     parser.add_argument("--tool", required=True)
     parser.add_argument("--mode", choices=("diff", "fix"), required=True)
     arguments = parser.parse_args()
@@ -75,7 +78,11 @@ def main() -> int:
         print("No Bazel or Starlark files selected.")
         return 0
     result = subprocess.run(
-        [str(resolve_runfile(arguments.tool)), f"-mode={arguments.mode}", *map(str, files)],
+        [
+            str(resolve_runfile(arguments.tool)),
+            f"-mode={arguments.mode}",
+            *map(str, files),
+        ],
         cwd=root,
         check=False,
     )

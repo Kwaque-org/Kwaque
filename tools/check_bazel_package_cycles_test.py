@@ -24,16 +24,12 @@ class PackageCycleTest(unittest.TestCase):
             {"BUILD_WORKSPACE_DIRECTORY": "/workspace/kwaque"},
             clear=False,
         ):
-            self.assertEqual(
-                resolve_workspace(Path(".")), Path("/workspace/kwaque")
-            )
+            self.assertEqual(resolve_workspace(Path(".")), Path("/workspace/kwaque"))
             self.assertEqual(
                 resolve_workspace(Path("nested")),
                 Path("/workspace/kwaque/nested"),
             )
-            self.assertEqual(
-                resolve_workspace(None), Path("/workspace/kwaque")
-            )
+            self.assertEqual(resolve_workspace(None), Path("/workspace/kwaque"))
 
     def test_accepts_acyclic_graph(self) -> None:
         graph = {
@@ -117,9 +113,7 @@ class PackageCycleTest(unittest.TestCase):
     def test_schema_invalid_file_returns_input_error(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             query_xml = Path(directory) / "query.xml"
-            query_xml.write_text(
-                '<query version="2"><rule/></query>', encoding="utf-8"
-            )
+            query_xml.write_text('<query version="2"><rule/></query>', encoding="utf-8")
             stderr = io.StringIO()
             with (
                 patch.object(

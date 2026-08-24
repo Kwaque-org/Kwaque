@@ -1,5 +1,3 @@
-#!/usr/bin/env python3
-
 from __future__ import annotations
 
 import argparse
@@ -9,7 +7,6 @@ import subprocess
 import sys
 from pathlib import Path
 from typing import Any
-
 
 CPP_SUFFIXES = frozenset({".c", ".cc", ".cpp", ".cxx"})
 
@@ -83,7 +80,9 @@ def ensure_external_link(root: Path, external_root: Path) -> None:
         if os.readlink(link) != EXTERNAL_LINK_TARGET:
             link.unlink()
     elif os.path.lexists(link):
-        raise RuntimeError(f"{link} exists and is not a symlink; refusing to replace it")
+        raise RuntimeError(
+            f"{link} exists and is not a symlink; refusing to replace it"
+        )
 
     if not os.path.lexists(link):
         link.symlink_to(EXTERNAL_LINK_TARGET)
@@ -91,12 +90,12 @@ def ensure_external_link(root: Path, external_root: Path) -> None:
 
     resolved = link.resolve()
     if resolved != external_root.resolve():
-        raise RuntimeError(
-            f"{link} resolves to {resolved}, expected {external_root}"
-        )
+        raise RuntimeError(f"{link} resolves to {resolved}, expected {external_root}")
 
 
-def compiler_arguments(action: dict[str, Any], execution_root: Path) -> tuple[str, list[str]] | None:
+def compiler_arguments(
+    action: dict[str, Any], execution_root: Path
+) -> tuple[str, list[str]] | None:
     arguments = list(action.get("arguments", []))
     if not arguments:
         return None
@@ -190,7 +189,9 @@ def generate(extra_bazel_args: list[str]) -> int:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Generate compile_commands.json from Bazel")
+    parser = argparse.ArgumentParser(
+        description="Generate compile_commands.json from Bazel"
+    )
     _, bazel_args = parser.parse_known_args()
     return generate(bazel_args)
 
@@ -198,6 +199,11 @@ def main() -> int:
 if __name__ == "__main__":
     try:
         sys.exit(main())
-    except (OSError, RuntimeError, subprocess.CalledProcessError, json.JSONDecodeError) as error:
+    except (
+        OSError,
+        RuntimeError,
+        subprocess.CalledProcessError,
+        json.JSONDecodeError,
+    ) as error:
         print(f"compilation database generation failed: {error}", file=sys.stderr)
         sys.exit(1)

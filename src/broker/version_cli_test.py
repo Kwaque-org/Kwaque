@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """Verify that the version command remains a single parseable line."""
 
 from __future__ import annotations
@@ -11,9 +10,8 @@ from pathlib import Path
 def assert_version_output(binary: Path, *arguments: str) -> None:
     result = subprocess.run(
         [binary, *arguments],
+        capture_output=True,
         check=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
         text=True,
     )
 
