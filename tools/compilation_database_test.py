@@ -130,9 +130,11 @@ class ExternalLinkTest(unittest.TestCase):
             self.assertEqual(active_output_base(workspace), base)
 
     def test_active_output_base_requires_a_build(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            with self.assertRaisesRegex(RuntimeError, "bazel-out is missing"):
-                active_output_base(Path(directory))
+        with (
+            tempfile.TemporaryDirectory() as directory,
+            self.assertRaisesRegex(RuntimeError, "bazel-out is missing"),
+        ):
+            active_output_base(Path(directory))
 
     def test_a_regular_bazel_out_directory_is_rejected(self) -> None:
         """A real directory carries no output base to derive."""
@@ -146,7 +148,9 @@ class ExternalLinkTest(unittest.TestCase):
         """It satisfies lexists, so only resolving it catches the bad target."""
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            (root / "bazel-out").symlink_to(root / "gone" / "execroot" / "_main" / "bazel-out")
+            (root / "bazel-out").symlink_to(
+                root / "gone" / "execroot" / "_main" / "bazel-out"
+            )
             with self.assertRaisesRegex(RuntimeError, "unexpected bazel-out target"):
                 active_output_base(root)
 

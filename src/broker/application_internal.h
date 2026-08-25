@@ -5,11 +5,10 @@
 #include "src/broker/service_lifecycle.h"
 #include "src/config/bootstrap_config.h"
 #include "src/runtime/runtime_service.h"
+#include "src/runtime/sharded_service.h"
 #include "src/runtime/stop_signal.h"
 
-#include <seastar/core/abort_source.hh>
 #include <seastar/core/future.hh>
-#include <seastar/core/sharded.hh>
 
 #include <boost/program_options/variables_map.hpp>
 
@@ -20,25 +19,6 @@
 #include <string>
 
 namespace kwaque::broker::detail {
-
-class service_abort_source final {
-public:
-    [[nodiscard]] seastar::abort_source& get() noexcept { return source_; }
-
-    void request_abort() noexcept {
-        if (!source_.abort_requested()) {
-            source_.request_abort();
-        }
-    }
-
-    [[nodiscard]] seastar::future<> stop() {
-        request_abort();
-        return seastar::make_ready_future<>();
-    }
-
-private:
-    seastar::abort_source source_;
-};
 
 class application_state final {
 public:
@@ -70,10 +50,9 @@ private:
     std::unique_ptr<service_lifecycle> lifecycle_;
     std::unique_ptr<pid_file> pid_file_;
     std::unique_ptr<admin::admin_server> admin_server_;
-    seastar::sharded<service_abort_source> service_abort_sources_;
-    seastar::sharded<runtime::runtime_service> runtime_service_;
+    std::unique_ptr<runtime::sharded_service<runtime::runtime_service>>
+      runtime_service_;
     std::chrono::steady_clock::time_point startup_started_at_{};
-    bool abort_sources_started_{false};
     bool runtime_started_{false};
 };
 

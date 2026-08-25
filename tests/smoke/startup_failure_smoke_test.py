@@ -7,7 +7,11 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from tests.smoke.broker_test_support import REACTOR_ARGUMENTS, reserve_loopback_port, write_config
+from tests.smoke.broker_test_support import (
+    REACTOR_ARGUMENTS,
+    reserve_loopback_port,
+    write_config,
+)
 
 
 class StartupFailureSmokeTest(unittest.TestCase):

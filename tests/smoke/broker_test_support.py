@@ -11,7 +11,6 @@ import urllib.request
 from pathlib import Path
 from typing import Any
 
-
 REACTOR_ARGUMENTS = (
     "--reactor-backend=epoll",
     "--smp=1",
@@ -107,9 +106,7 @@ class BrokerProcess:
                 f"broker did not stop after {requested_signal.name}:\n{self.output()}"
             ) from error
         if return_code != 0:
-            raise AssertionError(
-                f"broker exited with {return_code}:\n{self.output()}"
-            )
+            raise AssertionError(f"broker exited with {return_code}:\n{self.output()}")
         return self.output()
 
     def kill_if_running(self) -> None:

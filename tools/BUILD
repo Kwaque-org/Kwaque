@@ -49,6 +49,18 @@ py_binary(
     visibility = ["//visibility:public"],
 )
 
+py_binary(
+    name = "check_cross_shard_usage",
+    srcs = ["check_cross_shard_usage.py"],
+    main = "check_cross_shard_usage.py",
+    visibility = ["//visibility:public"],
+)
+
+py_library(
+    name = "cross_shard_usage_lib",
+    srcs = ["check_cross_shard_usage.py"],
+)
+
 py_library(
     name = "dependency_inventory_lib",
     srcs = ["check_dependency_inventory.py"],
@@ -142,6 +154,14 @@ py_test(
     srcs = ["check_dependency_inventory_test.py"],
     main = "check_dependency_inventory_test.py",
     deps = [":dependency_inventory_lib"],
+)
+
+py_test(
+    name = "check_cross_shard_usage_test",
+    size = "small",
+    srcs = ["check_cross_shard_usage_test.py"],
+    main = "check_cross_shard_usage_test.py",
+    deps = [":cross_shard_usage_lib"],
 )
 
 py_test(

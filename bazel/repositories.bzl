@@ -5,6 +5,7 @@ load("@toolchains_llvm//toolchain:sysroot.bzl", "sysroot")
 load("//bazel:versions.bzl", "SEASTAR_REVISION")
 
 def declare_native_dependencies():
+    """Declares the pinned native repositories and sysroots used by the build."""
     http_archive(
         name = "c-ares",
         build_file = "//bazel/thirdparty:c-ares.BUILD",

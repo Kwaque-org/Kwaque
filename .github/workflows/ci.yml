@@ -136,6 +136,8 @@ jobs:
         run: bazel run --lockfile_mode=error //tools:check_dependency_inventory
       - name: Check package dependency graph
         run: bazel run --lockfile_mode=error //tools:check_bazel_package_cycles
+      - name: Check cross-shard ownership
+        run: bazel run --lockfile_mode=error //tools:check_cross_shard_usage
       - name: Check module lock
         run: |
           bazel mod deps --lockfile_mode=update

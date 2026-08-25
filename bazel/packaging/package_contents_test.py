@@ -120,7 +120,9 @@ class PackageContentsTest(unittest.TestCase):
         self.assertIsNotNone(match)
         assert match is not None
         self.assertEqual(match.group(2), archive.name)
-        self.assertEqual(match.group(1), hashlib.sha256(archive.read_bytes()).hexdigest())
+        self.assertEqual(
+            match.group(1), hashlib.sha256(archive.read_bytes()).hexdigest()
+        )
 
 
 if __name__ == "__main__":

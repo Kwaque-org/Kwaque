@@ -8,7 +8,6 @@
 #include <seastar/core/map_reduce.hh>
 #include <seastar/core/memory.hh>
 #include <seastar/core/reactor.hh>
-#include <seastar/core/sharded.hh>
 #include <seastar/core/smp.hh>
 
 #include <chrono>
@@ -64,43 +63,17 @@ seastar::future<> application_state::start_services() {
     log::broker().info("startup stage=pid_file state=ready");
 
     co_await lifecycle_->start_step(
-      "abort_sources",
-      [this] {
-          return service_abort_sources_.start().then(
-            [this] { abort_sources_started_ = true; });
-      },
-      [this] {
-          abort_sources_started_ = false;
-          return service_abort_sources_.stop();
-      });
-    log::broker().info("startup stage=abort_sources state=ready");
-
-    co_await lifecycle_->start_step(
       "runtime_service",
       [this] -> seastar::future<> {
-          auto abort_source = seastar::sharded_parameter(
-            [](service_abort_source& source) { return std::ref(source.get()); },
-            std::ref(service_abort_sources_));
-          co_await runtime_service_.start(std::move(abort_source));
-          std::exception_ptr failure;
-          try {
-              co_await runtime_service_.invoke_on_all(
-                &runtime::runtime_service::start);
-          } catch (...) {
-              failure = std::current_exception();
-          }
-          if (failure) {
-              co_await runtime_service_.stop();
-              std::rethrow_exception(failure);
-          }
+          co_await runtime_service_->start();
           runtime_started_ = true;
       },
       [this] {
           runtime_started_ = false;
-          return runtime_service_.stop();
+          return runtime_service_->stop();
       });
 
-    co_await runtime_service_.invoke_on_all(
+    co_await runtime_service_->invoke_on_all(
       [](runtime::runtime_service& service) {
           log::broker().info("runtime service ready shard={}", service.shard());
       });

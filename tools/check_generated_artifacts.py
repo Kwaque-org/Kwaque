@@ -1,11 +1,8 @@
-#!/usr/bin/env python3
-
 from __future__ import annotations
 
 import subprocess
 import sys
 from pathlib import PurePosixPath
-
 
 FORBIDDEN_DIRECTORIES = frozenset({"bazel-bin", "bazel-out", "bazel-testlogs"})
 FORBIDDEN_NAMES = frozenset({"compile_commands.json"})
@@ -18,7 +15,11 @@ def is_forbidden(path: str) -> bool:
         parsed.name in FORBIDDEN_NAMES
         or bool(FORBIDDEN_DIRECTORIES.intersection(parsed.parts))
         or parsed.name.endswith(FORBIDDEN_SUFFIXES)
-        or (parsed.parts and parsed.parts[0].startswith("bazel-") and parsed.parts[0] != "bazel-thirdparty")
+        or (
+            parsed.parts
+            and parsed.parts[0].startswith("bazel-")
+            and parsed.parts[0] != "bazel-thirdparty"
+        )
     )
 
 

@@ -260,7 +260,7 @@
   "moduleExtensions": {
     "//bazel:extensions.bzl%native_dependencies": {
       "general": {
-        "bzlTransitiveDigest": "CQiyTydpizzOGhOWjJuTbGTLzvQeEsM2nu4wRPacgzA=",
+        "bzlTransitiveDigest": "k/W9mJxujECXDaV9cMk2juRPKhkt8JB7tlnmM98gZMM=",
         "usagesDigest": "9YDPLZWwbcujbIwOBv6LCUVfCkkytgvLeWbAXhHLa3Y=",
         "recordedInputs": [
           "REPO_MAPPING:,bazel_tools bazel_tools",

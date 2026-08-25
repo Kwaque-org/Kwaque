@@ -205,7 +205,18 @@ def kwaque_cc_fuzz_test(
         env = {},
         corpus = [],
         tags = []):
-    """Defines a libFuzzer test enabled only by --config=fuzz."""
+    """Defines a libFuzzer test enabled only by --config=fuzz.
+
+    Args:
+      name: Name of the generated test target.
+      srcs: C++ source files compiled into the fuzzing binary.
+      deps: Dependencies of the fuzzing binary.
+      args: Arguments passed to the fuzzing binary after wrapper arguments.
+      data: Runtime data dependencies in addition to the corpus and sanitizer data.
+      env: Environment variables set for the test.
+      corpus: Seed corpus files passed to libFuzzer.
+      tags: Additional Bazel tags applied to the test.
+    """
     runner_name = name + "_runner"
     compatibility = select({
         "//bazel:fuzz_build": [],

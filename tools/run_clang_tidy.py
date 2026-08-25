@@ -1,5 +1,3 @@
-#!/usr/bin/env python3
-
 from __future__ import annotations
 
 import argparse
@@ -47,7 +45,9 @@ def is_production_source(path: str) -> bool:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Run clang-tidy using compile_commands.json")
+    parser = argparse.ArgumentParser(
+        description="Run clang-tidy using compile_commands.json"
+    )
     parser.add_argument("--tool", required=True)
     parser.add_argument("--config", required=True)
     parser.add_argument("--production-only", action="store_true")
@@ -57,7 +57,10 @@ def main() -> int:
     root = workspace_root()
     database = root / "compile_commands.json"
     if not database.is_file():
-        print("compile_commands.json is missing; run bazel run //tools:compile_commands", file=sys.stderr)
+        print(
+            "compile_commands.json is missing; run bazel run //tools:compile_commands",
+            file=sys.stderr,
+        )
         return 2
 
     entries = json.loads(database.read_text())
