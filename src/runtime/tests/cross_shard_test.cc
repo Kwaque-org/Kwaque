@@ -1,9 +1,11 @@
+#include "src/bytes/fragmented_buffer.h"
 #include "src/runtime/cross_shard.h"
 
 #include <seastar/core/checked_ptr.hh>
 #include <seastar/core/coroutine.hh>
 #include <seastar/core/shared_ptr.hh>
 #include <seastar/core/smp.hh>
+#include <seastar/core/temporary_buffer.hh>
 #include <seastar/core/weak_ptr.hh>
 #include <seastar/testing/test_case.hh>
 
@@ -133,6 +135,11 @@ static_assert(!cross_shard_value<seastar::lw_shared_ptr<int>>);
 static_assert(!cross_shard_value<seastar::weak_ptr<int>>);
 static_assert(!cross_shard_value<seastar::checked_ptr<int*>>);
 static_assert(!cross_shard_value<seastar::foreign_ptr<std::unique_ptr<int>>>);
+// Fragmented buffers own shard-local storage and are deny-by-default here, so a
+// caller that needs bytes on another shard must go through the bounded deep
+// copy above rather than transferring the buffer itself.
+static_assert(!cross_shard_value<kwaque::bytes::fragmented_buffer>);
+static_assert(!cross_shard_value<seastar::temporary_buffer<char>>);
 static_assert(
   kwaque::runtime::cross_shard_invocation<decltype(&echo_id), scalar_id>);
 static_assert(

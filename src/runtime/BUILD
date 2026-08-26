@@ -26,7 +26,10 @@ kwaque_cc_library(
     testonly = True,
     srcs = ["shard_affinity.cc"],
     hdrs = ["shard_affinity.h"],
-    visibility = ["//src/runtime/tests:__pkg__"],
+    visibility = [
+        "//src/resource:__pkg__",
+        "//src/runtime/tests:__pkg__",
+    ],
     deps = [
         "//src/base:invariant_test_support",
         "@seastar",

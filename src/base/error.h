@@ -23,6 +23,7 @@ enum class errc {
     fault_injected = 14,
     replay_divergence = 15,
     invariant_violation = 16,
+    truncated_data = 17,
 };
 
 [[nodiscard]] const std::error_category& error_category() noexcept;

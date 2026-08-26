@@ -185,10 +185,20 @@ def kwaque_cc_benchmark(
         memory = "128MiB",
         tags = []):
     """Defines a Seastar benchmark executable."""
+    benchmark_args = list(args)
+    has_stall_threshold = False
+    for arg in benchmark_args:
+        if arg == "--blocked-reactor-notify-ms" or arg.startswith("--blocked-reactor-notify-ms="):
+            has_stall_threshold = True
+    if not has_stall_threshold:
+        # Synchronous benchmark loops deliberately occupy the shard for the
+        # duration of a run. Keep the stall detector from interrupting and
+        # printing backtraces for that expected behavior.
+        benchmark_args = ["--blocked-reactor-notify-ms=2000000"] + benchmark_args
     cc_binary(
         name = name,
         srcs = srcs,
-        args = _reactor_args(cpu, memory, args, False),
+        args = _reactor_args(cpu, memory, benchmark_args, False),
         copts = kwaque_copts(),
         deps = deps + ["@seastar//:benchmark"],
         features = ["layering_check"],

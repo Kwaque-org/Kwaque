@@ -29,7 +29,10 @@ kwaque_cc_seastar_test(
     srcs = ["cross_shard_test.cc"],
     cpu = 2,
     memory = "128MiB",
-    deps = ["//src/runtime:cross_shard"],
+    deps = [
+        "//src/bytes:fragmented_buffer",
+        "//src/runtime:cross_shard",
+    ],
 )
 
 kwaque_cc_seastar_test(
