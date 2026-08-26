@@ -46,6 +46,8 @@ public:
             return "replay divergence";
         case errc::invariant_violation:
             return "invariant violation";
+        case errc::truncated_data:
+            return "truncated data";
         }
         return "unknown Kwaque error";
     }
@@ -80,6 +82,7 @@ public:
         case errc::fault_injected:
         case errc::replay_divergence:
         case errc::invariant_violation:
+        case errc::truncated_data:
             return {value, *this};
         case errc::success:
             return std::error_condition{};

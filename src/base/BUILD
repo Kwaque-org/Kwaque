@@ -38,6 +38,8 @@ kwaque_cc_library(
     }),
     local_defines = ["KWAQUE_INVARIANT_TEST_OBSERVER=1"],
     visibility = [
+        "//src/resource:__pkg__",
+        "//src/resource/tests:__pkg__",
         "//src/runtime:__pkg__",
         "//src/runtime/tests:__pkg__",
     ],

@@ -14,6 +14,7 @@ static_assert(static_cast<int>(kwaque::errc::invalid_argument) == 1);
 static_assert(static_cast<int>(kwaque::errc::out_of_range) == 2);
 static_assert(static_cast<int>(kwaque::errc::malformed_data) == 3);
 static_assert(static_cast<int>(kwaque::errc::unavailable) == 4);
+static_assert(static_cast<int>(kwaque::errc::truncated_data) == 17);
 
 struct error_case final {
     kwaque::errc code;
@@ -39,6 +40,7 @@ constexpr std::array cases{
   error_case{kwaque::errc::fault_injected, 14, "fault injected"},
   error_case{kwaque::errc::replay_divergence, 15, "replay divergence"},
   error_case{kwaque::errc::invariant_violation, 16, "invariant violation"},
+  error_case{kwaque::errc::truncated_data, 17, "truncated data"},
 };
 
 TEST(ErrorTest, PreservesStableValuesAndRoundTripsEveryCode) {
@@ -76,6 +78,9 @@ TEST(ErrorTest, MapsOnlyPortableConditionsToStandardEquivalents) {
     EXPECT_EQ(
       kwaque::make_error_code(kwaque::errc::dns_failure),
       std::errc::host_unreachable);
+    EXPECT_NE(
+      kwaque::make_error_code(kwaque::errc::truncated_data),
+      std::errc::result_out_of_range);
     EXPECT_NE(
       kwaque::make_error_code(kwaque::errc::wrong_shard),
       std::errc::invalid_argument);
