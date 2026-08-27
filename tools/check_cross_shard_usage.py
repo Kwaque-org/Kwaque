@@ -34,10 +34,10 @@ RULES = (
     ),
 )
 
-ALLOWED_RULES = {
-    "src/runtime/cross_shard.h": frozenset({"direct cross-shard submission"}),
-    "src/runtime/sharded_service.h": frozenset({"direct sharded-service ownership"}),
-    "src/broker/application_start.cc": frozenset({"direct cross-shard submission"}),
+ALLOWED_RULE_COUNTS = {
+    "src/runtime/cross_shard.h": {"direct cross-shard submission": 1},
+    "src/runtime/sharded_service.h": {"direct sharded-service ownership": 1},
+    "src/broker/application_start.cc": {"direct cross-shard submission": 1},
 }
 
 
@@ -166,19 +166,19 @@ def source_files(root: Path, paths: list[Path]) -> list[Path]:
 def scan_paths(
     root: Path,
     paths: list[Path],
-    allowed_rules: dict[str, frozenset[str]] | None = None,
+    allowed_rules: dict[str, dict[str, int]] | None = None,
 ) -> list[str]:
-    allowed = ALLOWED_RULES if allowed_rules is None else allowed_rules
+    allowed = ALLOWED_RULE_COUNTS if allowed_rules is None else allowed_rules
     violations: list[str] = []
     for relative in source_files(root, paths):
         with (root / relative).open(encoding="utf-8", newline="") as source:
             text = source.read()
         code, physical_offsets = code_view(text)
-        permitted = allowed.get(relative.as_posix(), frozenset())
+        permitted = allowed.get(relative.as_posix(), {})
         for rule in RULES:
-            if rule.name in permitted:
-                continue
-            for match in rule.pattern.finditer(code):
+            matches = tuple(rule.pattern.finditer(code))
+            allowed_count = permitted.get(rule.name, 0)
+            for match in matches[allowed_count:]:
                 line = line_number(text, physical_offsets[match.start()])
                 violations.append(f"{relative}:{line}: {rule.name}")
     return violations

@@ -1,6 +1,5 @@
 #include "src/runtime/error.h"
 
-#include <algorithm>
 #include <charconv>
 
 namespace kwaque::runtime {
@@ -30,44 +29,27 @@ void append_number(
     }
 }
 
-void append_category(
-  std::string& output, std::string_view value, std::size_t maximum) {
-    for (const char raw_character : value) {
-        if (output.size() == maximum) {
-            return;
-        }
-        const auto character = static_cast<unsigned char>(raw_character);
-        const bool alpha = (character >= 'a' && character <= 'z')
-                           || (character >= 'A' && character <= 'Z');
-        const bool digit = character >= '0' && character <= '9';
-        output.push_back(
-          alpha || digit || character == '_' || character == '-'
-            ? static_cast<char>(character)
-            : '?');
-    }
-}
-
 } // namespace
 
-operation_error::operation_error(
-  std::error_code code, operation_kind operation) noexcept
+operation_error::operation_error(errc code, operation_kind operation) noexcept
   : code_(code)
   , operation_(operation) {}
 
-operation_error::operation_error(errc code, operation_kind operation) noexcept
-  : operation_error(make_error_code(code), operation) {}
-
 bool operation_error::add_context(
   operation_context_key key, std::uint64_t value) noexcept {
-    if (context_size_ == context_.size()) {
+    if (
+      context_size_ == max_context_fields
+      || static_cast<std::uint8_t>(key)
+           > static_cast<std::uint8_t>(operation_context_key::stable_id)) {
         return false;
     }
-    if (std::ranges::any_of(context(), [key](const auto& field) {
-            return field.key == key;
-        })) {
-        return false;
+    for (std::size_t index = 0; index < context_size_; ++index) {
+        if (context_keys_[index] == key) {
+            return false;
+        }
     }
-    context_[context_size_] = operation_context_field{key, value};
+    context_keys_[context_size_] = key;
+    context_values_[context_size_] = value;
     ++context_size_;
     return true;
 }
@@ -77,21 +59,10 @@ std::string operation_error::render() const {
     output.reserve(max_rendered_size);
     append_bounded(output, "operation=", max_rendered_size);
     append_bounded(output, to_string(operation_), max_rendered_size);
-    append_bounded(output, " error=", max_rendered_size);
-    append_category(output, code_.category().name(), max_rendered_size);
-    append_bounded(output, ":", max_rendered_size);
-    if (code_.value() < 0) {
-        append_bounded(output, "-", max_rendered_size);
-        append_number(
-          output,
-          static_cast<std::uint64_t>(
-            -(static_cast<std::int64_t>(code_.value()))),
-          max_rendered_size);
-    } else {
-        append_number(
-          output, static_cast<std::uint64_t>(code_.value()), max_rendered_size);
-    }
-    for (const auto& field : context()) {
+    append_bounded(output, " error=kwaque:", max_rendered_size);
+    append_number(output, static_cast<std::uint64_t>(code_), max_rendered_size);
+    for (std::size_t index = 0; index < context_size_; ++index) {
+        const auto field = context_at(index);
         append_bounded(output, " ", max_rendered_size);
         append_bounded(output, to_string(field.key), max_rendered_size);
         append_bounded(output, "=", max_rendered_size);

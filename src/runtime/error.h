@@ -6,10 +6,8 @@
 #include <cstddef>
 #include <cstdint>
 #include <expected>
-#include <span>
 #include <string>
 #include <string_view>
-#include <system_error>
 #include <utility>
 
 namespace kwaque::runtime {
@@ -49,18 +47,19 @@ public:
     static constexpr std::size_t max_rendered_size = 256;
 
     explicit operation_error(
-      std::error_code code,
-      operation_kind operation = operation_kind::generic) noexcept;
-    explicit operation_error(
       errc code, operation_kind operation = operation_kind::generic) noexcept;
 
-    [[nodiscard]] std::error_code code() const noexcept { return code_; }
+    [[nodiscard]] errc code() const noexcept { return code_; }
     [[nodiscard]] operation_kind operation() const noexcept {
         return operation_;
     }
-    [[nodiscard]] std::span<const operation_context_field>
-    context() const noexcept {
-        return {context_.data(), context_size_};
+    [[nodiscard]] std::size_t context_size() const noexcept {
+        return context_size_;
+    }
+    [[nodiscard]] operation_context_field
+    context_at(std::size_t index) const noexcept {
+        return operation_context_field{
+          .key = context_keys_[index], .value = context_values_[index]};
     }
 
     [[nodiscard]] bool
@@ -70,10 +69,11 @@ public:
     bool operator==(const operation_error&) const = default;
 
 private:
-    std::error_code code_;
+    std::array<std::uint64_t, max_context_fields> context_values_{};
+    std::array<operation_context_key, max_context_fields> context_keys_{};
+    errc code_;
     operation_kind operation_;
-    std::array<operation_context_field, max_context_fields> context_{};
-    std::size_t context_size_{0};
+    std::uint8_t context_size_{0};
 };
 
 [[nodiscard]] std::string_view to_string(operation_kind operation) noexcept;

@@ -51,12 +51,9 @@ void fragmented_buffer_parser::refresh_cache() noexcept {
     if (at_.fragment >= buffer_.fragment_count()) {
         return;
     }
-    const auto fragment = buffer_.fragment_at(at_.fragment);
-    if (!fragment) {
-        return;
-    }
-    cache_begin_ = fragment->data();
-    cache_end_ = fragment->data() + fragment->size();
+    const auto& fragment = buffer_.fragments_[at_.fragment].storage;
+    cache_begin_ = fragment.get();
+    cache_end_ = fragment.get() + fragment.size();
 }
 
 // Keeps the cursor off the end of a fragment so peek_current_fragment() and
@@ -66,13 +63,10 @@ void fragmented_buffer_parser::normalize() noexcept {
     cache_begin_ = nullptr;
     cache_end_ = nullptr;
     while (at_.fragment < buffer_.fragment_count()) {
-        const auto fragment = buffer_.fragment_at(at_.fragment);
-        if (!fragment) {
-            return;
-        }
-        if (at_.offset < fragment->size()) {
-            cache_begin_ = fragment->data();
-            cache_end_ = fragment->data() + fragment->size();
+        const auto& fragment = buffer_.fragments_[at_.fragment].storage;
+        if (at_.offset < fragment.size()) {
+            cache_begin_ = fragment.get();
+            cache_end_ = fragment.get() + fragment.size();
             return;
         }
         at_.offset = 0;
@@ -131,19 +125,16 @@ result<void> fragmented_buffer_parser::copy_out(
         if (cursor.fragment >= buffer_.fragment_count()) {
             return failure(errc::malformed_data);
         }
-        const auto fragment = buffer_.fragment_at(cursor.fragment);
-        if (!fragment) {
-            return failure(errc::malformed_data);
-        }
-        if (cursor.offset >= fragment->size()) {
+        const auto& fragment = buffer_.fragments_[cursor.fragment].storage;
+        if (cursor.offset >= fragment.size()) {
             cursor.offset = 0;
             ++cursor.fragment;
             continue;
         }
-        const auto available = fragment->size() - cursor.offset;
+        const auto available = fragment.size() - cursor.offset;
         const auto span = std::min(available, destination.size() - written);
         std::memcpy(
-          destination.data() + written, fragment->data() + cursor.offset, span);
+          destination.data() + written, fragment.get() + cursor.offset, span);
         written += span;
         cursor.offset += span;
     }
@@ -215,14 +206,6 @@ fragment_view fragmented_buffer_parser::peek_current_fragment() const noexcept {
     }
     return fragment_view{
       position, static_cast<std::size_t>(cache_end_ - position)};
-}
-
-result<std::uint8_t> fragmented_buffer_parser::read_u8() {
-    std::array<char, 1> raw{};
-    if (auto read = read_to(raw); !read) {
-        return failure(read.error());
-    }
-    return static_cast<std::uint8_t>(static_cast<unsigned char>(raw[0]));
 }
 
 result<void> fragmented_buffer_parser::push_checkpoint() {

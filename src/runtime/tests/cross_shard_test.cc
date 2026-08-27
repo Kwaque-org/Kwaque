@@ -8,6 +8,7 @@
 #include <seastar/core/temporary_buffer.hh>
 #include <seastar/core/weak_ptr.hh>
 #include <seastar/testing/test_case.hh>
+#include <seastar/util/later.hh>
 
 #include <boost/test/unit_test.hpp>
 
@@ -94,6 +95,28 @@ using kwaque::runtime::cross_shard_value;
 using kwaque::runtime::test_types::scalar_id;
 
 scalar_id echo_id(scalar_id value) { return value; }
+seastar::future<scalar_id> delayed_echo_id(scalar_id value) {
+    co_await seastar::yield();
+    co_return value;
+}
+seastar::future<scalar_id> delayed_echo_reference(const scalar_id& value) {
+    co_await seastar::yield();
+    co_return value;
+}
+seastar::future<kwaque::runtime::result<scalar_id>>
+delayed_result(scalar_id value) {
+    co_await seastar::yield();
+    co_return value;
+}
+seastar::future<kwaque::runtime::result<scalar_id>>
+delayed_result_failure(scalar_id) {
+    co_await seastar::yield();
+    kwaque::runtime::operation_error error{
+      kwaque::errc::timed_out, kwaque::runtime::operation_kind::resource};
+    static_cast<void>(
+      error.add_context(kwaque::runtime::operation_context_key::attempt, 7));
+    co_return kwaque::runtime::failure(std::move(error));
+}
 using consume_id_function = void (*)(scalar_id);
 using echo_pointer_function = int* (*)(int*);
 
@@ -121,7 +144,16 @@ seastar::future<kwaque::runtime::owner_shard> record_value_fanout() {
 
 static_assert(cross_shard_value<kwaque::runtime::owner_shard>);
 static_assert(cross_shard_value<kwaque::runtime::cross_shard_bytes>);
+static_assert(cross_shard_value<kwaque::runtime::operation_error>);
 static_assert(cross_shard_value<scalar_id>);
+static_assert(cross_shard_value<kwaque::runtime::result<void>>);
+static_assert(cross_shard_value<kwaque::runtime::result<scalar_id>>);
+static_assert(!cross_shard_value<kwaque::runtime::result<int>>);
+static_assert(!cross_shard_value<kwaque::runtime::result<int*>>);
+static_assert(!cross_shard_value<
+              kwaque::runtime::result<kwaque::bytes::fragmented_buffer>>);
+static_assert(
+  !std::is_copy_constructible_v<kwaque::runtime::cross_shard_bytes>);
 static_assert(!cross_shard_value<int>);
 static_assert(!cross_shard_value<int&>);
 static_assert(!cross_shard_value<int*>);
@@ -150,13 +182,11 @@ static_assert(
 } // namespace
 
 SEASTAR_TEST_CASE(cross_shard_bytes_are_bounded_and_deeply_owned) {
-    const std::array source{std::byte{0x01}, std::byte{0x02}, std::byte{0x03}};
+    std::array source{std::byte{0x01}, std::byte{0x02}, std::byte{0x03}};
     auto copied = kwaque::runtime::cross_shard_bytes::copy(source);
     BOOST_REQUIRE(copied.has_value());
-    const auto duplicate = *copied;
-
-    BOOST_CHECK(duplicate == *copied);
-    BOOST_CHECK_NE(duplicate.bytes().data(), copied->bytes().data());
+    source[0] = std::byte{0xff};
+    BOOST_CHECK(copied->bytes()[0] == std::byte{0x01});
 
     const std::vector<std::byte> oversized(
       kwaque::runtime::cross_shard_bytes::max_size + 1);
@@ -180,6 +210,21 @@ SEASTAR_TEST_CASE(cross_shard_wrappers_return_owned_values_from_every_shard) {
     const auto echoed = co_await kwaque::runtime::invoke_on_owner(
       owners.back(), group, &echo_id, expected);
     BOOST_CHECK(echoed == expected);
+    const auto delayed = co_await kwaque::runtime::invoke_on_owner(
+      owners.back(), group, &delayed_echo_id, expected);
+    BOOST_CHECK(delayed == expected);
+    const auto referenced = co_await kwaque::runtime::invoke_on_owner(
+      owners.back(), group, &delayed_echo_reference, expected);
+    BOOST_CHECK(referenced == expected);
+    const auto result = co_await kwaque::runtime::invoke_on_owner(
+      owners.back(), group, &delayed_result, expected);
+    BOOST_REQUIRE(result.has_value());
+    BOOST_CHECK(*result == expected);
+    const auto failure = co_await kwaque::runtime::invoke_on_owner(
+      owners.back(), group, &delayed_result_failure, expected);
+    BOOST_REQUIRE(!failure.has_value());
+    BOOST_CHECK(failure.error().code() == kwaque::errc::timed_out);
+    BOOST_CHECK_EQUAL(failure.error().context_size(), 1U);
 }
 
 SEASTAR_TEST_CASE(cross_shard_fanout_waits_for_all_shards_before_failing) {

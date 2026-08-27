@@ -14,6 +14,8 @@
 #include <stdexcept>
 #include <string>
 #include <type_traits>
+#include <utility>
+#include <vector>
 
 namespace kwaque::resource {
 
@@ -25,6 +27,9 @@ static_assert(!std::is_copy_constructible_v<resource_registry>);
 static_assert(!std::is_move_constructible_v<resource_registry>);
 static_assert(!std::is_copy_constructible_v<resource_manager>);
 static_assert(!std::is_move_constructible_v<resource_manager>);
+static_assert(!std::is_copy_constructible_v<workload_handle>);
+static_assert(std::is_nothrow_move_constructible_v<workload_handle>);
+static_assert(!std::is_move_assignable_v<workload_handle>);
 
 resource_config test_config() {
     auto config = resource_config::from_total_memory(
@@ -50,25 +55,35 @@ SEASTAR_TEST_CASE(
     BOOST_CHECK_EQUAL(
       handles.config().total_memory().value(),
       seastar::memory::stats().total_memory());
+    resource_manager manager{handles};
+    co_await manager.start();
+    {
+        auto original_workload = manager.acquire_workload(
+          workload_class::metadata);
+        auto moved_workload = std::move(original_workload);
+        // A moved-from lease is deliberately invalid and must reject access.
+        // NOLINTNEXTLINE(bugprone-use-after-move)
+        BOOST_CHECK_THROW(
+          static_cast<void>(original_workload.scheduling_group()),
+          std::logic_error);
+        BOOST_CHECK(!moved_workload.scheduling_group().is_main());
+    }
+
+    std::vector<seastar::scheduling_group> scheduling_groups;
+    scheduling_groups.reserve(workload_class_count);
     for (const auto classification : all_workload_classes) {
-        const auto group = handles.scheduling_group(classification);
+        auto workload = manager.acquire_workload(classification);
+        const auto group = workload.scheduling_group();
+        scheduling_groups.push_back(group);
         BOOST_CHECK(!group.is_main());
         BOOST_CHECK_EQUAL(
           group.name(),
           "kwaque_" + std::string{descriptor_for(classification).metric_name});
-        BOOST_CHECK_GE(
-          handles.smp_concurrency_limit(classification),
-          descriptor_for(classification).max_nonlocal_requests);
-        BOOST_CHECK_GE(
-          handles.smp_concurrency_limit(classification),
-          seastar::this_smp_shard_count() - 1);
     }
     for (std::size_t first = 0; first < workload_class_count; ++first) {
         for (std::size_t second = first + 1; second < workload_class_count;
              ++second) {
-            BOOST_CHECK(
-              handles.scheduling_group(all_workload_classes[first])
-              != handles.scheduling_group(all_workload_classes[second]));
+            BOOST_CHECK(scheduling_groups[first] != scheduling_groups[second]);
         }
     }
 
@@ -82,8 +97,6 @@ SEASTAR_TEST_CASE(
     BOOST_CHECK(rejected);
     co_await competing.stop();
 
-    resource_manager manager{handles};
-    co_await manager.start();
     bool active_manager_blocked_stop = false;
     try {
         co_await registry.stop();
@@ -99,9 +112,6 @@ SEASTAR_TEST_CASE(
     co_await registry.stop();
     BOOST_CHECK(!registry.ready());
     BOOST_CHECK(!handles.valid());
-    BOOST_CHECK_THROW(
-      static_cast<void>(handles.scheduling_group(workload_class::metadata)),
-      std::logic_error);
     BOOST_CHECK_THROW(static_cast<void>(registry.handles()), std::logic_error);
 
     resource_manager stale_manager{handles};

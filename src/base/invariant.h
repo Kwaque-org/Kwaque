@@ -53,27 +53,14 @@ inline constexpr std::size_t max_invariant_diagnostic_size = 2048;
   std::string_view context,
   std::source_location location = std::source_location::current());
 
-inline void require_invariant(
-  bool condition,
-  invariant_id id,
-  std::string_view expression,
-  std::string_view context,
-  std::source_location location = std::source_location::current()) {
-    if (!condition) [[unlikely]] {
-        invariant_failed(id, expression, context, location);
-    }
-}
-
 } // namespace kwaque
 
 #define KWAQUE_INVARIANT(id, expression, context)                              \
     do {                                                                       \
-        ::kwaque::require_invariant(                                           \
-          static_cast<bool>(expression),                                       \
-          (id),                                                                \
-          #expression,                                                         \
-          (context),                                                           \
-          std::source_location::current());                                    \
+        if (!static_cast<bool>(expression)) [[unlikely]] {                     \
+            ::kwaque::invariant_failed(                                        \
+              (id), #expression, (context), std::source_location::current());  \
+        }                                                                      \
     } while (false)
 
 #ifndef KWAQUE_ENABLE_DEBUG_ASSERTIONS

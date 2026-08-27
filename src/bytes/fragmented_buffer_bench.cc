@@ -6,10 +6,7 @@
 #include <seastar/core/temporary_buffer.hh>
 #include <seastar/testing/perf_tests.hh>
 
-#include <sys/uio.h>
-
 #include <algorithm>
-#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <string>
@@ -53,7 +50,7 @@ fixed_fragments(std::size_t fragment_count, std::size_t bytes_per_fragment) {
           static_cast<char>('a' + index % 26));
         fragments.push_back(std::move(fragment));
     }
-    auto buffer = fragmented_buffer::from_fragments(std::move(fragments));
+    auto buffer = fragmented_buffer::copy_from_fragments(fragments);
     return std::move(*buffer);
 }
 
@@ -69,7 +66,7 @@ std::vector<fragmented_buffer> shared_small_buffers() {
     std::vector<fragmented_buffer> inputs;
     inputs.reserve(shared_append_total);
     for (std::size_t index = 0; index < shared_append_total; ++index) {
-        auto shared = source->share(
+        auto shared = source.share(
           byte_count{index * shared_append_bytes},
           byte_count{shared_append_bytes});
         inputs.push_back(std::move(*shared));
@@ -79,6 +76,22 @@ std::vector<fragmented_buffer> shared_small_buffers() {
 
 struct buffer_fixture {
     fragmented_buffer buffer{many_fragments()};
+};
+
+struct tiny_fragments_fixture {
+    fragmented_buffer buffer{
+      fixed_fragments(transfer_fragment_total, transfer_fragment_bytes)};
+};
+
+struct native_fragments_fixture {
+    std::vector<seastar::temporary_buffer<char>> fragments;
+
+    native_fragments_fixture() {
+        fragments.reserve(fragment_total);
+        for (std::size_t index = 0; index < fragment_total; ++index) {
+            fragments.emplace_back(fragment_bytes);
+        }
+    }
 };
 
 struct bulk_builder_fixture {
@@ -115,9 +128,34 @@ PERF_TEST_F(buffer_fixture, move_262144_bytes_64_fragments) {
     return benchmark_inner_iterations * 2;
 }
 
-PERF_TEST_F(buffer_fixture, share_whole) {
+PERF_TEST_F(native_fragments_fixture, seastar_share_64_fragments) {
+    std::vector<seastar::temporary_buffer<char>> shared;
+    shared.reserve(fragments.size());
+    for (auto& fragment : fragments) {
+        shared.push_back(fragment.share());
+    }
+    perf_tests::do_not_optimize(shared.size());
+}
+
+PERF_TEST_F(buffer_fixture, kwaque_share_64_fragments) {
     auto shared = buffer.share();
-    perf_tests::do_not_optimize(shared->fragment_count());
+    perf_tests::do_not_optimize(shared.fragment_count());
+}
+
+PERF_TEST_F(buffer_fixture, deep_copy_262144_bytes_64_to_2_fragments) {
+    auto copied = buffer.copy();
+    perf_tests::do_not_optimize(copied.fragment_count());
+}
+
+PERF_TEST_F(tiny_fragments_fixture, deep_copy_10000_bytes_1000_to_1_fragment) {
+    auto copied = buffer.copy();
+    perf_tests::do_not_optimize(copied.fragment_count());
+}
+
+PERF_TEST_F(buffer_fixture, parser_construct_from_share_64_fragments) {
+    auto shared = buffer.share();
+    fragmented_buffer_parser parser{std::move(shared)};
+    perf_tests::do_not_optimize(parser.bytes_remaining().value());
 }
 
 PERF_TEST_F(buffer_fixture, share_interior_slice) {
@@ -126,17 +164,29 @@ PERF_TEST_F(buffer_fixture, share_interior_slice) {
     perf_tests::do_not_optimize(shared->fragment_count());
 }
 
+PERF_TEST_F(buffer_fixture, trim_front_262144_bytes_64_fragments) {
+    auto working = buffer.share();
+    std::size_t trimmed = 0;
+    perf_tests::start_measuring_time();
+    while (!working.empty()) {
+        const auto bytes = working.fragment_at(0)->size();
+        static_cast<void>(working.trim_front(byte_count{bytes}));
+        ++trimmed;
+    }
+    perf_tests::stop_measuring_time();
+    return trimmed;
+}
+
 PERF_TEST_F(
   buffer_fixture, export_scatter_262144_bytes_64_fragments_4_batches) {
-    std::array<::iovec, scatter_batch_vectors> vectors{};
     scatter_cursor cursor;
     std::size_t batches = 0;
     while (true) {
         const auto batch = buffer.export_scatter(
-          vectors, byte_count{scatter_batch_bytes}, cursor);
-        perf_tests::do_not_optimize(batch->bytes.value());
+          scatter_batch_vectors, byte_count{scatter_batch_bytes}, cursor);
+        perf_tests::do_not_optimize(batch->bytes().value());
         ++batches;
-        if (batch->complete) {
+        if (batch->complete()) {
             break;
         }
     }
@@ -150,7 +200,7 @@ PERF_TEST_F(buffer_fixture, linearize_whole) {
 
 PERF_TEST_F(buffer_fixture, cross_fragment_fixed_reads) {
     auto shared = buffer.share();
-    fragmented_buffer_parser parser{std::move(*shared)};
+    fragmented_buffer_parser parser{std::move(shared)};
     // Starting one byte in makes one read per fragment straddle a boundary.
     static_cast<void>(parser.skip(byte_count{1}));
     std::size_t reads = 0;
@@ -201,7 +251,7 @@ PERF_TEST_F(bulk_builder_fixture, bulk_append_262144_bytes_64_appends) {
     return fragment_total;
 }
 
-PERF_TEST(fragmented_buffer, release_to_packet_10000_bytes_1000_fragments) {
+PERF_TEST(fragmented_buffer, copy_to_packet_10000_bytes_1000_fragments) {
     std::vector<fragmented_buffer> inputs;
     inputs.reserve(transfer_input_total);
     for (std::size_t index = 0; index < transfer_input_total; ++index) {
@@ -213,15 +263,16 @@ PERF_TEST(fragmented_buffer, release_to_packet_10000_bytes_1000_fragments) {
     outputs.reserve(transfer_input_total);
     perf_tests::start_measuring_time();
     for (auto& input : inputs) {
-        auto transferred = std::move(input).release_to_packet();
+        auto transferred = input.copy_to_packet();
         outputs.emplace_back(std::move(*transferred));
     }
     perf_tests::do_not_optimize(outputs);
-    // Ownership cleanup is part of the transfer cost rather than deferred
-    // until after the timed region.
+    // Packet ownership cleanup is part of conversion cost rather than deferred
+    // until after the timed region. Source destruction is independent because
+    // this conversion is deliberately non-destructive.
     outputs.clear();
-    inputs.clear();
     perf_tests::stop_measuring_time();
+    inputs.clear();
     return transfer_input_total;
 }
 

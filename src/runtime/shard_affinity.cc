@@ -54,19 +54,16 @@ private:
 owner_shard::owner_shard() noexcept
   : shard_(seastar::this_shard_id()) {}
 
-bool owner_shard::is_current() const noexcept {
-    return shard_ == seastar::this_shard_id();
-}
-
-void owner_shard::assert_current(std::source_location location) const {
-    if (!is_current()) [[unlikely]] {
-        const shard_context context{shard_, seastar::this_shard_id()};
-        invariant_failed(
-          wrong_shard_invariant,
-          "this_shard_id() == owner_shard",
-          context.view(),
-          location);
-    }
+void owner_shard::fail_wrong_shard(
+  seastar::shard_id expected,
+  seastar::shard_id current,
+  std::source_location location) {
+    const shard_context context{expected, current};
+    invariant_failed(
+      wrong_shard_invariant,
+      "this_shard_id() == owner_shard",
+      context.view(),
+      location);
 }
 
 } // namespace kwaque::runtime

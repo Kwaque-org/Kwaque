@@ -13,7 +13,7 @@ runtime_service::runtime_service(
 
 seastar::future<> runtime_service::start() {
     assert_current();
-    if (ready_ || tasks_.closed()) {
+    if (ready_ || tasks_.admission_closed()) {
         throw std::logic_error("runtime service cannot be started");
     }
     ready_ = true;

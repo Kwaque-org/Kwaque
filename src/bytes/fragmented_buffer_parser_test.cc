@@ -41,7 +41,7 @@ split_at(std::string_view bytes, const std::vector<std::size_t>& cuts) {
         previous = cut;
     }
     fragments.push_back(fragment_of(bytes.substr(previous)));
-    auto buffer = fragmented_buffer::from_fragments(std::move(fragments));
+    auto buffer = fragmented_buffer::copy_from_fragments(fragments);
     EXPECT_TRUE(buffer.has_value());
     return std::move(*buffer);
 }
@@ -239,8 +239,7 @@ TEST(BufferParser, SubBuffersOutliveParserAndSource) {
     {
         auto source = split_at("abcdefghij", {2, 6});
         auto shared = source.share();
-        ASSERT_TRUE(shared.has_value());
-        fragmented_buffer_parser parser{std::move(*shared)};
+        fragmented_buffer_parser parser{std::move(shared)};
         ASSERT_TRUE(parser.skip(byte_count{1}).has_value());
         auto taken = parser.read_buffer(byte_count{7});
         ASSERT_TRUE(taken.has_value());
@@ -255,7 +254,7 @@ TEST(BufferParser, FixedWidthEndianReadsAtEveryBoundary) {
     for (std::size_t cut = 0; cut <= 8; ++cut) {
         fragmented_buffer_parser parser{split_at(bytes, {cut})};
 
-        const auto u8 = parser.read_u8();
+        const auto u8 = parser.read_le<std::uint8_t>();
         ASSERT_TRUE(u8.has_value()) << "cut=" << cut;
         EXPECT_EQ(*u8, 0x01U);
 
@@ -267,7 +266,7 @@ TEST(BufferParser, FixedWidthEndianReadsAtEveryBoundary) {
         ASSERT_TRUE(u32.has_value()) << "cut=" << cut;
         EXPECT_EQ(*u32, 0x07060504U);
 
-        const auto tail = parser.read_u8();
+        const auto tail = parser.read_le<std::uint8_t>();
         ASSERT_TRUE(tail.has_value()) << "cut=" << cut;
         EXPECT_EQ(*tail, 0x08U);
         EXPECT_TRUE(parser.at_end());
@@ -279,7 +278,7 @@ TEST(BufferParser, FixedWidthEndianReadsAtEveryBoundary) {
         const auto be = parser.read_be<std::uint64_t>();
         ASSERT_TRUE(be.has_value());
         EXPECT_EQ(*be, 0x0102030405060708ULL);
-        EXPECT_FALSE(parser.read_u8().has_value());
+        EXPECT_FALSE(parser.read_le<std::uint8_t>().has_value());
     }
     {
         fragmented_buffer_parser parser{split_at(bytes, {1, 3, 5, 7})};
@@ -372,8 +371,7 @@ TEST(BufferParser, ExhaustiveFragmentationMatchesContiguousOracle) {
         for (std::size_t start = 0; start <= length; ++start) {
             for (std::size_t span = 0; span + start <= length; ++span) {
                 auto shared = buffer.share();
-                ASSERT_TRUE(shared.has_value());
-                fragmented_buffer_parser parser{std::move(*shared)};
+                fragmented_buffer_parser parser{std::move(shared)};
                 ASSERT_TRUE(parser.skip(byte_count{start}).has_value());
 
                 std::vector<char> destination(span);
@@ -411,7 +409,7 @@ TEST(BufferParser, EmptyAndExhaustedInputsBehaveConsistently) {
     EXPECT_TRUE(empty.peek_current_fragment().empty());
     EXPECT_TRUE(empty.skip(byte_count{0}).has_value());
     EXPECT_FALSE(empty.skip(byte_count{1}).has_value());
-    const auto empty_read = empty.read_u8();
+    const auto empty_read = empty.read_le<std::uint8_t>();
     ASSERT_FALSE(empty_read.has_value());
     EXPECT_EQ(empty_read.error(), make_error_code(errc::truncated_data));
     auto nothing = empty.read_buffer(byte_count{0});
@@ -422,7 +420,7 @@ TEST(BufferParser, EmptyAndExhaustedInputsBehaveConsistently) {
     fragmented_buffer_parser sparse{split_at("", {0, 0, 0})};
     EXPECT_EQ(sparse.total_bytes().value(), 0U);
     EXPECT_TRUE(sparse.at_end());
-    const auto sparse_read = sparse.read_u8();
+    const auto sparse_read = sparse.read_le<std::uint8_t>();
     ASSERT_FALSE(sparse_read.has_value());
     EXPECT_EQ(sparse_read.error(), make_error_code(errc::truncated_data));
 }

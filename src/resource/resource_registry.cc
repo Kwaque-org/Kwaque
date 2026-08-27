@@ -32,6 +32,13 @@ std::string group_name(const workload_descriptor& descriptor) {
     return "kwaque_" + std::string(descriptor.metric_name);
 }
 
+template<std::size_t... Index>
+std::array<seastar::smp_service_group, sizeof...(Index)>
+default_smp_groups(std::index_sequence<Index...>) {
+    return {
+      (static_cast<void>(Index), seastar::default_smp_service_group())...};
+}
+
 } // namespace
 
 resource_handle_set::resource_handle_set(
@@ -39,13 +46,11 @@ resource_handle_set::resource_handle_set(
   std::uint64_t generation,
   std::array<seastar::scheduling_group, workload_class_count> scheduling_groups,
   std::array<seastar::smp_service_group, workload_class_count>
-    smp_service_groups,
-  std::array<unsigned, workload_class_count> smp_concurrency_limits) noexcept
+    smp_service_groups) noexcept
   : config_(config)
   , generation_(generation)
   , scheduling_groups_(scheduling_groups)
-  , smp_service_groups_(smp_service_groups)
-  , smp_concurrency_limits_(smp_concurrency_limits) {}
+  , smp_service_groups_(smp_service_groups) {}
 
 bool resource_handle_set::valid() const noexcept {
     return active_generation.load(std::memory_order_acquire) == generation_;
@@ -97,36 +102,6 @@ void resource_handle_set::release_manager_lease() const noexcept {
       (current & lease_closing_bit) != 0 || (current & lease_count_mask) == 0) {
         std::terminate();
     }
-}
-
-seastar::scheduling_group
-resource_handle_set::scheduling_group(workload_class classification) const {
-    assert_valid();
-    const auto index = workload_index(classification);
-    if (index >= scheduling_groups_.size()) {
-        throw std::out_of_range("unknown workload class");
-    }
-    return scheduling_groups_[index];
-}
-
-seastar::smp_service_group
-resource_handle_set::smp_service_group(workload_class classification) const {
-    assert_valid();
-    const auto index = workload_index(classification);
-    if (index >= smp_service_groups_.size()) {
-        throw std::out_of_range("unknown workload class");
-    }
-    return smp_service_groups_[index];
-}
-
-unsigned resource_handle_set::smp_concurrency_limit(
-  workload_class classification) const {
-    assert_valid();
-    const auto index = workload_index(classification);
-    if (index >= smp_concurrency_limits_.size()) {
-        throw std::out_of_range("unknown workload class");
-    }
-    return smp_concurrency_limits_[index];
 }
 
 resource_registry::~resource_registry() {
@@ -186,17 +161,12 @@ seastar::future<> resource_registry::start(resource_config config) {
               seastar::sstring{name},
               static_cast<float>(descriptor.scheduling_shares));
             scheduling_groups_[index] = scheduling_group;
-            if (descriptor.io_bandwidth_bytes_per_second) {
-                co_await scheduling_group.update_io_bandwidth(
-                  *descriptor.io_bandwidth_bytes_per_second);
-            }
 
             inject_before_creation();
             seastar::smp_service_group_config smp_config;
             const auto minimum_limit = seastar::this_smp_shard_count() - 1;
             const auto effective_limit = std::max(
               descriptor.max_nonlocal_requests, minimum_limit);
-            smp_concurrency_limits_[index] = effective_limit;
             smp_config.max_nonlocal_requests = effective_limit;
             smp_config.group_name = seastar::sstring{name};
             smp_service_groups_[index]
@@ -378,16 +348,8 @@ resource_handle_set resource_registry::handles() const {
 
     std::array<seastar::scheduling_group, workload_class_count>
       scheduling_groups;
-    std::array<seastar::smp_service_group, workload_class_count>
-      smp_service_groups{
-        seastar::default_smp_service_group(),
-        seastar::default_smp_service_group(),
-        seastar::default_smp_service_group(),
-        seastar::default_smp_service_group(),
-        seastar::default_smp_service_group(),
-        seastar::default_smp_service_group(),
-        seastar::default_smp_service_group(),
-    };
+    auto smp_service_groups = default_smp_groups(
+      std::make_index_sequence<workload_class_count>{});
     for (const auto classification : all_workload_classes) {
         const auto index = workload_index(classification);
         KWAQUE_INVARIANT(
@@ -399,11 +361,7 @@ resource_handle_set resource_registry::handles() const {
         smp_service_groups[index] = *smp_service_groups_[index];
     }
     return resource_handle_set{
-      *config_,
-      generation_,
-      scheduling_groups,
-      smp_service_groups,
-      smp_concurrency_limits_};
+      *config_, generation_, scheduling_groups, smp_service_groups};
 }
 
 } // namespace kwaque::resource

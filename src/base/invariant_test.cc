@@ -27,6 +27,18 @@ TEST(InvariantTest, DebugAssertionEvaluationMatchesBuildMode) {
 #endif
 }
 
+TEST(InvariantTest, SuccessfulInvariantDoesNotEvaluateFailureMetadata) {
+    int id_evaluations = 0;
+    int context_evaluations = 0;
+    KWAQUE_INVARIANT(
+      (++id_evaluations, kwaque::invariant_id{"KQ-INVARIANT-COLD-METADATA"}),
+      true,
+      (++context_evaluations, std::string_view{"unused"}));
+
+    EXPECT_EQ(id_evaluations, 0);
+    EXPECT_EQ(context_evaluations, 0);
+}
+
 TEST(InvariantDeathTest, AlwaysOnInvariantEmitsStableSingleLineIdentity) {
     EXPECT_DEATH(
       KWAQUE_INVARIANT(

@@ -10,7 +10,6 @@ namespace kwaque::resource {
 
 namespace {
 
-constexpr std::uint64_t minimum_headroom_bytes = 16ULL * 1024ULL * 1024ULL;
 constexpr std::uint64_t memory_weight_total = 100;
 
 } // namespace
@@ -25,14 +24,20 @@ resource_config::resource_config(
 
 result<resource_config>
 resource_config::from_total_memory(byte_count total_memory) noexcept {
+    return from_total_memory(total_memory, default_reactor_headroom());
+}
+
+result<resource_config> resource_config::from_total_memory(
+  byte_count total_memory, byte_count reactor_headroom) noexcept {
     if (total_memory < minimum_total_memory()) {
         return failure(errc::resource_exhausted);
     }
+    if (reactor_headroom.value() == 0) {
+        return failure(errc::invalid_argument);
+    }
 
-    const byte_count headroom{std::max(
-      minimum_headroom_bytes, total_memory.value() / std::uint64_t{4})};
-    const auto allocatable = total_memory.checked_sub(headroom);
-    if (!allocatable) {
+    const auto allocatable = total_memory.checked_sub(reactor_headroom);
+    if (!allocatable || allocatable->value() < workload_class_count * 2) {
         return failure(errc::resource_exhausted);
     }
 
@@ -48,6 +53,9 @@ resource_config::from_total_memory(byte_count total_memory) noexcept {
         remainder -= remainder_share;
         const byte_count budget{
           whole_share * static_cast<std::uint64_t>(weight) + remainder_share};
+        if (budget.value() < 2) {
+            return failure(errc::resource_exhausted);
+        }
         const auto next_allocated = allocated.checked_add(budget);
         if (!next_allocated) {
             return failure(errc::out_of_range);
@@ -56,11 +64,11 @@ resource_config::from_total_memory(byte_count total_memory) noexcept {
         budgets[index] = budget;
     }
 
-    const auto accounted = allocated.checked_add(headroom);
+    const auto accounted = allocated.checked_add(reactor_headroom);
     if (!accounted || *accounted > total_memory) {
         return failure(errc::out_of_range);
     }
-    return resource_config{total_memory, headroom, budgets};
+    return resource_config{total_memory, reactor_headroom, budgets};
 }
 
 byte_count resource_config::budget(workload_class classification) const {

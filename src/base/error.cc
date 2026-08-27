@@ -60,24 +60,19 @@ public:
             return std::make_error_condition(std::errc::invalid_argument);
         case errc::out_of_range:
             return std::make_error_condition(std::errc::result_out_of_range);
-        case errc::unavailable:
-        case errc::resource_exhausted:
-            return std::make_error_condition(
-              std::errc::resource_unavailable_try_again);
         case errc::aborted:
             return std::make_error_condition(std::errc::operation_canceled);
-        case errc::closed:
-            return std::make_error_condition(std::errc::broken_pipe);
         case errc::timed_out:
             return std::make_error_condition(std::errc::timed_out);
         case errc::queue_full:
             return std::make_error_condition(std::errc::no_buffer_space);
         case errc::io_failure:
             return std::make_error_condition(std::errc::io_error);
+        case errc::unavailable:
+        case errc::closed:
+        case errc::resource_exhausted:
         case errc::network_failure:
-            return std::make_error_condition(std::errc::network_unreachable);
         case errc::dns_failure:
-            return std::make_error_condition(std::errc::host_unreachable);
         case errc::wrong_shard:
         case errc::fault_injected:
         case errc::replay_divergence:
