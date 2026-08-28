@@ -67,4 +67,17 @@ TEST(PidFileTest, ReplacesAStalePid) {
     EXPECT_FALSE(std::filesystem::exists(path));
 }
 
+TEST(PidFileTest, DoesNotRemoveAFileWhoseContentsChanged) {
+    temporary_directory directory;
+    const auto path = directory.path() / "kwaque.pid";
+
+    {
+        kwaque::broker::pid_file owner(path);
+        std::ofstream replaced(path, std::ios::trunc);
+        replaced << ::getpid() << "unexpected\n";
+    }
+
+    EXPECT_TRUE(std::filesystem::exists(path));
+}
+
 } // namespace

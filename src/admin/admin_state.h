@@ -1,33 +1,39 @@
 #pragma once
 
-#include <atomic>
+#include "src/runtime/shard_affinity.h"
+
+#include <seastar/core/future.hh>
+#include <seastar/core/metrics.hh>
+
 #include <cstdint>
 
 namespace kwaque::admin {
 
-class admin_state final {
+class admin_state final : public runtime::shard_affine {
 public:
-    void listener_started(unsigned shard_count) noexcept;
-    void mark_ready(double startup_duration_seconds) noexcept;
-    void begin_shutdown() noexcept;
-    void stopped() noexcept;
-    void record_request() noexcept;
+    void register_metrics();
+    void listener_started(unsigned shard_count);
+    void mark_ready(double startup_duration_seconds);
+    void begin_shutdown();
+    [[nodiscard]] seastar::future<> stop();
+    void record_request();
 
-    [[nodiscard]] bool live() const noexcept;
-    [[nodiscard]] bool ready() const noexcept;
-    [[nodiscard]] unsigned shard_count() const noexcept;
-    [[nodiscard]] double startup_duration_seconds() const noexcept;
-    [[nodiscard]] std::uint64_t shutdown_count() const noexcept;
-    [[nodiscard]] std::uint64_t request_count() const noexcept;
+    [[nodiscard]] bool live() const;
+    [[nodiscard]] bool ready() const;
+    [[nodiscard]] unsigned shard_count() const;
+    [[nodiscard]] double startup_duration_seconds() const;
+    [[nodiscard]] std::uint64_t shutdown_count() const;
+    [[nodiscard]] std::uint64_t request_count() const;
 
 private:
     enum class lifecycle : std::uint8_t { stopped, live, ready, draining };
 
-    std::atomic<lifecycle> lifecycle_{lifecycle::stopped};
-    std::atomic<unsigned> shard_count_{0};
-    std::atomic<double> startup_duration_seconds_{0.0};
-    std::atomic<std::uint64_t> shutdown_count_{0};
-    std::atomic<std::uint64_t> request_count_{0};
+    lifecycle lifecycle_{lifecycle::stopped};
+    unsigned shard_count_{0};
+    double startup_duration_seconds_{0.0};
+    std::uint64_t shutdown_count_{0};
+    std::uint64_t request_count_{0};
+    seastar::metrics::metric_groups metrics_;
 };
 
 } // namespace kwaque::admin

@@ -1,5 +1,7 @@
 #pragma once
 
+#include "src/runtime/shard_affinity.h"
+
 #include <seastar/core/future.hh>
 
 #include <chrono>
@@ -9,7 +11,7 @@
 
 namespace kwaque::admin {
 
-class admin_server final {
+class admin_server final : public runtime::shard_affine {
 public:
     admin_server();
     ~admin_server();
@@ -21,15 +23,14 @@ public:
 
     [[nodiscard]] seastar::future<>
     start(std::string address, std::uint16_t port, unsigned shard_count);
-    void
-    mark_ready(std::chrono::steady_clock::duration startup_duration) noexcept;
-    void begin_shutdown() noexcept;
+    [[nodiscard]] seastar::future<>
+    mark_ready(std::chrono::steady_clock::duration startup_duration);
+    [[nodiscard]] seastar::future<> begin_shutdown();
     [[nodiscard]] seastar::future<> stop();
 
-    [[nodiscard]] bool live() const noexcept;
-    [[nodiscard]] bool ready() const noexcept;
-
 private:
+    [[nodiscard]] seastar::future<> stop_once();
+
     class impl;
     std::unique_ptr<impl> impl_;
 };

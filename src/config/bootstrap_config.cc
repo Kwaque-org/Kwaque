@@ -1,12 +1,12 @@
 #include "src/config/bootstrap_config.h"
 
+#include <arpa/inet.h>
 #include <yaml-cpp/yaml.h>
 
 #include <algorithm>
 #include <array>
 #include <cctype>
 #include <fstream>
-#include <iterator>
 #include <limits>
 #include <optional>
 #include <string>
@@ -148,9 +148,13 @@ std::optional<log_level> parse_log_level(std::string_view value) noexcept {
     return std::nullopt;
 }
 
-void append_escaped(std::string& output, std::string_view value) {
+void append_escaped(
+  std::string& output,
+  std::string_view value,
+  std::size_t maximum_input = max_rendered_config_value_bytes) {
     constexpr std::string_view hex_digits = "0123456789abcdef";
-    for (const char raw_character : value) {
+    const auto bounded_size = std::min(value.size(), maximum_input);
+    for (const char raw_character : value.substr(0, bounded_size)) {
         const auto character = static_cast<unsigned char>(raw_character);
         switch (character) {
         case '\\':
@@ -166,7 +170,7 @@ void append_escaped(std::string& output, std::string_view value) {
             output += "\\t";
             break;
         default:
-            if (character < 0x20 || character == 0x7f) {
+            if (character < 0x20 || character > 0x7e) {
                 output += "\\x";
                 output.push_back(hex_digits[character >> 4]);
                 output.push_back(hex_digits[character & 0x0f]);
@@ -176,6 +180,17 @@ void append_escaped(std::string& output, std::string_view value) {
             break;
         }
     }
+    if (value.size() > maximum_input) {
+        output += "<truncated>";
+    }
+}
+
+bool is_numeric_address(std::string_view value) {
+    in_addr address_v4{};
+    in6_addr address_v6{};
+    const std::string text{value};
+    return ::inet_pton(AF_INET, text.c_str(), &address_v4) == 1
+           || ::inet_pton(AF_INET6, text.c_str(), &address_v6) == 1;
 }
 
 bootstrap_config_result decode_bootstrap_config(const YAML::Node& root) {
@@ -272,10 +287,13 @@ bootstrap_config_result decode_bootstrap_config(const YAML::Node& root) {
             }
             if (
               is_blank(*address)
-              || std::ranges::any_of(*address, [](unsigned char character) {
-                     return std::isspace(character) != 0
-                            || std::iscntrl(character) != 0;
-                 })) {
+              || std::ranges::any_of(
+                *address,
+                [](unsigned char character) {
+                    return std::isspace(character) != 0
+                           || std::iscntrl(character) != 0;
+                })
+              || !is_numeric_address(*address)) {
                 return std::unexpected(make_error(
                   config_errc::invalid_admin_address,
                   "kwaque.admin.address",
@@ -334,6 +352,12 @@ bootstrap_config_result decode_bootstrap_config(const YAML::Node& root) {
 } // namespace
 
 bootstrap_config_result parse_bootstrap_config(std::string_view yaml) {
+    if (yaml.size() > max_bootstrap_config_bytes) {
+        return std::unexpected(make_error(
+          config_errc::input_too_large,
+          "root",
+          "configuration exceeds the maximum supported size"));
+    }
     try {
         return decode_bootstrap_config(YAML::Load(std::string(yaml)));
     } catch (const YAML::Exception& error) {
@@ -354,14 +378,22 @@ load_bootstrap_config(const std::filesystem::path& path) {
           "unable to open configuration file: " + path.string()));
     }
 
-    std::string contents{
-      std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>()};
+    std::string contents(max_bootstrap_config_bytes + 1, '\0');
+    input.read(contents.data(), static_cast<std::streamsize>(contents.size()));
+    const auto bytes_read = static_cast<std::size_t>(input.gcount());
     if (input.bad()) {
         return std::unexpected(make_error(
           config_errc::file_unavailable,
           "config",
           "unable to read configuration file: " + path.string()));
     }
+    if (bytes_read > max_bootstrap_config_bytes) {
+        return std::unexpected(make_error(
+          config_errc::input_too_large,
+          "config",
+          "configuration exceeds the maximum supported size"));
+    }
+    contents.resize(bytes_read);
     return parse_bootstrap_config(contents);
 }
 
@@ -418,6 +450,14 @@ std::string render_config(const bootstrap_config& configuration) {
       config_value{"developer_mode", developer_mode, config_visibility::safe},
     };
     return render_config(values);
+}
+
+std::string render_config_error(const config_error& error) {
+    std::string output{"field="};
+    append_escaped(output, error.field, 128);
+    output += " message=";
+    append_escaped(output, error.message, 256);
+    return output;
 }
 
 } // namespace kwaque::config

@@ -89,7 +89,11 @@ kwaque_cc_library(
     srcs = ["stop_signal.cc"],
     hdrs = ["stop_signal.h"],
     visibility = ["//visibility:public"],
-    deps = ["@seastar"],
+    deps = [
+        ":shard_affinity",
+        "//src/base:invariant",
+        "@seastar",
+    ],
 )
 
 kwaque_cc_binary(

@@ -3,6 +3,8 @@
 
 #include <gtest/gtest.h>
 
+#include <string>
+
 namespace {
 
 TEST(AdminResponsesTest, CurrentBuildInfoUsesStampedValues) {
@@ -31,6 +33,17 @@ TEST(AdminResponsesTest, ErrorJsonMatchesGoldenResponse) {
     EXPECT_EQ(
       kwaque::admin::error_json("bad\"code", "line\nbreak", "req-7"),
       R"({"code":"bad\"code","message":"line\nbreak","correlation_id":"req-7"})");
+}
+
+TEST(AdminResponsesTest, ErrorJsonBoundsAndEscapesNonAsciiInput) {
+    std::string message(kwaque::admin::max_json_message_bytes + 20, 'm');
+    message[0] = static_cast<char>(0x80);
+    const std::string response = kwaque::admin::error_json(
+      "oversized", message, std::string(200, 'c'));
+
+    EXPECT_NE(response.find("\\u0080"), std::string::npos);
+    EXPECT_NE(response.find("<truncated>"), std::string::npos);
+    EXPECT_EQ(response.find(static_cast<char>(0x80)), std::string::npos);
 }
 
 TEST(AdminResponsesTest, HealthResponsesReflectLifecycleState) {

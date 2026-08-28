@@ -8,7 +8,11 @@ kwaque_cc_library(
     name = "service_lifecycle",
     srcs = ["service_lifecycle.cc"],
     hdrs = ["service_lifecycle.h"],
-    deps = ["@seastar"],
+    deps = [
+        "//src/base:invariant",
+        "//src/runtime:shard_affinity",
+        "@seastar",
+    ],
 )
 
 kwaque_cc_library(

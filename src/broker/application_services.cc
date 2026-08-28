@@ -9,7 +9,22 @@
 
 namespace kwaque::broker::detail {
 
+void application_state::capture_or_assert_owner() {
+    if (!owner_) {
+        owner_.emplace();
+    }
+    owner_->assert_current();
+}
+
+void application_state::assert_owner() const {
+    if (!owner_) {
+        throw std::logic_error("application reactor owner is not captured");
+    }
+    owner_->assert_current();
+}
+
 void application_state::construct_services(bool install_signal_handlers) {
+    capture_or_assert_owner();
     if (services_constructed()) {
         throw std::logic_error("application services are already constructed");
     }
@@ -24,13 +39,15 @@ void application_state::construct_services(bool install_signal_handlers) {
 }
 
 seastar::future<> application_state::request_service_abort() {
-    if (!runtime_service_ || !runtime_started_) {
+    assert_owner();
+    if (!runtime_service_) {
         co_return;
     }
     co_await runtime_service_->request_abort();
 }
 
 seastar::future<> application_state::shutdown() {
+    assert_owner();
     std::exception_ptr failure;
     if (lifecycle_) {
         try {
@@ -40,7 +57,6 @@ seastar::future<> application_state::shutdown() {
         }
     }
 
-    runtime_started_ = false;
     runtime_service_.reset();
     pid_file_.reset();
     admin_server_.reset();
@@ -57,8 +73,11 @@ bool application_state::services_constructed() const noexcept {
            && admin_server_ != nullptr && runtime_service_ != nullptr;
 }
 
-bool application_state::runtime_started() const noexcept {
-    return runtime_started_;
+bool application_state::runtime_started() const {
+    assert_owner();
+    return runtime_service_ != nullptr
+           && runtime_service_->state()
+                == runtime::sharded_service_state::started;
 }
 
 const service_lifecycle* application_state::lifecycle() const noexcept {

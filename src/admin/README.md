@@ -9,4 +9,6 @@ The loopback-friendly administrative HTTP service exposes:
 
 Readiness is cleared before shutdown stops accepting administrative
 connections. Error responses use a stable JSON envelope containing `code`,
-`message`, and `correlation_id` fields.
+`message`, and `correlation_id` fields. Lifecycle state, request counters, route
+handlers, and metric ownership are shard-local; process-level metrics use native
+metric aggregation rather than shared cross-core counters.

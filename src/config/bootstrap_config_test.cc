@@ -20,6 +20,7 @@ using kwaque::config::load_bootstrap_config;
 using kwaque::config::log_level;
 using kwaque::config::parse_bootstrap_config;
 using kwaque::config::render_config;
+using kwaque::config::render_config_error;
 
 std::filesystem::path example_config_path() {
     const char* test_srcdir = std::getenv("TEST_SRCDIR");
@@ -72,6 +73,8 @@ TEST(BootstrapConfigTest, RejectsInvalidConfiguration) {
        config_errc::invalid_type},
       {"kwaque: {schema_version: 1, admin: {address: false}}",
        config_errc::invalid_type},
+      {"kwaque: {schema_version: 1, admin: {address: not-an-address}}",
+       config_errc::invalid_admin_address},
       {"kwaque: {schema_version: 1, admin: {address: \"bad\\naddress\"}}",
        config_errc::invalid_admin_address},
       {"kwaque: {schema_version: 1, admin: {port: 0}}",
@@ -110,14 +113,14 @@ kwaque:
   schema_version: 1
   data_directory: "123"
   admin:
-    address: 'true'
+    address: '127.0.0.2'
   log_level: !!str info
 )yaml");
 
     ASSERT_TRUE(configuration.has_value())
       << (configuration ? "" : configuration.error().message);
     EXPECT_EQ(configuration->data_directory, "123");
-    EXPECT_EQ(configuration->admin_address, "true");
+    EXPECT_EQ(configuration->admin_address, "127.0.0.2");
     EXPECT_EQ(configuration->level, log_level::info);
 }
 
@@ -132,6 +135,15 @@ TEST(BootstrapConfigTest, RejectsUnsupportedFutureSchemaVersion) {
     EXPECT_EQ(
       configuration.error().message,
       "unsupported configuration schema version 2; supported version is 1");
+}
+
+TEST(BootstrapConfigTest, RejectsInputAboveTheProductionLimit) {
+    const std::string oversized(
+      kwaque::config::max_bootstrap_config_bytes + 1, 'x');
+    const auto configuration = parse_bootstrap_config(oversized);
+
+    ASSERT_FALSE(configuration.has_value());
+    EXPECT_EQ(configuration.error().code, config_errc::input_too_large);
 }
 
 TEST(BootstrapConfigTest, ReportsUnavailableConfigurationFile) {
@@ -177,6 +189,24 @@ TEST(BootstrapConfigTest, EscapesSafeValuesForSingleLineLogs) {
     EXPECT_EQ(
       render_config(values),
       "path=first\\nsecond\\r\\t\\\\\\x00\\x07\\x1b\\x1f\\x7f");
+}
+
+TEST(BootstrapConfigTest, BoundsAndEscapesErrorRendering) {
+    std::string field(160, 'f');
+    std::string message{"first\nsecond"};
+    message.push_back(static_cast<char>(0x80));
+    message.append(300, 'm');
+    const std::string rendered = render_config_error(
+      kwaque::config::config_error{
+        .code = config_errc::malformed_yaml,
+        .field = std::move(field),
+        .message = std::move(message),
+      });
+
+    EXPECT_EQ(rendered.find('\n'), std::string::npos);
+    EXPECT_NE(rendered.find("\\n"), std::string::npos);
+    EXPECT_NE(rendered.find("\\x80"), std::string::npos);
+    EXPECT_NE(rendered.find("<truncated>"), std::string::npos);
 }
 
 } // namespace
