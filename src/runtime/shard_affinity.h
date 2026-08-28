@@ -15,13 +15,25 @@ public:
     owner_shard() noexcept;
 
     [[nodiscard]] seastar::shard_id value() const noexcept { return shard_; }
-    [[nodiscard]] bool is_current() const noexcept;
+    [[nodiscard]] bool is_current() const noexcept {
+        return shard_ == seastar::this_shard_id();
+    }
     void assert_current(
-      std::source_location location = std::source_location::current()) const;
+      std::source_location location = std::source_location::current()) const {
+        const auto current = seastar::this_shard_id();
+        if (current != shard_) [[unlikely]] {
+            fail_wrong_shard(shard_, current, location);
+        }
+    }
 
     bool operator==(const owner_shard&) const = default;
 
 private:
+    [[noreturn]] static void fail_wrong_shard(
+      seastar::shard_id expected,
+      seastar::shard_id current,
+      std::source_location location);
+
     seastar::shard_id shard_;
 };
 

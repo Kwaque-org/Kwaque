@@ -1,13 +1,11 @@
 #include "src/resource/resource_manager.h"
 
-#include "src/base/error.h"
-
 #include <seastar/core/coroutine.hh>
 #include <seastar/core/metrics.hh>
 #include <seastar/core/sstring.hh>
 
+#include <cstdint>
 #include <exception>
-#include <limits>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -20,6 +18,38 @@ namespace {
 thread_local resource_manager* active_manager = nullptr;
 
 } // namespace
+
+workload_handle::workload_handle(
+  resource_manager& manager,
+  seastar::semaphore& memory,
+  seastar::scheduling_group scheduling_group,
+  seastar::smp_service_group smp_service_group,
+  seastar::gate::holder lifetime) noexcept
+  : manager_(&manager)
+  , memory_(&memory)
+  , scheduling_group_(scheduling_group)
+  , smp_service_group_(smp_service_group)
+  , lifetime_(std::move(lifetime)) {}
+
+workload_handle::workload_handle(workload_handle&& other) noexcept
+  : owner_(other.owner_)
+  , manager_(std::exchange(other.manager_, nullptr))
+  , memory_(std::exchange(other.memory_, nullptr))
+  , scheduling_group_(other.scheduling_group_)
+  , smp_service_group_(other.smp_service_group_)
+  , lifetime_(std::move(other.lifetime_)) {}
+
+workload_handle::~workload_handle() { owner_.assert_current(); }
+
+seastar::scheduling_group workload_handle::scheduling_group() const {
+    assert_live();
+    return scheduling_group_;
+}
+
+seastar::smp_service_group workload_handle::smp_service_group() const {
+    assert_live();
+    return smp_service_group_;
+}
 
 resource_manager::resource_manager(resource_handle_set handles) noexcept
   : handles_(std::move(handles)) {}
@@ -36,28 +66,11 @@ resource_manager::~resource_manager() {
       "resource manager destroyed with a registry lease");
 }
 
-void resource_manager::increment(std::uint64_t& value) {
-    KWAQUE_INVARIANT(
-      invariant_id{"KQ-RESOURCE-COUNTER-OVERFLOW"},
-      value != std::numeric_limits<std::uint64_t>::max(),
-      "resource counter overflow");
-    ++value;
-}
-
-std::size_t resource_manager::checked_index(workload_class classification) {
-    const auto index = workload_index(classification);
-    if (index >= workload_class_count) {
-        throw std::out_of_range("unknown workload class");
-    }
-    return index;
-}
-
 void resource_manager::register_metrics() {
     namespace metrics = seastar::metrics;
     std::vector<metrics::metric_definition> definitions;
-    definitions.reserve(workload_class_count * 7);
+    definitions.reserve(workload_class_count);
     for (const auto classification : all_workload_classes) {
-        const auto index = workload_index(classification);
         const auto value = seastar::sstring{
           std::string{descriptor_for(classification).metric_name}};
         std::vector<metrics::label_instance> labels{
@@ -65,53 +78,19 @@ void resource_manager::register_metrics() {
 
         definitions.emplace_back(
           metrics::make_gauge(
-            "queued",
-            [this, index] { return counters_[index].queued; },
-            metrics::description("Accepted workload operations waiting to run"),
+            "memory_bytes_reserved",
+            [this, classification] {
+                return memory_used(classification).value();
+            },
+            metrics::description("Bytes reserved against the class budget"),
             labels));
-        definitions.emplace_back(
-          metrics::make_gauge(
-            "executing",
-            [this, index] { return counters_[index].executing; },
-            metrics::description("Workload operations currently executing"),
-            labels));
-        definitions.emplace_back(
-          metrics::make_counter(
-            "rejected_total",
-            [this, index] { return counters_[index].rejected; },
-            metrics::description("Rejected workload operations"),
-            labels));
-        definitions.emplace_back(
-          metrics::make_counter(
-            "completed_total",
-            [this, index] { return counters_[index].completed; },
-            metrics::description("Successfully completed workload operations"),
-            labels));
-        definitions.emplace_back(
-          metrics::make_counter(
-            "failed_total",
-            [this, index] { return counters_[index].failed; },
-            metrics::description("Failed workload operations"),
-            labels));
-        definitions.emplace_back(
-          metrics::make_gauge(
-            "bytes_reserved",
-            [this, index] { return counters_[index].bytes_reserved; },
-            metrics::description("Bytes reserved against the workload budget"),
-            labels));
-        definitions.emplace_back(
-          metrics::make_counter(
-            "reclaim_attempts_total",
-            [this, index] { return counters_[index].reclaim_attempts; },
-            metrics::description("Workload memory reclaim attempts"),
-            std::move(labels)));
     }
     metrics_.add_group("resource_manager", definitions);
 }
 
 void resource_manager::rollback_start() {
-    initialized_.fill(false);
-    for (auto& admission : smp_admission_) {
+    metrics_.clear();
+    for (auto& admission : memory_admissions_) {
         admission.reset();
     }
     if (registry_lease_acquired_) {
@@ -120,7 +99,6 @@ void resource_manager::rollback_start() {
     }
     active_manager = nullptr;
     state_ = resource_manager_state::stopped;
-    metrics_.clear();
 }
 
 seastar::future<> resource_manager::start() {
@@ -147,9 +125,12 @@ seastar::future<> resource_manager::start() {
                 throw std::runtime_error(
                   "injected resource manager start failure");
             }
-            smp_admission_[index].emplace(
-              descriptor_for(classification).max_nonlocal_requests);
-            initialized_[index] = true;
+            const auto capacity = handles_.config().budget(classification);
+            if (capacity.value() > seastar::semaphore::max_counter()) {
+                throw std::invalid_argument(
+                  "workload memory budget exceeds semaphore capacity");
+            }
+            memory_admissions_[index].emplace(capacity.value());
         }
         register_metrics();
         state_ = resource_manager_state::started;
@@ -166,9 +147,8 @@ seastar::future<> resource_manager::start() {
 
 void resource_manager::request_abort() {
     assert_current();
-    if (!abort_source_.abort_requested()) {
-        abort_source_.request_abort();
-    }
+    // The manager owns no asynchronous operations. Components abort and drain
+    // their bounded queues before releasing the leases drained by stop().
 }
 
 seastar::future<> resource_manager::stop_once() {
@@ -188,30 +168,19 @@ seastar::future<> resource_manager::stop_once() {
             failure = std::current_exception();
         }
     }
-    initialized_.fill(false);
     active_manager = nullptr;
     for (const auto classification : all_workload_classes) {
         const auto index = workload_index(classification);
-        if (!smp_admission_[index]) {
+        if (!memory_admissions_[index]) {
             continue;
         }
+        const auto capacity = handles_.config().budget(classification);
         KWAQUE_INVARIANT(
-          invariant_id{"KQ-RESOURCE-SMP-ADMISSION-DRAINED"},
-          smp_admission_[index]->waiters() == 0
-            && smp_admission_[index]->current()
-                 == descriptor_for(classification).max_nonlocal_requests,
-          "resource manager stopped with outstanding SMP admission");
-        smp_admission_[index].reset();
-    }
-    for (const auto& counters : counters_) {
-        KWAQUE_INVARIANT(
-          invariant_id{"KQ-RESOURCE-WORK-DRAINED"},
-          counters.queued == 0 && counters.executing == 0,
-          "resource manager stopped with active workload operations");
-        KWAQUE_INVARIANT(
-          invariant_id{"KQ-RESOURCE-BYTES-RELEASED"},
-          counters.bytes_reserved == 0,
-          "resource manager stopped with reserved bytes");
+          invariant_id{"KQ-RESOURCE-MEMORY-DRAINED"},
+          memory_admissions_[index]->waiters() == 0
+            && memory_admissions_[index]->current() == capacity.value(),
+          "resource manager stopped with outstanding memory admission");
+        memory_admissions_[index].reset();
     }
     if (registry_lease_acquired_) {
         handles_.release_manager_lease();
@@ -277,59 +246,48 @@ byte_count resource_manager::hard_budget(workload_class classification) const {
     return handles_.config().budget(classification);
 }
 
-seastar::scheduling_group
-resource_manager::scheduling_group(workload_class classification) const {
-    assert_ready();
-    return handles_.scheduling_group(classification);
-}
-
-unsigned
-resource_manager::smp_admission_limit(workload_class classification) const {
-    assert_ready();
-    return descriptor_for(classification).max_nonlocal_requests;
-}
-
-workload_counters
-resource_manager::counters(workload_class classification) const {
-    assert_ready();
-    return counters_[checked_index(classification)];
-}
-
-seastar::abort_source& resource_manager::abort_source() {
-    assert_ready();
-    return abort_source_;
-}
-
-result<void> resource_manager::reserve_bytes(
-  workload_class classification, byte_count bytes) {
-    assert_ready();
-    const auto index = checked_index(classification);
-    const byte_count current{counters_[index].bytes_reserved};
-    const auto next = current.checked_add(bytes);
-    if (!next || *next > handles_.config().budget(classification)) {
-        increment(counters_[index].rejected);
-        return failure(errc::resource_exhausted);
-    }
-    counters_[index].bytes_reserved = next->value();
-    return {};
-}
-
-void resource_manager::release_bytes(
-  workload_class classification, byte_count bytes) {
-    assert_ready();
-    const auto index = checked_index(classification);
-    const byte_count current{counters_[index].bytes_reserved};
-    const auto remaining = current.checked_sub(bytes);
+byte_count resource_manager::memory_used(workload_class classification) const {
+    const auto available = memory_available(classification);
+    const auto used
+      = handles_.config().budget(classification).checked_sub(available);
     KWAQUE_INVARIANT(
-      invariant_id{"KQ-RESOURCE-RESERVATION-UNDERFLOW"},
-      remaining.has_value(),
-      "released more bytes than the workload reserved");
-    counters_[index].bytes_reserved = remaining->value();
+      invariant_id{"KQ-RESOURCE-MEMORY-USED"},
+      used.has_value(),
+      "workload memory admission exceeded its capacity");
+    return *used;
 }
 
-void resource_manager::record_reclaim_attempt(workload_class classification) {
+byte_count
+resource_manager::memory_available(workload_class classification) const {
     assert_ready();
-    increment(counters_[checked_index(classification)].reclaim_attempts);
+    const auto index = checked_index(classification);
+    KWAQUE_INVARIANT(
+      invariant_id{"KQ-RESOURCE-MEMORY-READY"},
+      memory_admissions_[index].has_value(),
+      "started manager has no class memory admission");
+    KWAQUE_INVARIANT(
+      invariant_id{"KQ-RESOURCE-MEMORY-AVAILABLE"},
+      memory_admissions_[index]->current() >= 0,
+      "workload memory admission counter became negative");
+    return byte_count{
+      static_cast<std::uint64_t>(memory_admissions_[index]->current())};
+}
+
+workload_handle
+resource_manager::acquire_workload(workload_class classification) {
+    assert_ready();
+    const auto index = checked_index(classification);
+    auto lifetime = work_.try_hold();
+    KWAQUE_INVARIANT(
+      invariant_id{"KQ-WORKLOAD-HANDLE-ADMITTED"},
+      lifetime.has_value(),
+      "ready manager rejected a workload handle");
+    return workload_handle{
+      *this,
+      *memory_admissions_[index],
+      handles_.scheduling_groups_[index],
+      handles_.smp_service_groups_[index],
+      std::move(*lifetime)};
 }
 
 } // namespace kwaque::resource

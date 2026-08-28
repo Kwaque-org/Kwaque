@@ -77,8 +77,6 @@ public:
     // Empty at the end of input. Valid only while this parser is alive.
     [[nodiscard]] fragment_view peek_current_fragment() const noexcept;
 
-    [[nodiscard]] result<std::uint8_t> read_u8();
-
     // Fixed-width reads with an explicit byte order. No host-endian assumption
     // and no record-format policy: these are the primitives a later codec
     // composes.

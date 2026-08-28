@@ -1,7 +1,5 @@
 #include "src/base/invariant_test_observer.h"
 #include "src/base/units.h"
-#include "src/resource/memory_budget.h"
-#include "src/resource/reclaimer_registry.h"
 #include "src/resource/resource_config.h"
 #include "src/resource/resource_manager.h"
 #include "src/resource/resource_registry.h"
@@ -16,6 +14,7 @@
 #include <array>
 #include <cstdint>
 #include <exception>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -51,54 +50,27 @@ SEASTAR_TEST_CASE(resource_manager_rejects_foreign_shard_access) {
     co_await registry.start(local_memory_config());
     resource_manager manager{registry.handles()};
     co_await manager.start();
+    std::optional<workload_handle> workload{
+      manager.acquire_workload(workload_class::metadata)};
 
     resource_manager* manager_address = &manager;
-    const bool observed = co_await seastar::smp::submit_to(
-      1, [manager_address] {
+    workload_handle* workload_address = &*workload;
+    const auto observed = co_await seastar::smp::submit_to(
+      1, [manager_address, workload_address] {
+          std::array<bool, 2> failures{};
           observed_diagnostic.clear();
           testing::scoped_invariant_observer observer{observe_and_throw};
           try {
               static_cast<void>(manager_address->ready());
           } catch (const observed_invariant&) {
-              return observed_diagnostic.find("id=KQ-WRONG-SHARD-ACCESS")
-                       != std::string::npos
-                     && observed_diagnostic.find("expected=0 current=1")
-                          != std::string::npos;
-          }
-          return false;
-      });
-
-    BOOST_CHECK(observed);
-    co_await manager.stop();
-    co_await registry.stop();
-}
-
-SEASTAR_TEST_CASE(memory_resources_reject_foreign_shard_access) {
-    BOOST_REQUIRE_GE(seastar::this_smp_shard_count(), 2U);
-    memory_budget budget{memory_budget_config{
-      .capacity = byte_count{100},
-      .soft_watermark = byte_count{50},
-      .high_watermark = byte_count{80},
-      .max_waiters = 1,
-    }};
-    reclaimer_registry reclaimers{1};
-    reclaimers.start();
-
-    auto* budget_address = &budget;
-    auto* registry_address = &reclaimers;
-    const auto observed = co_await seastar::smp::submit_to(
-      1, [budget_address, registry_address] {
-          std::array<bool, 2> failures{};
-          testing::scoped_invariant_observer observer{observe_and_throw};
-          try {
-              static_cast<void>(budget_address->capacity());
-          } catch (const observed_invariant&) {
               failures[0] = observed_diagnostic.find("id=KQ-WRONG-SHARD-ACCESS")
-                            != std::string::npos;
+                              != std::string::npos
+                            && observed_diagnostic.find("expected=0 current=1")
+                                 != std::string::npos;
           }
+          observed_diagnostic.clear();
           try {
-              static_cast<void>(
-                registry_address->request_reclaim(byte_count{1}));
+              static_cast<void>(workload_address->memory_admission());
           } catch (const observed_invariant&) {
               failures[1] = observed_diagnostic.find("id=KQ-WRONG-SHARD-ACCESS")
                             != std::string::npos;
@@ -108,7 +80,9 @@ SEASTAR_TEST_CASE(memory_resources_reject_foreign_shard_access) {
 
     BOOST_CHECK(observed[0]);
     BOOST_CHECK(observed[1]);
-    reclaimers.stop();
+    workload.reset();
+    co_await manager.stop();
+    co_await registry.stop();
 }
 
 } // namespace kwaque::resource

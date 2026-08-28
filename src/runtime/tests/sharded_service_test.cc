@@ -257,6 +257,14 @@ SEASTAR_TEST_CASE(sharded_service_enforces_state_and_returns_owned_identities) {
     const auto owner = co_await services.invoke_on_owner(
       owners.back(), [](startup_probe& service) { return service.owner(); });
     BOOST_CHECK(owner == owners.back());
+    const auto typed_owner = co_await services.invoke_on_owner(
+      owners.back(),
+      [](startup_probe& service)
+        -> kwaque::runtime::result<kwaque::runtime::owner_shard> {
+          return service.owner();
+      });
+    BOOST_REQUIRE(typed_owner.has_value());
+    BOOST_CHECK(*typed_owner == owners.back());
 
     bool rejected = false;
     try {

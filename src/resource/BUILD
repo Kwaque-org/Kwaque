@@ -49,37 +49,6 @@ kwaque_cc_library(
         ":resource_registry",
         ":workload_class",
         "//src/base",
-        "//src/base:error",
-        "//src/base:invariant",
-        "//src/runtime:error",
-        "//src/runtime:shard_affinity",
-        "@seastar",
-    ],
-)
-
-kwaque_cc_library(
-    name = "memory_budget",
-    srcs = ["memory_budget.cc"],
-    hdrs = ["memory_budget.h"],
-    visibility = ["//visibility:public"],
-    deps = [
-        "//src/base",
-        "//src/base:error",
-        "//src/base:invariant",
-        "//src/runtime:error",
-        "//src/runtime:shard_affinity",
-        "@seastar",
-    ],
-)
-
-kwaque_cc_library(
-    name = "reclaimer_registry",
-    srcs = ["reclaimer_registry.cc"],
-    hdrs = ["reclaimer_registry.h"],
-    visibility = ["//visibility:public"],
-    deps = [
-        "//src/base",
-        "//src/base:error",
         "//src/base:invariant",
         "//src/runtime:shard_affinity",
         "@seastar",
@@ -91,7 +60,6 @@ kwaque_cc_library(
     hdrs = ["bounded_work_queue.h"],
     visibility = ["//visibility:public"],
     deps = [
-        ":memory_budget",
         ":resource_manager",
         ":workload_class",
         "//src/base",
@@ -131,31 +99,7 @@ kwaque_cc_library(
         ":resource_config",
         ":workload_class",
         "//src/base",
-        "//src/base:error",
         "//src/base:invariant_test_support",
-        "//src/runtime:error",
-        "//src/runtime:shard_affinity_test_support",
-        "@seastar",
-    ],
-)
-
-kwaque_cc_library(
-    name = "memory_affinity_test_support",
-    testonly = True,
-    srcs = [
-        "memory_budget.cc",
-        "reclaimer_registry.cc",
-    ],
-    hdrs = [
-        "memory_budget.h",
-        "reclaimer_registry.h",
-    ],
-    visibility = ["//src/resource/tests:__pkg__"],
-    deps = [
-        "//src/base",
-        "//src/base:error",
-        "//src/base:invariant_test_support",
-        "//src/runtime:error",
         "//src/runtime:shard_affinity_test_support",
         "@seastar",
     ],

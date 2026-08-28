@@ -10,13 +10,21 @@ namespace kwaque::resource {
 
 class resource_config final {
 public:
-    // The input is one reactor shard's memory, not process-wide aggregate
-    // memory. The returned budgets and headroom account for that same shard.
+    // The input is the memory already available to one reactor shard's
+    // allocator, not process-wide memory. Headroom is retained inside that
+    // amount for work not charged to a workload class; the overload lets
+    // bootstrap supply an exact reservation when those consumers are known.
     [[nodiscard]] static result<resource_config>
     from_total_memory(byte_count total_memory) noexcept;
+    [[nodiscard]] static result<resource_config> from_total_memory(
+      byte_count total_memory, byte_count reactor_headroom) noexcept;
 
     [[nodiscard]] static constexpr byte_count minimum_total_memory() noexcept {
         return byte_count{64ULL * 1024ULL * 1024ULL};
+    }
+    [[nodiscard]] static constexpr byte_count
+    default_reactor_headroom() noexcept {
+        return byte_count{16ULL * 1024ULL * 1024ULL};
     }
 
     [[nodiscard]] byte_count total_memory() const noexcept {

@@ -66,7 +66,10 @@ public:
     [[nodiscard]] seastar::future<> close();
 
     [[nodiscard]] bool abort_requested() const;
-    [[nodiscard]] bool closed() const;
+    // True once new task admission has closed. Existing accepted tasks may
+    // still be draining; the future returned by close() is the completion
+    // signal.
+    [[nodiscard]] bool admission_closed() const;
     [[nodiscard]] std::size_t task_count() const;
     [[nodiscard]] seastar::abort_source& abort_source();
 

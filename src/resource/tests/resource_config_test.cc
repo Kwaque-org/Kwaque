@@ -28,6 +28,22 @@ void expect_fully_accounted(std::uint64_t total) {
     EXPECT_EQ(accounted.value(), total);
 }
 
+void expect_fully_accounted(std::uint64_t total, std::uint64_t headroom) {
+    const auto config = resource_config::from_total_memory(
+      byte_count{total}, byte_count{headroom});
+    ASSERT_TRUE(config.has_value());
+    EXPECT_EQ(config->reactor_headroom(), byte_count{headroom});
+
+    auto accounted = config->reactor_headroom();
+    for (const auto classification : all_workload_classes) {
+        const auto next = accounted.checked_add(config->budget(classification));
+        ASSERT_TRUE(next.has_value());
+        accounted = *next;
+        EXPECT_GT(config->budget(classification).value(), 0U);
+    }
+    EXPECT_EQ(accounted.value(), total);
+}
+
 static_assert(!std::convertible_to<std::uint64_t, byte_count>);
 static_assert(!std::convertible_to<byte_count, std::uint64_t>);
 
@@ -40,6 +56,22 @@ TEST(resource_config_test, rejects_memory_below_the_viable_minimum) {
     ASSERT_FALSE(rejected.has_value());
     EXPECT_EQ(rejected.error(), make_error_code(errc::resource_exhausted));
     expect_fully_accounted(minimum);
+    EXPECT_EQ(
+      resource_config::from_total_memory(byte_count{minimum})
+        ->reactor_headroom(),
+      resource_config::default_reactor_headroom());
+    EXPECT_FALSE(
+      resource_config::from_total_memory(byte_count{minimum}, byte_count{})
+        .has_value());
+    EXPECT_FALSE(
+      resource_config::from_total_memory(
+        byte_count{minimum}, byte_count{minimum})
+        .has_value());
+    EXPECT_FALSE(
+      resource_config::from_total_memory(
+        byte_count{minimum}, byte_count{minimum - 14})
+        .has_value());
+    expect_fully_accounted(minimum, 8ULL * 1024ULL * 1024ULL);
 }
 
 TEST(resource_config_test, checked_partition_never_exceeds_supplied_memory) {

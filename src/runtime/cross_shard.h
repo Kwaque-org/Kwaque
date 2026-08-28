@@ -32,8 +32,10 @@ public:
     [[nodiscard]] static result<cross_shard_bytes>
     copy(std::span<const std::byte> source);
 
-    cross_shard_bytes(const cross_shard_bytes&) = default;
-    cross_shard_bytes& operator=(const cross_shard_bytes&) = default;
+    // Byte transfer is point-to-point. Keeping it move-only prevents an
+    // invoke-on-all call from multiplying the maximum payload by shard count.
+    cross_shard_bytes(const cross_shard_bytes&) = delete;
+    cross_shard_bytes& operator=(const cross_shard_bytes&) = delete;
     cross_shard_bytes(cross_shard_bytes&&) noexcept = default;
     cross_shard_bytes& operator=(cross_shard_bytes&&) noexcept = default;
 
@@ -60,6 +62,9 @@ struct enable_cross_shard_value<owner_shard> : std::true_type {};
 
 template<>
 struct enable_cross_shard_value<cross_shard_bytes> : std::true_type {};
+
+template<>
+struct enable_cross_shard_value<operation_error> : std::true_type {};
 
 namespace detail {
 
@@ -109,17 +114,49 @@ inline constexpr bool is_pointer_form = std::is_pointer_v<T>
                                         || is_seastar_pointer<T>::value;
 
 template<typename T>
+struct is_cross_shard_value_impl;
+
+template<typename T>
+struct cross_shard_value_policy : enable_cross_shard_value<T> {};
+
+template<typename T>
+struct result_payload_policy : is_cross_shard_value_impl<T> {};
+
+template<>
+struct result_payload_policy<void> : std::true_type {};
+
+template<typename T>
+struct cross_shard_value_policy<std::expected<T, operation_error>>
+  : result_payload_policy<T> {};
+
+template<typename T>
+struct is_cross_shard_value_impl
+  : std::bool_constant<
+      !std::is_reference_v<T> && !is_pointer_form<std::remove_cv_t<T>>
+      && !is_nonowning_form<std::remove_cv_t<T>>::value
+      && cross_shard_value_policy<std::remove_cv_t<T>>::value
+      && std::is_nothrow_move_constructible_v<std::remove_cv_t<T>>> {};
+
+template<typename T>
 inline constexpr bool is_cross_shard_value
-  = !std::is_reference_v<T> && !is_pointer_form<std::remove_cv_t<T>>
-    && !is_nonowning_form<std::remove_cv_t<T>>::value
-    && enable_cross_shard_value<std::remove_cv_t<T>>::value
-    && std::is_nothrow_move_constructible_v<std::remove_cv_t<T>>;
+  = is_cross_shard_value_impl<T>::value;
 
 template<typename Func>
 inline constexpr bool is_cross_shard_callable
   = (std::is_pointer_v<std::decay_t<Func>>
      && std::is_function_v<std::remove_pointer_t<std::decay_t<Func>>>)
     || (std::is_empty_v<std::decay_t<Func>> && std::is_trivially_copyable_v<std::decay_t<Func>>);
+
+template<typename Func>
+struct function_pointer_takes_owned_arguments : std::false_type {};
+
+template<typename Result, typename... Args>
+struct function_pointer_takes_owned_arguments<Result (*)(Args...)>
+  : std::bool_constant<(!std::is_reference_v<Args> && ...)> {};
+
+template<typename Result, typename... Args>
+struct function_pointer_takes_owned_arguments<Result (*)(Args...) noexcept>
+  : std::bool_constant<(!std::is_reference_v<Args> && ...)> {};
 
 template<typename Future>
 struct future_result;
@@ -160,8 +197,14 @@ seastar::future<Result> invoke_on_shard(
        arguments = std::tuple<Args...>{std::move(args)...}]() mutable {
           return std::apply(
             [&function](Args&... values) {
-                return invoke_owned<Result>(
-                  std::move(function), std::move(values)...);
+                if constexpr (
+                  function_pointer_takes_owned_arguments<
+                    std::decay_t<Func>>::value) {
+                    return std::invoke(function, std::move(values)...);
+                } else {
+                    return invoke_owned<Result>(
+                      std::move(function), std::move(values)...);
+                }
             },
             arguments);
       });
@@ -178,6 +221,9 @@ concept cross_shard_invocation = detail::is_cross_shard_callable<Func>
                                  && std::invocable<Func&, Args...>
                                  && detail::cross_shard_result_value<
                                    detail::cross_shard_result<Func, Args...>>;
+
+template<typename Func, typename... Args>
+using cross_shard_result_t = detail::cross_shard_result<Func, Args...>;
 
 // The callable cannot carry mutable shard-local captures. Pass all state as
 // explicitly opted-in value arguments and keep the supplied service group alive

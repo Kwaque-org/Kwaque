@@ -71,7 +71,7 @@ bool task_scope::abort_requested() const {
     return abort_source_.abort_requested();
 }
 
-bool task_scope::closed() const {
+bool task_scope::admission_closed() const {
     assert_current();
     return gate_.is_closed();
 }

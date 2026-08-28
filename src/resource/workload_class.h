@@ -3,7 +3,6 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
-#include <optional>
 #include <span>
 #include <string_view>
 
@@ -11,6 +10,7 @@ namespace kwaque::resource {
 
 enum class workload_class : std::uint8_t {
     foreground_protocol,
+    consensus_critical,
     replication,
     metadata,
     repair,
@@ -19,10 +19,11 @@ enum class workload_class : std::uint8_t {
     maintenance,
 };
 
-inline constexpr std::size_t workload_class_count = 7;
+inline constexpr std::size_t workload_class_count = 8;
 inline constexpr std::array<workload_class, workload_class_count>
   all_workload_classes{
     workload_class::foreground_protocol,
+    workload_class::consensus_critical,
     workload_class::replication,
     workload_class::metadata,
     workload_class::repair,
@@ -36,7 +37,6 @@ struct workload_descriptor final {
     std::string_view metric_name;
     std::uint32_t scheduling_shares;
     unsigned max_nonlocal_requests;
-    std::optional<std::uint64_t> io_bandwidth_bytes_per_second;
     std::uint32_t memory_weight;
 
     bool operator==(const workload_descriptor&) const = default;

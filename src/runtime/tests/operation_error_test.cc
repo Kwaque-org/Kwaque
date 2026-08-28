@@ -4,7 +4,6 @@
 
 #include <cstdint>
 #include <string>
-#include <string_view>
 #include <type_traits>
 
 namespace {
@@ -14,19 +13,11 @@ using kwaque::runtime::operation_context_key;
 using kwaque::runtime::operation_error;
 using kwaque::runtime::operation_kind;
 
-class unsafe_category final : public std::error_category {
-public:
-    [[nodiscard]] const char* name() const noexcept final {
-        return "unsafe/category\nname";
-    }
-
-    [[nodiscard]] std::string message(int) const final { return "unused"; }
-};
-
 static_assert(!std::is_convertible_v<kwaque::errc, operation_error>);
-static_assert(!std::is_convertible_v<std::error_code, operation_error>);
 static_assert(std::is_nothrow_move_constructible_v<operation_error>);
 static_assert(std::is_nothrow_move_assignable_v<operation_error>);
+static_assert(std::is_trivially_copyable_v<operation_error>);
+static_assert(sizeof(operation_error) <= 64);
 static_assert(
   std::is_nothrow_move_constructible_v<kwaque::runtime::result<std::uint64_t>>);
 static_assert(!std::is_constructible_v<
@@ -45,10 +36,14 @@ TEST(OperationErrorTest, CarriesTypedBoundedNumericContext) {
 
     EXPECT_EQ(error.code(), kwaque::errc::io_failure);
     EXPECT_EQ(error.operation(), operation_kind::file);
-    ASSERT_EQ(error.context().size(), operation_error::max_context_fields);
+    ASSERT_EQ(error.context_size(), operation_error::max_context_fields);
     EXPECT_EQ(
-      error.context().front(),
+      error.context_at(0),
       (operation_context_field{operation_context_key::shard, 3}));
+
+    operation_error invalid_key{kwaque::errc::io_failure, operation_kind::file};
+    EXPECT_FALSE(
+      invalid_key.add_context(static_cast<operation_context_key>(255), 1));
 }
 
 TEST(OperationErrorTest, RendersOnlyBoundedAllowlistedFields) {
@@ -76,18 +71,6 @@ TEST(OperationErrorTest, RuntimeResultSeparatesExpectedFailureFromExceptions) {
     ASSERT_FALSE(failure.has_value());
     EXPECT_EQ(failure.error().code(), kwaque::errc::timed_out);
     EXPECT_EQ(failure.error().operation(), operation_kind::timer);
-}
-
-TEST(OperationErrorTest, SanitizesForeignCategoryNames) {
-    const unsafe_category category;
-    const operation_error error{
-      std::error_code{7, category}, operation_kind::generic};
-    const std::string rendered = error.render();
-
-    EXPECT_EQ(rendered, "operation=generic error=unsafe?category?name:7");
-    EXPECT_EQ(rendered.find('\n'), std::string::npos);
-    EXPECT_EQ(rendered.find('/'), std::string::npos);
-    EXPECT_LE(rendered.size(), operation_error::max_rendered_size);
 }
 
 } // namespace

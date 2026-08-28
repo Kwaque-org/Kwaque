@@ -14,11 +14,12 @@ static_assert(!std::convertible_to<unsigned, workload_class>);
 static_assert(!std::convertible_to<workload_class, unsigned>);
 
 TEST(workload_class_test, descriptors_are_exhaustive_unique_and_bounded) {
-    ASSERT_EQ(all_workload_classes.size(), 7U);
+    ASSERT_EQ(all_workload_classes.size(), 8U);
     ASSERT_EQ(workload_descriptors().size(), all_workload_classes.size());
 
     const std::array<std::string_view, workload_class_count> expected_names{
       "foreground_protocol",
+      "consensus_critical",
       "replication",
       "metadata",
       "repair",
@@ -38,7 +39,7 @@ TEST(workload_class_test, descriptors_are_exhaustive_unique_and_bounded) {
         EXPECT_EQ(to_string(classification), expected_names[index]);
         EXPECT_LE(descriptor.metric_name.size(), 32U);
         EXPECT_GT(descriptor.scheduling_shares, 0U);
-        EXPECT_LE(descriptor.scheduling_shares, 1000U);
+        EXPECT_LE(descriptor.scheduling_shares, 2000U);
         EXPECT_GT(descriptor.max_nonlocal_requests, 0U);
         EXPECT_GT(descriptor.memory_weight, 0U);
         EXPECT_TRUE(names.emplace(descriptor.metric_name).second);
@@ -52,6 +53,10 @@ TEST(workload_class_test, descriptors_are_exhaustive_unique_and_bounded) {
       = descriptor_for(workload_class::foreground_protocol).scheduling_shares;
     const auto replication
       = descriptor_for(workload_class::replication).scheduling_shares;
+    const auto consensus
+      = descriptor_for(workload_class::consensus_critical).scheduling_shares;
+    EXPECT_GT(consensus, foreground);
+    EXPECT_GT(consensus, replication);
     for (const auto background : {
            workload_class::repair,
            workload_class::compaction,

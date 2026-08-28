@@ -4,7 +4,10 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from tools.check_cross_shard_usage import scan_paths
+try:
+    from tools.check_cross_shard_usage import scan_paths
+except ModuleNotFoundError:
+    from check_cross_shard_usage import scan_paths
 
 
 class CrossShardUsageTest(unittest.TestCase):
@@ -108,6 +111,49 @@ class CrossShardUsageTest(unittest.TestCase):
                 "auto work = seastar::smp::submit_to(1, [] {});\n",
             )
             self.assertEqual(scan_paths(root, [Path("src")], allowed_rules={}), [])
+
+    def test_does_not_exempt_benchmarks(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.write(
+                root,
+                "src/resource/comparison_bench.cc",
+                "auto work = seastar::smp::submit_to(1, [] {});\n",
+            )
+            self.write(
+                root,
+                "src/component/unsafe_bench.cc",
+                "auto work = seastar::smp::submit_to(1, [] {});\n",
+            )
+            self.assertEqual(
+                scan_paths(root, [Path("src")]),
+                [
+                    "src/component/unsafe_bench.cc:1: direct cross-shard submission",
+                    "src/resource/comparison_bench.cc:1: direct cross-shard submission",
+                ],
+            )
+
+    def test_limits_each_file_allowance_to_the_declared_count(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.write(
+                root,
+                "src/runtime/owner.h",
+                "auto first = smp::submit_to(0, [] {});\n"
+                "auto second = smp::submit_to(1, [] {});\n",
+            )
+            self.assertEqual(
+                scan_paths(
+                    root,
+                    [Path("src")],
+                    allowed_rules={
+                        "src/runtime/owner.h": {
+                            "direct cross-shard submission": 1,
+                        },
+                    },
+                ),
+                ["src/runtime/owner.h:2: direct cross-shard submission"],
+            )
 
 
 if __name__ == "__main__":

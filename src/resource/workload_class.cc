@@ -16,23 +16,29 @@ constexpr std::array<workload_descriptor, workload_class_count> descriptors{
     .metric_name = "foreground_protocol",
     .scheduling_shares = 1000,
     .max_nonlocal_requests = 1024,
-    .io_bandwidth_bytes_per_second = std::nullopt,
-    .memory_weight = 30,
+    .memory_weight = 28,
+  },
+  workload_descriptor{
+    .classification = workload_class::consensus_critical,
+    .metric_name = "consensus_critical",
+    // Heartbeats, lease renewal, and fencing must progress while bulk
+    // replication or foreground work is continuously runnable.
+    .scheduling_shares = 1500,
+    .max_nonlocal_requests = 5000,
+    .memory_weight = 6,
   },
   workload_descriptor{
     .classification = workload_class::replication,
     .metric_name = "replication",
     .scheduling_shares = 1000,
     .max_nonlocal_requests = 1024,
-    .io_bandwidth_bytes_per_second = std::nullopt,
-    .memory_weight = 24,
+    .memory_weight = 22,
   },
   workload_descriptor{
     .classification = workload_class::metadata,
     .metric_name = "metadata",
     .scheduling_shares = 600,
     .max_nonlocal_requests = 512,
-    .io_bandwidth_bytes_per_second = std::nullopt,
     .memory_weight = 12,
   },
   workload_descriptor{
@@ -40,15 +46,13 @@ constexpr std::array<workload_descriptor, workload_class_count> descriptors{
     .metric_name = "repair",
     .scheduling_shares = 200,
     .max_nonlocal_requests = 128,
-    .io_bandwidth_bytes_per_second = 64ULL * 1024ULL * 1024ULL,
-    .memory_weight = 10,
+    .memory_weight = 9,
   },
   workload_descriptor{
     .classification = workload_class::compaction,
     .metric_name = "compaction",
     .scheduling_shares = 100,
     .max_nonlocal_requests = 64,
-    .io_bandwidth_bytes_per_second = 32ULL * 1024ULL * 1024ULL,
     .memory_weight = 10,
   },
   workload_descriptor{
@@ -56,7 +60,6 @@ constexpr std::array<workload_descriptor, workload_class_count> descriptors{
     .metric_name = "offload",
     .scheduling_shares = 150,
     .max_nonlocal_requests = 64,
-    .io_bandwidth_bytes_per_second = 64ULL * 1024ULL * 1024ULL,
     .memory_weight = 8,
   },
   workload_descriptor{
@@ -64,8 +67,7 @@ constexpr std::array<workload_descriptor, workload_class_count> descriptors{
     .metric_name = "maintenance",
     .scheduling_shares = 100,
     .max_nonlocal_requests = 32,
-    .io_bandwidth_bytes_per_second = 16ULL * 1024ULL * 1024ULL,
-    .memory_weight = 6,
+    .memory_weight = 5,
   },
 };
 
@@ -79,7 +81,7 @@ consteval bool descriptors_are_valid() {
           || descriptor.metric_name.empty()
           || descriptor.metric_name.size() > max_metric_name_size
           || descriptor.scheduling_shares == 0
-          || descriptor.scheduling_shares > 1000
+          || descriptor.scheduling_shares > 2000
           || descriptor.max_nonlocal_requests == 0
           || descriptor.memory_weight == 0) {
             return false;
@@ -101,10 +103,14 @@ consteval bool descriptors_are_valid() {
         }
     }
     return shares > 0 && memory_weights == 100
-           && descriptors[0].scheduling_shares
-                >= descriptors[3].scheduling_shares
            && descriptors[1].scheduling_shares
-                >= descriptors[3].scheduling_shares;
+                > descriptors[0].scheduling_shares
+           && descriptors[1].scheduling_shares
+                > descriptors[2].scheduling_shares
+           && descriptors[0].scheduling_shares
+                >= descriptors[4].scheduling_shares
+           && descriptors[2].scheduling_shares
+                >= descriptors[4].scheduling_shares;
 }
 
 static_assert(descriptors_are_valid());

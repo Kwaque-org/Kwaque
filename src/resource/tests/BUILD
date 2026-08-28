@@ -39,14 +39,14 @@ kwaque_cc_seastar_test(
 kwaque_cc_seastar_test(
     name = "resource_manager_test",
     srcs = ["resource_manager_test.cc"],
-    cpu = 2,
-    memory = "192MiB",
+    cpu = 4,
+    memory = "512MiB",
     deps = [
         "//src/base",
-        "//src/base:error",
         "//src/resource:resource_manager",
         "//src/resource:resource_registry",
         "//src/resource:workload_class",
+        "//src/runtime:cross_shard",
         "//src/runtime:sharded_service",
     ],
 )
@@ -59,21 +59,8 @@ kwaque_cc_seastar_test(
     deps = [
         "//src/base",
         "//src/base:invariant_test_support",
-        "//src/resource:memory_affinity_test_support",
         "//src/resource:resource_affinity_test_support",
         "//src/resource:resource_config",
-    ],
-)
-
-kwaque_cc_seastar_test(
-    name = "memory_budget_test",
-    srcs = ["memory_budget_test.cc"],
-    memory = "192MiB",
-    deps = [
-        "//src/base",
-        "//src/base:error",
-        "//src/resource:memory_budget",
-        "//src/resource:reclaimer_registry",
     ],
 )
 

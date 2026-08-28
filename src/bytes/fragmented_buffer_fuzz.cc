@@ -89,7 +89,7 @@ fragmented_buffer build(script& input, std::string& oracle) {
     for (std::size_t operation = 0;
          operation < max_operations && !input.exhausted();
          ++operation) {
-        const auto choice = input.byte() % 3;
+        const auto choice = input.byte() % 4;
         const auto length = input.bounded(48);
         if (choice == 0) {
             const auto payload = input.bytes(length);
@@ -103,14 +103,24 @@ fragmented_buffer build(script& input, std::string& oracle) {
                 std::memcpy(
                   fragment.get_write(), payload.data(), payload.size());
             }
-            if (builder.append_fragment(std::move(fragment))) {
+            if (builder.append_fragment_copy(fragment)) {
                 oracle.append(payload);
             }
-        } else {
+        } else if (choice == 2) {
             static_cast<void>(
               builder.reserve(byte_count{static_cast<std::uint64_t>(length)}));
+        } else {
+            const auto payload = input.bytes(length);
+            auto donated = fragmented_buffer::copy_of(
+              std::span<const char>{payload.data(), payload.size()});
+            if (builder.append_buffer(std::move(donated))) {
+                oracle.append(payload);
+            }
         }
         require(builder.size().value() == oracle.size());
+        require(
+          builder.retained_bytes().value()
+          <= config.max_retained_bytes.value());
         require(builder.fragment_count() <= config.max_fragments);
     }
 
@@ -118,6 +128,8 @@ fragmented_buffer build(script& input, std::string& oracle) {
     require(published.has_value());
     require(published->size().value() == oracle.size());
     require(published->fragment_count() <= max_buffer_fragments);
+    require(
+      published->retained_bytes().value() <= config.max_retained_bytes.value());
     return std::move(*published);
 }
 
@@ -158,13 +170,15 @@ void reshape(script& input, fragmented_buffer& buffer, std::string& oracle) {
             require(contents(*shared) == oracle.substr(offset, length));
             // The slice must stay correct after the source is reshaped.
             const auto expected = contents(*shared);
-            require(buffer.trim_front(byte_count{0}).has_value());
+            if (size != 0) {
+                require(buffer.trim_front(byte_count{1}).has_value());
+                oracle.erase(0, 1);
+            }
             require(contents(*shared) == expected);
         } else {
             auto shared = buffer.share();
-            require(shared.has_value());
-            require(contents(*shared) == oracle);
-            require(shared->size() == buffer.size());
+            require(contents(shared) == oracle);
+            require(shared.size() == buffer.size());
         }
         require(buffer.size().value() == oracle.size());
         require(contents(buffer) == oracle);
@@ -174,13 +188,31 @@ void reshape(script& input, fragmented_buffer& buffer, std::string& oracle) {
     }
 }
 
+void scatter(fragmented_buffer& buffer, const std::string& oracle) {
+    auto shared = buffer.share();
+    scatter_cursor cursor;
+    std::string reassembled;
+    while (true) {
+        auto batch = shared.export_scatter(3, byte_count{17}, cursor);
+        require(batch.has_value());
+        require(batch->vector_count() <= 3);
+        require(batch->bytes().value() <= 17);
+        for (const auto segment : *batch) {
+            reassembled.append(segment.data, segment.size);
+        }
+        if (batch->complete()) {
+            break;
+        }
+    }
+    require(reassembled == oracle);
+}
+
 // Reads the buffer back through the parser and compares every result with the
 // oracle, including failures at and past the end.
 void parse(
   script& input, fragmented_buffer& buffer, const std::string& oracle) {
     auto shared = buffer.share();
-    require(shared.has_value());
-    fragmented_buffer_parser parser{std::move(*shared)};
+    fragmented_buffer_parser parser{std::move(shared)};
     std::size_t consumed = 0;
 
     for (std::size_t operation = 0;
@@ -190,7 +222,7 @@ void parse(
         require(parser.bytes_remaining().value() == remaining);
         require(parser.bytes_consumed().value() == consumed);
 
-        const auto choice = input.byte() % 5;
+        const auto choice = input.byte() % 8;
         const auto request = input.bounded(remaining + 1);
         if (choice == 0) {
             const auto skipped = parser.skip(
@@ -234,13 +266,47 @@ void parse(
                   std::string(out.begin(), out.end())
                   == oracle.substr(consumed, request));
             }
-        } else {
+        } else if (choice == 4) {
             if (parser.push_checkpoint()) {
                 const auto before = parser.bytes_consumed();
                 static_cast<void>(
                   parser.skip(byte_count{static_cast<std::uint64_t>(request)}));
                 require(parser.rollback().has_value());
                 require(parser.bytes_consumed() == before);
+            }
+        } else if (choice == 5) {
+            if (parser.push_checkpoint()) {
+                const auto skipped = parser.skip(
+                  byte_count{static_cast<std::uint64_t>(request)});
+                require(parser.commit().has_value());
+                if (skipped) {
+                    consumed += request;
+                }
+            }
+        } else if (choice == 6) {
+            const auto before = parser.bytes_consumed();
+            const auto value = parser.read_be<std::uint16_t>();
+            if (remaining < sizeof(std::uint16_t)) {
+                require(!value.has_value());
+                require(parser.bytes_consumed() == before);
+            } else {
+                const auto expected = static_cast<std::uint16_t>(
+                  (static_cast<std::uint16_t>(
+                     static_cast<unsigned char>(oracle[consumed]))
+                   << 8U)
+                  | static_cast<std::uint16_t>(
+                    static_cast<unsigned char>(oracle[consumed + 1])));
+                require(value.has_value() && *value == expected);
+                consumed += sizeof(std::uint16_t);
+            }
+        } else {
+            auto peeked = parser.peek_buffer(
+              byte_count{static_cast<std::uint64_t>(request)});
+            if (request > remaining) {
+                require(!peeked.has_value());
+            } else {
+                require(peeked.has_value());
+                require(contents(*peeked) == oracle.substr(consumed, request));
             }
         }
 
@@ -263,13 +329,22 @@ LLVMFuzzerTestOneInput(const std::uint8_t* data, std::size_t size) {
         return 0;
     }
 
-    script input{data, size};
+    const auto build_size = (size + 2) / 3;
+    const auto remaining = size - build_size;
+    const auto reshape_size = (remaining + 1) / 2;
+    const auto at = [data](std::size_t offset) {
+        return offset == 0 ? data : data + offset;
+    };
+    script build_input{data, build_size};
+    script reshape_input{at(build_size), reshape_size};
+    script parse_input{at(build_size + reshape_size), remaining - reshape_size};
     std::string oracle;
-    auto buffer = build(input, oracle);
+    auto buffer = build(build_input, oracle);
     require(contents(buffer) == oracle);
 
-    reshape(input, buffer, oracle);
-    parse(input, buffer, oracle);
+    reshape(reshape_input, buffer, oracle);
+    scatter(buffer, oracle);
+    parse(parse_input, buffer, oracle);
 
     require(contents(buffer) == oracle);
     return 0;

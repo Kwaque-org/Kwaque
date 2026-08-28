@@ -32,18 +32,11 @@ public:
         return config_;
     }
     [[nodiscard]] bool valid() const noexcept;
-    [[nodiscard]] seastar::scheduling_group
-    scheduling_group(workload_class classification) const;
-    // Raw service-group handles are for process-level lifecycle owners. Normal
-    // cross-shard work must use resource_manager's bounded admission API.
-    [[nodiscard]] seastar::smp_service_group
-    smp_service_group(workload_class classification) const;
-    [[nodiscard]] unsigned
-    smp_concurrency_limit(workload_class classification) const;
 
 private:
     friend class resource_registry;
     friend class resource_manager;
+    friend class resource_registry_test_access;
 
     resource_handle_set(
       resource_config config,
@@ -51,9 +44,7 @@ private:
       std::array<seastar::scheduling_group, workload_class_count>
         scheduling_groups,
       std::array<seastar::smp_service_group, workload_class_count>
-        smp_service_groups,
-      std::array<unsigned, workload_class_count>
-        smp_concurrency_limits) noexcept;
+        smp_service_groups) noexcept;
 
     [[nodiscard]] bool try_acquire_manager_lease() const noexcept;
     void release_manager_lease() const noexcept;
@@ -65,7 +56,6 @@ private:
       scheduling_groups_;
     std::array<seastar::smp_service_group, workload_class_count>
       smp_service_groups_;
-    std::array<unsigned, workload_class_count> smp_concurrency_limits_;
 };
 
 enum class resource_registry_state {
@@ -104,7 +94,6 @@ private:
       scheduling_groups_;
     std::array<std::optional<seastar::smp_service_group>, workload_class_count>
       smp_service_groups_;
-    std::array<unsigned, workload_class_count> smp_concurrency_limits_{};
     std::optional<resource_config> config_;
     seastar::shared_promise<> stop_done_;
     resource_registry_state state_{resource_registry_state::constructed};

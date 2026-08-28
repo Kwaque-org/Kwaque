@@ -52,7 +52,7 @@ SEASTAR_TEST_CASE(task_scope_aborts_rejects_and_drains_owned_temporary_work) {
     auto closing = scope.close();
     co_await seastar::yield();
     BOOST_CHECK(scope.abort_requested());
-    BOOST_CHECK(scope.closed());
+    BOOST_CHECK(scope.admission_closed());
     BOOST_CHECK(!closing.available());
 
     const auto rejected = scope.spawn(

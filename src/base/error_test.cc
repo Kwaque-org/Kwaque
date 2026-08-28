@@ -61,21 +61,24 @@ TEST(ErrorTest, MapsOnlyPortableConditionsToStandardEquivalents) {
       kwaque::make_error_code(kwaque::errc::aborted),
       std::errc::operation_canceled);
     EXPECT_EQ(
-      kwaque::make_error_code(kwaque::errc::closed), std::errc::broken_pipe);
-    EXPECT_EQ(
       kwaque::make_error_code(kwaque::errc::timed_out), std::errc::timed_out);
-    EXPECT_EQ(
-      kwaque::make_error_code(kwaque::errc::resource_exhausted),
-      std::errc::resource_unavailable_try_again);
     EXPECT_EQ(
       kwaque::make_error_code(kwaque::errc::queue_full),
       std::errc::no_buffer_space);
     EXPECT_EQ(
       kwaque::make_error_code(kwaque::errc::io_failure), std::errc::io_error);
-    EXPECT_EQ(
+    EXPECT_NE(
+      kwaque::make_error_code(kwaque::errc::closed), std::errc::broken_pipe);
+    EXPECT_NE(
+      kwaque::make_error_code(kwaque::errc::resource_exhausted),
+      std::errc::resource_unavailable_try_again);
+    EXPECT_NE(
+      kwaque::make_error_code(kwaque::errc::unavailable),
+      std::errc::resource_unavailable_try_again);
+    EXPECT_NE(
       kwaque::make_error_code(kwaque::errc::network_failure),
       std::errc::network_unreachable);
-    EXPECT_EQ(
+    EXPECT_NE(
       kwaque::make_error_code(kwaque::errc::dns_failure),
       std::errc::host_unreachable);
     EXPECT_NE(

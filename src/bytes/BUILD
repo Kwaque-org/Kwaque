@@ -47,7 +47,6 @@ kwaque_cc_library(
         ":fragmented_buffer",
         "//src/base",
         "//src/base:error",
-        "@seastar",
     ],
 )
 
@@ -95,11 +94,6 @@ kwaque_cc_fuzz_test(
 kwaque_cc_benchmark(
     name = "fragmented_buffer_bench",
     srcs = ["fragmented_buffer_bench.cc"],
-    args = [
-        "--parameter=fixture_bytes=262144",
-        "--parameter=fixture_fragments=64",
-        "--parameter=scatter_batches=4",
-    ],
     memory = "256MiB",
     deps = [
         ":fragmented_buffer",
