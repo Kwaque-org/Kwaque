@@ -1,5 +1,5 @@
 load("//bazel:build.bzl", "kwaque_cc_library")
-load("//bazel:test.bzl", "kwaque_cc_test")
+load("//bazel:test.bzl", "kwaque_cc_seastar_gtest", "kwaque_cc_test")
 
 package(default_visibility = ["//visibility:private"])
 
@@ -12,6 +12,10 @@ kwaque_cc_library(
     name = "admin_state",
     srcs = ["admin_state.cc"],
     hdrs = ["admin_state.h"],
+    deps = [
+        "//src/runtime:shard_affinity",
+        "@seastar",
+    ],
 )
 
 kwaque_cc_library(
@@ -32,13 +36,17 @@ kwaque_cc_library(
     deps = [
         ":admin_responses",
         ":admin_state",
+        "//src/base:invariant",
+        "//src/runtime:shard_affinity",
         "@seastar",
     ],
 )
 
-kwaque_cc_test(
+kwaque_cc_seastar_gtest(
     name = "admin_state_test",
     srcs = ["admin_state_test.cc"],
+    cpu = 1,
+    memory = "128MiB",
     deps = [":admin_state"],
 )
 

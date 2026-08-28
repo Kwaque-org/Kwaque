@@ -10,6 +10,8 @@
 namespace kwaque::config {
 
 inline constexpr std::uint32_t bootstrap_config_schema_version = 1;
+inline constexpr std::size_t max_bootstrap_config_bytes = 64UL * 1024UL;
+inline constexpr std::size_t max_rendered_config_value_bytes = 256;
 
 enum class log_level { trace, debug, info, warn, error };
 
@@ -28,6 +30,7 @@ struct bootstrap_config final {
 enum class config_errc {
     file_unavailable,
     malformed_yaml,
+    input_too_large,
     missing_key,
     unknown_key,
     duplicate_key,
@@ -67,5 +70,7 @@ load_bootstrap_config(const std::filesystem::path& path);
 [[nodiscard]] std::string render_config(std::span<const config_value> values);
 
 [[nodiscard]] std::string render_config(const bootstrap_config& configuration);
+
+[[nodiscard]] std::string render_config_error(const config_error& error);
 
 } // namespace kwaque::config

@@ -308,6 +308,29 @@ def main() -> None:
         finally:
             alternate.kill_if_running()
 
+        oversized_config = logs / "oversized.yaml"
+        oversized_config.write_bytes(b"x" * (64 * 1024 + 1))
+        oversized = subprocess.run(
+            [
+                binary,
+                "--config",
+                str(oversized_config),
+                *REACTOR_ARGUMENTS,
+            ],
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            timeout=15.0,
+        )
+        if oversized.returncode == 0:
+            raise AssertionError("oversized configuration unexpectedly started")
+        if "configuration exceeds the maximum supported size" not in oversized.stdout:
+            raise AssertionError(
+                "oversized configuration did not report its bound:\n"
+                + oversized.stdout
+            )
+
 
 if __name__ == "__main__":
     main()

@@ -76,8 +76,16 @@ pid_file::pid_file(std::filesystem::path path)
         }
         const std::string contents = std::to_string(::getpid()) + "\n";
         write_all(descriptor_, contents);
-        if (::fsync(descriptor_) < 0) {
-            throw_system_error("sync PID file");
+
+        struct stat path_status{};
+        if (::lstat(path_.c_str(), &path_status) < 0) {
+            throw_system_error("inspect PID file path");
+        }
+        if (
+          status.st_dev != path_status.st_dev
+          || status.st_ino != path_status.st_ino) {
+            throw std::runtime_error(
+              "PID file path changed during acquisition: " + path_.string());
         }
     } catch (...) {
         ::close(descriptor_);
@@ -126,7 +134,9 @@ void pid_file::remove_if_owned() noexcept {
     char* end = nullptr;
     errno = 0;
     const long recorded_pid = std::strtol(buffer, &end, 10);
-    if (errno != 0 || end == buffer || recorded_pid != ::getpid()) {
+    if (
+      errno != 0 || end == buffer || recorded_pid != ::getpid()
+      || end >= buffer + bytes || *end != '\n' || end + 1 != buffer + bytes) {
         return;
     }
     static_cast<void>(::unlink(path_.c_str()));

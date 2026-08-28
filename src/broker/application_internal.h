@@ -32,7 +32,7 @@ public:
 
     int execute(const boost::program_options::variables_map& options);
 
-    void
+    [[nodiscard]] seastar::future<>
     load_configuration(const boost::program_options::variables_map& options);
     void construct_services(bool install_signal_handlers = true);
     [[nodiscard]] seastar::future<> start_services();
@@ -40,10 +40,13 @@ public:
     [[nodiscard]] seastar::future<> shutdown();
 
     [[nodiscard]] bool services_constructed() const noexcept;
-    [[nodiscard]] bool runtime_started() const noexcept;
+    [[nodiscard]] bool runtime_started() const;
     [[nodiscard]] const service_lifecycle* lifecycle() const noexcept;
 
 private:
+    void capture_or_assert_owner();
+    void assert_owner() const;
+
     std::filesystem::path config_path_;
     std::optional<config::bootstrap_config> configuration_;
     std::unique_ptr<runtime::stop_signal> stop_signal_;
@@ -53,7 +56,7 @@ private:
     std::unique_ptr<runtime::sharded_service<runtime::runtime_service>>
       runtime_service_;
     std::chrono::steady_clock::time_point startup_started_at_{};
-    bool runtime_started_{false};
+    std::optional<runtime::owner_shard> owner_;
 };
 
 } // namespace kwaque::broker::detail

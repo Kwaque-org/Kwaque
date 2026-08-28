@@ -35,6 +35,7 @@ RULES = (
 )
 
 ALLOWED_RULE_COUNTS = {
+    "src/admin/admin_server.cc": {"direct sharded-service ownership": 1},
     "src/runtime/cross_shard.h": {"direct cross-shard submission": 1},
     "src/runtime/sharded_service.h": {"direct sharded-service ownership": 1},
     "src/broker/application_start.cc": {"direct cross-shard submission": 1},

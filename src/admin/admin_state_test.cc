@@ -6,6 +6,7 @@ namespace {
 
 TEST(AdminStateTest, ReadinessTracksListenerAndDrainLifecycle) {
     kwaque::admin::admin_state state;
+    state.register_metrics();
 
     EXPECT_FALSE(state.live());
     EXPECT_FALSE(state.ready());
@@ -26,16 +27,18 @@ TEST(AdminStateTest, ReadinessTracksListenerAndDrainLifecycle) {
     EXPECT_FALSE(state.ready());
     EXPECT_EQ(state.shutdown_count(), 1U);
 
-    state.stopped();
+    state.stop().get();
     EXPECT_FALSE(state.live());
     EXPECT_FALSE(state.ready());
 }
 
 TEST(AdminStateTest, RequestCounterIsMonotonic) {
     kwaque::admin::admin_state state;
+    state.register_metrics();
     state.record_request();
     state.record_request();
     EXPECT_EQ(state.request_count(), 2U);
+    state.stop().get();
 }
 
 } // namespace
