@@ -1,4 +1,5 @@
-#pragma once
+#ifndef KWAQUE_SRC_BYTES_FRAGMENTED_BUFFER_H_
+#define KWAQUE_SRC_BYTES_FRAGMENTED_BUFFER_H_
 
 #include "src/base/result.h"
 #include "src/base/units.h"
@@ -13,6 +14,10 @@
 #include <span>
 #include <string_view>
 #include <vector>
+
+namespace kwaque::runtime::detail {
+class fragmented_buffer_io_access;
+}
 
 namespace kwaque::bytes {
 
@@ -284,6 +289,7 @@ public:
 private:
     friend class fragmented_buffer_builder;
     friend class fragmented_buffer_parser;
+    friend class runtime::detail::fragmented_buffer_io_access;
 
     fragmented_buffer(
       std::deque<owned_fragment> fragments,
@@ -301,3 +307,5 @@ private:
 };
 
 } // namespace kwaque::bytes
+
+#endif // KWAQUE_SRC_BYTES_FRAGMENTED_BUFFER_H_
