@@ -21,6 +21,7 @@ enum class operation_kind : std::uint8_t {
     dns = 5,
     fault = 6,
     resource = 7,
+    runtime = 8,
 };
 
 enum class operation_context_key : std::uint8_t {

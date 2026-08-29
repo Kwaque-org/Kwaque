@@ -89,6 +89,8 @@ std::string_view to_string(operation_kind operation) noexcept {
         return "fault";
     case operation_kind::resource:
         return "resource";
+    case operation_kind::runtime:
+        return "runtime";
     }
     return "unknown";
 }

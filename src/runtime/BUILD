@@ -11,6 +11,118 @@ kwaque_cc_library(
 )
 
 kwaque_cc_library(
+    name = "time",
+    hdrs = ["time.h"],
+    visibility = ["//visibility:public"],
+)
+
+kwaque_cc_library(
+    name = "timer",
+    hdrs = ["timer.h"],
+    visibility = ["//visibility:public"],
+    deps = [
+        ":error",
+        ":time",
+        "@seastar",
+    ],
+)
+
+kwaque_cc_library(
+    name = "random",
+    hdrs = ["random.h"],
+    visibility = ["//visibility:public"],
+    deps = [":error"],
+)
+
+kwaque_cc_library(
+    name = "file",
+    srcs = ["file.cc"],
+    hdrs = ["file.h"],
+    visibility = ["//visibility:public"],
+    deps = [
+        ":error",
+        ":shard_affinity",
+        "//src/base",
+        "//src/base:invariant",
+        "//src/bytes:fragmented_buffer",
+        "@seastar",
+    ],
+)
+
+kwaque_cc_library(
+    name = "fragmented_buffer_internal",
+    hdrs = ["fragmented_buffer_internal.h"],
+    visibility = ["//src/runtime/tests:__pkg__"],
+    deps = [
+        "//src/base",
+        "//src/bytes:fragmented_buffer",
+        "@seastar",
+    ],
+)
+
+kwaque_cc_library(
+    name = "network",
+    srcs = ["network.cc"],
+    hdrs = ["network.h"],
+    visibility = ["//visibility:public"],
+    deps = [
+        ":error",
+        ":shard_affinity",
+        "//src/base",
+        "//src/base:invariant",
+        "//src/bytes:fragmented_buffer",
+        "@seastar",
+    ],
+)
+
+kwaque_cc_library(
+    name = "dns",
+    srcs = ["dns.cc"],
+    hdrs = ["dns.h"],
+    visibility = ["//visibility:public"],
+    deps = [
+        ":error",
+        ":network",
+        ":shard_affinity",
+        ":time",
+        "//src/base:invariant",
+        "@seastar",
+    ],
+)
+
+kwaque_cc_library(
+    name = "fault",
+    srcs = ["fault.cc"],
+    hdrs = ["fault.h"],
+    visibility = ["//visibility:public"],
+    deps = [
+        ":error",
+        ":time",
+        "//src/base",
+    ],
+)
+
+kwaque_cc_library(
+    name = "environment",
+    srcs = ["environment.cc"],
+    hdrs = ["environment.h"],
+    visibility = ["//visibility:public"],
+    deps = [
+        ":dns",
+        ":error",
+        ":fault",
+        ":file",
+        ":network",
+        ":random",
+        ":shard_affinity",
+        ":time",
+        ":timer",
+        "//src/base:invariant",
+        "@seastar",
+    ],
+)
+
+kwaque_cc_library(
     name = "shard_affinity",
     srcs = ["shard_affinity.cc"],
     hdrs = ["shard_affinity.h"],

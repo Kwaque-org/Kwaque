@@ -73,4 +73,10 @@ TEST(OperationErrorTest, RuntimeResultSeparatesExpectedFailureFromExceptions) {
     EXPECT_EQ(failure.error().operation(), operation_kind::timer);
 }
 
+TEST(OperationErrorTest, RuntimeLifetimeHasDistinctOperationKind) {
+    operation_error error{kwaque::errc::closed, operation_kind::runtime};
+    EXPECT_EQ(error.operation(), operation_kind::runtime);
+    EXPECT_EQ(kwaque::runtime::to_string(error.operation()), "runtime");
+}
+
 } // namespace
