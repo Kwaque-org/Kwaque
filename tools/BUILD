@@ -56,6 +56,14 @@ py_binary(
     visibility = ["//visibility:public"],
 )
 
+py_binary(
+    name = "check_runtime_boundaries",
+    srcs = ["check_runtime_boundaries.py"],
+    main = "check_runtime_boundaries.py",
+    visibility = ["//visibility:public"],
+    deps = [":cross_shard_usage_lib"],
+)
+
 py_library(
     name = "cross_shard_usage_lib",
     srcs = ["check_cross_shard_usage.py"],
@@ -161,6 +169,23 @@ py_test(
     size = "small",
     srcs = ["check_cross_shard_usage_test.py"],
     main = "check_cross_shard_usage_test.py",
+    deps = [":cross_shard_usage_lib"],
+)
+
+py_test(
+    name = "check_runtime_boundaries_test",
+    size = "small",
+    srcs = ["check_runtime_boundaries_test.py"],
+    main = "check_runtime_boundaries_test.py",
+    deps = [
+        ":cross_shard_usage_lib",
+        ":runtime_boundaries_lib",
+    ],
+)
+
+py_library(
+    name = "runtime_boundaries_lib",
+    srcs = ["check_runtime_boundaries.py"],
     deps = [":cross_shard_usage_lib"],
 )
 

@@ -6,6 +6,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <expected>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -57,8 +58,11 @@ public:
     [[nodiscard]] std::size_t context_size() const noexcept {
         return context_size_;
     }
-    [[nodiscard]] operation_context_field
+    [[nodiscard]] std::optional<operation_context_field>
     context_at(std::size_t index) const noexcept {
+        if (index >= context_size_) {
+            return std::nullopt;
+        }
         return operation_context_field{
           .key = context_keys_[index], .value = context_values_[index]};
     }

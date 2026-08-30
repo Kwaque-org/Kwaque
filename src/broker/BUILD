@@ -29,18 +29,13 @@ kwaque_cc_library(
 )
 
 kwaque_cc_library(
-    name = "application",
+    name = "application_internal",
     srcs = [
-        "application.cc",
         "application_config.cc",
         "application_services.cc",
         "application_start.cc",
     ],
-    hdrs = [
-        "application.h",
-        "application_internal.h",
-    ],
-    visibility = ["//visibility:public"],
+    hdrs = ["application_internal.h"],
     deps = [
         ":data_directory",
         ":pid_file",
@@ -52,6 +47,20 @@ kwaque_cc_library(
         "//src/runtime:runtime_service",
         "//src/runtime:sharded_service",
         "//src/runtime:stop_signal",
+        "//src/runtime/production:backend",
+        "@boost//:program_options",
+        "@seastar",
+    ],
+)
+
+kwaque_cc_library(
+    name = "application",
+    srcs = ["application.cc"],
+    hdrs = ["application.h"],
+    visibility = ["//visibility:public"],
+    deps = [
+        ":application_internal",
+        "//src/base:build_info",
         "@boost//:program_options",
         "@seastar",
     ],
@@ -84,6 +93,7 @@ kwaque_cc_seastar_test(
     memory = "128MiB",
     deps = [
         ":application",
+        ":application_internal",
         ":service_lifecycle",
     ],
 )

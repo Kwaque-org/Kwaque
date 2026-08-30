@@ -10,6 +10,7 @@
 #include <seastar/core/future.hh>
 #include <seastar/core/gate.hh>
 #include <seastar/core/io_intent.hh>
+#include <seastar/core/semaphore.hh>
 #include <seastar/core/shared_future.hh>
 
 #include <compare>
@@ -24,11 +25,32 @@
 
 namespace kwaque::runtime {
 
+class file_test_access;
+
 inline constexpr std::size_t maximum_file_path_bytes = 4095;
 inline constexpr std::size_t maximum_file_name_bytes = 255;
 inline constexpr std::size_t maximum_directory_entries = 1U << 16U;
 inline constexpr byte_count maximum_directory_name_bytes{16U * 1024U * 1024U};
 inline constexpr byte_count maximum_file_io_bytes{64U * 1024U * 1024U};
+inline constexpr std::uint32_t maximum_pending_file_reads = 4096;
+inline constexpr std::uint32_t maximum_pending_file_metadata_operations = 4096;
+inline constexpr std::uint32_t maximum_queued_file_writes = 4096;
+
+struct file_io_limits final {
+    // Reads allocate independently, so both their count and requested bytes are
+    // bounded before native dispatch. One active write is bounded by
+    // maximum_file_io_bytes; these write limits bound only contenders retained
+    // behind the native serializer.
+    byte_count pending_read_bytes{maximum_file_io_bytes};
+    std::uint32_t pending_reads{64};
+    std::uint32_t pending_metadata_operations{64};
+    byte_count queued_write_bytes{maximum_file_io_bytes};
+    std::uint32_t queued_writes{64};
+
+    [[nodiscard]] result<void> validate() const noexcept;
+
+    bool operator==(const file_io_limits&) const = default;
+};
 
 struct directory_listing_limits final {
     item_count maximum_entries{4096};
@@ -216,6 +238,7 @@ private:
     }
     if (
       data.size() > maximum_file_io_bytes
+      || data.retained_bytes() > maximum_file_io_bytes
       || !position.checked_add(data.size())) {
         return failure(
           operation_error{errc::out_of_range, operation_kind::file});
@@ -228,7 +251,7 @@ private:
 // operations still dispatch through the native Seastar implementation.
 class file final {
 public:
-    explicit file(seastar::file&& native_file);
+    explicit file(seastar::file&& native_file, file_io_limits limits = {});
     file(file&& other) noexcept;
     file& operator=(file&&) = delete;
     file(const file&) = delete;
@@ -251,17 +274,68 @@ public:
 
     [[nodiscard]] file_state state() const;
     [[nodiscard]] bool abort_requested() const;
+    [[nodiscard]] const file_io_limits& limits() const noexcept {
+        owner_.assert_current();
+        return limits_;
+    }
+    [[nodiscard]] std::uint32_t pending_reads() const;
+    [[nodiscard]] byte_count pending_read_bytes() const;
+    [[nodiscard]] std::uint32_t pending_metadata_operations() const;
+    [[nodiscard]] std::uint32_t queued_writes() const;
+    [[nodiscard]] byte_count queued_write_bytes() const;
     [[nodiscard]] owner_shard owner() const noexcept { return owner_; }
 
 private:
+    friend class file_test_access;
+
+    class writer;
+    class admission_reservation final {
+    public:
+        admission_reservation(
+          seastar::semaphore_units<> operation,
+          seastar::semaphore_units<> bytes) noexcept
+          : operation_(std::move(operation))
+          , bytes_(std::move(bytes)) {}
+
+        admission_reservation(admission_reservation&&) noexcept = default;
+        admission_reservation&
+        operator=(admission_reservation&&) noexcept = default;
+        admission_reservation(const admission_reservation&) = delete;
+        admission_reservation& operator=(const admission_reservation&) = delete;
+
+    private:
+        seastar::semaphore_units<> operation_;
+        seastar::semaphore_units<> bytes_;
+    };
+
+    [[nodiscard]] static bool move_is_idle(const file& other) noexcept;
     [[nodiscard]] static owner_shard prepare_move(file& other) noexcept;
     [[nodiscard]] std::optional<operation_error> operation_rejection() const;
+    [[nodiscard]] std::optional<admission_reservation>
+    try_acquire_read(byte_count bytes) noexcept;
+    [[nodiscard]] std::optional<seastar::semaphore_units<>>
+    try_acquire_metadata() noexcept;
+    [[nodiscard]] std::optional<admission_reservation>
+    try_acquire_queued_write(byte_count bytes) noexcept;
     [[nodiscard]] seastar::future<result<void>> close_once();
 
     owner_shard owner_;
+    file_io_limits limits_;
     seastar::file native_file_;
     seastar::io_intent io_intent_;
     seastar::gate operations_;
+    seastar::semaphore read_operation_units_;
+    seastar::semaphore read_byte_units_;
+    seastar::semaphore metadata_operation_units_;
+    seastar::semaphore queued_write_operation_units_;
+    seastar::semaphore queued_write_byte_units_;
+    seastar::semaphore write_serialization_{1};
+    std::uint64_t memory_dma_alignment_;
+    std::uint64_t disk_read_dma_alignment_;
+    std::uint64_t disk_write_dma_alignment_;
+    std::uint64_t disk_overwrite_dma_alignment_;
+    std::uint64_t native_write_max_length_;
+    std::uint64_t append_chunk_limit_;
     std::optional<seastar::shared_promise<result<void>>> close_done_;
     file_state state_{file_state::open};
     bool abort_requested_{false};

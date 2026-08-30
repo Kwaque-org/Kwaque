@@ -22,14 +22,24 @@ Working today:
   fails, and reverse-dependency shutdown;
 - administrative HTTP endpoints for liveness, readiness, build version, and
   Prometheus metrics;
+- shard-affine lifecycle primitives, deny-by-default cross-shard value transfer,
+  eight workload classes, native memory admission, and bounded work queues;
+- immutable owning fragmented buffers with bounded builders, scatter export,
+  checked parsing, fuzz coverage, and focused benchmarks;
+- statically dispatched runtime contracts for time, timers, randomness, files,
+  networking, DNS, and fault evaluation, together with test-only backend shapes;
+- direct Seastar low-resolution clocks and abortable timers, shard-local
+  xoshiro256++ randomness, a move-only native file owner with bounded
+  positioned I/O, production filesystem, TCP, and DNS adapters, and
+  shard-local runtime composition;
 - unit, reactor, subprocess smoke, sanitizer, bounded fuzz, benchmark, and
   packaging tests, all runnable through Bazel;
 - a relocatable binary archive with a checksum and bundled license material.
 
-Not implemented yet: durable log storage, the native wire protocol, consensus,
-cluster metadata, replication, consumer coordination, tiered storage, quotas,
-and authentication. The source packages for those areas exist as ownership
-boundaries only and contain no implementation.
+Not implemented yet: deterministic simulation backends; durable log storage;
+the native wire protocol; consensus; cluster metadata; replication; consumer
+coordination; tiered storage; quotas; and authentication. The source packages
+for the broker features in that list remain ownership boundaries only.
 
 ## Requirements
 
@@ -219,10 +229,12 @@ locally is a convenience rather than a requirement.
 |---|---|
 | `src/base` | Compiler attributes, strong byte and count types, typed errors, results, logging, build metadata. |
 | `src/config` | Bootstrap configuration schema, YAML decoding, validation, redacted rendering. |
-| `src/runtime` | Reactor lifecycle helpers, signal handling, per-shard runtime service. |
+| `src/runtime` | Shard ownership and lifecycle, typed runtime failures, cross-shard value rules, statically dispatched runtime contracts, and the implemented clock, timer, random, and native-file mechanisms. |
+| `src/bytes` | Immutable fragmented buffers, bounded construction and scatter export, checked parsing, fuzzing, and benchmarks. |
+| `src/resource` | Workload classes, process/shard resource ownership, native memory admission, and bounded work queues. |
 | `src/admin` | Administrative HTTP service, health and version responses, metric registration. |
 | `src/broker` | Broker assembly: entry point, application ownership, ordered startup, data directory, PID file. |
-| `src/bytes`, `src/model`, `src/storage`, `src/protocol`, `src/raft`, `src/metadata`, `src/cluster`, `src/replication`, `src/consumer`, `src/cloud`, `src/security`, `src/resource`, `src/observability`, `src/simulation` | Ownership boundaries reserved for future work. Each holds a `BUILD` file and a `README.md` describing what belongs there. |
+| `src/model`, `src/storage`, `src/protocol`, `src/raft`, `src/metadata`, `src/cluster`, `src/replication`, `src/consumer`, `src/cloud`, `src/security`, `src/observability`, `src/simulation` | Ownership boundaries reserved for future work. Each holds a `BUILD` file and a `README.md` describing what belongs there. |
 | `proto/` | Versioned Protocol Buffers control schemas and their generated-code consumers. |
 | `conf/` | Example broker configuration. |
 | `bazel/` | Build rules, dependency declarations, third-party overlays, packaging, rule probes. |

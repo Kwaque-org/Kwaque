@@ -48,6 +48,18 @@ public:
             return "invariant violation";
         case errc::truncated_data:
             return "truncated data";
+        case errc::not_found:
+            return "not found";
+        case errc::already_exists:
+            return "already exists";
+        case errc::permission_denied:
+            return "permission denied";
+        case errc::directory_not_empty:
+            return "directory not empty";
+        case errc::is_a_directory:
+            return "is a directory";
+        case errc::not_a_directory:
+            return "not a directory";
         }
         return "unknown Kwaque error";
     }
@@ -68,6 +80,19 @@ public:
             return std::make_error_condition(std::errc::no_buffer_space);
         case errc::io_failure:
             return std::make_error_condition(std::errc::io_error);
+        case errc::not_found:
+            return std::make_error_condition(
+              std::errc::no_such_file_or_directory);
+        case errc::already_exists:
+            return std::make_error_condition(std::errc::file_exists);
+        case errc::permission_denied:
+            return std::make_error_condition(std::errc::permission_denied);
+        case errc::directory_not_empty:
+            return std::make_error_condition(std::errc::directory_not_empty);
+        case errc::is_a_directory:
+            return std::make_error_condition(std::errc::is_a_directory);
+        case errc::not_a_directory:
+            return std::make_error_condition(std::errc::not_a_directory);
         case errc::unavailable:
         case errc::closed:
         case errc::resource_exhausted:

@@ -8,7 +8,9 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <deque>
 #include <optional>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -105,7 +107,8 @@ public:
       network_connection_limits limits) noexcept
       : local_(local)
       , remote_(remote)
-      , limits_(limits) {}
+      , limits_(limits)
+      , write_admission_(limits) {}
     contract_connection(contract_connection&&) noexcept = default;
     contract_connection& operator=(contract_connection&&) = delete;
     contract_connection(const contract_connection&) = delete;
@@ -113,6 +116,11 @@ public:
 
     seastar::future<result<network_read_result>>
     read(byte_count maximum_bytes, seastar::abort_source& abort_source) {
+        if (auto valid = validate_network_read_limit(maximum_bytes); !valid) {
+            result<network_read_result> outcome = failure(valid.error());
+            return seastar::make_ready_future<result<network_read_result>>(
+              std::move(outcome));
+        }
         if (abort_source.abort_requested() || abort_requested_) {
             result<network_read_result> outcome = failure(
               operation_error{errc::aborted, operation_kind::network});
@@ -126,6 +134,17 @@ public:
               operation_error{errc::closed, operation_kind::network});
             return seastar::make_ready_future<result<network_read_result>>(
               std::move(outcome));
+        }
+        if (controlled_io_) {
+            if (pending_read_) {
+                result<network_read_result> outcome = failure(
+                  operation_error{errc::unavailable, operation_kind::network});
+                return seastar::make_ready_future<result<network_read_result>>(
+                  std::move(outcome));
+            }
+            pending_read_.emplace();
+            pending_read_limit_ = maximum_bytes;
+            return pending_read_->get_future();
         }
         auto outcome = network_read_result::make(
           bytes::fragmented_buffer{}, true, maximum_bytes);
@@ -146,8 +165,26 @@ public:
               operation_error{errc::closed, operation_kind::network});
             return seastar::make_ready_future<result<void>>(std::move(outcome));
         }
-        auto valid = validate_network_write(data, limits_);
-        return seastar::make_ready_future<result<void>>(std::move(valid));
+        if (auto valid = validate_network_write(data, limits_); !valid) {
+            result<void> outcome = failure(valid.error());
+            return seastar::make_ready_future<result<void>>(std::move(outcome));
+        }
+        if (!controlled_io_) {
+            return detail::success();
+        }
+        auto reservation = write_admission_.try_acquire(data.size());
+        if (!reservation) {
+            result<void> outcome = failure(
+              operation_error{errc::queue_full, operation_kind::network});
+            return seastar::make_ready_future<result<void>>(std::move(outcome));
+        }
+        pending_write pending{
+          .data = std::move(data),
+          .reservation = std::move(*reservation),
+        };
+        auto completion = pending.completion.get_future();
+        pending_writes_.push_back(std::move(pending));
+        return completion;
     }
     network_endpoint local_endpoint() const noexcept { return local_; }
     network_endpoint remote_endpoint() const noexcept { return remote_; }
@@ -162,6 +199,7 @@ public:
               operation_error{errc::closed, operation_kind::network});
         }
         input_state_ = network_half_state::shut_down;
+        fail_pending_read(errc::closed);
         return {};
     }
     result<void> shutdown_output() {
@@ -170,25 +208,105 @@ public:
               operation_error{errc::closed, operation_kind::network});
         }
         output_state_ = network_half_state::shut_down;
+        fail_pending_writes(errc::closed);
         return {};
     }
-    void request_abort() { abort_requested_ = true; }
+    void request_abort() {
+        abort_requested_ = true;
+        fail_pending_read(errc::aborted);
+        fail_pending_writes(errc::aborted);
+    }
     seastar::future<result<void>> close() {
+        if (state_ == network_connection_state::closed) {
+            return detail::success();
+        }
         state_ = network_connection_state::closed;
         input_state_ = network_half_state::shut_down;
         output_state_ = network_half_state::shut_down;
+        fail_pending_read(errc::closed);
+        fail_pending_writes(errc::closed);
         return detail::success();
     }
 
+    void enable_controlled_io() noexcept { controlled_io_ = true; }
+    [[nodiscard]] bool read_pending() const noexcept {
+        return pending_read_.has_value();
+    }
+    [[nodiscard]] std::size_t pending_write_count() const noexcept {
+        return pending_writes_.size();
+    }
+    [[nodiscard]] byte_count pending_write_bytes() const {
+        return write_admission_.pending_bytes();
+    }
+    [[nodiscard]] bool pending_write_content_equals(
+      std::size_t index, std::string_view expected) const noexcept {
+        return index < pending_writes_.size()
+               && pending_writes_[index].data.content_equals(expected);
+    }
+    [[nodiscard]] bool complete_read(bytes::fragmented_buffer data, bool eof) {
+        if (!pending_read_) {
+            return false;
+        }
+        auto outcome = network_read_result::make(
+          std::move(data), eof, pending_read_limit_);
+        auto completion = std::move(*pending_read_);
+        pending_read_.reset();
+        pending_read_limit_ = byte_count{};
+        completion.set_value(std::move(outcome));
+        return true;
+    }
+    [[nodiscard]] bool complete_next_write() {
+        if (pending_writes_.empty()) {
+            return false;
+        }
+        auto pending = std::move(pending_writes_.front());
+        pending_writes_.pop_front();
+        pending.completion.set_value(result<void>{});
+        return true;
+    }
+
 private:
+    struct pending_write final {
+        bytes::fragmented_buffer data;
+        network_write_admission::reservation reservation;
+        seastar::promise<result<void>> completion;
+    };
+
+    void fail_pending_read(errc code) {
+        if (!pending_read_) {
+            return;
+        }
+        auto completion = std::move(*pending_read_);
+        pending_read_.reset();
+        pending_read_limit_ = byte_count{};
+        result<network_read_result> outcome = failure(
+          operation_error{code, operation_kind::network});
+        completion.set_value(std::move(outcome));
+    }
+
+    void fail_pending_writes(errc code) {
+        while (!pending_writes_.empty()) {
+            auto pending = std::move(pending_writes_.front());
+            pending_writes_.pop_front();
+            result<void> outcome = failure(
+              operation_error{code, operation_kind::network});
+            pending.completion.set_value(std::move(outcome));
+        }
+    }
+
     owner_shard owner_;
     network_endpoint local_;
     network_endpoint remote_;
     network_connection_limits limits_;
+    network_write_admission write_admission_;
+    std::optional<seastar::promise<result<network_read_result>>> pending_read_;
+    std::deque<pending_write> pending_writes_;
+    byte_count pending_read_limit_{};
     network_connection_state state_{network_connection_state::open};
     network_half_state input_state_{network_half_state::open};
     network_half_state output_state_{network_half_state::open};
     bool abort_requested_{false};
+    bool controlled_io_{false};
 };
 
 class contract_listener final {

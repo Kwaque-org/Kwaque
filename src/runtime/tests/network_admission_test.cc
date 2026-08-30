@@ -68,6 +68,18 @@ SEASTAR_TEST_CASE(network_write_validation_rejects_invalid_requests) {
       over_connection_limit, limits);
     BOOST_REQUIRE(!rejected.has_value());
     BOOST_CHECK(rejected.error().code() == kwaque::errc::out_of_range);
+
+    auto retained_backing = kwaque::bytes::fragmented_buffer::copy_of(
+      std::span<const char>{"123456789", 9});
+    auto retained_slice = retained_backing.share(
+      kwaque::byte_count{}, kwaque::byte_count{1});
+    BOOST_REQUIRE(retained_slice.has_value());
+    BOOST_CHECK_EQUAL(retained_slice->size().value(), 1U);
+    BOOST_CHECK_EQUAL(retained_slice->retained_bytes().value(), 9U);
+    const auto retained_rejected = kwaque::runtime::validate_network_write(
+      *retained_slice, limits);
+    BOOST_REQUIRE(!retained_rejected.has_value());
+    BOOST_CHECK(retained_rejected.error().code() == kwaque::errc::out_of_range);
     return seastar::make_ready_future<>();
 }
 
@@ -84,6 +96,26 @@ SEASTAR_TEST_CASE(network_write_admission_moves_before_first_use) {
     reservation.reset();
     BOOST_CHECK_EQUAL(moved.pending_bytes().value(), 0U);
     return seastar::make_ready_future<>();
+}
+
+SEASTAR_TEST_CASE(network_write_admission_moves_after_returning_all_units) {
+    kwaque::runtime::network_write_admission original{
+      kwaque::runtime::network_connection_limits{
+        .pending_write_bytes = kwaque::byte_count{8},
+        .pending_writes = 1,
+      }};
+    auto first = original.try_acquire(kwaque::byte_count{8});
+    BOOST_REQUIRE(first.has_value());
+    std::optional reservation{std::move(*first)};
+    reservation.reset();
+
+    auto moved = std::move(original);
+    auto second = moved.try_acquire(kwaque::byte_count{8});
+    BOOST_REQUIRE(second.has_value());
+    std::optional moved_reservation{std::move(*second)};
+    moved_reservation.reset();
+    BOOST_CHECK_EQUAL(moved.pending_bytes().value(), 0U);
+    co_return;
 }
 
 SEASTAR_TEST_CASE(dns_admission_serializes_and_bounds_waiters) {

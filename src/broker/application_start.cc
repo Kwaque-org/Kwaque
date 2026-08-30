@@ -73,6 +73,14 @@ seastar::future<> application_state::start_services() {
 
     co_await lifecycle_->start_step(
       [this] {
+          return runtime::production::start_backends(
+            *production_backends_, *runtime_service_);
+      },
+      [this] { return production_backends_->stop(); });
+    log::broker().info("startup stage=runtime_backend state=ready");
+
+    co_await lifecycle_->start_step(
+      [this] {
           return admin_server_->start(
             configuration_->admin_address,
             configuration_->admin_port,

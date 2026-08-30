@@ -4,6 +4,7 @@
 #include "src/broker/pid_file.h"
 #include "src/broker/service_lifecycle.h"
 #include "src/config/bootstrap_config.h"
+#include "src/runtime/production/backend.h"
 #include "src/runtime/runtime_service.h"
 #include "src/runtime/sharded_service.h"
 #include "src/runtime/stop_signal.h"
@@ -55,6 +56,7 @@ private:
     std::unique_ptr<admin::admin_server> admin_server_;
     std::unique_ptr<runtime::sharded_service<runtime::runtime_service>>
       runtime_service_;
+    std::unique_ptr<runtime::production::backend_owner> production_backends_;
     std::chrono::steady_clock::time_point startup_started_at_{};
     std::optional<runtime::owner_shard> owner_;
 };

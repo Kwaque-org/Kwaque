@@ -3,6 +3,7 @@
 #include <gtest/gtest.h>
 
 #include <cstdint>
+#include <optional>
 #include <string>
 #include <type_traits>
 
@@ -37,9 +38,12 @@ TEST(OperationErrorTest, CarriesTypedBoundedNumericContext) {
     EXPECT_EQ(error.code(), kwaque::errc::io_failure);
     EXPECT_EQ(error.operation(), operation_kind::file);
     ASSERT_EQ(error.context_size(), operation_error::max_context_fields);
-    EXPECT_EQ(
-      error.context_at(0),
-      (operation_context_field{operation_context_key::shard, 3}));
+    const std::optional expected_context{
+      operation_context_field{operation_context_key::shard, 3}};
+    EXPECT_EQ(error.context_at(0), expected_context);
+    EXPECT_FALSE(error.context_at(error.context_size()).has_value());
+    EXPECT_FALSE(
+      error.context_at(operation_error::max_context_fields).has_value());
 
     operation_error invalid_key{kwaque::errc::io_failure, operation_kind::file};
     EXPECT_FALSE(

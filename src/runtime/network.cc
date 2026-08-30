@@ -61,8 +61,11 @@ network_connection_limits
 network_write_admission::prepare_move(network_write_admission& other) noexcept {
     KWAQUE_INVARIANT(
       network_admission_move_invariant,
-      !other.used_ && !other.moved_from_,
-      "network write admission moved after first use");
+      !other.moved_from_
+        && other.operation_units_.current() == other.limits_.pending_writes
+        && other.byte_units_.current()
+             == other.limits_.pending_write_bytes.value(),
+      "network write admission moved with active reservations");
     return other.limits_;
 }
 
@@ -189,7 +192,9 @@ validate_network_write(const bytes::fragmented_buffer& data) noexcept {
         return failure(
           operation_error{errc::invalid_argument, operation_kind::network});
     }
-    if (data.size() > maximum_network_operation_bytes) {
+    if (
+      data.size() > maximum_network_operation_bytes
+      || data.retained_bytes() > maximum_network_operation_bytes) {
         return failure(
           operation_error{errc::out_of_range, operation_kind::network});
     }
@@ -202,7 +207,7 @@ result<void> validate_network_write(
     if (auto valid = validate_network_write(data); !valid) {
         return failure(valid.error());
     }
-    if (data.size() > limits.pending_write_bytes) {
+    if (data.retained_bytes() > limits.pending_write_bytes) {
         return failure(
           operation_error{errc::out_of_range, operation_kind::network});
     }

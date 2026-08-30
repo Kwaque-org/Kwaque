@@ -24,6 +24,12 @@ enum class errc {
     replay_divergence = 15,
     invariant_violation = 16,
     truncated_data = 17,
+    not_found = 18,
+    already_exists = 19,
+    permission_denied = 20,
+    directory_not_empty = 21,
+    is_a_directory = 22,
+    not_a_directory = 23,
 };
 
 [[nodiscard]] const std::error_category& error_category() noexcept;

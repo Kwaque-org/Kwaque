@@ -41,11 +41,52 @@ kwaque_cc_seastar_test(
 )
 
 kwaque_cc_seastar_test(
+    name = "production_primitives_test",
+    srcs = ["production_primitives_test.cc"],
+    cpu = 1,
+    memory = "128MiB",
+    deps = [
+        "//src/runtime:random",
+        "//src/runtime:time",
+        "//src/runtime:timer",
+        "//src/runtime/production:clocks",
+        "//src/runtime/production:random",
+        "//src/runtime/production:timer",
+    ],
+)
+
+kwaque_cc_seastar_test(
     name = "file_test",
     srcs = ["file_test.cc"],
     cpu = 1,
     memory = "128MiB",
-    deps = ["//src/runtime:file"],
+    deps = [
+        "//src/runtime:file",
+        "//src/runtime:file_test_support",
+        "//src/runtime:fragmented_buffer_internal",
+    ],
+)
+
+kwaque_cc_seastar_test(
+    name = "production_file_test",
+    srcs = ["production_file_test.cc"],
+    cpu = 1,
+    memory = "128MiB",
+    deps = [
+        "//src/runtime:file",
+        "//src/runtime:fragmented_buffer_internal",
+    ],
+)
+
+kwaque_cc_seastar_test(
+    name = "production_file_system_test",
+    srcs = ["production_file_system_test.cc"],
+    cpu = 1,
+    memory = "128MiB",
+    deps = [
+        "//src/runtime:file",
+        "//src/runtime/production:file",
+    ],
 )
 
 kwaque_cc_test(
@@ -66,6 +107,7 @@ kwaque_cc_test(
         "//src/bytes:fragmented_buffer",
         "//src/runtime:dns",
         "//src/runtime:fault",
+        "//src/runtime:fault_api",
         "//src/runtime:network",
         "@seastar",
     ],
@@ -80,6 +122,47 @@ kwaque_cc_seastar_test(
         "//src/bytes:fragmented_buffer",
         "//src/runtime:dns",
         "//src/runtime:network",
+    ],
+)
+
+kwaque_cc_seastar_test(
+    name = "production_network_test",
+    srcs = ["production_network_test.cc"],
+    cpu = 1,
+    memory = "128MiB",
+    deps = [
+        "//src/bytes:fragmented_buffer",
+        "//src/runtime:network",
+        "//src/runtime/production:network",
+        "//src/runtime/production:network_test_support",
+    ],
+)
+
+kwaque_cc_seastar_test(
+    name = "production_dns_test",
+    srcs = ["production_dns_test.cc"],
+    cpu = 1,
+    memory = "128MiB",
+    deps = [
+        "//src/runtime:dns",
+        "//src/runtime/production:dns",
+        "//src/runtime/testing/contracts:dns_test_server",
+    ],
+)
+
+kwaque_cc_seastar_test(
+    name = "production_backend_test",
+    srcs = ["production_backend_test.cc"],
+    cpu = 2,
+    memory = "256MiB",
+    deps = [
+        "//src/runtime:environment",
+        "//src/runtime:runtime_service",
+        "//src/runtime:sharded_service",
+        "//src/runtime/production:backend",
+        "//src/runtime/production:backend_test_support",
+        "//src/runtime/testing/contracts:dns_test_server",
+        "//src/runtime/testing/contracts:real_backend_conformance",
     ],
 )
 
@@ -101,7 +184,50 @@ kwaque_cc_benchmark(
     memory = "128MiB",
     deps = [
         "//src/runtime:environment",
+        "//src/runtime:random",
+        "//src/runtime/production:clocks",
+        "//src/runtime/production:dns",
+        "//src/runtime/production:random",
+        "//src/runtime/production:timer",
         "//src/runtime/testing/contracts:contract_backends",
+        "@abseil-cpp//absl/random:random",
+        "@seastar",
+    ],
+)
+
+kwaque_cc_benchmark(
+    name = "runtime_file_bench",
+    srcs = ["runtime_file_bench.cc"],
+    memory = "128MiB",
+    deps = [
+        "//src/bytes:fragmented_buffer",
+        "//src/runtime:file",
+        "//src/runtime:fragmented_buffer_internal",
+        "@seastar",
+    ],
+)
+
+kwaque_cc_benchmark(
+    name = "runtime_network_bench",
+    srcs = ["runtime_network_bench.cc"],
+    memory = "128MiB",
+    deps = [
+        "//src/bytes:fragmented_buffer",
+        "//src/runtime:fragmented_buffer_internal",
+        "//src/runtime:network",
+        "//src/runtime/production:network",
+        "@seastar",
+    ],
+)
+
+kwaque_cc_benchmark(
+    name = "runtime_backend_bench",
+    srcs = ["runtime_backend_bench.cc"],
+    memory = "256MiB",
+    deps = [
+        "//src/runtime:runtime_service",
+        "//src/runtime:sharded_service",
+        "//src/runtime/production:backend",
         "@seastar",
     ],
 )
