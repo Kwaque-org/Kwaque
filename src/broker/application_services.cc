@@ -36,12 +36,17 @@ void application_state::construct_services(bool install_signal_handlers) {
     runtime_service_
       = std::make_unique<runtime::sharded_service<runtime::runtime_service>>(
         seastar::default_smp_service_group());
+    production_backends_ = std::make_unique<runtime::production::backend_owner>(
+      seastar::default_smp_service_group());
 }
 
 seastar::future<> application_state::request_service_abort() {
     assert_owner();
     if (!runtime_service_) {
         co_return;
+    }
+    if (production_backends_) {
+        co_await production_backends_->request_abort();
     }
     co_await runtime_service_->request_abort();
 }
@@ -57,6 +62,7 @@ seastar::future<> application_state::shutdown() {
         }
     }
 
+    production_backends_.reset();
     runtime_service_.reset();
     pid_file_.reset();
     admin_server_.reset();
@@ -70,7 +76,8 @@ seastar::future<> application_state::shutdown() {
 
 bool application_state::services_constructed() const noexcept {
     return stop_signal_ != nullptr && lifecycle_ != nullptr
-           && admin_server_ != nullptr && runtime_service_ != nullptr;
+           && admin_server_ != nullptr && runtime_service_ != nullptr
+           && production_backends_ != nullptr;
 }
 
 bool application_state::runtime_started() const {

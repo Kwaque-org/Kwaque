@@ -229,6 +229,19 @@ public:
         return state_;
     }
 
+    template<typename Selector>
+    requires std::copy_constructible<Selector>
+             && std::invocable<const Selector&, Service&>
+    [[nodiscard]] auto local_parameter(Selector selector) {
+        assert_parameter_source();
+        return seastar::sharded_parameter(
+          [selector = std::move(selector)](
+            local_service& local) -> decltype(auto) {
+              return std::invoke(selector, local.service());
+          },
+          std::ref(services_));
+    }
+
     template<typename Func, typename... Args>
     requires(is_valid_invocation<Func, Args...>())
     [[nodiscard]] auto
@@ -289,6 +302,14 @@ public:
     }
 
 private:
+    void assert_parameter_source() const {
+        assert_current();
+        if (state_ != sharded_service_state::started || operation_active_) {
+            throw std::logic_error(
+              "sharded service cannot provide local constructor parameters");
+        }
+    }
+
     void assert_invocable() const {
         assert_current();
         if (state_ != sharded_service_state::started || operation_active_) {

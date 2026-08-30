@@ -15,6 +15,10 @@ static_assert(static_cast<int>(kwaque::errc::out_of_range) == 2);
 static_assert(static_cast<int>(kwaque::errc::malformed_data) == 3);
 static_assert(static_cast<int>(kwaque::errc::unavailable) == 4);
 static_assert(static_cast<int>(kwaque::errc::truncated_data) == 17);
+static_assert(static_cast<int>(kwaque::errc::not_found) == 18);
+static_assert(static_cast<int>(kwaque::errc::directory_not_empty) == 21);
+static_assert(static_cast<int>(kwaque::errc::is_a_directory) == 22);
+static_assert(static_cast<int>(kwaque::errc::not_a_directory) == 23);
 
 struct error_case final {
     kwaque::errc code;
@@ -41,6 +45,12 @@ constexpr std::array cases{
   error_case{kwaque::errc::replay_divergence, 15, "replay divergence"},
   error_case{kwaque::errc::invariant_violation, 16, "invariant violation"},
   error_case{kwaque::errc::truncated_data, 17, "truncated data"},
+  error_case{kwaque::errc::not_found, 18, "not found"},
+  error_case{kwaque::errc::already_exists, 19, "already exists"},
+  error_case{kwaque::errc::permission_denied, 20, "permission denied"},
+  error_case{kwaque::errc::directory_not_empty, 21, "directory not empty"},
+  error_case{kwaque::errc::is_a_directory, 22, "is a directory"},
+  error_case{kwaque::errc::not_a_directory, 23, "not a directory"},
 };
 
 TEST(ErrorTest, PreservesStableValuesAndRoundTripsEveryCode) {
@@ -67,6 +77,24 @@ TEST(ErrorTest, MapsOnlyPortableConditionsToStandardEquivalents) {
       std::errc::no_buffer_space);
     EXPECT_EQ(
       kwaque::make_error_code(kwaque::errc::io_failure), std::errc::io_error);
+    EXPECT_EQ(
+      kwaque::make_error_code(kwaque::errc::not_found),
+      std::errc::no_such_file_or_directory);
+    EXPECT_EQ(
+      kwaque::make_error_code(kwaque::errc::already_exists),
+      std::errc::file_exists);
+    EXPECT_EQ(
+      kwaque::make_error_code(kwaque::errc::permission_denied),
+      std::errc::permission_denied);
+    EXPECT_EQ(
+      kwaque::make_error_code(kwaque::errc::directory_not_empty),
+      std::errc::directory_not_empty);
+    EXPECT_EQ(
+      kwaque::make_error_code(kwaque::errc::is_a_directory),
+      std::errc::is_a_directory);
+    EXPECT_EQ(
+      kwaque::make_error_code(kwaque::errc::not_a_directory),
+      std::errc::not_a_directory);
     EXPECT_NE(
       kwaque::make_error_code(kwaque::errc::closed), std::errc::broken_pipe);
     EXPECT_NE(

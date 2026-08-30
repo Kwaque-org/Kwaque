@@ -65,6 +65,37 @@ TEST(FileIoContractTest, ValidatesReadAndWriteBoundsBeforeDispatch) {
         .has_value());
 }
 
+TEST(FileIoContractTest, ValidatesAggregateIoLimits) {
+    EXPECT_TRUE(kwaque::runtime::file_io_limits{}.validate().has_value());
+    EXPECT_FALSE(
+      kwaque::runtime::file_io_limits{
+        .pending_read_bytes = kwaque::byte_count{}}
+        .validate()
+        .has_value());
+    EXPECT_FALSE(
+      kwaque::runtime::file_io_limits{
+        .pending_reads = kwaque::runtime::maximum_pending_file_reads + 1}
+        .validate()
+        .has_value());
+    EXPECT_FALSE(
+      kwaque::runtime::file_io_limits{
+        .pending_metadata_operations
+        = kwaque::runtime::maximum_pending_file_metadata_operations + 1}
+        .validate()
+        .has_value());
+    EXPECT_FALSE(
+      kwaque::runtime::file_io_limits{
+        .queued_write_bytes = kwaque::
+          byte_count{kwaque::runtime::maximum_file_io_bytes.value() + 1}}
+        .validate()
+        .has_value());
+    EXPECT_FALSE(
+      kwaque::runtime::file_io_limits{
+        .queued_writes = kwaque::runtime::maximum_queued_file_writes + 1}
+        .validate()
+        .has_value());
+}
+
 TEST(FileIoContractTest, InternalConsumptionTransfersOwnershipCanonically) {
     seastar::temporary_buffer<char> first{"ab", 2};
     seastar::temporary_buffer<char> second{"cde", 3};
@@ -89,6 +120,31 @@ TEST(FileIoContractTest, InternalConsumptionTransfersOwnershipCanonically) {
     EXPECT_EQ(buffer.retained_bytes(), kwaque::byte_count{});
     EXPECT_EQ(buffer.fragment_count(), 0U);
     EXPECT_TRUE(consumer.take_front().empty());
+}
+
+TEST(FileIoContractTest, InternalConsumptionCanSplitAndCopyWithoutLinearizing) {
+    seastar::temporary_buffer<char> storage{"abcdef", 6};
+    auto buffer = kwaque::runtime::detail::fragmented_buffer_io_access::adopt(
+      std::move(storage));
+    auto consumer
+      = kwaque::runtime::detail::fragmented_buffer_io_access::consume(buffer);
+
+    EXPECT_EQ(consumer.front().bytes(), "abcdef");
+    auto prefix = consumer.take_front(2);
+    EXPECT_EQ(std::string_view(prefix.get(), prefix.size()), "ab");
+    EXPECT_EQ(buffer.size(), kwaque::byte_count{4});
+    EXPECT_EQ(buffer.retained_bytes(), kwaque::byte_count{6});
+
+    std::array<char, 3> copied{};
+    EXPECT_EQ(consumer.copy_front_to(std::span<char>{copied}), copied.size());
+    EXPECT_EQ(std::string_view(copied.data(), copied.size()), "cde");
+    EXPECT_EQ(buffer.size(), kwaque::byte_count{1});
+    EXPECT_EQ(buffer.retained_bytes(), kwaque::byte_count{6});
+
+    auto suffix = consumer.take_front();
+    EXPECT_EQ(std::string_view(suffix.get(), suffix.size()), "f");
+    EXPECT_TRUE(buffer.empty());
+    EXPECT_EQ(buffer.retained_bytes(), kwaque::byte_count{});
 }
 
 TEST(FileIoContractTest, ReadResultCarriesExplicitEofAndOwningBytes) {

@@ -116,10 +116,11 @@ inline constexpr std::uint32_t maximum_pending_network_writes = 1024;
 inline constexpr std::uint32_t maximum_listen_backlog = 65535;
 
 struct network_connection_limits final {
-    // The active write is included in both limits. A single write larger than
-    // the byte capacity is out_of_range; temporary saturation fails immediately
-    // with queue_full. Rejected payload is released rather than retained in an
-    // unbounded waiter list.
+    // The active write is included in both limits. Byte admission accounts for
+    // retained backing rather than only the logical slice. A single write
+    // larger than the byte capacity is out_of_range; temporary saturation fails
+    // immediately with queue_full. Rejected payload is released rather than
+    // retained in an unbounded waiter list.
     byte_count pending_write_bytes{16U * 1024U * 1024U};
     std::uint32_t pending_writes{256};
 
@@ -167,12 +168,6 @@ public:
     // count/byte saturation and maps to queue_full at the connection boundary.
     [[nodiscard]] std::optional<reservation>
     try_acquire(byte_count bytes) noexcept {
-        if (moved_from_) [[unlikely]] {
-            std::terminate();
-        }
-        if (!used_) [[unlikely]] {
-            used_ = true;
-        }
         auto operation = seastar::try_get_units(operation_units_, 1);
         if (!operation) {
             return std::nullopt;
@@ -197,7 +192,6 @@ private:
     network_connection_limits limits_;
     seastar::semaphore operation_units_;
     seastar::semaphore byte_units_;
-    bool used_{false};
     bool moved_from_{false};
 };
 

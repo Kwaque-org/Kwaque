@@ -41,6 +41,7 @@ kwaque_cc_library(
     visibility = ["//visibility:public"],
     deps = [
         ":error",
+        ":fragmented_buffer_internal",
         ":shard_affinity",
         "//src/base",
         "//src/base:invariant",
@@ -50,9 +51,21 @@ kwaque_cc_library(
 )
 
 kwaque_cc_library(
+    name = "file_test_support",
+    testonly = True,
+    hdrs = ["file_test_support.h"],
+    visibility = ["//src/runtime/tests:__pkg__"],
+    deps = [":file"],
+)
+
+kwaque_cc_library(
     name = "fragmented_buffer_internal",
     hdrs = ["fragmented_buffer_internal.h"],
-    visibility = ["//src/runtime/tests:__pkg__"],
+    visibility = [
+        "//src/runtime:__pkg__",
+        "//src/runtime/production:__pkg__",
+        "//src/runtime/tests:__pkg__",
+    ],
     deps = [
         "//src/base",
         "//src/bytes:fragmented_buffer",
@@ -91,8 +104,7 @@ kwaque_cc_library(
 )
 
 kwaque_cc_library(
-    name = "fault",
-    srcs = ["fault.cc"],
+    name = "fault_api",
     hdrs = ["fault.h"],
     visibility = ["//visibility:public"],
     deps = [
@@ -103,6 +115,13 @@ kwaque_cc_library(
 )
 
 kwaque_cc_library(
+    name = "fault",
+    srcs = ["fault.cc"],
+    visibility = ["//visibility:public"],
+    deps = [":fault_api"],
+)
+
+kwaque_cc_library(
     name = "environment",
     srcs = ["environment.cc"],
     hdrs = ["environment.h"],
@@ -110,7 +129,7 @@ kwaque_cc_library(
     deps = [
         ":dns",
         ":error",
-        ":fault",
+        ":fault_api",
         ":file",
         ":network",
         ":random",

@@ -134,6 +134,133 @@ SEASTAR_TEST_CASE(runtime_consumer_instantiates_for_both_backend_shapes) {
     co_await exercise_contract(deterministic);
 }
 
+SEASTAR_TEST_CASE(
+  network_contract_serializes_owning_io_and_drains_before_close) {
+    production_backend backend;
+    seastar::abort_source abort_source;
+    const auto endpoint = kwaque::runtime::testing::detail::loopback(33146);
+    auto connected = co_await backend.network().connect(
+      endpoint,
+      std::nullopt,
+      kwaque::runtime::network_connection_limits{
+        .pending_write_bytes = kwaque::byte_count{8},
+        .pending_writes = 2,
+      },
+      abort_source);
+    BOOST_REQUIRE(connected.has_value());
+    connected->enable_controlled_io();
+
+    auto first_payload = kwaque::bytes::fragmented_buffer::copy_of(
+      std::span<const char>{"abc", 3});
+    auto first_write = connected->write(std::move(first_payload), abort_source);
+    BOOST_CHECK(!first_write.available());
+
+    std::optional<seastar::future<kwaque::runtime::result<void>>> second_write;
+    {
+        auto second_payload = kwaque::bytes::fragmented_buffer::copy_of(
+          std::span<const char>{"defg", 4});
+        second_write.emplace(
+          connected->write(std::move(second_payload), abort_source));
+    }
+    BOOST_CHECK(!second_write->available());
+    BOOST_CHECK_EQUAL(connected->pending_write_count(), 2U);
+    BOOST_CHECK_EQUAL(connected->pending_write_bytes().value(), 7U);
+    BOOST_CHECK(connected->pending_write_content_equals(0, "abc"));
+    BOOST_CHECK(connected->pending_write_content_equals(1, "defg"));
+
+    auto rejected_payload = kwaque::bytes::fragmented_buffer::copy_of(
+      std::span<const char>{"z", 1});
+    const auto rejected_write = co_await connected->write(
+      std::move(rejected_payload), abort_source);
+    BOOST_REQUIRE(!rejected_write.has_value());
+    BOOST_CHECK(rejected_write.error().code() == kwaque::errc::queue_full);
+
+    auto pending_read = connected->read(kwaque::byte_count{8}, abort_source);
+    BOOST_CHECK(!pending_read.available());
+    BOOST_CHECK(connected->read_pending());
+    const auto concurrent_read = co_await connected->read(
+      kwaque::byte_count{8}, abort_source);
+    BOOST_REQUIRE(!concurrent_read.has_value());
+    BOOST_CHECK(concurrent_read.error().code() == kwaque::errc::unavailable);
+
+    auto read_payload = kwaque::bytes::fragmented_buffer::copy_of(
+      std::span<const char>{"hi", 2});
+    const bool read_completed = connected->complete_read(
+      std::move(read_payload), false);
+    BOOST_REQUIRE(read_completed);
+    const auto completed_read = co_await std::move(pending_read);
+    BOOST_REQUIRE(completed_read.has_value());
+    BOOST_CHECK(!completed_read->eof());
+    BOOST_CHECK(completed_read->data().content_equals("hi"));
+    auto close_interrupted_read = connected->read(
+      kwaque::byte_count{8}, abort_source);
+    BOOST_CHECK(!close_interrupted_read.available());
+
+    BOOST_REQUIRE(connected->complete_next_write());
+    const auto first_result = co_await std::move(first_write);
+    BOOST_REQUIRE(first_result.has_value());
+    BOOST_CHECK(!second_write->available());
+    BOOST_CHECK_EQUAL(connected->pending_write_count(), 1U);
+
+    const auto closed = co_await connected->close();
+    BOOST_REQUIRE(closed.has_value());
+    const auto second_result = co_await std::move(*second_write);
+    BOOST_REQUIRE(!second_result.has_value());
+    BOOST_CHECK(second_result.error().code() == kwaque::errc::closed);
+    const auto read_result = co_await std::move(close_interrupted_read);
+    BOOST_REQUIRE(!read_result.has_value());
+    BOOST_CHECK(read_result.error().code() == kwaque::errc::closed);
+    BOOST_CHECK_EQUAL(connected->pending_write_count(), 0U);
+    BOOST_CHECK_EQUAL(connected->pending_write_bytes().value(), 0U);
+    BOOST_CHECK(!connected->read_pending());
+    BOOST_CHECK(!connected->complete_next_write());
+    BOOST_CHECK(
+      !connected->complete_read(kwaque::bytes::fragmented_buffer{}, true));
+
+    const auto closed_again = co_await connected->close();
+    BOOST_REQUIRE(closed_again.has_value());
+}
+
+SEASTAR_TEST_CASE(network_contract_abort_resolves_every_accepted_operation) {
+    production_backend backend;
+    seastar::abort_source abort_source;
+    const auto endpoint = kwaque::runtime::testing::detail::loopback(33147);
+    auto connected = co_await backend.network().connect(
+      endpoint,
+      std::nullopt,
+      kwaque::runtime::network_connection_limits{
+        .pending_write_bytes = kwaque::byte_count{8},
+        .pending_writes = 1,
+      },
+      abort_source);
+    BOOST_REQUIRE(connected.has_value());
+    connected->enable_controlled_io();
+
+    auto pending_read = connected->read(kwaque::byte_count{8}, abort_source);
+    auto payload = kwaque::bytes::fragmented_buffer::copy_of(
+      std::span<const char>{"abc", 3});
+    auto pending_write = connected->write(std::move(payload), abort_source);
+    BOOST_CHECK(!pending_read.available());
+    BOOST_CHECK(!pending_write.available());
+
+    connected->request_abort();
+    const auto read_result = co_await std::move(pending_read);
+    const auto write_result = co_await std::move(pending_write);
+    BOOST_REQUIRE(!read_result.has_value());
+    BOOST_REQUIRE(!write_result.has_value());
+    BOOST_CHECK(read_result.error().code() == kwaque::errc::aborted);
+    BOOST_CHECK(write_result.error().code() == kwaque::errc::aborted);
+    BOOST_CHECK(!connected->read_pending());
+    BOOST_CHECK_EQUAL(connected->pending_write_count(), 0U);
+
+    const auto rejected_read = co_await connected->read(
+      kwaque::byte_count{8}, abort_source);
+    BOOST_REQUIRE(!rejected_read.has_value());
+    BOOST_CHECK(rejected_read.error().code() == kwaque::errc::aborted);
+    const auto closed = co_await connected->close();
+    BOOST_REQUIRE(closed.has_value());
+}
+
 SEASTAR_TEST_CASE(runtime_lifetime_waits_for_root_and_component_views) {
     production_backend backend;
     std::optional<seastar::future<>> closing;

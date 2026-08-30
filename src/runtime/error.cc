@@ -62,7 +62,7 @@ std::string operation_error::render() const {
     append_bounded(output, " error=kwaque:", max_rendered_size);
     append_number(output, static_cast<std::uint64_t>(code_), max_rendered_size);
     for (std::size_t index = 0; index < context_size_; ++index) {
-        const auto field = context_at(index);
+        const auto field = *context_at(index);
         append_bounded(output, " ", max_rendered_size);
         append_bounded(output, to_string(field.key), max_rendered_size);
         append_bounded(output, "=", max_rendered_size);
