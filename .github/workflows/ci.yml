@@ -138,6 +138,8 @@ jobs:
         run: bazel run --lockfile_mode=error //tools:check_bazel_package_cycles
       - name: Check cross-shard ownership
         run: bazel run --lockfile_mode=error //tools:check_cross_shard_usage
+      - name: Check runtime dependency boundaries
+        run: bazel run --lockfile_mode=error //tools:check_runtime_boundaries
       - name: Check module lock
         run: |
           bazel mod deps --lockfile_mode=update
@@ -163,7 +165,7 @@ jobs:
     name: Build Linux aarch64 broker
     needs: build
     runs-on: ubuntu-24.04-arm
-    timeout-minutes: 45
+    timeout-minutes: 60
     steps:
       - name: Check out source
         uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # 6.0.1
@@ -172,3 +174,22 @@ jobs:
       - uses: ./.github/actions/setup-build
       - name: Build broker
         run: bazel build --config=ci-release //:kwaque
+      - name: Test deterministic runtime on aarch64 release
+        run: >-
+          bazel test --config=ci-release
+          //src/runtime/tests:operation_error_test
+          //src/simulation/tests:scheduler_test
+          //src/simulation/tests:virtual_time_test
+          //src/simulation/tests:virtual_time_binding_test
+          //src/simulation/tests:virtual_time_death_test
+          //src/simulation/tests:timer_test
+          //src/simulation/tests:philox_kat_test
+          //src/simulation/tests:deterministic_random_test
+          //src/simulation/tests:event_trace_test
+          //src/simulation/tests:determinism_test
+      - name: Test deterministic vectors on aarch64 debug
+        run: >-
+          bazel test --config=ci-debug
+          //src/simulation/tests:philox_kat_test
+          //src/simulation/tests:deterministic_random_test
+          //src/simulation/tests:event_trace_test

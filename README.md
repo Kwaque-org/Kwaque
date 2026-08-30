@@ -32,6 +32,8 @@ Working today:
   xoshiro256++ randomness, a move-only native file owner with bounded
   positioned I/O, production filesystem, TCP, and DNS adapters, and
   shard-local runtime composition;
+- a bounded deterministic event scheduler, virtual clocks and timers,
+  counter-addressed randomness, and chunked canonical capture/replay traces;
 - unit, reactor, subprocess smoke, sanitizer, bounded fuzz, benchmark, and
   packaging tests, all runnable through Bazel;
 - a relocatable binary archive with a checksum and bundled license material.
@@ -195,6 +197,8 @@ bazel run //tools:clang_tidy_strict     # stricter profile, production sources
 bazel run //tools:check_dependency_inventory   # MODULE.bazel vs THIRD_PARTY.md
 bazel run //tools:check_generated_artifacts    # reject tracked build output
 bazel run //tools:check_bazel_package_cycles   # package graph must stay acyclic
+bazel run //tools:check_cross_shard_usage       # enforce shared-nothing transfers
+bazel run //tools:check_runtime_boundaries      # keep real/test backends separated
 bazel mod tidy                                 # must leave the lockfile unchanged
 ```
 
@@ -234,7 +238,8 @@ locally is a convenience rather than a requirement.
 | `src/resource` | Workload classes, process/shard resource ownership, native memory admission, and bounded work queues. |
 | `src/admin` | Administrative HTTP service, health and version responses, metric registration. |
 | `src/broker` | Broker assembly: entry point, application ownership, ordered startup, data directory, PID file. |
-| `src/model`, `src/storage`, `src/protocol`, `src/raft`, `src/metadata`, `src/cluster`, `src/replication`, `src/consumer`, `src/cloud`, `src/security`, `src/observability`, `src/simulation` | Ownership boundaries reserved for future work. Each holds a `BUILD` file and a `README.md` describing what belongs there. |
+| `src/simulation` | Deterministic scheduler, virtual time and timers, counter-addressed randomness, and canonical trace capture/replay. |
+| `src/model`, `src/storage`, `src/protocol`, `src/raft`, `src/metadata`, `src/cluster`, `src/replication`, `src/consumer`, `src/cloud`, `src/security`, `src/observability` | Ownership boundaries reserved for future work. Each holds a `BUILD` file and a `README.md` describing what belongs there. |
 | `proto/` | Versioned Protocol Buffers control schemas and their generated-code consumers. |
 | `conf/` | Example broker configuration. |
 | `bazel/` | Build rules, dependency declarations, third-party overlays, packaging, rule probes. |

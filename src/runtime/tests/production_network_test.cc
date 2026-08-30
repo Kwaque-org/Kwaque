@@ -1,3 +1,4 @@
+#include "src/bytes/fragmented_buffer_builder.h"
 #include "src/runtime/network.h"
 #include "src/runtime/production/network.h"
 #include "src/runtime/production/network_connect_internal.h"
@@ -10,6 +11,7 @@
 
 #include <boost/test/unit_test.hpp>
 
+#include <algorithm>
 #include <array>
 #include <cstddef>
 #include <cstring>
@@ -26,8 +28,32 @@ constexpr auto loopback_address = kwaque::runtime::network_address::ipv4(
   {std::byte{127}, std::byte{0}, std::byte{0}, std::byte{1}});
 
 kwaque::bytes::fragmented_buffer bytes(std::string_view value) {
-    return kwaque::bytes::fragmented_buffer::copy_of(
+    auto copied = kwaque::bytes::fragmented_buffer::copy_of(
       std::span<const char>{value.data(), value.size()});
+    if (!copied) {
+        throw std::runtime_error("test payload exceeds buffer limits");
+    }
+    return std::move(*copied);
+}
+
+kwaque::bytes::fragmented_buffer repeated_bytes(std::size_t size, char value) {
+    kwaque::bytes::fragmented_buffer_builder builder;
+    std::array<char, 4096> chunk{};
+    chunk.fill(value);
+    while (size != 0) {
+        const auto count = std::min(size, chunk.size());
+        const auto appended = builder.append(
+          std::span<const char>{chunk}.first(count));
+        if (!appended) {
+            throw std::runtime_error("test payload exceeds buffer limits");
+        }
+        size -= count;
+    }
+    auto result = builder.finish();
+    if (!result) {
+        throw std::runtime_error("test payload publication failed");
+    }
+    return std::move(*result);
 }
 
 seastar::future<std::string> read_exactly(
@@ -399,7 +425,7 @@ SEASTAR_TEST_CASE(production_network_bounds_and_aborts_a_queued_writer) {
 
     seastar::abort_source active_abort;
     auto active = accepted->write(
-      bytes(std::string(1024U * 1024U, 'a')), active_abort);
+      repeated_bytes(1024U * 1024U, 'a'), active_abort);
     BOOST_CHECK(!active.available());
 
     seastar::abort_source queued_abort;

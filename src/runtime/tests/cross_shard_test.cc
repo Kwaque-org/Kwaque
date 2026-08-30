@@ -144,6 +144,9 @@ seastar::future<kwaque::runtime::owner_shard> record_value_fanout() {
 
 static_assert(cross_shard_value<kwaque::runtime::owner_shard>);
 static_assert(cross_shard_value<kwaque::runtime::cross_shard_bytes>);
+static_assert(
+  kwaque::runtime::cross_shard_bytes::max_size
+  == kwaque::maximum_contiguous_allocation_bytes);
 static_assert(cross_shard_value<kwaque::runtime::operation_error>);
 static_assert(cross_shard_value<scalar_id>);
 static_assert(cross_shard_value<kwaque::runtime::result<void>>);

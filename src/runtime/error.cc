@@ -40,7 +40,7 @@ bool operation_error::add_context(
     if (
       context_size_ == max_context_fields
       || static_cast<std::uint8_t>(key)
-           > static_cast<std::uint8_t>(operation_context_key::stable_id)) {
+           > static_cast<std::uint8_t>(operation_context_key::actual)) {
         return false;
     }
     for (std::size_t index = 0; index < context_size_; ++index) {
@@ -91,6 +91,12 @@ std::string_view to_string(operation_kind operation) noexcept {
         return "resource";
     case operation_kind::runtime:
         return "runtime";
+    case operation_kind::scheduler:
+        return "scheduler";
+    case operation_kind::clock:
+        return "clock";
+    case operation_kind::trace:
+        return "trace";
     }
     return "unknown";
 }
@@ -113,6 +119,14 @@ std::string_view to_string(operation_context_key key) noexcept {
         return "deadline_ns";
     case operation_context_key::stable_id:
         return "stable_id";
+    case operation_context_key::sequence:
+        return "sequence";
+    case operation_context_key::limit:
+        return "limit";
+    case operation_context_key::expected:
+        return "expected";
+    case operation_context_key::actual:
+        return "actual";
     }
     return "unknown";
 }

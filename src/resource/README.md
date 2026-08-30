@@ -25,6 +25,8 @@ managed queue draws native units from the same per-class semaphore as direct
 reservations and reserves one waiter slot for the producer holding its admission
 turn. Its optional worker set is owned by the queue, is started at most once,
 and retains each item's memory units until that item's handler completes.
+Per-queue worker and producer-waiter ceilings also prevent task metadata from
+becoming an unaccounted memory multiplier.
 
 Components obtain one move-only workload lease during startup. It supplies the
 copyable scheduling/SMP handles and a shard-local native memory semaphore while

@@ -66,7 +66,7 @@ std::vector<fragmented_buffer> shared_small_buffers() {
     std::vector<fragmented_buffer> inputs;
     inputs.reserve(shared_append_total);
     for (std::size_t index = 0; index < shared_append_total; ++index) {
-        auto shared = source.share(
+        auto shared = source->share(
           byte_count{index * shared_append_bytes},
           byte_count{shared_append_bytes});
         inputs.push_back(std::move(*shared));

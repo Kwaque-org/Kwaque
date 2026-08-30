@@ -43,6 +43,8 @@ struct file_probe final {
       delayed_bulk_read;
     std::vector<io_call> writes;
     std::vector<io_call> reads;
+    std::vector<std::size_t> bulk_read_sizes;
+    std::vector<std::uintptr_t> bulk_read_addresses;
     std::vector<char> storage;
     std::uint64_t size{0};
     std::uintptr_t bulk_read_address{0};
@@ -141,6 +143,7 @@ public:
     seastar::future<seastar::temporary_buffer<std::uint8_t>> dma_read_bulk(
       std::uint64_t position, std::size_t size, seastar::io_intent*) final {
         ++probe_.bulk_reads;
+        probe_.bulk_read_sizes.push_back(size);
         if (probe_.delayed_bulk_read) {
             return probe_.delayed_bulk_read->get_future();
         }
@@ -151,6 +154,7 @@ public:
           static_cast<std::size_t>(read)};
         probe_.bulk_read_address = reinterpret_cast<std::uintptr_t>(
           result.get());
+        probe_.bulk_read_addresses.push_back(probe_.bulk_read_address);
         if (read != 0) {
             std::memcpy(
               result.get_write(),
@@ -452,6 +456,36 @@ SEASTAR_TEST_CASE(file_read_reports_short_and_empty_eof_with_owned_bytes) {
     BOOST_REQUIRE(close_result.has_value());
 }
 
+SEASTAR_TEST_CASE(file_read_chunks_large_logical_requests) {
+    file_probe probe;
+    const auto total = 2U * kwaque::maximum_contiguous_allocation_bytes + 37U;
+    probe.storage.assign(total, 'c');
+    probe.size = probe.storage.size();
+    auto owner = make_file(probe);
+
+    auto read = co_await owner.read(
+      kwaque::runtime::file_position{0}, kwaque::byte_count{total});
+    const auto closed = co_await owner.close();
+
+    BOOST_REQUIRE(read.has_value());
+    BOOST_CHECK(!read->eof());
+    BOOST_CHECK_EQUAL(read->data().size().value(), total);
+    BOOST_CHECK_EQUAL(read->data().fragment_count(), 3U);
+    BOOST_REQUIRE_EQUAL(probe.bulk_read_sizes.size(), 3U);
+    BOOST_REQUIRE_EQUAL(probe.bulk_read_addresses.size(), 3U);
+    for (std::size_t index = 0; index < probe.bulk_read_sizes.size(); ++index) {
+        BOOST_CHECK_LE(
+          probe.bulk_read_sizes[index],
+          kwaque::maximum_contiguous_allocation_bytes);
+        const auto fragment = read->data().fragment_at(index);
+        BOOST_REQUIRE(fragment.has_value());
+        BOOST_CHECK_EQUAL(
+          reinterpret_cast<std::uintptr_t>(fragment->data()),
+          probe.bulk_read_addresses[index]);
+    }
+    BOOST_REQUIRE(closed.has_value());
+}
+
 SEASTAR_TEST_CASE(file_read_rejects_bounds_and_abort_before_native_dispatch) {
     file_probe probe;
     auto owner = make_file(probe);
@@ -545,7 +579,8 @@ SEASTAR_TEST_CASE(file_write_stages_only_the_unaligned_native_chunk) {
     const std::string source(4097, 's');
     auto backing = kwaque::bytes::fragmented_buffer::copy_of(
       std::span<const char>{source});
-    auto unaligned = backing.share(
+    BOOST_REQUIRE(backing.has_value());
+    auto unaligned = backing->share(
       kwaque::byte_count{1}, kwaque::byte_count{4096});
     BOOST_REQUIRE(unaligned.has_value());
     const auto source_fragment = unaligned->fragment_at(0);
@@ -597,6 +632,30 @@ SEASTAR_TEST_CASE(file_write_coalesces_fragment_batch_without_native_iovecs) {
     BOOST_REQUIRE(close_result.has_value());
 }
 
+SEASTAR_TEST_CASE(file_write_staging_never_exceeds_contiguous_ceiling) {
+    file_probe probe;
+    auto owner = make_file(probe);
+    std::array<seastar::temporary_buffer<char>, 1024> fragments;
+    for (auto& fragment : fragments) {
+        fragment = seastar::temporary_buffer<char>(256);
+        std::memset(fragment.get_write(), 'b', fragment.size());
+    }
+    auto data = kwaque::bytes::fragmented_buffer::copy_from_fragments(
+      std::span<const seastar::temporary_buffer<char>>{fragments});
+    BOOST_REQUIRE(data.has_value());
+
+    const auto written = co_await owner.write(
+      kwaque::runtime::file_position{0}, std::move(*data));
+    const auto closed = co_await owner.close();
+
+    BOOST_REQUIRE(written.has_value());
+    BOOST_REQUIRE_EQUAL(probe.writes.size(), 2U);
+    for (const auto& write : probe.writes) {
+        BOOST_CHECK_LE(write.size, kwaque::maximum_contiguous_allocation_bytes);
+    }
+    BOOST_REQUIRE(closed.has_value());
+}
+
 SEASTAR_TEST_CASE(file_write_preserves_bytes_around_unaligned_overwrite) {
     file_probe probe;
     probe.storage.assign(8192, 'p');
@@ -604,9 +663,10 @@ SEASTAR_TEST_CASE(file_write_preserves_bytes_around_unaligned_overwrite) {
     auto owner = make_file(probe);
     auto data = kwaque::bytes::fragmented_buffer::copy_of(
       std::span<const char>{"kwaque", 6});
+    BOOST_REQUIRE(data.has_value());
 
     const auto written = co_await owner.write(
-      kwaque::runtime::file_position{101}, std::move(data));
+      kwaque::runtime::file_position{101}, std::move(*data));
     const auto close_result = co_await owner.close();
 
     BOOST_REQUIRE(written.has_value());
@@ -632,9 +692,10 @@ SEASTAR_TEST_CASE(file_write_restores_logical_size_after_tail_extension) {
     auto owner = make_file(probe);
     auto data = kwaque::bytes::fragmented_buffer::copy_of(
       std::span<const char>{"tail", 4});
+    BOOST_REQUIRE(data.has_value());
 
     const auto written = co_await owner.write(
-      kwaque::runtime::file_position{4999}, std::move(data));
+      kwaque::runtime::file_position{4999}, std::move(*data));
     const auto close_result = co_await owner.close();
 
     BOOST_REQUIRE(written.has_value());
@@ -690,7 +751,8 @@ SEASTAR_TEST_CASE(
         const std::string source(4097, 's');
         auto backing = kwaque::bytes::fragmented_buffer::copy_of(
           std::span<const char>{source});
-        auto unaligned = backing.share(
+        BOOST_REQUIRE(backing.has_value());
+        auto unaligned = backing->share(
           kwaque::byte_count{1}, kwaque::byte_count{4096});
         BOOST_REQUIRE(unaligned.has_value());
 
@@ -751,7 +813,8 @@ SEASTAR_TEST_CASE(file_write_admission_bounds_retained_contenders) {
     const std::string retained_source(4097, 'r');
     auto retained_backing = kwaque::bytes::fragmented_buffer::copy_of(
       std::span<const char>{retained_source});
-    auto retained_slice = retained_backing.share(
+    BOOST_REQUIRE(retained_backing.has_value());
+    auto retained_slice = retained_backing->share(
       kwaque::byte_count{}, kwaque::byte_count{4096});
     BOOST_REQUIRE(retained_slice.has_value());
     BOOST_CHECK_EQUAL(retained_slice->retained_bytes().value(), 4097U);

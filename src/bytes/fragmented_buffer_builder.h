@@ -14,9 +14,8 @@
 
 namespace kwaque::bytes {
 
-// A single buffer's bytes stay well inside the range where size arithmetic and
-// allocation rounding cannot overflow.
-inline constexpr byte_count max_builder_total_bytes{std::uint64_t{1} << 40};
+// A buffer remains representable using only bounded contiguous fragments.
+inline constexpr byte_count max_builder_total_bytes{max_buffer_bytes};
 
 struct fragmented_buffer_builder_config final {
     // Size of the first allocation. Later allocations grow geometrically from

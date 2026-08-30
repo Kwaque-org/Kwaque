@@ -57,11 +57,12 @@ TEST(FileIoContractTest, ValidatesReadAndWriteBoundsBeforeDispatch) {
         .has_value());
     auto one_byte = kwaque::bytes::fragmented_buffer::copy_of(
       std::span<const char>{"x", 1});
+    ASSERT_TRUE(one_byte.has_value());
     EXPECT_FALSE(
       kwaque::runtime::validate_file_write_request(
         kwaque::runtime::file_position{
           std::numeric_limits<std::uint64_t>::max()},
-        one_byte)
+        *one_byte)
         .has_value());
 }
 
@@ -150,8 +151,9 @@ TEST(FileIoContractTest, InternalConsumptionCanSplitAndCopyWithoutLinearizing) {
 TEST(FileIoContractTest, ReadResultCarriesExplicitEofAndOwningBytes) {
     auto data = kwaque::bytes::fragmented_buffer::copy_of(
       std::span<const char>{"short", 5});
+    ASSERT_TRUE(data.has_value());
     auto result = kwaque::runtime::file_read_result::make(
-      std::move(data), true, kwaque::byte_count{5});
+      std::move(*data), true, kwaque::byte_count{5});
     ASSERT_TRUE(result.has_value());
     EXPECT_TRUE(result->eof());
     EXPECT_EQ(result->data().size(), kwaque::byte_count{5});

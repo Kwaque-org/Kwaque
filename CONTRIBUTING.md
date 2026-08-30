@@ -48,6 +48,8 @@ bazel run //tools:clang_tidy_strict
 bazel run //tools:check_dependency_inventory
 bazel run //tools:check_generated_artifacts
 bazel run //tools:check_bazel_package_cycles
+bazel run //tools:check_cross_shard_usage
+bazel run //tools:check_runtime_boundaries
 ```
 
 Changes that add or update a dependency must also run `bazel mod tidy` and

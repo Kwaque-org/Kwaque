@@ -87,8 +87,9 @@ seastar::future<> exercise_contract(Backend& backend) {
       connected->output_state() == kwaque::runtime::network_half_state::open);
     auto payload = kwaque::bytes::fragmented_buffer::copy_of(
       std::span<const char>{"x", 1});
+    BOOST_REQUIRE(payload.has_value());
     const auto write_result = co_await connected->write(
-      std::move(payload), abort_source);
+      std::move(*payload), abort_source);
     BOOST_REQUIRE(write_result.has_value());
     const auto read_result = co_await connected->read(
       kwaque::byte_count{1}, abort_source);
@@ -152,15 +153,18 @@ SEASTAR_TEST_CASE(
 
     auto first_payload = kwaque::bytes::fragmented_buffer::copy_of(
       std::span<const char>{"abc", 3});
-    auto first_write = connected->write(std::move(first_payload), abort_source);
+    BOOST_REQUIRE(first_payload.has_value());
+    auto first_write = connected->write(
+      std::move(*first_payload), abort_source);
     BOOST_CHECK(!first_write.available());
 
     std::optional<seastar::future<kwaque::runtime::result<void>>> second_write;
     {
         auto second_payload = kwaque::bytes::fragmented_buffer::copy_of(
           std::span<const char>{"defg", 4});
+        BOOST_REQUIRE(second_payload.has_value());
         second_write.emplace(
-          connected->write(std::move(second_payload), abort_source));
+          connected->write(std::move(*second_payload), abort_source));
     }
     BOOST_CHECK(!second_write->available());
     BOOST_CHECK_EQUAL(connected->pending_write_count(), 2U);
@@ -170,8 +174,9 @@ SEASTAR_TEST_CASE(
 
     auto rejected_payload = kwaque::bytes::fragmented_buffer::copy_of(
       std::span<const char>{"z", 1});
+    BOOST_REQUIRE(rejected_payload.has_value());
     const auto rejected_write = co_await connected->write(
-      std::move(rejected_payload), abort_source);
+      std::move(*rejected_payload), abort_source);
     BOOST_REQUIRE(!rejected_write.has_value());
     BOOST_CHECK(rejected_write.error().code() == kwaque::errc::queue_full);
 
@@ -185,8 +190,9 @@ SEASTAR_TEST_CASE(
 
     auto read_payload = kwaque::bytes::fragmented_buffer::copy_of(
       std::span<const char>{"hi", 2});
+    BOOST_REQUIRE(read_payload.has_value());
     const bool read_completed = connected->complete_read(
-      std::move(read_payload), false);
+      std::move(*read_payload), false);
     BOOST_REQUIRE(read_completed);
     const auto completed_read = co_await std::move(pending_read);
     BOOST_REQUIRE(completed_read.has_value());
@@ -239,7 +245,8 @@ SEASTAR_TEST_CASE(network_contract_abort_resolves_every_accepted_operation) {
     auto pending_read = connected->read(kwaque::byte_count{8}, abort_source);
     auto payload = kwaque::bytes::fragmented_buffer::copy_of(
       std::span<const char>{"abc", 3});
-    auto pending_write = connected->write(std::move(payload), abort_source);
+    BOOST_REQUIRE(payload.has_value());
+    auto pending_write = connected->write(std::move(*payload), abort_source);
     BOOST_CHECK(!pending_read.available());
     BOOST_CHECK(!pending_write.available());
 

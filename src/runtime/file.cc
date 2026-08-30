@@ -160,8 +160,8 @@ public:
         try {
             if (!serialization) {
                 serialization.emplace(
-                  co_await seastar::get_units(
-                    self.owner_.write_serialization_, 1));
+                  co_await seastar::coroutine::without_preemption_check(
+                    seastar::get_units(self.owner_.write_serialization_, 1)));
             }
             queued.reset();
             static_cast<void>(*serialization);
@@ -492,7 +492,7 @@ result<void> directory_listing_limits::validate() const noexcept {
 }
 
 result<directory_listing> directory_listing::make(
-  std::vector<directory_entry> entries,
+  seastar::chunked_vector<directory_entry> entries,
   directory_listing_limits limits) noexcept {
     if (auto valid = limits.validate(); !valid) {
         return failure(valid.error());
@@ -574,7 +574,8 @@ file::file(seastar::file&& native_file, file_io_limits limits)
   , disk_overwrite_dma_alignment_(native_file_.disk_overwrite_dma_alignment())
   , native_write_max_length_(
       std::min<std::uint64_t>(
-        native_file_.disk_write_max_length(), maximum_file_io_bytes.value()))
+        native_file_.disk_write_max_length(),
+        maximum_contiguous_allocation_bytes))
   , append_chunk_limit_(
       round_down(native_write_max_length_, disk_write_dma_alignment_)) {
     KWAQUE_INVARIANT(
@@ -583,8 +584,14 @@ file::file(seastar::file&& native_file, file_io_limits limits)
         && std::has_single_bit(memory_dma_alignment_)
         && std::has_single_bit(disk_read_dma_alignment_)
         && std::has_single_bit(disk_write_dma_alignment_)
-        && std::has_single_bit(disk_overwrite_dma_alignment_),
-      "native file reported a non-power-of-two DMA alignment");
+        && std::has_single_bit(disk_overwrite_dma_alignment_)
+        && std::max(
+             {memory_dma_alignment_,
+              disk_read_dma_alignment_,
+              disk_write_dma_alignment_,
+              disk_overwrite_dma_alignment_})
+             <= maximum_contiguous_allocation_bytes,
+      "native file reported an invalid or oversized DMA alignment");
     if (append_chunk_limit_ == 0) {
         append_chunk_limit_ = disk_write_dma_alignment_;
     }
@@ -775,6 +782,10 @@ file::read(file_position position, byte_count maximum_bytes) {
       file_gate_invariant,
       holder.has_value(),
       "open file rejected operation gate entry");
+    if (maximum_bytes.value() > maximum_contiguous_allocation_bytes) {
+        return read_chunked(
+          position, maximum_bytes, std::move(*admission), std::move(*holder));
+    }
     return native_file_
       .dma_read_bulk<char>(
         position.value(),
@@ -806,6 +817,52 @@ file::read(file_position position, byte_count maximum_bytes) {
                   file_error_from_exception(std::current_exception()));
             }
         });
+}
+
+seastar::future<result<file_read_result>> file::read_chunked(
+  file_position position,
+  byte_count maximum_bytes,
+  admission_reservation admission,
+  seastar::gate::holder holder) {
+    static_cast<void>(admission);
+    static_cast<void>(holder);
+    bytes::fragmented_buffer data;
+    auto current = position.value();
+    auto remaining = maximum_bytes.value();
+    bool eof = false;
+    try {
+        while (remaining != 0) {
+            const auto requested = static_cast<std::size_t>(
+              std::min<std::uint64_t>(
+                remaining, maximum_contiguous_allocation_bytes));
+            auto native = co_await native_file_.dma_read_bulk<char>(
+              current, requested, &io_intent_);
+            if (native.size() > requested) {
+                native.trim(requested);
+            }
+            const auto received = native.size();
+            if (received != 0) {
+                const auto appended
+                  = detail::fragmented_buffer_io_access::append_adopted(
+                    data, std::move(native));
+                KWAQUE_INVARIANT(
+                  file_consumption_invariant,
+                  appended.has_value(),
+                  "bounded file read could not adopt a native chunk");
+                current += received;
+                remaining -= received;
+            }
+            if (received < requested) {
+                eof = true;
+                break;
+            }
+        }
+        co_return file_read_result::make(std::move(data), eof, maximum_bytes);
+    } catch (const std::bad_alloc&) {
+        throw;
+    } catch (...) {
+        co_return failure(file_error_from_exception(std::current_exception()));
+    }
 }
 
 seastar::future<result<byte_count>>
@@ -924,7 +981,8 @@ seastar::future<result<void>> file::truncate(std::uint64_t size) {
     try {
         if (!serialization) {
             serialization.emplace(
-              co_await seastar::get_units(write_serialization_, 1));
+              co_await seastar::coroutine::without_preemption_check(
+                seastar::get_units(write_serialization_, 1)));
         }
         queued.reset();
         static_cast<void>(*serialization);
@@ -1002,8 +1060,9 @@ seastar::future<result<void>> file::close() {
 seastar::future<result<void>> file::close_once() {
     co_await operations_.close();
     try {
-        auto serialization = co_await seastar::get_units(
-          write_serialization_, 1);
+        auto serialization
+          = co_await seastar::coroutine::without_preemption_check(
+            seastar::get_units(write_serialization_, 1));
         static_cast<void>(serialization);
         co_await native_file_.close();
         co_return result<void>{};

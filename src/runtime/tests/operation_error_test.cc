@@ -83,4 +83,27 @@ TEST(OperationErrorTest, RuntimeLifetimeHasDistinctOperationKind) {
     EXPECT_EQ(kwaque::runtime::to_string(error.operation()), "runtime");
 }
 
+TEST(OperationErrorTest, SchedulerBudgetVocabularyIsStableAndBounded) {
+    static_assert(static_cast<std::uint8_t>(operation_kind::scheduler) == 9);
+    static_assert(static_cast<std::uint8_t>(operation_kind::clock) == 10);
+    static_assert(static_cast<std::uint8_t>(operation_kind::trace) == 11);
+    static_assert(
+      static_cast<std::uint8_t>(operation_context_key::sequence) == 8);
+    static_assert(static_cast<std::uint8_t>(operation_context_key::limit) == 9);
+    static_assert(
+      static_cast<std::uint8_t>(operation_context_key::expected) == 10);
+    static_assert(
+      static_cast<std::uint8_t>(operation_context_key::actual) == 11);
+    EXPECT_EQ(kwaque::runtime::to_string(operation_kind::clock), "clock");
+    EXPECT_EQ(kwaque::runtime::to_string(operation_kind::trace), "trace");
+
+    operation_error error{
+      kwaque::errc::resource_exhausted, operation_kind::scheduler};
+    ASSERT_TRUE(error.add_context(operation_context_key::sequence, 41));
+    ASSERT_TRUE(error.add_context(operation_context_key::limit, 40));
+    EXPECT_EQ(
+      error.render(),
+      "operation=scheduler error=kwaque:8 sequence=41 limit=40");
+}
+
 } // namespace

@@ -1,6 +1,7 @@
 #ifndef KWAQUE_SRC_BYTES_FRAGMENTED_BUFFER_H_
 #define KWAQUE_SRC_BYTES_FRAGMENTED_BUFFER_H_
 
+#include "src/base/allocation.h"
 #include "src/base/result.h"
 #include "src/base/units.h"
 
@@ -27,6 +28,8 @@ class fragmented_buffer_parser;
 // buffer can impose on iteration, export, and parsing regardless of how it was
 // built, and are internal defaults rather than configuration.
 inline constexpr std::size_t max_buffer_fragments = 1024;
+inline constexpr byte_count max_buffer_bytes{
+  max_buffer_fragments * maximum_contiguous_allocation_bytes};
 // A scatter batch never exceeds what one vectored write can accept, taken from
 // the platform rather than assumed, so a full batch is always submittable.
 inline constexpr std::size_t max_scatter_vectors = 1024;
@@ -217,15 +220,16 @@ public:
     // External temporary buffers may have writable aliases. Copy them into
     // frozen backing so publication is actually immutable through every owner.
     // Empty fragments are dropped from the resulting presentation.
-    [[nodiscard]] static fragmented_buffer
+    [[nodiscard]] static result<fragmented_buffer>
     copy_from_fragment(const fragment_type& fragment);
     [[nodiscard]] static result<fragmented_buffer>
     copy_from_fragments(std::span<const fragment_type> fragments);
     // A character array is refused for the same reason as on the builder: its
     // span would include the terminator.
-    [[nodiscard]] static fragmented_buffer copy_of(std::span<const char> bytes);
+    [[nodiscard]] static result<fragmented_buffer>
+    copy_of(std::span<const char> bytes);
     template<std::size_t N>
-    static fragmented_buffer copy_of(const char (&literal)[N]) = delete;
+    static result<fragmented_buffer> copy_of(const char (&literal)[N]) = delete;
 
     [[nodiscard]] byte_count size() const noexcept { return size_; }
     [[nodiscard]] byte_count retained_bytes() const noexcept {
@@ -277,9 +281,9 @@ public:
     [[nodiscard]] result<fragment_type> linearize(byte_count max_bytes) const;
     [[nodiscard]] result<byte_count> copy_to(std::span<char> destination) const;
 
-    // Produces an independent single-fragment native packet. Packet exposes
-    // mutable fragments, so one bounded linear copy preserves immutability of
-    // this buffer and all published shares without cloning every source link.
+    // Produces an independent native packet after coalescing tiny source
+    // fragments into bounded deep-copy chunks. Packet exposes mutable storage,
+    // so the source and all published shares remain immutable.
     [[nodiscard]] result<seastar::net::packet> copy_to_packet() const;
 
     [[nodiscard]] bool content_equals(std::string_view bytes) const noexcept;

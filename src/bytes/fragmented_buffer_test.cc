@@ -165,7 +165,8 @@ TEST(FragmentedBuffer, CopiesExternalStorageIntoImmutableBacking) {
 
     auto borrowed_single = borrowed_fragment(borrowed);
     const auto single = fragmented_buffer::copy_from_fragment(borrowed_single);
-    EXPECT_TRUE(single.content_equals("test"));
+    ASSERT_TRUE(single.has_value());
+    EXPECT_TRUE(single->content_equals("test"));
 
     std::vector<fragment_type> fragments;
     fragments.push_back(fragment_of("owned"));
@@ -176,8 +177,15 @@ TEST(FragmentedBuffer, CopiesExternalStorageIntoImmutableBacking) {
     EXPECT_EQ(multiple->fragment_count(), 2U);
     borrowed[0] = 'X';
     fragments[0].get_write()[0] = 'Y';
-    EXPECT_TRUE(single.content_equals("test"));
+    EXPECT_TRUE(single->content_equals("test"));
     EXPECT_TRUE(multiple->content_equals("ownedtest"));
+
+    fragment_type oversized{maximum_contiguous_allocation_bytes + 1U};
+    const auto oversized_freeze = fragmented_buffer::copy_from_fragment(
+      oversized);
+    ASSERT_FALSE(oversized_freeze.has_value());
+    EXPECT_EQ(
+      oversized_freeze.error(), make_error_code(errc::resource_exhausted));
 
     std::array<char, 4> builder_bytes{'t', 'e', 's', 't'};
     fragmented_buffer_builder builder;
@@ -269,11 +277,15 @@ TEST(FragmentedBuffer, CopyIsDeepAndIndependent) {
     const std::string large(200UL * 1024UL, 'L');
     auto large_source = fragmented_buffer::copy_of(
       std::span<const char>{large.data(), large.size()});
-    auto chunked = large_source.copy();
+    ASSERT_TRUE(large_source.has_value());
+    EXPECT_EQ(
+      fragment_sizes(*large_source),
+      (std::vector<std::size_t>{128UL * 1024UL, 72UL * 1024UL}));
+    auto chunked = large_source->copy();
     EXPECT_EQ(
       fragment_sizes(chunked),
       (std::vector<std::size_t>{128UL * 1024UL, 64UL * 1024UL, 8UL * 1024UL}));
-    EXPECT_TRUE(large_source.content_equals(chunked));
+    EXPECT_TRUE(large_source->content_equals(chunked));
 }
 
 // Walks a four-fragment buffer down to empty one trim at a time, checking the
@@ -550,6 +562,15 @@ TEST(FragmentedBuffer, LinearizationIsExplicitAndBounded) {
 
     std::array<char, 7> too_small{};
     EXPECT_FALSE(buffer.copy_to(too_small).has_value());
+
+    const std::string large(maximum_contiguous_allocation_bytes + 1U, 'x');
+    auto chunked = fragmented_buffer::copy_of(
+      std::span<const char>{large.data(), large.size()});
+    ASSERT_TRUE(chunked.has_value());
+    EXPECT_EQ(chunked->fragment_count(), 2U);
+    const auto too_wide = chunked->linearize(chunked->size());
+    ASSERT_FALSE(too_wide.has_value());
+    EXPECT_EQ(too_wide.error(), make_error_code(errc::resource_exhausted));
 }
 
 TEST(FragmentedBuffer, CopyToPacketPreservesPublishedImmutability) {
@@ -567,11 +588,35 @@ TEST(FragmentedBuffer, CopyToPacketPreservesPublishedImmutability) {
     EXPECT_TRUE(buffer.content_equals("abcdefgh"));
     EXPECT_EQ(contents(retained), "abcdefgh");
 
+    std::vector<fragment_type> tiny_fragments;
+    tiny_fragments.reserve(1000);
+    for (std::size_t index = 0; index < 1000; ++index) {
+        tiny_fragments.push_back(fragment_of("0123456789"));
+    }
+    auto fragmented = fragmented_buffer::copy_from_fragments(tiny_fragments);
+    ASSERT_TRUE(fragmented.has_value());
+    auto coalesced_packet = fragmented->copy_to_packet();
+    ASSERT_TRUE(coalesced_packet.has_value());
+    EXPECT_EQ(coalesced_packet->len(), 10'000U);
+    EXPECT_EQ(coalesced_packet->nr_frags(), 1U);
+
     fragmented_buffer empty;
     auto empty_packet = empty.copy_to_packet();
     ASSERT_TRUE(empty_packet.has_value());
     EXPECT_EQ(empty_packet->len(), 0U);
     EXPECT_EQ(empty_packet->nr_frags(), 0U);
+
+    const std::string large(maximum_contiguous_allocation_bytes + 1U, 'p');
+    auto large_buffer = fragmented_buffer::copy_of(
+      std::span<const char>{large.data(), large.size()});
+    ASSERT_TRUE(large_buffer.has_value());
+    auto large_packet = large_buffer->copy_to_packet();
+    ASSERT_TRUE(large_packet.has_value());
+    ASSERT_EQ(large_packet->nr_frags(), 2U);
+    for (unsigned index = 0; index < large_packet->nr_frags(); ++index) {
+        EXPECT_LE(
+          large_packet->frag(index).size, maximum_contiguous_allocation_bytes);
+    }
 }
 
 TEST(BufferBuilder, RejectsInvalidConfigurationAndUseAfterFinish) {
@@ -825,12 +870,14 @@ TEST(BufferBuilder, AppendBufferSplicesAndEmptiesTheSource) {
       fragmented_buffer_builder::pack_copy_threshold.value() + 1, 'z');
     auto frozen = fragmented_buffer::copy_of(
       std::span<const char>{large.data(), large.size()});
-    const auto* backing = frozen.fragment_at(0)->data();
-    ASSERT_TRUE(zero_copy_builder.append_buffer(std::move(frozen)).has_value());
+    ASSERT_TRUE(frozen.has_value());
+    const auto* backing = frozen->fragment_at(0)->data();
+    ASSERT_TRUE(
+      zero_copy_builder.append_buffer(std::move(*frozen)).has_value());
     // The move contract explicitly canonicalizes the donated source.
     // NOLINTBEGIN(bugprone-use-after-move)
-    EXPECT_TRUE(frozen.empty());
-    EXPECT_EQ(frozen.fragment_count(), 0U);
+    EXPECT_TRUE(frozen->empty());
+    EXPECT_EQ(frozen->fragment_count(), 0U);
     // NOLINTEND(bugprone-use-after-move)
     auto zero_copy = zero_copy_builder.finish();
     ASSERT_TRUE(zero_copy.has_value());

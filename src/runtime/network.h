@@ -1,6 +1,7 @@
 #ifndef KWAQUE_SRC_RUNTIME_NETWORK_H_
 #define KWAQUE_SRC_RUNTIME_NETWORK_H_
 
+#include "src/base/allocation.h"
 #include "src/base/units.h"
 #include "src/bytes/fragmented_buffer.h"
 #include "src/runtime/error.h"
@@ -112,7 +113,7 @@ inline constexpr byte_count maximum_network_operation_bytes{
 inline constexpr byte_count maximum_socket_buffer_bytes{16U * 1024U * 1024U};
 inline constexpr byte_count maximum_pending_network_write_bytes{
   64U * 1024U * 1024U};
-inline constexpr std::uint32_t maximum_pending_network_writes = 1024;
+inline constexpr std::uint32_t maximum_pending_network_writes = 96;
 inline constexpr std::uint32_t maximum_listen_backlog = 65535;
 
 struct network_connection_limits final {
@@ -122,7 +123,7 @@ struct network_connection_limits final {
     // immediately with queue_full. Rejected payload is released rather than
     // retained in an unbounded waiter list.
     byte_count pending_write_bytes{16U * 1024U * 1024U};
-    std::uint32_t pending_writes{256};
+    std::uint32_t pending_writes{64};
 
     [[nodiscard]] result<void> validate() const noexcept;
 

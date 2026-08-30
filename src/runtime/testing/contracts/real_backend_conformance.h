@@ -44,8 +44,12 @@ seastar::future<T> bounded(seastar::future<T> operation) {
 }
 
 inline bytes::fragmented_buffer conformance_bytes(std::string_view value) {
-    return bytes::fragmented_buffer::copy_of(
+    auto copied = bytes::fragmented_buffer::copy_of(
       std::span<const char>{value.data(), value.size()});
+    if (!copied) {
+        throw std::runtime_error("conformance payload exceeds buffer limits");
+    }
+    return std::move(*copied);
 }
 
 inline network_address conformance_loopback() noexcept {
