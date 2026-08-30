@@ -56,6 +56,7 @@ result<void> fragmented_buffer_builder_config::validate() const noexcept {
       // exact. Without this an enormous ceiling makes the rounding wrap and
       // report capacity that was never allocated.
       || max_fragment_bytes > max_total_bytes
+      || max_fragment_bytes.value() > maximum_contiguous_allocation_bytes
       || max_total_bytes > max_retained_bytes
       || max_retained_bytes > max_builder_total_bytes) {
         return failure(errc::invalid_argument);

@@ -78,7 +78,7 @@ public:
     seastar::future<result<directory_listing>>
     list(file_path, directory_listing_limits limits) {
         auto listing = directory_listing::make(
-          std::vector<directory_entry>{}, limits);
+          seastar::chunked_vector<directory_entry>{}, limits);
         return seastar::make_ready_future<result<directory_listing>>(
           std::move(listing));
     }

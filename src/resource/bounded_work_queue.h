@@ -35,7 +35,7 @@
 namespace kwaque::resource {
 
 struct bounded_work_queue_config final {
-    static constexpr std::size_t maximum_supported_producer_waiters = 4096;
+    static constexpr std::size_t maximum_supported_producer_waiters = 256;
 
     item_count maximum_items;
     byte_count maximum_bytes;
@@ -115,7 +115,7 @@ enum class bounded_work_queue_state {
 };
 
 struct bounded_queue_worker_config final {
-    static constexpr std::size_t maximum_supported_workers = 256;
+    static constexpr std::size_t maximum_supported_workers = 64;
 
     std::size_t workers;
     std::uint64_t maximum_error_reports;
@@ -221,7 +221,8 @@ public:
           items_.empty() && waiting_producers() == 0 && waiting_consumers_ == 0
             && active_producers_ == 0 && active_consumers_ == 0
             && bytes_held_.value() == 0 && producer_turn_.waiters() == 0
-            && producer_turn_.current() == 1,
+            && producer_turn_.current() == 1 && consumer_turn_.waiters() == 0
+            && consumer_turn_.current() == 1,
           "bounded work queue destroyed with retained work or waiters");
         KWAQUE_INVARIANT(
           invariant_id{"KQ-QUEUE-WORKERS-DRAINED"},
@@ -335,8 +336,8 @@ public:
             }
             auto& push_abort = cancellation_source();
             try {
-                turn = co_await seastar::get_units(
-                  producer_turn_, 1, push_abort);
+                turn = co_await seastar::coroutine::without_preemption_check(
+                  seastar::get_units(producer_turn_, 1, push_abort));
             } catch (...) {
                 if (push_abort.abort_requested()) {
                     co_return std::unexpected(
@@ -390,8 +391,10 @@ public:
             }
             auto& push_abort = cancellation_source();
             try {
-                acquired = co_await seastar::get_units(
-                  *memory_admission_, cost.value(), push_abort);
+                acquired
+                  = co_await seastar::coroutine::without_preemption_check(
+                    seastar::get_units(
+                      *memory_admission_, cost.value(), push_abort));
             } catch (...) {
                 if (push_abort.abort_requested()) {
                     co_return std::unexpected(
@@ -448,6 +451,20 @@ private:
         assert_current();
         operation_token operation{*this, active_consumers_};
         consumer_wait_token waiting{*this};
+        auto turn = seastar::try_get_units(consumer_turn_, 1);
+        if (!turn) {
+            waiting.engage();
+            try {
+                turn = co_await seastar::coroutine::without_preemption_check(
+                  seastar::get_units(consumer_turn_, 1, abort_source));
+            } catch (...) {
+                if (abort_source.abort_requested()) {
+                    co_return std::unexpected(
+                      interruption_failure(abort_source, byte_count{}));
+                }
+                throw;
+            }
+        }
         while (true) {
             if (state_ != bounded_work_queue_state::open && items_.empty()) {
                 co_return std::unexpected(
@@ -906,6 +923,7 @@ private:
     seastar::semaphore* memory_admission_{nullptr};
     std::deque<admitted_item> items_;
     seastar::semaphore producer_turn_{1};
+    seastar::semaphore consumer_turn_{1};
     seastar::condition_variable producer_condition_;
     seastar::condition_variable consumer_condition_;
     seastar::abort_source producer_abort_;

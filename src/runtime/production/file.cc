@@ -11,7 +11,6 @@
 #include <optional>
 #include <system_error>
 #include <utility>
-#include <vector>
 
 namespace kwaque::runtime::production {
 
@@ -184,7 +183,7 @@ file_system::list(file_path path, directory_listing_limits limits) {
     }
 
     seastar::file directory;
-    std::vector<directory_entry> entries;
+    seastar::chunked_vector<directory_entry> entries;
     std::optional<operation_error> rejected;
     std::exception_ptr exception;
     try {

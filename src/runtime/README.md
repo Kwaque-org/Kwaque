@@ -17,3 +17,11 @@ prove the direct value-only native path safe.
 Closing a task scope first closes admission and requests abort, then waits for
 all accepted work. `admission_closed()` reports only the first condition; the
 future returned by `close()` is the drain-completion boundary.
+
+Logical file operations and network writes may span many fragments, but each
+physical file read, network read result, or staging allocation is capped at 128
+KiB. Common one-chunk native I/O keeps its direct continuation path; larger or
+contended state machines remain coroutines. Directory results use chunked
+storage, and the explicit point-to-point cross-shard byte value has the same
+contiguous ceiling. Waiting-task and worker ceilings are kept independently of
+byte admission so small requests cannot create an excessive fiber population.

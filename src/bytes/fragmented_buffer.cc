@@ -19,12 +19,12 @@ add_would_overflow(std::uint64_t left, std::uint64_t right) noexcept {
 }
 
 // Deep copies use exact small allocations, then lower-bound powers of two
-// capped at 128 KiB. A larger minimum may be selected solely to keep a very
-// large published result within max_buffer_fragments.
+// capped at the process-wide contiguous-allocation ceiling.
 [[nodiscard]] constexpr std::uint64_t
 deep_copy_allocation_size(std::uint64_t remaining) noexcept {
     constexpr std::uint64_t max_small_allocation = 16UL * 1024UL;
-    constexpr std::uint64_t max_chunk_size = 128UL * 1024UL;
+    constexpr std::uint64_t max_chunk_size
+      = maximum_contiguous_allocation_bytes;
     if (remaining <= max_small_allocation) {
         return remaining;
     }
@@ -86,19 +86,9 @@ void fragmented_buffer::drop_empty_fragments() {
     }
 }
 
-fragmented_buffer
+result<fragmented_buffer>
 fragmented_buffer::copy_from_fragment(const fragment_type& fragment) {
-    if (fragment.empty()) {
-        return fragmented_buffer{};
-    }
-    const byte_count size{static_cast<std::uint64_t>(fragment.size())};
-    std::deque<owned_fragment> fragments;
-    fragments.push_back(
-      owned_fragment{
-        .storage = fragment.clone(),
-        .retained_bytes = size,
-      });
-    return fragmented_buffer{std::move(fragments), size, size};
+    return copy_from_fragments(std::span<const fragment_type>{&fragment, 1});
 }
 
 result<fragmented_buffer>
@@ -109,14 +99,20 @@ fragmented_buffer::copy_from_fragments(std::span<const fragment_type> source) {
         if (fragment.empty()) {
             continue;
         }
-        if (++fragment_count > max_buffer_fragments) {
+        if (
+          fragment.size() > maximum_contiguous_allocation_bytes
+          || fragment_count == max_buffer_fragments) {
             return failure(errc::resource_exhausted);
         }
+        ++fragment_count;
         const auto fragment_size = static_cast<std::uint64_t>(fragment.size());
         if (add_would_overflow(total, fragment_size)) {
             return failure(errc::out_of_range);
         }
         total += fragment_size;
+        if (total > max_buffer_bytes.value()) {
+            return failure(errc::resource_exhausted);
+        }
     }
 
     std::deque<owned_fragment> fragments;
@@ -134,18 +130,28 @@ fragmented_buffer::copy_from_fragments(std::span<const fragment_type> source) {
     return fragmented_buffer{std::move(fragments), size, size};
 }
 
-fragmented_buffer fragmented_buffer::copy_of(std::span<const char> bytes) {
+result<fragmented_buffer>
+fragmented_buffer::copy_of(std::span<const char> bytes) {
     if (bytes.empty()) {
         return fragmented_buffer{};
     }
-    fragment_type fragment{bytes.size()};
-    std::memcpy(fragment.get_write(), bytes.data(), bytes.size());
+    if (bytes.size() > max_buffer_bytes.value()) {
+        return failure(errc::resource_exhausted);
+    }
     std::deque<owned_fragment> fragments;
-    fragments.push_back(
-      owned_fragment{
-        .storage = std::move(fragment),
-        .retained_bytes = byte_count{static_cast<std::uint64_t>(bytes.size())},
-      });
+    std::size_t offset = 0;
+    while (offset < bytes.size()) {
+        const auto size = std::min(
+          maximum_contiguous_allocation_bytes, bytes.size() - offset);
+        fragment_type fragment{size};
+        std::memcpy(fragment.get_write(), bytes.data() + offset, size);
+        fragments.push_back(
+          owned_fragment{
+            .storage = std::move(fragment),
+            .retained_bytes = byte_count{size},
+          });
+        offset += size;
+    }
     const byte_count size{static_cast<std::uint64_t>(bytes.size())};
     return fragmented_buffer{std::move(fragments), size, size};
 }
@@ -395,7 +401,9 @@ result<scatter_batch> fragmented_buffer::export_scatter(
 
 result<fragmented_buffer::fragment_type>
 fragmented_buffer::linearize(byte_count max_bytes) const {
-    if (size_ > max_bytes) {
+    if (
+      size_ > max_bytes
+      || size_.value() > maximum_contiguous_allocation_bytes) {
         return failure(errc::resource_exhausted);
     }
     fragment_type linear{static_cast<std::size_t>(size_.value())};
@@ -436,16 +444,16 @@ result<seastar::net::packet> fragmented_buffer::copy_to_packet() const {
     if (empty()) {
         return seastar::net::packet{};
     }
-    fragment_type copied{static_cast<std::size_t>(size_.value())};
-    std::size_t written = 0;
-    for (const auto& fragment : fragments_) {
-        std::memcpy(
-          copied.get_write() + written,
-          fragment.storage.get(),
-          fragment.storage.size());
-        written += fragment.storage.size();
+    // Coalesce hostile tiny-fragment layouts using the bounded deep-copy
+    // policy, then transfer those independent chunks directly into the packet.
+    // Pre-sizing the packet avoids a descriptor vector and repeated growth.
+    auto copied = copy();
+    seastar::net::packet packet{copied.fragments_.size()};
+    for (auto& fragment : copied.fragments_) {
+        packet = seastar::net::packet(
+          std::move(packet), std::move(fragment.storage));
     }
-    return seastar::net::packet{std::move(copied)};
+    return packet;
 }
 
 bool fragmented_buffer::content_equals(std::string_view bytes) const noexcept {

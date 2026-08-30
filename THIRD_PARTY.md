@@ -1,9 +1,10 @@
 # Third-party software
 
-This file records the Kwaque's direct build and runtime dependencies. Do not
-declare an additional direct module or archive without adding a row here in the
-same change. The license distributed with each resolved artifact is
-authoritative.
+This file records Kwaque's direct build/runtime dependencies and embedded
+third-party source material. Do not declare an additional direct module or
+archive, or embed third-party source, without recording it here in the same
+change. The license distributed with each resolved artifact or retained in each
+embedded source file is authoritative.
 
 | Dependency | Version or revision | Source | License | Distribution scope | Purpose |
 |---|---|---|---|---|---|
@@ -40,6 +41,15 @@ authoritative.
 | OpenSSL | 3.5.7 | https://github.com/openssl/openssl | Apache-2.0 | Bundled shared libraries; license bundled | TLS and cryptography for Seastar |
 | Ragel | 26.04.0-20260414092900-8841e561489e | https://www.colm.net/open-source/ragel/ | MIT | Build only | Generate Seastar protocol parsers at build time |
 | `unordered_dense` | `f30ed41b58af8c79788e8581fe57a6faf856258e` | https://github.com/martinus/unordered_dense | MIT | Compile-time header; license bundled | Hash containers required by Seastar |
+
+## Embedded source material
+
+These entries are copied or trimmed into Kwaque and are not build/runtime
+dependencies.
+
+| Material | Source | License | Distribution scope | Purpose |
+|---|---|---|---|---|
+| Random123 Philox4x32-10 core and selected known-answer material | https://github.com/DEShawResearch/random123 | BSD-3-Clause | Embedded source and compiled binary material; full notice retained in source and root `NOTICE` | Deterministic simulation randomness and compatibility vectors |
 
 Transitive dependencies are resolved and locked by Bazel. The binary package
 preserves upstream license material for every direct native baseline dependency

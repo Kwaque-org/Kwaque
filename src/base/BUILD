@@ -42,12 +42,15 @@ kwaque_cc_library(
         "//src/resource/tests:__pkg__",
         "//src/runtime:__pkg__",
         "//src/runtime/tests:__pkg__",
+        "//src/simulation:__pkg__",
+        "//src/simulation/tests:__pkg__",
     ],
 )
 
 kwaque_cc_library(
     name = "base",
     hdrs = [
+        "allocation.h",
         "compiler.h",
         "result.h",
         "units.h",

@@ -4,10 +4,11 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
+#include <cstddef>
 #include <string>
 #include <type_traits>
 #include <utility>
-#include <vector>
 
 namespace {
 
@@ -113,7 +114,7 @@ TEST(FileContractTest, DirectoryListingBoundsEntriesAndAggregateNameBytes) {
     auto second_name = kwaque::runtime::file_name::make("bc");
     ASSERT_TRUE(first_name.has_value());
     ASSERT_TRUE(second_name.has_value());
-    std::vector<kwaque::runtime::directory_entry> entries;
+    seastar::chunked_vector<kwaque::runtime::directory_entry> entries;
     entries.push_back(
       {.name = std::move(*first_name),
        .kind = kwaque::runtime::file_kind::regular});
@@ -130,7 +131,7 @@ TEST(FileContractTest, DirectoryListingBoundsEntriesAndAggregateNameBytes) {
 
     auto oversized_name = kwaque::runtime::file_name::make("ab");
     ASSERT_TRUE(oversized_name.has_value());
-    std::vector<kwaque::runtime::directory_entry> oversized_entries;
+    seastar::chunked_vector<kwaque::runtime::directory_entry> oversized_entries;
     oversized_entries.push_back(
       {.name = std::move(*oversized_name),
        .kind = kwaque::runtime::file_kind::regular});
@@ -140,6 +141,28 @@ TEST(FileContractTest, DirectoryListingBoundsEntriesAndAggregateNameBytes) {
        .maximum_name_bytes = kwaque::byte_count{1}});
     ASSERT_FALSE(rejected.has_value());
     EXPECT_EQ(rejected.error().code(), kwaque::errc::resource_exhausted);
+}
+
+TEST(FileContractTest, DirectoryListingCrossesChunkBoundaries) {
+    const auto entry_count = std::min<std::size_t>(
+      seastar::chunked_vector<
+        kwaque::runtime::directory_entry>::elements_per_fragment()
+        + 1U,
+      kwaque::runtime::maximum_directory_entries);
+    seastar::chunked_vector<kwaque::runtime::directory_entry> entries;
+    for (std::size_t index = 0; index < entry_count; ++index) {
+        auto name = kwaque::runtime::file_name::make("entry");
+        ASSERT_TRUE(name.has_value());
+        entries.push_back(
+          {.name = std::move(*name),
+           .kind = kwaque::runtime::file_kind::regular});
+    }
+    auto listing = kwaque::runtime::directory_listing::make(
+      std::move(entries),
+      {.maximum_entries = kwaque::item_count{entry_count},
+       .maximum_name_bytes = kwaque::byte_count{entry_count * 5U}});
+    ASSERT_TRUE(listing.has_value());
+    EXPECT_EQ(listing->entries().size(), entry_count);
 }
 
 } // namespace

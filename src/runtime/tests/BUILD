@@ -132,6 +132,7 @@ kwaque_cc_seastar_test(
     memory = "128MiB",
     deps = [
         "//src/bytes:fragmented_buffer",
+        "//src/bytes:fragmented_buffer_builder",
         "//src/runtime:network",
         "//src/runtime/production:network",
         "//src/runtime/production:network_test_support",

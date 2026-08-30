@@ -53,8 +53,10 @@ struct runtime_contract_fixture {
 struct network_admission_fixture {
     static constexpr std::size_t write_bytes = 4096;
 
-    seastar::semaphore direct_operations{256};
-    seastar::semaphore direct_bytes{16U * 1024U * 1024U};
+    seastar::semaphore direct_operations{
+      network_connection_limits{}.pending_writes};
+    seastar::semaphore direct_bytes{
+      network_connection_limits{}.pending_write_bytes.value()};
     network_write_admission admission{network_connection_limits{}};
 };
 

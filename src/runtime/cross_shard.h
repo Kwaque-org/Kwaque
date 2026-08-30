@@ -1,5 +1,6 @@
 #pragma once
 
+#include "src/base/allocation.h"
 #include "src/runtime/error.h"
 #include "src/runtime/shard_affinity.h"
 
@@ -27,7 +28,7 @@ namespace kwaque::runtime {
 
 class cross_shard_bytes final {
 public:
-    static constexpr std::size_t max_size = 1024 * 1024;
+    static constexpr std::size_t max_size = maximum_contiguous_allocation_bytes;
 
     [[nodiscard]] static result<cross_shard_bytes>
     copy(std::span<const std::byte> source);

@@ -165,7 +165,8 @@ seastar::future<result<dns_result>> resolver::resolve_name(
   seastar::abort_source& caller_abort,
   seastar::gate::holder holder) {
     static_cast<void>(holder);
-    auto admitted = co_await admission_.acquire(caller_abort);
+    auto admitted = co_await seastar::coroutine::without_preemption_check(
+      admission_.acquire(caller_abort));
     if (!admitted) {
         co_return failure(admitted.error());
     }

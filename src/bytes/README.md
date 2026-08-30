@@ -7,15 +7,16 @@ bytes are immutable. External temporary buffers are copied into frozen backing,
 while shares, slices, and buffer-to-builder splices remain zero-copy between
 already-published Kwaque buffers. Logical and retained backing bytes are reported
 separately, so a small slice cannot hide the larger backing it keeps alive.
-Explicit deep copy coalesces tiny source fragments into allocator-sized chunks;
-external freeze preserves supplied fragment boundaries because those boundaries
-may describe I/O layout. Contiguous conversion is always explicit and bounded.
+Explicit deep copy coalesces tiny source fragments into chunks no larger than
+128 KiB. External freeze preserves every accepted supplied boundary and rejects
+an individual source fragment above that ceiling before allocation. Contiguous
+conversion is always explicit, bounded, and rejected above 128 KiB.
 Scatter export is independently bounded by vector slots and bytes, owns shared
 claims in one descriptor allocation for async lifetime safety, and resumes
 through a cursor bound to one buffer generation.
-Native packet conversion uses one bounded linear copy into independent mutable
-packet backing and is refused before allocation if the receiver cannot
-represent the total size.
+Native packet conversion first coalesces into independent bounded backing, then
+transfers those chunks without a descriptor vector. It is refused before
+allocation if the receiver cannot represent the total size.
 
 `fragmented_buffer_builder` is the only surface that mutates content. It fills
 spare tail capacity before allocating, grows allocations geometrically up to a

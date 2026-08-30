@@ -1,11 +1,13 @@
 #ifndef KWAQUE_SRC_RUNTIME_FILE_H_
 #define KWAQUE_SRC_RUNTIME_FILE_H_
 
+#include "src/base/allocation.h"
 #include "src/base/units.h"
 #include "src/bytes/fragmented_buffer.h"
 #include "src/runtime/error.h"
 #include "src/runtime/shard_affinity.h"
 
+#include <seastar/core/chunked_vector.hh>
 #include <seastar/core/file.hh>
 #include <seastar/core/future.hh>
 #include <seastar/core/gate.hh>
@@ -21,7 +23,6 @@
 #include <optional>
 #include <string>
 #include <utility>
-#include <vector>
 
 namespace kwaque::runtime {
 
@@ -32,9 +33,9 @@ inline constexpr std::size_t maximum_file_name_bytes = 255;
 inline constexpr std::size_t maximum_directory_entries = 1U << 16U;
 inline constexpr byte_count maximum_directory_name_bytes{16U * 1024U * 1024U};
 inline constexpr byte_count maximum_file_io_bytes{64U * 1024U * 1024U};
-inline constexpr std::uint32_t maximum_pending_file_reads = 4096;
-inline constexpr std::uint32_t maximum_pending_file_metadata_operations = 4096;
-inline constexpr std::uint32_t maximum_queued_file_writes = 4096;
+inline constexpr std::uint32_t maximum_pending_file_reads = 96;
+inline constexpr std::uint32_t maximum_pending_file_metadata_operations = 96;
+inline constexpr std::uint32_t maximum_queued_file_writes = 96;
 
 struct file_io_limits final {
     // Reads allocate independently, so both their count and requested bytes are
@@ -114,7 +115,7 @@ struct directory_entry final {
 class directory_listing final {
 public:
     [[nodiscard]] static result<directory_listing> make(
-      std::vector<directory_entry> entries,
+      seastar::chunked_vector<directory_entry> entries,
       directory_listing_limits limits) noexcept;
 
     directory_listing(directory_listing&&) noexcept = default;
@@ -122,18 +123,21 @@ public:
     directory_listing(const directory_listing&) = delete;
     directory_listing& operator=(const directory_listing&) = delete;
 
-    [[nodiscard]] const std::vector<directory_entry>& entries() const noexcept {
+    [[nodiscard]] const seastar::chunked_vector<directory_entry>&
+    entries() const noexcept {
         return entries_;
     }
-    [[nodiscard]] std::vector<directory_entry> take_entries() && noexcept {
+    [[nodiscard]] seastar::chunked_vector<directory_entry>
+    take_entries() && noexcept {
         return std::move(entries_);
     }
 
 private:
-    explicit directory_listing(std::vector<directory_entry> entries) noexcept
+    explicit directory_listing(
+      seastar::chunked_vector<directory_entry> entries) noexcept
       : entries_(std::move(entries)) {}
 
-    std::vector<directory_entry> entries_;
+    seastar::chunked_vector<directory_entry> entries_;
 };
 
 enum class file_access : std::uint8_t {
@@ -317,6 +321,11 @@ private:
     try_acquire_metadata() noexcept;
     [[nodiscard]] std::optional<admission_reservation>
     try_acquire_queued_write(byte_count bytes) noexcept;
+    [[nodiscard]] seastar::future<result<file_read_result>> read_chunked(
+      file_position position,
+      byte_count maximum_bytes,
+      admission_reservation admission,
+      seastar::gate::holder holder);
     [[nodiscard]] seastar::future<result<void>> close_once();
 
     owner_shard owner_;

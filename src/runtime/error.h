@@ -23,6 +23,9 @@ enum class operation_kind : std::uint8_t {
     fault = 6,
     resource = 7,
     runtime = 8,
+    scheduler = 9,
+    clock = 10,
+    trace = 11,
 };
 
 enum class operation_context_key : std::uint8_t {
@@ -34,6 +37,10 @@ enum class operation_context_key : std::uint8_t {
     occurrence = 5,
     deadline_ns = 6,
     stable_id = 7,
+    sequence = 8,
+    limit = 9,
+    expected = 10,
+    actual = 11,
 };
 
 struct operation_context_field final {

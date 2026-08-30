@@ -113,7 +113,7 @@ fragmented_buffer build(script& input, std::string& oracle) {
             const auto payload = input.bytes(length);
             auto donated = fragmented_buffer::copy_of(
               std::span<const char>{payload.data(), payload.size()});
-            if (builder.append_buffer(std::move(donated))) {
+            if (donated && builder.append_buffer(std::move(*donated))) {
                 oracle.append(payload);
             }
         }

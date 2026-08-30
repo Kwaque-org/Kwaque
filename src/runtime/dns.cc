@@ -166,7 +166,8 @@ dns_admission::acquire(seastar::abort_source& abort_source) {
 
     ++waiters_;
     try {
-        auto units = co_await seastar::get_units(permit_, 1, abort_source);
+        auto units = co_await seastar::coroutine::without_preemption_check(
+          seastar::get_units(permit_, 1, abort_source));
         --waiters_;
         active_ = true;
         co_return reservation{*this, std::move(units)};

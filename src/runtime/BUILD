@@ -160,6 +160,7 @@ kwaque_cc_library(
     visibility = [
         "//src/resource:__pkg__",
         "//src/runtime/tests:__pkg__",
+        "//src/simulation:__pkg__",
     ],
     deps = [
         "//src/base:invariant_test_support",
@@ -175,6 +176,7 @@ kwaque_cc_library(
     deps = [
         ":error",
         ":shard_affinity",
+        "//src/base",
         "@seastar",
     ],
 )

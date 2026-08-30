@@ -64,14 +64,16 @@ SEASTAR_TEST_CASE(network_write_validation_rejects_invalid_requests) {
 
     auto over_connection_limit = kwaque::bytes::fragmented_buffer::copy_of(
       std::span<const char>{"123456789", 9});
+    BOOST_REQUIRE(over_connection_limit.has_value());
     const auto rejected = kwaque::runtime::validate_network_write(
-      over_connection_limit, limits);
+      *over_connection_limit, limits);
     BOOST_REQUIRE(!rejected.has_value());
     BOOST_CHECK(rejected.error().code() == kwaque::errc::out_of_range);
 
     auto retained_backing = kwaque::bytes::fragmented_buffer::copy_of(
       std::span<const char>{"123456789", 9});
-    auto retained_slice = retained_backing.share(
+    BOOST_REQUIRE(retained_backing.has_value());
+    auto retained_slice = retained_backing->share(
       kwaque::byte_count{}, kwaque::byte_count{1});
     BOOST_REQUIRE(retained_slice.has_value());
     BOOST_CHECK_EQUAL(retained_slice->size().value(), 1U);

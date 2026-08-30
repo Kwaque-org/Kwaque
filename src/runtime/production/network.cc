@@ -216,7 +216,10 @@ seastar::future<result<network_read_result>> connection::read(
       holder.has_value(),
       "open connection rejected input gate entry");
     read_in_flight_ = true;
-    return input_.read_up_to(static_cast<std::size_t>(maximum_bytes.value()))
+    const auto physical_limit = static_cast<std::size_t>(
+      std::min<std::uint64_t>(
+        maximum_bytes.value(), maximum_contiguous_allocation_bytes));
+    return input_.read_up_to(physical_limit)
       .then_wrapped(
         [this, holder = std::move(*holder), maximum_bytes](
           seastar::future<seastar::temporary_buffer<char>> completed) mutable
@@ -406,8 +409,9 @@ seastar::future<result<void>> connection::write_general(
     static_cast<void>(reservation);
     static_cast<void>(holder);
     try {
-        auto serialization = co_await seastar::get_units(
-          write_serializer_, 1, caller_abort);
+        auto serialization
+          = co_await seastar::coroutine::without_preemption_check(
+            seastar::get_units(write_serializer_, 1, caller_abort));
         if (caller_abort.abort_requested()) {
             co_return co_await flush_preceding_batch_after_cancellation();
         }
@@ -583,7 +587,9 @@ seastar::future<result<void>> connection::close_once() {
     static_cast<void>(release_native);
     std::optional<operation_error> first_error;
     try {
-        auto serialization = co_await seastar::get_units(write_serializer_, 1);
+        auto serialization
+          = co_await seastar::coroutine::without_preemption_check(
+            seastar::get_units(write_serializer_, 1));
         try {
             co_await output_.close();
         } catch (const std::bad_alloc&) {

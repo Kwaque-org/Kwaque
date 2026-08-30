@@ -154,9 +154,10 @@ TEST(NetworkContractTest, ValidatesAdmissionAndPayloadBounds) {
     EXPECT_FALSE(kwaque::runtime::validate_network_write(empty).has_value());
     auto payload = kwaque::bytes::fragmented_buffer::copy_of(
       std::span<const char>{"payload", 7});
-    EXPECT_TRUE(kwaque::runtime::validate_network_write(payload).has_value());
+    ASSERT_TRUE(payload.has_value());
+    EXPECT_TRUE(kwaque::runtime::validate_network_write(*payload).has_value());
     EXPECT_TRUE(
-      kwaque::runtime::validate_network_write(payload, connection_limits)
+      kwaque::runtime::validate_network_write(*payload, connection_limits)
         .has_value());
 
     auto eof = kwaque::runtime::network_read_result::make(

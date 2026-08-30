@@ -88,6 +88,40 @@ public:
         return bytes::fragmented_buffer{std::move(fragments), size, size};
     }
 
+    // Appends newly returned native storage without copying its payload or
+    // allocating replacement backing. This remains an internal I/O boundary:
+    // callers can observe only immutable bytes after the buffer is published.
+    [[nodiscard]] static kwaque::result<void> append_adopted(
+      bytes::fragmented_buffer& buffer,
+      seastar::temporary_buffer<char> fragment) {
+        if (fragment.empty()) {
+            return {};
+        }
+        if (
+          fragment.size() > maximum_contiguous_allocation_bytes
+          || buffer.fragments_.size() == bytes::max_buffer_fragments) {
+            return kwaque::failure(errc::resource_exhausted);
+        }
+        const byte_count fragment_bytes{
+          static_cast<std::uint64_t>(fragment.size())};
+        const auto next_size = buffer.size_.checked_add(fragment_bytes);
+        const auto next_retained = buffer.retained_bytes_.checked_add(
+          fragment_bytes);
+        if (
+          !next_size || !next_retained || *next_size > bytes::max_buffer_bytes
+          || *next_retained > bytes::max_buffer_bytes) {
+            return kwaque::failure(errc::resource_exhausted);
+        }
+        buffer.fragments_.push_back(
+          bytes::fragmented_buffer::owned_fragment{
+            .storage = std::move(fragment),
+            .retained_bytes = fragment_bytes,
+          });
+        buffer.size_ = *next_size;
+        buffer.retained_bytes_ = *next_retained;
+        return {};
+    }
+
 private:
     [[nodiscard]] static bytes::fragment_view
     front(const bytes::fragmented_buffer& buffer) noexcept {

@@ -24,7 +24,7 @@ namespace kwaque::runtime {
 
 inline constexpr std::size_t maximum_dns_name_bytes = 253;
 inline constexpr std::size_t maximum_dns_results = 256;
-inline constexpr std::size_t maximum_dns_waiters = 4096;
+inline constexpr std::size_t maximum_dns_waiters = 256;
 inline constexpr std::size_t dns_native_concurrency = 1;
 inline constexpr monotonic_duration maximum_dns_ttl{
   static_cast<std::uint64_t>(std::numeric_limits<std::uint32_t>::max())
