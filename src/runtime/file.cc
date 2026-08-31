@@ -129,6 +129,25 @@ is_aligned(const void* address, std::uint64_t alignment) noexcept {
       alignment);
 }
 
+struct native_bulk_read_request final {
+    std::size_t bytes;
+    byte_count retained_bytes;
+};
+
+[[nodiscard]] native_bulk_read_request bounded_native_bulk_read(
+  std::uint64_t position,
+  std::uint64_t remaining,
+  std::uint64_t read_alignment) noexcept {
+    const auto front = position & (read_alignment - 1U);
+    const auto maximum_payload = maximum_contiguous_allocation_bytes - front;
+    const auto requested = std::min(remaining, maximum_payload);
+    const auto retained = round_up(requested + front, read_alignment);
+    return native_bulk_read_request{
+      .bytes = static_cast<std::size_t>(requested),
+      .retained_bytes = byte_count{retained},
+    };
+}
+
 } // namespace
 
 class file::writer final {
@@ -170,8 +189,6 @@ public:
                 co_return failure(std::move(*rejected));
             }
 
-            auto source = detail::fragmented_buffer_io_access::consume(
-              self.data_);
             const auto logical_end = self.initial_position_ + self.total_bytes_;
 
             const auto memory_alignment = self.owner_.memory_dma_alignment_;
@@ -194,6 +211,20 @@ public:
             }
             self.rmw_alignment_ = std::max(
               {self.memory_alignment_, read_alignment, self.write_alignment_});
+            if (
+              (!is_aligned(self.initial_position_, self.write_alignment_)
+               || !is_aligned(self.total_bytes_, self.write_alignment_))) {
+                const auto final_block = round_down(
+                  logical_end - 1U, self.rmw_alignment_);
+                if (
+                  self.rmw_alignment_
+                  > std::numeric_limits<std::uint64_t>::max() - final_block) {
+                    co_return failure(file_error(errc::out_of_range));
+                }
+            }
+
+            auto source = detail::fragmented_buffer_io_access::consume(
+              self.data_);
 
             const auto recommended = self.owner_.native_write_max_length_;
             self.native_chunk_bytes_ = round_down(
@@ -534,7 +565,7 @@ result<file_read_result> file_read_result::make(
     if (data.size() > maximum_bytes) {
         return failure(file_error(errc::out_of_range));
     }
-    if (data.empty() && !eof) {
+    if (data.size() < maximum_bytes && !eof) {
         return failure(file_error(errc::invalid_argument));
     }
     return file_read_result{std::move(data), eof};
@@ -782,19 +813,19 @@ file::read(file_position position, byte_count maximum_bytes) {
       file_gate_invariant,
       holder.has_value(),
       "open file rejected operation gate entry");
-    if (maximum_bytes.value() > maximum_contiguous_allocation_bytes) {
+    const auto native_request = bounded_native_bulk_read(
+      position.value(), maximum_bytes.value(), disk_read_dma_alignment_);
+    if (native_request.bytes != maximum_bytes.value()) {
         return read_chunked(
           position, maximum_bytes, std::move(*admission), std::move(*holder));
     }
     return native_file_
-      .dma_read_bulk<char>(
-        position.value(),
-        static_cast<std::size_t>(maximum_bytes.value()),
-        &io_intent_)
+      .dma_read_bulk<char>(position.value(), native_request.bytes, &io_intent_)
       .then_wrapped(
         [admission = std::move(*admission),
          holder = std::move(*holder),
-         maximum_bytes](
+         maximum_bytes,
+         retained_bytes = native_request.retained_bytes](
           seastar::future<seastar::temporary_buffer<char>> completed) mutable
           -> result<file_read_result> {
             static_cast<void>(admission);
@@ -806,8 +837,10 @@ file::read(file_position position, byte_count maximum_bytes) {
                       static_cast<std::size_t>(maximum_bytes.value()));
                 }
                 const bool eof = native.size() < maximum_bytes.value();
+                const auto retained = native.empty() ? byte_count{}
+                                                     : retained_bytes;
                 auto data = detail::fragmented_buffer_io_access::adopt(
-                  std::move(native));
+                  std::move(native), retained);
                 return file_read_result::make(
                   std::move(data), eof, maximum_bytes);
             } catch (const std::bad_alloc&) {
@@ -832,9 +865,9 @@ seastar::future<result<file_read_result>> file::read_chunked(
     bool eof = false;
     try {
         while (remaining != 0) {
-            const auto requested = static_cast<std::size_t>(
-              std::min<std::uint64_t>(
-                remaining, maximum_contiguous_allocation_bytes));
+            const auto native_request = bounded_native_bulk_read(
+              current, remaining, disk_read_dma_alignment_);
+            const auto requested = native_request.bytes;
             auto native = co_await native_file_.dma_read_bulk<char>(
               current, requested, &io_intent_);
             if (native.size() > requested) {
@@ -844,7 +877,7 @@ seastar::future<result<file_read_result>> file::read_chunked(
             if (received != 0) {
                 const auto appended
                   = detail::fragmented_buffer_io_access::append_adopted(
-                    data, std::move(native));
+                    data, std::move(native), native_request.retained_bytes);
                 KWAQUE_INVARIANT(
                   file_consumption_invariant,
                   appended.has_value(),

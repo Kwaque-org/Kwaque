@@ -64,6 +64,14 @@ configure_make(
         "//conditions:default": [],
     }),
     env = {
+        "CFLAGS": " ".join([
+            "-ffile-prefix-map=$$EXT_BUILD_ROOT=.",
+            "-ffile-prefix-map=$${EXT_BUILD_ROOT%%/sandbox/*}/external=external",
+        ]),
+        "CXXFLAGS": " ".join([
+            "-ffile-prefix-map=$$EXT_BUILD_ROOT=.",
+            "-ffile-prefix-map=$${EXT_BUILD_ROOT%%/sandbox/*}/external=external",
+        ]),
         "OPENSSL_BUILD_JOBS": "$(BUILD_JOBS)",
         "SOURCE_DATE_EPOCH": "0",
     },

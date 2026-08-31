@@ -263,7 +263,7 @@ SEASTAR_TEST_CASE(deterministic_scenario_is_byte_identical_under_noise) {
 }
 
 SEASTAR_TEST_CASE(trace_codec_yields_between_bounded_entry_batches) {
-    constexpr std::uint32_t entry_count{1'025};
+    constexpr std::uint32_t entry_count{10'001};
     const auto scheduler_budget = scenario_scheduler_limits();
     const auto trace_budget = trace_limits::make(
       trace_limit_values{
@@ -298,7 +298,7 @@ SEASTAR_TEST_CASE(trace_codec_yields_between_bounded_entry_batches) {
       std::move(*encoded), *trace_budget, 19);
     BOOST_REQUIRE(decoded.has_value());
     BOOST_CHECK_EQUAL(decoded->entries.size(), entry_count);
-    BOOST_CHECK(decoded->entries == captured.entries());
+    BOOST_CHECK(std::ranges::equal(decoded->entries, captured.entries()));
 }
 
 SEASTAR_TEST_CASE(scheduler_replay_compares_before_the_first_side_effect) {
@@ -341,6 +341,55 @@ SEASTAR_TEST_CASE(scheduler_replay_compares_before_the_first_side_effect) {
     BOOST_REQUIRE(!divergence.has_value());
     BOOST_CHECK(divergence.error().code() == kwaque::errc::replay_divergence);
     BOOST_TEST(untouched_state == 0U);
+    co_return;
+}
+
+SEASTAR_TEST_CASE(
+  replay_rejects_a_changed_canceled_deadline_at_the_schedule_entry) {
+    const auto scheduler_budget = scenario_scheduler_limits();
+    const auto trace_budget = scenario_trace_limits();
+    const auto header = scenario_header(92, scheduler_budget, trace_budget);
+    event_trace captured{header, trace_budget};
+    {
+        scheduler target{scheduler_budget, &captured};
+        const auto event = target.schedule(
+          kwaque::runtime::monotonic_time{10},
+          event_priority::normal(),
+          [] noexcept {},
+          trace_event_descriptor{
+            .kind = trace_event_kind::generic,
+            .stable_id = 77,
+          });
+        BOOST_REQUIRE(event.has_value());
+        const auto canceled = target.cancel(*event);
+        BOOST_REQUIRE(canceled.has_value());
+        BOOST_REQUIRE(*canceled);
+    }
+    const auto encoded = captured.encode();
+    BOOST_REQUIRE(encoded.has_value());
+    auto decoded = event_trace::decode(*encoded, trace_budget);
+    BOOST_REQUIRE(decoded.has_value());
+    auto replay = event_trace::replay(
+      header, trace_budget, std::move(*decoded));
+    BOOST_REQUIRE(replay.has_value());
+    {
+        scheduler target{scheduler_budget, replay->get()};
+        scheduler::callback retained{[] noexcept {}};
+        const auto changed = target.schedule(
+          kwaque::runtime::monotonic_time{20},
+          event_priority::normal(),
+          std::move(retained),
+          trace_event_descriptor{
+            .kind = trace_event_kind::generic,
+            .stable_id = 77,
+          });
+        BOOST_REQUIRE(!changed.has_value());
+        BOOST_CHECK(changed.error().code() == kwaque::errc::replay_divergence);
+        // Replay rejected the schedule before callback ownership moved.
+        // NOLINTNEXTLINE(bugprone-use-after-move)
+        BOOST_CHECK(static_cast<bool>(retained));
+        BOOST_CHECK(target.pending_events() == 0U);
+    }
     co_return;
 }
 

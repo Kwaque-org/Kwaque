@@ -28,6 +28,11 @@ constexpr invariant_id connection_gate_invariant{"KQ-NET-CONN-GATE"};
 constexpr invariant_id listener_move_invariant{"KQ-NET-LISTEN-MOVE-IDLE"};
 constexpr invariant_id listener_closed_invariant{"KQ-NET-LISTEN-CLOSED"};
 constexpr std::uint64_t maximum_unflushed_bytes = 1024U * 1024U;
+constexpr auto native_input_buffer_limit = static_cast<unsigned>(
+  maximum_contiguous_allocation_bytes);
+static_assert(
+  static_cast<std::size_t>(native_input_buffer_limit)
+  == maximum_contiguous_allocation_bytes);
 
 operation_error network_error(errc code) noexcept {
     return operation_error{code, operation_kind::network};
@@ -103,7 +108,12 @@ connection::connection(
   network_endpoint remote,
   network_connection_limits limits)
   : native_(std::move(native))
-  , input_(native_.input())
+  , input_(native_.input(
+      seastar::connected_socket_input_stream_config{
+        .buffer_size = 8192,
+        .min_buffer_size = 512,
+        .max_buffer_size = native_input_buffer_limit,
+      }))
   , output_(native_.output())
   , local_(local)
   , remote_(remote)
@@ -232,9 +242,13 @@ seastar::future<result<network_read_result>> connection::read(
                     return failure(network_error(errc::aborted));
                 }
                 const bool eof = native.empty() && input_.eof();
+                const auto retained
+                  = native.empty()
+                      ? byte_count{}
+                      : byte_count{maximum_contiguous_allocation_bytes};
                 auto data
                   = kwaque::runtime::detail::fragmented_buffer_io_access::adopt(
-                    std::move(native));
+                    std::move(native), retained);
                 return network_read_result::make(
                   std::move(data), eof, maximum_bytes);
             } catch (const std::bad_alloc&) {

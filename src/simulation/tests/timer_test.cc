@@ -140,6 +140,13 @@ SEASTAR_TEST_CASE(simulation_timer_caller_abort_posts_a_terminal_event) {
     const auto rejected_outcome = co_await std::move(rejected);
     BOOST_REQUIRE(!rejected_outcome.has_value());
     BOOST_CHECK(rejected_outcome.error().code() == kwaque::errc::aborted);
+    const auto first_event = preaborted_target.schedule(
+      monotonic_time{}, event_priority::normal(), [] noexcept {});
+    BOOST_REQUIRE(first_event.has_value());
+    BOOST_TEST(first_event->value() == 1U);
+    const auto canceled = preaborted_target.cancel(*first_event);
+    BOOST_REQUIRE(canceled.has_value());
+    BOOST_TEST(*canceled);
     co_await stop_timer(preaborted_service, preaborted_target);
 }
 

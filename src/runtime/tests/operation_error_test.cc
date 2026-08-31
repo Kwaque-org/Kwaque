@@ -94,6 +94,8 @@ TEST(OperationErrorTest, SchedulerBudgetVocabularyIsStableAndBounded) {
       static_cast<std::uint8_t>(operation_context_key::expected) == 10);
     static_assert(
       static_cast<std::uint8_t>(operation_context_key::actual) == 11);
+    static_assert(
+      static_cast<std::uint8_t>(operation_context_key::detail) == 12);
     EXPECT_EQ(kwaque::runtime::to_string(operation_kind::clock), "clock");
     EXPECT_EQ(kwaque::runtime::to_string(operation_kind::trace), "trace");
 

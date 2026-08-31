@@ -129,6 +129,14 @@ runtime::result<std::uint64_t> deterministic_random::recorded_word_at(
   runtime::monotonic_time time,
   random_coordinate coordinate,
   std::uint64_t draw_index) const noexcept {
+    if (
+      trace.header().master_seed != master_seed_
+      || trace.header().random_algorithm_version
+           != deterministic_random_algorithm_version
+      || trace.header().coordinate_schema_version
+           != deterministic_random_coordinate_version) {
+        return runtime::failure(random_error(errc::invalid_argument));
+    }
     const auto word = word_at(coordinate, draw_index);
     auto observed = trace.observe(
       trace_entry{

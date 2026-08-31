@@ -68,6 +68,7 @@ kwaque_cc_library(
     ],
     deps = [
         "//src/base",
+        "//src/base:invariant",
         "//src/bytes:fragmented_buffer",
         "@seastar",
     ],

@@ -378,6 +378,42 @@ SEASTAR_TEST_CASE(scheduler_cancellation_repairs_every_heap_position) {
     co_return;
 }
 
+SEASTAR_TEST_CASE(
+  scheduler_robin_hood_deletion_preserves_displaced_sequential_ids) {
+    const auto limits = scheduler_limits::make(
+      scheduler_limit_values{
+        .pending_events = 3,
+        .events_per_pump = 8,
+        .total_events = 16,
+        .maximum_deadline = monotonic_time{1},
+      });
+    BOOST_REQUIRE(limits.has_value());
+    scheduler target{*limits};
+    const auto add = [&target] {
+        auto scheduled = target.schedule(
+          monotonic_time{}, event_priority::normal(), [] noexcept {});
+        BOOST_REQUIRE(scheduled.has_value());
+        return *scheduled;
+    };
+
+    const auto one = add();
+    const auto two = add();
+    const auto three = add();
+    BOOST_TEST(cancel_event(target, two));
+    const auto four = add();
+    BOOST_TEST(cancel_event(target, three));
+    const auto five = add();
+    BOOST_TEST(cancel_event(target, four));
+    const auto six = add();
+    BOOST_TEST(cancel_event(target, five));
+    const auto seven = add();
+    BOOST_TEST(cancel_event(target, six));
+    BOOST_TEST(cancel_event(target, seven));
+    BOOST_TEST(cancel_event(target, one));
+    BOOST_TEST(target.pending_events() == 0U);
+    co_return;
+}
+
 SEASTAR_TEST_CASE(scheduler_chunked_storage_preserves_order_across_fragments) {
     constexpr std::uint32_t event_count{8'193};
     const auto limits = scheduler_limits::make(
@@ -394,14 +430,22 @@ SEASTAR_TEST_CASE(scheduler_chunked_storage_preserves_order_across_fragments) {
     observed.reserve(event_count);
     std::vector<event_id> ids;
     ids.reserve(event_count);
+    bool all_scheduled = true;
+    const auto before_enqueue = seastar::memory::stats().mallocs();
     for (std::uint64_t marker = 0; marker < event_count; ++marker) {
         auto scheduled = target.schedule(
           monotonic_time{0},
           event_priority::normal(),
           [&observed, marker] noexcept { observed.push_back(marker); });
-        BOOST_REQUIRE(scheduled.has_value());
+        if (!scheduled) {
+            all_scheduled = false;
+            break;
+        }
         ids.push_back(*scheduled);
     }
+    const auto after_enqueue = seastar::memory::stats().mallocs();
+    BOOST_REQUIRE(all_scheduled);
+    BOOST_TEST(after_enqueue == before_enqueue);
 
     const auto root = scheduler_test_access::event_at(target, 0);
     const auto middle = scheduler_test_access::event_at(
@@ -728,6 +772,61 @@ SEASTAR_TEST_CASE(
     BOOST_REQUIRE(!invalid_kind.has_value());
     BOOST_CHECK(invalid_kind.error().code() == kwaque::errc::invalid_argument);
     BOOST_TEST(target.pending_events() == 0U);
+
+    const auto file_without_cleanup = target.schedule(
+      monotonic_time{},
+      event_priority::normal(),
+      [] noexcept {},
+      kwaque::simulation::trace_event_descriptor{
+        .kind = kwaque::simulation::trace_event_kind::file,
+      });
+    BOOST_REQUIRE(!file_without_cleanup.has_value());
+    BOOST_CHECK(
+      file_without_cleanup.error().code() == kwaque::errc::invalid_argument);
+
+    const auto direct_fault = target.schedule(
+      monotonic_time{},
+      event_priority::normal(),
+      [] noexcept {},
+      kwaque::simulation::trace_event_descriptor{
+        .kind = kwaque::simulation::trace_event_kind::fault,
+      });
+    BOOST_REQUIRE(!direct_fault.has_value());
+
+    const auto discarded_file = target.schedule(
+      monotonic_time{},
+      event_priority::normal(),
+      [] noexcept {},
+      kwaque::simulation::trace_event_descriptor{
+        .kind = kwaque::simulation::trace_event_kind::file,
+        .effect = kwaque::simulation::trace_action::operation_discarded,
+      },
+      kwaque::simulation::event_cleanup_policy::invoke);
+    BOOST_REQUIRE(discarded_file.has_value());
+    BOOST_TEST(cancel_event(target, *discarded_file));
+
+    const auto invalid_file_crash = target.schedule(
+      monotonic_time{},
+      event_priority::normal(),
+      [] noexcept {},
+      kwaque::simulation::trace_event_descriptor{
+        .kind = kwaque::simulation::trace_event_kind::file,
+        .effect = kwaque::simulation::trace_action::crash_applied,
+      },
+      kwaque::simulation::event_cleanup_policy::invoke);
+    BOOST_REQUIRE(!invalid_file_crash.has_value());
+
+    const auto filesystem_crash = target.schedule(
+      monotonic_time{},
+      event_priority::normal(),
+      [] noexcept {},
+      kwaque::simulation::trace_event_descriptor{
+        .kind = kwaque::simulation::trace_event_kind::filesystem,
+        .effect = kwaque::simulation::trace_action::crash_applied,
+      },
+      kwaque::simulation::event_cleanup_policy::invoke);
+    BOOST_REQUIRE(filesystem_crash.has_value());
+    BOOST_TEST(cancel_event(target, *filesystem_crash));
     co_return;
 }
 

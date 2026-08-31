@@ -199,3 +199,36 @@ TEST(DeterministicRandomTest, LargeSequentialFillCreatesNoTraceEntries) {
     kwaque::runtime::fill_bytes(*source, output);
     EXPECT_TRUE(trace.entries().empty());
 }
+
+TEST(DeterministicRandomTest, RecordedDecisionsRequireTheTraceMasterSeed) {
+    const auto limits = kwaque::simulation::trace_limits::make(
+      kwaque::simulation::trace_limit_values{
+        .entries = 8,
+        .encoded_bytes = 4'096,
+        .line_bytes = 1'024,
+      });
+    ASSERT_TRUE(limits.has_value());
+    kwaque::simulation::event_trace trace{
+      kwaque::simulation::trace_header::current(
+        7,
+        kwaque::simulation::deterministic_random_algorithm_version,
+        kwaque::simulation::deterministic_random_coordinate_version,
+        kwaque::simulation::trace_scheduler_budget{
+          .pending_events = 1,
+          .events_per_pump = 1,
+          .total_events = 1,
+          .maximum_deadline = 1,
+        },
+        *limits,
+        kwaque::simulation::trace_digest{},
+        kwaque::simulation::trace_digest{}),
+      *limits};
+    const deterministic_random random{8};
+    const auto source_coordinate = coordinate(
+      random_domain::runtime_stream, 1, 1);
+    const auto rejected = random.recorded_word_at(
+      trace, kwaque::runtime::monotonic_time{}, source_coordinate, 0);
+    ASSERT_FALSE(rejected.has_value());
+    EXPECT_EQ(rejected.error().code(), kwaque::errc::invalid_argument);
+    EXPECT_TRUE(trace.entries().empty());
+}

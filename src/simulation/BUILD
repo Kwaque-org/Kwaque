@@ -10,12 +10,17 @@ filegroup(
 kwaque_cc_library(
     name = "event_trace",
     srcs = ["event_trace.cc"],
-    hdrs = ["event_trace.h"],
+    hdrs = [
+        "determinism_version.h",
+        "event_trace.h",
+    ],
     visibility = ["//src/simulation:__subpackages__"],
     deps = [
         "//src/base",
         "//src/base:invariant",
         "//src/runtime:error",
+        "//src/runtime:fault",
+        "//src/runtime:fault_api",
         "//src/runtime:time",
         "@seastar",
     ],
@@ -25,7 +30,10 @@ kwaque_cc_library(
     name = "event_trace_invariant_test_support",
     testonly = True,
     srcs = ["event_trace.cc"],
-    hdrs = ["event_trace.h"],
+    hdrs = [
+        "determinism_version.h",
+        "event_trace.h",
+    ],
     visibility = [
         "//src/simulation:__pkg__",
         "//src/simulation/tests:__pkg__",
@@ -34,6 +42,8 @@ kwaque_cc_library(
         "//src/base",
         "//src/base:invariant_test_support",
         "//src/runtime:error",
+        "//src/runtime:fault",
+        "//src/runtime:fault_api",
         "//src/runtime:time",
         "@seastar",
     ],
@@ -160,4 +170,49 @@ kwaque_cc_library(
     hdrs = ["deterministic_random_test_support.h"],
     visibility = ["//src/simulation/tests:__pkg__"],
     deps = [":deterministic_random"],
+)
+
+kwaque_cc_library(
+    name = "fault_schedule",
+    srcs = ["fault_schedule.cc"],
+    hdrs = ["fault_schedule.h"],
+    visibility = ["//src/simulation:__subpackages__"],
+    deps = [
+        ":deterministic_random",
+        ":event_trace",
+        ":scheduler",
+        "//src/base:invariant",
+        "//src/runtime:fault",
+        "//src/runtime:fault_api",
+        "//src/runtime:random",
+        "//src/runtime:shard_affinity",
+        "@seastar",
+    ],
+)
+
+kwaque_cc_library(
+    name = "fake_file",
+    srcs = ["fake_file.cc"],
+    hdrs = ["fake_file.h"],
+    visibility = ["//src/simulation:__subpackages__"],
+    deps = [
+        ":fault_schedule",
+        ":scheduler",
+        "//src/base",
+        "//src/base:invariant",
+        "//src/runtime:error",
+        "//src/runtime:fault_api",
+        "//src/runtime:file",
+        "//src/runtime:shard_affinity",
+        "@abseil-cpp//absl/container:btree",
+        "@seastar",
+    ],
+)
+
+kwaque_cc_library(
+    name = "fake_file_test_support",
+    testonly = True,
+    hdrs = ["fake_file_test_support.h"],
+    visibility = ["//src/simulation/tests:__pkg__"],
+    deps = [":fake_file"],
 )

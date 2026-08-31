@@ -3,6 +3,7 @@
 #include "src/base/invariant.h"
 
 #include <algorithm>
+#include <bit>
 #include <limits>
 #include <utility>
 
@@ -16,6 +17,7 @@ constexpr invariant_id scheduler_reservation_invariant{
   "KQ-SCHEDULER-ID-RESERVATION"};
 constexpr invariant_id scheduler_cleanup_invariant{"KQ-SCHEDULER-CLEANUP"};
 constexpr invariant_id scheduler_trace_invariant{"KQ-SCHEDULER-TRACE"};
+constexpr invariant_id scheduler_storage_invariant{"KQ-SCHEDULER-STORAGE"};
 constexpr std::size_t scheduler_heap_root_index{1};
 constexpr std::uint64_t scheduler_sentinel_event_id{0};
 
@@ -29,6 +31,190 @@ invalid_limits(errc code) noexcept {
 }
 
 } // namespace
+
+scheduler::event_storage::event_storage(std::size_t capacity)
+  : capacity_(capacity) {
+    auto remaining = capacity;
+    while (remaining != 0) {
+        const auto count = std::min(remaining, entries_per_chunk);
+        chunks_.emplace_back(count);
+        remaining -= count;
+    }
+}
+
+scheduler::event&
+scheduler::event_storage::operator[](std::size_t index) noexcept {
+    KWAQUE_INVARIANT(
+      scheduler_storage_invariant,
+      index < size_,
+      "scheduler event storage index out of range");
+    return *chunks_[index / entries_per_chunk][index % entries_per_chunk];
+}
+
+const scheduler::event&
+scheduler::event_storage::operator[](std::size_t index) const noexcept {
+    KWAQUE_INVARIANT(
+      scheduler_storage_invariant,
+      index < size_,
+      "scheduler event storage index out of range");
+    return *chunks_[index / entries_per_chunk][index % entries_per_chunk];
+}
+
+void scheduler::event_storage::push_back(event value) noexcept {
+    KWAQUE_INVARIANT(
+      scheduler_storage_invariant,
+      size_ < capacity_,
+      "scheduler event storage exceeded its fixed capacity");
+    chunks_[size_ / entries_per_chunk][size_ % entries_per_chunk].emplace(
+      std::move(value));
+    ++size_;
+}
+
+void scheduler::event_storage::pop_back() noexcept {
+    KWAQUE_INVARIANT(
+      scheduler_storage_invariant,
+      size_ != 0,
+      "scheduler event storage popped while empty");
+    --size_;
+    chunks_[size_ / entries_per_chunk][size_ % entries_per_chunk].reset();
+}
+
+scheduler::event_index::event_index(std::size_t maximum_entries) {
+    const auto requested = maximum_entries + maximum_entries / 2U + 1U;
+    capacity_ = std::bit_ceil(std::max<std::size_t>(requested, 2U));
+    mask_ = capacity_ - 1U;
+    auto remaining = capacity_;
+    while (remaining != 0) {
+        const auto count = std::min(remaining, entries_per_chunk);
+        chunks_.emplace_back(count);
+        remaining -= count;
+    }
+}
+
+std::uint64_t scheduler::event_index::hash(std::uint64_t key) noexcept {
+    key += UINT64_C(0x9e3779b97f4a7c15);
+    key = (key ^ (key >> 30U)) * UINT64_C(0xbf58476d1ce4e5b9);
+    key = (key ^ (key >> 27U)) * UINT64_C(0x94d049bb133111eb);
+    return key ^ (key >> 31U);
+}
+
+std::size_t scheduler::event_index::bucket(std::uint64_t key) const noexcept {
+    return static_cast<std::size_t>(hash(key)) & mask_;
+}
+
+scheduler::event_index::slot&
+scheduler::event_index::slot_at(std::size_t index) noexcept {
+    return chunks_[index / entries_per_chunk][index % entries_per_chunk];
+}
+
+const scheduler::event_index::slot&
+scheduler::event_index::slot_at(std::size_t index) const noexcept {
+    return chunks_[index / entries_per_chunk][index % entries_per_chunk];
+}
+
+std::size_t* scheduler::event_index::find(std::uint64_t key) noexcept {
+    auto position = bucket(key);
+    std::uint32_t distance = 1;
+    for (std::size_t probed = 0; probed < capacity_; ++probed) {
+        auto& candidate = slot_at(position);
+        if (candidate.distance < distance) {
+            return nullptr;
+        }
+        if (candidate.key == key) {
+            return &candidate.value;
+        }
+        ++distance;
+        position = (position + 1U) & mask_;
+    }
+    return nullptr;
+}
+
+const std::size_t*
+scheduler::event_index::find(std::uint64_t key) const noexcept {
+    auto position = bucket(key);
+    std::uint32_t distance = 1;
+    for (std::size_t probed = 0; probed < capacity_; ++probed) {
+        const auto& candidate = slot_at(position);
+        if (candidate.distance < distance) {
+            return nullptr;
+        }
+        if (candidate.key == key) {
+            return &candidate.value;
+        }
+        ++distance;
+        position = (position + 1U) & mask_;
+    }
+    return nullptr;
+}
+
+std::size_t& scheduler::event_index::at(std::uint64_t key) noexcept {
+    auto* found = find(key);
+    KWAQUE_INVARIANT(
+      scheduler_index_invariant,
+      found != nullptr,
+      "scheduler event index lost a live event");
+    return *found;
+}
+
+bool scheduler::event_index::try_emplace(
+  std::uint64_t key, std::size_t value) noexcept {
+    slot incoming{
+      .key = key,
+      .value = value,
+      .distance = 1,
+    };
+    bool seeking_key = true;
+    auto position = bucket(key);
+    for (std::size_t probed = 0; probed < capacity_; ++probed) {
+        auto& candidate = slot_at(position);
+        if (candidate.distance == 0) {
+            candidate = incoming;
+            ++size_;
+            return true;
+        }
+        if (seeking_key && candidate.key == key) {
+            return false;
+        }
+        if (incoming.distance > candidate.distance) {
+            std::swap(incoming, candidate);
+            seeking_key = false;
+        }
+        ++incoming.distance;
+        position = (position + 1U) & mask_;
+    }
+    KWAQUE_INVARIANT(
+      scheduler_index_invariant,
+      false,
+      "scheduler event index exceeded its fixed capacity");
+    return false;
+}
+
+bool scheduler::event_index::erase(std::uint64_t key) noexcept {
+    auto position = bucket(key);
+    std::uint32_t distance = 1;
+    for (std::size_t probed = 0; probed < capacity_; ++probed) {
+        const auto& candidate = slot_at(position);
+        if (candidate.distance < distance) {
+            return false;
+        }
+        if (candidate.key == key) {
+            auto hole = position;
+            auto next = (hole + 1U) & mask_;
+            while (slot_at(next).distance > 1) {
+                slot_at(hole) = slot_at(next);
+                --slot_at(hole).distance;
+                hole = next;
+                next = (next + 1U) & mask_;
+            }
+            slot_at(hole) = slot{};
+            --size_;
+            return true;
+        }
+        ++distance;
+        position = (position + 1U) & mask_;
+    }
+    return false;
+}
 
 runtime::result<scheduler_limits>
 scheduler_limits::make(scheduler_limit_values values) noexcept {
@@ -50,17 +236,14 @@ scheduler_limits::make(scheduler_limit_values values) noexcept {
 
 scheduler::scheduler(scheduler_limits limits, event_trace* trace)
   : limits_(limits)
-  , trace_(trace) {
-    const auto storage_capacity
-      = static_cast<std::size_t>(limits_.pending_events()) + 1U;
-    heap_.reserve(storage_capacity);
-    indices_.reserve(storage_capacity);
+  , trace_(trace)
+  , heap_(static_cast<std::size_t>(limits.pending_events()) + 1U)
+  , indices_(static_cast<std::size_t>(limits.pending_events()) + 1U) {
     heap_.push_back(event{});
-    const auto [sentinel, inserted] = indices_.try_emplace(
-      scheduler_sentinel_event_id, 0U);
+    const auto inserted = indices_.try_emplace(scheduler_sentinel_event_id, 0U);
     KWAQUE_INVARIANT(
       scheduler_index_invariant,
-      inserted && sentinel->second == 0U,
+      inserted && indices_.at(scheduler_sentinel_event_id) == 0U,
       "scheduler sentinel insertion failed");
     KWAQUE_INVARIANT(
       scheduler_trace_invariant,
@@ -110,12 +293,12 @@ scheduler::~scheduler() {
             static_cast<void>(remove_at(heap_.size() - 1U));
         }
     }
-    const auto sentinel = indices_.find(scheduler_sentinel_event_id);
+    const auto* sentinel = indices_.find(scheduler_sentinel_event_id);
     KWAQUE_INVARIANT(
       scheduler_drained_invariant,
       heap_.size() == scheduler_heap_root_index && indices_.size() == 1U
-        && sentinel != indices_.end() && sentinel->second == 0U
-        && reserved_event_ids_ == 0 && !pumping_ && !discarding_failed_event_,
+        && sentinel != nullptr && *sentinel == 0U && reserved_event_ids_ == 0
+        && !pumping_ && !discarding_failed_event_,
       "scheduler destroyed with pending work");
     if (trace_ != nullptr) {
         trace_->detach_scheduler();
@@ -130,66 +313,38 @@ runtime::result<event_id> scheduler::schedule(
   event_cleanup_policy cleanup,
   event_trace::reservation trace_reservation) {
     assert_current();
-    if (auto healthy = check_trace_failure(); !healthy) {
-        return runtime::failure(healthy.error());
-    }
-    if (auto valid = validate_descriptor(descriptor, cleanup); !valid) {
-        return runtime::failure(valid.error());
-    }
     if (!completion) {
         return runtime::failure(scheduler_error(errc::invalid_argument));
     }
-    if (deadline < now_) {
-        auto error = scheduler_error(errc::invalid_argument);
-        static_cast<void>(error.add_context(
-          runtime::operation_context_key::deadline_ns, deadline.nanoseconds()));
-        static_cast<void>(error.add_context(
-          runtime::operation_context_key::limit, now_.nanoseconds()));
-        return runtime::failure(std::move(error));
-    }
-    if (deadline > limits_.maximum_deadline()) {
-        auto error = scheduler_error(errc::out_of_range);
-        static_cast<void>(error.add_context(
-          runtime::operation_context_key::deadline_ns, deadline.nanoseconds()));
-        static_cast<void>(error.add_context(
-          runtime::operation_context_key::limit,
-          limits_.maximum_deadline().nanoseconds()));
-        return runtime::failure(std::move(error));
-    }
-    if (pending_events() == limits_.pending_events()) {
-        auto error = scheduler_error(errc::queue_full);
-        static_cast<void>(error.add_context(
-          runtime::operation_context_key::items, pending_events()));
-        static_cast<void>(error.add_context(
-          runtime::operation_context_key::limit, limits_.pending_events()));
-        return runtime::failure(std::move(error));
-    }
-    if (!event_id_available()) {
-        auto error = scheduler_error(errc::out_of_range);
-        static_cast<void>(error.add_context(
-          runtime::operation_context_key::sequence,
-          std::numeric_limits<std::uint64_t>::max()));
-        return runtime::failure(std::move(error));
+    if (
+      auto available = can_schedule(deadline, descriptor, cleanup);
+      !available) {
+        return runtime::failure(available.error());
     }
     if (trace_ == nullptr && trace_reservation.active()) {
         return runtime::failure(scheduler_error(errc::invalid_argument));
     }
-
-    const event_id id{next_event_id_};
     if (trace_ != nullptr) {
         const std::uint32_t entries = descriptor.effect == trace_action::none
                                         ? 2U
                                         : 3U;
+        if (
+          trace_reservation.active()
+          && trace_reservation.entries() != entries) {
+            return runtime::failure(
+              runtime::operation_error{
+                errc::invalid_argument, runtime::operation_kind::trace});
+        }
+    }
+
+    const event_id id{next_event_id_};
+    if (trace_ != nullptr) {
         if (!trace_reservation.active()) {
             auto reserved = reserve_trace(descriptor);
             if (!reserved) {
                 return runtime::failure(reserved.error());
             }
             trace_reservation = std::move(*reserved);
-        } else if (trace_reservation.entries() != entries) {
-            return runtime::failure(
-              runtime::operation_error{
-                errc::invalid_argument, runtime::operation_kind::trace});
         }
         event pending{
           .deadline = deadline,
@@ -217,9 +372,7 @@ runtime::result<event_id> scheduler::schedule(
         .descriptor = descriptor,
         .trace_reservation = std::move(trace_reservation),
       });
-    const auto [position, inserted] = indices_.try_emplace(
-      id.value(), heap_.size() - 1);
-    static_cast<void>(position);
+    const auto inserted = indices_.try_emplace(id.value(), heap_.size() - 1U);
     KWAQUE_INVARIANT(
       scheduler_index_invariant, inserted, "duplicate scheduler event id");
     sift_up(heap_.size() - 1);
@@ -230,6 +383,52 @@ runtime::result<event_id> scheduler::schedule(
         ++next_event_id_;
     }
     return id;
+}
+
+runtime::result<void> scheduler::can_schedule(
+  runtime::monotonic_time deadline,
+  trace_event_descriptor descriptor,
+  event_cleanup_policy cleanup) const noexcept {
+    assert_current();
+    if (auto healthy = check_trace_failure(); !healthy) {
+        return runtime::failure(healthy.error());
+    }
+    if (auto valid = validate_descriptor(descriptor, cleanup); !valid) {
+        return runtime::failure(valid.error());
+    }
+    if (deadline < now_) {
+        auto error = scheduler_error(errc::invalid_argument);
+        static_cast<void>(error.add_context(
+          runtime::operation_context_key::deadline_ns, deadline.nanoseconds()));
+        static_cast<void>(error.add_context(
+          runtime::operation_context_key::limit, now_.nanoseconds()));
+        return runtime::failure(std::move(error));
+    }
+    if (deadline > limits_.maximum_deadline()) {
+        auto error = scheduler_error(errc::out_of_range);
+        static_cast<void>(error.add_context(
+          runtime::operation_context_key::deadline_ns, deadline.nanoseconds()));
+        static_cast<void>(error.add_context(
+          runtime::operation_context_key::limit,
+          limits_.maximum_deadline().nanoseconds()));
+        return runtime::failure(std::move(error));
+    }
+    if (pending_events() >= limits_.pending_events()) {
+        auto error = scheduler_error(errc::queue_full);
+        static_cast<void>(error.add_context(
+          runtime::operation_context_key::items, pending_events()));
+        static_cast<void>(error.add_context(
+          runtime::operation_context_key::limit, limits_.pending_events()));
+        return runtime::failure(std::move(error));
+    }
+    if (!event_id_available()) {
+        auto error = scheduler_error(errc::out_of_range);
+        static_cast<void>(error.add_context(
+          runtime::operation_context_key::sequence,
+          std::numeric_limits<std::uint64_t>::max()));
+        return runtime::failure(std::move(error));
+    }
+    return {};
 }
 
 runtime::result<scheduler::event_id_reservation> scheduler::reserve_event_id() {
@@ -259,6 +458,8 @@ scheduler::reserve_trace(trace_event_descriptor descriptor) {
         descriptor,
         descriptor.kind == trace_event_kind::timer
             || descriptor.kind == trace_event_kind::wall_adjustment
+            || descriptor.kind == trace_event_kind::file
+            || descriptor.kind == trace_event_kind::filesystem
           ? event_cleanup_policy::invoke
           : event_cleanup_policy::drop);
       !valid) {
@@ -282,11 +483,11 @@ runtime::result<bool> scheduler::cancel(event_id id) noexcept {
     if (!id.valid()) {
         return false;
     }
-    const auto found = indices_.find(id.value());
-    if (found == indices_.end()) {
+    const auto* found = indices_.find(id.value());
+    if (found == nullptr) {
         return false;
     }
-    auto& selected = heap_[found->second];
+    auto& selected = heap_[*found];
     if (
       auto observed = observe_event(
         trace_action::canceled,
@@ -296,7 +497,7 @@ runtime::result<bool> scheduler::cancel(event_id id) noexcept {
       !observed) {
         return runtime::failure(observed.error());
     }
-    static_cast<void>(remove_at(found->second));
+    static_cast<void>(remove_at(*found));
     return true;
 }
 
@@ -578,6 +779,11 @@ const runtime::operation_error* scheduler::trace_failure() const {
     return trace_ == nullptr ? nullptr : trace_->failure();
 }
 
+bool scheduler::uses_trace(const event_trace& trace) const {
+    assert_current();
+    return trace_ == &trace;
+}
+
 bool scheduler::discarding_failed_event() const {
     assert_current();
     return discarding_failed_event_;
@@ -644,7 +850,11 @@ scheduler::event scheduler::remove_at(std::size_t index) noexcept {
     }
     event removed = std::move(heap_.back());
     heap_.pop_back();
-    indices_.erase(removed_id);
+    const auto erased = indices_.erase(removed_id);
+    KWAQUE_INVARIANT(
+      scheduler_index_invariant,
+      erased,
+      "scheduler event index lost the removed event");
 
     if (index < heap_.size()) {
         if (
@@ -720,19 +930,28 @@ runtime::result<void> scheduler::validate_descriptor(
     const auto effect = static_cast<std::uint8_t>(descriptor.effect);
     const auto cleanup_value = static_cast<std::uint8_t>(cleanup);
     if (
-      kind > static_cast<std::uint8_t>(trace_event_kind::keyed_random)
-      || effect > static_cast<std::uint8_t>(trace_action::keyed_decision)
+      kind > static_cast<std::uint8_t>(trace_event_kind::filesystem)
+      || effect > static_cast<std::uint8_t>(trace_action::crash_applied)
       || cleanup_value
            > static_cast<std::uint8_t>(event_cleanup_policy::invoke)
       || descriptor.kind == trace_event_kind::keyed_random
+      || descriptor.kind == trace_event_kind::fault
       || ((descriptor.kind == trace_event_kind::timer
-           || descriptor.kind == trace_event_kind::wall_adjustment)
+           || descriptor.kind == trace_event_kind::wall_adjustment
+           || descriptor.kind == trace_event_kind::file
+           || descriptor.kind == trace_event_kind::filesystem)
           && cleanup != event_cleanup_policy::invoke)
       || (descriptor.kind == trace_event_kind::wall_adjustment
           && descriptor.effect != trace_action::wall_adjusted)
       || (descriptor.effect != trace_action::none
-          && (descriptor.effect != trace_action::wall_adjusted
-              || descriptor.kind != trace_event_kind::wall_adjustment)))
+          && !(
+            (descriptor.effect == trace_action::wall_adjusted
+             && descriptor.kind == trace_event_kind::wall_adjustment)
+            || (descriptor.effect == trace_action::operation_discarded
+                && (descriptor.kind == trace_event_kind::file
+                    || descriptor.kind == trace_event_kind::filesystem))
+            || (descriptor.effect == trace_action::crash_applied
+                && descriptor.kind == trace_event_kind::filesystem))))
       [[unlikely]] {
         return runtime::failure(scheduler_error(errc::invalid_argument));
     }
@@ -767,6 +986,7 @@ runtime::result<void> scheduler::observe_event(
     return trace_->observe(
       trace_entry{
         .time = now_,
+        .deadline = selected.deadline,
         .action = action,
         .kind = selected.descriptor.kind,
         .event_id = selected.id.value(),

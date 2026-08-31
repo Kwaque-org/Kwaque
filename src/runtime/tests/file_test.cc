@@ -44,6 +44,7 @@ struct file_probe final {
     std::vector<io_call> writes;
     std::vector<io_call> reads;
     std::vector<std::size_t> bulk_read_sizes;
+    std::vector<std::size_t> bulk_read_allocations;
     std::vector<std::uintptr_t> bulk_read_addresses;
     std::vector<char> storage;
     std::uint64_t size{0};
@@ -150,8 +151,13 @@ public:
         const auto available = position < probe_.size ? probe_.size - position
                                                       : std::uint64_t{0};
         const auto read = std::min<std::uint64_t>(available, size);
-        seastar::temporary_buffer<std::uint8_t> result{
-          static_cast<std::size_t>(read)};
+        const auto front = position & (probe_.read_alignment - 1U);
+        const auto allocation = static_cast<std::size_t>(
+          (size + front + probe_.read_alignment - 1U)
+          & ~(probe_.read_alignment - 1U));
+        probe_.bulk_read_allocations.push_back(allocation);
+        auto result = seastar::temporary_buffer<std::uint8_t>::aligned(
+          probe_.memory_alignment, allocation);
         probe_.bulk_read_address = reinterpret_cast<std::uintptr_t>(
           result.get());
         probe_.bulk_read_addresses.push_back(probe_.bulk_read_address);
@@ -161,6 +167,7 @@ public:
               probe_.storage.data() + static_cast<std::size_t>(position),
               static_cast<std::size_t>(read));
         }
+        result.trim(static_cast<std::size_t>(read));
         return seastar::make_ready_future<
           seastar::temporary_buffer<std::uint8_t>>(std::move(result));
     }
@@ -230,7 +237,7 @@ kwaque::bytes::fragmented_buffer aligned_data(std::size_t size, char value) {
     auto storage = seastar::temporary_buffer<char>::aligned(4096, size);
     std::memset(storage.get_write(), value, storage.size());
     return kwaque::runtime::detail::fragmented_buffer_io_access::adopt(
-      std::move(storage));
+      std::move(storage), kwaque::byte_count{size});
 }
 
 } // namespace
@@ -486,6 +493,33 @@ SEASTAR_TEST_CASE(file_read_chunks_large_logical_requests) {
     BOOST_REQUIRE(closed.has_value());
 }
 
+SEASTAR_TEST_CASE(
+  file_read_caps_unaligned_native_allocations_and_tracks_backing) {
+    file_probe probe;
+    const auto limit = kwaque::maximum_contiguous_allocation_bytes;
+    probe.storage.assign(limit + 1U, 'u');
+    probe.size = probe.storage.size();
+    auto owner = make_file(probe);
+
+    auto read = co_await owner.read(
+      kwaque::runtime::file_position{1}, kwaque::byte_count{limit});
+    const auto closed = co_await owner.close();
+
+    BOOST_REQUIRE(read.has_value());
+    BOOST_CHECK(!read->eof());
+    BOOST_CHECK_EQUAL(read->data().size().value(), limit);
+    BOOST_CHECK_EQUAL(
+      read->data().retained_bytes().value(), limit + probe.read_alignment);
+    BOOST_REQUIRE_EQUAL(probe.bulk_read_sizes.size(), 2U);
+    BOOST_REQUIRE_EQUAL(probe.bulk_read_allocations.size(), 2U);
+    BOOST_CHECK_EQUAL(probe.bulk_read_sizes[0], limit - 1U);
+    BOOST_CHECK_EQUAL(probe.bulk_read_sizes[1], 1U);
+    for (const auto allocation : probe.bulk_read_allocations) {
+        BOOST_CHECK_LE(allocation, limit);
+    }
+    BOOST_REQUIRE(closed.has_value());
+}
+
 SEASTAR_TEST_CASE(file_read_rejects_bounds_and_abort_before_native_dispatch) {
     file_probe probe;
     auto owner = make_file(probe);
@@ -683,6 +717,27 @@ SEASTAR_TEST_CASE(file_write_preserves_bytes_around_unaligned_overwrite) {
     BOOST_CHECK_EQUAL(probe.storage[107], 'p');
     BOOST_CHECK_EQUAL(probe.storage.size(), 8192U);
     BOOST_REQUIRE(close_result.has_value());
+}
+
+SEASTAR_TEST_CASE(file_write_rejects_an_overflowing_aligned_physical_span) {
+    file_probe probe;
+    auto owner = make_file(probe);
+    auto data = kwaque::bytes::fragmented_buffer::copy_of(
+      std::span<const char>{"x", 1});
+    BOOST_REQUIRE(data.has_value());
+
+    const auto written = co_await owner.write(
+      kwaque::runtime::file_position{
+        std::numeric_limits<std::uint64_t>::max() - 1U},
+      std::move(*data));
+    const auto closed = co_await owner.close();
+
+    BOOST_REQUIRE(!written.has_value());
+    BOOST_CHECK(written.error().code() == kwaque::errc::out_of_range);
+    BOOST_CHECK(probe.reads.empty());
+    BOOST_CHECK(probe.writes.empty());
+    BOOST_CHECK_EQUAL(probe.sizes, 1U);
+    BOOST_REQUIRE(closed.has_value());
 }
 
 SEASTAR_TEST_CASE(file_write_restores_logical_size_after_tail_extension) {

@@ -21,6 +21,16 @@ cmake(
         "CARES_STATIC": "ON",
         "CMAKE_INSTALL_LIBDIR": "lib",
     },
+    env = {
+        "CFLAGS": " ".join([
+            "-ffile-prefix-map=$$EXT_BUILD_ROOT=.",
+            "-ffile-prefix-map=$${EXT_BUILD_ROOT%%/sandbox/*}/external=external",
+        ]),
+        "CXXFLAGS": " ".join([
+            "-ffile-prefix-map=$$EXT_BUILD_ROOT=.",
+            "-ffile-prefix-map=$${EXT_BUILD_ROOT%%/sandbox/*}/external=external",
+        ]),
+    },
     generate_args = ["-GNinja"],
     lib_source = ":srcs",
     out_static_libs = ["libcares.a"],

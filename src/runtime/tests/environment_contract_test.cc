@@ -21,6 +21,19 @@ using production_backend = kwaque::runtime::testing::production_shaped_backend;
 using deterministic_backend
   = kwaque::runtime::testing::deterministic_shaped_backend;
 
+class throwing_fault_accessor_backend final
+  : public kwaque::runtime::testing::contract_backend_common {
+public:
+    using fault_injector_type
+      = kwaque::runtime::testing::contract_fault_injector;
+    static constexpr bool faults_enabled = true;
+
+    fault_injector_type& faults() { return faults_; }
+
+private:
+    fault_injector_type faults_;
+};
+
 template<typename Backend>
 concept exposes_fault_injector = requires(Backend& backend) {
     backend.faults();
@@ -35,6 +48,10 @@ using timer_only_view = kwaque::runtime::basic_runtime_view<
 
 static_assert(kwaque::runtime::runtime_backend<production_backend>);
 static_assert(kwaque::runtime::runtime_backend<deterministic_backend>);
+static_assert(
+  !kwaque::runtime::fault_backend_contract<throwing_fault_accessor_backend>);
+static_assert(
+  !kwaque::runtime::runtime_backend<throwing_fault_accessor_backend>);
 static_assert(!exposes_fault_injector<production_backend>);
 static_assert(exposes_fault_injector<deterministic_backend>);
 static_assert(!exposes_random<timer_only_view>);
@@ -83,6 +100,9 @@ seastar::future<> exercise_contract(Backend& backend) {
     BOOST_CHECK(
       connected->input_state()
       == kwaque::runtime::network_half_state::shut_down);
+    const auto repeated_input_shutdown = connected->shutdown_input();
+    BOOST_REQUIRE(!repeated_input_shutdown.has_value());
+    BOOST_CHECK(repeated_input_shutdown.error().code() == kwaque::errc::closed);
     BOOST_CHECK(
       connected->output_state() == kwaque::runtime::network_half_state::open);
     auto payload = kwaque::bytes::fragmented_buffer::copy_of(
@@ -111,6 +131,7 @@ seastar::future<> exercise_contract(Backend& backend) {
       {.host = std::move(*host), .port = 33145}, abort_source);
     BOOST_REQUIRE(resolved.has_value());
     BOOST_REQUIRE_EQUAL(resolved->answers().size(), 1U);
+    BOOST_CHECK(resolved->answers()[0].ttl == kwaque::runtime::maximum_dns_ttl);
 
     const auto* descriptor = kwaque::runtime::descriptor_for(
       kwaque::runtime::builtin_fault_point::timer);
@@ -212,10 +233,10 @@ SEASTAR_TEST_CASE(
     BOOST_REQUIRE(closed.has_value());
     const auto second_result = co_await std::move(*second_write);
     BOOST_REQUIRE(!second_result.has_value());
-    BOOST_CHECK(second_result.error().code() == kwaque::errc::closed);
+    BOOST_CHECK(second_result.error().code() == kwaque::errc::aborted);
     const auto read_result = co_await std::move(close_interrupted_read);
     BOOST_REQUIRE(!read_result.has_value());
-    BOOST_CHECK(read_result.error().code() == kwaque::errc::closed);
+    BOOST_CHECK(read_result.error().code() == kwaque::errc::aborted);
     BOOST_CHECK_EQUAL(connected->pending_write_count(), 0U);
     BOOST_CHECK_EQUAL(connected->pending_write_bytes().value(), 0U);
     BOOST_CHECK(!connected->read_pending());
@@ -225,6 +246,91 @@ SEASTAR_TEST_CASE(
 
     const auto closed_again = co_await connected->close();
     BOOST_REQUIRE(closed_again.has_value());
+}
+
+SEASTAR_TEST_CASE(network_contract_reserves_retained_backing) {
+    production_backend backend;
+    seastar::abort_source abort_source;
+    const auto endpoint = kwaque::runtime::testing::detail::loopback(33148);
+    auto connected = co_await backend.network().connect(
+      endpoint,
+      std::nullopt,
+      kwaque::runtime::network_connection_limits{
+        .pending_write_bytes = kwaque::byte_count{8},
+        .pending_writes = 2,
+      },
+      abort_source);
+    BOOST_REQUIRE(connected.has_value());
+    connected->enable_controlled_io();
+
+    auto backing = kwaque::bytes::fragmented_buffer::copy_of(
+      std::span<const char>{"12345678", 8});
+    BOOST_REQUIRE(backing.has_value());
+    auto slice = backing->share(kwaque::byte_count{}, kwaque::byte_count{1});
+    BOOST_REQUIRE(slice.has_value());
+    auto first = connected->write(std::move(*slice), abort_source);
+    BOOST_CHECK(!first.available());
+    BOOST_CHECK_EQUAL(connected->pending_write_bytes().value(), 8U);
+
+    auto second_payload = kwaque::bytes::fragmented_buffer::copy_of(
+      std::span<const char>{"x", 1});
+    BOOST_REQUIRE(second_payload.has_value());
+    const auto second = co_await connected->write(
+      std::move(*second_payload), abort_source);
+    BOOST_REQUIRE(!second.has_value());
+    BOOST_CHECK(second.error().code() == kwaque::errc::queue_full);
+
+    BOOST_REQUIRE(connected->complete_next_write());
+    const auto first_result = co_await std::move(first);
+    BOOST_REQUIRE(first_result.has_value());
+    BOOST_CHECK_EQUAL(connected->pending_write_bytes().value(), 0U);
+    const auto closed = co_await connected->close();
+    BOOST_REQUIRE(closed.has_value());
+}
+
+SEASTAR_TEST_CASE(network_contract_matches_validation_and_abort_precedence) {
+    production_backend backend;
+    seastar::abort_source active;
+    const auto endpoint = kwaque::runtime::testing::detail::loopback(33149);
+    auto connected = co_await backend.network().connect(
+      endpoint,
+      std::nullopt,
+      kwaque::runtime::network_connection_limits{},
+      active);
+    BOOST_REQUIRE(connected.has_value());
+
+    seastar::abort_source preaborted;
+    preaborted.request_abort();
+    const auto invalid = co_await connected->write(
+      kwaque::bytes::fragmented_buffer{}, preaborted);
+    BOOST_REQUIRE(!invalid.has_value());
+    BOOST_CHECK(invalid.error().code() == kwaque::errc::invalid_argument);
+
+    connected->request_abort();
+    BOOST_CHECK(
+      connected->input_state()
+      == kwaque::runtime::network_half_state::shut_down);
+    BOOST_CHECK(
+      connected->output_state()
+      == kwaque::runtime::network_half_state::shut_down);
+    const auto aborted_shutdown = connected->shutdown_input();
+    BOOST_REQUIRE(!aborted_shutdown.has_value());
+    BOOST_CHECK(aborted_shutdown.error().code() == kwaque::errc::aborted);
+    const auto closed = co_await connected->close();
+    BOOST_REQUIRE(closed.has_value());
+    seastar::abort_source fresh;
+    const auto closed_read = co_await connected->read(
+      kwaque::byte_count{1}, fresh);
+    BOOST_REQUIRE(!closed_read.has_value());
+    BOOST_CHECK(closed_read.error().code() == kwaque::errc::closed);
+
+    auto listener = co_await backend.network().listen(endpoint, {});
+    BOOST_REQUIRE(listener.has_value());
+    const auto listener_closed = co_await listener->close();
+    BOOST_REQUIRE(listener_closed.has_value());
+    const auto aborted_accept = co_await listener->accept(fresh);
+    BOOST_REQUIRE(!aborted_accept.has_value());
+    BOOST_CHECK(aborted_accept.error().code() == kwaque::errc::aborted);
 }
 
 SEASTAR_TEST_CASE(network_contract_abort_resolves_every_accepted_operation) {
@@ -251,6 +357,12 @@ SEASTAR_TEST_CASE(network_contract_abort_resolves_every_accepted_operation) {
     BOOST_CHECK(!pending_write.available());
 
     connected->request_abort();
+    BOOST_CHECK(
+      connected->input_state()
+      == kwaque::runtime::network_half_state::shut_down);
+    BOOST_CHECK(
+      connected->output_state()
+      == kwaque::runtime::network_half_state::shut_down);
     const auto read_result = co_await std::move(pending_read);
     const auto write_result = co_await std::move(pending_write);
     BOOST_REQUIRE(!read_result.has_value());

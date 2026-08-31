@@ -1,6 +1,7 @@
 #ifndef KWAQUE_SRC_RUNTIME_FRAGMENTED_BUFFER_INTERNAL_H_
 #define KWAQUE_SRC_RUNTIME_FRAGMENTED_BUFFER_INTERNAL_H_
 
+#include "src/base/invariant.h"
 #include "src/base/units.h"
 #include "src/bytes/fragmented_buffer.h"
 
@@ -15,6 +16,9 @@
 #include <utility>
 
 namespace kwaque::runtime::detail {
+
+inline constexpr invariant_id fragmented_buffer_adoption_invariant{
+  "KQ-FRAGMENTED-BUFFER-ADOPTION"};
 
 // Runtime-I/O-only destructive ownership transfer. It deliberately has no
 // public forwarding API: concrete native adapters consume and adopt fragments
@@ -74,18 +78,28 @@ public:
     }
 
     [[nodiscard]] static bytes::fragmented_buffer
-    adopt(seastar::temporary_buffer<char> fragment) {
+    adopt(seastar::temporary_buffer<char> fragment, byte_count retained_bytes) {
         if (fragment.empty()) {
+            KWAQUE_INVARIANT(
+              fragmented_buffer_adoption_invariant,
+              retained_bytes.value() == 0,
+              "empty native fragment retained backing");
             return {};
         }
         const byte_count size{static_cast<std::uint64_t>(fragment.size())};
+        KWAQUE_INVARIANT(
+          fragmented_buffer_adoption_invariant,
+          retained_bytes >= size
+            && retained_bytes.value() <= maximum_contiguous_allocation_bytes,
+          "native fragment retained backing is invalid");
         std::deque<bytes::fragmented_buffer::owned_fragment> fragments;
         fragments.push_back(
           bytes::fragmented_buffer::owned_fragment{
             .storage = std::move(fragment),
-            .retained_bytes = size,
+            .retained_bytes = retained_bytes,
           });
-        return bytes::fragmented_buffer{std::move(fragments), size, size};
+        return bytes::fragmented_buffer{
+          std::move(fragments), size, retained_bytes};
     }
 
     // Appends newly returned native storage without copying its payload or
@@ -93,20 +107,27 @@ public:
     // callers can observe only immutable bytes after the buffer is published.
     [[nodiscard]] static kwaque::result<void> append_adopted(
       bytes::fragmented_buffer& buffer,
-      seastar::temporary_buffer<char> fragment) {
+      seastar::temporary_buffer<char> fragment,
+      byte_count retained_bytes) {
         if (fragment.empty()) {
-            return {};
-        }
-        if (
-          fragment.size() > maximum_contiguous_allocation_bytes
-          || buffer.fragments_.size() == bytes::max_buffer_fragments) {
-            return kwaque::failure(errc::resource_exhausted);
+            return retained_bytes.value() == 0
+                     ? kwaque::result<void>{}
+                     : kwaque::failure(errc::invalid_argument);
         }
         const byte_count fragment_bytes{
           static_cast<std::uint64_t>(fragment.size())};
+        if (retained_bytes < fragment_bytes) {
+            return kwaque::failure(errc::invalid_argument);
+        }
+        if (
+          fragment.size() > maximum_contiguous_allocation_bytes
+          || retained_bytes.value() > maximum_contiguous_allocation_bytes
+          || buffer.fragments_.size() == bytes::max_buffer_fragments) {
+            return kwaque::failure(errc::resource_exhausted);
+        }
         const auto next_size = buffer.size_.checked_add(fragment_bytes);
         const auto next_retained = buffer.retained_bytes_.checked_add(
-          fragment_bytes);
+          retained_bytes);
         if (
           !next_size || !next_retained || *next_size > bytes::max_buffer_bytes
           || *next_retained > bytes::max_buffer_bytes) {
@@ -115,7 +136,7 @@ public:
         buffer.fragments_.push_back(
           bytes::fragmented_buffer::owned_fragment{
             .storage = std::move(fragment),
-            .retained_bytes = fragment_bytes,
+            .retained_bytes = retained_bytes,
           });
         buffer.size_ = *next_size;
         buffer.retained_bytes_ = *next_retained;

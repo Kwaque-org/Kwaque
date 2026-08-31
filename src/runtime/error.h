@@ -41,6 +41,7 @@ enum class operation_context_key : std::uint8_t {
     limit = 9,
     expected = 10,
     actual = 11,
+    detail = 12,
 };
 
 struct operation_context_field final {

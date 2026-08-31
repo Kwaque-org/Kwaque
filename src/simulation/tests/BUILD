@@ -1,3 +1,4 @@
+load("//bazel:build.bzl", "kwaque_cc_library")
 load(
     "//bazel:test.bzl",
     "kwaque_cc_seastar_test",
@@ -5,6 +6,16 @@ load(
 )
 
 package(default_visibility = ["//visibility:private"])
+
+kwaque_cc_library(
+    name = "fake_file_model",
+    testonly = True,
+    hdrs = ["fake_file_model.h"],
+    deps = [
+        "//src/runtime:random",
+        "//src/simulation:deterministic_random",
+    ],
+)
 
 kwaque_cc_seastar_test(
     name = "scheduler_test",
@@ -95,7 +106,10 @@ kwaque_cc_test(
 kwaque_cc_test(
     name = "event_trace_test",
     srcs = ["event_trace_test.cc"],
-    deps = ["//src/simulation:event_trace"],
+    deps = [
+        "//src/runtime:fault_api",
+        "//src/simulation:event_trace",
+    ],
 )
 
 kwaque_cc_seastar_test(
@@ -109,5 +123,68 @@ kwaque_cc_seastar_test(
         "//src/simulation:scheduler",
         "//src/simulation:virtual_time",
         "@openssl",
+    ],
+)
+
+kwaque_cc_seastar_test(
+    name = "fault_schedule_test",
+    srcs = ["fault_schedule_test.cc"],
+    cpu = 1,
+    memory = "256MiB",
+    deps = [
+        "//src/runtime:fault",
+        "//src/runtime:random",
+        "//src/simulation:deterministic_random",
+        "//src/simulation:event_trace",
+        "//src/simulation:fault_schedule",
+        "//src/simulation:scheduler",
+    ],
+)
+
+kwaque_cc_seastar_test(
+    name = "fake_file_test",
+    srcs = ["fake_file_test.cc"],
+    cpu = 1,
+    memory = "256MiB",
+    deps = [
+        "//src/base",
+        "//src/simulation:fake_file",
+        "//src/simulation:fake_file_test_support",
+    ],
+)
+
+kwaque_cc_seastar_test(
+    name = "fake_file_runtime_test",
+    srcs = ["fake_file_runtime_test.cc"],
+    cpu = 2,
+    memory = "256MiB",
+    deps = [
+        "//src/bytes:fragmented_buffer",
+        "//src/runtime:file",
+        "//src/runtime:random",
+        "//src/simulation:deterministic_random",
+        "//src/simulation:event_trace",
+        "//src/simulation:fake_file",
+        "//src/simulation:fake_file_test_support",
+        "//src/simulation:fault_schedule",
+        "//src/simulation:scheduler",
+        "//src/simulation/tests:fake_file_model",
+    ],
+)
+
+kwaque_cc_seastar_test(
+    name = "fake_file_replay_test",
+    srcs = ["fake_file_replay_test.cc"],
+    cpu = 1,
+    memory = "256MiB",
+    deps = [
+        "//src/bytes:fragmented_buffer",
+        "//src/runtime:fault",
+        "//src/runtime:file",
+        "//src/simulation:event_trace",
+        "//src/simulation:fake_file",
+        "//src/simulation:fake_file_test_support",
+        "//src/simulation:fault_schedule",
+        "//src/simulation:scheduler",
     ],
 )
