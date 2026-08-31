@@ -3,6 +3,7 @@
 
 #include "src/runtime/error.h"
 #include "src/runtime/random.h"
+#include "src/simulation/determinism_version.h"
 #include "src/simulation/event_trace.h"
 #include "src/simulation/philox.h"
 
@@ -14,8 +15,6 @@ namespace kwaque::simulation {
 
 class deterministic_random_test_access;
 
-inline constexpr std::uint32_t deterministic_random_algorithm_version{1};
-inline constexpr std::uint32_t deterministic_random_coordinate_version{1};
 inline constexpr std::uint32_t deterministic_random_derivation_tag{
   UINT32_C(0x314b514b)};
 

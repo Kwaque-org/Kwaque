@@ -203,8 +203,9 @@ public:
     kwaque_file_fixture& operator=(const kwaque_file_fixture&) = delete;
 
     [[gnu::noinline]] seastar::future<> execute() {
+        auto fragment = source_.share(source_offset_, write_size_);
         auto data = detail::fragmented_buffer_io_access::adopt(
-          source_.share(source_offset_, write_size_));
+          std::move(fragment), byte_count{source_.size()});
         return owner_.write(file_position{position_}, std::move(data))
           .then([expected = write_size_](result<byte_count> outcome) {
               if (!outcome || outcome->value() != expected) {
@@ -411,8 +412,9 @@ public:
     operator=(const native_aligned_file_fixture&) = delete;
 
     [[gnu::noinline]] seastar::future<> execute() {
+        auto fragment = source_.share(0, write_size_);
         auto data = detail::fragmented_buffer_io_access::adopt(
-          source_.share(0, write_size_));
+          std::move(fragment), byte_count{source_.size()});
         const auto expected = data.size().value();
         return write_impl(file_position{position_}, std::move(data))
           .then([expected](result<byte_count> outcome) {
@@ -423,8 +425,9 @@ public:
     }
 
     [[gnu::noinline]] seastar::future<> execute_out_of_line() {
+        auto fragment = source_.share(0, write_size_);
         auto data = detail::fragmented_buffer_io_access::adopt(
-          source_.share(0, write_size_));
+          std::move(fragment), byte_count{source_.size()});
         const auto expected = data.size().value();
         return write_boundary(*this, file_position{position_}, std::move(data))
           .then([expected](result<byte_count> outcome) {
@@ -651,8 +654,10 @@ public:
                 static_cast<void>(holder);
                 try {
                     auto native = completed.get();
+                    const auto retained = byte_count{
+                      static_cast<std::uint64_t>(native.size())};
                     auto data = detail::fragmented_buffer_io_access::adopt(
-                      std::move(native));
+                      std::move(native), retained);
                     return file_read_result::make(
                       std::move(data), false, byte_count{4096});
                 } catch (const std::bad_alloc&) {

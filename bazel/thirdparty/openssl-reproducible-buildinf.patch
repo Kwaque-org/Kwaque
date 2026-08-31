@@ -1,6 +1,6 @@
 --- a/util/mkbuildinf.pl
 +++ b/util/mkbuildinf.pl
-@@ -12,6 +12,17 @@
+@@ -12,6 +12,24 @@
  my $platform = pop @ARGV;
  my $cflags = join(' ', @ARGV);
  $cflags =~ s(\\)(\\\\)g;
@@ -13,6 +13,13 @@
 +my $build_root = $ENV{'EXT_BUILD_ROOT'};
 +if (defined $build_root && $build_root ne '') {
 +    $build_root =~ s{/+$}{};
++    # Clang's resource directory can live under Bazel's output-base external
++    # tree rather than the sandbox execroot. Stabilize that flag as well.
++    my $output_base = $build_root;
++    $output_base =~ s{/sandbox/.*$}{};
++    if ($output_base ne $build_root) {
++        $cflags =~ s{\Q$output_base\E/external}{external}g;
++    }
 +    $cflags =~ s{\Q$build_root\E}{.}g;
 +}
  $cflags = "compiler: $cflags";

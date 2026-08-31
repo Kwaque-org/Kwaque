@@ -93,8 +93,12 @@ seastar::future<result<network_read_result>> read_native_up_to(
             try {
                 auto native = completed.get();
                 const bool eof = native.empty() && input.eof();
+                const auto retained
+                  = native.empty()
+                      ? byte_count{}
+                      : byte_count{maximum_contiguous_allocation_bytes};
                 auto data = detail::fragmented_buffer_io_access::adopt(
-                  std::move(native));
+                  std::move(native), retained);
                 return network_read_result::make(
                   std::move(data), eof, maximum_bytes);
             } catch (const std::bad_alloc&) {

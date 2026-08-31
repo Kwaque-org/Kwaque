@@ -1,8 +1,11 @@
+#include "src/runtime/fault.h"
 #include "src/simulation/event_trace.h"
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <cstdint>
+#include <limits>
 #include <string>
 #include <type_traits>
 #include <utility>
@@ -15,6 +18,7 @@ using kwaque::simulation::decoded_event_trace;
 using kwaque::simulation::event_trace;
 using kwaque::simulation::trace_action;
 using kwaque::simulation::trace_context_key;
+using kwaque::simulation::trace_difference_field;
 using kwaque::simulation::trace_digest;
 using kwaque::simulation::trace_entry;
 using kwaque::simulation::trace_event_kind;
@@ -44,8 +48,8 @@ trace_header test_header(
   trace_digest input = {}) {
     return trace_header::current(
       seed,
-      1,
-      1,
+      kwaque::simulation::deterministic_random_algorithm_version,
+      kwaque::simulation::deterministic_random_coordinate_version,
       trace_scheduler_budget{
         .pending_events = 4,
         .events_per_pump = 4,
@@ -70,21 +74,44 @@ trace_entry keyed_entry(std::uint64_t value = 5) {
     };
 }
 
+trace_entry fault_entry(
+  std::uint64_t value = std::numeric_limits<std::uint64_t>::max(),
+  std::uint64_t draws = 0,
+  std::uint32_t outcome = 1) {
+    return trace_entry{
+      .time = kwaque::runtime::monotonic_time{2},
+      .action = trace_action::fault_evaluated,
+      .kind = trace_event_kind::fault,
+      .domain = kwaque::runtime::descriptor_for(
+                  kwaque::runtime::builtin_fault_point::file_read)
+                  ->id.value(),
+      .stable_id = 7,
+      .coordinate_a = 3,
+      .coordinate_b = draws,
+      .value = value,
+      .result = static_cast<std::uint8_t>(kwaque::runtime::fault_action::error)
+                | (outcome << 8U),
+    };
+}
+
 constexpr std::string_view golden_trace
-  = "KQTR 01 0000000000000000 00000001 00000001 00000001 00000004 "
+  = "KQTR 03 0000000000000000 00000001 00000001 00000001 00000004 "
     "0000000000000004 0000000000000008 0000000000000064 00000004 "
     "0000000000001000 00000400 0000000000000001 "
     "0000000000000000000000000000000000000000000000000000000000000000 "
     "0000000000000000000000000000000000000000000000000000000000000000\n"
-    "E 0000000000000001 0000000000000002 06 03 0000000000000000 00 "
-    "00000001 0000000000000002 0000000000000003 0000000000000004 "
-    "0000000000000005 00000000 00 000000000000000000 "
+    "E 0000000000000001 0000000000000002 0000000000000000 06 03 "
+    "0000000000000000 00 00000001 0000000000000002 0000000000000003 "
+    "0000000000000004 0000000000000005 00000000 00 000000000000000000 "
     "000000000000000000 000000000000000000 000000000000000000\n";
 
 static_assert(canonical_header_encoded_size == 294);
-static_assert(canonical_entry_encoded_size == 227);
-static_assert(golden_trace.size() == 521);
+static_assert(canonical_entry_encoded_size == 244);
+static_assert(golden_trace.size() == 538);
 static_assert(!std::is_move_constructible_v<event_trace>);
+static_assert(noexcept(
+  std::declval<event_trace&>().reserve(1, canonical_entry_encoded_size)));
+static_assert(noexcept(std::declval<event_trace&>().observe(trace_entry{})));
 
 void replace_token(
   std::string& artifact,
@@ -149,10 +176,14 @@ TEST(EventTraceTest, EncodingAndParsingMatchTheCanonicalGoldenFixture) {
     EXPECT_EQ(encoded_text->find("/home/"), std::string::npos);
     EXPECT_EQ(encoded_text->find('\n'), canonical_header_encoded_size - 1U);
 
+    auto version_one = *encoded_text;
+    version_one[6] = '1';
+    EXPECT_FALSE(event_trace::decode(version_one, limits).has_value());
+
     const auto decoded = event_trace::decode(*encoded, limits);
     ASSERT_TRUE(decoded.has_value());
     EXPECT_EQ(decoded->header, trace.header());
-    EXPECT_EQ(decoded->entries, trace.entries());
+    EXPECT_TRUE(std::ranges::equal(decoded->entries, trace.entries()));
     EXPECT_EQ(decoded->encoded_bytes, encoded->size());
 }
 
@@ -199,28 +230,35 @@ TEST(EventTraceTest, ParserRejectsEveryNoncanonicalBoundary) {
     EXPECT_FALSE(event_trace::decode(trailing, limits).has_value());
 
     auto invalid_action = *encoded_text;
-    invalid_action[canonical_header_encoded_size + 36] = 'f';
+    replace_token(invalid_action, canonical_header_encoded_size, 4, "ff");
     EXPECT_FALSE(event_trace::decode(invalid_action, limits).has_value());
 
     auto unknown_schema = *encoded_text;
-    replace_token(unknown_schema, 0, 1, "02");
+    replace_token(unknown_schema, 0, 1, "04");
     EXPECT_FALSE(event_trace::decode(unknown_schema, limits).has_value());
 
+    auto unknown_random = *encoded_text;
+    replace_token(unknown_random, 0, 3, "00000002");
+    EXPECT_FALSE(event_trace::decode(unknown_random, limits).has_value());
+    auto unknown_coordinate = *encoded_text;
+    replace_token(unknown_coordinate, 0, 4, "00000002");
+    EXPECT_FALSE(event_trace::decode(unknown_coordinate, limits).has_value());
+
     auto invalid_kind = *encoded_text;
-    replace_token(invalid_kind, canonical_header_encoded_size, 4, "ff");
+    replace_token(invalid_kind, canonical_header_encoded_size, 5, "ff");
     EXPECT_FALSE(event_trace::decode(invalid_kind, limits).has_value());
 
     auto duplicate_context = *encoded_text;
-    replace_token(duplicate_context, canonical_header_encoded_size, 13, "02");
-    replace_token(
-      duplicate_context,
-      canonical_header_encoded_size,
-      14,
-      "040000000000000001");
+    replace_token(duplicate_context, canonical_header_encoded_size, 14, "02");
     replace_token(
       duplicate_context,
       canonical_header_encoded_size,
       15,
+      "040000000000000001");
+    replace_token(
+      duplicate_context,
+      canonical_header_encoded_size,
+      16,
       "040000000000000002");
     EXPECT_FALSE(event_trace::decode(duplicate_context, limits).has_value());
 
@@ -274,6 +312,99 @@ TEST(EventTraceTest, RejectsDuplicateAndOutOfRangeEntryFields) {
     EXPECT_EQ(
       trace.observe(invalid_action).error().code(),
       kwaque::errc::malformed_data);
+
+    auto keyed_with_deadline = keyed_entry();
+    keyed_with_deadline.deadline = kwaque::runtime::monotonic_time{2};
+    EXPECT_EQ(
+      trace.observe(keyed_with_deadline).error().code(),
+      kwaque::errc::malformed_data);
+    EXPECT_EQ(
+      trace
+        .observe(
+          trace_entry{
+            .time = kwaque::runtime::monotonic_time{2},
+            .deadline = kwaque::runtime::monotonic_time{3},
+            .action = trace_action::selected,
+            .kind = trace_event_kind::generic,
+            .event_id = 1,
+          })
+        .error()
+        .code(),
+      kwaque::errc::malformed_data);
+    EXPECT_EQ(
+      trace
+        .observe(
+          trace_entry{
+            .action = trace_action::time_advanced,
+            .kind = trace_event_kind::generic,
+            .coordinate_b = 1,
+            .value = 1,
+          })
+        .error()
+        .code(),
+      kwaque::errc::malformed_data);
+}
+
+TEST(EventTraceTest, ValidatesFaultAndFileLifecycleVocabulary) {
+    const auto limits = test_limits();
+    event_trace trace{test_header(limits), limits};
+    EXPECT_TRUE(trace.observe(fault_entry()).has_value());
+    EXPECT_TRUE(trace.observe(fault_entry(2, 1, 2)).has_value());
+
+    auto inconsistent_sample = fault_entry(2, 0);
+    EXPECT_EQ(
+      trace.observe(inconsistent_sample).error().code(),
+      kwaque::errc::malformed_data);
+    auto unknown_outcome = fault_entry();
+    unknown_outcome.result = static_cast<std::uint8_t>(
+      kwaque::runtime::fault_action::error);
+    EXPECT_EQ(
+      trace.observe(unknown_outcome).error().code(),
+      kwaque::errc::malformed_data);
+    auto illegal_action = fault_entry();
+    illegal_action.domain = kwaque::runtime::descriptor_for(
+                              kwaque::runtime::builtin_fault_point::timer)
+                              ->id.value();
+    illegal_action.result = static_cast<std::uint8_t>(
+                              kwaque::runtime::fault_action::corrupt)
+                            | UINT32_C(0x100);
+    EXPECT_EQ(
+      trace.observe(illegal_action).error().code(),
+      kwaque::errc::malformed_data);
+
+    EXPECT_TRUE(trace
+                  .observe(
+                    trace_entry{
+                      .time = kwaque::runtime::monotonic_time{2},
+                      .deadline = kwaque::runtime::monotonic_time{2},
+                      .action = trace_action::operation_discarded,
+                      .kind = trace_event_kind::file,
+                      .event_id = 1,
+                    })
+                  .has_value());
+    EXPECT_TRUE(trace
+                  .observe(
+                    trace_entry{
+                      .time = kwaque::runtime::monotonic_time{2},
+                      .deadline = kwaque::runtime::monotonic_time{2},
+                      .action = trace_action::crash_applied,
+                      .kind = trace_event_kind::filesystem,
+                      .event_id = 2,
+                    })
+                  .has_value());
+    EXPECT_EQ(
+      trace
+        .observe(
+          trace_entry{
+            .time = kwaque::runtime::monotonic_time{2},
+            .deadline = kwaque::runtime::monotonic_time{2},
+            .action = trace_action::operation_discarded,
+            .kind = trace_event_kind::generic,
+            .event_id = 3,
+          })
+        .error()
+        .code(),
+      kwaque::errc::malformed_data);
 }
 
 TEST(EventTraceTest, ReplayDetectsTheFirstDifferenceAndTrailingEntries) {
@@ -301,7 +432,24 @@ TEST(EventTraceTest, ReplayDetectsTheFirstDifferenceAndTrailingEntries) {
     const auto mismatch = (*divergent)->observe(keyed_entry(99));
     ASSERT_FALSE(mismatch.has_value());
     EXPECT_EQ(mismatch.error().code(), kwaque::errc::replay_divergence);
+    EXPECT_EQ(
+      mismatch.error().context_at(0)->key,
+      kwaque::runtime::operation_context_key::sequence);
     EXPECT_EQ(mismatch.error().context_at(0)->value, 1U);
+    EXPECT_EQ(
+      mismatch.error().context_at(1)->key,
+      kwaque::runtime::operation_context_key::detail);
+    EXPECT_EQ(
+      mismatch.error().context_at(1)->value,
+      static_cast<std::uint8_t>(trace_difference_field::value));
+    EXPECT_EQ(
+      mismatch.error().context_at(2)->key,
+      kwaque::runtime::operation_context_key::expected);
+    EXPECT_EQ(mismatch.error().context_at(2)->value, 5U);
+    EXPECT_EQ(
+      mismatch.error().context_at(3)->key,
+      kwaque::runtime::operation_context_key::actual);
+    EXPECT_EQ(mismatch.error().context_at(3)->value, 99U);
 
     auto trailing_decoded = event_trace::decode(*encoded, limits);
     ASSERT_TRUE(trailing_decoded.has_value());
@@ -314,8 +462,11 @@ TEST(EventTraceTest, ReplayDetectsTheFirstDifferenceAndTrailingEntries) {
     EXPECT_EQ(trailing_error.error().code(), kwaque::errc::replay_divergence);
     EXPECT_EQ(
       trailing_error.error().context_at(1)->value,
+      static_cast<std::uint8_t>(trace_difference_field::actual_missing));
+    EXPECT_EQ(
+      trailing_error.error().context_at(2)->value,
       static_cast<std::uint8_t>(trace_action::keyed_decision));
-    EXPECT_EQ(trailing_error.error().context_at(2)->value, 0U);
+    EXPECT_EQ(trailing_error.error().context_at(3)->value, 0U);
 
     auto deleted_decoded = event_trace::decode(*encoded, limits);
     ASSERT_TRUE(deleted_decoded.has_value());
@@ -328,9 +479,12 @@ TEST(EventTraceTest, ReplayDetectsTheFirstDifferenceAndTrailingEntries) {
     const auto missing_expected = (*deleted)->observe(keyed_entry(6));
     ASSERT_FALSE(missing_expected.has_value());
     EXPECT_EQ(missing_expected.error().code(), kwaque::errc::replay_divergence);
-    EXPECT_EQ(missing_expected.error().context_at(1)->value, 0U);
     EXPECT_EQ(
-      missing_expected.error().context_at(2)->value,
+      missing_expected.error().context_at(1)->value,
+      static_cast<std::uint8_t>(trace_difference_field::expected_missing));
+    EXPECT_EQ(missing_expected.error().context_at(2)->value, 0U);
+    EXPECT_EQ(
+      missing_expected.error().context_at(3)->value,
       static_cast<std::uint8_t>(trace_action::keyed_decision));
 
     auto inserted_decoded = event_trace::decode(*encoded, limits);

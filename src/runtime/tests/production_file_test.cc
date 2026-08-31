@@ -51,7 +51,7 @@ kwaque::bytes::fragmented_buffer aligned_data(std::size_t size, char value) {
     auto storage = seastar::temporary_buffer<char>::aligned(4096, size);
     std::memset(storage.get_write(), value, storage.size());
     return kwaque::runtime::detail::fragmented_buffer_io_access::adopt(
-      std::move(storage));
+      std::move(storage), kwaque::byte_count{size});
 }
 
 } // namespace

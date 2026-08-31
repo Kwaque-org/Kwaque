@@ -88,6 +88,20 @@ seastar::future<runtime::result<void>> timer::sleep_until(
     wait.position = position;
     auto waiting = wait.completion.get_future();
 
+    auto subscription = caller_abort.subscribe(
+      [this, state = &wait](const std::optional<std::exception_ptr>&) noexcept {
+          schedule_abort(*state, errc::aborted);
+      });
+    if (!subscription) {
+        auto completion = std::move(wait.completion);
+        waits_.erase(position);
+        runtime::result<void> outcome = runtime::failure(
+          timer_error(errc::aborted));
+        completion.set_value(std::move(outcome));
+        return waiting;
+    }
+    wait.caller_subscription.emplace(std::move(*subscription));
+
     const auto effective_deadline = std::max(deadline, scheduler_->now());
     auto scheduled = scheduler_->schedule(
       effective_deadline,
@@ -111,6 +125,7 @@ seastar::future<runtime::result<void>> timer::sleep_until(
       event_cleanup_policy::invoke);
     if (!scheduled) {
         auto completion = std::move(wait.completion);
+        wait.caller_subscription.reset();
         waits_.erase(position);
         runtime::result<void> outcome = runtime::failure(
           timer_error(scheduled.error()));
@@ -118,33 +133,6 @@ seastar::future<runtime::result<void>> timer::sleep_until(
         return waiting;
     }
     wait.event = *scheduled;
-
-    auto subscription = caller_abort.subscribe(
-      [this, state = &wait](const std::optional<std::exception_ptr>&) noexcept {
-          schedule_abort(*state, errc::aborted);
-      });
-    if (!subscription) {
-        const auto canceled = scheduler_->cancel(wait.event);
-        if (!canceled) {
-            KWAQUE_INVARIANT(
-              timer_event_invariant,
-              scheduler_->trace_failed(),
-              "pre-aborted timer cancellation failed without trace divergence");
-            static_cast<void>(scheduler_->discard_failed());
-            return waiting;
-        }
-        KWAQUE_INVARIANT(
-          timer_event_invariant,
-          *canceled,
-          "pre-aborted timer event was not pending");
-        auto completion = std::move(wait.completion);
-        waits_.erase(position);
-        runtime::result<void> outcome = runtime::failure(
-          timer_error(errc::aborted));
-        completion.set_value(std::move(outcome));
-        return waiting;
-    }
-    wait.caller_subscription.emplace(std::move(*subscription));
     activated_ = true;
     return waiting;
 }

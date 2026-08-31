@@ -167,6 +167,19 @@ enum class builtin_fault_point : std::uint8_t {
     network_read,
     network_write,
     close,
+    file_open,
+    file_exists,
+    file_stat,
+    file_list,
+    directory_create,
+    file_remove,
+    directory_remove,
+    file_rename,
+    directory_sync,
+    file_flush,
+    file_truncate,
+    file_size,
+    file_close,
 };
 
 struct fault_point_descriptor final {
@@ -231,7 +244,8 @@ inline constexpr std::array builtin_fault_points{
       fault_action::short_operation,
       fault_action::corrupt,
       fault_action::misdirect,
-      fault_action::drop_completion>()},
+      fault_action::drop_completion,
+      fault_action::crash>()},
   fault_point_descriptor{
     .point = builtin_fault_point::file_write,
     .id = fault_point_id::constant<7>(),
@@ -243,7 +257,8 @@ inline constexpr std::array builtin_fault_points{
       fault_action::corrupt,
       fault_action::misdirect,
       fault_action::torn_write,
-      fault_action::drop_completion>()},
+      fault_action::drop_completion,
+      fault_action::crash>()},
   fault_point_descriptor{
     .point = builtin_fault_point::network_read,
     .id = fault_point_id::constant<8>(),
@@ -278,6 +293,122 @@ inline constexpr std::array builtin_fault_points{
       fault_action::error,
       fault_action::delay,
       fault_action::drop_completion>()},
+  fault_point_descriptor{
+    .point = builtin_fault_point::file_open,
+    .id = fault_point_id::constant<11>(),
+    .name = "file_open",
+    .permitted_actions = fault_action_set::constant<
+      fault_action::error,
+      fault_action::delay,
+      fault_action::drop_completion,
+      fault_action::crash>()},
+  fault_point_descriptor{
+    .point = builtin_fault_point::file_exists,
+    .id = fault_point_id::constant<12>(),
+    .name = "file_exists",
+    .permitted_actions = fault_action_set::constant<
+      fault_action::error,
+      fault_action::delay,
+      fault_action::drop_completion,
+      fault_action::crash>()},
+  fault_point_descriptor{
+    .point = builtin_fault_point::file_stat,
+    .id = fault_point_id::constant<13>(),
+    .name = "file_stat",
+    .permitted_actions = fault_action_set::constant<
+      fault_action::error,
+      fault_action::delay,
+      fault_action::drop_completion,
+      fault_action::crash>()},
+  fault_point_descriptor{
+    .point = builtin_fault_point::file_list,
+    .id = fault_point_id::constant<14>(),
+    .name = "file_list",
+    .permitted_actions = fault_action_set::constant<
+      fault_action::error,
+      fault_action::delay,
+      fault_action::drop_completion,
+      fault_action::crash>()},
+  fault_point_descriptor{
+    .point = builtin_fault_point::directory_create,
+    .id = fault_point_id::constant<15>(),
+    .name = "directory_create",
+    .permitted_actions = fault_action_set::constant<
+      fault_action::error,
+      fault_action::delay,
+      fault_action::drop_completion,
+      fault_action::crash>()},
+  fault_point_descriptor{
+    .point = builtin_fault_point::file_remove,
+    .id = fault_point_id::constant<16>(),
+    .name = "file_remove",
+    .permitted_actions = fault_action_set::constant<
+      fault_action::error,
+      fault_action::delay,
+      fault_action::drop_completion,
+      fault_action::crash>()},
+  fault_point_descriptor{
+    .point = builtin_fault_point::directory_remove,
+    .id = fault_point_id::constant<17>(),
+    .name = "directory_remove",
+    .permitted_actions = fault_action_set::constant<
+      fault_action::error,
+      fault_action::delay,
+      fault_action::drop_completion,
+      fault_action::crash>()},
+  fault_point_descriptor{
+    .point = builtin_fault_point::file_rename,
+    .id = fault_point_id::constant<18>(),
+    .name = "file_rename",
+    .permitted_actions = fault_action_set::constant<
+      fault_action::error,
+      fault_action::delay,
+      fault_action::drop_completion,
+      fault_action::crash>()},
+  fault_point_descriptor{
+    .point = builtin_fault_point::directory_sync,
+    .id = fault_point_id::constant<19>(),
+    .name = "directory_sync",
+    .permitted_actions = fault_action_set::constant<
+      fault_action::error,
+      fault_action::delay,
+      fault_action::drop_completion,
+      fault_action::crash>()},
+  fault_point_descriptor{
+    .point = builtin_fault_point::file_flush,
+    .id = fault_point_id::constant<20>(),
+    .name = "file_flush",
+    .permitted_actions = fault_action_set::constant<
+      fault_action::error,
+      fault_action::delay,
+      fault_action::drop_completion,
+      fault_action::crash>()},
+  fault_point_descriptor{
+    .point = builtin_fault_point::file_truncate,
+    .id = fault_point_id::constant<21>(),
+    .name = "file_truncate",
+    .permitted_actions = fault_action_set::constant<
+      fault_action::error,
+      fault_action::delay,
+      fault_action::drop_completion,
+      fault_action::crash>()},
+  fault_point_descriptor{
+    .point = builtin_fault_point::file_size,
+    .id = fault_point_id::constant<22>(),
+    .name = "file_size",
+    .permitted_actions = fault_action_set::constant<
+      fault_action::error,
+      fault_action::delay,
+      fault_action::drop_completion,
+      fault_action::crash>()},
+  fault_point_descriptor{
+    .point = builtin_fault_point::file_close,
+    .id = fault_point_id::constant<23>(),
+    .name = "file_close",
+    .permitted_actions = fault_action_set::constant<
+      fault_action::delay,
+      fault_action::drop_completion,
+      fault_action::crash>()},
 };
 
 [[nodiscard]] consteval bool valid_builtin_fault_points() noexcept {

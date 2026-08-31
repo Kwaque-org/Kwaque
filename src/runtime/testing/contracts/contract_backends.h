@@ -121,17 +121,14 @@ public:
             return seastar::make_ready_future<result<network_read_result>>(
               std::move(outcome));
         }
-        if (abort_source.abort_requested() || abort_requested_) {
+        if (abort_source.abort_requested()) {
             result<network_read_result> outcome = failure(
               operation_error{errc::aborted, operation_kind::network});
             return seastar::make_ready_future<result<network_read_result>>(
               std::move(outcome));
         }
-        if (
-          state_ != network_connection_state::open
-          || input_state_ == network_half_state::shut_down) {
-            result<network_read_result> outcome = failure(
-              operation_error{errc::closed, operation_kind::network});
+        if (auto rejected = input_rejection()) {
+            result<network_read_result> outcome = failure(std::move(*rejected));
             return seastar::make_ready_future<result<network_read_result>>(
               std::move(outcome));
         }
@@ -153,26 +150,23 @@ public:
     }
     seastar::future<result<void>>
     write(bytes::fragmented_buffer data, seastar::abort_source& abort_source) {
-        if (abort_source.abort_requested() || abort_requested_) {
+        if (auto valid = validate_network_write(data, limits_); !valid) {
+            result<void> outcome = failure(valid.error());
+            return seastar::make_ready_future<result<void>>(std::move(outcome));
+        }
+        if (abort_source.abort_requested()) {
             result<void> outcome = failure(
               operation_error{errc::aborted, operation_kind::network});
             return seastar::make_ready_future<result<void>>(std::move(outcome));
         }
-        if (
-          state_ != network_connection_state::open
-          || output_state_ == network_half_state::shut_down) {
-            result<void> outcome = failure(
-              operation_error{errc::closed, operation_kind::network});
-            return seastar::make_ready_future<result<void>>(std::move(outcome));
-        }
-        if (auto valid = validate_network_write(data, limits_); !valid) {
-            result<void> outcome = failure(valid.error());
+        if (auto rejected = output_rejection()) {
+            result<void> outcome = failure(std::move(*rejected));
             return seastar::make_ready_future<result<void>>(std::move(outcome));
         }
         if (!controlled_io_) {
             return detail::success();
         }
-        auto reservation = write_admission_.try_acquire(data.size());
+        auto reservation = write_admission_.try_acquire(data.retained_bytes());
         if (!reservation) {
             result<void> outcome = failure(
               operation_error{errc::queue_full, operation_kind::network});
@@ -194,25 +188,28 @@ public:
     const network_connection_limits& limits() const noexcept { return limits_; }
     owner_shard owner() const noexcept { return owner_; }
     result<void> shutdown_input() {
-        if (state_ != network_connection_state::open) {
-            return failure(
-              operation_error{errc::closed, operation_kind::network});
+        if (auto rejected = input_rejection()) {
+            return failure(std::move(*rejected));
         }
         input_state_ = network_half_state::shut_down;
         fail_pending_read(errc::closed);
         return {};
     }
     result<void> shutdown_output() {
-        if (state_ != network_connection_state::open) {
-            return failure(
-              operation_error{errc::closed, operation_kind::network});
+        if (auto rejected = output_rejection()) {
+            return failure(std::move(*rejected));
         }
         output_state_ = network_half_state::shut_down;
         fail_pending_writes(errc::closed);
         return {};
     }
     void request_abort() {
+        if (state_ == network_connection_state::closed || abort_requested_) {
+            return;
+        }
         abort_requested_ = true;
+        input_state_ = network_half_state::shut_down;
+        output_state_ = network_half_state::shut_down;
         fail_pending_read(errc::aborted);
         fail_pending_writes(errc::aborted);
     }
@@ -220,11 +217,9 @@ public:
         if (state_ == network_connection_state::closed) {
             return detail::success();
         }
+        state_ = network_connection_state::closing;
+        request_abort();
         state_ = network_connection_state::closed;
-        input_state_ = network_half_state::shut_down;
-        output_state_ = network_half_state::shut_down;
-        fail_pending_read(errc::closed);
-        fail_pending_writes(errc::closed);
         return detail::success();
     }
 
@@ -266,6 +261,32 @@ public:
     }
 
 private:
+    [[nodiscard]] std::optional<operation_error> input_rejection() const {
+        if (state_ != network_connection_state::open) {
+            return operation_error{errc::closed, operation_kind::network};
+        }
+        if (abort_requested_) {
+            return operation_error{errc::aborted, operation_kind::network};
+        }
+        if (input_state_ != network_half_state::open) {
+            return operation_error{errc::closed, operation_kind::network};
+        }
+        return std::nullopt;
+    }
+
+    [[nodiscard]] std::optional<operation_error> output_rejection() const {
+        if (state_ != network_connection_state::open) {
+            return operation_error{errc::closed, operation_kind::network};
+        }
+        if (abort_requested_) {
+            return operation_error{errc::aborted, operation_kind::network};
+        }
+        if (output_state_ != network_half_state::open) {
+            return operation_error{errc::closed, operation_kind::network};
+        }
+        return std::nullopt;
+    }
+
     struct pending_write final {
         bytes::fragmented_buffer data;
         network_write_admission::reservation reservation;
@@ -322,15 +343,15 @@ public:
 
     seastar::future<result<contract_connection>>
     accept(seastar::abort_source& abort_source) {
-        if (closed_) {
-            result<contract_connection> outcome = failure(
-              operation_error{errc::closed, operation_kind::network});
-            return seastar::make_ready_future<result<contract_connection>>(
-              std::move(outcome));
-        }
         if (abort_source.abort_requested() || abort_requested_) {
             result<contract_connection> outcome = failure(
               operation_error{errc::aborted, operation_kind::network});
+            return seastar::make_ready_future<result<contract_connection>>(
+              std::move(outcome));
+        }
+        if (closed_) {
+            result<contract_connection> outcome = failure(
+              operation_error{errc::closed, operation_kind::network});
             return seastar::make_ready_future<result<contract_connection>>(
               std::move(outcome));
         }
@@ -344,6 +365,10 @@ public:
     owner_shard owner() const noexcept { return owner_; }
     void request_abort() { abort_requested_ = true; }
     seastar::future<result<void>> close() {
+        if (closed_) {
+            return detail::success();
+        }
+        request_abort();
         closed_ = true;
         return detail::success();
     }
@@ -425,7 +450,7 @@ public:
         }
         std::vector<dns_answer> answers;
         answers.push_back(
-          dns_answer{.endpoint = **numeric, .ttl = monotonic_duration{0}});
+          dns_answer{.endpoint = **numeric, .ttl = maximum_dns_ttl});
         auto outcome = dns_result::make(std::move(answers), 1);
         return seastar::make_ready_future<result<dns_result>>(
           std::move(outcome));

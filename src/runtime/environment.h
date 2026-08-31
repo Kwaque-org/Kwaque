@@ -67,7 +67,7 @@ concept fault_backend_contract
         requires fault_injector<typename Backend::fault_injector_type>;
         {
             backend.faults()
-        } -> std::same_as<typename Backend::fault_injector_type&>;
+        } noexcept -> std::same_as<typename Backend::fault_injector_type&>;
     });
 
 template<typename Backend>

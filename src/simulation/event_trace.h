@@ -4,15 +4,18 @@
 #include "src/base/allocation.h"
 #include "src/runtime/error.h"
 #include "src/runtime/time.h"
+#include "src/simulation/determinism_version.h"
 
 #include <seastar/core/chunked_vector.hh>
 #include <seastar/core/future.hh>
 
+#include <algorithm>
 #include <array>
 #include <compare>
 #include <cstddef>
 #include <cstdint>
 #include <deque>
+#include <iterator>
 #include <memory>
 #include <optional>
 #include <span>
@@ -24,10 +27,10 @@ namespace kwaque::simulation {
 
 class scheduler;
 
-inline constexpr std::uint32_t event_trace_schema_version{1};
+inline constexpr std::uint32_t event_trace_schema_version{3};
 inline constexpr std::uint32_t scheduler_ordering_version{1};
 inline constexpr std::size_t trace_context_fields_max{4};
-inline constexpr std::size_t canonical_entry_encoded_size{227};
+inline constexpr std::size_t canonical_entry_encoded_size{244};
 inline constexpr std::size_t canonical_header_encoded_size{294};
 inline constexpr std::uint32_t synchronous_trace_entries_max{1'024};
 
@@ -146,6 +149,9 @@ enum class trace_action : std::uint8_t {
     time_advanced = 4,
     wall_adjusted = 5,
     keyed_decision = 6,
+    fault_evaluated = 7,
+    operation_discarded = 8,
+    crash_applied = 9,
 };
 
 enum class trace_event_kind : std::uint8_t {
@@ -153,6 +159,9 @@ enum class trace_event_kind : std::uint8_t {
     timer = 1,
     wall_adjustment = 2,
     keyed_random = 3,
+    fault = 4,
+    file = 5,
+    filesystem = 6,
 };
 
 enum class trace_context_key : std::uint8_t {
@@ -161,6 +170,33 @@ enum class trace_context_key : std::uint8_t {
     actual = 2,
     limit = 3,
     detail = 4,
+};
+
+enum class trace_difference_field : std::uint8_t {
+    expected_missing = 1,
+    actual_missing = 2,
+    sequence = 3,
+    time = 4,
+    deadline = 5,
+    action = 6,
+    kind = 7,
+    event_id = 8,
+    priority = 9,
+    domain = 10,
+    stable_id = 11,
+    coordinate_a = 12,
+    coordinate_b = 13,
+    value = 14,
+    result = 15,
+    context_size = 16,
+    context_key_0 = 17,
+    context_value_0 = 18,
+    context_key_1 = 19,
+    context_value_1 = 20,
+    context_key_2 = 21,
+    context_value_2 = 22,
+    context_key_3 = 23,
+    context_value_3 = 24,
 };
 
 struct trace_context_field final {
@@ -186,6 +222,7 @@ struct trace_event_descriptor final {
 struct trace_entry final {
     std::uint64_t sequence{0};
     runtime::monotonic_time time{};
+    runtime::monotonic_time deadline{};
     trace_action action{trace_action::none};
     trace_event_kind kind{trace_event_kind::generic};
     std::uint64_t event_id{0};
@@ -200,6 +237,81 @@ struct trace_entry final {
     std::uint8_t context_size{0};
 
     bool operator==(const trace_entry&) const = default;
+};
+
+// Fixed-capacity chunked storage for the hot trace-append path. Construction
+// allocates every bounded slot; appending an accepted entry is then noexcept
+// and cannot discover allocator pressure after a simulated effect was admitted.
+class trace_entry_log final {
+public:
+    class const_iterator final {
+    public:
+        using difference_type = std::ptrdiff_t;
+        using value_type = trace_entry;
+        using reference = const trace_entry&;
+        using pointer = const trace_entry*;
+        using iterator_category = std::forward_iterator_tag;
+
+        const_iterator() noexcept = default;
+
+        [[nodiscard]] reference operator*() const noexcept {
+            return (*owner_)[index_];
+        }
+        [[nodiscard]] pointer operator->() const noexcept {
+            return &(*owner_)[index_];
+        }
+        const_iterator& operator++() noexcept {
+            ++index_;
+            return *this;
+        }
+        const_iterator operator++(int) noexcept {
+            auto previous = *this;
+            ++*this;
+            return previous;
+        }
+
+        bool operator==(const const_iterator&) const = default;
+
+    private:
+        friend class trace_entry_log;
+
+        const_iterator(const trace_entry_log& owner, std::size_t index) noexcept
+          : owner_(&owner)
+          , index_(index) {}
+
+        const trace_entry_log* owner_{nullptr};
+        std::size_t index_{0};
+    };
+
+    explicit trace_entry_log(std::size_t capacity);
+    trace_entry_log(const trace_entry_log&) = delete;
+    trace_entry_log& operator=(const trace_entry_log&) = delete;
+    trace_entry_log(trace_entry_log&&) = delete;
+    trace_entry_log& operator=(trace_entry_log&&) = delete;
+
+    [[nodiscard]] bool empty() const noexcept { return size_ == 0; }
+    [[nodiscard]] std::size_t size() const noexcept { return size_; }
+    [[nodiscard]] std::size_t capacity() const noexcept { return capacity_; }
+    [[nodiscard]] const trace_entry&
+    operator[](std::size_t index) const noexcept;
+    [[nodiscard]] const_iterator begin() const noexcept {
+        return const_iterator{*this, 0};
+    }
+    [[nodiscard]] const_iterator end() const noexcept {
+        return const_iterator{*this, size_};
+    }
+
+private:
+    friend class event_trace;
+
+    static constexpr std::size_t entries_per_chunk = std::max<std::size_t>(
+      1, maximum_contiguous_allocation_bytes / sizeof(trace_entry));
+
+    void append(trace_entry entry) noexcept;
+
+    std::deque<std::vector<trace_entry>> chunks_;
+    std::size_t size_{0};
+    std::size_t capacity_{0};
 };
 
 struct decoded_event_trace final {
@@ -224,6 +336,7 @@ public:
         [[nodiscard]] std::uint32_t entries() const noexcept {
             return entries_;
         }
+        [[nodiscard]] runtime::result<void> observe(trace_entry entry) noexcept;
         void release() noexcept;
 
     private:
@@ -256,9 +369,9 @@ public:
       decoded_event_trace expected);
 
     [[nodiscard]] runtime::result<reservation>
-    reserve(std::uint32_t entries, std::uint64_t encoded_bytes);
+    reserve(std::uint32_t entries, std::uint64_t encoded_bytes) noexcept;
     [[nodiscard]] runtime::result<void>
-    observe(trace_entry entry, reservation* reserved = nullptr);
+    observe(trace_entry entry, reservation* reserved = nullptr) noexcept;
     [[nodiscard]] runtime::result<void> finish_replay() noexcept;
 
     [[nodiscard]] runtime::result<trace_artifact> encode() const;
@@ -282,8 +395,7 @@ public:
     [[nodiscard]] const trace_limits& limits() const noexcept {
         return limits_;
     }
-    [[nodiscard]] const seastar::chunked_vector<trace_entry>&
-    entries() const noexcept {
+    [[nodiscard]] const trace_entry_log& entries() const noexcept {
         return entries_;
     }
     [[nodiscard]] std::uint64_t encoded_bytes() const noexcept {
@@ -319,7 +431,7 @@ private:
 
     trace_header header_;
     trace_limits limits_;
-    seastar::chunked_vector<trace_entry> entries_;
+    trace_entry_log entries_;
     std::uint64_t encoded_bytes_{0};
     std::uint64_t observed_entries_{0};
     std::uint32_t reserved_entries_{0};

@@ -1,6 +1,7 @@
 #include "src/simulation/event_trace.h"
 
 #include "src/base/invariant.h"
+#include "src/runtime/fault.h"
 
 #include <seastar/coroutine/maybe_yield.hh>
 
@@ -86,6 +87,7 @@ void append_entry(Output& output, const trace_entry& entry) {
     output.push_back('E');
     append_field(output, entry.sequence, 16);
     append_field(output, entry.time.nanoseconds(), 16);
+    append_field(output, entry.deadline.nanoseconds(), 16);
     append_field(output, static_cast<std::uint8_t>(entry.action), 2);
     append_field(output, static_cast<std::uint8_t>(entry.kind), 2);
     append_field(output, entry.event_id, 16);
@@ -210,35 +212,36 @@ parse_header(std::string_view line) noexcept {
 
 [[nodiscard]] runtime::result<trace_entry>
 parse_entry(std::string_view line) noexcept {
-    std::array<std::string_view, 18> tokens{};
+    std::array<std::string_view, 19> tokens{};
     const auto count = tokenize(line, tokens);
-    if (!count || *count != 18 || tokens[0] != "E") {
+    if (!count || *count != 19 || tokens[0] != "E") {
         return runtime::failure(trace_error(errc::malformed_data));
     }
 
     trace_entry entry;
     std::uint64_t time = 0;
+    std::uint64_t deadline = 0;
     std::uint8_t action = 0;
     std::uint8_t kind = 0;
     if (
       !parse_hex(tokens[1], 16, entry.sequence)
-      || !parse_hex(tokens[2], 16, time) || !parse_hex(tokens[3], 2, action)
-      || !parse_hex(tokens[4], 2, kind)
-      || !parse_hex(tokens[5], 16, entry.event_id)
-      || !parse_hex(tokens[6], 2, entry.priority)
-      || !parse_hex(tokens[7], 8, entry.domain)
-      || !parse_hex(tokens[8], 16, entry.stable_id)
-      || !parse_hex(tokens[9], 16, entry.coordinate_a)
-      || !parse_hex(tokens[10], 16, entry.coordinate_b)
-      || !parse_hex(tokens[11], 16, entry.value)
-      || !parse_hex(tokens[12], 8, entry.result)
-      || !parse_hex(tokens[13], 2, entry.context_size)) {
+      || !parse_hex(tokens[2], 16, time) || !parse_hex(tokens[3], 16, deadline)
+      || !parse_hex(tokens[4], 2, action) || !parse_hex(tokens[5], 2, kind)
+      || !parse_hex(tokens[6], 16, entry.event_id)
+      || !parse_hex(tokens[7], 2, entry.priority)
+      || !parse_hex(tokens[8], 8, entry.domain)
+      || !parse_hex(tokens[9], 16, entry.stable_id)
+      || !parse_hex(tokens[10], 16, entry.coordinate_a)
+      || !parse_hex(tokens[11], 16, entry.coordinate_b)
+      || !parse_hex(tokens[12], 16, entry.value)
+      || !parse_hex(tokens[13], 8, entry.result)
+      || !parse_hex(tokens[14], 2, entry.context_size)) {
         return runtime::failure(trace_error(errc::malformed_data));
     }
     entry.action = static_cast<trace_action>(action);
     entry.kind = static_cast<trace_event_kind>(kind);
     for (std::size_t index = 0; index < entry.context.size(); ++index) {
-        const auto token = tokens[14 + index];
+        const auto token = tokens[15 + index];
         std::uint8_t key = 0;
         if (
           token.size() != 18 || !parse_hex(token.substr(0, 2), 2, key)
@@ -248,7 +251,28 @@ parse_entry(std::string_view line) noexcept {
         entry.context[index].key = static_cast<trace_context_key>(key);
     }
     entry.time = runtime::monotonic_time{time};
+    entry.deadline = runtime::monotonic_time{deadline};
     return entry;
+}
+
+[[nodiscard]] constexpr bool
+sample_matches_draws(const trace_entry& entry) noexcept {
+    return (entry.coordinate_b == 0)
+           == (entry.value == std::numeric_limits<std::uint64_t>::max());
+}
+
+[[nodiscard]] bool fault_result_is_well_formed(
+  const trace_entry& entry,
+  const runtime::fault_point_descriptor* descriptor) noexcept {
+    const auto encoded_action = static_cast<std::uint8_t>(
+      entry.result & UINT32_C(0xff));
+    const auto outcome = entry.result >> 8U;
+    const auto action = static_cast<runtime::fault_action>(encoded_action);
+    return (entry.result & UINT32_C(0xffff0000)) == 0 && encoded_action != 0
+           && encoded_action
+                <= static_cast<std::uint8_t>(runtime::fault_action::crash)
+           && (outcome == 1U || outcome == 2U) && descriptor != nullptr
+           && descriptor->permitted_actions.contains(action);
 }
 
 [[nodiscard]] runtime::result<void> validate_entry_shape(
@@ -257,27 +281,39 @@ parse_entry(std::string_view line) noexcept {
     const auto kind = static_cast<std::uint8_t>(entry.kind);
     if (
       entry.sequence == 0 || action == 0
-      || action > static_cast<std::uint8_t>(trace_action::keyed_decision)
-      || kind > static_cast<std::uint8_t>(trace_event_kind::keyed_random)
+      || action > static_cast<std::uint8_t>(trace_action::crash_applied)
+      || kind > static_cast<std::uint8_t>(trace_event_kind::filesystem)
       || entry.context_size > entry.context.size()
-      || entry.time.nanoseconds() > header.scheduler_budget.maximum_deadline) {
+      || entry.time.nanoseconds() > header.scheduler_budget.maximum_deadline
+      || entry.deadline.nanoseconds()
+           > header.scheduler_budget.maximum_deadline) {
         return invalid_trace(errc::malformed_data);
     }
     switch (entry.action) {
     case trace_action::scheduled:
     case trace_action::canceled:
+        if (
+          entry.event_id == 0 || entry.kind == trace_event_kind::keyed_random
+          || entry.kind == trace_event_kind::fault
+          || entry.deadline < entry.time) {
+            return invalid_trace(errc::malformed_data);
+        }
+        break;
     case trace_action::selected:
         if (
-          entry.event_id == 0 || entry.kind == trace_event_kind::keyed_random) {
+          entry.event_id == 0 || entry.kind == trace_event_kind::keyed_random
+          || entry.kind == trace_event_kind::fault
+          || entry.deadline != entry.time) {
             return invalid_trace(errc::malformed_data);
         }
         break;
     case trace_action::time_advanced:
         if (
           entry.event_id != 0 || entry.kind != trace_event_kind::generic
-          || entry.priority != 0 || entry.domain != 0 || entry.stable_id != 0
+          || entry.deadline.nanoseconds() != 0 || entry.priority != 0
+          || entry.domain != 0 || entry.stable_id != 0
           || entry.coordinate_a != entry.time.nanoseconds()
-          || entry.value <= entry.coordinate_a
+          || entry.coordinate_b != 0 || entry.value <= entry.coordinate_a
           || entry.value > header.scheduler_budget.maximum_deadline
           || entry.result != 0) {
             return invalid_trace(errc::malformed_data);
@@ -285,15 +321,47 @@ parse_entry(std::string_view line) noexcept {
         break;
     case trace_action::wall_adjusted:
         if (
-          entry.event_id == 0
-          || entry.kind != trace_event_kind::wall_adjustment) {
+          entry.event_id == 0 || entry.kind != trace_event_kind::wall_adjustment
+          || entry.deadline != entry.time) {
             return invalid_trace(errc::malformed_data);
         }
         break;
     case trace_action::keyed_decision:
         if (
           entry.event_id != 0 || entry.kind != trace_event_kind::keyed_random
-          || entry.priority != 0 || entry.domain == 0) {
+          || entry.deadline.nanoseconds() != 0 || entry.priority != 0
+          || entry.domain == 0) {
+            return invalid_trace(errc::malformed_data);
+        }
+        break;
+    case trace_action::fault_evaluated: {
+        const auto point = runtime::fault_point_id::make(entry.domain);
+        const auto* descriptor = point
+                                   ? runtime::find_builtin_fault_point(*point)
+                                   : nullptr;
+        if (
+          entry.event_id != 0 || entry.kind != trace_event_kind::fault
+          || entry.deadline.nanoseconds() != 0 || entry.priority != 0
+          || entry.domain == 0 || entry.stable_id == 0
+          || entry.coordinate_a == 0 || entry.context_size != 0
+          || !sample_matches_draws(entry)
+          || !fault_result_is_well_formed(entry, descriptor)) {
+            return invalid_trace(errc::malformed_data);
+        }
+        break;
+    }
+    case trace_action::operation_discarded:
+        if (
+          entry.event_id == 0
+          || (entry.kind != trace_event_kind::file && entry.kind != trace_event_kind::filesystem)
+          || entry.deadline != entry.time) {
+            return invalid_trace(errc::malformed_data);
+        }
+        break;
+    case trace_action::crash_applied:
+        if (
+          entry.event_id == 0 || entry.kind != trace_event_kind::filesystem
+          || entry.deadline != entry.time) {
             return invalid_trace(errc::malformed_data);
         }
         break;
@@ -322,7 +390,189 @@ parse_entry(std::string_view line) noexcept {
     return {};
 }
 
+struct trace_difference final {
+    trace_difference_field field;
+    std::uint64_t expected;
+    std::uint64_t actual;
+};
+
+[[nodiscard]] trace_difference first_difference(
+  const trace_entry* expected, const trace_entry* actual) noexcept {
+    if (expected == nullptr) {
+        return {
+          .field = trace_difference_field::expected_missing,
+          .expected = 0,
+          .actual = actual == nullptr
+                      ? std::uint64_t{0}
+                      : static_cast<std::uint64_t>(actual->action),
+        };
+    }
+    if (actual == nullptr) {
+        return {
+          .field = trace_difference_field::actual_missing,
+          .expected = static_cast<std::uint8_t>(expected->action),
+          .actual = 0,
+        };
+    }
+
+    const auto difference =
+      [](
+        trace_difference_field field,
+        std::uint64_t expected_value,
+        std::uint64_t actual_value) -> std::optional<trace_difference> {
+        if (expected_value == actual_value) {
+            return std::nullopt;
+        }
+        return trace_difference{
+          .field = field,
+          .expected = expected_value,
+          .actual = actual_value,
+        };
+    };
+
+    const std::array differences{
+      trace_difference{
+        trace_difference_field::sequence, expected->sequence, actual->sequence},
+      trace_difference{
+        trace_difference_field::time,
+        expected->time.nanoseconds(),
+        actual->time.nanoseconds()},
+      trace_difference{
+        trace_difference_field::deadline,
+        expected->deadline.nanoseconds(),
+        actual->deadline.nanoseconds()},
+      trace_difference{
+        trace_difference_field::action,
+        static_cast<std::uint8_t>(expected->action),
+        static_cast<std::uint8_t>(actual->action)},
+      trace_difference{
+        trace_difference_field::kind,
+        static_cast<std::uint8_t>(expected->kind),
+        static_cast<std::uint8_t>(actual->kind)},
+      trace_difference{
+        trace_difference_field::event_id, expected->event_id, actual->event_id},
+      trace_difference{
+        trace_difference_field::priority, expected->priority, actual->priority},
+      trace_difference{
+        trace_difference_field::domain, expected->domain, actual->domain},
+      trace_difference{
+        trace_difference_field::stable_id,
+        expected->stable_id,
+        actual->stable_id},
+      trace_difference{
+        trace_difference_field::coordinate_a,
+        expected->coordinate_a,
+        actual->coordinate_a},
+      trace_difference{
+        trace_difference_field::coordinate_b,
+        expected->coordinate_b,
+        actual->coordinate_b},
+      trace_difference{
+        trace_difference_field::value, expected->value, actual->value},
+      trace_difference{
+        trace_difference_field::result, expected->result, actual->result},
+      trace_difference{
+        trace_difference_field::context_size,
+        expected->context_size,
+        actual->context_size},
+    };
+    for (const auto& candidate : differences) {
+        if (
+          auto found = difference(
+            candidate.field, candidate.expected, candidate.actual)) {
+            return *found;
+        }
+    }
+
+    for (std::size_t index = 0; index < expected->context.size(); ++index) {
+        if (expected->context[index].key != actual->context[index].key) {
+            return {
+              .field = static_cast<trace_difference_field>(
+                static_cast<std::uint8_t>(trace_difference_field::context_key_0)
+                + index * 2U),
+              .expected = static_cast<std::uint8_t>(
+                expected->context[index].key),
+              .actual = static_cast<std::uint8_t>(actual->context[index].key),
+            };
+        }
+        if (expected->context[index].value != actual->context[index].value) {
+            return {
+              .field = static_cast<trace_difference_field>(
+                static_cast<std::uint8_t>(
+                  trace_difference_field::context_value_0)
+                + index * 2U),
+              .expected = expected->context[index].value,
+              .actual = actual->context[index].value,
+            };
+        }
+    }
+
+    return {
+      .field = trace_difference_field::action,
+      .expected = static_cast<std::uint8_t>(expected->action),
+      .actual = static_cast<std::uint8_t>(actual->action),
+    };
+}
+
+class trace_artifact_reader final {
+public:
+    explicit trace_artifact_reader(const trace_artifact& artifact) noexcept
+      : artifact_(&artifact) {}
+
+    [[nodiscard]] bool copy_to(std::span<char> destination) noexcept {
+        if (destination.size() > artifact_->size() - consumed_) {
+            return false;
+        }
+        std::size_t copied = 0;
+        while (copied < destination.size()) {
+            const auto& chunk = artifact_->chunks()[chunk_index_];
+            const auto count = std::min(
+              chunk.size() - chunk_offset_, destination.size() - copied);
+            std::memcpy(
+              destination.data() + copied, chunk.data() + chunk_offset_, count);
+            copied += count;
+            consumed_ += count;
+            chunk_offset_ += count;
+            if (chunk_offset_ == chunk.size()) {
+                ++chunk_index_;
+                chunk_offset_ = 0;
+            }
+        }
+        return true;
+    }
+
+private:
+    const trace_artifact* artifact_;
+    std::uint64_t consumed_{0};
+    std::size_t chunk_index_{0};
+    std::size_t chunk_offset_{0};
+};
+
 } // namespace
+
+trace_entry_log::trace_entry_log(std::size_t capacity)
+  : capacity_(capacity) {
+    auto remaining = capacity;
+    while (remaining != 0) {
+        const auto count = std::min(remaining, entries_per_chunk);
+        chunks_.emplace_back(count);
+        remaining -= count;
+    }
+}
+
+const trace_entry&
+trace_entry_log::operator[](std::size_t index) const noexcept {
+    return chunks_[index / entries_per_chunk][index % entries_per_chunk];
+}
+
+void trace_entry_log::append(trace_entry entry) noexcept {
+    KWAQUE_INVARIANT(
+      trace_reservation_invariant,
+      size_ < capacity_,
+      "event trace exceeded preallocated entry storage");
+    chunks_[size_ / entries_per_chunk][size_ % entries_per_chunk] = entry;
+    ++size_;
+}
 
 void trace_artifact::append(std::string_view bytes) {
     while (!bytes.empty()) {
@@ -478,7 +728,8 @@ trace_header trace_header::current(
 runtime::result<void> trace_header::validate() const noexcept {
     if (
       schema_version != event_trace_schema_version
-      || random_algorithm_version == 0 || coordinate_schema_version == 0
+      || random_algorithm_version != deterministic_random_algorithm_version
+      || coordinate_schema_version != deterministic_random_coordinate_version
       || ordering_version != scheduler_ordering_version
       || scheduler_budget.pending_events == 0
       || scheduler_budget.events_per_pump == 0
@@ -530,16 +781,24 @@ void event_trace::reservation::release() noexcept {
     encoded_bytes_ = 0;
 }
 
+runtime::result<void>
+event_trace::reservation::observe(trace_entry entry) noexcept {
+    if (owner_ == nullptr) {
+        return runtime::failure(trace_error(errc::invalid_argument));
+    }
+    return owner_->observe(entry, this);
+}
+
 event_trace::event_trace(trace_header header, trace_limits limits)
   : header_(std::move(header))
   , limits_(limits)
+  , entries_(limits.entries())
   , encoded_bytes_(canonical_header_encoded_size) {
     if (
       auto valid = header_.validate();
       !valid || !header_matches_limits(header_, limits_)) {
         throw std::invalid_argument("invalid event trace header");
     }
-    entries_.reserve(limits_.entries());
 }
 
 event_trace::event_trace(
@@ -548,9 +807,13 @@ event_trace::event_trace(
   seastar::chunked_vector<trace_entry> expected)
   : header_(std::move(header))
   , limits_(limits)
-  , entries_(std::move(expected))
+  , entries_(limits.entries())
   , encoded_bytes_(canonical_header_encoded_size)
-  , replaying_(true) {}
+  , replaying_(true) {
+    for (const auto& entry : expected) {
+        entries_.append(entry);
+    }
+}
 
 event_trace::~event_trace() {
     KWAQUE_INVARIANT(
@@ -591,8 +854,8 @@ runtime::result<std::unique_ptr<event_trace>> event_trace::replay(
       std::move(actual_header), limits, std::move(expected.entries)}};
 }
 
-runtime::result<event_trace::reservation>
-event_trace::reserve(std::uint32_t entries, std::uint64_t encoded_bytes) {
+runtime::result<event_trace::reservation> event_trace::reserve(
+  std::uint32_t entries, std::uint64_t encoded_bytes) noexcept {
     if (failure_) [[unlikely]] {
         return runtime::failure(*failure_);
     }
@@ -619,7 +882,7 @@ event_trace::reserve(std::uint32_t entries, std::uint64_t encoded_bytes) {
 }
 
 runtime::result<void>
-event_trace::observe(trace_entry entry, reservation* reserved) {
+event_trace::observe(trace_entry entry, reservation* reserved) noexcept {
     if (failure_) [[unlikely]] {
         return runtime::failure(*failure_);
     }
@@ -657,7 +920,7 @@ event_trace::observe(trace_entry entry, reservation* reserved) {
         consume(*reserved);
     }
     if (!replaying_) {
-        entries_.push_back(entry);
+        entries_.append(entry);
     }
     ++observed_entries_;
     encoded_bytes_ += canonical_entry_encoded_size;
@@ -732,8 +995,9 @@ event_trace::decode(const trace_artifact& encoded, trace_limits parser_limits) {
     if (canonical_header_encoded_size - 1U > parser_limits.line_bytes()) {
         return runtime::failure(trace_error(errc::malformed_data));
     }
+    trace_artifact_reader reader{encoded};
     std::array<char, canonical_header_encoded_size> header_line{};
-    if (!encoded.copy_to(0, header_line) || header_line.back() != '\n') {
+    if (!reader.copy_to(header_line) || header_line.back() != '\n') {
         return runtime::failure(trace_error(errc::malformed_data));
     }
     auto parsed_header = parse_header(
@@ -760,13 +1024,11 @@ event_trace::decode(const trace_artifact& encoded, trace_limits parser_limits) {
 
     seastar::chunked_vector<trace_entry> entries;
     entries.reserve(static_cast<std::size_t>(entry_count));
-    std::uint64_t offset = canonical_header_encoded_size;
     std::array<char, canonical_entry_encoded_size> entry_line{};
     for (std::uint64_t index = 0; index < entry_count; ++index) {
         if (
           canonical_entry_encoded_size - 1U > parser_limits.line_bytes()
-          || !encoded.copy_to(offset, entry_line)
-          || entry_line.back() != '\n') {
+          || !reader.copy_to(entry_line) || entry_line.back() != '\n') {
             return runtime::failure(trace_error(errc::malformed_data));
         }
         auto entry = parse_entry(
@@ -777,7 +1039,6 @@ event_trace::decode(const trace_artifact& encoded, trace_limits parser_limits) {
             return runtime::failure(trace_error(errc::malformed_data));
         }
         entries.push_back(*entry);
-        offset += canonical_entry_encoded_size;
     }
     return decoded_event_trace{
       .header = std::move(header),
@@ -811,8 +1072,9 @@ event_trace::decode_cooperatively(
         co_return runtime::failure(trace_error(errc::malformed_data));
     }
 
+    trace_artifact_reader reader{encoded};
     std::array<char, canonical_header_encoded_size> header_line{};
-    if (!encoded.copy_to(0, header_line) || header_line.back() != '\n') {
+    if (!reader.copy_to(header_line) || header_line.back() != '\n') {
         co_return runtime::failure(trace_error(errc::malformed_data));
     }
     auto parsed_header = parse_header(
@@ -836,14 +1098,12 @@ event_trace::decode_cooperatively(
 
     seastar::chunked_vector<trace_entry> entries;
     entries.reserve(static_cast<std::size_t>(entry_count));
-    std::uint64_t offset = canonical_header_encoded_size;
     std::array<char, canonical_entry_encoded_size> entry_line{};
     std::uint32_t batch_entries = 0;
     for (std::uint64_t index = 0; index < entry_count; ++index) {
         if (
           canonical_entry_encoded_size - 1U > parser_limits.line_bytes()
-          || !encoded.copy_to(offset, entry_line)
-          || entry_line.back() != '\n') {
+          || !reader.copy_to(entry_line) || entry_line.back() != '\n') {
             co_return runtime::failure(trace_error(errc::malformed_data));
         }
         auto entry = parse_entry(
@@ -854,7 +1114,6 @@ event_trace::decode_cooperatively(
             co_return runtime::failure(trace_error(errc::malformed_data));
         }
         entries.push_back(*entry);
-        offset += canonical_entry_encoded_size;
         if (++batch_entries == entries_per_yield) {
             batch_entries = 0;
             co_await seastar::coroutine::maybe_yield{};
@@ -874,17 +1133,17 @@ event_trace::validate_entry(const trace_entry& entry) const noexcept {
 
 runtime::operation_error event_trace::divergence_error(
   const trace_entry* expected, const trace_entry* actual) const noexcept {
+    const auto difference = first_difference(expected, actual);
     auto error = trace_error(errc::replay_divergence);
     static_cast<void>(error.add_context(
       runtime::operation_context_key::sequence, next_sequence()));
     static_cast<void>(error.add_context(
-      runtime::operation_context_key::expected,
-      expected == nullptr ? 0 : static_cast<std::uint8_t>(expected->action)));
+      runtime::operation_context_key::detail,
+      static_cast<std::uint8_t>(difference.field)));
     static_cast<void>(error.add_context(
-      runtime::operation_context_key::actual,
-      actual == nullptr ? 0 : static_cast<std::uint8_t>(actual->action)));
+      runtime::operation_context_key::expected, difference.expected));
     static_cast<void>(error.add_context(
-      runtime::operation_context_key::limit, entries_.size()));
+      runtime::operation_context_key::actual, difference.actual));
     return error;
 }
 

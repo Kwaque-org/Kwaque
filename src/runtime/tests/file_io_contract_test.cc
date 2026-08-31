@@ -126,7 +126,7 @@ TEST(FileIoContractTest, InternalConsumptionTransfersOwnershipCanonically) {
 TEST(FileIoContractTest, InternalConsumptionCanSplitAndCopyWithoutLinearizing) {
     seastar::temporary_buffer<char> storage{"abcdef", 6};
     auto buffer = kwaque::runtime::detail::fragmented_buffer_io_access::adopt(
-      std::move(storage));
+      std::move(storage), kwaque::byte_count{6});
     auto consumer
       = kwaque::runtime::detail::fragmented_buffer_io_access::consume(buffer);
 
@@ -148,6 +148,17 @@ TEST(FileIoContractTest, InternalConsumptionCanSplitAndCopyWithoutLinearizing) {
     EXPECT_EQ(buffer.retained_bytes(), kwaque::byte_count{});
 }
 
+TEST(FileIoContractTest, NativeAdoptionTracksHiddenRetainedBacking) {
+    auto storage = seastar::temporary_buffer<char>::aligned(4096, 4096);
+    storage.trim(1);
+    auto buffer = kwaque::runtime::detail::fragmented_buffer_io_access::adopt(
+      std::move(storage), kwaque::byte_count{4096});
+
+    EXPECT_EQ(buffer.size(), kwaque::byte_count{1});
+    EXPECT_EQ(buffer.retained_bytes(), kwaque::byte_count{4096});
+    EXPECT_EQ(buffer.fragment_count(), 1U);
+}
+
 TEST(FileIoContractTest, ReadResultCarriesExplicitEofAndOwningBytes) {
     auto data = kwaque::bytes::fragmented_buffer::copy_of(
       std::span<const char>{"short", 5});
@@ -163,6 +174,14 @@ TEST(FileIoContractTest, ReadResultCarriesExplicitEofAndOwningBytes) {
     auto invalid = kwaque::runtime::file_read_result::make(
       kwaque::bytes::fragmented_buffer{}, false, kwaque::byte_count{1});
     EXPECT_FALSE(invalid.has_value());
+
+    auto ambiguous = kwaque::bytes::fragmented_buffer::copy_of(
+      std::span<const char>{"x", 1});
+    ASSERT_TRUE(ambiguous.has_value());
+    auto ambiguous_result = kwaque::runtime::file_read_result::make(
+      std::move(*ambiguous), false, kwaque::byte_count{2});
+    ASSERT_FALSE(ambiguous_result.has_value());
+    EXPECT_EQ(ambiguous_result.error().code(), kwaque::errc::invalid_argument);
 }
 
 } // namespace

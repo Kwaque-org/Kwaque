@@ -6,15 +6,17 @@
 #include "src/runtime/time.h"
 #include "src/simulation/event_trace.h"
 
-#include <seastar/core/chunked_hash_map.hh>
-#include <seastar/core/chunked_vector.hh>
 #include <seastar/util/noncopyable_function.hh>
 
+#include <algorithm>
 #include <compare>
 #include <cstddef>
 #include <cstdint>
+#include <deque>
 #include <limits>
 #include <optional>
+#include <type_traits>
+#include <vector>
 
 namespace kwaque::simulation {
 
@@ -157,6 +159,10 @@ public:
       event_cleanup_policy cleanup = event_cleanup_policy::drop,
       event_trace::reservation trace_reservation = {});
     [[nodiscard]] runtime::result<event_id_reservation> reserve_event_id();
+    [[nodiscard]] runtime::result<void> can_schedule(
+      runtime::monotonic_time deadline,
+      trace_event_descriptor descriptor = {},
+      event_cleanup_policy cleanup = event_cleanup_policy::drop) const noexcept;
     [[nodiscard]] runtime::result<event_trace::reservation>
     reserve_trace(trace_event_descriptor descriptor = {});
     [[nodiscard]] runtime::result<bool> cancel(event_id id) noexcept;
@@ -187,6 +193,7 @@ public:
     [[nodiscard]] std::uint64_t executed_events() const;
     [[nodiscard]] bool trace_failed() const;
     [[nodiscard]] const runtime::operation_error* trace_failure() const;
+    [[nodiscard]] bool uses_trace(const event_trace& trace) const;
     // True only while a poisoned replay invokes an explicitly admitted
     // teardown callback. Such a callback must release ownership and must not
     // apply the event's normal simulated effect.
@@ -211,6 +218,68 @@ private:
 
     static_assert(sizeof(callback) == 40);
     static_assert(sizeof(event) == 136);
+    static_assert(std::is_nothrow_move_constructible_v<event>);
+    static_assert(std::is_nothrow_move_assignable_v<event>);
+
+    class event_storage final {
+    public:
+        explicit event_storage(std::size_t capacity);
+
+        [[nodiscard]] std::size_t size() const noexcept { return size_; }
+        [[nodiscard]] std::size_t capacity() const noexcept {
+            return capacity_;
+        }
+        [[nodiscard]] event& operator[](std::size_t index) noexcept;
+        [[nodiscard]] const event& operator[](std::size_t index) const noexcept;
+        [[nodiscard]] event& back() noexcept { return (*this)[size_ - 1U]; }
+
+        void push_back(event value) noexcept;
+        void pop_back() noexcept;
+
+    private:
+        using slot = std::optional<event>;
+        static constexpr std::size_t entries_per_chunk = std::max<std::size_t>(
+          1, maximum_contiguous_allocation_bytes / sizeof(slot));
+
+        std::deque<std::vector<slot>> chunks_;
+        std::size_t size_{0};
+        std::size_t capacity_{0};
+    };
+
+    class event_index final {
+    public:
+        explicit event_index(std::size_t maximum_entries);
+
+        [[nodiscard]] std::size_t size() const noexcept { return size_; }
+        [[nodiscard]] std::size_t* find(std::uint64_t key) noexcept;
+        [[nodiscard]] const std::size_t* find(std::uint64_t key) const noexcept;
+        [[nodiscard]] std::size_t& at(std::uint64_t key) noexcept;
+        [[nodiscard]] bool
+        try_emplace(std::uint64_t key, std::size_t value) noexcept;
+        [[nodiscard]] bool erase(std::uint64_t key) noexcept;
+
+    private:
+        struct slot final {
+            std::uint64_t key{0};
+            std::size_t value{0};
+            // Zero is empty; one means the ideal bucket. Larger values are the
+            // Robin-Hood probe distance plus one.
+            std::uint32_t distance{0};
+        };
+
+        static constexpr std::size_t entries_per_chunk = std::max<std::size_t>(
+          1, maximum_contiguous_allocation_bytes / sizeof(slot));
+
+        [[nodiscard]] static std::uint64_t hash(std::uint64_t key) noexcept;
+        [[nodiscard]] std::size_t bucket(std::uint64_t key) const noexcept;
+        [[nodiscard]] slot& slot_at(std::size_t index) noexcept;
+        [[nodiscard]] const slot& slot_at(std::size_t index) const noexcept;
+
+        std::deque<std::vector<slot>> chunks_;
+        std::size_t capacity_{0};
+        std::size_t mask_{0};
+        std::size_t size_{0};
+    };
 
     class pump_scope final {
     public:
@@ -274,8 +343,8 @@ private:
 
     scheduler_limits limits_;
     event_trace* trace_;
-    seastar::chunked_vector<event> heap_;
-    seastar::chunked_hash_map<std::uint64_t, std::size_t> indices_;
+    event_storage heap_;
+    event_index indices_;
     runtime::monotonic_time now_{};
     std::uint64_t next_event_id_{1};
     std::uint64_t executed_events_{0};

@@ -105,7 +105,7 @@ static_assert(sizeof(kwaque::runtime::network_endpoint) <= 32);
 static_assert(sizeof(kwaque::runtime::fault_object_key) <= 40);
 static_assert(sizeof(kwaque::runtime::fault_request) <= 64);
 static_assert(sizeof(kwaque::runtime::fault_decision) <= 16);
-static_assert(kwaque::runtime::builtin_fault_points.size() == 10);
+static_assert(kwaque::runtime::builtin_fault_points.size() == 23);
 
 TEST(NetworkContractTest, ParsesOnlyCanonicalNumericEndpoints) {
     const auto ipv4 = kwaque::runtime::network_address::try_parse_numeric(
@@ -383,6 +383,8 @@ TEST(FaultContractTest, BuiltinPointTableHasExactLegalActionSets) {
     ASSERT_NE(file_read, nullptr);
     EXPECT_TRUE(file_read->permitted_actions.contains(
       kwaque::runtime::fault_action::corrupt));
+    EXPECT_TRUE(file_read->permitted_actions.contains(
+      kwaque::runtime::fault_action::crash));
     EXPECT_FALSE(file_read->permitted_actions.contains(
       kwaque::runtime::fault_action::torn_write));
     EXPECT_FALSE(file_read->permitted_actions.contains(
@@ -393,6 +395,8 @@ TEST(FaultContractTest, BuiltinPointTableHasExactLegalActionSets) {
     ASSERT_NE(file_write, nullptr);
     EXPECT_TRUE(file_write->permitted_actions.contains(
       kwaque::runtime::fault_action::torn_write));
+    EXPECT_TRUE(file_write->permitted_actions.contains(
+      kwaque::runtime::fault_action::crash));
     EXPECT_FALSE(file_write->permitted_actions.contains(
       kwaque::runtime::fault_action::duplicate));
 
@@ -403,6 +407,15 @@ TEST(FaultContractTest, BuiltinPointTableHasExactLegalActionSets) {
       kwaque::runtime::fault_action::duplicate));
     EXPECT_FALSE(network_write->permitted_actions.contains(
       kwaque::runtime::fault_action::torn_write));
+
+    const auto* file_close = kwaque::runtime::descriptor_for(
+      kwaque::runtime::builtin_fault_point::file_close);
+    ASSERT_NE(file_close, nullptr);
+    EXPECT_EQ(file_close->id.value(), 23U);
+    EXPECT_FALSE(file_close->permitted_actions.contains(
+      kwaque::runtime::fault_action::error));
+    EXPECT_TRUE(file_close->permitted_actions.contains(
+      kwaque::runtime::fault_action::drop_completion));
 
     EXPECT_EQ(
       kwaque::runtime::descriptor_for(

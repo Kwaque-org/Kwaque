@@ -40,7 +40,7 @@ bool operation_error::add_context(
     if (
       context_size_ == max_context_fields
       || static_cast<std::uint8_t>(key)
-           > static_cast<std::uint8_t>(operation_context_key::actual)) {
+           > static_cast<std::uint8_t>(operation_context_key::detail)) {
         return false;
     }
     for (std::size_t index = 0; index < context_size_; ++index) {
@@ -127,6 +127,8 @@ std::string_view to_string(operation_context_key key) noexcept {
         return "expected";
     case operation_context_key::actual:
         return "actual";
+    case operation_context_key::detail:
+        return "detail";
     }
     return "unknown";
 }

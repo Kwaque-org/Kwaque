@@ -136,6 +136,19 @@ SEASTAR_TEST_CASE(production_network_loopback_preserves_ownership_and_eof) {
     BOOST_REQUIRE(received.has_value());
     BOOST_CHECK(!received->eof());
     BOOST_CHECK(received->data().content_equals("hello"));
+    BOOST_CHECK_EQUAL(
+      received->data().retained_bytes().value(),
+      kwaque::maximum_contiguous_allocation_bytes);
+    const auto retained_rejection = kwaque::runtime::validate_network_write(
+      received->data(),
+      kwaque::runtime::network_connection_limits{
+        .pending_write_bytes
+        = kwaque::byte_count{kwaque::maximum_contiguous_allocation_bytes - 1U},
+        .pending_writes = 1,
+      });
+    BOOST_REQUIRE(!retained_rejection.has_value());
+    BOOST_CHECK(
+      retained_rejection.error().code() == kwaque::errc::out_of_range);
 
     const auto replied = co_await accepted->write(bytes("world"), write_abort);
     const auto reply = co_await connected->read(
