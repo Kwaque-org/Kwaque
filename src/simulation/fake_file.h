@@ -153,6 +153,7 @@ struct fake_file_system_config final {
 
 enum class fake_file_system_state : std::uint8_t {
     open,
+    crashing,
     stopping,
     stopped,
 };
@@ -269,6 +270,17 @@ private:
         std::uint64_t durable_size{0};
     };
 
+    struct prepared_truncate final {
+        fake_object_id object;
+        std::uint64_t size{0};
+        std::uint64_t previous_size{0};
+        std::uint64_t retained_before{0};
+        std::uint64_t retained_after{0};
+        std::uint64_t kept_pages{0};
+        std::optional<page_pointer> tail;
+        bool insert_tail{false};
+    };
+
     struct inode final : runtime::shard_affine {
         inode(
           fake_object_id object_id,
@@ -330,6 +342,7 @@ private:
         parked,
         terminal_scheduled,
         crash_apply_scheduled,
+        partial_resize_apply_scheduled,
         discard_pending,
     };
 
@@ -341,7 +354,7 @@ private:
 
     struct open_handle_state final : runtime::shard_affine {
         handle_lifecycle lifecycle{handle_lifecycle::open};
-        bool reference_owned{true};
+        bool reference_owned{false};
     };
 
     using pending_value = std::variant<
@@ -399,9 +412,12 @@ private:
         event_trace::reservation terminal_trace;
         scheduler::event_id_reservation crash_event;
         event_trace::reservation crash_trace;
+        scheduler::event_id_reservation partial_resize_event;
+        event_trace::reservation partial_resize_trace;
         event_id completion_event;
         std::optional<fake_object_id> object;
         operation_payload payload;
+        std::optional<prepared_truncate> truncate_commit;
         std::uint64_t fault_a{0};
         std::uint64_t fault_b{0};
         byte_count accounted_bytes{};
@@ -526,6 +542,8 @@ private:
     lookup_parent(const canonical_fake_path& path) const noexcept;
     [[nodiscard]] runtime::result<fake_object_id>
     create(const canonical_fake_path& path, fake_file_kind kind);
+    [[nodiscard]] runtime::result<runtime::file>
+    apply_open(metadata_operation& metadata, bool& open_slot);
     [[nodiscard]] runtime::result<void>
     remove(const canonical_fake_path& path, fake_file_kind kind);
     [[nodiscard]] runtime::result<void>
@@ -555,15 +573,21 @@ private:
     truncate(const canonical_fake_path& path, std::uint64_t size);
     [[nodiscard]] runtime::result<void>
     truncate(fake_object_id id, std::uint64_t size);
+    [[nodiscard]] runtime::result<prepared_truncate>
+    prepare_truncate(fake_object_id id, std::uint64_t size);
+    void commit_truncate(prepared_truncate prepared) noexcept;
     [[nodiscard]] runtime::result<void> flush(const canonical_fake_path& path);
     [[nodiscard]] runtime::result<void> flush(fake_object_id id);
     void restore_durable_state() noexcept;
     void invalidate_handles() noexcept;
     [[nodiscard]] runtime::result<void> begin_crash(fake_operation_id active);
     [[nodiscard]] runtime::result<void>
+    begin_partial_resize(fake_operation_id active);
+    [[nodiscard]] runtime::result<void>
     schedule_terminal(pending_operation& operation) noexcept;
     void complete_terminal(fake_operation_id id) noexcept;
     void apply_crash(fake_operation_id active) noexcept;
+    void apply_partial_resize(fake_operation_id active) noexcept;
     void discard_operation(
       pending_operation& operation,
       const runtime::operation_error& failure) noexcept;

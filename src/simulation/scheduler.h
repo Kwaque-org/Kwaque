@@ -15,6 +15,7 @@
 #include <deque>
 #include <limits>
 #include <optional>
+#include <span>
 #include <type_traits>
 #include <vector>
 
@@ -165,6 +166,13 @@ public:
       event_cleanup_policy cleanup = event_cleanup_policy::drop) const noexcept;
     [[nodiscard]] runtime::result<event_trace::reservation>
     reserve_trace(trace_event_descriptor descriptor = {});
+    [[nodiscard]] runtime::result<event_trace::reservation> reserve_effect(
+      trace_event_descriptor descriptor,
+      std::span<const trace_context_field> context = {});
+    [[nodiscard]] runtime::result<void> observe_effect(
+      trace_event_descriptor descriptor,
+      std::span<const trace_context_field> context,
+      event_trace::reservation& reservation) noexcept;
     [[nodiscard]] runtime::result<bool> cancel(event_id id) noexcept;
 
     [[nodiscard]] runtime::result<bool> step();
@@ -330,6 +338,9 @@ private:
     [[nodiscard]] runtime::result<void> validate_descriptor(
       trace_event_descriptor descriptor,
       event_cleanup_policy cleanup) const noexcept;
+    [[nodiscard]] runtime::result<void> validate_effect(
+      trace_event_descriptor descriptor,
+      std::span<const trace_context_field> context) const noexcept;
     [[nodiscard]] bool event_id_available() const noexcept;
     void release_reserved_event_id() noexcept;
     [[nodiscard]] runtime::result<void> observe_event(

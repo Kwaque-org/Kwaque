@@ -1,6 +1,7 @@
 #include "src/simulation/scheduler.h"
 
 #include "src/base/invariant.h"
+#include "src/runtime/fault.h"
 
 #include <algorithm>
 #include <bit>
@@ -28,6 +29,83 @@ constexpr std::uint64_t scheduler_sentinel_event_id{0};
 [[nodiscard]] runtime::result<scheduler_limits>
 invalid_limits(errc code) noexcept {
     return runtime::failure(scheduler_error(code));
+}
+
+[[nodiscard]] constexpr bool
+effect_domain_is_valid(const trace_event_descriptor& descriptor) noexcept {
+    switch (descriptor.effect) {
+    case trace_action::partial_resize_applied: {
+        const auto lower = std::min(descriptor.coordinate_b, descriptor.value);
+        const auto upper = std::max(descriptor.coordinate_b, descriptor.value);
+        return descriptor.domain
+                 == runtime::descriptor_for(
+                      runtime::builtin_fault_point::file_truncate)
+                      ->id.value()
+               && descriptor.stable_id != 0 && upper - lower > 1U
+               && descriptor.coordinate_a > lower
+               && descriptor.coordinate_a < upper;
+    }
+    case trace_action::network_operation_applied:
+        return (descriptor.domain
+                  <= static_cast<std::uint32_t>(network_trace_phase::close)
+                || descriptor.domain
+                     == static_cast<std::uint32_t>(
+                       network_trace_phase::sequence_release))
+               && descriptor.stable_id != 0;
+    case trace_action::flow_started:
+        return descriptor.domain
+                 == static_cast<std::uint32_t>(
+                   bandwidth_trace_phase::flow_start)
+               && descriptor.stable_id != 0;
+    case trace_action::transfer_completed:
+        return descriptor.domain
+                 == static_cast<std::uint32_t>(
+                   bandwidth_trace_phase::transfer_done)
+               && descriptor.stable_id != 0;
+    case trace_action::packet_delivered:
+    case trace_action::packet_dropped:
+        return descriptor.domain
+                 == static_cast<std::uint32_t>(network_trace_phase::delivery)
+               && descriptor.stable_id != 0;
+    case trace_action::fin_delivered:
+        return descriptor.domain
+                 == static_cast<std::uint32_t>(network_trace_phase::fin)
+               && descriptor.stable_id != 0;
+    case trace_action::reset_applied:
+        return descriptor.domain
+                 == static_cast<std::uint32_t>(network_trace_phase::reset)
+               && descriptor.stable_id != 0;
+    case trace_action::network_control_applied:
+        return descriptor.stable_id != 0;
+    case trace_action::dns_result_applied:
+        return descriptor.domain <= static_cast<std::uint32_t>(
+                 dns_trace_phase::configured_error)
+               && descriptor.stable_id != 0;
+    case trace_action::operation_parked:
+        return descriptor.stable_id != 0
+               && ((descriptor.kind == trace_event_kind::network
+                    && descriptor.domain
+                         == static_cast<std::uint32_t>(
+                           network_trace_phase::parked))
+                   || (descriptor.kind == trace_event_kind::dns
+                       && descriptor.domain
+                            == static_cast<std::uint32_t>(
+                              dns_trace_phase::parked)));
+    case trace_action::stop_terminal:
+        return descriptor.stable_id != 0
+               && ((descriptor.kind == trace_event_kind::network
+                    && descriptor.domain
+                         == static_cast<std::uint32_t>(
+                           network_trace_phase::stop))
+                   || (descriptor.kind == trace_event_kind::dns
+                       && descriptor.domain
+                            == static_cast<std::uint32_t>(
+                              dns_trace_phase::stop)));
+    case trace_action::bandwidth_rebalanced:
+        return false;
+    default:
+        return true;
+    }
 }
 
 } // namespace
@@ -460,6 +538,10 @@ scheduler::reserve_trace(trace_event_descriptor descriptor) {
             || descriptor.kind == trace_event_kind::wall_adjustment
             || descriptor.kind == trace_event_kind::file
             || descriptor.kind == trace_event_kind::filesystem
+            || descriptor.kind == trace_event_kind::network
+            || descriptor.kind == trace_event_kind::bandwidth
+            || descriptor.kind == trace_event_kind::network_control
+            || descriptor.kind == trace_event_kind::dns
           ? event_cleanup_policy::invoke
           : event_cleanup_policy::drop);
       !valid) {
@@ -473,6 +555,58 @@ scheduler::reserve_trace(trace_event_descriptor descriptor) {
     return trace_->reserve(
       entries,
       static_cast<std::uint64_t>(entries) * canonical_entry_encoded_size);
+}
+
+runtime::result<event_trace::reservation> scheduler::reserve_effect(
+  trace_event_descriptor descriptor,
+  std::span<const trace_context_field> context) {
+    assert_current();
+    if (auto healthy = check_trace_failure(); !healthy) {
+        return runtime::failure(healthy.error());
+    }
+    if (auto valid = validate_effect(descriptor, context); !valid) {
+        return runtime::failure(valid.error());
+    }
+    if (trace_ == nullptr) {
+        return event_trace::reservation{};
+    }
+    return trace_->reserve(1, canonical_entry_encoded_size);
+}
+
+runtime::result<void> scheduler::observe_effect(
+  trace_event_descriptor descriptor,
+  std::span<const trace_context_field> context,
+  event_trace::reservation& reservation) noexcept {
+    assert_current();
+    if (auto healthy = check_trace_failure(); !healthy) {
+        return runtime::failure(healthy.error());
+    }
+    if (auto valid = validate_effect(descriptor, context); !valid) {
+        return runtime::failure(valid.error());
+    }
+    if (trace_ == nullptr) {
+        if (reservation.active()) {
+            return runtime::failure(scheduler_error(errc::invalid_argument));
+        }
+        return {};
+    }
+    if (!reservation.active() || reservation.entries() != 1U) {
+        return runtime::failure(scheduler_error(errc::invalid_argument));
+    }
+    trace_entry entry{
+      .time = now_,
+      .action = descriptor.effect,
+      .kind = descriptor.kind,
+      .domain = descriptor.domain,
+      .stable_id = descriptor.stable_id,
+      .coordinate_a = descriptor.coordinate_a,
+      .coordinate_b = descriptor.coordinate_b,
+      .value = descriptor.value,
+      .result = descriptor.result,
+      .context_size = static_cast<std::uint8_t>(context.size()),
+    };
+    std::copy(context.begin(), context.end(), entry.context.begin());
+    return reservation.observe(std::move(entry));
 }
 
 runtime::result<bool> scheduler::cancel(event_id id) noexcept {
@@ -930,16 +1064,27 @@ runtime::result<void> scheduler::validate_descriptor(
     const auto effect = static_cast<std::uint8_t>(descriptor.effect);
     const auto cleanup_value = static_cast<std::uint8_t>(cleanup);
     if (
-      kind > static_cast<std::uint8_t>(trace_event_kind::filesystem)
-      || effect > static_cast<std::uint8_t>(trace_action::crash_applied)
+      kind > static_cast<std::uint8_t>(trace_event_kind::dns)
+      || effect > static_cast<std::uint8_t>(trace_action::stop_terminal)
       || cleanup_value
            > static_cast<std::uint8_t>(event_cleanup_policy::invoke)
+      || !trace_event_domain_is_valid(descriptor.kind, descriptor.domain)
+      || ((descriptor.kind == trace_event_kind::network
+           || descriptor.kind == trace_event_kind::bandwidth
+           || descriptor.kind == trace_event_kind::network_control
+           || descriptor.kind == trace_event_kind::dns)
+          && descriptor.stable_id == 0)
+      || !effect_domain_is_valid(descriptor)
       || descriptor.kind == trace_event_kind::keyed_random
       || descriptor.kind == trace_event_kind::fault
       || ((descriptor.kind == trace_event_kind::timer
            || descriptor.kind == trace_event_kind::wall_adjustment
            || descriptor.kind == trace_event_kind::file
-           || descriptor.kind == trace_event_kind::filesystem)
+           || descriptor.kind == trace_event_kind::filesystem
+           || descriptor.kind == trace_event_kind::network
+           || descriptor.kind == trace_event_kind::bandwidth
+           || descriptor.kind == trace_event_kind::network_control
+           || descriptor.kind == trace_event_kind::dns)
           && cleanup != event_cleanup_policy::invoke)
       || (descriptor.kind == trace_event_kind::wall_adjustment
           && descriptor.effect != trace_action::wall_adjusted)
@@ -951,11 +1096,60 @@ runtime::result<void> scheduler::validate_descriptor(
                 && (descriptor.kind == trace_event_kind::file
                     || descriptor.kind == trace_event_kind::filesystem))
             || (descriptor.effect == trace_action::crash_applied
-                && descriptor.kind == trace_event_kind::filesystem))))
+                && descriptor.kind == trace_event_kind::filesystem)
+            || (descriptor.effect == trace_action::partial_resize_applied
+                && descriptor.kind == trace_event_kind::file)
+            || (descriptor.effect == trace_action::network_operation_applied
+                && descriptor.kind == trace_event_kind::network)
+            || (descriptor.effect == trace_action::flow_started
+                && descriptor.kind == trace_event_kind::bandwidth)
+            || (descriptor.effect == trace_action::transfer_completed
+                && descriptor.kind == trace_event_kind::bandwidth)
+            || ((descriptor.effect == trace_action::packet_delivered
+                 || descriptor.effect == trace_action::packet_dropped
+                 || descriptor.effect == trace_action::fin_delivered
+                 || descriptor.effect == trace_action::reset_applied)
+                && descriptor.kind == trace_event_kind::network)
+            || (descriptor.effect == trace_action::network_control_applied
+                && descriptor.kind == trace_event_kind::network_control)
+            || (descriptor.effect == trace_action::dns_result_applied
+                && descriptor.kind == trace_event_kind::dns)
+            || ((descriptor.effect == trace_action::operation_parked
+                 || descriptor.effect == trace_action::stop_terminal)
+                && (descriptor.kind == trace_event_kind::network
+                    || descriptor.kind == trace_event_kind::dns)))))
       [[unlikely]] {
         return runtime::failure(scheduler_error(errc::invalid_argument));
     }
     return {};
+}
+
+runtime::result<void> scheduler::validate_effect(
+  trace_event_descriptor descriptor,
+  std::span<const trace_context_field> context) const noexcept {
+    if (
+      descriptor.effect == trace_action::none
+      || context.size() > trace_context_fields_max) {
+        return runtime::failure(scheduler_error(errc::invalid_argument));
+    }
+    if (descriptor.effect == trace_action::bandwidth_rebalanced) {
+        if (
+          descriptor.kind != trace_event_kind::bandwidth
+          || descriptor.domain
+               != static_cast<std::uint32_t>(bandwidth_trace_phase::rebalance)
+          || descriptor.stable_id == 0 || context.size() != 4U
+          || context[0].key != trace_context_key::digest_word_0
+          || context[1].key != trace_context_key::digest_word_1
+          || context[2].key != trace_context_key::digest_word_2
+          || context[3].key != trace_context_key::digest_word_3) {
+            return runtime::failure(scheduler_error(errc::invalid_argument));
+        }
+        return {};
+    }
+    if (!context.empty()) {
+        return runtime::failure(scheduler_error(errc::invalid_argument));
+    }
+    return validate_descriptor(descriptor, event_cleanup_policy::invoke);
 }
 
 bool scheduler::event_id_available() const noexcept {

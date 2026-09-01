@@ -2064,6 +2064,16 @@ runtime::result<void> fake_file_system::truncate(
 
 runtime::result<void>
 fake_file_system::truncate(fake_object_id id, std::uint64_t size) {
+    auto prepared = prepare_truncate(id, size);
+    if (!prepared) {
+        return runtime::failure(prepared.error());
+    }
+    commit_truncate(std::move(*prepared));
+    return {};
+}
+
+runtime::result<fake_file_system::prepared_truncate>
+fake_file_system::prepare_truncate(fake_object_id id, std::uint64_t size) {
     assert_current();
     auto* object = find_inode(id);
     if (object == nullptr) {
@@ -2083,13 +2093,18 @@ fake_file_system::truncate(fake_object_id id, std::uint64_t size) {
         return runtime::failure(file_error(errc::resource_exhausted));
     }
 
-    std::optional<page_pointer> tail;
-    bool tail_needs_dirty_entry = false;
+    prepared_truncate prepared{
+      .object = id,
+      .size = size,
+      .previous_size = previous_size,
+      .retained_before = before,
+      .retained_after = after,
+      .kept_pages = page_count(size),
+    };
     const auto tail_bytes = static_cast<std::size_t>(
       size % fake_file_page_bytes);
-    const auto kept_pages = page_count(size);
     if (size < file.visible_size && tail_bytes != 0) {
-        const auto tail_index = kept_pages - 1U;
+        const auto tail_index = prepared.kept_pages - 1U;
         page replacement{};
         const auto visible = file.visible_pages.find(tail_index);
         if (visible != file.visible_pages.end()) {
@@ -2109,60 +2124,81 @@ fake_file_system::truncate(fake_object_id id, std::uint64_t size) {
         auto mutable_tail = seastar::make_lw_shared<page>(
           std::move(replacement));
         page_pointer immutable_tail = mutable_tail;
-        tail = std::move(immutable_tail);
-        tail_needs_dirty_entry = visible == file.visible_pages.end();
+        prepared.tail = std::move(immutable_tail);
+        prepared.insert_tail = visible == file.visible_pages.end();
     }
 
-    if (tail && tail_needs_dirty_entry) {
-        const auto tail_index = kept_pages - 1U;
+    if (prepared.tail && prepared.insert_tail) {
+        file.visible_pages.reserve(file.visible_pages.size() + 1U);
+        file.dirty_pages.reserve(file.dirty_page_count + 1U);
+    }
+    return prepared;
+}
+
+void fake_file_system::commit_truncate(prepared_truncate prepared) noexcept {
+    assert_current();
+    auto* object = find_inode(prepared.object);
+    KWAQUE_INVARIANT(
+      fake_storage_transaction_invariant,
+      object != nullptr && object->kind == fake_file_kind::regular,
+      "prepared truncate lost its regular file");
+    auto& file = std::get<regular_file_state>(object->state);
+    KWAQUE_INVARIANT(
+      fake_storage_transaction_invariant,
+      file.visible_size == prepared.previous_size
+        && retained_size(file) == prepared.retained_before,
+      "prepared truncate observed intervening file state");
+
+    if (prepared.tail && prepared.insert_tail) {
+        const auto tail_index = prepared.kept_pages - 1U;
         const auto [position, inserted] = file.visible_pages.try_emplace(
-          tail_index, page_state{.bytes = *tail, .dirty = true});
+          tail_index, page_state{.bytes = *prepared.tail, .dirty = true});
         static_cast<void>(position);
         KWAQUE_INVARIANT(
           fake_storage_transaction_invariant,
           inserted,
           "truncate tail override was already present");
-        try {
-            if (file.dirty_page_count < file.dirty_pages.size()) {
-                file.dirty_pages[file.dirty_page_count] = tail_index;
-            } else {
-                file.dirty_pages.push_back(tail_index);
-            }
-            ++file.dirty_page_count;
-        } catch (...) {
-            file.visible_pages.erase(tail_index);
-            throw;
+        if (file.dirty_page_count < file.dirty_pages.size()) {
+            file.dirty_pages[file.dirty_page_count] = tail_index;
+        } else {
+            file.dirty_pages.push_back(tail_index);
         }
+        ++file.dirty_page_count;
     }
 
-    static_cast<void>(update_retained_capacity(before, after));
-    if (size < file.visible_size) {
+    const auto retained = update_retained_capacity(
+      prepared.retained_before, prepared.retained_after);
+    KWAQUE_INVARIANT(
+      fake_storage_transaction_invariant,
+      retained.has_value(),
+      "prepared truncate lost retained-capacity admission");
+    if (prepared.size < file.visible_size) {
         for (auto current = file.visible_pages.begin();
              current != file.visible_pages.end();) {
-            if (current->first >= kept_pages) {
+            if (current->first >= prepared.kept_pages) {
                 current = file.visible_pages.erase(current);
             } else {
                 ++current;
             }
         }
         file.cleared_from_page = std::min(
-          file.cleared_from_page.value_or(kept_pages), kept_pages);
-        if (tail) {
-            const auto tail_index = kept_pages - 1U;
+          file.cleared_from_page.value_or(prepared.kept_pages),
+          prepared.kept_pages);
+        if (prepared.tail) {
+            const auto tail_index = prepared.kept_pages - 1U;
             const auto found = file.visible_pages.find(tail_index);
             KWAQUE_INVARIANT(
               fake_storage_transaction_invariant,
               found != file.visible_pages.end(),
               "truncate tail override disappeared before commit");
-            found->second.bytes = std::move(*tail);
+            found->second.bytes = std::move(*prepared.tail);
             found->second.dirty = true;
         }
     }
-    file.visible_size = size;
-    if (size != previous_size) {
+    file.visible_size = prepared.size;
+    if (prepared.size != prepared.previous_size) {
         mark_dirty(*object);
     }
-    return {};
 }
 
 runtime::result<void> fake_file_system::flush(const canonical_fake_path& path) {
@@ -2334,7 +2370,8 @@ fake_file_system::schedule_terminal(pending_operation& operation) noexcept {
     }
     if (
       operation.phase == pending_phase::queued
-      || operation.phase == pending_phase::crash_apply_scheduled) {
+      || operation.phase == pending_phase::crash_apply_scheduled
+      || operation.phase == pending_phase::partial_resize_apply_scheduled) {
         const auto canceled = scheduler_->cancel(operation.completion_event);
         if (!canceled) {
             operation.phase = pending_phase::discard_pending;
@@ -2428,6 +2465,57 @@ runtime::result<void> fake_file_system::begin_crash(fake_operation_id active) {
         return runtime::failure(applied.error());
     }
     active_operation.completion_event = *applied;
+    state_ = fake_file_system_state::crashing;
+    operation_changed_.broadcast();
+    return {};
+}
+
+runtime::result<void>
+fake_file_system::begin_partial_resize(fake_operation_id active) {
+    assert_current();
+    auto& operation = pending_.at(active.value());
+    KWAQUE_INVARIANT(
+      fake_storage_transaction_invariant,
+      operation.kind == pending_kind::truncate
+        && operation.fault.action() == runtime::fault_action::partial_resize
+        && operation.truncate_commit.has_value()
+        && operation.partial_resize_event.active()
+        && operation.partial_resize_trace.active(),
+      "partial resize lost its prepared commit or reservation");
+    const auto* io = std::get_if<native_io_operation>(&operation.payload);
+    KWAQUE_INVARIANT(
+      fake_storage_transaction_invariant,
+      io != nullptr,
+      "partial resize lost its requested size");
+
+    operation.phase = pending_phase::partial_resize_apply_scheduled;
+    operation.partial_resize_event.release();
+    auto applied = scheduler_->schedule(
+      scheduler_->now(),
+      event_priority::highest(),
+      [this, active] noexcept { apply_partial_resize(active); },
+      trace_event_descriptor{
+        .kind = trace_event_kind::file,
+        .domain = runtime::descriptor_for(
+                    runtime::builtin_fault_point::file_truncate)
+                    ->id.value(),
+        .stable_id = active.value(),
+        .coordinate_a = operation.fault_a,
+        .coordinate_b = operation.fault_b,
+        .value = io->position,
+        .result = static_cast<std::uint8_t>(
+                    runtime::fault_action::partial_resize)
+                  | UINT32_C(0x100),
+        .effect = trace_action::partial_resize_applied,
+      },
+      event_cleanup_policy::invoke,
+      std::move(operation.partial_resize_trace));
+    if (!applied) {
+        operation.phase = pending_phase::queued;
+        operation.truncate_commit.reset();
+        return runtime::failure(applied.error());
+    }
+    operation.completion_event = *applied;
     return {};
 }
 
@@ -2465,11 +2553,39 @@ void fake_file_system::apply_crash(fake_operation_id active) noexcept {
         return;
     }
     restore_durable_state();
+    state_ = fake_file_system_state::open;
+    operation_changed_.broadcast();
     if (operation->kind == pending_kind::crash_control) {
         finish(*operation, pending_value{std::monostate{}}, true);
     } else {
         finish(*operation, runtime::failure(file_error(errc::aborted)), true);
     }
+}
+
+void fake_file_system::apply_partial_resize(fake_operation_id active) noexcept {
+    assert_current();
+    auto* operation = pending_.find(active.value());
+    if (operation == nullptr) {
+        return;
+    }
+    if (scheduler_->discarding_failed_event()) [[unlikely]] {
+        const auto* failure = scheduler_->trace_failure();
+        KWAQUE_INVARIANT(
+          fake_storage_transaction_invariant,
+          failure != nullptr,
+          "discarded partial resize has no trace failure");
+        discard_operation(*operation, *failure);
+        return;
+    }
+    KWAQUE_INVARIANT(
+      fake_storage_transaction_invariant,
+      operation->phase == pending_phase::partial_resize_apply_scheduled
+        && operation->truncate_commit.has_value(),
+      "partial resize apply lost its prepared transaction");
+    auto prepared = std::move(*operation->truncate_commit);
+    operation->truncate_commit.reset();
+    commit_truncate(std::move(prepared));
+    finish(*operation, runtime::failure(file_error(errc::io_failure)), true);
 }
 
 void fake_file_system::discard_operation(
@@ -2544,24 +2660,15 @@ runtime::result<seastar::file> fake_file_system::make_native_file_for_test(
     if (open_handles_ == config_.maximum_open_handles) {
         return runtime::failure(file_error(errc::queue_full));
     }
+    auto handle = seastar::make_lw_shared<open_handle_state>();
+    seastar::file native{seastar::make_shared<native_file_impl>(
+      *this, id, access, generation_, handle)};
     if (auto retained = retain_open_reference(id); !retained) {
         return runtime::failure(retained.error());
     }
     ++open_handles_;
-    seastar::lw_shared_ptr<open_handle_state> handle;
-    try {
-        handle = seastar::make_lw_shared<open_handle_state>();
-        return seastar::file{seastar::make_shared<native_file_impl>(
-          *this, id, access, generation_, handle)};
-    } catch (...) {
-        if (handle) {
-            release_handle_reference(id, handle);
-        } else {
-            release_open_reference(id);
-            --open_handles_;
-        }
-        throw;
-    }
+    handle->reference_owned = true;
+    return native;
 }
 
 void fake_file_system::release_open_reference(fake_object_id id) {
@@ -2656,6 +2763,9 @@ runtime::result<void> fake_file_system::validate_submission(
   byte_count retained_bytes,
   std::uint64_t retained_path_bytes,
   bool open_slot) const noexcept {
+    if (state_ == fake_file_system_state::crashing) {
+        return runtime::failure(file_error(errc::unavailable));
+    }
     if (state_ != fake_file_system_state::open) {
         return runtime::failure(file_error(errc::closed));
     }
@@ -2932,6 +3042,28 @@ fake_file_system::submit(
                                    ? selected
                                    : after_begin + selected - before;
         }
+    } else if (
+      operation->fault.action() == runtime::fault_action::partial_resize) {
+        const auto* inode = operation->object ? find_inode(*operation->object)
+                                              : nullptr;
+        const auto* file = inode != nullptr
+                               && inode->kind == fake_file_kind::regular
+                             ? &std::get<regular_file_state>(inode->state)
+                             : nullptr;
+        KWAQUE_INVARIANT(
+          fake_storage_transaction_invariant,
+          operation->kind == pending_kind::truncate && file != nullptr,
+          "partial resize was selected outside regular-file truncate");
+        operation->fault_b = file->visible_size;
+        const auto lower = std::min(file->visible_size, io_position);
+        const auto upper = std::max(file->visible_size, io_position);
+        if (upper - lower <= 1U) {
+            applicable = false;
+        } else {
+            operation->fault_a = lower
+                                 + *prepared->draw_bounded(upper - lower - 1U)
+                                 + 1U;
+        }
     }
 
     const auto deadline = completion_deadline(
@@ -2978,6 +3110,35 @@ fake_file_system::submit(
     }
     operation->terminal_event = std::move(*terminal_event);
     operation->terminal_trace = std::move(*terminal_trace);
+    if (
+      operation->fault.action() == runtime::fault_action::partial_resize
+      && applicable) {
+        auto partial_resize_event = scheduler_->reserve_event_id();
+        auto partial_resize_trace = scheduler_->reserve_trace(
+          trace_event_descriptor{
+            .kind = trace_event_kind::file,
+            .domain = runtime::descriptor_for(
+                        runtime::builtin_fault_point::file_truncate)
+                        ->id.value(),
+            .stable_id = operation->id.value(),
+            .coordinate_a = operation->fault_a,
+            .coordinate_b = operation->fault_b,
+            .value = io_position,
+            .result = static_cast<std::uint8_t>(
+                        runtime::fault_action::partial_resize)
+                      | UINT32_C(0x100),
+            .effect = trace_action::partial_resize_applied,
+          });
+        if (!partial_resize_event || !partial_resize_trace) {
+            const auto error = !partial_resize_event
+                                 ? partial_resize_event.error()
+                                 : partial_resize_trace.error();
+            return seastar::make_ready_future<runtime::result<pending_value>>(
+              runtime::failure(error));
+        }
+        operation->partial_resize_event = std::move(*partial_resize_event);
+        operation->partial_resize_trace = std::move(*partial_resize_trace);
+    }
     if (
       operation->fault.action() == runtime::fault_action::crash
       || operation->kind == pending_kind::crash_control) {
@@ -3074,7 +3235,9 @@ void fake_file_system::complete(fake_operation_id id) noexcept {
     }
     try {
         auto result = apply(operation);
-        if (operation.phase == pending_phase::crash_apply_scheduled) {
+        if (
+          operation.phase == pending_phase::crash_apply_scheduled
+          || operation.phase == pending_phase::partial_resize_apply_scheduled) {
             return;
         }
         const bool resolve = operation.fault.action()
@@ -3113,6 +3276,118 @@ void fake_file_system::complete(fake_operation_id id) noexcept {
     }
 }
 
+runtime::result<runtime::file>
+fake_file_system::apply_open(metadata_operation& metadata, bool& open_slot) {
+    assert_current();
+    KWAQUE_INVARIANT(
+      fake_storage_transaction_invariant,
+      metadata.path.has_value(),
+      "fake open completion has no canonical path");
+    if (auto valid = metadata.open_options.validate(); !valid) {
+        return runtime::failure(valid.error());
+    }
+
+    auto existing = lookup(*metadata.path);
+    const bool creating = !existing;
+    if (
+      creating
+      && (existing.error().code() != errc::not_found || !metadata.open_options.create)) {
+        return runtime::failure(existing.error());
+    }
+
+    const fake_object_id id = existing ? *existing
+                                       : fake_object_id{next_object_id_};
+    auto* selected = existing ? find_inode(id) : nullptr;
+    if (selected != nullptr) {
+        if (selected->kind != fake_file_kind::regular) {
+            return runtime::failure(file_error(errc::is_a_directory));
+        }
+        if (metadata.open_options.create && metadata.open_options.exclusive) {
+            return runtime::failure(file_error(errc::already_exists));
+        }
+        if (
+          selected->open_references
+          == std::numeric_limits<std::uint32_t>::max()) {
+            return runtime::failure(file_error(errc::resource_exhausted));
+        }
+    }
+    if (open_handles_ == config_.maximum_open_handles) {
+        return runtime::failure(file_error(errc::queue_full));
+    }
+
+    // Allocate every handle object before create/truncate can mutate namespace
+    // or file state. The handle begins uncommitted, so unwinding these owners
+    // cannot release a reference that was never made visible.
+    auto handle = seastar::make_lw_shared<open_handle_state>();
+    seastar::file native{seastar::make_shared<native_file_impl>(
+      *this, id, metadata.open_options.access, generation_, handle)};
+
+    bool inserted_open_tracking = false;
+    if (selected == nullptr || selected->open_references == 0) {
+        const auto [position, inserted] = open_objects_.insert(id.value());
+        static_cast<void>(position);
+        KWAQUE_INVARIANT(
+          fake_storage_transaction_invariant,
+          inserted,
+          "newly opened fake inode was already tracked");
+        inserted_open_tracking = true;
+    } else {
+        KWAQUE_INVARIANT(
+          fake_storage_transaction_invariant,
+          open_objects_.contains(id.value()),
+          "referenced fake inode was not tracked as open");
+    }
+
+    if (creating) {
+        try {
+            auto created = create(*metadata.path, fake_file_kind::regular);
+            if (!created) {
+                const auto erased = open_objects_.erase(id.value());
+                KWAQUE_INVARIANT(
+                  fake_storage_transaction_invariant,
+                  erased != 0,
+                  "failed fake open lost its prepared tracking entry");
+                return runtime::failure(created.error());
+            }
+            KWAQUE_INVARIANT(
+              fake_storage_transaction_invariant,
+              *created == id,
+              "fake open created an unexpected object ID");
+        } catch (...) {
+            if (inserted_open_tracking) {
+                static_cast<void>(open_objects_.erase(id.value()));
+            }
+            throw;
+        }
+        selected = find_inode(id);
+    }
+
+    KWAQUE_INVARIANT(
+      fake_storage_transaction_invariant,
+      selected != nullptr && selected->kind == fake_file_kind::regular,
+      "fake open commit lost its regular file");
+    if (metadata.open_options.truncate) {
+        auto truncated = truncate(id, 0);
+        KWAQUE_INVARIANT(
+          fake_storage_transaction_invariant,
+          truncated.has_value(),
+          "validated fake open truncate failed during commit");
+    }
+
+    ++selected->open_references;
+    ++open_handles_;
+    handle->reference_owned = true;
+    if (open_slot) {
+        KWAQUE_INVARIANT(
+          fake_storage_transaction_invariant,
+          pending_opens_ != 0,
+          "fake open commit lost its pending-handle reservation");
+        --pending_opens_;
+        open_slot = false;
+    }
+    return runtime::file{std::move(native)};
+}
+
 runtime::result<fake_file_system::pending_value>
 fake_file_system::apply(pending_operation& operation) {
     assert_current();
@@ -3140,6 +3415,25 @@ fake_file_system::apply(pending_operation& operation) {
     if (operation.fault.action() == runtime::fault_action::error) {
         return runtime::failure(file_error(errc::fault_injected));
     }
+    if (operation.fault.action() == runtime::fault_action::partial_resize) {
+        KWAQUE_INVARIANT(
+          fake_storage_transaction_invariant,
+          operation.kind == pending_kind::truncate,
+          "partial resize reached a non-truncate completion");
+        if (operation.fault_a == 0) {
+            return runtime::failure(file_error(errc::io_failure));
+        }
+        auto prepared = prepare_truncate(*operation.object, operation.fault_a);
+        if (!prepared) {
+            return runtime::failure(prepared.error());
+        }
+        operation.truncate_commit.emplace(std::move(*prepared));
+        if (auto started = begin_partial_resize(operation.id); !started) {
+            operation.truncate_commit.reset();
+            return runtime::failure(started.error());
+        }
+        return pending_value{std::monostate{}};
+    }
     if (
       operation.fault.action() == runtime::fault_action::crash
       || operation.kind == pending_kind::crash_control) {
@@ -3151,59 +3445,11 @@ fake_file_system::apply(pending_operation& operation) {
 
     switch (operation.kind) {
     case pending_kind::open: {
-        auto existing = lookup(*metadata->path);
-        fake_object_id id{1};
-        if (!existing) {
-            if (
-              existing.error().code() != errc::not_found
-              || !metadata->open_options.create) {
-                return runtime::failure(existing.error());
-            }
-            auto created = create(*metadata->path, fake_file_kind::regular);
-            if (!created) {
-                return runtime::failure(created.error());
-            }
-            id = *created;
-        } else {
-            id = *existing;
-            const auto* object = find_inode(id);
-            if (object->kind != fake_file_kind::regular) {
-                return runtime::failure(file_error(errc::is_a_directory));
-            }
-            if (
-              metadata->open_options.create
-              && metadata->open_options.exclusive) {
-                return runtime::failure(file_error(errc::already_exists));
-            }
+        auto opened = apply_open(*metadata, operation.open_slot);
+        if (!opened) {
+            return runtime::failure(opened.error());
         }
-        if (metadata->open_options.truncate) {
-            if (auto truncated = truncate(id, 0); !truncated) {
-                return runtime::failure(truncated.error());
-            }
-        }
-        if (auto retained = retain_open_reference(id); !retained) {
-            return runtime::failure(retained.error());
-        }
-        ++open_handles_;
-        if (operation.open_slot) {
-            --pending_opens_;
-            operation.open_slot = false;
-        }
-        seastar::lw_shared_ptr<open_handle_state> handle;
-        try {
-            handle = seastar::make_lw_shared<open_handle_state>();
-            seastar::file native{seastar::make_shared<native_file_impl>(
-              *this, id, metadata->open_options.access, generation_, handle)};
-            return pending_value{runtime::file{std::move(native)}};
-        } catch (...) {
-            if (handle) {
-                release_handle_reference(id, handle);
-            } else {
-                release_open_reference(id);
-                --open_handles_;
-            }
-            throw;
-        }
+        return pending_value{std::move(*opened)};
     }
     case pending_kind::exists: {
         auto existing = lookup(*metadata->path);

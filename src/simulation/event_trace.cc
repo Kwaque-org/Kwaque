@@ -269,10 +269,17 @@ sample_matches_draws(const trace_entry& entry) noexcept {
     const auto outcome = entry.result >> 8U;
     const auto action = static_cast<runtime::fault_action>(encoded_action);
     return (entry.result & UINT32_C(0xffff0000)) == 0 && encoded_action != 0
-           && encoded_action
-                <= static_cast<std::uint8_t>(runtime::fault_action::crash)
+           && encoded_action <= static_cast<std::uint8_t>(
+                runtime::fault_action::partial_resize)
            && (outcome == 1U || outcome == 2U) && descriptor != nullptr
            && descriptor->permitted_actions.contains(action);
+}
+
+[[nodiscard]] constexpr bool
+effect_position_is_valid(const trace_entry& entry) noexcept {
+    return entry.event_id == 0
+             ? entry.deadline.nanoseconds() == 0 && entry.priority == 0
+             : entry.deadline == entry.time;
 }
 
 [[nodiscard]] runtime::result<void> validate_entry_shape(
@@ -281,9 +288,10 @@ sample_matches_draws(const trace_entry& entry) noexcept {
     const auto kind = static_cast<std::uint8_t>(entry.kind);
     if (
       entry.sequence == 0 || action == 0
-      || action > static_cast<std::uint8_t>(trace_action::crash_applied)
-      || kind > static_cast<std::uint8_t>(trace_event_kind::filesystem)
+      || action > static_cast<std::uint8_t>(trace_action::stop_terminal)
+      || kind > static_cast<std::uint8_t>(trace_event_kind::dns)
       || entry.context_size > entry.context.size()
+      || !trace_event_domain_is_valid(entry.kind, entry.domain)
       || entry.time.nanoseconds() > header.scheduler_budget.maximum_deadline
       || entry.deadline.nanoseconds()
            > header.scheduler_budget.maximum_deadline) {
@@ -365,6 +373,141 @@ sample_matches_draws(const trace_entry& entry) noexcept {
             return invalid_trace(errc::malformed_data);
         }
         break;
+    case trace_action::partial_resize_applied: {
+        const auto lower = std::min(entry.coordinate_b, entry.value);
+        const auto upper = std::max(entry.coordinate_b, entry.value);
+        if (
+          entry.event_id == 0 || entry.kind != trace_event_kind::file
+          || entry.deadline != entry.time
+          || entry.domain
+               != runtime::descriptor_for(
+                    runtime::builtin_fault_point::file_truncate)
+                    ->id.value()
+          || entry.stable_id == 0 || upper - lower <= 1U
+          || entry.coordinate_a <= lower || entry.coordinate_a >= upper) {
+            return invalid_trace(errc::malformed_data);
+        }
+        if (
+          (entry.result & UINT32_C(0xff))
+            != static_cast<std::uint8_t>(runtime::fault_action::partial_resize)
+          || (entry.result >> 8U) != 1U
+          || !fault_result_is_well_formed(
+            entry,
+            runtime::descriptor_for(
+              runtime::builtin_fault_point::file_truncate))) {
+            return invalid_trace(errc::malformed_data);
+        }
+        break;
+    }
+    case trace_action::network_operation_applied:
+        if (
+          entry.kind != trace_event_kind::network || entry.stable_id == 0
+          || (entry.domain
+                > static_cast<std::uint32_t>(network_trace_phase::close)
+              && entry.domain
+                   != static_cast<std::uint32_t>(
+                     network_trace_phase::sequence_release))
+          || !effect_position_is_valid(entry)) {
+            return invalid_trace(errc::malformed_data);
+        }
+        break;
+    case trace_action::flow_started:
+        if (
+          entry.kind != trace_event_kind::bandwidth || entry.stable_id == 0
+          || entry.domain
+               != static_cast<std::uint32_t>(bandwidth_trace_phase::flow_start)
+          || !effect_position_is_valid(entry)) {
+            return invalid_trace(errc::malformed_data);
+        }
+        break;
+    case trace_action::transfer_completed:
+        if (
+          entry.kind != trace_event_kind::bandwidth || entry.stable_id == 0
+          || entry.domain
+               != static_cast<std::uint32_t>(
+                 bandwidth_trace_phase::transfer_done)
+          || !effect_position_is_valid(entry)) {
+            return invalid_trace(errc::malformed_data);
+        }
+        break;
+    case trace_action::bandwidth_rebalanced:
+        if (
+          entry.kind != trace_event_kind::bandwidth || entry.event_id != 0
+          || entry.deadline.nanoseconds() != 0 || entry.priority != 0
+          || entry.domain
+               != static_cast<std::uint32_t>(bandwidth_trace_phase::rebalance)
+          || entry.stable_id == 0 || entry.context_size != 4
+          || entry.context[0].key != trace_context_key::digest_word_0
+          || entry.context[1].key != trace_context_key::digest_word_1
+          || entry.context[2].key != trace_context_key::digest_word_2
+          || entry.context[3].key != trace_context_key::digest_word_3) {
+            return invalid_trace(errc::malformed_data);
+        }
+        break;
+    case trace_action::packet_delivered:
+    case trace_action::packet_dropped:
+        if (
+          entry.kind != trace_event_kind::network || entry.stable_id == 0
+          || entry.domain
+               != static_cast<std::uint32_t>(network_trace_phase::delivery)
+          || !effect_position_is_valid(entry)) {
+            return invalid_trace(errc::malformed_data);
+        }
+        break;
+    case trace_action::fin_delivered:
+        if (
+          entry.kind != trace_event_kind::network || entry.stable_id == 0
+          || entry.domain
+               != static_cast<std::uint32_t>(network_trace_phase::fin)
+          || !effect_position_is_valid(entry)) {
+            return invalid_trace(errc::malformed_data);
+        }
+        break;
+    case trace_action::reset_applied:
+        if (
+          entry.kind != trace_event_kind::network || entry.stable_id == 0
+          || entry.domain
+               != static_cast<std::uint32_t>(network_trace_phase::reset)
+          || !effect_position_is_valid(entry)) {
+            return invalid_trace(errc::malformed_data);
+        }
+        break;
+    case trace_action::network_control_applied:
+        if (
+          entry.kind != trace_event_kind::network_control
+          || entry.stable_id == 0 || !effect_position_is_valid(entry)) {
+            return invalid_trace(errc::malformed_data);
+        }
+        break;
+    case trace_action::dns_result_applied:
+        if (
+          entry.kind != trace_event_kind::dns || entry.stable_id == 0
+          || entry.domain
+               > static_cast<std::uint32_t>(dns_trace_phase::configured_error)
+          || !effect_position_is_valid(entry)) {
+            return invalid_trace(errc::malformed_data);
+        }
+        break;
+    case trace_action::operation_parked:
+        if (
+          (entry.kind != trace_event_kind::network
+           && entry.kind != trace_event_kind::dns)
+          || (entry.kind == trace_event_kind::network && entry.domain != static_cast<std::uint32_t>(network_trace_phase::parked))
+          || (entry.kind == trace_event_kind::dns && entry.domain != static_cast<std::uint32_t>(dns_trace_phase::parked))
+          || entry.stable_id == 0 || !effect_position_is_valid(entry)) {
+            return invalid_trace(errc::malformed_data);
+        }
+        break;
+    case trace_action::stop_terminal:
+        if (
+          (entry.kind != trace_event_kind::network
+           && entry.kind != trace_event_kind::dns)
+          || (entry.kind == trace_event_kind::network && entry.domain != static_cast<std::uint32_t>(network_trace_phase::stop))
+          || (entry.kind == trace_event_kind::dns && entry.domain != static_cast<std::uint32_t>(dns_trace_phase::stop))
+          || entry.stable_id == 0 || !effect_position_is_valid(entry)) {
+            return invalid_trace(errc::malformed_data);
+        }
+        break;
     case trace_action::none:
         return invalid_trace(errc::malformed_data);
     }
@@ -373,7 +516,8 @@ sample_matches_draws(const trace_entry& entry) noexcept {
         if (index < entry.context_size) {
             if (
               key == 0
-              || key > static_cast<std::uint8_t>(trace_context_key::detail)) {
+              || key > static_cast<std::uint8_t>(
+                   trace_context_key::digest_word_3)) {
                 return invalid_trace(errc::malformed_data);
             }
             for (std::size_t previous = 0; previous < index; ++previous) {
@@ -386,6 +530,24 @@ sample_matches_draws(const trace_entry& entry) noexcept {
           || entry.context[index].value != 0) {
             return invalid_trace(errc::malformed_data);
         }
+    }
+    if (
+      entry.action != trace_action::bandwidth_rebalanced
+      && static_cast<std::uint8_t>(entry.action)
+           >= static_cast<std::uint8_t>(trace_action::partial_resize_applied)
+      && entry.context_size != 0) {
+        return invalid_trace(errc::malformed_data);
+    }
+    if (
+      static_cast<std::uint8_t>(entry.action)
+        < static_cast<std::uint8_t>(trace_action::partial_resize_applied)
+      && std::ranges::any_of(
+        entry.context.begin(),
+        entry.context.begin() + entry.context_size,
+        [](const trace_context_field& context) {
+            return context.key >= trace_context_key::digest_word_0;
+        })) {
+        return invalid_trace(errc::malformed_data);
     }
     return {};
 }

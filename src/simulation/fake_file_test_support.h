@@ -72,6 +72,7 @@ enum class fake_submission_kind : std::uint8_t {
     read,
     write,
     flush,
+    truncate,
 };
 
 class fake_native_file_probe final {
@@ -131,6 +132,9 @@ public:
         case fake_submission_kind::flush:
             pending = fake_file_system::pending_kind::flush;
             break;
+        case fake_submission_kind::truncate:
+            pending = fake_file_system::pending_kind::truncate;
+            break;
         }
         const auto index = static_cast<std::size_t>(pending);
         return pending == fake_file_system::pending_kind::read
@@ -155,6 +159,9 @@ public:
         case fake_submission_kind::flush:
             pending = fake_file_system::pending_kind::flush;
             break;
+        case fake_submission_kind::truncate:
+            pending = fake_file_system::pending_kind::truncate;
+            break;
         }
         return filesystem.wait_submitted(pending, count);
     }
@@ -173,6 +180,9 @@ public:
             break;
         case fake_submission_kind::flush:
             pending = fake_file_system::pending_kind::flush;
+            break;
+        case fake_submission_kind::truncate:
+            pending = fake_file_system::pending_kind::truncate;
             break;
         }
         return filesystem.wait_parked(pending, count);
@@ -400,6 +410,16 @@ public:
     [[nodiscard]] static runtime::result<fake_object_id>
     create_file(fake_file_system& filesystem, const canonical_fake_path& path) {
         return filesystem.create(path, fake_file_kind::regular);
+    }
+    [[nodiscard]] static runtime::result<runtime::file> open_at_completion(
+      fake_file_system& filesystem,
+      const canonical_fake_path& path,
+      runtime::file_open_options options) {
+        fake_file_system::metadata_operation metadata;
+        metadata.path = path;
+        metadata.open_options = options;
+        bool open_slot = false;
+        return filesystem.apply_open(metadata, open_slot);
     }
     [[nodiscard]] static runtime::result<fake_object_id> create_directory(
       fake_file_system& filesystem, const canonical_fake_path& path) {

@@ -1,3 +1,4 @@
+#include "src/runtime/fault.h"
 #include "src/simulation/scheduler.h"
 #include "src/simulation/scheduler_test_support.h"
 
@@ -206,6 +207,82 @@ SEASTAR_TEST_CASE(scheduler_limits_validate_every_local_dimension) {
       scheduler_limits::maximum_deadline_absolute.nanoseconds() + 1};
     expect_error(oversized_deadline, kwaque::errc::out_of_range);
 
+    co_return;
+}
+
+SEASTAR_TEST_CASE(
+  scheduler_reserves_and_observes_synchronous_effect_before_mutation) {
+    auto limits = scheduler_limits::make(
+      scheduler_limit_values{
+        .pending_events = 8,
+        .events_per_pump = 8,
+        .total_events = 32,
+        .maximum_deadline = monotonic_time{1'000},
+      });
+    BOOST_REQUIRE(limits.has_value());
+    auto trace_budget = kwaque::simulation::trace_limits::make(
+      kwaque::simulation::trace_limit_values{
+        .entries = 16,
+        .encoded_bytes = kwaque::simulation::canonical_header_encoded_size
+                         + 16U
+                             * kwaque::simulation::canonical_entry_encoded_size,
+        .line_bytes = 1'024,
+      });
+    BOOST_REQUIRE(trace_budget.has_value());
+    kwaque::simulation::event_trace trace{
+      kwaque::simulation::trace_header::current(
+        1,
+        kwaque::simulation::deterministic_random_algorithm_version,
+        kwaque::simulation::deterministic_random_coordinate_version,
+        kwaque::simulation::trace_scheduler_budget{
+          .pending_events = limits->pending_events(),
+          .events_per_pump = limits->events_per_pump(),
+          .total_events = limits->total_events(),
+          .maximum_deadline = limits->maximum_deadline().nanoseconds(),
+        },
+        *trace_budget,
+        {},
+        {}),
+      *trace_budget};
+    scheduler target{*limits, &trace};
+    const kwaque::simulation::trace_event_descriptor descriptor{
+      .kind = kwaque::simulation::trace_event_kind::bandwidth,
+      .domain = static_cast<std::uint32_t>(
+        kwaque::simulation::bandwidth_trace_phase::rebalance),
+      .stable_id = 7,
+      .coordinate_a = 2,
+      .coordinate_b = 3,
+      .value = 99,
+      .result = 4,
+      .effect = kwaque::simulation::trace_action::bandwidth_rebalanced,
+    };
+    const std::array context{
+      kwaque::simulation::trace_context_field{
+        .key = kwaque::simulation::trace_context_key::digest_word_0,
+        .value = 11},
+      kwaque::simulation::trace_context_field{
+        .key = kwaque::simulation::trace_context_key::digest_word_1,
+        .value = 12},
+      kwaque::simulation::trace_context_field{
+        .key = kwaque::simulation::trace_context_key::digest_word_2,
+        .value = 13},
+      kwaque::simulation::trace_context_field{
+        .key = kwaque::simulation::trace_context_key::digest_word_3,
+        .value = 14},
+    };
+    auto reserved = target.reserve_effect(descriptor, context);
+    BOOST_REQUIRE(reserved.has_value());
+    BOOST_TEST(trace.entries().empty());
+    BOOST_REQUIRE(
+      target.observe_effect(descriptor, context, *reserved).has_value());
+    BOOST_REQUIRE(trace.entries().size() == 1U);
+    const auto& observed = trace.entries()[0];
+    BOOST_CHECK(
+      observed.action
+      == kwaque::simulation::trace_action::bandwidth_rebalanced);
+    BOOST_TEST(observed.event_id == 0U);
+    BOOST_TEST(observed.stable_id == 7U);
+    BOOST_CHECK(observed.context == context);
     co_return;
 }
 
@@ -827,6 +904,69 @@ SEASTAR_TEST_CASE(
       kwaque::simulation::event_cleanup_policy::invoke);
     BOOST_REQUIRE(filesystem_crash.has_value());
     BOOST_TEST(cancel_event(target, *filesystem_crash));
+
+    const auto partial_resize = target.schedule(
+      monotonic_time{},
+      event_priority::normal(),
+      [] noexcept {},
+      kwaque::simulation::trace_event_descriptor{
+        .kind = kwaque::simulation::trace_event_kind::file,
+        .domain = kwaque::runtime::descriptor_for(
+                    kwaque::runtime::builtin_fault_point::file_truncate)
+                    ->id.value(),
+        .stable_id = 1,
+        .coordinate_a = 1,
+        .value = 2,
+        .result = static_cast<std::uint8_t>(
+                    kwaque::runtime::fault_action::partial_resize)
+                  | UINT32_C(0x100),
+        .effect = kwaque::simulation::trace_action::partial_resize_applied,
+      },
+      kwaque::simulation::event_cleanup_policy::invoke);
+    BOOST_REQUIRE(partial_resize.has_value());
+    BOOST_TEST(cancel_event(target, *partial_resize));
+
+    const auto network_without_cleanup = target.schedule(
+      monotonic_time{},
+      event_priority::normal(),
+      [] noexcept {},
+      kwaque::simulation::trace_event_descriptor{
+        .kind = kwaque::simulation::trace_event_kind::network,
+        .domain = static_cast<std::uint32_t>(
+          kwaque::simulation::network_trace_phase::bind),
+        .stable_id = 2,
+        .effect = kwaque::simulation::trace_action::network_operation_applied,
+      });
+    BOOST_REQUIRE(!network_without_cleanup.has_value());
+
+    const auto network_operation = target.schedule(
+      monotonic_time{},
+      event_priority::normal(),
+      [] noexcept {},
+      kwaque::simulation::trace_event_descriptor{
+        .kind = kwaque::simulation::trace_event_kind::network,
+        .domain = static_cast<std::uint32_t>(
+          kwaque::simulation::network_trace_phase::bind),
+        .stable_id = 3,
+        .effect = kwaque::simulation::trace_action::network_operation_applied,
+      },
+      kwaque::simulation::event_cleanup_policy::invoke);
+    BOOST_REQUIRE(network_operation.has_value());
+    BOOST_TEST(cancel_event(target, *network_operation));
+
+    const auto scheduled_rebalance = target.schedule(
+      monotonic_time{},
+      event_priority::normal(),
+      [] noexcept {},
+      kwaque::simulation::trace_event_descriptor{
+        .kind = kwaque::simulation::trace_event_kind::bandwidth,
+        .domain = static_cast<std::uint32_t>(
+          kwaque::simulation::bandwidth_trace_phase::rebalance),
+        .stable_id = 4,
+        .effect = kwaque::simulation::trace_action::bandwidth_rebalanced,
+      },
+      kwaque::simulation::event_cleanup_policy::invoke);
+    BOOST_REQUIRE(!scheduled_rebalance.has_value());
     co_return;
 }
 

@@ -8,6 +8,14 @@ filegroup(
 )
 
 kwaque_cc_library(
+    name = "sha256",
+    srcs = ["sha256.cc"],
+    hdrs = ["sha256.h"],
+    visibility = ["//src/simulation:__subpackages__"],
+    deps = ["@openssl"],
+)
+
+kwaque_cc_library(
     name = "event_trace",
     srcs = ["event_trace.cc"],
     hdrs = [
@@ -58,6 +66,7 @@ kwaque_cc_library(
         ":event_trace",
         "//src/base:invariant",
         "//src/runtime:error",
+        "//src/runtime:fault_api",
         "//src/runtime:shard_affinity",
         "//src/runtime:time",
         "@seastar",
@@ -82,6 +91,7 @@ kwaque_cc_library(
         ":event_trace_invariant_test_support",
         "//src/base:invariant_test_support",
         "//src/runtime:error",
+        "//src/runtime:fault_api",
         "//src/runtime:shard_affinity_test_support",
         "//src/runtime:time",
         "@seastar",
@@ -191,6 +201,22 @@ kwaque_cc_library(
 )
 
 kwaque_cc_library(
+    name = "bandwidth",
+    srcs = ["bandwidth.cc"],
+    hdrs = ["bandwidth.h"],
+    visibility = ["//src/simulation:__subpackages__"],
+    deps = [
+        ":sha256",
+        "//src/base",
+        "//src/base:invariant",
+        "//src/runtime:error",
+        "//src/runtime:time",
+        "@boost//:multiprecision",
+        "@seastar",
+    ],
+)
+
+kwaque_cc_library(
     name = "fake_file",
     srcs = ["fake_file.cc"],
     hdrs = ["fake_file.h"],
@@ -215,4 +241,47 @@ kwaque_cc_library(
     hdrs = ["fake_file_test_support.h"],
     visibility = ["//src/simulation/tests:__pkg__"],
     deps = [":fake_file"],
+)
+
+kwaque_cc_library(
+    name = "fake_network",
+    srcs = ["fake_network.cc"],
+    hdrs = ["fake_network.h"],
+    visibility = ["//src/simulation:__subpackages__"],
+    deps = [
+        ":bandwidth",
+        ":deterministic_random",
+        ":fault_schedule",
+        ":scheduler",
+        "//src/base:invariant",
+        "//src/bytes:fragmented_buffer",
+        "//src/bytes:fragmented_buffer_builder",
+        "//src/runtime:error",
+        "//src/runtime:network",
+        "//src/runtime:random",
+        "//src/runtime:shard_affinity",
+        "//src/runtime:time",
+        "@abseil-cpp//absl/container:btree",
+        "@seastar",
+    ],
+)
+
+kwaque_cc_library(
+    name = "fake_dns",
+    srcs = ["fake_dns.cc"],
+    hdrs = ["fake_dns.h"],
+    visibility = ["//src/simulation:__subpackages__"],
+    deps = [
+        ":event_trace",
+        ":fault_schedule",
+        ":scheduler",
+        "//src/base",
+        "//src/base:invariant",
+        "//src/runtime:dns",
+        "//src/runtime:error",
+        "//src/runtime:fault_api",
+        "//src/runtime:shard_affinity",
+        "//src/runtime:time",
+        "@seastar",
+    ],
 )

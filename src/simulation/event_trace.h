@@ -27,7 +27,7 @@ namespace kwaque::simulation {
 
 class scheduler;
 
-inline constexpr std::uint32_t event_trace_schema_version{3};
+inline constexpr std::uint32_t event_trace_schema_version{4};
 inline constexpr std::uint32_t scheduler_ordering_version{1};
 inline constexpr std::size_t trace_context_fields_max{4};
 inline constexpr std::size_t canonical_entry_encoded_size{244};
@@ -152,6 +152,19 @@ enum class trace_action : std::uint8_t {
     fault_evaluated = 7,
     operation_discarded = 8,
     crash_applied = 9,
+    partial_resize_applied = 10,
+    network_operation_applied = 11,
+    flow_started = 12,
+    bandwidth_rebalanced = 13,
+    transfer_completed = 14,
+    packet_delivered = 15,
+    packet_dropped = 16,
+    fin_delivered = 17,
+    reset_applied = 18,
+    network_control_applied = 19,
+    dns_result_applied = 20,
+    operation_parked = 21,
+    stop_terminal = 22,
 };
 
 enum class trace_event_kind : std::uint8_t {
@@ -162,6 +175,10 @@ enum class trace_event_kind : std::uint8_t {
     fault = 4,
     file = 5,
     filesystem = 6,
+    network = 7,
+    bandwidth = 8,
+    network_control = 9,
+    dns = 10,
 };
 
 enum class trace_context_key : std::uint8_t {
@@ -170,7 +187,75 @@ enum class trace_context_key : std::uint8_t {
     actual = 2,
     limit = 3,
     detail = 4,
+    digest_word_0 = 5,
+    digest_word_1 = 6,
+    digest_word_2 = 7,
+    digest_word_3 = 8,
 };
+
+enum class network_trace_phase : std::uint32_t {
+    bind = 1,
+    connect_client = 2,
+    incoming = 3,
+    accept = 4,
+    read = 5,
+    write = 6,
+    close = 7,
+    fin = 8,
+    reset = 9,
+    delivery = 10,
+    sequence_release = 11,
+    parked = 12,
+    stop = 13,
+};
+
+enum class bandwidth_trace_phase : std::uint32_t {
+    flow_start = 1,
+    rebalance = 2,
+    transfer_done = 3,
+};
+
+enum class network_control_trace_phase : std::uint32_t {
+    partition = 1,
+    heal = 2,
+    clog = 3,
+    unclog = 4,
+    egress_limit = 5,
+    link_limit = 6,
+    ingress_limit = 7,
+};
+
+enum class dns_trace_phase : std::uint32_t {
+    numeric = 1,
+    record = 2,
+    configured_error = 3,
+    parked = 4,
+    stop = 5,
+};
+
+template<typename Phase>
+[[nodiscard]] constexpr bool
+trace_phase_is_valid(std::uint32_t value, Phase last) noexcept {
+    return value != 0 && value <= static_cast<std::uint32_t>(last);
+}
+
+[[nodiscard]] constexpr bool trace_event_domain_is_valid(
+  trace_event_kind kind, std::uint32_t domain) noexcept {
+    switch (kind) {
+    case trace_event_kind::network:
+        return trace_phase_is_valid(domain, network_trace_phase::stop);
+    case trace_event_kind::bandwidth:
+        return trace_phase_is_valid(
+          domain, bandwidth_trace_phase::transfer_done);
+    case trace_event_kind::network_control:
+        return trace_phase_is_valid(
+          domain, network_control_trace_phase::ingress_limit);
+    case trace_event_kind::dns:
+        return trace_phase_is_valid(domain, dns_trace_phase::stop);
+    default:
+        return true;
+    }
+}
 
 enum class trace_difference_field : std::uint8_t {
     expected_missing = 1,

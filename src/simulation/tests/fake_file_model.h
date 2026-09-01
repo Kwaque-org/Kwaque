@@ -53,10 +53,12 @@ enum class storage_fault_action : std::uint8_t {
     delay,
     crash,
     drop_completion,
+    partial_resize,
 };
 
 struct storage_fault_rule final {
     std::uint64_t id{0};
+    storage_command_kind point{storage_command_kind::write};
     std::uint64_t first{0};
     std::uint64_t last{0};
     storage_fault_action action{storage_fault_action::error};
@@ -89,8 +91,10 @@ struct dense_storage_snapshot final {
 class dense_storage_model final {
 public:
     explicit dense_storage_model(
-      std::vector<storage_fault_rule> fault_rules = {})
-      : fault_rules_(std::move(fault_rules)) {
+      std::vector<storage_fault_rule> fault_rules = {},
+      std::uint64_t fault_seed = 0)
+      : fault_rules_(std::move(fault_rules))
+      , fault_seed_(fault_seed) {
         nodes_.emplace(
           1,
           node{
@@ -181,6 +185,7 @@ private:
         std::map<std::string, std::uint64_t> visible_entries;
         std::map<std::string, std::uint64_t> durable_entries;
         std::uint64_t write_occurrences{0};
+        std::uint64_t truncate_occurrences{0};
     };
 
     [[nodiscard]] static std::string_view name(std::uint8_t slot) noexcept {
@@ -215,7 +220,8 @@ private:
         ++selected->write_occurrences;
         for (const auto& rule : fault_rules_) {
             if (
-              selected->write_occurrences < rule.first
+              rule.point != storage_command_kind::write
+              || selected->write_occurrences < rule.first
               || selected->write_occurrences > rule.last) {
                 continue;
             }
@@ -243,6 +249,43 @@ private:
         auto* selected = find(command.source);
         if (selected == nullptr) {
             return storage_outcome::not_found;
+        }
+        ++selected->truncate_occurrences;
+        for (const auto& rule : fault_rules_) {
+            if (
+              rule.point != storage_command_kind::truncate
+              || selected->truncate_occurrences < rule.first
+              || selected->truncate_occurrences > rule.last) {
+                continue;
+            }
+            if (rule.action == storage_fault_action::error) {
+                return storage_outcome::io_failure;
+            }
+            if (rule.action == storage_fault_action::partial_resize) {
+                const auto current = selected->visible_bytes.size();
+                const auto requested = static_cast<std::size_t>(command.length);
+                const auto lower = std::min(current, requested);
+                const auto upper = std::max(current, requested);
+                if (upper - lower > 1U) {
+                    const auto coordinate = random_coordinate::make(
+                      random_domain::fault_decision,
+                      rule.id,
+                      selected->truncate_occurrences);
+                    if (!coordinate) {
+                        return storage_outcome::io_failure;
+                    }
+                    auto source = deterministic_random{fault_seed_}.stream(
+                      *coordinate);
+                    const auto offset = runtime::uniform_u64(
+                      source, upper - lower - 1U);
+                    if (!offset) {
+                        return storage_outcome::io_failure;
+                    }
+                    selected->visible_bytes.resize(lower + *offset + 1U);
+                }
+                return storage_outcome::io_failure;
+            }
+            break;
         }
         selected->visible_bytes.resize(command.length);
         return storage_outcome::success;
@@ -342,6 +385,7 @@ private:
     std::uint64_t next_id_{3};
     std::uint64_t generation_{1};
     std::vector<storage_fault_rule> fault_rules_;
+    std::uint64_t fault_seed_{0};
 };
 
 class storage_workload_generator final {

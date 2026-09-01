@@ -17,6 +17,28 @@ kwaque_cc_library(
     ],
 )
 
+kwaque_cc_library(
+    name = "network_oracle",
+    testonly = True,
+    srcs = ["network_oracle.cc"],
+    hdrs = ["network_oracle.h"],
+    deps = [
+        "//src/runtime:error",
+        "//src/runtime:fault_api",
+        "//src/simulation:sha256",
+        "@boost//:multiprecision",
+    ],
+)
+
+kwaque_cc_test(
+    name = "network_oracle_test",
+    srcs = ["network_oracle_test.cc"],
+    deps = [
+        ":network_oracle",
+        "//src/simulation:bandwidth",
+    ],
+)
+
 kwaque_cc_seastar_test(
     name = "scheduler_test",
     srcs = ["scheduler_test.cc"],
@@ -24,6 +46,7 @@ kwaque_cc_seastar_test(
     memory = "192MiB",
     deps = [
         "//src/runtime:error",
+        "//src/runtime:fault_api",
         "//src/runtime:time",
         "//src/simulation:scheduler",
         "//src/simulation:scheduler_test_support",
@@ -112,6 +135,16 @@ kwaque_cc_test(
     ],
 )
 
+kwaque_cc_test(
+    name = "bandwidth_test",
+    srcs = ["bandwidth_test.cc"],
+    deps = [
+        "//src/runtime:error",
+        "//src/runtime:time",
+        "//src/simulation:bandwidth",
+    ],
+)
+
 kwaque_cc_seastar_test(
     name = "determinism_test",
     srcs = ["determinism_test.cc"],
@@ -121,8 +154,8 @@ kwaque_cc_seastar_test(
         "//src/simulation:deterministic_random",
         "//src/simulation:event_trace",
         "//src/simulation:scheduler",
+        "//src/simulation:sha256",
         "//src/simulation:virtual_time",
-        "@openssl",
     ],
 )
 
@@ -184,6 +217,37 @@ kwaque_cc_seastar_test(
         "//src/simulation:event_trace",
         "//src/simulation:fake_file",
         "//src/simulation:fake_file_test_support",
+        "//src/simulation:fault_schedule",
+        "//src/simulation:scheduler",
+    ],
+)
+
+kwaque_cc_seastar_test(
+    name = "fake_network_test",
+    srcs = ["fake_network_test.cc"],
+    cpu = 1,
+    memory = "256MiB",
+    deps = [
+        "//src/runtime:network",
+        "//src/runtime/testing/contracts:network_contract",
+        "//src/simulation:event_trace",
+        "//src/simulation:fake_network",
+        "//src/simulation:fault_schedule",
+        "//src/simulation:scheduler",
+        "//src/simulation/tests:network_oracle",
+    ],
+)
+
+kwaque_cc_seastar_test(
+    name = "fake_dns_test",
+    srcs = ["fake_dns_test.cc"],
+    cpu = 1,
+    memory = "256MiB",
+    deps = [
+        "//src/runtime:dns",
+        "//src/runtime/testing/contracts:dns_contract",
+        "//src/simulation:event_trace",
+        "//src/simulation:fake_dns",
         "//src/simulation:fault_schedule",
         "//src/simulation:scheduler",
     ],

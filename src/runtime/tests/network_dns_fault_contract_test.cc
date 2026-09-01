@@ -400,6 +400,34 @@ TEST(FaultContractTest, BuiltinPointTableHasExactLegalActionSets) {
     EXPECT_FALSE(file_write->permitted_actions.contains(
       kwaque::runtime::fault_action::duplicate));
 
+    const auto* file_truncate = kwaque::runtime::descriptor_for(
+      kwaque::runtime::builtin_fault_point::file_truncate);
+    ASSERT_NE(file_truncate, nullptr);
+    EXPECT_TRUE(file_truncate->permitted_actions.contains(
+      kwaque::runtime::fault_action::partial_resize));
+    EXPECT_EQ(
+      static_cast<std::uint8_t>(kwaque::runtime::fault_action::partial_resize),
+      13U);
+    const kwaque::runtime::fault_request truncate_request{
+      .point = file_truncate->id,
+      .occurrence = kwaque::runtime::fault_occurrence::first(),
+      .object = kwaque::runtime::fault_object_key::none(),
+    };
+    EXPECT_TRUE(
+      kwaque::runtime::validate_fault_decision(
+        truncate_request,
+        kwaque::runtime::fault_decision::make_partial_resize())
+        .has_value());
+    EXPECT_FALSE(
+      kwaque::runtime::validate_fault_decision(
+        kwaque::runtime::fault_request{
+          .point = file_write->id,
+          .occurrence = kwaque::runtime::fault_occurrence::first(),
+          .object = kwaque::runtime::fault_object_key::none(),
+        },
+        kwaque::runtime::fault_decision::make_partial_resize())
+        .has_value());
+
     const auto* network_write = kwaque::runtime::descriptor_for(
       kwaque::runtime::builtin_fault_point::network_write);
     ASSERT_NE(network_write, nullptr);

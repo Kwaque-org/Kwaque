@@ -118,6 +118,7 @@ enum class fault_action : std::uint8_t {
     torn_write,
     drop_completion,
     crash,
+    partial_resize = 13,
 };
 
 class fault_action_set final {
@@ -128,7 +129,7 @@ public:
     [[nodiscard]] static consteval fault_action_set constant() noexcept {
         static_assert(
           ((static_cast<std::uint8_t>(Actions)
-            <= static_cast<std::uint8_t>(fault_action::crash))
+            <= static_cast<std::uint8_t>(fault_action::partial_resize))
            && ...),
           "unknown fault action");
         fault_action_set result;
@@ -391,7 +392,8 @@ inline constexpr std::array builtin_fault_points{
       fault_action::error,
       fault_action::delay,
       fault_action::drop_completion,
-      fault_action::crash>()},
+      fault_action::crash,
+      fault_action::partial_resize>()},
   fault_point_descriptor{
     .point = builtin_fault_point::file_size,
     .id = fault_point_id::constant<22>(),
@@ -504,6 +506,10 @@ public:
     }
     [[nodiscard]] static constexpr fault_decision make_crash() noexcept {
         return fault_decision{fault_action::crash, 0};
+    }
+    [[nodiscard]] static constexpr fault_decision
+    make_partial_resize() noexcept {
+        return fault_decision{fault_action::partial_resize, 0};
     }
 
     [[nodiscard]] constexpr fault_action action() const noexcept {

@@ -132,10 +132,10 @@ kwaque_cc_seastar_test(
     memory = "128MiB",
     deps = [
         "//src/bytes:fragmented_buffer",
-        "//src/bytes:fragmented_buffer_builder",
         "//src/runtime:network",
         "//src/runtime/production:network",
         "//src/runtime/production:network_test_support",
+        "//src/runtime/testing/contracts:network_contract",
     ],
 )
 
@@ -147,6 +147,7 @@ kwaque_cc_seastar_test(
     deps = [
         "//src/runtime:dns",
         "//src/runtime/production:dns",
+        "//src/runtime/testing/contracts:dns_contract",
         "//src/runtime/testing/contracts:dns_test_server",
     ],
 )
