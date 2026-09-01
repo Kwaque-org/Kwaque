@@ -272,6 +272,12 @@ seastar::future<> pump_until(scheduler& events, seastar::future<T>& waiting) {
     }
 }
 
+template<typename Future>
+seastar::future<> require_ready_success(Future& waiting) {
+    const auto result = co_await std::move(waiting);
+    BOOST_REQUIRE(result.has_value());
+}
+
 kwaque::runtime::file_path path(std::string value) {
     auto result = kwaque::runtime::file_path::make(std::move(value));
     BOOST_REQUIRE(result.has_value());
@@ -289,7 +295,7 @@ kwaque::bytes::fragmented_buffer payload(char value) {
 template<typename Future>
 seastar::future<> require_success(scheduler& events, Future& waiting) {
     co_await pump_until(events, waiting);
-    BOOST_REQUIRE((co_await std::move(waiting)).has_value());
+    co_await require_ready_success(waiting);
 }
 
 template<typename Future>
@@ -307,6 +313,70 @@ struct compound_result final {
 
     bool operator==(const compound_result&) const = default;
 };
+
+struct partial_resize_result final {
+    fake_file_state_snapshot state;
+    fake_file_state_digest digest;
+    kwaque::errc terminal{kwaque::errc::success};
+    std::uint64_t selected_target{0};
+
+    bool operator==(const partial_resize_result&) const = default;
+};
+
+seastar::future<partial_resize_result> run_partial_resize(
+  event_trace& trace, const scheduler_limits& scheduler_budget) {
+    seastar::chunked_vector<fault_rule> rules;
+    rules.push_back(wildcard_rule(
+      401,
+      builtin_fault_point::file_truncate,
+      1,
+      fault_decision::make_partial_resize()));
+    fixture environment{scheduler_budget, trace, std::move(rules)};
+    auto creating = environment.files->create_directories(path("/kwaque/data"));
+    co_await require_success(environment.events, creating);
+    auto opening = environment.files->open(
+      path("/kwaque/data/file"),
+      {.access = kwaque::runtime::file_access::read_write, .create = true});
+    co_await pump_until(environment.events, opening);
+    auto opened = co_await std::move(opening);
+    BOOST_REQUIRE(opened.has_value());
+    auto file = std::move(*opened);
+    auto writing = file.write(kwaque::runtime::file_position{0}, payload('p'));
+    co_await require_success(environment.events, writing);
+    auto flushing = file.flush();
+    co_await require_success(environment.events, flushing);
+
+    auto truncating = file.truncate(10);
+    co_await pump_until(environment.events, truncating);
+    const auto truncated = co_await std::move(truncating);
+    BOOST_REQUIRE(!truncated.has_value());
+    BOOST_CHECK(truncated.error().code() == kwaque::errc::io_failure);
+    const auto effect = std::ranges::find_if(
+      trace.entries(), [](const auto& entry) {
+          return entry.action == trace_action::partial_resize_applied;
+      });
+    BOOST_REQUIRE(effect != trace.entries().end());
+    BOOST_CHECK(effect->coordinate_a > 10U);
+    BOOST_CHECK(effect->coordinate_a < 4'096U);
+
+    auto closing = file.close();
+    co_await require_success(environment.events, closing);
+    auto stopping = environment.files->stop();
+    if (!stopping.available()) {
+        co_await pump_until(environment.events, stopping);
+    }
+    co_await require_ready_success(stopping);
+    auto state = fake_file_test_access::snapshot(*environment.files);
+    auto state_digest = fake_file_test_access::state_digest(*environment.files);
+    BOOST_REQUIRE(state.has_value());
+    BOOST_REQUIRE(state_digest.has_value());
+    co_return partial_resize_result{
+      .state = std::move(*state),
+      .digest = *state_digest,
+      .terminal = truncated.error().code(),
+      .selected_target = effect->coordinate_a,
+    };
+}
 
 seastar::future<compound_result> run_compound(
   event_trace& trace,
@@ -548,7 +618,7 @@ seastar::future<compound_result> run_compound(
     if (!stopping.available()) {
         co_await pump_until(environment.events, stopping);
     }
-    BOOST_REQUIRE((co_await std::move(stopping)).has_value());
+    co_await require_ready_success(stopping);
     co_return compound_result{
       .state = std::move(state),
       .digest = *digest_value,
@@ -618,7 +688,7 @@ seastar::future<crash_boundary_result> run_crash_boundary(
     }
 
     if (!diverged) {
-        BOOST_REQUIRE((co_await std::move(crashing)).has_value());
+        co_await require_ready_success(crashing);
         const auto delayed_result = co_await std::move(delayed);
         BOOST_REQUIRE(!delayed_result.has_value());
         BOOST_CHECK(delayed_result.error().code() == kwaque::errc::aborted);
@@ -646,7 +716,7 @@ seastar::future<crash_boundary_result> run_crash_boundary(
     BOOST_REQUIRE(captured.has_value());
     auto state = std::move(*captured);
     auto closing = file.close();
-    BOOST_REQUIRE((co_await std::move(closing)).has_value());
+    co_await require_ready_success(closing);
     co_return crash_boundary_result{
       .state = std::move(state),
       .diverged = diverged,
@@ -693,6 +763,112 @@ SEASTAR_TEST_CASE(fake_file_compound_capture_replays_byte_identically) {
 
     BOOST_CHECK(*replay_encoding == *encoded);
     BOOST_CHECK(replayed == captured);
+    co_return;
+}
+
+SEASTAR_TEST_CASE(fake_file_partial_resize_capture_replays_exactly) {
+    const auto scheduler_budget = make_scheduler_limits();
+    const auto trace_budget = make_trace_limits();
+    const auto header = make_header(scheduler_budget, trace_budget);
+    event_trace capture{header, trace_budget};
+    const auto captured = co_await run_partial_resize(
+      capture, scheduler_budget);
+    auto encoded = capture.encode();
+    BOOST_REQUIRE(encoded.has_value());
+
+    auto decoded = event_trace::decode(*encoded, trace_budget);
+    BOOST_REQUIRE(decoded.has_value());
+    auto replay = event_trace::replay(
+      header, trace_budget, std::move(*decoded));
+    BOOST_REQUIRE(replay.has_value());
+    const auto replayed = co_await run_partial_resize(
+      **replay, scheduler_budget);
+    BOOST_REQUIRE((*replay)->finish_replay().has_value());
+    auto replay_encoding = (*replay)->encode();
+    BOOST_REQUIRE(replay_encoding.has_value());
+
+    BOOST_CHECK(captured == replayed);
+    BOOST_CHECK(*encoded == *replay_encoding);
+    BOOST_CHECK(captured.terminal == kwaque::errc::io_failure);
+    BOOST_CHECK(captured.selected_target > 10U);
+    BOOST_CHECK(captured.selected_target < 4'096U);
+    co_return;
+}
+
+SEASTAR_TEST_CASE(fake_file_partial_resize_replay_diverges_before_size_change) {
+    const auto scheduler_budget = make_scheduler_limits();
+    const auto trace_budget = make_trace_limits();
+    const auto header = make_header(scheduler_budget, trace_budget);
+    event_trace capture{header, trace_budget};
+    static_cast<void>(co_await run_partial_resize(capture, scheduler_budget));
+    auto encoded = capture.encode();
+    BOOST_REQUIRE(encoded.has_value());
+    auto decoded = event_trace::decode(*encoded, trace_budget);
+    BOOST_REQUIRE(decoded.has_value());
+    const auto boundary = std::ranges::find_if(
+      decoded->entries, [](const auto& entry) {
+          return entry.action == trace_action::partial_resize_applied;
+      });
+    BOOST_REQUIRE(boundary != decoded->entries.end());
+    boundary->coordinate_a ^= UINT64_C(1);
+    auto replay = event_trace::replay(
+      header, trace_budget, std::move(*decoded));
+    BOOST_REQUIRE(replay.has_value());
+
+    seastar::chunked_vector<fault_rule> rules;
+    rules.push_back(wildcard_rule(
+      401,
+      builtin_fault_point::file_truncate,
+      1,
+      fault_decision::make_partial_resize()));
+    fixture environment{scheduler_budget, **replay, std::move(rules)};
+    auto creating = environment.files->create_directories(path("/kwaque/data"));
+    co_await require_success(environment.events, creating);
+    auto opening = environment.files->open(
+      path("/kwaque/data/file"),
+      {.access = kwaque::runtime::file_access::read_write, .create = true});
+    co_await pump_until(environment.events, opening);
+    auto opened = co_await std::move(opening);
+    BOOST_REQUIRE(opened.has_value());
+    auto file = std::move(*opened);
+    auto writing = file.write(kwaque::runtime::file_position{0}, payload('p'));
+    co_await require_success(environment.events, writing);
+    auto flushing = file.flush();
+    co_await require_success(environment.events, flushing);
+
+    const auto file_path = fake_file_test_access::resolve(
+      *environment.files, "/kwaque/data/file");
+    BOOST_REQUIRE(file_path.has_value());
+    BOOST_CHECK(
+      *fake_file_test_access::visible_size(*environment.files, *file_path)
+      == 4'096U);
+    auto truncating = file.truncate(10);
+    BOOST_REQUIRE(!truncating.available());
+    if (!environment.events.has_ready_events()) {
+        const auto advanced = environment.events.advance_to_next();
+        BOOST_REQUIRE(advanced.has_value());
+        BOOST_REQUIRE(advanced->has_value());
+    }
+    const auto ran = environment.events.run_ready();
+    BOOST_REQUIRE(!ran.has_value());
+    BOOST_CHECK(ran.error().code() == kwaque::errc::replay_divergence);
+    BOOST_REQUIRE(environment.events.discard_failed());
+    const auto truncated = co_await std::move(truncating);
+    BOOST_REQUIRE(!truncated.has_value());
+    BOOST_CHECK(
+      *fake_file_test_access::visible_size(*environment.files, *file_path)
+      == 4'096U);
+    BOOST_CHECK(
+      *fake_file_test_access::durable_size(*environment.files, *file_path)
+      == 4'096U);
+    BOOST_CHECK(environment.files->pending_operations() == 0U);
+    BOOST_CHECK(environment.files->pending_bytes().value() == 0U);
+
+    auto stopping = environment.files->stop();
+    const auto stopped = co_await std::move(stopping);
+    BOOST_REQUIRE(!stopped.has_value());
+    BOOST_CHECK(stopped.error().code() == kwaque::errc::replay_divergence);
+    BOOST_REQUIRE((co_await file.close()).has_value());
     co_return;
 }
 
@@ -891,7 +1067,7 @@ SEASTAR_TEST_CASE(
         BOOST_REQUIRE(!result.has_value());
         BOOST_CHECK(result.error().code() == kwaque::errc::fault_injected);
         auto stopping = environment.files->stop();
-        BOOST_REQUIRE((co_await std::move(stopping)).has_value());
+        co_await require_ready_success(stopping);
     }
     auto encoded = capture.encode();
     BOOST_REQUIRE(encoded.has_value());
@@ -959,7 +1135,7 @@ SEASTAR_TEST_CASE(
         auto syncing = environment.files->sync_directory(path("/kwaque"));
         co_await require_success(environment.events, syncing);
         auto stopping = environment.files->stop();
-        BOOST_REQUIRE((co_await std::move(stopping)).has_value());
+        co_await require_ready_success(stopping);
     }
     auto encoded = capture.encode();
     BOOST_REQUIRE(encoded.has_value());

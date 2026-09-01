@@ -187,6 +187,10 @@ jobs:
           //src/simulation/tests:deterministic_random_test
           //src/simulation/tests:event_trace_test
           //src/simulation/tests:determinism_test
+          //src/simulation/tests:fault_schedule_test
+          //src/simulation/tests:fake_file_test
+          //src/simulation/tests:fake_file_runtime_test
+          //src/simulation/tests:fake_file_replay_test
       - name: Test deterministic vectors on aarch64 debug
         run: >-
           bazel test --config=ci-debug

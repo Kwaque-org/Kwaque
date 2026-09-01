@@ -13,6 +13,7 @@
 #include <cstdint>
 #include <cstring>
 #include <limits>
+#include <optional>
 #include <span>
 #include <string>
 #include <string_view>
@@ -150,7 +151,8 @@ SEASTAR_TEST_CASE(fake_file_configuration_validates_exact_absolute_limits) {
     BOOST_CHECK(!oversized_pending.has_value());
 
     const auto expect_invalid = [](fake_file_system_config config) {
-        BOOST_CHECK(!fake_file_system::make(std::move(config)).has_value());
+        const auto result = fake_file_system::make(std::move(config));
+        BOOST_CHECK(!result.has_value());
     };
     auto invalid = fake_file_system_config{.virtual_root = "/"};
     invalid.logical_capacity = kwaque::byte_count{};
@@ -630,6 +632,121 @@ SEASTAR_TEST_CASE(fake_file_state_changes_are_allocation_transactional) {
     BOOST_CHECK(rename_pristine);
     BOOST_REQUIRE(renamed_file);
     BOOST_CHECK(read(*filesystem, renamed, 0, payload.size()) == payload);
+    co_return;
+}
+
+SEASTAR_TEST_CASE(fake_truncate_allocation_failure_leaves_state_unchanged) {
+    auto filesystem = make_filesystem("/disk", 65'536);
+    const auto root = path(*filesystem, ".");
+    const auto file = path(*filesystem, "file");
+    static_cast<void>(make_durable_file(*filesystem, root, file));
+
+    const std::string payload(4'097, 'p');
+    BOOST_REQUIRE(
+      fake_file_test_access::write(*filesystem, file, 0, bytes(payload))
+        .has_value());
+    BOOST_REQUIRE(fake_file_test_access::flush(*filesystem, file).has_value());
+    const auto original_page = fake_file_test_access::visible_page(
+      *filesystem, file, 0);
+    BOOST_REQUIRE(original_page.has_value());
+    const auto original_retained = filesystem->retained_capacity();
+
+    bool resized = false;
+    bool pristine_until_success = true;
+    seastar::memory::with_allocation_failures([&] {
+        pristine_until_success
+          = pristine_until_success
+            && *fake_file_test_access::visible_size(*filesystem, file)
+                 == payload.size()
+            && *fake_file_test_access::durable_size(*filesystem, file)
+                 == payload.size()
+            && fake_file_test_access::visible_page(*filesystem, file, 0)
+                 == original_page
+            && filesystem->retained_capacity() == original_retained;
+        resized
+          = fake_file_test_access::truncate(*filesystem, file, 2).has_value();
+    });
+
+    BOOST_CHECK(pristine_until_success);
+    BOOST_REQUIRE(resized);
+    BOOST_CHECK(*fake_file_test_access::visible_size(*filesystem, file) == 2U);
+    BOOST_CHECK(
+      *fake_file_test_access::durable_size(*filesystem, file)
+      == payload.size());
+    co_return;
+}
+
+SEASTAR_TEST_CASE(fake_open_allocates_handles_before_create_or_truncate) {
+    auto filesystem = make_filesystem("/disk", 65'536);
+    const auto root = path(*filesystem, ".");
+    const auto directory = path(*filesystem, "data");
+    const auto file = path(*filesystem, "data/file");
+    make_durable_directory(*filesystem, root, directory);
+
+    std::optional<kwaque::runtime::file> created_handle;
+    bool create_pristine_until_success = true;
+    bool create_result_valid = true;
+    seastar::memory::with_allocation_failures([&] {
+        create_pristine_until_success
+          = create_pristine_until_success && filesystem->object_count() == 2U
+            && fake_file_test_access::open_handles(*filesystem) == 0U
+            && !fake_file_test_access::lookup(*filesystem, file).has_value();
+        auto opened = fake_file_test_access::open_at_completion(
+          *filesystem,
+          file,
+          {.access = kwaque::runtime::file_access::read_write, .create = true});
+        if (!opened) {
+            create_result_valid = false;
+            return;
+        }
+        created_handle.emplace(std::move(*opened));
+    });
+    BOOST_CHECK(create_pristine_until_success);
+    BOOST_CHECK(create_result_valid);
+    BOOST_REQUIRE(created_handle.has_value());
+    BOOST_CHECK(fake_file_test_access::lookup(*filesystem, file).has_value());
+    BOOST_CHECK(fake_file_test_access::open_handles(*filesystem) == 1U);
+    BOOST_REQUIRE((co_await created_handle->close()).has_value());
+    created_handle.reset();
+    BOOST_CHECK(fake_file_test_access::open_handles(*filesystem) == 0U);
+
+    const std::string payload(4'096, 'p');
+    BOOST_REQUIRE(
+      fake_file_test_access::write(*filesystem, file, 0, bytes(payload))
+        .has_value());
+    BOOST_REQUIRE(fake_file_test_access::flush(*filesystem, file).has_value());
+
+    std::optional<kwaque::runtime::file> truncated_handle;
+    bool truncate_pristine_until_success = true;
+    bool truncate_result_valid = true;
+    seastar::memory::with_allocation_failures([&] {
+        truncate_pristine_until_success
+          = truncate_pristine_until_success
+            && *fake_file_test_access::visible_size(*filesystem, file)
+                 == payload.size()
+            && read(*filesystem, file, 0, payload.size()) == payload
+            && fake_file_test_access::open_handles(*filesystem) == 0U;
+        auto opened = fake_file_test_access::open_at_completion(
+          *filesystem,
+          file,
+          {.access = kwaque::runtime::file_access::read_write,
+           .truncate = true});
+        if (!opened) {
+            truncate_result_valid = false;
+            return;
+        }
+        truncated_handle.emplace(std::move(*opened));
+    });
+    BOOST_CHECK(truncate_pristine_until_success);
+    BOOST_CHECK(truncate_result_valid);
+    BOOST_REQUIRE(truncated_handle.has_value());
+    BOOST_CHECK(*fake_file_test_access::visible_size(*filesystem, file) == 0U);
+    BOOST_CHECK(
+      *fake_file_test_access::durable_size(*filesystem, file)
+      == payload.size());
+    BOOST_REQUIRE((co_await truncated_handle->close()).has_value());
+    truncated_handle.reset();
+    BOOST_CHECK(fake_file_test_access::open_handles(*filesystem) == 0U);
     co_return;
 }
 

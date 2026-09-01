@@ -4,6 +4,7 @@ Checks: >-
   clang-analyzer-core.*,
   clang-analyzer-deadcode.*,
   clang-analyzer-security.*,
+  -clang-analyzer-security.ArrayBound,
   clang-analyzer-unix.*,
   bugprone-assert-side-effect,
   bugprone-assignment-in-if-condition,

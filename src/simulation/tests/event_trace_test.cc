@@ -95,7 +95,7 @@ trace_entry fault_entry(
 }
 
 constexpr std::string_view golden_trace
-  = "KQTR 03 0000000000000000 00000001 00000001 00000001 00000004 "
+  = "KQTR 04 0000000000000000 00000001 00000001 00000001 00000004 "
     "0000000000000004 0000000000000008 0000000000000064 00000004 "
     "0000000000001000 00000400 0000000000000001 "
     "0000000000000000000000000000000000000000000000000000000000000000 "
@@ -108,6 +108,48 @@ constexpr std::string_view golden_trace
 static_assert(canonical_header_encoded_size == 294);
 static_assert(canonical_entry_encoded_size == 244);
 static_assert(golden_trace.size() == 538);
+static_assert(
+  kwaque::runtime::fault_action::partial_resize
+  == static_cast<kwaque::runtime::fault_action>(13));
+static_assert(trace_action::stop_terminal == static_cast<trace_action>(22));
+static_assert(trace_event_kind::dns == static_cast<trace_event_kind>(10));
+static_assert(
+  trace_context_key::digest_word_3 == static_cast<trace_context_key>(8));
+static_assert(
+  kwaque::simulation::network_trace_phase::stop
+  == static_cast<kwaque::simulation::network_trace_phase>(13));
+static_assert(
+  kwaque::simulation::bandwidth_trace_phase::transfer_done
+  == static_cast<kwaque::simulation::bandwidth_trace_phase>(3));
+static_assert(
+  kwaque::simulation::network_control_trace_phase::ingress_limit
+  == static_cast<kwaque::simulation::network_control_trace_phase>(7));
+static_assert(
+  kwaque::simulation::dns_trace_phase::stop
+  == static_cast<kwaque::simulation::dns_trace_phase>(5));
+static_assert(kwaque::simulation::trace_event_domain_is_valid(
+  kwaque::simulation::trace_event_kind::network,
+  static_cast<std::uint32_t>(kwaque::simulation::network_trace_phase::stop)));
+static_assert(kwaque::simulation::trace_event_domain_is_valid(
+  kwaque::simulation::trace_event_kind::bandwidth,
+  static_cast<std::uint32_t>(
+    kwaque::simulation::bandwidth_trace_phase::transfer_done)));
+static_assert(kwaque::simulation::trace_event_domain_is_valid(
+  kwaque::simulation::trace_event_kind::network_control,
+  static_cast<std::uint32_t>(
+    kwaque::simulation::network_control_trace_phase::ingress_limit)));
+static_assert(kwaque::simulation::trace_event_domain_is_valid(
+  kwaque::simulation::trace_event_kind::dns,
+  static_cast<std::uint32_t>(kwaque::simulation::dns_trace_phase::stop)));
+static_assert(!kwaque::simulation::trace_event_domain_is_valid(
+  kwaque::simulation::trace_event_kind::network, 0));
+static_assert(!kwaque::simulation::trace_event_domain_is_valid(
+  kwaque::simulation::trace_event_kind::network,
+  static_cast<std::uint32_t>(kwaque::simulation::network_trace_phase::stop)
+    + 1U));
+static_assert(kwaque::simulation::trace_event_domain_is_valid(
+  kwaque::simulation::trace_event_kind::generic,
+  std::numeric_limits<std::uint32_t>::max()));
 static_assert(!std::is_move_constructible_v<event_trace>);
 static_assert(noexcept(
   std::declval<event_trace&>().reserve(1, canonical_entry_encoded_size)));
@@ -176,9 +218,11 @@ TEST(EventTraceTest, EncodingAndParsingMatchTheCanonicalGoldenFixture) {
     EXPECT_EQ(encoded_text->find("/home/"), std::string::npos);
     EXPECT_EQ(encoded_text->find('\n'), canonical_header_encoded_size - 1U);
 
-    auto version_one = *encoded_text;
-    version_one[6] = '1';
-    EXPECT_FALSE(event_trace::decode(version_one, limits).has_value());
+    for (const char version : {'1', '2', '3'}) {
+        auto old_version = *encoded_text;
+        old_version[6] = version;
+        EXPECT_FALSE(event_trace::decode(old_version, limits).has_value());
+    }
 
     const auto decoded = event_trace::decode(*encoded, limits);
     ASSERT_TRUE(decoded.has_value());
@@ -234,7 +278,7 @@ TEST(EventTraceTest, ParserRejectsEveryNoncanonicalBoundary) {
     EXPECT_FALSE(event_trace::decode(invalid_action, limits).has_value());
 
     auto unknown_schema = *encoded_text;
-    replace_token(unknown_schema, 0, 1, "04");
+    replace_token(unknown_schema, 0, 1, "05");
     EXPECT_FALSE(event_trace::decode(unknown_schema, limits).has_value());
 
     auto unknown_random = *encoded_text;
@@ -405,6 +449,190 @@ TEST(EventTraceTest, ValidatesFaultAndFileLifecycleVocabulary) {
         .error()
         .code(),
       kwaque::errc::malformed_data);
+}
+
+TEST(EventTraceTest, ValidatesReservedSchemaFourVocabulary) {
+    const auto limits = test_limits(32, 32'768);
+    event_trace trace{test_header(limits), limits};
+    const auto event_effect = [](
+                                trace_action action,
+                                trace_event_kind kind,
+                                std::uint32_t domain,
+                                std::uint64_t stable_id = 1) {
+        return trace_entry{
+          .time = kwaque::runtime::monotonic_time{2},
+          .deadline = kwaque::runtime::monotonic_time{2},
+          .action = action,
+          .kind = kind,
+          .event_id = 1,
+          .priority = 128,
+          .domain = domain,
+          .stable_id = stable_id,
+        };
+    };
+
+    auto partial = event_effect(
+      trace_action::partial_resize_applied,
+      trace_event_kind::file,
+      kwaque::runtime::descriptor_for(
+        kwaque::runtime::builtin_fault_point::file_truncate)
+        ->id.value());
+    partial.coordinate_a = 7;
+    partial.value = 10;
+    partial.result = static_cast<std::uint8_t>(
+                       kwaque::runtime::fault_action::partial_resize)
+                     | UINT32_C(0x100);
+    EXPECT_TRUE(trace.observe(partial).has_value());
+    EXPECT_TRUE(trace
+                  .observe(event_effect(
+                    trace_action::network_operation_applied,
+                    trace_event_kind::network,
+                    static_cast<std::uint32_t>(
+                      kwaque::simulation::network_trace_phase::bind)))
+                  .has_value());
+    EXPECT_TRUE(
+      trace
+        .observe(event_effect(
+          trace_action::network_operation_applied,
+          trace_event_kind::network,
+          static_cast<std::uint32_t>(
+            kwaque::simulation::network_trace_phase::sequence_release)))
+        .has_value());
+
+    auto flow = event_effect(
+      trace_action::flow_started,
+      trace_event_kind::bandwidth,
+      static_cast<std::uint32_t>(
+        kwaque::simulation::bandwidth_trace_phase::flow_start));
+    flow.event_id = 0;
+    flow.deadline = kwaque::runtime::monotonic_time{};
+    flow.priority = 0;
+    EXPECT_TRUE(trace.observe(flow).has_value());
+
+    auto rebalance = trace_entry{
+      .time = kwaque::runtime::monotonic_time{2},
+      .action = trace_action::bandwidth_rebalanced,
+      .kind = trace_event_kind::bandwidth,
+      .domain = static_cast<std::uint32_t>(
+        kwaque::simulation::bandwidth_trace_phase::rebalance),
+      .stable_id = 2,
+      .coordinate_a = 3,
+      .coordinate_b = 4,
+      .value = std::numeric_limits<std::uint64_t>::max(),
+      .result = 5,
+      .context = {
+        kwaque::simulation::trace_context_field{
+          .key = trace_context_key::digest_word_0, .value = 1},
+        kwaque::simulation::trace_context_field{
+          .key = trace_context_key::digest_word_1, .value = 2},
+        kwaque::simulation::trace_context_field{
+          .key = trace_context_key::digest_word_2, .value = 3},
+        kwaque::simulation::trace_context_field{
+          .key = trace_context_key::digest_word_3, .value = 4},
+      },
+      .context_size = 4,
+    };
+    EXPECT_TRUE(trace.observe(rebalance).has_value());
+    EXPECT_TRUE(
+      trace
+        .observe(event_effect(
+          trace_action::transfer_completed,
+          trace_event_kind::bandwidth,
+          static_cast<std::uint32_t>(
+            kwaque::simulation::bandwidth_trace_phase::transfer_done)))
+        .has_value());
+    for (const auto action : {
+           trace_action::packet_delivered,
+           trace_action::packet_dropped,
+         }) {
+        EXPECT_TRUE(trace
+                      .observe(event_effect(
+                        action,
+                        trace_event_kind::network,
+                        static_cast<std::uint32_t>(
+                          kwaque::simulation::network_trace_phase::delivery)))
+                      .has_value());
+    }
+    EXPECT_TRUE(trace
+                  .observe(event_effect(
+                    trace_action::fin_delivered,
+                    trace_event_kind::network,
+                    static_cast<std::uint32_t>(
+                      kwaque::simulation::network_trace_phase::fin)))
+                  .has_value());
+    EXPECT_TRUE(trace
+                  .observe(event_effect(
+                    trace_action::reset_applied,
+                    trace_event_kind::network,
+                    static_cast<std::uint32_t>(
+                      kwaque::simulation::network_trace_phase::reset)))
+                  .has_value());
+    EXPECT_TRUE(
+      trace
+        .observe(event_effect(
+          trace_action::network_control_applied,
+          trace_event_kind::network_control,
+          static_cast<std::uint32_t>(
+            kwaque::simulation::network_control_trace_phase::partition)))
+        .has_value());
+    EXPECT_TRUE(trace
+                  .observe(event_effect(
+                    trace_action::dns_result_applied,
+                    trace_event_kind::dns,
+                    static_cast<std::uint32_t>(
+                      kwaque::simulation::dns_trace_phase::numeric)))
+                  .has_value());
+    for (const auto [kind, domain] : {
+           std::pair{
+             trace_event_kind::network,
+             static_cast<std::uint32_t>(
+               kwaque::simulation::network_trace_phase::parked)},
+           std::pair{
+             trace_event_kind::dns,
+             static_cast<std::uint32_t>(
+               kwaque::simulation::dns_trace_phase::parked)},
+         }) {
+        EXPECT_TRUE(
+          trace
+            .observe(event_effect(trace_action::operation_parked, kind, domain))
+            .has_value());
+    }
+    for (const auto [kind, domain] : {
+           std::pair{
+             trace_event_kind::network,
+             static_cast<std::uint32_t>(
+               kwaque::simulation::network_trace_phase::stop)},
+           std::pair{
+             trace_event_kind::dns,
+             static_cast<std::uint32_t>(
+               kwaque::simulation::dns_trace_phase::stop)},
+         }) {
+        EXPECT_TRUE(
+          trace.observe(event_effect(trace_action::stop_terminal, kind, domain))
+            .has_value());
+    }
+
+    auto missing_digest = rebalance;
+    missing_digest.context_size = 3;
+    EXPECT_FALSE(trace.observe(missing_digest).has_value());
+    auto digest_on_partial = partial;
+    digest_on_partial.context_size = 1;
+    digest_on_partial.context[0] = {
+      .key = trace_context_key::digest_word_0,
+      .value = 1,
+    };
+    EXPECT_FALSE(trace.observe(digest_on_partial).has_value());
+    auto nonintermediate_partial = partial;
+    nonintermediate_partial.coordinate_a = nonintermediate_partial.value;
+    EXPECT_FALSE(trace.observe(nonintermediate_partial).has_value());
+    auto wrong_delivery_domain = event_effect(
+      trace_action::packet_delivered,
+      trace_event_kind::network,
+      static_cast<std::uint32_t>(kwaque::simulation::network_trace_phase::fin));
+    EXPECT_FALSE(trace.observe(wrong_delivery_domain).has_value());
+    auto unknown_phase = event_effect(
+      trace_action::scheduled, trace_event_kind::network, 99);
+    EXPECT_FALSE(trace.observe(unknown_phase).has_value());
 }
 
 TEST(EventTraceTest, ReplayDetectsTheFirstDifferenceAndTrailingEntries) {

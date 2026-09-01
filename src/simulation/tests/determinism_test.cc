@@ -1,14 +1,13 @@
 #include "src/simulation/deterministic_random.h"
 #include "src/simulation/event_trace.h"
 #include "src/simulation/scheduler.h"
+#include "src/simulation/sha256.h"
 #include "src/simulation/virtual_time.h"
 
 #include <seastar/core/coroutine.hh>
 #include <seastar/testing/test_case.hh>
 
 #include <boost/test/unit_test.hpp>
-#define OPENSSL_SUPPRESS_DEPRECATED
-#include <openssl/sha.h>
 
 #include <algorithm>
 #include <array>
@@ -30,6 +29,8 @@ using kwaque::simulation::random_domain;
 using kwaque::simulation::scheduler;
 using kwaque::simulation::scheduler_limit_values;
 using kwaque::simulation::scheduler_limits;
+using kwaque::simulation::sha256_digest;
+using kwaque::simulation::sha256_hasher;
 using kwaque::simulation::trace_action;
 using kwaque::simulation::trace_artifact;
 using kwaque::simulation::trace_digest;
@@ -175,16 +176,12 @@ std::optional<std::uint64_t> context_value(
     return std::nullopt;
 }
 
-std::array<unsigned char, SHA256_DIGEST_LENGTH>
-sha256(const trace_artifact& artifact) {
-    std::array<unsigned char, SHA256_DIGEST_LENGTH> output{};
-    SHA256_CTX context{};
-    static_cast<void>(SHA256_Init(&context));
+sha256_digest sha256(const trace_artifact& artifact) {
+    sha256_hasher hasher;
     for (const auto& chunk : artifact.chunks()) {
-        static_cast<void>(SHA256_Update(&context, chunk.data(), chunk.size()));
+        hasher.update(chunk.data(), chunk.size());
     }
-    static_cast<void>(SHA256_Final(output.data(), &context));
-    return output;
+    return std::move(hasher).final();
 }
 
 } // namespace
@@ -194,7 +191,7 @@ SEASTAR_TEST_CASE(deterministic_scenario_is_byte_identical_under_noise) {
     const auto trace_budget = scenario_trace_limits();
     const auto header = scenario_header(92, scheduler_budget, trace_budget);
     trace_artifact expected_encoding;
-    std::array<unsigned char, SHA256_DIGEST_LENGTH> expected_hash{};
+    sha256_digest expected_hash{};
     std::uint64_t expected_state = 0;
 
     for (std::size_t repetition = 0; repetition < 100; ++repetition) {

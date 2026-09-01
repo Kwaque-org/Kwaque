@@ -6,42 +6,7 @@ Kwaque is a high-performance, self-governing distributed log/data-streaming plat
 
 ## Project status
 
-Kwaque is early and under heavy development. This repository currently builds a
-single broker process together with the build, test, and release tooling that
-later work depends on. Treat the commands in this file as the definition of what
-Kwaque can do today.
-
-Working today:
-
-- a hermetic C++23 Bazel build with pinned toolchains and dependency lockfile;
-- a Seastar broker process that starts on one or many shards and shuts down
-  cleanly on `SIGINT` and `SIGTERM`;
-- typed YAML bootstrap configuration with strict key checking, field validation,
-  schema-version compatibility, and redacted diagnostics;
-- ordered service startup, rollback of started services when a later stage
-  fails, and reverse-dependency shutdown;
-- administrative HTTP endpoints for liveness, readiness, build version, and
-  Prometheus metrics;
-- shard-affine lifecycle primitives, deny-by-default cross-shard value transfer,
-  eight workload classes, native memory admission, and bounded work queues;
-- immutable owning fragmented buffers with bounded builders, scatter export,
-  checked parsing, fuzz coverage, and focused benchmarks;
-- statically dispatched runtime contracts for time, timers, randomness, files,
-  networking, DNS, and fault evaluation, together with test-only backend shapes;
-- direct Seastar low-resolution clocks and abortable timers, shard-local
-  xoshiro256++ randomness, a move-only native file owner with bounded
-  positioned I/O, production filesystem, TCP, and DNS adapters, and
-  shard-local runtime composition;
-- a bounded deterministic event scheduler, virtual clocks and timers,
-  counter-addressed randomness, and chunked canonical capture/replay traces;
-- unit, reactor, subprocess smoke, sanitizer, bounded fuzz, benchmark, and
-  packaging tests, all runnable through Bazel;
-- a relocatable binary archive with a checksum and bundled license material.
-
-Not implemented yet: deterministic simulation backends; durable log storage;
-the native wire protocol; consensus; cluster metadata; replication; consumer
-coordination; tiered storage; quotas; and authentication. The source packages
-for the broker features in that list remain ownership boundaries only.
+Kwaque is currently under active development.
 
 ## Requirements
 

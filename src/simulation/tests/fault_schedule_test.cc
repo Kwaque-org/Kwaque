@@ -231,6 +231,25 @@ SEASTAR_TEST_CASE(fault_rule_validation_rejects_ambiguous_schedules) {
                    fault_selector::once(),
                    fault_decision::make_error())
                    .has_value());
+    BOOST_CHECK(
+      fault_rule::make(
+        *id,
+        builtin_fault_point::file_truncate,
+        std::nullopt,
+        *first,
+        *first,
+        fault_selector::once(),
+        fault_decision::make_partial_resize())
+        .has_value());
+    BOOST_CHECK(!fault_rule::make(
+                   *id,
+                   builtin_fault_point::file_write,
+                   std::nullopt,
+                   *first,
+                   *first,
+                   fault_selector::once(),
+                   fault_decision::make_partial_resize())
+                   .has_value());
     BOOST_CHECK(!fault_rule::make(
                    *id,
                    static_cast<builtin_fault_point>(255),
@@ -257,12 +276,12 @@ SEASTAR_TEST_CASE(fault_rule_validation_rejects_ambiguous_schedules) {
       1,
       1,
       fault_selector::once()));
-    BOOST_CHECK(!fault_schedule::make(
-                   environment.events,
-                   environment.trace,
-                   master_seed,
-                   std::move(duplicate_ids))
-                   .has_value());
+    const auto duplicate_schedule = fault_schedule::make(
+      environment.events,
+      environment.trace,
+      master_seed,
+      std::move(duplicate_ids));
+    BOOST_CHECK(!duplicate_schedule.has_value());
 
     seastar::chunked_vector<fault_rule> overlapping;
     overlapping.push_back(make_rule(
@@ -279,12 +298,12 @@ SEASTAR_TEST_CASE(fault_rule_validation_rejects_ambiguous_schedules) {
       4,
       8,
       fault_selector::bounded_range()));
-    BOOST_CHECK(!fault_schedule::make(
-                   environment.events,
-                   environment.trace,
-                   master_seed,
-                   std::move(overlapping))
-                   .has_value());
+    const auto overlapping_schedule = fault_schedule::make(
+      environment.events,
+      environment.trace,
+      master_seed,
+      std::move(overlapping));
+    BOOST_CHECK(!overlapping_schedule.has_value());
 
     seastar::chunked_vector<fault_rule> independent_objects;
     independent_objects.push_back(make_rule(

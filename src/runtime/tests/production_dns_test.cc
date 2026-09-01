@@ -1,5 +1,6 @@
 #include "src/runtime/dns.h"
 #include "src/runtime/production/dns.h"
+#include "src/runtime/testing/contracts/dns_contract.h"
 #include "src/runtime/testing/contracts/dns_test_server.h"
 
 #include <seastar/core/coroutine.hh>
@@ -41,28 +42,9 @@ SEASTAR_TEST_CASE(production_dns_numeric_bypasses_native_resolution) {
     options.tcp_port = 1;
     options.timeout = std::chrono::milliseconds{1};
     kwaque::runtime::production::resolver resolver{{}, options};
-
-    seastar::abort_source abort_source;
-    const auto resolved = co_await resolver.resolve(
-      make_dns_query("127.0.0.42", 12000), abort_source);
-    BOOST_REQUIRE(resolved.has_value());
-    BOOST_REQUIRE_EQUAL(resolved->answers().size(), 1U);
-    BOOST_CHECK_EQUAL(resolved->answers()[0].endpoint.port(), 12000U);
-    BOOST_CHECK(
-      resolved->answers()[0].endpoint.address().bytes()[3] == std::byte{42});
-    BOOST_CHECK(resolved->answers()[0].ttl == kwaque::runtime::maximum_dns_ttl);
+    co_await kwaque::runtime::testing::run_dns_contract(resolver);
     BOOST_CHECK(!resolver.active());
     BOOST_CHECK_EQUAL(resolver.waiters(), 0U);
-
-    seastar::abort_source preaborted;
-    preaborted.request_abort();
-    const auto aborted = co_await resolver.resolve(
-      make_dns_query("127.0.0.43", 12000), preaborted);
-    BOOST_REQUIRE(!aborted.has_value());
-    BOOST_CHECK(aborted.error().code() == kwaque::errc::aborted);
-
-    const auto stopped = co_await resolver.stop();
-    BOOST_REQUIRE(stopped.has_value());
 }
 
 SEASTAR_TEST_CASE(production_dns_preserves_answer_order_ttl_and_split_input) {
