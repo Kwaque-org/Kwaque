@@ -122,6 +122,9 @@ class scheduler final : public runtime::shard_affine {
 public:
     using callback = seastar::noncopyable_function<void() noexcept>;
 
+    // Reserves future monotonic-ID headroom only. It deliberately does not
+    // consume pending-event capacity because a replacement may reuse the slot
+    // released by canceling its currently queued event.
     class event_id_reservation final {
     public:
         event_id_reservation() noexcept = default;
@@ -144,6 +147,31 @@ public:
         scheduler* owner_{nullptr};
     };
 
+    // Reserves both one future event ID and one physical pending-event slot.
+    class event_slot_reservation final {
+    public:
+        event_slot_reservation() noexcept = default;
+        ~event_slot_reservation();
+
+        event_slot_reservation(const event_slot_reservation&) = delete;
+        event_slot_reservation&
+        operator=(const event_slot_reservation&) = delete;
+        event_slot_reservation(event_slot_reservation&& other) noexcept;
+        event_slot_reservation&
+        operator=(event_slot_reservation&& other) noexcept;
+
+        [[nodiscard]] bool active() const noexcept { return owner_ != nullptr; }
+        void release() noexcept;
+
+    private:
+        friend class scheduler;
+
+        explicit event_slot_reservation(scheduler& owner) noexcept
+          : owner_(&owner) {}
+
+        scheduler* owner_{nullptr};
+    };
+
     explicit scheduler(scheduler_limits limits, event_trace* trace = nullptr);
     ~scheduler();
 
@@ -160,6 +188,7 @@ public:
       event_cleanup_policy cleanup = event_cleanup_policy::drop,
       event_trace::reservation trace_reservation = {});
     [[nodiscard]] runtime::result<event_id_reservation> reserve_event_id();
+    [[nodiscard]] runtime::result<event_slot_reservation> reserve_event_slot();
     [[nodiscard]] runtime::result<void> can_schedule(
       runtime::monotonic_time deadline,
       trace_event_descriptor descriptor = {},
@@ -342,7 +371,9 @@ private:
       trace_event_descriptor descriptor,
       std::span<const trace_context_field> context) const noexcept;
     [[nodiscard]] bool event_id_available() const noexcept;
+    [[nodiscard]] std::size_t claimed_event_slots() const noexcept;
     void release_reserved_event_id() noexcept;
+    void release_reserved_event_slot() noexcept;
     [[nodiscard]] runtime::result<void> observe_event(
       trace_action action,
       const event& selected,
@@ -356,10 +387,11 @@ private:
     event_trace* trace_;
     event_storage heap_;
     event_index indices_;
-    runtime::monotonic_time now_{};
+    runtime::monotonic_time now_;
     std::uint64_t next_event_id_{1};
     std::uint64_t executed_events_{0};
     std::uint64_t reserved_event_ids_{0};
+    std::uint64_t reserved_event_slots_{0};
     bool event_ids_exhausted_{false};
     bool pumping_{false};
     bool discarding_failed_event_{false};

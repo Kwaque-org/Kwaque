@@ -356,6 +356,29 @@ void scheduler::event_id_reservation::release() noexcept {
     owner->release_reserved_event_id();
 }
 
+scheduler::event_slot_reservation::~event_slot_reservation() { release(); }
+
+scheduler::event_slot_reservation::event_slot_reservation(
+  event_slot_reservation&& other) noexcept
+  : owner_(std::exchange(other.owner_, nullptr)) {}
+
+scheduler::event_slot_reservation& scheduler::event_slot_reservation::operator=(
+  event_slot_reservation&& other) noexcept {
+    if (this != &other) {
+        release();
+        owner_ = std::exchange(other.owner_, nullptr);
+    }
+    return *this;
+}
+
+void scheduler::event_slot_reservation::release() noexcept {
+    if (owner_ == nullptr) {
+        return;
+    }
+    auto* owner = std::exchange(owner_, nullptr);
+    owner->release_reserved_event_slot();
+}
+
 scheduler::~scheduler() {
     assert_current();
     if (trace_failed()) {
@@ -376,7 +399,7 @@ scheduler::~scheduler() {
       scheduler_drained_invariant,
       heap_.size() == scheduler_heap_root_index && indices_.size() == 1U
         && sentinel != nullptr && *sentinel == 0U && reserved_event_ids_ == 0
-        && !pumping_ && !discarding_failed_event_,
+        && reserved_event_slots_ == 0 && !pumping_ && !discarding_failed_event_,
       "scheduler destroyed with pending work");
     if (trace_ != nullptr) {
         trace_->detach_scheduler();
@@ -491,10 +514,10 @@ runtime::result<void> scheduler::can_schedule(
           limits_.maximum_deadline().nanoseconds()));
         return runtime::failure(std::move(error));
     }
-    if (pending_events() >= limits_.pending_events()) {
+    if (claimed_event_slots() >= limits_.pending_events()) {
         auto error = scheduler_error(errc::queue_full);
         static_cast<void>(error.add_context(
-          runtime::operation_context_key::items, pending_events()));
+          runtime::operation_context_key::items, claimed_event_slots()));
         static_cast<void>(error.add_context(
           runtime::operation_context_key::limit, limits_.pending_events()));
         return runtime::failure(std::move(error));
@@ -523,6 +546,32 @@ runtime::result<scheduler::event_id_reservation> scheduler::reserve_event_id() {
     }
     ++reserved_event_ids_;
     return event_id_reservation{*this};
+}
+
+runtime::result<scheduler::event_slot_reservation>
+scheduler::reserve_event_slot() {
+    assert_current();
+    if (auto healthy = check_trace_failure(); !healthy) {
+        return runtime::failure(healthy.error());
+    }
+    if (claimed_event_slots() >= limits_.pending_events()) {
+        auto error = scheduler_error(errc::queue_full);
+        static_cast<void>(error.add_context(
+          runtime::operation_context_key::items, claimed_event_slots()));
+        static_cast<void>(error.add_context(
+          runtime::operation_context_key::limit, limits_.pending_events()));
+        return runtime::failure(std::move(error));
+    }
+    if (!event_id_available()) {
+        auto error = scheduler_error(errc::out_of_range);
+        static_cast<void>(error.add_context(
+          runtime::operation_context_key::sequence,
+          std::numeric_limits<std::uint64_t>::max()));
+        return runtime::failure(std::move(error));
+    }
+    ++reserved_event_ids_;
+    ++reserved_event_slots_;
+    return event_slot_reservation{*this};
 }
 
 runtime::result<event_trace::reservation>
@@ -1161,12 +1210,26 @@ bool scheduler::event_id_available() const noexcept {
     return reserved_event_ids_ < remaining;
 }
 
+std::size_t scheduler::claimed_event_slots() const noexcept {
+    return pending_events() + static_cast<std::size_t>(reserved_event_slots_);
+}
+
 void scheduler::release_reserved_event_id() noexcept {
     assert_current();
     KWAQUE_INVARIANT(
       scheduler_reservation_invariant,
       reserved_event_ids_ != 0,
       "scheduler event-id reservation underflow");
+    --reserved_event_ids_;
+}
+
+void scheduler::release_reserved_event_slot() noexcept {
+    assert_current();
+    KWAQUE_INVARIANT(
+      scheduler_reservation_invariant,
+      reserved_event_slots_ != 0 && reserved_event_ids_ != 0,
+      "scheduler event-slot reservation underflow");
+    --reserved_event_slots_;
     --reserved_event_ids_;
 }
 

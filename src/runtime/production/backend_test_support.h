@@ -41,7 +41,8 @@ public:
 
     [[nodiscard]] static bool components_released(const backend& target) {
         return !target.random_ && !target.timer_ && !target.file_system_
-               && !target.network_ && !target.dns_ && !target.dns_options_;
+               && !target.network_ && !target.dns_ && !target.metrics_
+               && !target.dns_options_;
     }
 };
 

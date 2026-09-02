@@ -105,7 +105,7 @@ static_assert(sizeof(kwaque::runtime::network_endpoint) <= 32);
 static_assert(sizeof(kwaque::runtime::fault_object_key) <= 40);
 static_assert(sizeof(kwaque::runtime::fault_request) <= 64);
 static_assert(sizeof(kwaque::runtime::fault_decision) <= 16);
-static_assert(kwaque::runtime::builtin_fault_points.size() == 23);
+static_assert(kwaque::runtime::builtin_fault_points.size() == 27);
 
 TEST(NetworkContractTest, ParsesOnlyCanonicalNumericEndpoints) {
     const auto ipv4 = kwaque::runtime::network_address::try_parse_numeric(
@@ -445,12 +445,67 @@ TEST(FaultContractTest, BuiltinPointTableHasExactLegalActionSets) {
     EXPECT_TRUE(file_close->permitted_actions.contains(
       kwaque::runtime::fault_action::drop_completion));
 
+    const auto* environment_start = kwaque::runtime::descriptor_for(
+      kwaque::runtime::builtin_fault_point::environment_start);
+    ASSERT_NE(environment_start, nullptr);
+    EXPECT_EQ(environment_start->id.value(), 24U);
+    EXPECT_EQ(environment_start->name, "environment_start");
+    EXPECT_TRUE(environment_start->permitted_actions.contains(
+      kwaque::runtime::fault_action::error));
+    EXPECT_TRUE(environment_start->permitted_actions.contains(
+      kwaque::runtime::fault_action::delay));
+    EXPECT_FALSE(environment_start->permitted_actions.contains(
+      kwaque::runtime::fault_action::crash));
+
+    const auto* resource_group_create = kwaque::runtime::descriptor_for(
+      kwaque::runtime::builtin_fault_point::resource_group_create);
+    ASSERT_NE(resource_group_create, nullptr);
+    EXPECT_EQ(resource_group_create->id.value(), 25U);
+    EXPECT_EQ(resource_group_create->name, "resource_group_create");
+    EXPECT_TRUE(resource_group_create->permitted_actions.contains(
+      kwaque::runtime::fault_action::error));
+    EXPECT_FALSE(resource_group_create->permitted_actions.contains(
+      kwaque::runtime::fault_action::delay));
+
+    const auto* queue_admission = kwaque::runtime::descriptor_for(
+      kwaque::runtime::builtin_fault_point::queue_admission);
+    ASSERT_NE(queue_admission, nullptr);
+    EXPECT_EQ(queue_admission->id.value(), 26U);
+    EXPECT_EQ(queue_admission->name, "queue_admission");
+    EXPECT_TRUE(queue_admission->permitted_actions.contains(
+      kwaque::runtime::fault_action::error));
+    EXPECT_TRUE(queue_admission->permitted_actions.contains(
+      kwaque::runtime::fault_action::delay));
+    EXPECT_FALSE(queue_admission->permitted_actions.contains(
+      kwaque::runtime::fault_action::drop_completion));
+
+    const auto* environment_stop = kwaque::runtime::descriptor_for(
+      kwaque::runtime::builtin_fault_point::environment_stop);
+    ASSERT_NE(environment_stop, nullptr);
+    EXPECT_EQ(environment_stop->id.value(), 27U);
+    EXPECT_EQ(environment_stop->name, "environment_stop");
+    EXPECT_TRUE(environment_stop->permitted_actions.contains(
+      kwaque::runtime::fault_action::error));
+    EXPECT_TRUE(environment_stop->permitted_actions.contains(
+      kwaque::runtime::fault_action::delay));
+    EXPECT_FALSE(environment_stop->permitted_actions.contains(
+      kwaque::runtime::fault_action::drop_completion));
+
+    const auto unknown_point = kwaque::runtime::fault_point_id::make(28);
+    ASSERT_TRUE(unknown_point.has_value());
+    EXPECT_EQ(
+      kwaque::runtime::find_builtin_fault_point(*unknown_point), nullptr);
+
     EXPECT_EQ(
       kwaque::runtime::descriptor_for(
         static_cast<kwaque::runtime::builtin_fault_point>(255)),
       nullptr);
 
-    for (const auto& descriptor : kwaque::runtime::builtin_fault_points) {
+    for (std::size_t index = 0;
+         index < kwaque::runtime::builtin_fault_points.size();
+         ++index) {
+        const auto& descriptor = kwaque::runtime::builtin_fault_points[index];
+        EXPECT_EQ(descriptor.id.value(), index + 1U);
         EXPECT_EQ(
           kwaque::runtime::find_builtin_fault_point(descriptor.id),
           &descriptor);

@@ -26,6 +26,7 @@ enum class operation_kind : std::uint8_t {
     scheduler = 9,
     clock = 10,
     trace = 11,
+    observability = 12,
 };
 
 enum class operation_context_key : std::uint8_t {

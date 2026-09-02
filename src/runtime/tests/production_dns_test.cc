@@ -81,6 +81,13 @@ SEASTAR_TEST_CASE(production_dns_preserves_answer_order_ttl_and_split_input) {
 
     const auto stopped = co_await resolver.stop();
     BOOST_REQUIRE(stopped.has_value());
+    BOOST_CHECK(
+      resolver.statistics()
+      == (kwaque::runtime::operation_statistics_snapshot{
+        .active = 0,
+        .accepted = 1,
+        .completed = 1,
+      }));
     co_await std::move(serving);
     listener.abort_accept();
 }

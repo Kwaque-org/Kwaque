@@ -74,9 +74,11 @@ seastar::future<result<void>> timer::sleep_until(
   monotonic_time deadline, seastar::abort_source& caller_abort) {
     owner_.assert_current();
     if (state_ != timer_state::open) {
+        statistics_->reject();
         co_return failure(timer_error(errc::closed));
     }
     if (abort_requested_ || caller_abort.abort_requested()) {
+        statistics_->reject();
         co_return failure(timer_error(errc::aborted));
     }
 
@@ -90,8 +92,10 @@ seastar::future<result<void>> timer::sleep_until(
     const auto duration = native_duration_until(
       deadline, monotonic_clock::now());
     if (!duration) {
+        statistics_->reject();
         co_return failure(duration.error());
     }
+    [[maybe_unused]] auto metric = statistics_->accept();
 
     seastar::abort_source sleep_abort;
     auto caller_subscription = caller_abort.subscribe(

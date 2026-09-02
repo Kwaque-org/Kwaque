@@ -2,6 +2,7 @@
 #define KWAQUE_SRC_RUNTIME_PRODUCTION_TIMER_H_
 
 #include "src/runtime/error.h"
+#include "src/runtime/operation_statistics.h"
 #include "src/runtime/shard_affinity.h"
 #include "src/runtime/time.h"
 #include "src/runtime/timer.h"
@@ -24,7 +25,10 @@ enum class timer_state : std::uint8_t {
 
 class timer final {
 public:
-    timer() noexcept = default;
+    timer() noexcept
+      : statistics_(&local_statistics_) {}
+    explicit timer(operation_statistics& statistics) noexcept
+      : statistics_(&statistics) {}
     ~timer();
 
     timer(const timer&) = delete;
@@ -38,12 +42,18 @@ public:
     [[nodiscard]] seastar::future<result<void>> stop();
 
     [[nodiscard]] timer_state state() const;
+    [[nodiscard]] operation_statistics_snapshot statistics() const noexcept {
+        owner_.assert_current();
+        return statistics_->snapshot();
+    }
     [[nodiscard]] owner_shard owner() const noexcept { return owner_; }
 
 private:
     [[nodiscard]] seastar::future<result<void>> stop_once();
 
     owner_shard owner_;
+    operation_statistics local_statistics_;
+    operation_statistics* statistics_;
     seastar::abort_source owner_abort_;
     seastar::gate waiters_;
     std::optional<seastar::shared_promise<result<void>>> stop_done_;

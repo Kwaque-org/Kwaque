@@ -2,13 +2,17 @@
 #define KWAQUE_SRC_RUNTIME_PRODUCTION_FILE_H_
 
 #include "src/runtime/file.h"
+#include "src/runtime/operation_statistics.h"
 #include "src/runtime/shard_affinity.h"
 
 namespace kwaque::runtime::production {
 
 class file_system final : public shard_affine {
 public:
-    file_system() noexcept = default;
+    file_system() noexcept
+      : statistics_(&local_statistics_) {}
+    explicit file_system(operation_statistics& statistics) noexcept
+      : statistics_(&statistics) {}
 
     file_system(const file_system&) = delete;
     file_system& operator=(const file_system&) = delete;
@@ -29,6 +33,15 @@ public:
     [[nodiscard]] seastar::future<result<void>>
     rename(file_path source, file_path destination);
     [[nodiscard]] seastar::future<result<void>> sync_directory(file_path path);
+
+    [[nodiscard]] operation_statistics_snapshot statistics() const noexcept {
+        assert_current();
+        return statistics_->snapshot();
+    }
+
+private:
+    operation_statistics local_statistics_;
+    operation_statistics* statistics_;
 };
 
 static_assert(kwaque::runtime::file_system_backend<file_system>);

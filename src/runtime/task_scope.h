@@ -12,12 +12,22 @@
 
 #include <concepts>
 #include <cstddef>
+#include <cstdint>
 #include <exception>
 #include <functional>
 #include <type_traits>
 #include <utility>
 
 namespace kwaque::runtime {
+
+struct task_scope_statistics final {
+    std::uint64_t accepted{0};
+    std::uint64_t completed{0};
+    std::uint64_t failed{0};
+    std::uint64_t abort_requests{0};
+
+    bool operator==(const task_scope_statistics&) const = default;
+};
 
 // Owns background work on one shard. Await close() before destroying the
 // owner; close first requests cancellation, then waits for every accepted task.
@@ -50,14 +60,17 @@ public:
               .then_wrapped([this, holder = std::move(*holder)](
                               seastar::future<> completion) mutable noexcept {
                   static_cast<void>(holder);
+                  ++statistics_.completed;
                   try {
                       completion.get();
                   } catch (...) {
+                      ++statistics_.failed;
                       if (!first_failure_) {
                           first_failure_ = std::current_exception();
                       }
                   }
               });
+        ++statistics_.accepted;
         static_cast<void>(tracked);
         return {};
     }
@@ -71,6 +84,7 @@ public:
     // signal.
     [[nodiscard]] bool admission_closed() const;
     [[nodiscard]] std::size_t task_count() const;
+    [[nodiscard]] task_scope_statistics statistics() const;
     [[nodiscard]] seastar::abort_source& abort_source();
 
 private:
@@ -88,6 +102,7 @@ private:
     seastar::gate gate_;
     seastar::shared_promise<> close_done_;
     std::exception_ptr first_failure_;
+    task_scope_statistics statistics_;
     bool closing_{false};
 };
 

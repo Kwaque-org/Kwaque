@@ -15,8 +15,10 @@
 
 #include <array>
 #include <cstddef>
+#include <exception>
 #include <optional>
 #include <stdexcept>
+#include <utility>
 
 namespace kwaque::resource {
 
@@ -116,6 +118,9 @@ private:
         return index;
     }
     void assert_ready() const;
+    template<typename Checkpoint>
+    [[nodiscard]] seastar::future<> start_with(Checkpoint checkpoint);
+    void prepare_start();
     void register_metrics();
     void rollback_start();
     [[nodiscard]] seastar::future<> stop_once();
@@ -124,12 +129,42 @@ private:
     std::array<std::optional<seastar::semaphore>, workload_class_count>
       memory_admissions_{};
     seastar::gate work_;
-    seastar::metrics::metric_groups metrics_;
+    std::optional<seastar::metrics::metric_groups> metrics_;
     seastar::shared_promise<> stop_done_;
     resource_manager_state state_{resource_manager_state::constructed};
-    std::optional<std::size_t> fail_before_start_point_;
     bool registry_lease_acquired_{false};
 };
+
+template<typename Checkpoint>
+seastar::future<> resource_manager::start_with(Checkpoint checkpoint) {
+    prepare_start();
+    try {
+        if (!handles_.try_acquire_manager_lease()) {
+            throw std::logic_error("resource handles are no longer valid");
+        }
+        registry_lease_acquired_ = true;
+        for (const auto classification : all_workload_classes) {
+            const auto index = workload_index(classification);
+            checkpoint(index);
+            const auto capacity = handles_.config().budget(classification);
+            if (capacity.value() > seastar::semaphore::max_counter()) {
+                throw std::invalid_argument(
+                  "workload memory budget exceeds semaphore capacity");
+            }
+            memory_admissions_[index].emplace(capacity.value());
+        }
+        register_metrics();
+        state_ = resource_manager_state::started;
+        return seastar::make_ready_future<>();
+    } catch (...) {
+        auto failure = std::current_exception();
+        try {
+            rollback_start();
+        } catch (...) {
+        }
+        return seastar::make_exception_future<>(std::move(failure));
+    }
+}
 
 inline seastar::semaphore& workload_handle::memory_admission() const {
     assert_live();

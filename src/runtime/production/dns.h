@@ -2,6 +2,7 @@
 #define KWAQUE_SRC_RUNTIME_PRODUCTION_DNS_H_
 
 #include "src/runtime/dns.h"
+#include "src/runtime/operation_statistics.h"
 #include "src/runtime/shard_affinity.h"
 
 #include <seastar/core/future.hh>
@@ -25,6 +26,11 @@ public:
     explicit resolver(dns_config config = {});
     resolver(
       dns_config config, const seastar::net::dns_resolver::options& options);
+    resolver(operation_statistics& statistics, dns_config config = {});
+    resolver(
+      operation_statistics& statistics,
+      dns_config config,
+      const seastar::net::dns_resolver::options& options);
     ~resolver();
 
     resolver(const resolver&) = delete;
@@ -40,6 +46,10 @@ public:
     [[nodiscard]] resolver_state state() const;
     [[nodiscard]] std::size_t waiters() const;
     [[nodiscard]] bool active() const;
+    [[nodiscard]] operation_statistics_snapshot statistics() const noexcept {
+        assert_current();
+        return statistics_->snapshot();
+    }
     [[nodiscard]] owner_shard owner() const noexcept {
         return shard_affine::owner();
     }
@@ -51,6 +61,8 @@ private:
       seastar::gate::holder holder);
     [[nodiscard]] seastar::future<result<void>> stop_once();
 
+    operation_statistics local_statistics_;
+    operation_statistics* statistics_;
     seastar::net::dns_resolver native_;
     dns_config config_;
     dns_admission admission_;

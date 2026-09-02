@@ -1,42 +1,54 @@
 #include "src/admin/admin_state.h"
 
+#include <stdexcept>
 #include <vector>
 
 namespace kwaque::admin {
 
 void admin_state::register_metrics() {
     assert_current();
+    if (metrics_) {
+        throw std::logic_error("admin metrics are already registered");
+    }
     namespace metrics = seastar::metrics;
-    std::vector<metrics::metric_definition> definitions;
-    if (owner().value() == 0) {
-        definitions.emplace_back(
-          metrics::make_gauge(
-            "process_readiness",
-            [this] { return ready() ? 1U : 0U; },
-            metrics::description("Whether the broker is ready for traffic")));
-        definitions.emplace_back(
-          metrics::make_gauge(
-            "shard_count",
-            [this] { return shard_count(); },
-            metrics::description("Configured reactor shard count")));
-        definitions.emplace_back(
-          metrics::make_gauge(
-            "startup_duration_seconds",
-            [this] { return startup_duration_seconds(); },
-            metrics::description("Time from application start to readiness")));
+    try {
+        metrics_.emplace();
+        std::vector<metrics::metric_definition> definitions;
+        if (owner().value() == 0) {
+            definitions.emplace_back(
+              metrics::make_gauge(
+                "process_readiness",
+                [this] { return ready() ? 1U : 0U; },
+                metrics::description(
+                  "Whether the broker is ready for traffic")));
+            definitions.emplace_back(
+              metrics::make_gauge(
+                "shard_count",
+                [this] { return shard_count(); },
+                metrics::description("Configured reactor shard count")));
+            definitions.emplace_back(
+              metrics::make_gauge(
+                "startup_duration_seconds",
+                [this] { return startup_duration_seconds(); },
+                metrics::description(
+                  "Time from application start to readiness")));
+            definitions.emplace_back(
+              metrics::make_counter(
+                "shutdown_total",
+                [this] { return shutdown_count(); },
+                metrics::description("Number of initiated broker shutdowns")));
+        }
         definitions.emplace_back(
           metrics::make_counter(
-            "shutdown_total",
-            [this] { return shutdown_count(); },
-            metrics::description("Number of initiated broker shutdowns")));
+            "http_requests_total",
+            [this] { return request_count(); },
+            metrics::description("Administrative HTTP requests"))
+            .aggregate(std::vector<metrics::label>{metrics::shard_label}));
+        metrics_->add_group("broker", definitions);
+    } catch (...) {
+        metrics_.reset();
+        throw;
     }
-    definitions.emplace_back(
-      metrics::make_counter(
-        "http_requests_total",
-        [this] { return request_count(); },
-        metrics::description("Administrative HTTP requests"))
-        .aggregate(std::vector<metrics::label>{metrics::shard_label}));
-    metrics_.add_group("broker", definitions);
 }
 
 void admin_state::listener_started(unsigned shard_count) {
@@ -64,7 +76,7 @@ void admin_state::begin_shutdown() {
 seastar::future<> admin_state::stop() {
     assert_current();
     lifecycle_ = lifecycle::stopped;
-    metrics_.clear();
+    metrics_.reset();
     return seastar::make_ready_future<>();
 }
 

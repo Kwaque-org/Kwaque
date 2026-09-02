@@ -113,13 +113,15 @@ fault_schedule_limits::make(std::uint32_t rules) noexcept {
 }
 
 prepared_fault_evaluation::prepared_fault_evaluation(
+  fault_schedule& owner,
   runtime::fault_decision decision,
   bool applied,
   trace_entry entry,
   event_trace::reservation reservation,
   std::uint64_t master_seed,
   std::uint64_t next_draw) noexcept
-  : decision_(decision)
+  : owner_(&owner)
+  , decision_(decision)
   , entry_(entry)
   , reservation_(std::move(reservation))
   , matched_(true)
@@ -131,7 +133,8 @@ prepared_fault_evaluation::prepared_fault_evaluation(
 
 prepared_fault_evaluation::prepared_fault_evaluation(
   prepared_fault_evaluation&& other) noexcept
-  : decision_(other.decision_)
+  : owner_(std::exchange(other.owner_, nullptr))
+  , decision_(other.decision_)
   , entry_(other.entry_)
   , reservation_(std::move(other.reservation_))
   , matched_(std::exchange(other.matched_, false))
@@ -145,6 +148,7 @@ prepared_fault_evaluation::prepared_fault_evaluation(
 prepared_fault_evaluation& prepared_fault_evaluation::operator=(
   prepared_fault_evaluation&& other) noexcept {
     if (this != &other) {
+        owner_ = std::exchange(other.owner_, nullptr);
         decision_ = other.decision_;
         entry_ = other.entry_;
         reservation_ = std::move(other.reservation_);
@@ -191,6 +195,9 @@ prepared_fault_evaluation::commit() noexcept {
     }
     if (auto observed = reservation_.observe(entry_); !observed) {
         return runtime::failure(observed.error());
+    }
+    if (applied_) {
+        ++owner_->applied_decisions_;
     }
     return preview();
 }
@@ -413,6 +420,22 @@ fault_schedule::prepare(const runtime::fault_request& request) noexcept {
         return runtime::failure(descriptor.error());
     }
     const auto* rule = find_rule(request, (**descriptor).point);
+    const auto selected = rule != nullptr ? select(*rule, request.occurrence)
+                                          : selector_result{};
+    if (
+      rule != nullptr && selected.applied
+      && rule->decision().action() == runtime::fault_action::delay) {
+        const auto deadline = scheduler_->now().checked_add(
+          *rule->decision().delay());
+        if (!deadline || *deadline > scheduler_->limits().maximum_deadline()) {
+            auto error = fault_error(errc::out_of_range);
+            static_cast<void>(error.add_context(
+              runtime::operation_context_key::limit,
+              scheduler_->limits().maximum_deadline().nanoseconds()));
+            return runtime::failure(std::move(error));
+        }
+    }
+    ++evaluations_;
     if (rule == nullptr) {
         return prepared_fault_evaluation{};
     }
@@ -420,9 +443,9 @@ fault_schedule::prepare(const runtime::fault_request& request) noexcept {
     if (!reservation) {
         return runtime::failure(reservation.error());
     }
-    const auto selected = select(*rule, request.occurrence);
     const auto outcome = selected.applied ? selector_applied : selector_skipped;
     return prepared_fault_evaluation{
+      *this,
       rule->decision(),
       selected.applied,
       trace_entry{

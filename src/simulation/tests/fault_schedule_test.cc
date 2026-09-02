@@ -198,6 +198,41 @@ kwaque::simulation::trace_entry evaluate_with_rule_noise(bool add_noise) {
     return environment.trace.entries()[0];
 }
 
+seastar::chunked_vector<fault_rule> lifecycle_rules() {
+    seastar::chunked_vector<fault_rule> rules;
+    rules.push_back(make_rule(
+      101,
+      builtin_fault_point::environment_start,
+      std::nullopt,
+      1,
+      1,
+      fault_selector::once(),
+      fault_decision::make_delay(kwaque::runtime::monotonic_duration{7})));
+    rules.push_back(make_rule(
+      102,
+      builtin_fault_point::resource_group_create,
+      std::nullopt,
+      1,
+      1,
+      fault_selector::once()));
+    rules.push_back(make_rule(
+      103,
+      builtin_fault_point::queue_admission,
+      std::nullopt,
+      1,
+      1,
+      fault_selector::once(),
+      fault_decision::make_delay(kwaque::runtime::monotonic_duration{11})));
+    rules.push_back(make_rule(
+      104,
+      builtin_fault_point::environment_stop,
+      std::nullopt,
+      1,
+      1,
+      fault_selector::once()));
+    return rules;
+}
+
 } // namespace
 
 SEASTAR_TEST_CASE(fault_rule_validation_rejects_ambiguous_schedules) {
@@ -360,6 +395,106 @@ SEASTAR_TEST_CASE(fault_schedule_accepts_its_absolute_rule_limit) {
     co_return;
 }
 
+SEASTAR_TEST_CASE(
+  lifecycle_and_admission_fault_points_capture_and_replay_exactly) {
+    const std::array points{
+      builtin_fault_point::environment_start,
+      builtin_fault_point::resource_group_create,
+      builtin_fault_point::queue_admission,
+      builtin_fault_point::environment_stop,
+    };
+    const std::array actions{
+      fault_action::delay,
+      fault_action::error,
+      fault_action::delay,
+      fault_action::error,
+    };
+    const std::array delay_nanoseconds{7U, 0U, 11U, 0U};
+    const std::array rule_ids{101U, 102U, 103U, 104U};
+
+    fixture captured;
+    auto capture_schedule = captured.schedule(lifecycle_rules());
+    for (std::size_t index = 0; index < points.size(); ++index) {
+        const auto outcome = capture_schedule->evaluate(
+          request(points[index], 1));
+        BOOST_REQUIRE(outcome.has_value());
+        BOOST_CHECK(outcome->action() == actions[index]);
+        if (actions[index] == fault_action::delay) {
+            BOOST_REQUIRE(outcome->delay().has_value());
+            BOOST_CHECK(
+              outcome->delay()->nanoseconds() == delay_nanoseconds[index]);
+        } else {
+            BOOST_CHECK(!outcome->delay().has_value());
+        }
+    }
+    BOOST_REQUIRE(captured.trace.entries().size() == points.size());
+    for (std::size_t index = 0; index < points.size(); ++index) {
+        const auto& entry = captured.trace.entries()[index];
+        BOOST_CHECK(entry.action == trace_action::fault_evaluated);
+        BOOST_CHECK(entry.kind == trace_event_kind::fault);
+        BOOST_CHECK(
+          entry.domain
+          == kwaque::runtime::descriptor_for(points[index])->id.value());
+        BOOST_CHECK(entry.stable_id == rule_ids[index]);
+        BOOST_CHECK(entry.coordinate_a == 1U);
+        BOOST_CHECK(
+          (entry.result & UINT32_C(0xff))
+          == static_cast<std::uint8_t>(actions[index]));
+    }
+
+    auto encoded = captured.trace.encode();
+    BOOST_REQUIRE(encoded.has_value());
+    auto decoded = event_trace::decode(*encoded, captured.trace_budget);
+    BOOST_REQUIRE(decoded.has_value());
+    BOOST_CHECK(
+      decoded->header.schema_version
+      == kwaque::simulation::event_trace_schema_version);
+    auto replay_trace = event_trace::replay(
+      captured.trace.header(), captured.trace_budget, std::move(*decoded));
+    BOOST_REQUIRE(replay_trace.has_value());
+    scheduler replay_events{captured.scheduler_budget, replay_trace->get()};
+    auto replay_schedule = fault_schedule::make(
+      replay_events, **replay_trace, master_seed, lifecycle_rules());
+    BOOST_REQUIRE(replay_schedule.has_value());
+    for (std::size_t index = 0; index < points.size(); ++index) {
+        const auto outcome
+          = (*replay_schedule)->evaluate(request(points[index], 1));
+        BOOST_REQUIRE(outcome.has_value());
+        BOOST_CHECK(outcome->action() == actions[index]);
+        if (actions[index] == fault_action::delay) {
+            BOOST_REQUIRE(outcome->delay().has_value());
+            BOOST_CHECK(
+              outcome->delay()->nanoseconds() == delay_nanoseconds[index]);
+        }
+    }
+    BOOST_CHECK((*replay_trace)->finish_replay().has_value());
+
+    const auto rule_id = fault_rule_id::make(201);
+    const auto occurrence = fault_occurrence::make(1);
+    BOOST_REQUIRE(rule_id.has_value());
+    BOOST_REQUIRE(occurrence.has_value());
+    BOOST_CHECK(
+      !fault_rule::make(
+         *rule_id,
+         builtin_fault_point::resource_group_create,
+         std::nullopt,
+         *occurrence,
+         *occurrence,
+         fault_selector::once(),
+         fault_decision::make_delay(kwaque::runtime::monotonic_duration{1}))
+         .has_value());
+    BOOST_CHECK(!fault_rule::make(
+                   *rule_id,
+                   builtin_fault_point::environment_start,
+                   std::nullopt,
+                   *occurrence,
+                   *occurrence,
+                   fault_selector::once(),
+                   fault_decision::make_crash())
+                   .has_value());
+    co_return;
+}
+
 SEASTAR_TEST_CASE(fault_selectors_have_exact_window_and_draw_semantics) {
     const auto ratio = kwaque::runtime::probability_ratio::make(2, 5);
     const auto zero = kwaque::runtime::probability_ratio::make(0, 7);
@@ -514,6 +649,8 @@ SEASTAR_TEST_CASE(fault_preparation_rolls_back_and_commits_exactly_once) {
         BOOST_CHECK(prepared->applied());
         BOOST_CHECK(prepared->preview().action() == fault_action::crash);
     }
+    BOOST_CHECK_EQUAL(schedule->evaluations(), 1U);
+    BOOST_CHECK_EQUAL(schedule->applied_decisions(), 0U);
     BOOST_CHECK(environment.trace.entries().empty());
     {
         auto full_capacity = environment.trace.reserve(
@@ -525,6 +662,8 @@ SEASTAR_TEST_CASE(fault_preparation_rolls_back_and_commits_exactly_once) {
 
     auto prepared = schedule->prepare(selected);
     BOOST_REQUIRE(prepared.has_value());
+    BOOST_CHECK_EQUAL(schedule->evaluations(), 2U);
+    BOOST_CHECK_EQUAL(schedule->applied_decisions(), 0U);
     auto moved = std::move(*prepared);
     // The moved-from token must be inert and reject a second ownership action.
     // NOLINTNEXTLINE(bugprone-use-after-move)
@@ -532,7 +671,9 @@ SEASTAR_TEST_CASE(fault_preparation_rolls_back_and_commits_exactly_once) {
     const auto committed = moved.commit();
     BOOST_REQUIRE(committed.has_value());
     BOOST_CHECK(committed->action() == fault_action::crash);
+    BOOST_CHECK_EQUAL(schedule->applied_decisions(), 1U);
     BOOST_CHECK(!moved.commit().has_value());
+    BOOST_CHECK_EQUAL(schedule->applied_decisions(), 1U);
     BOOST_CHECK(environment.trace.entries().size() == 1U);
     const auto& entry = environment.trace.entries()[0];
     BOOST_CHECK(entry.action == trace_action::fault_evaluated);

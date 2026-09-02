@@ -1,4 +1,5 @@
 #include "src/simulation/bandwidth.h"
+#include "src/simulation/deterministic_random.h"
 #include "src/simulation/tests/network_oracle.h"
 
 #include <gtest/gtest.h>
@@ -25,13 +26,6 @@ using kwaque::simulation::testing::oracle_script;
 using kwaque::simulation::testing::oracle_step;
 using kwaque::simulation::testing::oracle_step_kind;
 using kwaque::simulation::testing::solve_bandwidth_oracle;
-
-std::uint64_t random_word(std::uint64_t& state) {
-    state ^= state << 13U;
-    state ^= state >> 7U;
-    state ^= state << 17U;
-    return state;
-}
 
 bandwidth_capacity actual_capacity(oracle_capacity value) {
     return value.is_unlimited() ? bandwidth_capacity::unlimited()
@@ -88,15 +82,18 @@ void reconcile(std::span<const oracle_flow> flows) {
 
 TEST(NetworkOracleTest, ProgressiveFillReconcilesHundredsOfSeededScenarios) {
     for (std::uint64_t seed = 1; seed <= 300; ++seed) {
-        std::uint64_t random = seed;
-        const auto flow_count = 2U + random_word(random) % 7U;
+        auto random = kwaque::simulation::deterministic_random{seed}.stream(
+          kwaque::simulation::random_domain::network_decision,
+          UINT64_C(0x42414e4457494454));
+        ASSERT_TRUE(random.has_value());
+        auto next = [&] { return random->next_u64(); };
+        const auto flow_count = 2U + next() % 7U;
         std::array<oracle_capacity, 4> capacities{
-          oracle_capacity::finite(96U * (1U + random_word(random) % 20U)),
-          oracle_capacity::finite(96U * (1U + random_word(random) % 20U)),
-          oracle_capacity::finite(96U * (1U + random_word(random) % 20U)),
-          random_word(random) % 5U == 0
-            ? oracle_capacity::unlimited()
-            : oracle_capacity::finite(96U * (1U + random_word(random) % 20U)),
+          oracle_capacity::finite(96U * (1U + next() % 20U)),
+          oracle_capacity::finite(96U * (1U + next() % 20U)),
+          oracle_capacity::finite(96U * (1U + next() % 20U)),
+          next() % 5U == 0 ? oracle_capacity::unlimited()
+                           : oracle_capacity::finite(96U * (1U + next() % 20U)),
         };
         if (seed % 29U == 0) {
             capacities[2] = oracle_capacity::finite(0);
@@ -106,7 +103,7 @@ TEST(NetworkOracleTest, ProgressiveFillReconcilesHundredsOfSeededScenarios) {
         for (std::uint64_t index = 0; index < flow_count; ++index) {
             oracle_flow flow{
               .id = 100U + index,
-              .bytes = 1U + random_word(random) % 4'096U,
+              .bytes = 1U + next() % 4'096U,
             };
             flow.constraints[flow.constraint_count++] = oracle_constraint{
               .resource = 1, .capacity = capacities[0]};
@@ -184,7 +181,7 @@ TEST(NetworkOracleTest, GeneratorIsCanonicalBoundedAndCoversEverySurface) {
     }
 }
 
-TEST(NetworkOracleTest, DenseModelReconcilesHistoriesAndDetectsMutation) {
+TEST(NetworkOracleTest, DenseModelIsDeterministicAndDetectsMutation) {
     dense_network_oracle two_endpoints{2};
     ASSERT_TRUE(
       two_endpoints
@@ -240,6 +237,54 @@ TEST(NetworkOracleTest, DenseModelReconcilesHistoriesAndDetectsMutation) {
         static_cast<void>(mutated.apply(changed));
     }
     EXPECT_NE(expected.snapshot(), mutated.snapshot());
+}
+
+TEST(NetworkOracleTest, DenseModelDigestIncludesParkedPacketPayload) {
+    dense_network_oracle first;
+    dense_network_oracle second;
+    const std::array setup{
+      oracle_step{.kind = oracle_step_kind::bind_exact, .source = 1, .port = 9},
+      oracle_step{.kind = oracle_step_kind::connect_implicit, .target = 1},
+      oracle_step{.kind = oracle_step_kind::clog, .target = 1},
+    };
+    for (const auto& step : setup) {
+        ASSERT_TRUE(first.apply(step).has_value());
+        ASSERT_TRUE(second.apply(step).has_value());
+    }
+
+    ASSERT_TRUE(first
+                  .apply(
+                    oracle_step{
+                      .kind = oracle_step_kind::write,
+                      .target = 1,
+                      .value = 3,
+                      .pattern = static_cast<std::uint8_t>('x'),
+                    })
+                  .has_value());
+    ASSERT_TRUE(second
+                  .apply(
+                    oracle_step{
+                      .kind = oracle_step_kind::write,
+                      .target = 1,
+                      .value = 3,
+                      .pattern = static_cast<std::uint8_t>('y'),
+                    })
+                  .has_value());
+
+    const auto first_parked = first.snapshot();
+    const auto second_parked = second.snapshot();
+    EXPECT_TRUE(first_parked.visible[1].empty());
+    EXPECT_TRUE(second_parked.visible[1].empty());
+    EXPECT_EQ(first_parked.live_packets, second_parked.live_packets);
+    EXPECT_EQ(first_parked.logical_bytes, second_parked.logical_bytes);
+    EXPECT_EQ(first_parked.tombstones, second_parked.tombstones);
+    EXPECT_NE(first_parked.digest, second_parked.digest);
+
+    const oracle_step release{.kind = oracle_step_kind::unclog, .target = 1};
+    ASSERT_TRUE(first.apply(release).has_value());
+    ASSERT_TRUE(second.apply(release).has_value());
+    EXPECT_EQ(first.snapshot().visible[1], "xxx");
+    EXPECT_EQ(second.snapshot().visible[1], "yyy");
 }
 
 TEST(NetworkOracleTest, DirectedSwizzleClogFiltersAtActualDelivery) {

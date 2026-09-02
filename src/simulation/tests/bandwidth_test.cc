@@ -152,6 +152,136 @@ TEST(bandwidth_test, freezes_multi_resource_bottlenecks_in_order) {
     EXPECT_TRUE(allocation(*planner, 2).rate.finite_value().equals(49'000, 1));
 }
 
+TEST(bandwidth_test, propagates_an_ingress_bottleneck_upstream) {
+    auto made = bandwidth_planner::make(2);
+    ASSERT_TRUE(made.has_value());
+    auto planner = std::move(*made);
+    const auto source = bandwidth_resource_key::numeric(1, 1);
+    ASSERT_TRUE(
+      planner
+        ->add_flow(
+          bandwidth_flow{
+            .id = 1,
+            .constraints = {
+              bandwidth_constraint{
+                .resource = source,
+                .capacity = bandwidth_capacity::finite(1'000'000)},
+              bandwidth_constraint{
+                .resource = bandwidth_resource_key::numeric(2, 10),
+                .capacity = bandwidth_capacity::finite(1'000)},
+            },
+            .constraint_count = 2,
+          })
+        .has_value());
+    ASSERT_TRUE(
+      planner
+        ->add_flow(
+          bandwidth_flow{
+            .id = 2,
+            .constraints = {
+              bandwidth_constraint{
+                .resource = source,
+                .capacity = bandwidth_capacity::finite(1'000'000)},
+              bandwidth_constraint{
+                .resource = bandwidth_resource_key::numeric(2, 11),
+                .capacity = bandwidth_capacity::finite(500'000)},
+            },
+            .constraint_count = 2,
+          })
+        .has_value());
+    ASSERT_TRUE(planner->solve().has_value());
+    EXPECT_TRUE(allocation(*planner, 1).rate.finite_value().equals(1'000, 1));
+    EXPECT_TRUE(allocation(*planner, 2).rate.finite_value().equals(500'000, 1));
+}
+
+TEST(bandwidth_test, preserves_three_peer_progressive_fill_residuals) {
+    auto made = bandwidth_planner::make(5);
+    ASSERT_TRUE(made.has_value());
+    auto planner = std::move(*made);
+    const auto source_a = bandwidth_resource_key::numeric(1, 1);
+    const auto source_b = bandwidth_resource_key::numeric(1, 2);
+    const auto source_c = bandwidth_resource_key::numeric(1, 3);
+    const auto target_b = bandwidth_resource_key::numeric(3, 2);
+    const auto target_c = bandwidth_resource_key::numeric(3, 3);
+    const std::array inputs{
+      bandwidth_flow{
+        .id = 1,
+        .constraints = {
+          bandwidth_constraint{source_a, bandwidth_capacity::finite(1'000'000)},
+          bandwidth_constraint{target_b, bandwidth_capacity::finite(250'000)},
+        },
+        .constraint_count = 2,
+      },
+      bandwidth_flow{
+        .id = 2,
+        .constraints = {
+          bandwidth_constraint{source_a, bandwidth_capacity::finite(1'000'000)},
+          bandwidth_constraint{target_b, bandwidth_capacity::finite(250'000)},
+        },
+        .constraint_count = 2,
+      },
+      bandwidth_flow{
+        .id = 3,
+        .constraints = {
+          bandwidth_constraint{source_b, bandwidth_capacity::finite(750'000)},
+          bandwidth_constraint{target_c, bandwidth_capacity::finite(1'000'000)},
+        },
+        .constraint_count = 2,
+      },
+      bandwidth_flow{
+        .id = 4,
+        .constraints = {
+          bandwidth_constraint{source_a, bandwidth_capacity::finite(1'000'000)},
+          bandwidth_constraint{target_c, bandwidth_capacity::finite(1'000'000)},
+        },
+        .constraint_count = 2,
+      },
+      bandwidth_flow{
+        .id = 5,
+        .constraints = {
+          bandwidth_constraint{source_c, bandwidth_capacity::finite(100'000)},
+          bandwidth_constraint{target_b, bandwidth_capacity::finite(250'000)},
+        },
+        .constraint_count = 2,
+      },
+    };
+    for (const auto& input : inputs) {
+        ASSERT_TRUE(planner->add_flow(input).has_value());
+    }
+    ASSERT_TRUE(planner->solve().has_value());
+    EXPECT_TRUE(allocation(*planner, 1).rate.finite_value().equals(250'000, 3));
+    EXPECT_TRUE(allocation(*planner, 2).rate.finite_value().equals(250'000, 3));
+    EXPECT_TRUE(allocation(*planner, 3).rate.finite_value().equals(500'000, 1));
+    EXPECT_TRUE(allocation(*planner, 4).rate.finite_value().equals(500'000, 1));
+    EXPECT_TRUE(allocation(*planner, 5).rate.finite_value().equals(250'000, 3));
+}
+
+TEST(bandwidth_test, unlimited_resources_create_no_membership_state) {
+    auto made = bandwidth_planner::make(1);
+    ASSERT_TRUE(made.has_value());
+    auto planner = std::move(*made);
+    ASSERT_TRUE(
+      planner
+        ->add_flow(
+          bandwidth_flow{
+            .id = 99,
+            .constraints = {
+              bandwidth_constraint{
+                .resource = bandwidth_resource_key::numeric(1, 1),
+                .capacity = bandwidth_capacity::unlimited()},
+              bandwidth_constraint{
+                .resource = bandwidth_resource_key::numeric(3, 2),
+                .capacity = bandwidth_capacity::unlimited()},
+            },
+            .constraint_count = 2,
+          })
+        .has_value());
+    ASSERT_TRUE(planner->solve().has_value());
+    EXPECT_EQ(planner->resource_count(), 0U);
+    EXPECT_EQ(planner->membership_count(), 0U);
+    EXPECT_TRUE(allocation(*planner, 99).rate.is_unlimited());
+}
+
 TEST(bandwidth_test, solves_absolute_flow_and_membership_bound) {
     auto made = bandwidth_planner::make(
       kwaque::simulation::maximum_bandwidth_flows);
@@ -197,6 +327,15 @@ TEST(bandwidth_test, preserves_fractional_progress_and_ceil_duration) {
     ASSERT_TRUE(duration.has_value());
     ASSERT_TRUE(duration->has_value());
     EXPECT_EQ((*duration)->nanoseconds(), 1'500'000'000U);
+
+    const auto first = kwaque::simulation::bandwidth_transfer(
+      rate,
+      kwaque::runtime::monotonic_duration{500'000'000},
+      bandwidth_fraction::whole(10));
+    EXPECT_TRUE(first.equals(39, 4));
+    const auto second = kwaque::simulation::bandwidth_transfer(
+      rate, kwaque::runtime::monotonic_duration{1'500'000'000}, first);
+    EXPECT_TRUE(second.equals(9, 1));
 }
 
 TEST(bandwidth_test, distinguishes_zero_and_unlimited_rates) {
@@ -236,6 +375,33 @@ TEST(bandwidth_test, matches_representable_bit_rate_vectors) {
         ASSERT_TRUE(duration.has_value());
         ASSERT_TRUE(duration->has_value());
         EXPECT_EQ((*duration)->nanoseconds(), expected_ns);
+    }
+
+    constexpr std::array rates{
+      UINT64_C(1'000'000),
+      UINT64_C(10'000'000),
+      UINT64_C(100'000'000),
+      UINT64_C(1'000'000'000),
+      UINT64_C(10'000'000'000),
+      UINT64_C(25'000'000'000),
+      UINT64_C(40'000'000'000),
+      UINT64_C(100'000'000'000),
+      UINT64_C(200'000'000'000),
+      UINT64_C(400'000'000'000),
+    };
+    for (std::uint64_t bytes = 0; bytes <= 64; ++bytes) {
+        for (const auto bits_per_second : rates) {
+            const auto duration
+              = kwaque::simulation::bit_rate_transmission_duration(
+                kwaque::byte_count{bytes}, bits_per_second);
+            ASSERT_TRUE(duration.has_value());
+            ASSERT_TRUE(duration->has_value());
+            const auto numerator = bytes * UINT64_C(8'000'000'000);
+            const auto expected = numerator == 0
+                                    ? 0
+                                    : 1U + (numerator - 1U) / bits_per_second;
+            EXPECT_EQ((*duration)->nanoseconds(), expected);
+        }
     }
 
     const auto arbitrary = kwaque::simulation::bytes_per_second_from_bits(10);

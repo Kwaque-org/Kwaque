@@ -52,6 +52,23 @@ kwaque_cc_seastar_test(
 )
 
 kwaque_cc_seastar_test(
+    name = "resource_metrics_test",
+    srcs = ["resource_metrics_test.cc"],
+    cpu = 1,
+    memory = "192MiB",
+    deps = [
+        "//src/base",
+        "//src/base:metric_schema",
+        "//src/resource:bounded_work_queue",
+        "//src/resource:bounded_work_queue_metrics",
+        "//src/resource:resource_config",
+        "//src/resource:resource_manager",
+        "//src/resource:resource_registry",
+        "//src/resource:workload_class",
+    ],
+)
+
+kwaque_cc_seastar_test(
     name = "resource_manager_affinity_test",
     srcs = ["resource_manager_affinity_test.cc"],
     cpu = 2,

@@ -28,6 +28,7 @@ task_scope::~task_scope() {
 
 void task_scope::request_abort_unchecked() noexcept {
     if (!abort_source_.abort_requested()) {
+        ++statistics_.abort_requests;
         abort_source_.request_abort();
     }
 }
@@ -79,6 +80,11 @@ bool task_scope::admission_closed() const {
 std::size_t task_scope::task_count() const {
     assert_current();
     return gate_.get_count();
+}
+
+task_scope_statistics task_scope::statistics() const {
+    assert_current();
+    return statistics_;
 }
 
 seastar::abort_source& task_scope::abort_source() {

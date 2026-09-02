@@ -127,8 +127,10 @@ seastar::future<result<file>>
 file_system::open(file_path path, file_open_options options) {
     assert_current();
     if (auto valid = options.validate(); !valid) {
+        statistics_->reject();
         co_return failure(valid.error());
     }
+    [[maybe_unused]] auto metric = statistics_->accept();
     try {
         seastar::file_open_options native_options;
         native_options.create_permissions
@@ -136,7 +138,7 @@ file_system::open(file_path path, file_open_options options) {
         native_options.durable = true;
         auto native = co_await seastar::open_file_dma(
           path.value(), native_open_flags(options), native_options);
-        co_return file{std::move(native)};
+        co_return file{std::move(native), file_io_limits{}, statistics_};
     } catch (const std::bad_alloc&) {
         throw;
     } catch (...) {
@@ -147,6 +149,7 @@ file_system::open(file_path path, file_open_options options) {
 
 seastar::future<result<bool>> file_system::exists(file_path path) {
     assert_current();
+    [[maybe_unused]] auto metric = statistics_->accept();
     try {
         co_return co_await seastar::file_exists(path.value());
     } catch (const std::bad_alloc&) {
@@ -159,6 +162,7 @@ seastar::future<result<bool>> file_system::exists(file_path path) {
 
 seastar::future<result<file_status>> file_system::stat(file_path path) {
     assert_current();
+    [[maybe_unused]] auto metric = statistics_->accept();
     try {
         const auto native = co_await seastar::file_stat(
           path.value(), seastar::follow_symlink::no);
@@ -179,8 +183,10 @@ seastar::future<result<directory_listing>>
 file_system::list(file_path path, directory_listing_limits limits) {
     assert_current();
     if (auto valid = limits.validate(); !valid) {
+        statistics_->reject();
         co_return failure(valid.error());
     }
+    [[maybe_unused]] auto metric = statistics_->accept();
 
     seastar::file directory;
     seastar::chunked_vector<directory_entry> entries;
@@ -268,6 +274,7 @@ file_system::list(file_path path, directory_listing_limits limits) {
 
 seastar::future<result<void>> file_system::create_directories(file_path path) {
     assert_current();
+    [[maybe_unused]] auto metric = statistics_->accept();
     try {
         co_await seastar::recursive_touch_directory(path.value());
         co_return result<void>{};
@@ -281,6 +288,7 @@ seastar::future<result<void>> file_system::create_directories(file_path path) {
 
 seastar::future<result<void>> file_system::remove_file(file_path path) {
     assert_current();
+    [[maybe_unused]] auto metric = statistics_->accept();
     try {
         co_await seastar::remove_file(path.value());
         co_return result<void>{};
@@ -299,6 +307,7 @@ seastar::future<result<void>> file_system::remove_directory(file_path path) {
 seastar::future<result<void>>
 file_system::rename(file_path source, file_path destination) {
     assert_current();
+    [[maybe_unused]] auto metric = statistics_->accept();
     try {
         co_await seastar::rename_file(source.value(), destination.value());
         co_return result<void>{};
@@ -312,6 +321,7 @@ file_system::rename(file_path source, file_path destination) {
 
 seastar::future<result<void>> file_system::sync_directory(file_path path) {
     assert_current();
+    [[maybe_unused]] auto metric = statistics_->accept();
     try {
         co_await seastar::sync_directory(path.value());
         co_return result<void>{};

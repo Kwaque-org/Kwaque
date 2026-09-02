@@ -137,10 +137,10 @@ struct fake_file_system_config final {
     std::uint32_t maximum_pending_operations{96};
     byte_count maximum_pending_bytes{std::uint64_t{128} * 1024U * 1024U};
     runtime::monotonic_duration base_latency{1};
-    runtime::monotonic_duration read_latency_min{};
-    runtime::monotonic_duration read_latency_mean{};
-    runtime::monotonic_duration write_latency_min{};
-    runtime::monotonic_duration write_latency_mean{};
+    runtime::monotonic_duration read_latency_min;
+    runtime::monotonic_duration read_latency_mean;
+    runtime::monotonic_duration write_latency_min;
+    runtime::monotonic_duration write_latency_mean;
     std::uint32_t maximum_pending_reads{64};
     std::uint32_t maximum_pending_writes{64};
     std::uint32_t memory_dma_alignment{4'096};
@@ -408,11 +408,11 @@ private:
         runtime::fault_decision fault;
         runtime::fault_action configured_action{runtime::fault_action::none};
         seastar::promise<runtime::result<pending_value>> completion;
-        scheduler::event_id_reservation terminal_event;
+        scheduler::event_slot_reservation terminal_event;
         event_trace::reservation terminal_trace;
-        scheduler::event_id_reservation crash_event;
+        scheduler::event_slot_reservation crash_event;
         event_trace::reservation crash_trace;
-        scheduler::event_id_reservation partial_resize_event;
+        scheduler::event_slot_reservation partial_resize_event;
         event_trace::reservation partial_resize_trace;
         event_id completion_event;
         std::optional<fake_object_id> object;
@@ -420,7 +420,7 @@ private:
         std::optional<prepared_truncate> truncate_commit;
         std::uint64_t fault_a{0};
         std::uint64_t fault_b{0};
-        byte_count accounted_bytes{};
+        byte_count accounted_bytes;
         std::uint64_t accounted_path_bytes{0};
         trace_event_kind trace_kind{trace_event_kind::generic};
         bool open_slot{false};
@@ -696,7 +696,7 @@ private:
     fake_file_system_config config_;
     canonical_fake_path root_;
     inode_map objects_;
-    byte_count retained_capacity_{};
+    byte_count retained_capacity_;
     std::uint64_t next_object_id_{2};
     std::uint64_t next_operation_id_{1};
     bool object_ids_exhausted_{false};
@@ -715,7 +715,7 @@ private:
     std::uint32_t parked_operations_{0};
     std::uint32_t pending_reads_{0};
     std::uint32_t pending_writes_{0};
-    byte_count pending_bytes_{};
+    byte_count pending_bytes_;
     std::uint64_t pending_path_bytes_{0};
     std::uint64_t retained_path_bytes_{0};
     std::uint32_t open_handles_{0};

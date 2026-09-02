@@ -27,7 +27,7 @@ namespace kwaque::simulation {
 
 class scheduler;
 
-inline constexpr std::uint32_t event_trace_schema_version{4};
+inline constexpr std::uint32_t event_trace_schema_version{5};
 inline constexpr std::uint32_t scheduler_ordering_version{1};
 inline constexpr std::size_t trace_context_fields_max{4};
 inline constexpr std::size_t canonical_entry_encoded_size{244};

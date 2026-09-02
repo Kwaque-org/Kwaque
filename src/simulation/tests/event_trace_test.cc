@@ -77,25 +77,26 @@ trace_entry keyed_entry(std::uint64_t value = 5) {
 trace_entry fault_entry(
   std::uint64_t value = std::numeric_limits<std::uint64_t>::max(),
   std::uint64_t draws = 0,
-  std::uint32_t outcome = 1) {
+  std::uint32_t outcome = 1,
+  kwaque::runtime::builtin_fault_point point
+  = kwaque::runtime::builtin_fault_point::file_read,
+  kwaque::runtime::fault_action decision
+  = kwaque::runtime::fault_action::error) {
     return trace_entry{
       .time = kwaque::runtime::monotonic_time{2},
       .action = trace_action::fault_evaluated,
       .kind = trace_event_kind::fault,
-      .domain = kwaque::runtime::descriptor_for(
-                  kwaque::runtime::builtin_fault_point::file_read)
-                  ->id.value(),
+      .domain = kwaque::runtime::descriptor_for(point)->id.value(),
       .stable_id = 7,
       .coordinate_a = 3,
       .coordinate_b = draws,
       .value = value,
-      .result = static_cast<std::uint8_t>(kwaque::runtime::fault_action::error)
-                | (outcome << 8U),
+      .result = static_cast<std::uint8_t>(decision) | (outcome << 8U),
     };
 }
 
 constexpr std::string_view golden_trace
-  = "KQTR 04 0000000000000000 00000001 00000001 00000001 00000004 "
+  = "KQTR 05 0000000000000000 00000001 00000001 00000001 00000004 "
     "0000000000000004 0000000000000008 0000000000000064 00000004 "
     "0000000000001000 00000400 0000000000000001 "
     "0000000000000000000000000000000000000000000000000000000000000000 "
@@ -108,6 +109,8 @@ constexpr std::string_view golden_trace
 static_assert(canonical_header_encoded_size == 294);
 static_assert(canonical_entry_encoded_size == 244);
 static_assert(golden_trace.size() == 538);
+static_assert(kwaque::simulation::event_trace_schema_version == 5);
+static_assert(kwaque::runtime::builtin_fault_points.size() == 27);
 static_assert(
   kwaque::runtime::fault_action::partial_resize
   == static_cast<kwaque::runtime::fault_action>(13));
@@ -218,7 +221,7 @@ TEST(EventTraceTest, EncodingAndParsingMatchTheCanonicalGoldenFixture) {
     EXPECT_EQ(encoded_text->find("/home/"), std::string::npos);
     EXPECT_EQ(encoded_text->find('\n'), canonical_header_encoded_size - 1U);
 
-    for (const char version : {'1', '2', '3'}) {
+    for (const char version : {'1', '2', '3', '4'}) {
         auto old_version = *encoded_text;
         old_version[6] = version;
         EXPECT_FALSE(event_trace::decode(old_version, limits).has_value());
@@ -278,7 +281,7 @@ TEST(EventTraceTest, ParserRejectsEveryNoncanonicalBoundary) {
     EXPECT_FALSE(event_trace::decode(invalid_action, limits).has_value());
 
     auto unknown_schema = *encoded_text;
-    replace_token(unknown_schema, 0, 1, "05");
+    replace_token(unknown_schema, 0, 1, "06");
     EXPECT_FALSE(event_trace::decode(unknown_schema, limits).has_value());
 
     auto unknown_random = *encoded_text;
@@ -416,6 +419,117 @@ TEST(EventTraceTest, ValidatesFaultAndFileLifecycleVocabulary) {
       trace.observe(illegal_action).error().code(),
       kwaque::errc::malformed_data);
 
+    for (const auto [point, action] : {
+           std::pair{
+             kwaque::runtime::builtin_fault_point::environment_start,
+             kwaque::runtime::fault_action::error},
+           std::pair{
+             kwaque::runtime::builtin_fault_point::environment_start,
+             kwaque::runtime::fault_action::delay},
+           std::pair{
+             kwaque::runtime::builtin_fault_point::resource_group_create,
+             kwaque::runtime::fault_action::error},
+           std::pair{
+             kwaque::runtime::builtin_fault_point::queue_admission,
+             kwaque::runtime::fault_action::error},
+           std::pair{
+             kwaque::runtime::builtin_fault_point::queue_admission,
+             kwaque::runtime::fault_action::delay},
+           std::pair{
+             kwaque::runtime::builtin_fault_point::environment_stop,
+             kwaque::runtime::fault_action::error},
+           std::pair{
+             kwaque::runtime::builtin_fault_point::environment_stop,
+             kwaque::runtime::fault_action::delay},
+         }) {
+        EXPECT_TRUE(
+          trace
+            .observe(fault_entry(
+              std::numeric_limits<std::uint64_t>::max(), 0, 1, point, action))
+            .has_value());
+    }
+
+    auto unknown_point = fault_entry();
+    unknown_point.domain = 28;
+    EXPECT_EQ(
+      trace.observe(unknown_point).error().code(),
+      kwaque::errc::malformed_data);
+    auto unsupported_resource_delay = fault_entry(
+      std::numeric_limits<std::uint64_t>::max(),
+      0,
+      1,
+      kwaque::runtime::builtin_fault_point::resource_group_create,
+      kwaque::runtime::fault_action::delay);
+    EXPECT_EQ(
+      trace.observe(unsupported_resource_delay).error().code(),
+      kwaque::errc::malformed_data);
+    auto unsupported_environment_crash = fault_entry(
+      std::numeric_limits<std::uint64_t>::max(),
+      0,
+      1,
+      kwaque::runtime::builtin_fault_point::environment_start,
+      kwaque::runtime::fault_action::crash);
+    EXPECT_EQ(
+      trace.observe(unsupported_environment_crash).error().code(),
+      kwaque::errc::malformed_data);
+    auto fault_context = fault_entry(
+      std::numeric_limits<std::uint64_t>::max(),
+      0,
+      1,
+      kwaque::runtime::builtin_fault_point::queue_admission);
+    fault_context.context_size = 1;
+    fault_context.context[0] = {
+      .key = trace_context_key::detail,
+      .value = 1,
+    };
+    EXPECT_EQ(
+      trace.observe(fault_context).error().code(),
+      kwaque::errc::malformed_data);
+    auto fault_deadline = fault_entry(
+      std::numeric_limits<std::uint64_t>::max(),
+      0,
+      1,
+      kwaque::runtime::builtin_fault_point::environment_start);
+    fault_deadline.deadline = kwaque::runtime::monotonic_time{1};
+    EXPECT_EQ(
+      trace.observe(fault_deadline).error().code(),
+      kwaque::errc::malformed_data);
+    auto fault_trace_action = fault_entry(
+      std::numeric_limits<std::uint64_t>::max(),
+      0,
+      1,
+      kwaque::runtime::builtin_fault_point::environment_start);
+    fault_trace_action.action = trace_action::keyed_decision;
+    EXPECT_EQ(
+      trace.observe(fault_trace_action).error().code(),
+      kwaque::errc::malformed_data);
+    auto fault_kind = fault_entry(
+      std::numeric_limits<std::uint64_t>::max(),
+      0,
+      1,
+      kwaque::runtime::builtin_fault_point::environment_start);
+    fault_kind.kind = trace_event_kind::generic;
+    EXPECT_EQ(
+      trace.observe(fault_kind).error().code(), kwaque::errc::malformed_data);
+    auto fault_event_id = fault_entry(
+      std::numeric_limits<std::uint64_t>::max(),
+      0,
+      1,
+      kwaque::runtime::builtin_fault_point::environment_start);
+    fault_event_id.event_id = 1;
+    EXPECT_EQ(
+      trace.observe(fault_event_id).error().code(),
+      kwaque::errc::malformed_data);
+    auto fault_priority = fault_entry(
+      std::numeric_limits<std::uint64_t>::max(),
+      0,
+      1,
+      kwaque::runtime::builtin_fault_point::environment_start);
+    fault_priority.priority = 1;
+    EXPECT_EQ(
+      trace.observe(fault_priority).error().code(),
+      kwaque::errc::malformed_data);
+
     EXPECT_TRUE(trace
                   .observe(
                     trace_entry{
@@ -451,7 +565,86 @@ TEST(EventTraceTest, ValidatesFaultAndFileLifecycleVocabulary) {
       kwaque::errc::malformed_data);
 }
 
-TEST(EventTraceTest, ValidatesReservedSchemaFourVocabulary) {
+TEST(EventTraceTest, ReplayRejectsEveryValidLifecycleFaultMutation) {
+    const auto limits = test_limits();
+    const auto original = fault_entry(
+      std::numeric_limits<std::uint64_t>::max(),
+      0,
+      1,
+      kwaque::runtime::builtin_fault_point::environment_start,
+      kwaque::runtime::fault_action::error);
+    event_trace captured{test_header(limits), limits};
+    ASSERT_TRUE(captured.observe(original).has_value());
+    const auto encoded = captured.encode();
+    ASSERT_TRUE(encoded.has_value());
+
+    enum class mutation {
+        time,
+        domain,
+        stable_id,
+        coordinate_a,
+        sample,
+        result,
+    };
+    struct mutation_case final {
+        mutation selected;
+        trace_difference_field expected;
+    };
+    constexpr std::array mutations{
+      mutation_case{mutation::time, trace_difference_field::time},
+      mutation_case{mutation::domain, trace_difference_field::domain},
+      mutation_case{mutation::stable_id, trace_difference_field::stable_id},
+      mutation_case{
+        mutation::coordinate_a, trace_difference_field::coordinate_a},
+      mutation_case{mutation::sample, trace_difference_field::coordinate_b},
+      mutation_case{mutation::result, trace_difference_field::result},
+    };
+
+    for (const auto& test_case : mutations) {
+        auto decoded = event_trace::decode(*encoded, limits);
+        ASSERT_TRUE(decoded.has_value());
+        auto replay = event_trace::replay(
+          captured.header(), limits, std::move(*decoded));
+        ASSERT_TRUE(replay.has_value());
+        auto changed = original;
+        switch (test_case.selected) {
+        case mutation::time:
+            changed.time = kwaque::runtime::monotonic_time{3};
+            break;
+        case mutation::domain:
+            changed.domain
+              = kwaque::runtime::descriptor_for(
+                  kwaque::runtime::builtin_fault_point::queue_admission)
+                  ->id.value();
+            break;
+        case mutation::stable_id:
+            ++changed.stable_id;
+            break;
+        case mutation::coordinate_a:
+            ++changed.coordinate_a;
+            break;
+        case mutation::sample:
+            changed.coordinate_b = 1;
+            changed.value = 0;
+            break;
+        case mutation::result:
+            changed.result = static_cast<std::uint8_t>(
+                               kwaque::runtime::fault_action::delay)
+                             | UINT32_C(0x100);
+            break;
+        }
+
+        const auto mismatch = (*replay)->observe(changed);
+        ASSERT_FALSE(mismatch.has_value());
+        EXPECT_EQ(mismatch.error().code(), kwaque::errc::replay_divergence);
+        ASSERT_TRUE(mismatch.error().context_at(1).has_value());
+        EXPECT_EQ(
+          mismatch.error().context_at(1)->value,
+          static_cast<std::uint8_t>(test_case.expected));
+    }
+}
+
+TEST(EventTraceTest, ValidatesReservedSchemaFiveVocabulary) {
     const auto limits = test_limits(32, 32'768);
     event_trace trace{test_header(limits), limits};
     const auto event_effect = [](

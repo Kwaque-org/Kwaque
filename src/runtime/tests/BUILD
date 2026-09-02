@@ -15,6 +15,15 @@ kwaque_cc_test(
 )
 
 kwaque_cc_test(
+    name = "operation_statistics_test",
+    srcs = ["operation_statistics_test.cc"],
+    deps = [
+        "//src/runtime:operation_statistics",
+        "//src/runtime:operation_statistics_test_support",
+    ],
+)
+
+kwaque_cc_test(
     name = "time_random_contract_test",
     srcs = ["time_random_contract_test.cc"],
     deps = [
@@ -186,6 +195,7 @@ kwaque_cc_benchmark(
     memory = "128MiB",
     deps = [
         "//src/runtime:environment",
+        "//src/runtime:operation_statistics",
         "//src/runtime:random",
         "//src/runtime/production:clocks",
         "//src/runtime/production:dns",
@@ -262,6 +272,18 @@ kwaque_cc_seastar_test(
     cpu = 1,
     memory = "128MiB",
     deps = ["//src/runtime:task_scope"],
+)
+
+kwaque_cc_seastar_test(
+    name = "runtime_metrics_test",
+    srcs = ["runtime_metrics_test.cc"],
+    cpu = 1,
+    memory = "192MiB",
+    deps = [
+        "//src/base:metric_schema",
+        "//src/runtime:runtime_service",
+        "//src/runtime/production:backend_test_support",
+    ],
 )
 
 kwaque_cc_seastar_test(

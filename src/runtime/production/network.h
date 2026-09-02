@@ -2,6 +2,7 @@
 #define KWAQUE_SRC_RUNTIME_PRODUCTION_NETWORK_H_
 
 #include "src/runtime/network.h"
+#include "src/runtime/operation_statistics.h"
 #include "src/runtime/shard_affinity.h"
 
 #include <seastar/core/future.hh>
@@ -39,6 +40,10 @@ public:
     [[nodiscard]] network_half_state output_state() const noexcept;
     [[nodiscard]] const network_connection_limits& limits() const noexcept;
     [[nodiscard]] owner_shard owner() const noexcept { return owner_; }
+    [[nodiscard]] operation_statistics_snapshot statistics() const noexcept {
+        owner_.assert_current();
+        return statistics_->snapshot();
+    }
 
     [[nodiscard]] result<void> shutdown_input();
     [[nodiscard]] result<void> shutdown_output();
@@ -54,7 +59,8 @@ private:
       seastar::connected_socket native,
       network_endpoint local,
       network_endpoint remote,
-      network_connection_limits limits);
+      network_connection_limits limits,
+      operation_statistics* statistics = nullptr);
 
     [[nodiscard]] static owner_shard prepare_move(connection& other) noexcept;
     [[nodiscard]] std::optional<operation_error> input_rejection() const;
@@ -63,17 +69,21 @@ private:
       bytes::fragmented_buffer data,
       network_write_admission::reservation reservation,
       seastar::gate::holder holder,
-      seastar::semaphore_units<> serialization);
+      seastar::semaphore_units<> serialization,
+      operation_statistics::reservation metric);
     [[nodiscard]] seastar::future<result<void>> write_general(
       bytes::fragmented_buffer data,
       seastar::abort_source& caller_abort,
       network_write_admission::reservation reservation,
-      seastar::gate::holder holder);
+      seastar::gate::holder holder,
+      operation_statistics::reservation metric);
     [[nodiscard]] seastar::future<result<void>>
     flush_preceding_batch_after_cancellation();
     [[nodiscard]] seastar::future<result<void>> close_once();
 
     owner_shard owner_;
+    operation_statistics local_statistics_;
+    operation_statistics* statistics_;
     seastar::connected_socket native_;
     seastar::input_stream<char> input_;
     seastar::output_stream<char> output_;
@@ -108,6 +118,10 @@ public:
     [[nodiscard]] const network_connection_limits&
     connection_limits() const noexcept;
     [[nodiscard]] owner_shard owner() const noexcept { return owner_; }
+    [[nodiscard]] operation_statistics_snapshot statistics() const noexcept {
+        owner_.assert_current();
+        return statistics_->snapshot();
+    }
     void request_abort();
     [[nodiscard]] seastar::future<result<void>> close();
 
@@ -117,11 +131,14 @@ private:
     listener(
       seastar::server_socket native,
       network_endpoint local,
-      network_connection_limits limits);
+      network_connection_limits limits,
+      operation_statistics* statistics = nullptr);
 
     [[nodiscard]] static owner_shard prepare_move(listener& other) noexcept;
 
     owner_shard owner_;
+    operation_statistics local_statistics_;
+    operation_statistics* statistics_;
     seastar::server_socket native_;
     network_endpoint local_;
     network_connection_limits limits_;
@@ -139,6 +156,11 @@ public:
     using connection_type = connection;
     using listener_type = listener;
 
+    network() noexcept
+      : statistics_(&local_statistics_) {}
+    explicit network(operation_statistics& statistics) noexcept
+      : statistics_(&statistics) {}
+
     [[nodiscard]] seastar::future<result<connection>> connect(
       network_endpoint endpoint,
       std::optional<network_endpoint> local_endpoint,
@@ -146,6 +168,15 @@ public:
       seastar::abort_source& caller_abort);
     [[nodiscard]] seastar::future<result<listener>>
     listen(network_endpoint endpoint, network_listen_options options);
+
+    [[nodiscard]] operation_statistics_snapshot statistics() const noexcept {
+        assert_current();
+        return statistics_->snapshot();
+    }
+
+private:
+    operation_statistics local_statistics_;
+    operation_statistics* statistics_;
 };
 
 static_assert(kwaque::runtime::network_backend<network>);

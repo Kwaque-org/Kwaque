@@ -58,6 +58,40 @@ kwaque_cc_library(
 )
 
 kwaque_cc_library(
+    name = "structured_event_sink",
+    srcs = ["event_sink.cc"],
+    hdrs = ["event_sink.h"],
+    visibility = ["//src/simulation:__subpackages__"],
+    deps = [
+        "//src/observability:event",
+        "//src/observability:event_log",
+        "//src/observability:event_sequence",
+        "//src/observability:event_sink_concept",
+        "//src/runtime:error",
+        "//src/runtime:shard_affinity",
+    ],
+)
+
+kwaque_cc_library(
+    name = "metrics",
+    srcs = ["metrics.cc"],
+    hdrs = ["metrics.h"],
+    visibility = ["//src/simulation:__subpackages__"],
+    deps = [
+        ":event_trace",
+        ":fake_dns",
+        ":fake_file",
+        ":fake_network",
+        ":fault_schedule",
+        ":scheduler",
+        "//src/base:invariant",
+        "//src/base:metric_schema",
+        "//src/runtime:shard_affinity",
+        "@seastar",
+    ],
+)
+
+kwaque_cc_library(
     name = "scheduler",
     srcs = ["scheduler.cc"],
     hdrs = ["scheduler.h"],
@@ -264,6 +298,14 @@ kwaque_cc_library(
         "@abseil-cpp//absl/container:btree",
         "@seastar",
     ],
+)
+
+kwaque_cc_library(
+    name = "fake_network_test_support",
+    testonly = True,
+    hdrs = ["fake_network_test_support.h"],
+    visibility = ["//src/simulation/tests:__pkg__"],
+    deps = [":fake_network"],
 )
 
 kwaque_cc_library(
