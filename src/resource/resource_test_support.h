@@ -3,7 +3,11 @@
 #include "src/resource/resource_manager.h"
 #include "src/resource/resource_registry.h"
 
+#include <seastar/core/future.hh>
+
 #include <cstddef>
+#include <stdexcept>
+#include <utility>
 
 namespace kwaque::resource {
 
@@ -12,9 +16,15 @@ public:
     static constexpr std::size_t creation_point_count = workload_class_count
                                                         * 2;
 
-    static void fail_before_creation(
-      resource_registry& registry, std::size_t point) noexcept {
-        registry.fail_before_creation_ = point;
+    [[nodiscard]] static seastar::future<> fail_before_creation(
+      resource_registry& registry, resource_config config, std::size_t point) {
+        return registry.start_with(
+          std::move(config), [point](std::size_t current) {
+              if (current == point) {
+                  throw std::runtime_error(
+                    "injected resource group creation failure");
+              }
+          });
     }
 };
 
@@ -22,9 +32,14 @@ class resource_manager_test_access final {
 public:
     static constexpr std::size_t start_point_count = workload_class_count;
 
-    static void fail_before_start_point(
-      resource_manager& manager, std::size_t point) noexcept {
-        manager.fail_before_start_point_ = point;
+    [[nodiscard]] static seastar::future<>
+    fail_before_start_point(resource_manager& manager, std::size_t point) {
+        return manager.start_with([point](std::size_t current) {
+            if (current == point) {
+                throw std::runtime_error(
+                  "injected resource manager start failure");
+            }
+        });
     }
 };
 

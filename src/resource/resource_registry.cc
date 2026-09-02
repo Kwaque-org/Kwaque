@@ -120,14 +120,11 @@ void resource_registry::assert_coordinator() const {
     }
 }
 
-void resource_registry::inject_before_creation() {
-    if (fail_before_creation_ && creation_point_ == *fail_before_creation_) {
-        throw std::runtime_error("injected resource group creation failure");
-    }
-    ++creation_point_;
+seastar::future<> resource_registry::start(resource_config config) {
+    return start_with(std::move(config), [](std::size_t) noexcept {});
 }
 
-seastar::future<> resource_registry::start(resource_config config) {
+void resource_registry::prepare_start(resource_config config) {
     assert_coordinator();
     if (state_ != resource_registry_state::constructed) {
         throw std::logic_error("resource registry cannot be started");
@@ -146,54 +143,51 @@ seastar::future<> resource_registry::start(resource_config config) {
 
     active_registry = this;
     state_ = resource_registry_state::starting;
-    config_ = config;
-    creation_point_ = 0;
+    config_ = std::move(config);
+}
 
-    std::exception_ptr startup_failure;
+seastar::future<>
+resource_registry::create_scheduling_group(workload_class classification) {
+    const auto index = workload_index(classification);
+    const auto& descriptor = descriptor_for(classification);
+    const auto name = group_name(descriptor);
+    scheduling_groups_[index] = co_await seastar::create_scheduling_group(
+      seastar::sstring{name}, static_cast<float>(descriptor.scheduling_shares));
+}
+
+seastar::future<>
+resource_registry::create_smp_service_group(workload_class classification) {
+    const auto index = workload_index(classification);
+    const auto& descriptor = descriptor_for(classification);
+    const auto name = group_name(descriptor);
+    seastar::smp_service_group_config smp_config;
+    const auto minimum_limit = seastar::this_smp_shard_count() - 1;
+    const auto effective_limit = std::max(
+      descriptor.max_nonlocal_requests, minimum_limit);
+    smp_config.max_nonlocal_requests = effective_limit;
+    smp_config.group_name = seastar::sstring{name};
+    smp_service_groups_[index] = co_await seastar::create_smp_service_group(
+      std::move(smp_config));
+}
+
+seastar::future<> resource_registry::rollback_start() noexcept {
+    bool cleanup_failed = false;
     try {
-        for (const auto classification : all_workload_classes) {
-            const auto index = workload_index(classification);
-            const auto& descriptor = descriptor_for(classification);
-            const auto name = group_name(descriptor);
-
-            inject_before_creation();
-            auto scheduling_group = co_await seastar::create_scheduling_group(
-              seastar::sstring{name},
-              static_cast<float>(descriptor.scheduling_shares));
-            scheduling_groups_[index] = scheduling_group;
-
-            inject_before_creation();
-            seastar::smp_service_group_config smp_config;
-            const auto minimum_limit = seastar::this_smp_shard_count() - 1;
-            const auto effective_limit = std::max(
-              descriptor.max_nonlocal_requests, minimum_limit);
-            smp_config.max_nonlocal_requests = effective_limit;
-            smp_config.group_name = seastar::sstring{name};
-            smp_service_groups_[index]
-              = co_await seastar::create_smp_service_group(
-                std::move(smp_config));
-        }
+        co_await destroy_created_groups();
     } catch (...) {
-        startup_failure = std::current_exception();
+        cleanup_failed = true;
     }
+    config_.reset();
+    active_registry = nullptr;
+    if (cleanup_failed) {
+        registry_poisoned.store(true, std::memory_order_release);
+        state_ = resource_registry_state::failed;
+    } else {
+        state_ = resource_registry_state::stopped;
+    }
+}
 
-    if (startup_failure) {
-        bool cleanup_failed = false;
-        try {
-            co_await destroy_created_groups();
-        } catch (...) {
-            cleanup_failed = true;
-        }
-        config_.reset();
-        active_registry = nullptr;
-        if (cleanup_failed) {
-            registry_poisoned.store(true, std::memory_order_release);
-            state_ = resource_registry_state::failed;
-        } else {
-            state_ = resource_registry_state::stopped;
-        }
-        std::rethrow_exception(startup_failure);
-    }
+void resource_registry::finish_start() {
     generation_ = next_generation.fetch_add(1, std::memory_order_acq_rel);
     KWAQUE_INVARIANT(
       invariant_id{"KQ-RESOURCE-GENERATION-VALID"},

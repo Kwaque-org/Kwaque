@@ -5,6 +5,7 @@
 #include "src/base/units.h"
 #include "src/bytes/fragmented_buffer.h"
 #include "src/runtime/error.h"
+#include "src/runtime/operation_statistics.h"
 #include "src/runtime/shard_affinity.h"
 
 #include <seastar/core/chunked_vector.hh>
@@ -255,7 +256,10 @@ private:
 // operations still dispatch through the native Seastar implementation.
 class file final {
 public:
-    explicit file(seastar::file&& native_file, file_io_limits limits = {});
+    explicit file(
+      seastar::file&& native_file,
+      file_io_limits limits = {},
+      operation_statistics* statistics = nullptr);
     file(file&& other) noexcept;
     file& operator=(file&&) = delete;
     file(const file&) = delete;
@@ -288,6 +292,10 @@ public:
     [[nodiscard]] std::uint32_t queued_writes() const;
     [[nodiscard]] byte_count queued_write_bytes() const;
     [[nodiscard]] owner_shard owner() const noexcept { return owner_; }
+    [[nodiscard]] operation_statistics_snapshot statistics() const noexcept {
+        owner_.assert_current();
+        return statistics_->snapshot();
+    }
 
 private:
     friend class file_test_access;
@@ -325,10 +333,13 @@ private:
       file_position position,
       byte_count maximum_bytes,
       admission_reservation admission,
-      seastar::gate::holder holder);
+      seastar::gate::holder holder,
+      operation_statistics::reservation metric);
     [[nodiscard]] seastar::future<result<void>> close_once();
 
     owner_shard owner_;
+    operation_statistics local_statistics_;
+    operation_statistics* statistics_;
     file_io_limits limits_;
     seastar::file native_file_;
     seastar::io_intent io_intent_;

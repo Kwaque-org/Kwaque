@@ -48,10 +48,13 @@ SEASTAR_TEST_CASE(task_scope_aborts_rejects_and_drains_owned_temporary_work) {
       delayed_task{release.get_future(), completions});
     BOOST_REQUIRE(accepted.has_value());
     BOOST_CHECK_EQUAL(scope.task_count(), 1U);
+    BOOST_CHECK_EQUAL(scope.statistics().accepted, 1U);
+    BOOST_CHECK_EQUAL(scope.statistics().completed, 0U);
 
     auto closing = scope.close();
     co_await seastar::yield();
     BOOST_CHECK(scope.abort_requested());
+    BOOST_CHECK_EQUAL(scope.statistics().abort_requests, 1U);
     BOOST_CHECK(scope.admission_closed());
     BOOST_CHECK(!closing.available());
 
@@ -59,11 +62,14 @@ SEASTAR_TEST_CASE(task_scope_aborts_rejects_and_drains_owned_temporary_work) {
       [] { return seastar::make_ready_future<>(); });
     BOOST_REQUIRE(!rejected.has_value());
     BOOST_CHECK(rejected.error().code() == kwaque::errc::closed);
+    BOOST_CHECK_EQUAL(scope.statistics().accepted, 1U);
 
     release.set_value();
     co_await std::move(closing);
     BOOST_CHECK_EQUAL(completions, 1U);
     BOOST_CHECK_EQUAL(scope.task_count(), 0U);
+    BOOST_CHECK_EQUAL(scope.statistics().completed, 1U);
+    BOOST_CHECK_EQUAL(scope.statistics().failed, 0U);
     co_await scope.close();
 }
 
@@ -110,6 +116,9 @@ SEASTAR_TEST_CASE(task_scope_reports_the_first_background_failure_once_closed) {
         failed = true;
     }
     BOOST_REQUIRE(failed);
+    BOOST_CHECK_EQUAL(scope.statistics().accepted, 1U);
+    BOOST_CHECK_EQUAL(scope.statistics().completed, 1U);
+    BOOST_CHECK_EQUAL(scope.statistics().failed, 1U);
 
     failed = false;
     try {

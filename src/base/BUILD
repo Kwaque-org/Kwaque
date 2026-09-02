@@ -59,6 +59,13 @@ kwaque_cc_library(
     deps = [":error"],
 )
 
+kwaque_cc_library(
+    name = "metric_schema",
+    srcs = ["metric_schema.cc"],
+    hdrs = ["metric_schema.h"],
+    visibility = ["//visibility:public"],
+)
+
 stamp_template(
     name = "build_stamp",
     out = "build_stamp.h",
@@ -100,6 +107,12 @@ kwaque_cc_test(
         ":base",
         ":error",
     ],
+)
+
+kwaque_cc_test(
+    name = "metric_schema_test",
+    srcs = ["metric_schema_test.cc"],
+    deps = [":metric_schema"],
 )
 
 kwaque_cc_test(

@@ -303,20 +303,28 @@ public:
         return suppressed_errors_;
     }
 
+    [[nodiscard]] std::uint64_t accepted_pushes() const {
+        assert_current();
+        return accepted_pushes_;
+    }
+
+    [[nodiscard]] std::uint64_t rejected_pushes() const {
+        assert_current();
+        return rejected_pushes_;
+    }
+
     [[nodiscard]] seastar::future<queue_result<void>>
     push(T item, byte_count cost, seastar::abort_source& abort_source) {
         assert_current();
         operation_token operation{*this, active_producers_};
         if (auto invalid = validate_cost(cost)) {
-            co_return std::unexpected(std::move(*invalid));
+            co_return reject_push(std::move(*invalid));
         }
         if (state_ != bounded_work_queue_state::open) {
-            co_return std::unexpected(
-              failure(queue_failure_kind::closed, cost));
+            co_return reject_push(failure(queue_failure_kind::closed, cost));
         }
         if (abort_source.abort_requested()) {
-            co_return std::unexpected(
-              failure(queue_failure_kind::aborted, cost));
+            co_return reject_push(failure(queue_failure_kind::aborted, cost));
         }
 
         std::optional<producer_cancellation> cancellation;
@@ -331,7 +339,7 @@ public:
         producer_wait_token waiting{*this};
         if (!turn) {
             if (!waiting.try_engage_queued()) {
-                co_return std::unexpected(failure(
+                co_return reject_push(failure(
                   queue_failure_kind::producer_waiters_exhausted, cost));
             }
             auto& push_abort = cancellation_source();
@@ -340,7 +348,7 @@ public:
                   seastar::get_units(producer_turn_, 1, push_abort));
             } catch (...) {
                 if (push_abort.abort_requested()) {
-                    co_return std::unexpected(
+                    co_return reject_push(
                       interruption_failure(abort_source, cost));
                 }
                 throw;
@@ -349,11 +357,11 @@ public:
 
         while (true) {
             if (state_ != bounded_work_queue_state::open) {
-                co_return std::unexpected(
+                co_return reject_push(
                   failure(queue_failure_kind::closed, cost));
             }
             if (abort_source.abort_requested()) {
-                co_return std::unexpected(
+                co_return reject_push(
                   failure(queue_failure_kind::aborted, cost));
             }
             if (can_admit_locally(cost)) {
@@ -364,7 +372,7 @@ public:
             // the head of the admission order. Only a queue that permits no
             // suspended producers at all can refuse it.
             if (!waiting.engage_admitting()) {
-                co_return std::unexpected(failure(
+                co_return reject_push(failure(
                   queue_failure_kind::producer_waiters_exhausted, cost));
             }
             auto& push_abort = cancellation_source();
@@ -386,7 +394,7 @@ public:
           *memory_admission_, cost.value());
         if (!acquired) {
             if (!waiting.engage_admitting()) {
-                co_return std::unexpected(failure(
+                co_return reject_push(failure(
                   queue_failure_kind::producer_waiters_exhausted, cost));
             }
             auto& push_abort = cancellation_source();
@@ -397,7 +405,7 @@ public:
                       *memory_admission_, cost.value(), push_abort));
             } catch (...) {
                 if (push_abort.abort_requested()) {
-                    co_return std::unexpected(
+                    co_return reject_push(
                       interruption_failure(abort_source, cost));
                 }
                 throw;
@@ -406,7 +414,7 @@ public:
         if (
           state_ != bounded_work_queue_state::open
           || abort_source.abort_requested()) {
-            co_return std::unexpected(interruption_failure(abort_source, cost));
+            co_return reject_push(interruption_failure(abort_source, cost));
         }
 
         items_.push_back(
@@ -421,6 +429,7 @@ public:
           "queue byte admission exceeded its local capacity");
         bytes_held_ = *held;
         consumer_condition_.signal();
+        ++accepted_pushes_;
         co_return queue_result<void>{};
     }
 
@@ -764,6 +773,12 @@ private:
         };
     }
 
+    [[nodiscard]] std::unexpected<queue_failure>
+    reject_push(queue_failure failure) noexcept {
+        ++rejected_pushes_;
+        return std::unexpected(std::move(failure));
+    }
+
     [[nodiscard]] queue_failure interruption_failure(
       const seastar::abort_source& caller_abort,
       byte_count cost) const noexcept {
@@ -788,13 +803,7 @@ private:
                && remaining.has_value() && *remaining >= cost;
     }
 
-    static void increment(std::uint64_t& value) {
-        KWAQUE_INVARIANT(
-          invariant_id{"KQ-QUEUE-WORKER-COUNTER"},
-          value != std::numeric_limits<std::uint64_t>::max(),
-          "queue worker counter overflow");
-        ++value;
-    }
+    static void increment(std::uint64_t& value) noexcept { ++value; }
 
     [[nodiscard]] seastar::future<> worker_loop() {
         count_guard worker{active_workers_};
@@ -945,6 +954,8 @@ private:
     std::size_t maximum_active_handlers_{0};
     std::uint64_t reported_errors_{0};
     std::uint64_t suppressed_errors_{0};
+    std::uint64_t accepted_pushes_{0};
+    std::uint64_t rejected_pushes_{0};
     bool workers_started_{false};
     bool closing_{false};
 };

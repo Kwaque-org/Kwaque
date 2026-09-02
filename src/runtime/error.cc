@@ -97,6 +97,8 @@ std::string_view to_string(operation_kind operation) noexcept {
         return "clock";
     case operation_kind::trace:
         return "trace";
+    case operation_kind::observability:
+        return "observability";
     }
     return "unknown";
 }

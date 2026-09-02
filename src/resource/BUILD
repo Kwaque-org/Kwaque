@@ -50,6 +50,7 @@ kwaque_cc_library(
         ":workload_class",
         "//src/base",
         "//src/base:invariant",
+        "//src/base:metric_schema",
         "//src/runtime:shard_affinity",
         "@seastar",
     ],
@@ -73,6 +74,18 @@ kwaque_cc_library(
 )
 
 kwaque_cc_library(
+    name = "bounded_work_queue_metrics",
+    hdrs = ["bounded_work_queue_metrics.h"],
+    visibility = ["//visibility:public"],
+    deps = [
+        "//src/base:invariant",
+        "//src/base:metric_schema",
+        "//src/runtime:shard_affinity",
+        "@seastar",
+    ],
+)
+
+kwaque_cc_library(
     name = "resource_test_support",
     testonly = True,
     hdrs = ["resource_test_support.h"],
@@ -80,6 +93,7 @@ kwaque_cc_library(
     deps = [
         ":resource_manager",
         ":resource_registry",
+        "@seastar",
     ],
 )
 
@@ -100,6 +114,7 @@ kwaque_cc_library(
         ":workload_class",
         "//src/base",
         "//src/base:invariant_test_support",
+        "//src/base:metric_schema",
         "//src/runtime:shard_affinity_test_support",
         "@seastar",
     ],

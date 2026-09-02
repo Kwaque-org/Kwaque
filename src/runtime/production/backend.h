@@ -2,6 +2,7 @@
 #define KWAQUE_SRC_RUNTIME_PRODUCTION_BACKEND_H_
 
 #include "src/runtime/environment.h"
+#include "src/runtime/operation_statistics.h"
 #include "src/runtime/production/clocks.h"
 #include "src/runtime/production/dns.h"
 #include "src/runtime/production/file.h"
@@ -13,6 +14,7 @@
 
 #include <seastar/core/abort_source.hh>
 #include <seastar/core/future.hh>
+#include <seastar/core/metrics_registration.hh>
 #include <seastar/core/shared_future.hh>
 #include <seastar/util/optimized_optional.hh>
 
@@ -103,17 +105,23 @@ private:
     [[nodiscard]] seastar::future<> start_with(Checkpoint checkpoint);
     [[nodiscard]] seastar::future<> stop_once();
     [[nodiscard]] seastar::future<> rollback_start() noexcept;
+    void register_metrics();
 
     seastar::abort_source* parent_abort_;
     std::optional<seastar::net::dns_resolver::options> dns_options_;
     seastar::optimized_optional<seastar::abort_source::subscription>
       parent_subscription_;
     runtime_lifetime lifetime_;
+    operation_statistics timer_statistics_;
+    operation_statistics file_statistics_;
+    operation_statistics network_statistics_;
+    operation_statistics dns_statistics_;
     std::optional<random_type> random_;
     std::optional<timer_type> timer_;
     std::optional<file_system_type> file_system_;
     std::optional<network_type> network_;
     std::optional<dns_type> dns_;
+    std::optional<seastar::metrics::metric_groups> metrics_;
     std::optional<seastar::shared_promise<>> stop_done_;
     backend_state state_{backend_state::constructed};
     bool abort_requested_{false};
@@ -168,18 +176,19 @@ seastar::future<> backend::start_with(Checkpoint checkpoint) {
         }
         random_.emplace(std::move(*source));
         checkpoint(1);
-        timer_.emplace();
+        timer_.emplace(timer_statistics_);
         checkpoint(2);
-        file_system_.emplace();
+        file_system_.emplace(file_statistics_);
         checkpoint(3);
-        network_.emplace();
+        network_.emplace(network_statistics_);
         checkpoint(4);
         if (dns_options_) {
-            dns_.emplace(dns_config{}, *dns_options_);
+            dns_.emplace(dns_statistics_, dns_config{}, *dns_options_);
         } else {
-            dns_.emplace();
+            dns_.emplace(dns_statistics_);
         }
         dns_options_.reset();
+        register_metrics();
         if (abort_requested_) {
             throw seastar::abort_requested_exception{};
         }

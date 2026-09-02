@@ -30,6 +30,8 @@ inline constexpr std::uint32_t default_fake_network_backlog_entries{1'024};
 inline constexpr std::uint32_t maximum_fake_network_backlog_entries{16'384};
 inline constexpr std::uint32_t default_fake_network_operations{4'096};
 inline constexpr std::uint32_t maximum_fake_network_operations{65'536};
+inline constexpr std::uint32_t default_fake_network_parked_operations{256};
+inline constexpr std::uint32_t maximum_fake_network_parked_operations{4'096};
 inline constexpr byte_count default_fake_network_direction_bytes{
   std::uint64_t{16} * 1024U * 1024U};
 inline constexpr byte_count maximum_fake_network_direction_bytes{
@@ -48,6 +50,8 @@ inline constexpr std::uint32_t default_fake_network_direction_packets{64};
 inline constexpr std::uint32_t maximum_fake_network_direction_packets{1'024};
 inline constexpr std::uint32_t default_fake_network_links{1'024};
 inline constexpr std::uint32_t maximum_fake_network_links{16'384};
+inline constexpr std::uint32_t default_fake_network_address_entries{1'024};
+inline constexpr std::uint32_t maximum_fake_network_address_entries{16'384};
 inline constexpr std::uint32_t default_fake_network_active_flows{32};
 inline constexpr std::uint32_t default_fake_network_controls{256};
 inline constexpr std::uint32_t maximum_fake_network_controls{4'096};
@@ -91,6 +95,8 @@ struct fake_network_config final {
       default_fake_network_pending_connects};
     std::uint32_t maximum_backlog_entries{default_fake_network_backlog_entries};
     std::uint32_t maximum_operations{default_fake_network_operations};
+    std::uint32_t maximum_parked_operations{
+      default_fake_network_parked_operations};
     byte_count maximum_direction_bytes{default_fake_network_direction_bytes};
     std::uint32_t maximum_packets{default_fake_network_packets};
     byte_count maximum_packet_logical_bytes{
@@ -100,6 +106,7 @@ struct fake_network_config final {
     std::uint32_t maximum_direction_packets{
       default_fake_network_direction_packets};
     std::uint32_t maximum_links{default_fake_network_links};
+    std::uint32_t maximum_address_entries{default_fake_network_address_entries};
     std::uint32_t maximum_active_flows{default_fake_network_active_flows};
     std::uint32_t maximum_controls{default_fake_network_controls};
     std::uint32_t stop_batch{default_fake_network_stop_batch};
@@ -240,6 +247,7 @@ public:
       runtime::network_address address, bandwidth_capacity capacity);
     [[nodiscard]] bandwidth_allocation_digest
     allocation_digest() const noexcept;
+    [[nodiscard]] std::size_t active_operations() const noexcept;
     void request_abort() noexcept;
     [[nodiscard]] seastar::future<runtime::result<void>> stop();
     [[nodiscard]] fake_network_state state() const noexcept;
@@ -290,6 +298,8 @@ private:
     [[nodiscard]] bool
     connection_movable(std::uint64_t pair, std::uint8_t side) const noexcept;
     [[nodiscard]] bool owner_stopped() const noexcept;
+    void
+    force_discard_for_test(const runtime::operation_error& failure) noexcept;
 
     [[nodiscard]] seastar::future<runtime::result<fake_connection>>
     accept(std::uint64_t listener, seastar::abort_source& caller_abort);

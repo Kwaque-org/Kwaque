@@ -65,7 +65,7 @@ constexpr std::uint64_t seed{71};
 scheduler_limits make_scheduler_limits() {
     auto limits = scheduler_limits::make(
       scheduler_limit_values{
-        .pending_events = 128,
+        .pending_events = 512,
         .events_per_pump = 128,
         .total_events = 1'024,
         .maximum_deadline = kwaque::runtime::monotonic_time{1'000'000},

@@ -35,6 +35,20 @@ kwaque_cc_library(
 )
 
 kwaque_cc_library(
+    name = "operation_statistics",
+    hdrs = ["operation_statistics.h"],
+    visibility = ["//visibility:public"],
+)
+
+kwaque_cc_library(
+    name = "operation_statistics_test_support",
+    testonly = True,
+    hdrs = ["operation_statistics_test_support.h"],
+    visibility = ["//src/runtime/tests:__pkg__"],
+    deps = [":operation_statistics"],
+)
+
+kwaque_cc_library(
     name = "file",
     srcs = ["file.cc"],
     hdrs = ["file.h"],
@@ -42,6 +56,7 @@ kwaque_cc_library(
     deps = [
         ":error",
         ":fragmented_buffer_internal",
+        ":operation_statistics",
         ":shard_affinity",
         "//src/base",
         "//src/base:invariant",
@@ -214,6 +229,7 @@ kwaque_cc_library(
     deps = [
         ":shard_affinity",
         ":task_scope",
+        "//src/base:metric_schema",
         "@seastar",
     ],
 )

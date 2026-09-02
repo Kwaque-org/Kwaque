@@ -717,6 +717,32 @@ SEASTAR_TEST_CASE(
     BOOST_REQUIRE(final_id.has_value());
     BOOST_TEST(final_id->value() == std::numeric_limits<std::uint64_t>::max());
     BOOST_TEST(cancel_event(reserved_target, *final_id));
+
+    scheduler capacity_target{*limits};
+    auto capacity = capacity_target.reserve_event_slot();
+    BOOST_REQUIRE(capacity.has_value());
+    const auto reserved_full = capacity_target.reserve_event_slot();
+    BOOST_REQUIRE(!reserved_full.has_value());
+    BOOST_CHECK(reserved_full.error().code() == kwaque::errc::queue_full);
+    const auto schedule_over_reservation = capacity_target.schedule(
+      monotonic_time{10}, event_priority::normal(), [] noexcept {});
+    BOOST_REQUIRE(!schedule_over_reservation.has_value());
+    BOOST_CHECK(
+      schedule_over_reservation.error().code() == kwaque::errc::queue_full);
+    capacity->release();
+    const auto schedule_after_release = capacity_target.schedule(
+      monotonic_time{10}, event_priority::normal(), [] noexcept {});
+    BOOST_REQUIRE(schedule_after_release.has_value());
+    BOOST_TEST(cancel_event(capacity_target, *schedule_after_release));
+
+    scheduler id_headroom_target{*limits};
+    auto id_headroom = id_headroom_target.reserve_event_id();
+    BOOST_REQUIRE(id_headroom.has_value());
+    const auto schedule_beside_id_headroom = id_headroom_target.schedule(
+      monotonic_time{10}, event_priority::normal(), [] noexcept {});
+    BOOST_REQUIRE(schedule_beside_id_headroom.has_value());
+    BOOST_TEST(cancel_event(id_headroom_target, *schedule_beside_id_headroom));
+    id_headroom->release();
     co_return;
 }
 

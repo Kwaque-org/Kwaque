@@ -110,6 +110,14 @@ SEASTAR_TEST_CASE(production_network_moves_idle_native_owners_after_use) {
     BOOST_REQUIRE(client_closed.has_value());
     BOOST_REQUIRE(server_closed.has_value());
     BOOST_REQUIRE(listener_closed.has_value());
+    BOOST_CHECK(
+      backend.statistics()
+      == (kwaque::runtime::operation_statistics_snapshot{
+        .active = 0,
+        .accepted = 8,
+        .completed = 8,
+        .completed_bytes = 2,
+      }));
 }
 
 SEASTAR_TEST_CASE(

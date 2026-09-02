@@ -156,12 +156,14 @@ public:
       file& owner,
       file_position position,
       bytes::fragmented_buffer data,
-      seastar::gate::holder holder)
+      seastar::gate::holder holder,
+      operation_statistics::reservation metric)
       : owner_(owner)
       , data_(std::move(data))
       , initial_position_(position.value())
       , total_bytes_(data_.size().value())
-      , holder_(std::move(holder)) {}
+      , holder_(std::move(holder))
+      , metric_(std::move(metric)) {}
 
     writer(writer&&) noexcept = default;
     writer& operator=(writer&&) = delete;
@@ -330,6 +332,7 @@ public:
             if (self.size_known_ && self.physical_end_ > self.final_size_) {
                 co_await self.owner_.native_file_.truncate(self.final_size_);
             }
+            self.metric_.add_completed_bytes(self.total_bytes_);
             co_return byte_count{self.total_bytes_};
         } catch (const std::bad_alloc&) {
             throw;
@@ -347,7 +350,8 @@ public:
       seastar::semaphore_units<> serialization,
       std::size_t completed,
       std::uint64_t write_alignment,
-      std::uint64_t memory_alignment) {
+      std::uint64_t memory_alignment,
+      operation_statistics::reservation metric) {
         static_cast<void>(data);
         static_cast<void>(serialization);
         const auto size = fragment.size();
@@ -360,6 +364,7 @@ public:
               completed,
               write_alignment,
               memory_alignment);
+            metric.add_completed_bytes(static_cast<std::uint64_t>(size));
             co_return byte_count{static_cast<std::uint64_t>(size)};
         } catch (const std::bad_alloc&) {
             throw;
@@ -478,6 +483,7 @@ private:
     std::uint64_t initial_position_;
     std::uint64_t total_bytes_;
     seastar::gate::holder holder_;
+    operation_statistics::reservation metric_;
     std::uint64_t original_size_{0};
     std::uint64_t final_size_{0};
     std::uint64_t physical_end_{0};
@@ -589,8 +595,12 @@ result<void> file_io_limits::validate() const noexcept {
     return {};
 }
 
-file::file(seastar::file&& native_file, file_io_limits limits)
-  : limits_(validated_file_io_limits(limits))
+file::file(
+  seastar::file&& native_file,
+  file_io_limits limits,
+  operation_statistics* statistics)
+  : statistics_(statistics != nullptr ? statistics : &local_statistics_)
+  , limits_(validated_file_io_limits(limits))
   , native_file_(require_open_file(std::move(native_file)))
   , read_operation_units_(limits_.pending_reads)
   , read_byte_units_(limits_.pending_read_bytes.value())
@@ -656,6 +666,10 @@ owner_shard file::prepare_move(file& other) noexcept {
 
 file::file(file&& other) noexcept
   : owner_(prepare_move(other))
+  , local_statistics_(other.local_statistics_)
+  , statistics_(
+      other.statistics_ == &other.local_statistics_ ? &local_statistics_
+                                                    : other.statistics_)
   , limits_(other.limits_)
   , native_file_(std::move(other.native_file_))
   , io_intent_(std::move(other.io_intent_))
@@ -758,10 +772,12 @@ std::optional<operation_error> file::operation_rejection() const {
 seastar::future<result<void>> file::flush() {
     owner_.assert_current();
     if (auto rejected = operation_rejection()) {
+        statistics_->reject();
         co_return failure(std::move(*rejected));
     }
     auto admission = try_acquire_metadata();
     if (!admission) {
+        statistics_->reject();
         co_return failure(file_error(errc::queue_full));
     }
     static_cast<void>(*admission);
@@ -770,6 +786,7 @@ seastar::future<result<void>> file::flush() {
       file_gate_invariant,
       holder.has_value(),
       "open file rejected operation gate entry");
+    [[maybe_unused]] auto metric = statistics_->accept();
     try {
         co_await native_file_.flush();
         co_return result<void>{};
@@ -786,16 +803,19 @@ file::read(file_position position, byte_count maximum_bytes) {
     if (
       auto valid = validate_file_read_request(position, maximum_bytes);
       !valid) {
+        statistics_->reject();
         result<file_read_result> outcome = failure(valid.error());
         return seastar::make_ready_future<result<file_read_result>>(
           std::move(outcome));
     }
     if (auto rejected = operation_rejection()) {
+        statistics_->reject();
         result<file_read_result> outcome = failure(std::move(*rejected));
         return seastar::make_ready_future<result<file_read_result>>(
           std::move(outcome));
     }
     if (maximum_bytes > limits_.pending_read_bytes) {
+        statistics_->reject();
         result<file_read_result> outcome = failure(
           file_error(errc::out_of_range));
         return seastar::make_ready_future<result<file_read_result>>(
@@ -803,6 +823,7 @@ file::read(file_position position, byte_count maximum_bytes) {
     }
     auto admission = try_acquire_read(maximum_bytes);
     if (!admission) {
+        statistics_->reject();
         result<file_read_result> outcome = failure(
           file_error(errc::queue_full));
         return seastar::make_ready_future<result<file_read_result>>(
@@ -813,17 +834,23 @@ file::read(file_position position, byte_count maximum_bytes) {
       file_gate_invariant,
       holder.has_value(),
       "open file rejected operation gate entry");
+    auto metric = statistics_->accept();
     const auto native_request = bounded_native_bulk_read(
       position.value(), maximum_bytes.value(), disk_read_dma_alignment_);
     if (native_request.bytes != maximum_bytes.value()) {
         return read_chunked(
-          position, maximum_bytes, std::move(*admission), std::move(*holder));
+          position,
+          maximum_bytes,
+          std::move(*admission),
+          std::move(*holder),
+          std::move(metric));
     }
     return native_file_
       .dma_read_bulk<char>(position.value(), native_request.bytes, &io_intent_)
       .then_wrapped(
         [admission = std::move(*admission),
          holder = std::move(*holder),
+         metric = std::move(metric),
          maximum_bytes,
          retained_bytes = native_request.retained_bytes](
           seastar::future<seastar::temporary_buffer<char>> completed) mutable
@@ -841,6 +868,7 @@ file::read(file_position position, byte_count maximum_bytes) {
                                                      : retained_bytes;
                 auto data = detail::fragmented_buffer_io_access::adopt(
                   std::move(native), retained);
+                metric.add_completed_bytes(data.size().value());
                 return file_read_result::make(
                   std::move(data), eof, maximum_bytes);
             } catch (const std::bad_alloc&) {
@@ -856,7 +884,8 @@ seastar::future<result<file_read_result>> file::read_chunked(
   file_position position,
   byte_count maximum_bytes,
   admission_reservation admission,
-  seastar::gate::holder holder) {
+  seastar::gate::holder holder,
+  operation_statistics::reservation metric) {
     static_cast<void>(admission);
     static_cast<void>(holder);
     bytes::fragmented_buffer data;
@@ -890,6 +919,7 @@ seastar::future<result<file_read_result>> file::read_chunked(
                 break;
             }
         }
+        metric.add_completed_bytes(data.size().value());
         co_return file_read_result::make(std::move(data), eof, maximum_bytes);
     } catch (const std::bad_alloc&) {
         throw;
@@ -902,11 +932,13 @@ seastar::future<result<byte_count>>
 file::write(file_position position, bytes::fragmented_buffer data) {
     owner_.assert_current();
     if (auto valid = validate_file_write_request(position, data); !valid) {
+        statistics_->reject();
         result<byte_count> outcome = failure(valid.error());
         return seastar::make_ready_future<result<byte_count>>(
           std::move(outcome));
     }
     if (auto rejected = operation_rejection()) {
+        statistics_->reject();
         result<byte_count> outcome = failure(std::move(*rejected));
         return seastar::make_ready_future<result<byte_count>>(
           std::move(outcome));
@@ -924,6 +956,7 @@ file::write(file_position position, bytes::fragmented_buffer data) {
       && is_aligned(data_size, append_alignment)
       && data_size <= append_chunk_limit_
       && is_aligned(only_fragment.data(), memory_alignment)) {
+        auto metric = statistics_->accept();
         auto consumer = detail::fragmented_buffer_io_access::consume(data);
         auto fragment = consumer.take_front();
         const auto expected = fragment.size();
@@ -935,6 +968,7 @@ file::write(file_position position, bytes::fragmented_buffer data) {
              data = std::move(data),
              fragment = std::move(fragment),
              serialization = std::move(*serialization),
+             metric = std::move(metric),
              expected,
              append_alignment,
              memory_alignment](seastar::future<std::size_t> completed) mutable
@@ -948,6 +982,8 @@ file::write(file_position position, bytes::fragmented_buffer data) {
                           std::move(outcome));
                     }
                     if (written == expected) {
+                        metric.add_completed_bytes(
+                          static_cast<std::uint64_t>(expected));
                         result<byte_count> outcome = byte_count{
                           static_cast<std::uint64_t>(expected)};
                         return seastar::make_ready_future<result<byte_count>>(
@@ -961,7 +997,8 @@ file::write(file_position position, bytes::fragmented_buffer data) {
                       std::move(serialization),
                       written,
                       append_alignment,
-                      memory_alignment);
+                      memory_alignment,
+                      std::move(metric));
                 } catch (const std::bad_alloc&) {
                     return seastar::current_exception_as_future<
                       result<byte_count>>();
@@ -977,6 +1014,7 @@ file::write(file_position position, bytes::fragmented_buffer data) {
     if (!serialization) {
         queued = try_acquire_queued_write(data.retained_bytes());
         if (!queued) {
+            statistics_->reject();
             result<byte_count> outcome = failure(file_error(errc::queue_full));
             return seastar::make_ready_future<result<byte_count>>(
               std::move(outcome));
@@ -987,8 +1025,14 @@ file::write(file_position position, bytes::fragmented_buffer data) {
       file_gate_invariant,
       holder.has_value(),
       "open file rejected operation gate entry");
+    auto metric = statistics_->accept();
     return writer::run(
-      writer{*this, position, std::move(data), std::move(*holder)},
+      writer{
+        *this,
+        position,
+        std::move(data),
+        std::move(*holder),
+        std::move(metric)},
       std::move(serialization),
       std::move(queued));
 }
@@ -996,6 +1040,7 @@ file::write(file_position position, bytes::fragmented_buffer data) {
 seastar::future<result<void>> file::truncate(std::uint64_t size) {
     owner_.assert_current();
     if (auto rejected = operation_rejection()) {
+        statistics_->reject();
         co_return failure(std::move(*rejected));
     }
     auto serialization = seastar::try_get_units(write_serialization_, 1);
@@ -1003,6 +1048,7 @@ seastar::future<result<void>> file::truncate(std::uint64_t size) {
     if (!serialization) {
         queued = try_acquire_queued_write(byte_count{});
         if (!queued) {
+            statistics_->reject();
             co_return failure(file_error(errc::queue_full));
         }
     }
@@ -1011,6 +1057,7 @@ seastar::future<result<void>> file::truncate(std::uint64_t size) {
       file_gate_invariant,
       holder.has_value(),
       "open file rejected operation gate entry");
+    [[maybe_unused]] auto metric = statistics_->accept();
     try {
         if (!serialization) {
             serialization.emplace(
@@ -1034,10 +1081,12 @@ seastar::future<result<void>> file::truncate(std::uint64_t size) {
 seastar::future<result<std::uint64_t>> file::size() {
     owner_.assert_current();
     if (auto rejected = operation_rejection()) {
+        statistics_->reject();
         co_return failure(std::move(*rejected));
     }
     auto admission = try_acquire_metadata();
     if (!admission) {
+        statistics_->reject();
         co_return failure(file_error(errc::queue_full));
     }
     static_cast<void>(*admission);
@@ -1046,6 +1095,7 @@ seastar::future<result<std::uint64_t>> file::size() {
       file_gate_invariant,
       holder.has_value(),
       "open file rejected operation gate entry");
+    [[maybe_unused]] auto metric = statistics_->accept();
     try {
         co_return co_await native_file_.size();
     } catch (const std::bad_alloc&) {
@@ -1077,8 +1127,11 @@ seastar::future<result<void>> file::close() {
     state_ = file_state::closing;
     abort_requested_ = true;
     io_intent_.cancel();
+    auto metric = statistics_->accept();
     auto completion = close_once().then_wrapped(
-      [this](seastar::future<result<void>> closed) {
+      [this, metric = std::move(metric)](
+        seastar::future<result<void>> closed) mutable {
+          static_cast<void>(metric);
           state_ = file_state::closed;
           try {
               close_done_->set_value(closed.get());

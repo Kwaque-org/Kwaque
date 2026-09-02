@@ -99,6 +99,20 @@ kwaque_cc_seastar_test(
 )
 
 kwaque_cc_seastar_test(
+    name = "metrics_lifecycle_test",
+    srcs = ["metrics_lifecycle_test.cc"],
+    cpu = 2,
+    memory = "256MiB",
+    deps = [
+        "//src/admin:admin_server",
+        "//src/base:metric_schema",
+        "//src/runtime:runtime_service",
+        "//src/runtime:sharded_service",
+        "//src/runtime/production:backend",
+    ],
+)
+
+kwaque_cc_seastar_test(
     name = "data_directory_test",
     srcs = ["data_directory_test.cc"],
     cpu = 1,
@@ -133,7 +147,7 @@ py_test(
     main = "config_cli_test.py",
     tags = [
         "requires-network",
-        "resources:cpu:2",
-        "resources:memory:128",
+        "resources:cpu:4",
+        "resources:memory:256",
     ],
 )

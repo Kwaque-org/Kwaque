@@ -6,6 +6,7 @@
 #include <seastar/core/metrics.hh>
 
 #include <cstdint>
+#include <optional>
 
 namespace kwaque::admin {
 
@@ -33,7 +34,7 @@ private:
     double startup_duration_seconds_{0.0};
     std::uint64_t shutdown_count_{0};
     std::uint64_t request_count_{0};
-    seastar::metrics::metric_groups metrics_;
+    std::optional<seastar::metrics::metric_groups> metrics_;
 };
 
 } // namespace kwaque::admin

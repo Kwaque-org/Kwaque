@@ -181,6 +181,10 @@ enum class builtin_fault_point : std::uint8_t {
     file_truncate,
     file_size,
     file_close,
+    environment_start,
+    resource_group_create,
+    queue_admission,
+    environment_stop,
 };
 
 struct fault_point_descriptor final {
@@ -411,6 +415,29 @@ inline constexpr std::array builtin_fault_points{
       fault_action::delay,
       fault_action::drop_completion,
       fault_action::crash>()},
+  fault_point_descriptor{
+    .point = builtin_fault_point::environment_start,
+    .id = fault_point_id::constant<24>(),
+    .name = "environment_start",
+    .permitted_actions
+    = fault_action_set::constant<fault_action::error, fault_action::delay>()},
+  fault_point_descriptor{
+    .point = builtin_fault_point::resource_group_create,
+    .id = fault_point_id::constant<25>(),
+    .name = "resource_group_create",
+    .permitted_actions = fault_action_set::constant<fault_action::error>()},
+  fault_point_descriptor{
+    .point = builtin_fault_point::queue_admission,
+    .id = fault_point_id::constant<26>(),
+    .name = "queue_admission",
+    .permitted_actions
+    = fault_action_set::constant<fault_action::error, fault_action::delay>()},
+  fault_point_descriptor{
+    .point = builtin_fault_point::environment_stop,
+    .id = fault_point_id::constant<27>(),
+    .name = "environment_stop",
+    .permitted_actions
+    = fault_action_set::constant<fault_action::error, fault_action::delay>()},
 };
 
 [[nodiscard]] consteval bool valid_builtin_fault_points() noexcept {
@@ -418,6 +445,7 @@ inline constexpr std::array builtin_fault_points{
         if (
           builtin_fault_points[left].point
             != static_cast<builtin_fault_point>(left)
+          || builtin_fault_points[left].id.value() != left + 1U
           || builtin_fault_points[left].name.empty()
           || builtin_fault_points[left].name.size() > 32) {
             return false;

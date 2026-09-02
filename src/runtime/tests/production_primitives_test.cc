@@ -102,6 +102,13 @@ SEASTAR_TEST_CASE(production_timer_handles_future_deadline_and_caller_abort) {
 
     BOOST_REQUIRE(completed.has_value());
     BOOST_REQUIRE(completed_stop.has_value());
+    BOOST_CHECK(
+      completed_service.statistics()
+      == (kwaque::runtime::operation_statistics_snapshot{
+        .active = 0,
+        .accepted = 1,
+        .completed = 1,
+      }));
 
     timer aborted_service;
     seastar::abort_source preaborted;
@@ -113,6 +120,11 @@ SEASTAR_TEST_CASE(production_timer_handles_future_deadline_and_caller_abort) {
     BOOST_REQUIRE(!aborted.has_value());
     BOOST_CHECK(aborted.error().code() == kwaque::errc::aborted);
     BOOST_REQUIRE(aborted_stop.has_value());
+    BOOST_CHECK(
+      aborted_service.statistics()
+      == (kwaque::runtime::operation_statistics_snapshot{
+        .rejected = 1,
+      }));
 }
 
 SEASTAR_TEST_CASE(production_timer_checks_native_signed_duration_boundary) {

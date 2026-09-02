@@ -5,9 +5,11 @@
 
 #include <seastar/core/abort_source.hh>
 #include <seastar/core/future.hh>
+#include <seastar/core/metrics_registration.hh>
 #include <seastar/core/shard_id.hh>
 
 #include <functional>
+#include <optional>
 
 namespace kwaque::runtime {
 
@@ -29,7 +31,10 @@ public:
     [[nodiscard]] task_scope& tasks();
 
 private:
+    void register_metrics();
+
     task_scope tasks_;
+    std::optional<seastar::metrics::metric_groups> metrics_;
     bool ready_{false};
 };
 

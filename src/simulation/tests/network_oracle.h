@@ -156,6 +156,7 @@ struct oracle_step final {
     std::uint8_t target{0};
     std::uint16_t port{0};
     std::uint64_t value{0};
+    std::uint8_t pattern{0};
     runtime::fault_action action{runtime::fault_action::none};
 };
 

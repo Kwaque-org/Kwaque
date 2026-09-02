@@ -88,6 +88,8 @@ TEST(OperationErrorTest, SchedulerBudgetVocabularyIsStableAndBounded) {
     static_assert(static_cast<std::uint8_t>(operation_kind::clock) == 10);
     static_assert(static_cast<std::uint8_t>(operation_kind::trace) == 11);
     static_assert(
+      static_cast<std::uint8_t>(operation_kind::observability) == 12);
+    static_assert(
       static_cast<std::uint8_t>(operation_context_key::sequence) == 8);
     static_assert(static_cast<std::uint8_t>(operation_context_key::limit) == 9);
     static_assert(
@@ -98,6 +100,9 @@ TEST(OperationErrorTest, SchedulerBudgetVocabularyIsStableAndBounded) {
       static_cast<std::uint8_t>(operation_context_key::detail) == 12);
     EXPECT_EQ(kwaque::runtime::to_string(operation_kind::clock), "clock");
     EXPECT_EQ(kwaque::runtime::to_string(operation_kind::trace), "trace");
+    EXPECT_EQ(
+      kwaque::runtime::to_string(operation_kind::observability),
+      "observability");
 
     operation_error error{
       kwaque::errc::resource_exhausted, operation_kind::scheduler};

@@ -20,6 +20,8 @@
 
 namespace kwaque::simulation {
 
+class fault_schedule;
+
 inline constexpr std::uint32_t default_fault_schedule_rules{4'096};
 inline constexpr std::uint32_t maximum_fault_schedule_rules{65'536};
 inline constexpr std::uint64_t fault_trace_no_sample{
@@ -211,6 +213,7 @@ private:
 
     prepared_fault_evaluation() noexcept = default;
     prepared_fault_evaluation(
+      fault_schedule& owner,
       runtime::fault_decision decision,
       bool applied,
       trace_entry entry,
@@ -218,6 +221,7 @@ private:
       std::uint64_t master_seed,
       std::uint64_t next_draw) noexcept;
 
+    fault_schedule* owner_{nullptr};
     runtime::fault_decision decision_{};
     trace_entry entry_{};
     event_trace::reservation reservation_{};
@@ -258,8 +262,18 @@ public:
         assert_current();
         return random_.master_seed();
     }
+    [[nodiscard]] std::uint64_t evaluations() const noexcept {
+        assert_current();
+        return evaluations_;
+    }
+    [[nodiscard]] std::uint64_t applied_decisions() const noexcept {
+        assert_current();
+        return applied_decisions_;
+    }
 
 private:
+    friend class prepared_fault_evaluation;
+
     struct rule_group final {
         runtime::builtin_fault_point point;
         std::optional<runtime::fault_object_key> object;
@@ -306,6 +320,8 @@ private:
     seastar::chunked_vector<fault_rule> rules_;
     seastar::chunked_vector<rule_group> groups_;
     std::array<group_range, runtime::builtin_fault_points.size()> ranges_;
+    std::uint64_t evaluations_{0};
+    std::uint64_t applied_decisions_{0};
 };
 
 static_assert(runtime::fault_injector<fault_schedule>);

@@ -12,7 +12,9 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <exception>
 #include <optional>
+#include <utility>
 
 namespace kwaque::resource {
 
@@ -86,7 +88,16 @@ private:
     friend class resource_registry_test_access;
 
     void assert_coordinator() const;
-    void inject_before_creation();
+    template<typename Checkpoint>
+    [[nodiscard]] seastar::future<>
+    start_with(resource_config config, Checkpoint checkpoint);
+    void prepare_start(resource_config config);
+    [[nodiscard]] seastar::future<>
+    create_scheduling_group(workload_class classification);
+    [[nodiscard]] seastar::future<>
+    create_smp_service_group(workload_class classification);
+    [[nodiscard]] seastar::future<> rollback_start() noexcept;
+    void finish_start();
     [[nodiscard]] seastar::future<> destroy_created_groups();
     [[nodiscard]] seastar::future<> stop_once();
 
@@ -97,9 +108,32 @@ private:
     std::optional<resource_config> config_;
     seastar::shared_promise<> stop_done_;
     resource_registry_state state_{resource_registry_state::constructed};
-    std::optional<std::size_t> fail_before_creation_;
-    std::size_t creation_point_{0};
     std::uint64_t generation_{0};
 };
+
+template<typename Checkpoint>
+seastar::future<>
+resource_registry::start_with(resource_config config, Checkpoint checkpoint) {
+    prepare_start(std::move(config));
+
+    std::exception_ptr startup_failure;
+    try {
+        std::size_t point = 0;
+        for (const auto classification : all_workload_classes) {
+            checkpoint(point++);
+            co_await create_scheduling_group(classification);
+            checkpoint(point++);
+            co_await create_smp_service_group(classification);
+        }
+    } catch (...) {
+        startup_failure = std::current_exception();
+    }
+
+    if (startup_failure) {
+        co_await rollback_start();
+        std::rethrow_exception(startup_failure);
+    }
+    finish_start();
+}
 
 } // namespace kwaque::resource

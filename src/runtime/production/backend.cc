@@ -1,14 +1,17 @@
 #include "src/runtime/production/backend.h"
 
 #include "src/base/invariant.h"
+#include "src/base/metric_schema.h"
 
 #include <seastar/core/coroutine.hh>
+#include <seastar/core/metrics.hh>
 
 #include <exception>
 #include <new>
 #include <stdexcept>
 #include <system_error>
 #include <utility>
+#include <vector>
 
 namespace kwaque::runtime::production {
 
@@ -102,6 +105,8 @@ seastar::future<> backend::stop_once() {
         first_failure = std::current_exception();
     }
 
+    metrics_.reset();
+
     if (dns_) {
         try {
             throw_if_failed(co_await dns_->stop());
@@ -149,6 +154,94 @@ backend_state backend::state() const {
 bool backend::abort_requested() const {
     assert_current();
     return abort_requested_;
+}
+
+void backend::register_metrics() {
+    namespace metrics = seastar::metrics;
+    try {
+        metrics_.emplace();
+        const std::vector<metrics::label> aggregate{metrics::shard_label};
+        const auto add_group = [this, &aggregate](
+                                 operation_statistics& statistics,
+                                 metric_id active_id,
+                                 metric_id accepted_id,
+                                 metric_id completed_id,
+                                 metric_id rejected_id,
+                                 std::optional<metric_id> bytes_id) {
+            const auto& active = *descriptor_for(active_id);
+            const auto& accepted = *descriptor_for(accepted_id);
+            const auto& completed = *descriptor_for(completed_id);
+            const auto& rejected = *descriptor_for(rejected_id);
+            auto* values = &statistics;
+            std::vector<metrics::metric_definition> definitions;
+            definitions.reserve(bytes_id ? 5U : 4U);
+            definitions.emplace_back(
+              metrics::make_gauge(
+                seastar::sstring{active.name},
+                [values] { return values->active(); },
+                metrics::description(seastar::sstring{active.help}))
+                .aggregate(aggregate));
+            definitions.emplace_back(
+              metrics::make_counter(
+                seastar::sstring{accepted.name},
+                [values] { return values->accepted(); },
+                metrics::description(seastar::sstring{accepted.help}))
+                .aggregate(aggregate));
+            definitions.emplace_back(
+              metrics::make_counter(
+                seastar::sstring{completed.name},
+                [values] { return values->completed(); },
+                metrics::description(seastar::sstring{completed.help}))
+                .aggregate(aggregate));
+            definitions.emplace_back(
+              metrics::make_counter(
+                seastar::sstring{rejected.name},
+                [values] { return values->rejected(); },
+                metrics::description(seastar::sstring{rejected.help}))
+                .aggregate(aggregate));
+            if (bytes_id) {
+                const auto& bytes = *descriptor_for(*bytes_id);
+                definitions.emplace_back(
+                  metrics::make_counter(
+                    seastar::sstring{bytes.name},
+                    [values] { return values->completed_bytes(); },
+                    metrics::description(seastar::sstring{bytes.help}))
+                    .aggregate(aggregate));
+            }
+            metrics_->add_group(seastar::sstring{active.group}, definitions);
+        };
+        add_group(
+          timer_statistics_,
+          metric_id::timer_active,
+          metric_id::timer_accepted_total,
+          metric_id::timer_completed_total,
+          metric_id::timer_rejected_total,
+          std::nullopt);
+        add_group(
+          file_statistics_,
+          metric_id::file_active,
+          metric_id::file_accepted_total,
+          metric_id::file_completed_total,
+          metric_id::file_rejected_total,
+          metric_id::file_completed_bytes_total);
+        add_group(
+          network_statistics_,
+          metric_id::network_active,
+          metric_id::network_accepted_total,
+          metric_id::network_completed_total,
+          metric_id::network_rejected_total,
+          metric_id::network_completed_bytes_total);
+        add_group(
+          dns_statistics_,
+          metric_id::dns_active,
+          metric_id::dns_accepted_total,
+          metric_id::dns_completed_total,
+          metric_id::dns_rejected_total,
+          std::nullopt);
+    } catch (...) {
+        metrics_.reset();
+        throw;
+    }
 }
 
 } // namespace kwaque::runtime::production

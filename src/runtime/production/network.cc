@@ -106,8 +106,10 @@ connection::connection(
   seastar::connected_socket native,
   network_endpoint local,
   network_endpoint remote,
-  network_connection_limits limits)
-  : native_(std::move(native))
+  network_connection_limits limits,
+  operation_statistics* statistics)
+  : statistics_(statistics != nullptr ? statistics : &local_statistics_)
+  , native_(std::move(native))
   , input_(native_.input(
       seastar::connected_socket_input_stream_config{
         .buffer_size = 8192,
@@ -136,6 +138,10 @@ owner_shard connection::prepare_move(connection& other) noexcept {
 
 connection::connection(connection&& other) noexcept
   : owner_(prepare_move(other))
+  , local_statistics_(other.local_statistics_)
+  , statistics_(
+      other.statistics_ == &other.local_statistics_ ? &local_statistics_
+                                                    : other.statistics_)
   , native_(std::move(other.native_))
   , input_(std::move(other.input_))
   , output_(std::move(other.output_))
@@ -199,22 +205,26 @@ seastar::future<result<network_read_result>> connection::read(
   byte_count maximum_bytes, seastar::abort_source& caller_abort) {
     owner_.assert_current();
     if (auto valid = validate_network_read_limit(maximum_bytes); !valid) {
+        statistics_->reject();
         result<network_read_result> outcome = failure(valid.error());
         return seastar::make_ready_future<result<network_read_result>>(
           std::move(outcome));
     }
     if (caller_abort.abort_requested()) {
+        statistics_->reject();
         result<network_read_result> outcome = failure(
           network_error(errc::aborted));
         return seastar::make_ready_future<result<network_read_result>>(
           std::move(outcome));
     }
     if (auto rejected = input_rejection()) {
+        statistics_->reject();
         result<network_read_result> outcome = failure(std::move(*rejected));
         return seastar::make_ready_future<result<network_read_result>>(
           std::move(outcome));
     }
     if (read_in_flight_) {
+        statistics_->reject();
         result<network_read_result> outcome = failure(
           network_error(errc::unavailable));
         return seastar::make_ready_future<result<network_read_result>>(
@@ -226,12 +236,16 @@ seastar::future<result<network_read_result>> connection::read(
       holder.has_value(),
       "open connection rejected input gate entry");
     read_in_flight_ = true;
+    auto metric = statistics_->accept();
     const auto physical_limit = static_cast<std::size_t>(
       std::min<std::uint64_t>(
         maximum_bytes.value(), maximum_contiguous_allocation_bytes));
     return input_.read_up_to(physical_limit)
       .then_wrapped(
-        [this, holder = std::move(*holder), maximum_bytes](
+        [this,
+         holder = std::move(*holder),
+         metric = std::move(metric),
+         maximum_bytes](
           seastar::future<seastar::temporary_buffer<char>> completed) mutable
           -> result<network_read_result> {
             static_cast<void>(holder);
@@ -249,6 +263,7 @@ seastar::future<result<network_read_result>> connection::read(
                 auto data
                   = kwaque::runtime::detail::fragmented_buffer_io_access::adopt(
                     std::move(native), retained);
+                metric.add_completed_bytes(data.size().value());
                 return network_read_result::make(
                   std::move(data), eof, maximum_bytes);
             } catch (const std::bad_alloc&) {
@@ -267,19 +282,23 @@ seastar::future<result<void>> connection::write(
   bytes::fragmented_buffer data, seastar::abort_source& caller_abort) {
     owner_.assert_current();
     if (auto valid = validate_network_write(data, limits_); !valid) {
+        statistics_->reject();
         result<void> outcome = failure(valid.error());
         return seastar::make_ready_future<result<void>>(std::move(outcome));
     }
     if (caller_abort.abort_requested()) {
+        statistics_->reject();
         result<void> outcome = failure(network_error(errc::aborted));
         return seastar::make_ready_future<result<void>>(std::move(outcome));
     }
     if (auto rejected = output_rejection()) {
+        statistics_->reject();
         result<void> outcome = failure(std::move(*rejected));
         return seastar::make_ready_future<result<void>>(std::move(outcome));
     }
     auto reservation = admission_.try_acquire(data.retained_bytes());
     if (!reservation) {
+        statistics_->reject();
         result<void> outcome = failure(network_error(errc::queue_full));
         return seastar::make_ready_future<result<void>>(std::move(outcome));
     }
@@ -288,6 +307,7 @@ seastar::future<result<void>> connection::write(
       connection_gate_invariant,
       holder.has_value(),
       "open connection rejected output gate entry");
+    auto metric = statistics_->accept();
 
     auto serialization = seastar::try_get_units(write_serializer_, 1);
     if (serialization) [[likely]] {
@@ -303,7 +323,8 @@ seastar::future<result<void>> connection::write(
                  bytes,
                  reservation = std::move(*reservation),
                  holder = std::move(*holder),
-                 serialization = std::move(*serialization)](
+                 serialization = std::move(*serialization),
+                 metric = std::move(metric)](
                   seastar::future<> completion) mutable
                   -> seastar::future<result<void>> {
                     try {
@@ -330,6 +351,7 @@ seastar::future<result<void>> connection::write(
                     if (
                       write_serializer_.waiters() != 0
                       && unflushed_bytes_ < maximum_unflushed_bytes) {
+                        metric.add_completed_bytes(bytes);
                         result<void> outcome;
                         return seastar::make_ready_future<result<void>>(
                           std::move(outcome));
@@ -339,17 +361,21 @@ seastar::future<result<void>> connection::write(
                       [this,
                        reservation = std::move(reservation),
                        holder = std::move(holder),
-                       serialization = std::move(serialization)](
+                       serialization = std::move(serialization),
+                       metric = std::move(metric),
+                       bytes](
                         seastar::future<> flushed) mutable -> result<void> {
                           static_cast<void>(reservation);
                           static_cast<void>(holder);
                           static_cast<void>(serialization);
+                          static_cast<void>(metric);
                           try {
                               flushed.get();
                               unflushed_bytes_ = 0;
                               if (abort_requested_) {
                                   return failure(network_error(errc::aborted));
                               }
+                              metric.add_completed_bytes(bytes);
                               return {};
                           } catch (const std::bad_alloc&) {
                               throw;
@@ -366,20 +392,23 @@ seastar::future<result<void>> connection::write(
           std::move(data),
           std::move(*reservation),
           std::move(*holder),
-          std::move(*serialization));
+          std::move(*serialization),
+          std::move(metric));
     }
     return write_general(
       std::move(data),
       caller_abort,
       std::move(*reservation),
-      std::move(*holder));
+      std::move(*holder),
+      std::move(metric));
 }
 
 seastar::future<result<void>> connection::write_acquired(
   bytes::fragmented_buffer data,
   network_write_admission::reservation reservation,
   seastar::gate::holder holder,
-  seastar::semaphore_units<> serialization) {
+  seastar::semaphore_units<> serialization,
+  operation_statistics::reservation metric) {
     static_cast<void>(reservation);
     static_cast<void>(holder);
     static_cast<void>(serialization);
@@ -403,6 +432,7 @@ seastar::future<result<void>> connection::write_acquired(
         if (abort_requested_) {
             co_return failure(network_error(errc::aborted));
         }
+        metric.add_completed_bytes(bytes);
         co_return result<void>{};
     } catch (const std::bad_alloc&) {
         throw;
@@ -419,7 +449,8 @@ seastar::future<result<void>> connection::write_general(
   bytes::fragmented_buffer data,
   seastar::abort_source& caller_abort,
   network_write_admission::reservation reservation,
-  seastar::gate::holder holder) {
+  seastar::gate::holder holder,
+  operation_statistics::reservation metric) {
     static_cast<void>(reservation);
     static_cast<void>(holder);
     try {
@@ -449,6 +480,7 @@ seastar::future<result<void>> connection::write_general(
         if (abort_requested_) {
             co_return failure(network_error(errc::aborted));
         }
+        metric.add_completed_bytes(bytes);
         co_return result<void>{};
     } catch (const std::bad_alloc&) {
         throw;
@@ -515,8 +547,10 @@ const network_connection_limits& connection::limits() const noexcept {
 result<void> connection::shutdown_input() {
     owner_.assert_current();
     if (auto rejected = input_rejection()) {
+        statistics_->reject();
         return failure(std::move(*rejected));
     }
+    [[maybe_unused]] auto metric = statistics_->accept();
     try {
         input_state_ = network_half_state::shut_down;
         native_.shutdown_input();
@@ -529,8 +563,10 @@ result<void> connection::shutdown_input() {
 result<void> connection::shutdown_output() {
     owner_.assert_current();
     if (auto rejected = output_rejection()) {
+        statistics_->reject();
         return failure(std::move(*rejected));
     }
+    [[maybe_unused]] auto metric = statistics_->accept();
     try {
         output_state_ = network_half_state::shut_down;
         native_.shutdown_output();
@@ -580,8 +616,11 @@ seastar::future<result<void>> connection::close() {
     }
     state_ = network_connection_state::closing;
     request_abort();
+    auto metric = statistics_->accept();
     auto completion = close_once().then_wrapped(
-      [this](seastar::future<result<void>> closed) {
+      [this, metric = std::move(metric)](
+        seastar::future<result<void>> closed) mutable {
+          static_cast<void>(metric);
           state_ = network_connection_state::closed;
           try {
               close_done_->set_value(closed.get());
@@ -636,8 +675,10 @@ seastar::future<result<void>> connection::close_once() {
 listener::listener(
   seastar::server_socket native,
   network_endpoint local,
-  network_connection_limits limits)
-  : native_(std::move(native))
+  network_connection_limits limits,
+  operation_statistics* statistics)
+  : statistics_(statistics != nullptr ? statistics : &local_statistics_)
+  , native_(std::move(native))
   , local_(local)
   , limits_(limits) {}
 
@@ -653,6 +694,10 @@ owner_shard listener::prepare_move(listener& other) noexcept {
 
 listener::listener(listener&& other) noexcept
   : owner_(prepare_move(other))
+  , local_statistics_(other.local_statistics_)
+  , statistics_(
+      other.statistics_ == &other.local_statistics_ ? &local_statistics_
+                                                    : other.statistics_)
   , native_(std::move(other.native_))
   , local_(other.local_)
   , limits_(other.limits_)
@@ -680,12 +725,15 @@ seastar::future<result<connection>>
 listener::accept(seastar::abort_source& caller_abort) {
     owner_.assert_current();
     if (caller_abort.abort_requested() || aborted_) {
+        statistics_->reject();
         co_return failure(network_error(errc::aborted));
     }
     if (closing_ || closed_) {
+        statistics_->reject();
         co_return failure(network_error(errc::closed));
     }
     if (accept_in_flight_) {
+        statistics_->reject();
         co_return failure(network_error(errc::unavailable));
     }
     auto holder = accepts_.try_hold();
@@ -694,6 +742,7 @@ listener::accept(seastar::abort_source& caller_abort) {
       holder.has_value(),
       "open listener rejected accept gate entry");
     accept_in_flight_ = true;
+    [[maybe_unused]] auto metric = statistics_->accept();
     auto reset_accept = seastar::defer([this] { accept_in_flight_ = false; });
     try {
         auto accepted = co_await native_.accept();
@@ -705,7 +754,7 @@ listener::accept(seastar::abort_source& caller_abort) {
         const auto local = kwaque_endpoint(accepted.connection.local_address());
         const auto remote = kwaque_endpoint(accepted.remote_address);
         co_return connection{
-          std::move(accepted.connection), local, remote, limits_};
+          std::move(accepted.connection), local, remote, limits_, statistics_};
     } catch (const std::bad_alloc&) {
         throw;
     } catch (...) {
@@ -753,8 +802,10 @@ seastar::future<result<void>> listener::close() {
     }
     closing_ = true;
     request_abort();
+    auto metric = statistics_->accept();
     auto completion = accepts_.close().then_wrapped(
-      [this](seastar::future<> drained) {
+      [this, metric = std::move(metric)](seastar::future<> drained) mutable {
+          static_cast<void>(metric);
           auto release_native = seastar::defer(
             [this] { native_ = seastar::server_socket{}; });
           static_cast<void>(release_native);
@@ -780,16 +831,20 @@ seastar::future<result<connection>> network::connect(
   seastar::abort_source& caller_abort) {
     assert_current();
     if (auto valid = limits.validate(); !valid) {
+        statistics_->reject();
         co_return failure(valid.error());
     }
     if (caller_abort.abort_requested()) {
+        statistics_->reject();
         co_return failure(network_error(errc::aborted));
     }
     auto socket = seastar::engine().net().socket();
     connect_detail::connect_abort_guard subscription{socket, caller_abort};
     if (!subscription.armed()) {
+        statistics_->reject();
         co_return failure(network_error(errc::aborted));
     }
+    [[maybe_unused]] auto metric = statistics_->accept();
     try {
         auto native = co_await socket.connect(
           native_endpoint(endpoint),
@@ -802,7 +857,8 @@ seastar::future<result<connection>> network::connect(
         }
         const auto local = kwaque_endpoint(native.local_address());
         const auto remote = kwaque_endpoint(native.remote_address());
-        co_return connection{std::move(native), local, remote, limits};
+        co_return connection{
+          std::move(native), local, remote, limits, statistics_};
     } catch (const std::bad_alloc&) {
         throw;
     } catch (...) {
@@ -818,8 +874,10 @@ seastar::future<result<listener>>
 network::listen(network_endpoint endpoint, network_listen_options options) {
     assert_current();
     if (auto valid = options.validate(); !valid) {
+        statistics_->reject();
         co_return failure(valid.error());
     }
+    [[maybe_unused]] auto metric = statistics_->accept();
     try {
         seastar::listen_options native_options;
         native_options.set_fixed_cpu(seastar::this_shard_id());
@@ -836,7 +894,8 @@ network::listen(network_endpoint endpoint, network_listen_options options) {
         auto native = seastar::listen(
           native_endpoint(endpoint), native_options);
         const auto local = kwaque_endpoint(native.local_address());
-        co_return listener{std::move(native), local, options.connection_limits};
+        co_return listener{
+          std::move(native), local, options.connection_limits, statistics_};
     } catch (const std::bad_alloc&) {
         throw;
     } catch (...) {

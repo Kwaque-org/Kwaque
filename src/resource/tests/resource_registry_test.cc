@@ -134,10 +134,10 @@ SEASTAR_TEST_CASE(resource_registry_rolls_back_every_group_creation_point) {
          point < resource_registry_test_access::creation_point_count;
          ++point) {
         resource_registry registry;
-        resource_registry_test_access::fail_before_creation(registry, point);
         bool injected = false;
         try {
-            co_await registry.start(test_config());
+            co_await resource_registry_test_access::fail_before_creation(
+              registry, test_config(), point);
         } catch (const std::runtime_error&) {
             injected = true;
         }
@@ -160,10 +160,10 @@ SEASTAR_TEST_CASE(resource_manager_rolls_back_every_local_start_point) {
          point < resource_manager_test_access::start_point_count;
          ++point) {
         resource_manager manager{handles};
-        resource_manager_test_access::fail_before_start_point(manager, point);
         bool injected = false;
         try {
-            co_await manager.start();
+            co_await resource_manager_test_access::fail_before_start_point(
+              manager, point);
         } catch (const std::runtime_error&) {
             injected = true;
         }

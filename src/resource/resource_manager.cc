@@ -1,5 +1,7 @@
 #include "src/resource/resource_manager.h"
 
+#include "src/base/metric_schema.h"
+
 #include <seastar/core/coroutine.hh>
 #include <seastar/core/metrics.hh>
 #include <seastar/core/sstring.hh>
@@ -67,29 +69,79 @@ resource_manager::~resource_manager() {
 }
 
 void resource_manager::register_metrics() {
-    namespace metrics = seastar::metrics;
-    std::vector<metrics::metric_definition> definitions;
-    definitions.reserve(workload_class_count);
-    for (const auto classification : all_workload_classes) {
-        const auto value = seastar::sstring{
-          std::string{descriptor_for(classification).metric_name}};
-        std::vector<metrics::label_instance> labels{
-          metrics::label_instance{seastar::sstring{"workload"}, value}};
-
-        definitions.emplace_back(
-          metrics::make_gauge(
-            "memory_bytes_reserved",
-            [this, classification] {
-                return memory_used(classification).value();
-            },
-            metrics::description("Bytes reserved against the class budget"),
-            labels));
+    if (metrics_) {
+        throw std::logic_error("resource metrics are already registered");
     }
-    metrics_.add_group("resource_manager", definitions);
+    namespace metrics = seastar::metrics;
+    try {
+        metrics_.emplace();
+        std::vector<metrics::metric_definition> definitions;
+        definitions.reserve(workload_class_count * 4U);
+        const std::vector<metrics::label> aggregate{metrics::shard_label};
+        const auto& configured = *kwaque::descriptor_for(
+          metric_id::memory_configured_bytes);
+        const auto& used = *kwaque::descriptor_for(
+          metric_id::memory_used_bytes);
+        const auto& available = *kwaque::descriptor_for(
+          metric_id::memory_available_bytes);
+        const auto& waiters = *kwaque::descriptor_for(
+          metric_id::memory_waiters);
+        for (const auto classification : all_workload_classes) {
+            const auto index = workload_index(classification);
+            const auto value = seastar::sstring{
+              metric_workload_label_values[index]};
+            std::vector<metrics::label_instance> labels{metrics::label_instance{
+              seastar::sstring{metric_workload_label}, value}};
+
+            definitions.emplace_back(
+              metrics::make_gauge(
+                seastar::sstring{configured.name},
+                [this, classification] {
+                    return handles_.config().budget(classification).value();
+                },
+                metrics::description(seastar::sstring{configured.help}),
+                labels)
+                .aggregate(aggregate));
+            definitions.emplace_back(
+              metrics::make_gauge(
+                seastar::sstring{used.name},
+                [this, classification, index] {
+                    const auto capacity
+                      = handles_.config().budget(classification).value();
+                    return capacity
+                           - static_cast<std::uint64_t>(
+                             memory_admissions_[index]->current());
+                },
+                metrics::description(seastar::sstring{used.help}),
+                labels)
+                .aggregate(aggregate));
+            definitions.emplace_back(
+              metrics::make_gauge(
+                seastar::sstring{available.name},
+                [this, index] {
+                    return static_cast<std::uint64_t>(
+                      memory_admissions_[index]->current());
+                },
+                metrics::description(seastar::sstring{available.help}),
+                labels)
+                .aggregate(aggregate));
+            definitions.emplace_back(
+              metrics::make_gauge(
+                seastar::sstring{waiters.name},
+                [this, index] { return memory_admissions_[index]->waiters(); },
+                metrics::description(seastar::sstring{waiters.help}),
+                labels)
+                .aggregate(aggregate));
+        }
+        metrics_->add_group(seastar::sstring{configured.group}, definitions);
+    } catch (...) {
+        metrics_.reset();
+        throw;
+    }
 }
 
 void resource_manager::rollback_start() {
-    metrics_.clear();
+    metrics_.reset();
     for (auto& admission : memory_admissions_) {
         admission.reset();
     }
@@ -102,6 +154,10 @@ void resource_manager::rollback_start() {
 }
 
 seastar::future<> resource_manager::start() {
+    return start_with([](std::size_t) noexcept {});
+}
+
+void resource_manager::prepare_start() {
     assert_current();
     if (state_ != resource_manager_state::constructed) {
         throw std::logic_error("resource manager cannot be started");
@@ -113,36 +169,6 @@ seastar::future<> resource_manager::start() {
 
     active_manager = this;
     state_ = resource_manager_state::starting;
-    try {
-        if (!handles_.try_acquire_manager_lease()) {
-            throw std::logic_error("resource handles are no longer valid");
-        }
-        registry_lease_acquired_ = true;
-        for (const auto classification : all_workload_classes) {
-            const auto index = workload_index(classification);
-            if (
-              fail_before_start_point_ && index == *fail_before_start_point_) {
-                throw std::runtime_error(
-                  "injected resource manager start failure");
-            }
-            const auto capacity = handles_.config().budget(classification);
-            if (capacity.value() > seastar::semaphore::max_counter()) {
-                throw std::invalid_argument(
-                  "workload memory budget exceeds semaphore capacity");
-            }
-            memory_admissions_[index].emplace(capacity.value());
-        }
-        register_metrics();
-        state_ = resource_manager_state::started;
-        return seastar::make_ready_future<>();
-    } catch (...) {
-        auto failure = std::current_exception();
-        try {
-            rollback_start();
-        } catch (...) {
-        }
-        return seastar::make_exception_future<>(std::move(failure));
-    }
 }
 
 void resource_manager::request_abort() {
@@ -161,13 +187,7 @@ seastar::future<> resource_manager::stop_once() {
     } catch (...) {
         failure = std::current_exception();
     }
-    try {
-        metrics_.clear();
-    } catch (...) {
-        if (!failure) {
-            failure = std::current_exception();
-        }
-    }
+    metrics_.reset();
     active_manager = nullptr;
     for (const auto classification : all_workload_classes) {
         const auto index = workload_index(classification);

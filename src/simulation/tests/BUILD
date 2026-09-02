@@ -1,6 +1,7 @@
 load("//bazel:build.bzl", "kwaque_cc_library")
 load(
     "//bazel:test.bzl",
+    "kwaque_cc_benchmark",
     "kwaque_cc_seastar_test",
     "kwaque_cc_test",
 )
@@ -25,6 +26,7 @@ kwaque_cc_library(
     deps = [
         "//src/runtime:error",
         "//src/runtime:fault_api",
+        "//src/simulation:deterministic_random",
         "//src/simulation:sha256",
         "@boost//:multiprecision",
     ],
@@ -36,6 +38,23 @@ kwaque_cc_test(
     deps = [
         ":network_oracle",
         "//src/simulation:bandwidth",
+        "//src/simulation:deterministic_random",
+    ],
+)
+
+kwaque_cc_benchmark(
+    name = "simulation_bench",
+    srcs = ["simulation_bench.cc"],
+    memory = "256MiB",
+    deps = [
+        ":network_oracle",
+        "//src/bytes:fragmented_buffer",
+        "//src/runtime:network",
+        "//src/runtime/testing/contracts:network_contract",
+        "//src/simulation:bandwidth",
+        "//src/simulation:fake_network",
+        "//src/simulation:scheduler",
+        "@seastar",
     ],
 )
 
@@ -61,6 +80,60 @@ kwaque_cc_seastar_test(
     deps = [
         "//src/base:invariant_test_support",
         "//src/simulation:scheduler_affinity_test_support",
+    ],
+)
+
+kwaque_cc_seastar_test(
+    name = "structured_event_sink_test",
+    srcs = ["structured_event_sink_test.cc"],
+    cpu = 1,
+    memory = "192MiB",
+    deps = [
+        "//src/observability:event",
+        "//src/observability:event_log",
+        "//src/observability:event_sequence",
+        "//src/observability:event_sink_concept",
+        "//src/simulation:structured_event_sink",
+    ],
+)
+
+kwaque_cc_seastar_test(
+    name = "simulation_metrics_test",
+    srcs = ["simulation_metrics_test.cc"],
+    cpu = 1,
+    memory = "256MiB",
+    deps = [
+        "//src/base:metric_schema",
+        "//src/runtime:fault",
+        "//src/runtime:fault_api",
+        "//src/simulation:deterministic_random",
+        "//src/simulation:event_trace",
+        "//src/simulation:fake_dns",
+        "//src/simulation:fake_file",
+        "//src/simulation:fake_network",
+        "//src/simulation:fault_schedule",
+        "//src/simulation:metrics",
+        "//src/simulation:scheduler",
+    ],
+)
+
+kwaque_cc_seastar_test(
+    name = "failure_probe_test",
+    srcs = ["failure_probe_test.cc"],
+    cpu = 1,
+    memory = "192MiB",
+    deps = [
+        "//src/runtime:error",
+        "//src/runtime:fault",
+        "//src/runtime:fault_api",
+        "//src/runtime:time",
+        "//src/runtime/testing/failure_probe",
+        "//src/runtime/testing/failure_probe:failure_probe_test_support",
+        "//src/simulation:deterministic_random",
+        "//src/simulation:event_trace",
+        "//src/simulation:fault_schedule",
+        "//src/simulation:scheduler",
+        "//src/simulation:timer",
     ],
 )
 
@@ -229,12 +302,27 @@ kwaque_cc_seastar_test(
     memory = "256MiB",
     deps = [
         "//src/runtime:network",
+        "//src/runtime:random",
         "//src/runtime/testing/contracts:network_contract",
+        "//src/simulation:deterministic_random",
         "//src/simulation:event_trace",
         "//src/simulation:fake_network",
+        "//src/simulation:fake_network_test_support",
         "//src/simulation:fault_schedule",
         "//src/simulation:scheduler",
         "//src/simulation/tests:network_oracle",
+    ],
+)
+
+kwaque_cc_seastar_test(
+    name = "fake_network_affinity_test",
+    srcs = ["fake_network_affinity_test.cc"],
+    cpu = 2,
+    memory = "256MiB",
+    deps = [
+        "//src/simulation:fake_dns",
+        "//src/simulation:fake_network",
+        "//src/simulation:scheduler",
     ],
 )
 
@@ -245,7 +333,9 @@ kwaque_cc_seastar_test(
     memory = "256MiB",
     deps = [
         "//src/runtime:dns",
+        "//src/runtime:random",
         "//src/runtime/testing/contracts:dns_contract",
+        "//src/simulation:deterministic_random",
         "//src/simulation:event_trace",
         "//src/simulation:fake_dns",
         "//src/simulation:fault_schedule",

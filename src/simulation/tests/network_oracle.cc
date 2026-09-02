@@ -1,5 +1,6 @@
 #include "src/simulation/tests/network_oracle.h"
 
+#include "src/simulation/deterministic_random.h"
 #include "src/simulation/sha256.h"
 
 #include <boost/multiprecision/cpp_int/import_export.hpp>
@@ -39,13 +40,6 @@ gcd(oracle_fraction::integer left, oracle_fraction::integer right) {
         right = std::move(remainder);
     }
     return left;
-}
-
-[[nodiscard]] std::uint64_t next_random(std::uint64_t& state) noexcept {
-    state ^= state << 13U;
-    state ^= state >> 7U;
-    state ^= state << 17U;
-    return state;
 }
 
 [[nodiscard]] std::uint64_t
@@ -415,9 +409,13 @@ oracle_script::generate(std::uint64_t seed, std::size_t operations) {
             .action = action,
           });
     }
-    auto random = seed == 0 ? UINT64_C(0x6a09e667f3bcc909) : seed;
+    auto random = deterministic_random{seed}.stream(
+      random_domain::network_decision, UINT64_C(0x4f5241434c455631));
+    if (!random) {
+        return runtime::failure(random.error());
+    }
     while (steps.size() < operations) {
-        const auto value = next_random(random);
+        const auto value = random->next_u64();
         const auto kind = static_cast<oracle_step_kind>(
           value % oracle_step_kind_count);
         steps.push_back(
@@ -428,6 +426,7 @@ oracle_script::generate(std::uint64_t seed, std::size_t operations) {
             .port = static_cast<std::uint16_t>(
               10'000U + ((value >> 24U) % 1'000U)),
             .value = 1U + ((value >> 40U) % 128U),
+            .pattern = static_cast<std::uint8_t>('a' + (value % 26U)),
             .action = actions[(value >> 56U) % actions.size()],
           });
     }
@@ -455,6 +454,8 @@ std::string oracle_script::render() const {
         result.append(std::to_string(step.port));
         result.push_back(' ');
         result.append(std::to_string(step.value));
+        result.push_back(' ');
+        result.append(std::to_string(step.pattern));
         result.push_back(' ');
         result.append(std::to_string(static_cast<std::uint8_t>(step.action)));
         result.push_back('\n');
@@ -644,8 +645,11 @@ runtime::result<void> dense_network_oracle::write(const oracle_step& step) {
         return runtime::failure(oracle_error(errc::network_failure));
     }
     const auto size = std::max<std::uint64_t>(1, step.value);
+    const auto pattern = step.pattern == 0
+                           ? static_cast<std::uint8_t>('a' + step.source)
+                           : step.pattern;
     std::string bytes(
-      static_cast<std::size_t>(size), static_cast<char>('a' + step.source));
+      static_cast<std::size_t>(size), static_cast<char>(pattern));
     if (step.action == runtime::fault_action::short_operation) {
         bytes.resize(std::max<std::size_t>(1, bytes.size() / 2U));
     }
@@ -755,6 +759,10 @@ void dense_network_oracle::recompute_digest() noexcept {
         state = mix(state, packet.target);
         state = mix(state, packet.ready);
         state = mix(state, packet.retired);
+        state = mix(state, static_cast<std::uint64_t>(packet.bytes.size()));
+        for (const auto byte : packet.bytes) {
+            state = mix(state, static_cast<unsigned char>(byte));
+        }
     }
     digest_ = state;
 }

@@ -13,8 +13,62 @@ import time
 import urllib.request
 from pathlib import Path
 
-REACTOR_ARGUMENTS = ("--smp=1", "--memory=128M", "--overprovisioned")
+REACTOR_ARGUMENTS = ("--smp=2", "--memory=128M", "--overprovisioned")
 STARTUP_ATTEMPTS = 5
+
+ADMIN_METRICS = frozenset(
+    {
+        "kwaque_broker_process_readiness",
+        "kwaque_broker_shard_count",
+        "kwaque_broker_startup_duration_seconds",
+        "kwaque_broker_shutdown_total",
+        "kwaque_broker_http_requests_total",
+    }
+)
+RUNTIME_METRICS = frozenset(
+    {
+        "kwaque_runtime_task_active",
+        "kwaque_runtime_task_accepted_total",
+        "kwaque_runtime_task_completed_total",
+        "kwaque_runtime_task_failed_total",
+        "kwaque_runtime_task_abort_requests_total",
+        "kwaque_runtime_timer_active",
+        "kwaque_runtime_timer_accepted_total",
+        "kwaque_runtime_timer_completed_total",
+        "kwaque_runtime_timer_rejected_total",
+        "kwaque_runtime_file_active",
+        "kwaque_runtime_file_accepted_total",
+        "kwaque_runtime_file_completed_total",
+        "kwaque_runtime_file_rejected_total",
+        "kwaque_runtime_file_completed_bytes_total",
+        "kwaque_runtime_network_active",
+        "kwaque_runtime_network_accepted_total",
+        "kwaque_runtime_network_completed_total",
+        "kwaque_runtime_network_rejected_total",
+        "kwaque_runtime_network_completed_bytes_total",
+        "kwaque_runtime_dns_active",
+        "kwaque_runtime_dns_accepted_total",
+        "kwaque_runtime_dns_completed_total",
+        "kwaque_runtime_dns_rejected_total",
+    }
+)
+PRODUCT_METRICS = ADMIN_METRICS | RUNTIME_METRICS
+SHARD_AGGREGATED_METRICS = RUNTIME_METRICS | {
+    "kwaque_broker_http_requests_total"
+}
+PRODUCT_PREFIXES = (
+    "kwaque_broker_",
+    "kwaque_runtime_task_",
+    "kwaque_runtime_timer_",
+    "kwaque_runtime_file_",
+    "kwaque_runtime_network_",
+    "kwaque_runtime_dns_",
+)
+DEFERRED_PREFIXES = (
+    "kwaque_bounded_queue_",
+    "kwaque_resource_manager_",
+    "kwaque_simulation_",
+)
 
 
 def reserve_loopback_port() -> int:
@@ -73,6 +127,92 @@ def metric_value(exposition: str, name: str) -> float:
             f"expected one bounded-cardinality sample for {name!r}:\n{exposition}"
         )
     return float(samples[0].rsplit(maxsplit=1)[1])
+
+
+def metric_samples(exposition: str, name: str) -> list[str]:
+    return [
+        line
+        for line in exposition.splitlines()
+        if line.startswith((name + "{", name + " "))
+    ]
+
+
+def sample_name(line: str) -> str:
+    return line.split("{", maxsplit=1)[0].split(maxsplit=1)[0]
+
+
+def label_names(line: str) -> set[str]:
+    if "{" not in line:
+        return set()
+    labels = line.split("{", maxsplit=1)[1].split("}", maxsplit=1)[0]
+    if not labels:
+        return set()
+    return {label.split("=", maxsplit=1)[0] for label in labels.split(",")}
+
+
+def verify_product_metrics(exposition: str, *, aggregated: bool) -> None:
+    samples = [
+        line
+        for line in exposition.splitlines()
+        if line and not line.startswith("#")
+    ]
+    observed = {
+        sample_name(line)
+        for line in samples
+        if sample_name(line).startswith(PRODUCT_PREFIXES)
+    }
+    if observed != PRODUCT_METRICS:
+        raise AssertionError(
+            "product metric inventory mismatch: "
+            f"missing={sorted(PRODUCT_METRICS - observed)} "
+            f"unexpected={sorted(observed - PRODUCT_METRICS)}"
+        )
+    for name in PRODUCT_METRICS:
+        matching = metric_samples(exposition, name)
+        expected_samples = (
+            1
+            if aggregated
+            or name in ADMIN_METRICS - {"kwaque_broker_http_requests_total"}
+            else 2
+        )
+        if len(matching) != expected_samples:
+            raise AssertionError(
+                f"expected {expected_samples} sample(s) for {name!r}: {matching}"
+            )
+        for sample in matching:
+            labels = label_names(sample)
+            if not labels.issubset({"shard"}):
+                raise AssertionError(
+                    f"metric {name!r} exposed forbidden labels: {sorted(labels)}"
+                )
+            if aggregated:
+                expected_labels = (
+                    set() if name in SHARD_AGGREGATED_METRICS else {"shard"}
+                )
+                if labels != expected_labels:
+                    raise AssertionError(
+                        f"metric {name!r} has labels {sorted(labels)}, "
+                        f"expected {sorted(expected_labels)}"
+                    )
+            if not aggregated and labels != {"shard"}:
+                raise AssertionError(
+                    f"unaggregated metric {name!r} lost its native shard label"
+                )
+        if not aggregated and expected_samples == 2:
+            for shard in (0, 1):
+                if not any(f'shard="{shard}"' in sample for sample in matching):
+                    raise AssertionError(
+                        f"metric {name!r} omitted shard {shard}: {matching}"
+                    )
+    deferred = {
+        sample_name(line)
+        for line in samples
+        if sample_name(line).startswith(DEFERRED_PREFIXES)
+    }
+    if deferred:
+        raise AssertionError(
+            f"deferred metric families appeared in broker output: {sorted(deferred)}"
+        )
 
 
 class RunningBroker:
@@ -188,10 +328,11 @@ def main() -> None:
                 f"configuration loaded path={default_config}",
                 "node_id=0",
                 "build version=",
-                "runtime shards=1",
+                "runtime shards=2",
                 "memory_bytes=",
                 "reactor_backend=",
                 "runtime service ready shard=0",
+                "runtime service ready shard=1",
             ):
                 if expected not in output:
                     raise AssertionError(
@@ -203,6 +344,7 @@ def main() -> None:
                     "startup stage=data_directory state=ready",
                     "startup stage=pid_file state=ready",
                     "startup stage=runtime_service state=ready",
+                    "startup stage=runtime_backend state=ready",
                     "startup stage=admin state=ready",
                 ),
             )
@@ -238,10 +380,11 @@ def main() -> None:
                 raise AssertionError(
                     f"unexpected metrics response: {status} {content_type}"
                 )
+            verify_product_metrics(metrics, aggregated=True)
             metric_prefix = "kwaque_broker_"
             if metric_value(metrics, metric_prefix + "process_readiness") != 1:
                 raise AssertionError("readiness metric was not set")
-            if metric_value(metrics, metric_prefix + "shard_count") != 1:
+            if metric_value(metrics, metric_prefix + "shard_count") != 2:
                 raise AssertionError("shard-count metric did not match --smp")
             if metric_value(metrics, metric_prefix + "startup_duration_seconds") < 0:
                 raise AssertionError("startup duration metric was negative")
@@ -249,6 +392,16 @@ def main() -> None:
                 raise AssertionError("shutdown counter changed before shutdown")
             if metric_value(metrics, metric_prefix + "http_requests_total") < 3:
                 raise AssertionError("administrative request counter did not advance")
+
+            status, content_type, unaggregated = get(
+                base_url + "/metrics?__aggregate__=false"
+            )
+            if status != 200 or content_type != "text/plain":
+                raise AssertionError(
+                    "unexpected unaggregated metrics response: "
+                    f"{status} {content_type}"
+                )
+            verify_product_metrics(unaggregated, aggregated=False)
 
             incomplete_request = socket.create_connection(
                 ("127.0.0.1", default_port), timeout=5.0

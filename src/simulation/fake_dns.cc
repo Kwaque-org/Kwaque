@@ -123,7 +123,10 @@ template<typename T>
         return runtime::failure(dns_error(errc::out_of_range));
     }
     const auto maximum_queries = config.query_limits.maximum_waiters + 1U;
-    if (maximum_queries > events.limits().pending_events()) {
+    const auto required_events = static_cast<std::uint64_t>(maximum_queries)
+                                   * 2U
+                                 + 1U;
+    if (required_events > events.limits().pending_events()) {
         return runtime::failure(dns_error(errc::out_of_range));
     }
     return {};
@@ -189,10 +192,11 @@ public:
           runtime::dns_query selected_query,
           prepared_result selected,
           runtime::fault_decision selected_fault,
-          scheduler::event_id_reservation result_id,
+          scheduler::event_slot_reservation result_id,
           event_trace::reservation result_reservation,
-          scheduler::event_id_reservation terminal_id,
+          scheduler::event_slot_reservation terminal_id,
           event_trace::reservation terminal_reservation,
+          event_trace::reservation cleanup_reservation,
           event_trace::reservation parked_reservation,
           runtime::fault_object_key selected_object) noexcept
           : id(query_id)
@@ -204,6 +208,7 @@ public:
           , trace(std::move(result_reservation))
           , terminal_event(std::move(terminal_id))
           , terminal_trace(std::move(terminal_reservation))
+          , cleanup_trace(std::move(cleanup_reservation))
           , parked_trace(std::move(parked_reservation))
           , fault_object(selected_object)
           , trace_phase(selected.phase) {}
@@ -216,10 +221,11 @@ public:
         seastar::promise<runtime::result<runtime::dns_result>> done;
         seastar::optimized_optional<seastar::abort_source::subscription>
           caller_subscription;
-        scheduler::event_id_reservation event_reservation;
+        scheduler::event_slot_reservation event_reservation;
         event_trace::reservation trace;
-        scheduler::event_id_reservation terminal_event;
+        scheduler::event_slot_reservation terminal_event;
         event_trace::reservation terminal_trace;
+        event_trace::reservation cleanup_trace;
         event_trace::reservation parked_trace;
         runtime::fault_object_key fault_object;
         event_id event;
@@ -254,10 +260,12 @@ public:
       fake_dns& owner,
       fake_dns_config config,
       scheduler& event_scheduler,
+      scheduler::event_slot_reservation cleanup_event,
       fault_schedule* faults)
       : owner_(&owner)
       , config_(config)
       , scheduler_(&event_scheduler)
+      , cleanup_event_reservation_(std::move(cleanup_event))
       , faults_(faults) {
         const auto maximum_queries = config_.query_limits.maximum_waiters + 1U;
         queries_.reserve(maximum_queries);
@@ -275,7 +283,7 @@ public:
     [[nodiscard]] runtime::result<prepared_result> select_result(
       const runtime::dns_query& query, const runtime::fault_decision& decision);
     [[nodiscard]] runtime::result<
-      std::pair<scheduler::event_id_reservation, event_trace::reservation>>
+      std::pair<scheduler::event_slot_reservation, event_trace::reservation>>
     reserve_terminal(
       dns_trace_phase phase,
       std::uint64_t query_id,
@@ -314,10 +322,12 @@ public:
     fake_dns* owner_;
     fake_dns_config config_;
     scheduler* scheduler_;
+    scheduler::event_slot_reservation cleanup_event_reservation_;
     record_map records_;
     std::map<std::uint64_t, record_map::iterator> records_by_id_;
     std::map<std::uint64_t, std::uint32_t> cleanup_queries_;
     std::map<std::uint64_t, std::uint32_t> deferred_cleanup_queries_;
+    seastar::chunked_fifo<event_trace::reservation, 32, 2> stop_cleanup_traces_;
     seastar::chunked_vector<std::optional<query_state>> queries_;
     seastar::chunked_fifo<std::uint32_t, 128, 8> free_queries_;
     seastar::chunked_fifo<query_token, 128, 8> waiters_;
@@ -367,15 +377,22 @@ runtime::result<std::unique_ptr<fake_dns>> fake_dns::make(
     if (auto valid = validate_config(config, event_scheduler); !valid) {
         return runtime::failure(valid.error());
     }
+    auto cleanup_event = event_scheduler.reserve_event_slot();
+    if (!cleanup_event) {
+        return runtime::failure(dns_error(cleanup_event.error()));
+    }
     auto owner = std::unique_ptr<fake_dns>{
       new fake_dns(config, event_scheduler, nullptr)};
     owner->impl_ = std::make_unique<impl>(
-      *owner, config, event_scheduler, faults);
+      *owner, config, event_scheduler, std::move(*cleanup_event), faults);
     return owner;
 }
 
 fake_dns::~fake_dns() {
     assert_current();
+    if (impl_ == nullptr) {
+        return;
+    }
     const bool failed = scheduler_->trace_failed();
     if (failed) {
         const auto* failure = scheduler_->trace_failure();
@@ -397,8 +414,10 @@ fake_dns::~fake_dns() {
         && impl_->fault_occurrences_.empty() && impl_->waiters_.empty()
         && impl_->cleanup_queries_.empty()
         && impl_->deferred_cleanup_queries_.empty()
+        && impl_->stop_cleanup_traces_.empty()
         && impl_->free_queries_.size() == impl_->queries_.size()
-        && !impl_->cleanup_scheduled_,
+        && !impl_->cleanup_scheduled_
+        && (!impl_->activated_ || !impl_->cleanup_event_reservation_.active()),
       "fake DNS resolver destroyed before bounded state drained");
 }
 
@@ -627,7 +646,7 @@ runtime::result<fake_dns::impl::prepared_result> fake_dns::impl::select_result(
 }
 
 runtime::result<
-  std::pair<scheduler::event_id_reservation, event_trace::reservation>>
+  std::pair<scheduler::event_slot_reservation, event_trace::reservation>>
 fake_dns::impl::reserve_terminal(
   dns_trace_phase phase,
   std::uint64_t query_id,
@@ -636,7 +655,7 @@ fake_dns::impl::reserve_terminal(
   std::uint64_t coordinate_b,
   std::uint64_t value,
   std::uint32_t result) {
-    auto event = scheduler_->reserve_event_id();
+    auto event = scheduler_->reserve_event_slot();
     if (!event) {
         return runtime::failure(dns_error(event.error()));
     }
@@ -733,6 +752,12 @@ seastar::future<runtime::result<runtime::dns_result>> fake_dns::resolve(
       0,
       0,
       static_cast<std::uint32_t>(errc::aborted));
+    auto cleanup_trace = scheduler_->reserve_trace(
+      trace_event_descriptor{
+        .kind = trace_event_kind::dns,
+        .domain = static_cast<std::uint32_t>(dns_trace_phase::stop),
+        .stable_id = query_id,
+      });
     runtime::result<event_trace::reservation> parked_trace{
       event_trace::reservation{}};
     if (
@@ -746,9 +771,11 @@ seastar::future<runtime::result<runtime::dns_result>> fake_dns::resolve(
             .effect = trace_action::operation_parked,
           });
     }
-    if (!result_terminal || !abort_terminal || !parked_trace) {
+    if (
+      !result_terminal || !abort_terminal || !cleanup_trace || !parked_trace) {
         const auto error = !result_terminal  ? result_terminal.error()
                            : !abort_terminal ? abort_terminal.error()
+                           : !cleanup_trace  ? cleanup_trace.error()
                                              : parked_trace.error();
         return seastar::make_ready_future<runtime::result<runtime::dns_result>>(
           runtime::failure(error));
@@ -768,6 +795,7 @@ seastar::future<runtime::result<runtime::dns_result>> fake_dns::resolve(
           std::move(result_terminal->second),
           std::move(abort_terminal->first),
           std::move(abort_terminal->second),
+          std::move(*cleanup_trace),
           std::move(*parked_trace),
           prepared_fault->object);
         auto& state = *impl_->queries_[slot];
@@ -1038,7 +1066,11 @@ void fake_dns::impl::complete_query(
     if (
       state_ == fake_dns_state::stopping && !in_cleanup_batch_
       && !cleanup_scheduled_) {
-        schedule_cleanup_batch();
+        if (has_cleanup_work()) {
+            schedule_cleanup_batch();
+        } else if (live_queries_ == 0) {
+            finish_stop();
+        }
     }
 }
 
@@ -1109,6 +1141,7 @@ void fake_dns::impl::release_query(query_token token) noexcept {
     query->trace.release();
     query->terminal_event.release();
     query->terminal_trace.release();
+    query->cleanup_trace.release();
     query->parked_trace.release();
     retained_name_bytes_ = *retained_name_bytes_.checked_sub(
       byte_count{query->query.host.value().size()});
@@ -1125,6 +1158,7 @@ void fake_dns::request_abort() {
         return;
     }
     impl_->abort_requested_ = true;
+    impl_->activated_ = true;
     impl_->schedule_cleanup_batch();
 }
 
@@ -1139,20 +1173,34 @@ seastar::future<runtime::result<void>> fake_dns::stop() {
                  : seastar::make_ready_future<runtime::result<void>>(
                      runtime::result<void>{});
     }
-    const trace_event_descriptor descriptor{
-      .kind = trace_event_kind::dns,
-      .domain = static_cast<std::uint32_t>(dns_trace_phase::stop),
-      .stable_id = impl_->next_cleanup_id_,
-    };
-    if (
-      auto schedulable = scheduler_->can_schedule(
-        scheduler_->now(), descriptor, event_cleanup_policy::invoke);
-      !schedulable) {
-        return seastar::make_ready_future<runtime::result<void>>(
-          runtime::failure(dns_error(schedulable.error())));
-    }
     try {
+        const auto record_batches = std::max<std::size_t>(
+          1U,
+          (impl_->records_.size() + config_.stop_batch - 1U)
+            / config_.stop_batch);
+        if (
+          record_batches > std::numeric_limits<std::uint64_t>::max()
+                             - impl_->next_cleanup_id_ + 1U) {
+            return seastar::make_ready_future<runtime::result<void>>(
+              runtime::failure(dns_error(errc::out_of_range)));
+        }
+        seastar::chunked_fifo<event_trace::reservation, 32, 2> prepared;
+        prepared.reserve(record_batches);
+        for (std::size_t index = 0; index < record_batches; ++index) {
+            auto trace = scheduler_->reserve_trace(
+              trace_event_descriptor{
+                .kind = trace_event_kind::dns,
+                .domain = static_cast<std::uint32_t>(dns_trace_phase::stop),
+                .stable_id = impl_->next_cleanup_id_ + index,
+              });
+            if (!trace) {
+                return seastar::make_ready_future<runtime::result<void>>(
+                  runtime::failure(dns_error(trace.error())));
+            }
+            prepared.push_back(std::move(*trace));
+        }
         impl_->stop_done_.emplace();
+        impl_->stop_cleanup_traces_ = std::move(prepared);
     } catch (...) {
         return seastar::current_exception_as_future<runtime::result<void>>();
     }
@@ -1182,10 +1230,9 @@ void fake_dns::impl::schedule_cleanup_batch() noexcept {
     if (cleanup_scheduled_) {
         return;
     }
-    if (!has_cleanup_work()) {
-        if (state_ == fake_dns_state::stopping && live_queries_ == 0) {
-            finish_stop();
-        }
+    if (
+      !has_cleanup_work()
+      && (state_ != fake_dns_state::stopping || live_queries_ != 0)) {
         return;
     }
     KWAQUE_INVARIANT(
@@ -1198,11 +1245,35 @@ void fake_dns::impl::schedule_cleanup_batch() noexcept {
     } else {
         ++next_cleanup_id_;
     }
+    event_trace::reservation cleanup_trace;
+    const auto query = next_cleanup_query();
+    if (query.valid()) {
+        auto* state = find_query(query);
+        KWAQUE_INVARIANT(
+          fake_dns_state_invariant,
+          state != nullptr,
+          "fake DNS cleanup trace lost its query");
+        cleanup_trace = std::move(state->cleanup_trace);
+    } else {
+        KWAQUE_INVARIANT(
+          fake_dns_state_invariant,
+          !stop_cleanup_traces_.empty(),
+          "fake DNS cleanup lost its reserved stop trace");
+        cleanup_trace = std::move(stop_cleanup_traces_.front());
+        stop_cleanup_traces_.pop_front();
+    }
+    cleanup_event_reservation_.release();
     auto scheduled = scheduler_->schedule(
       scheduler_->now(),
       event_priority::highest(),
       [this] noexcept {
           cleanup_scheduled_ = false;
+          auto replacement = scheduler_->reserve_event_slot();
+          KWAQUE_INVARIANT(
+            fake_dns_state_invariant,
+            replacement.has_value(),
+            "fake DNS cleanup lost its reserved scheduler slot");
+          cleanup_event_reservation_ = std::move(*replacement);
           if (scheduler_->discarding_failed_event()) [[unlikely]] {
               const auto* failure = scheduler_->trace_failure();
               KWAQUE_INVARIANT(
@@ -1219,7 +1290,8 @@ void fake_dns::impl::schedule_cleanup_batch() noexcept {
         .domain = static_cast<std::uint32_t>(dns_trace_phase::stop),
         .stable_id = cleanup_id,
       },
-      event_cleanup_policy::invoke);
+      event_cleanup_policy::invoke,
+      std::move(cleanup_trace));
     KWAQUE_INVARIANT(
       fake_dns_state_invariant,
       scheduled.has_value(),
@@ -1317,6 +1389,7 @@ void fake_dns::impl::discard_all(
     waiters_.clear();
     records_by_id_.clear();
     records_.clear();
+    stop_cleanup_traces_.clear();
     answer_count_ = 0;
     retained_name_bytes_ = byte_count{};
     fault_occurrences_.clear();
@@ -1329,10 +1402,13 @@ void fake_dns::impl::discard_all(
     if (state_ == fake_dns_state::stopping) {
         stop_failure_ = dns_error(failure);
         finish_stop();
+    } else {
+        cleanup_event_reservation_.release();
     }
 }
 
 void fake_dns::impl::finish_stop() noexcept {
+    stop_cleanup_traces_.clear();
     KWAQUE_INVARIANT(
       fake_dns_drained_invariant,
       state_ == fake_dns_state::stopping && live_queries_ == 0
@@ -1340,9 +1416,11 @@ void fake_dns::impl::finish_stop() noexcept {
         && records_by_id_.empty() && answer_count_ == 0
         && retained_name_bytes_.value() == 0 && waiters_.empty()
         && free_queries_.size() == queries_.size() && fault_occurrences_.empty()
-        && cleanup_queries_.empty() && deferred_cleanup_queries_.empty(),
+        && cleanup_queries_.empty() && deferred_cleanup_queries_.empty()
+        && stop_cleanup_traces_.empty(),
       "fake DNS stop completed with retained bounded state");
     state_ = fake_dns_state::stopped;
+    cleanup_event_reservation_.release();
     if (stop_failure_) {
         stop_done_->set_value(runtime::failure(*stop_failure_));
     } else {

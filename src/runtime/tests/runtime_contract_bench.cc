@@ -1,4 +1,5 @@
 #include "src/runtime/environment.h"
+#include "src/runtime/operation_statistics.h"
 #include "src/runtime/production/clocks.h"
 #include "src/runtime/production/dns.h"
 #include "src/runtime/production/random.h"
@@ -58,6 +59,14 @@ struct network_admission_fixture {
     seastar::semaphore direct_bytes{
       network_connection_limits{}.pending_write_bytes.value()};
     network_write_admission admission{network_connection_limits{}};
+};
+
+struct direct_operation_statistics_fixture {
+    operation_statistics_snapshot statistics;
+};
+
+struct owner_operation_statistics_fixture {
+    operation_statistics statistics;
 };
 
 class network_count_saturation_fixture {
@@ -559,6 +568,34 @@ PERF_TEST(disabled_fault_policy, compiled_out) {
     for (std::size_t index = 0; index < inner_iterations; ++index) {
         perf_tests::do_not_optimize(compiled_fault_path(backend));
     }
+    return inner_iterations;
+}
+
+PERF_TEST_F(direct_operation_statistics_fixture, accepted_terminal_update) {
+    for (std::size_t index = 0; index < inner_iterations; ++index) {
+        ++statistics.active;
+        ++statistics.accepted;
+        statistics.completed_bytes += UINT64_C(4096);
+        perf_tests::do_not_optimize(statistics.active);
+        --statistics.active;
+        ++statistics.completed;
+    }
+    perf_tests::do_not_optimize(statistics.accepted);
+    perf_tests::do_not_optimize(statistics.completed);
+    perf_tests::do_not_optimize(statistics.completed_bytes);
+    return inner_iterations;
+}
+
+PERF_TEST_F(owner_operation_statistics_fixture, accepted_terminal_update) {
+    for (std::size_t index = 0; index < inner_iterations; ++index) {
+        auto reservation = statistics.accept();
+        reservation.add_completed_bytes(UINT64_C(4096));
+        perf_tests::do_not_optimize(statistics.snapshot().active);
+    }
+    const auto snapshot = statistics.snapshot();
+    perf_tests::do_not_optimize(snapshot.accepted);
+    perf_tests::do_not_optimize(snapshot.completed);
+    perf_tests::do_not_optimize(snapshot.completed_bytes);
     return inner_iterations;
 }
 

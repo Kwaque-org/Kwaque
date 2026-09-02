@@ -1,0 +1,152 @@
+#include "src/observability/event.h"
+#include "src/observability/event_log.h"
+#include "src/observability/event_sequence.h"
+#include "src/simulation/event_sink.h"
+
+#include <seastar/core/coroutine.hh>
+#include <seastar/testing/test_case.hh>
+#include <seastar/util/alloc_failure_injector.hh>
+#include <seastar/util/later.hh>
+
+#include <boost/test/unit_test.hpp>
+
+#include <array>
+#include <cstddef>
+#include <cstdint>
+#include <utility>
+#include <vector>
+
+namespace {
+
+kwaque::observability::event_text
+text(kwaque::observability::event_public_text value) {
+    auto made = kwaque::observability::event_text::make(value);
+    BOOST_REQUIRE(made.has_value());
+    return *made;
+}
+
+kwaque::observability::event_request make_event() {
+    using kwaque::observability::event_field;
+    using kwaque::observability::event_field_key;
+    using kwaque::observability::event_field_value;
+    using kwaque::observability::event_public_text;
+    const std::array fields{
+      event_field{
+        .key = event_field_key::outcome,
+        .value = event_field_value::from_text(
+          text(event_public_text::outcome_completed))},
+      event_field{
+        .key = event_field_key::operation,
+        .value = event_field_value::from_text(
+          text(event_public_text::operation_dns_resolve))},
+      event_field{
+        .key = event_field_key::items,
+        .value = event_field_value::from_unsigned(2)},
+    };
+    auto made = kwaque::observability::event_request::make(
+      kwaque::observability::event_request_context{
+        .kind = kwaque::observability::event_kind::dns_completion,
+        .severity = kwaque::observability::event_severity::info,
+        .monotonic = kwaque::runtime::monotonic_time{17},
+        .wall = kwaque::runtime::wall_time{23},
+        .workload = kwaque::resource::workload_class::metadata,
+      },
+      fields);
+    BOOST_REQUIRE(made.has_value());
+    return *made;
+}
+
+kwaque::observability::event_sink_identity
+identity(std::uint64_t epoch_value = 11) {
+    auto epoch = kwaque::observability::event_sink_epoch::make(epoch_value);
+    BOOST_REQUIRE(epoch.has_value());
+    kwaque::observability::event_configuration_digest digest{};
+    digest[0] = 0x51;
+    return kwaque::observability::event_sink_identity{
+      .epoch = *epoch,
+      .configuration_digest = digest,
+    };
+}
+
+kwaque::observability::event_log_limits limits(std::uint32_t entries = 2) {
+    auto made = kwaque::observability::event_log_limits::make(
+      kwaque::observability::event_log_limit_values{
+        .entries = entries,
+        .encoded_bytes = 4'096,
+      });
+    BOOST_REQUIRE(made.has_value());
+    return *made;
+}
+
+seastar::future<std::vector<std::uint8_t>> capture_history(bool perturb_tasks) {
+    kwaque::simulation::event_log_sink sink{identity(), limits(3)};
+    const auto value = make_event();
+    for (std::uint32_t index = 0; index < 3; ++index) {
+        std::size_t attempts = 0;
+        bool emitted = false;
+        seastar::memory::with_allocation_failures([&] {
+            ++attempts;
+            emitted = sink.emit(value).has_value();
+        });
+        BOOST_REQUIRE(emitted);
+        BOOST_REQUIRE(attempts == 1U);
+        if (perturb_tasks) {
+            co_await seastar::yield();
+        }
+    }
+    const auto encoded = sink.events().encode();
+    BOOST_REQUIRE(encoded.has_value());
+    auto flattened = encoded->to_vector();
+    BOOST_REQUIRE(flattened.has_value());
+    BOOST_REQUIRE(sink.stop().has_value());
+    co_return std::move(*flattened);
+}
+
+static_assert(
+  kwaque::observability::event_sink<kwaque::simulation::event_log_sink>);
+
+} // namespace
+
+SEASTAR_TEST_CASE(simulation_event_sink_records_identical_canonical_events) {
+    const auto sink_identity = identity();
+    kwaque::simulation::event_log_sink sink{sink_identity, limits()};
+    const auto value = make_event();
+    std::size_t emit_attempts = 0;
+    bool emitted = false;
+    seastar::memory::with_allocation_failures([&] {
+        ++emit_attempts;
+        emitted = sink.emit(value).has_value();
+    });
+    BOOST_CHECK(emitted);
+    BOOST_CHECK(emit_attempts == 1U);
+    BOOST_CHECK(sink.events().entries().size() == 1U);
+    BOOST_CHECK(sink.events().identity() == sink_identity);
+    BOOST_CHECK(sink.events().entries()[0].sequence() == 1U);
+    BOOST_CHECK(sink.events().entries()[0].kind() == value.kind());
+
+    const auto encoded = sink.events().encode();
+    BOOST_REQUIRE(encoded.has_value());
+    const auto decoded = kwaque::observability::event_log::decode(
+      *encoded, sink.events().limits());
+    BOOST_REQUIRE(decoded.has_value());
+    BOOST_CHECK((*decoded)->entries()[0] == sink.events().entries()[0]);
+
+    BOOST_REQUIRE(sink.emit(value).has_value());
+    const auto rejected = sink.emit(value);
+    BOOST_REQUIRE(!rejected.has_value());
+    BOOST_CHECK(rejected.error().code() == kwaque::errc::resource_exhausted);
+    BOOST_CHECK(sink.last_sequence() == 2U);
+    BOOST_REQUIRE(sink.stop().has_value());
+    BOOST_REQUIRE(sink.stop().has_value());
+    const auto after_stop = sink.emit(value);
+    BOOST_REQUIRE(!after_stop.has_value());
+    BOOST_CHECK(after_stop.error().code() == kwaque::errc::closed);
+    co_return;
+}
+
+SEASTAR_TEST_CASE(simulation_event_sequences_ignore_task_and_allocator_noise) {
+    const auto direct = co_await capture_history(false);
+    const auto perturbed = co_await capture_history(true);
+    BOOST_CHECK(direct == perturbed);
+    co_return;
+}

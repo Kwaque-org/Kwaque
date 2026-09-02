@@ -111,6 +111,8 @@ SEASTAR_TEST_CASE(bounded_work_queue_saturates_each_admission_dimension) {
     BOOST_CHECK_EQUAL(*second, 2);
     BOOST_CHECK_EQUAL(queue.size(), 0U);
     BOOST_CHECK_EQUAL(queue.bytes().value(), 0U);
+    BOOST_CHECK_EQUAL(queue.accepted_pushes(), 2U);
+    BOOST_CHECK_EQUAL(queue.rejected_pushes(), 3U);
     co_await queue.close(queue_close_mode::drain);
 }
 

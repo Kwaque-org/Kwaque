@@ -696,7 +696,9 @@ runtime::result<std::unique_ptr<fake_file_system>> fake_file_system::make(
       (*state)->config_.base_latency);
     if (
       event_scheduler.limits().pending_events()
-        < (*state)->config_.maximum_pending_operations
+        < static_cast<std::uint64_t>(
+            (*state)->config_.maximum_pending_operations)
+            * 3U
       || !first_deadline
       || *first_deadline > event_scheduler.limits().maximum_deadline()) {
         return runtime::failure(file_error(errc::invalid_argument));
@@ -3087,7 +3089,7 @@ fake_file_system::submit(
           runtime::failure(available.error()));
     }
     auto main_trace = scheduler_->reserve_trace(descriptor);
-    auto terminal_event = scheduler_->reserve_event_id();
+    auto terminal_event = scheduler_->reserve_event_slot();
     auto terminal_trace = scheduler_->reserve_trace(
       trace_event_descriptor{
         .kind = descriptor.kind,
@@ -3101,19 +3103,12 @@ fake_file_system::submit(
         return seastar::make_ready_future<runtime::result<pending_value>>(
           runtime::failure(error));
     }
-    if (
-      auto available = scheduler_->can_schedule(
-        *deadline, descriptor, event_cleanup_policy::invoke);
-      !available) {
-        return seastar::make_ready_future<runtime::result<pending_value>>(
-          runtime::failure(available.error()));
-    }
     operation->terminal_event = std::move(*terminal_event);
     operation->terminal_trace = std::move(*terminal_trace);
     if (
       operation->fault.action() == runtime::fault_action::partial_resize
       && applicable) {
-        auto partial_resize_event = scheduler_->reserve_event_id();
+        auto partial_resize_event = scheduler_->reserve_event_slot();
         auto partial_resize_trace = scheduler_->reserve_trace(
           trace_event_descriptor{
             .kind = trace_event_kind::file,
@@ -3142,7 +3137,7 @@ fake_file_system::submit(
     if (
       operation->fault.action() == runtime::fault_action::crash
       || operation->kind == pending_kind::crash_control) {
-        auto crash_event = scheduler_->reserve_event_id();
+        auto crash_event = scheduler_->reserve_event_slot();
         auto crash_trace = scheduler_->reserve_trace(
           trace_event_descriptor{
             .kind = trace_event_kind::filesystem,
@@ -3161,6 +3156,13 @@ fake_file_system::submit(
         }
         operation->crash_event = std::move(*crash_event);
         operation->crash_trace = std::move(*crash_trace);
+    }
+    if (
+      auto available = scheduler_->can_schedule(
+        *deadline, descriptor, event_cleanup_policy::invoke);
+      !available) {
+        return seastar::make_ready_future<runtime::result<pending_value>>(
+          runtime::failure(available.error()));
     }
     operation->accounted_bytes = retained_bytes;
     operation->accounted_path_bytes = path_bytes;

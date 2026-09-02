@@ -106,6 +106,13 @@ SEASTAR_TEST_CASE(production_file_system_creates_opens_stats_and_reopens) {
     BOOST_REQUIRE(reopened.has_value());
     const auto reopened_closed = co_await reopened->close();
     BOOST_REQUIRE(reopened_closed.has_value());
+    BOOST_CHECK(
+      file_system.statistics()
+      == (kwaque::runtime::operation_statistics_snapshot{
+        .active = 0,
+        .accepted = 9,
+        .completed = 9,
+      }));
 }
 
 SEASTAR_TEST_CASE(

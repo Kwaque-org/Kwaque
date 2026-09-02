@@ -101,7 +101,20 @@ resolver::resolver(dns_config config)
 
 resolver::resolver(
   dns_config config, const seastar::net::dns_resolver::options& options)
-  : native_(options)
+  : statistics_(&local_statistics_)
+  , native_(options)
+  , config_(config)
+  , admission_(config) {}
+
+resolver::resolver(operation_statistics& statistics, dns_config config)
+  : resolver(statistics, config, seastar::net::dns_resolver::options{}) {}
+
+resolver::resolver(
+  operation_statistics& statistics,
+  dns_config config,
+  const seastar::net::dns_resolver::options& options)
+  : statistics_(&statistics)
+  , native_(options)
   , config_(config)
   , admission_(config) {}
 
@@ -120,11 +133,13 @@ seastar::future<result<dns_result>>
 resolver::resolve(dns_query query, seastar::abort_source& caller_abort) {
     assert_current();
     if (state_ != resolver_state::open) {
+        statistics_->reject();
         result<dns_result> outcome = failure(dns_error(errc::closed));
         return seastar::make_ready_future<result<dns_result>>(
           std::move(outcome));
     }
     if (abort_requested_ || caller_abort.abort_requested()) {
+        statistics_->reject();
         result<dns_result> outcome = failure(dns_error(errc::aborted));
         return seastar::make_ready_future<result<dns_result>>(
           std::move(outcome));
@@ -133,11 +148,13 @@ resolver::resolve(dns_query query, seastar::abort_source& caller_abort) {
     activated_ = true;
     auto numeric = resolve_numeric(query);
     if (!numeric) {
+        statistics_->reject();
         result<dns_result> outcome = failure(numeric.error());
         return seastar::make_ready_future<result<dns_result>>(
           std::move(outcome));
     }
     if (*numeric) {
+        [[maybe_unused]] auto metric = statistics_->accept();
         std::vector<dns_answer> answers;
         try {
             answers.push_back(
@@ -168,8 +185,10 @@ seastar::future<result<dns_result>> resolver::resolve_name(
     auto admitted = co_await seastar::coroutine::without_preemption_check(
       admission_.acquire(caller_abort));
     if (!admitted) {
+        statistics_->reject();
         co_return failure(admitted.error());
     }
+    [[maybe_unused]] auto metric = statistics_->accept();
     if (
       state_ != resolver_state::open || abort_requested_
       || caller_abort.abort_requested()) {
