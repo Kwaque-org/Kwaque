@@ -9,6 +9,7 @@
 #include <seastar/core/future.hh>
 
 #include <array>
+#include <concepts>
 #include <cstddef>
 #include <cstdint>
 #include <limits>
@@ -16,6 +17,33 @@
 #include <utility>
 
 namespace kwaque::runtime::testing {
+
+template<typename Prepared>
+concept prepared_failure_evaluation = requires(Prepared& prepared) {
+    { prepared.preview() } noexcept -> std::same_as<fault_decision>;
+    { prepared.commit() } noexcept -> std::same_as<result<fault_decision>>;
+};
+
+template<typename Injector>
+using failure_preparation_result = decltype(std::declval<Injector&>().prepare(
+  std::declval<const fault_request&>(),
+  std::declval<monotonic_time>(),
+  std::declval<monotonic_time>()));
+
+template<typename Injector>
+using failure_preparation =
+  typename failure_preparation_result<Injector>::value_type;
+
+template<typename Injector>
+concept failure_probe_injector = requires(
+                                   Injector& injector,
+                                   const fault_request& request,
+                                   monotonic_time now,
+                                   monotonic_time maximum_deadline) {
+    {
+        injector.prepare(request, now, maximum_deadline)
+    } noexcept -> std::same_as<result<failure_preparation<Injector>>>;
+} && prepared_failure_evaluation<failure_preparation<Injector>>;
 
 inline constexpr std::array logical_failure_points{
   builtin_fault_point::environment_start,
@@ -104,7 +132,7 @@ public:
     failure_probe(failure_probe&&) = delete;
     failure_probe& operator=(failure_probe&&) = delete;
 
-    template<fault_injector Injector>
+    template<failure_probe_injector Injector>
     [[nodiscard]] result<failure_evaluation> evaluate(
       Injector& injector,
       builtin_fault_point point,
@@ -119,23 +147,25 @@ public:
         if (!candidate) {
             return failure(candidate.error());
         }
-        auto decision = injector.evaluate(candidate->request);
-        if (!decision) {
-            return failure(decision.error());
+        auto prepared = injector.prepare(
+          candidate->request, now, maximum_deadline);
+        if (!prepared) {
+            return failure(prepared.error());
         }
+        const auto decision = prepared->preview();
         if (
-          auto valid = validate_fault_decision(candidate->request, *decision);
+          auto valid = validate_fault_decision(candidate->request, decision);
           !valid) {
             return failure(valid.error());
         }
 
         std::optional<monotonic_time> deadline;
-        switch (decision->action()) {
+        switch (decision.action()) {
         case fault_action::none:
         case fault_action::error:
             break;
         case fault_action::delay:
-            deadline = now.checked_add(*decision->delay());
+            deadline = now.checked_add(*decision.delay());
             if (!deadline || *deadline > maximum_deadline) {
                 return failure(probe_error(errc::out_of_range));
             }
@@ -144,11 +174,20 @@ public:
             return failure(probe_error(errc::invalid_argument));
         }
 
-        if (auto committed = commit(*candidate); !committed) {
-            return failure(committed.error());
+        auto committed_decision = prepared->commit();
+        if (!committed_decision) {
+            return failure(committed_decision.error());
+        }
+        if (*committed_decision != decision) {
+            return failure(probe_error(errc::invariant_violation));
+        }
+        if (
+          auto committed_occurrence = commit(*candidate);
+          !committed_occurrence) {
+            return failure(committed_occurrence.error());
         }
         return failure_evaluation{
-          owner(), candidate->request, *decision, std::move(deadline)};
+          owner(), candidate->request, decision, std::move(deadline)};
     }
 
     [[nodiscard]] result<std::uint64_t>
@@ -158,6 +197,23 @@ private:
     friend class failure_probe_test_access;
 
     struct occurrence_candidate final {
+        occurrence_candidate(
+          failure_probe& owner,
+          fault_request candidate_request,
+          std::size_t candidate_index,
+          std::uint64_t candidate_previous) noexcept
+          : owner(&owner)
+          , request(candidate_request)
+          , index(candidate_index)
+          , previous(candidate_previous) {}
+        ~occurrence_candidate();
+
+        occurrence_candidate(const occurrence_candidate&) = delete;
+        occurrence_candidate& operator=(const occurrence_candidate&) = delete;
+        occurrence_candidate(occurrence_candidate&& other) noexcept;
+        occurrence_candidate& operator=(occurrence_candidate&&) = delete;
+
+        failure_probe* owner;
         fault_request request;
         std::size_t index;
         std::uint64_t previous;
@@ -165,11 +221,12 @@ private:
 
     [[nodiscard]] static operation_error probe_error(errc code) noexcept;
     [[nodiscard]] result<occurrence_candidate>
-    prepare(builtin_fault_point point, fault_object_key object) const noexcept;
-    [[nodiscard]] result<void>
-    commit(const occurrence_candidate& candidate) noexcept;
+    prepare(builtin_fault_point point, fault_object_key object) noexcept;
+    [[nodiscard]] result<void> commit(occurrence_candidate& candidate) noexcept;
+    void release(occurrence_candidate& candidate) noexcept;
 
     std::array<std::uint64_t, logical_failure_points.size()> occurrences_{};
+    std::array<bool, logical_failure_points.size()> reserved_{};
 };
 
 template<timer_service Timer>

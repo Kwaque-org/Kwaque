@@ -15,10 +15,15 @@ they do not add a virtual sink hierarchy or detached work.
 
 Callers submit validated event requests without shard or sequence fields. Each
 owner-local sink stamps its own shard and monotonic sequence transactionally.
+The sequence mechanism is shard-affine and package-internal; raw recorded shard
+construction is reserved for canonical decoding, so callers cannot bypass the
+sink boundary.
 Sequences restart only with an explicitly supplied nonzero sink epoch; event-log
 headers retain that epoch and the canonical configuration digest needed to
 distinguish reproduction data.
 
 Metric-owning components hold native metric groups directly in optional storage.
 Startup failure and stop destroy that storage to unregister callbacks without
-allocating a replacement registry.
+allocating a replacement registry. The pinned dependency is patched so
+allocation failure during registration also rolls back any partially inserted
+series before the owner can disappear.

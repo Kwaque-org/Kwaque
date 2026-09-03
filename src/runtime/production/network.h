@@ -15,6 +15,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <optional>
+#include <utility>
 
 namespace kwaque::runtime::production {
 
@@ -60,7 +61,7 @@ private:
       network_endpoint local,
       network_endpoint remote,
       network_connection_limits limits,
-      operation_statistics* statistics = nullptr);
+      operation_statistics_owner statistics = {});
 
     [[nodiscard]] static owner_shard prepare_move(connection& other) noexcept;
     [[nodiscard]] std::optional<operation_error> input_rejection() const;
@@ -82,7 +83,7 @@ private:
     [[nodiscard]] seastar::future<result<void>> close_once();
 
     owner_shard owner_;
-    operation_statistics local_statistics_;
+    operation_statistics_owner statistics_owner_;
     operation_statistics* statistics_;
     seastar::connected_socket native_;
     seastar::input_stream<char> input_;
@@ -132,12 +133,12 @@ private:
       seastar::server_socket native,
       network_endpoint local,
       network_connection_limits limits,
-      operation_statistics* statistics = nullptr);
+      operation_statistics_owner statistics = {});
 
     [[nodiscard]] static owner_shard prepare_move(listener& other) noexcept;
 
     owner_shard owner_;
-    operation_statistics local_statistics_;
+    operation_statistics_owner statistics_owner_;
     operation_statistics* statistics_;
     seastar::server_socket native_;
     network_endpoint local_;
@@ -156,10 +157,11 @@ public:
     using connection_type = connection;
     using listener_type = listener;
 
-    network() noexcept
-      : statistics_(&local_statistics_) {}
-    explicit network(operation_statistics& statistics) noexcept
-      : statistics_(&statistics) {}
+    network()
+      : statistics_(&statistics_owner_.get()) {}
+    explicit network(operation_statistics_owner statistics) noexcept
+      : statistics_owner_(std::move(statistics))
+      , statistics_(&statistics_owner_.get()) {}
 
     [[nodiscard]] seastar::future<result<connection>> connect(
       network_endpoint endpoint,
@@ -175,7 +177,7 @@ public:
     }
 
 private:
-    operation_statistics local_statistics_;
+    operation_statistics_owner statistics_owner_;
     operation_statistics* statistics_;
 };
 

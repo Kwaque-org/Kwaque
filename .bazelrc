@@ -61,6 +61,7 @@ build:heap-profile --@seastar//:heap_profiling=True
 build:heap-profile --@seastar//:system_allocator=False
 
 build:san-base --@seastar//:system_allocator=True
+build:san-base --@seastar//:allocation_failure_injection=False
 build:san-base --linkopt=-fsanitize-link-c++-runtime
 build:san-asan-only --config=san-base
 build:san-asan-only --copt=-fsanitize=address
@@ -84,6 +85,7 @@ build:release --compilation_mode=opt
 build:release --config=secure
 build:release --@seastar//:stack_guards=False
 build:release --@seastar//:debug=False
+build:release --@seastar//:allocation_failure_injection=False
 build:release --copt=-g
 build:release --strip=never
 

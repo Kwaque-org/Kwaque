@@ -29,6 +29,9 @@ using kwaque::simulation::fake_file_system_config;
 using kwaque::simulation::fake_file_test_access;
 using kwaque::simulation::fake_object_id;
 
+static_assert(!noexcept(
+  std::declval<const seastar::chunked_vector<std::uint64_t>&>().copy()));
+
 std::unique_ptr<fake_file_system> make_filesystem(
   std::string root = "/virtual/root",
   std::uint64_t capacity = 1U << 20U,

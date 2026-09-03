@@ -23,8 +23,7 @@ public:
         if (stopped_) {
             return runtime::failure(error(errc::closed));
         }
-        auto prepared = sequence_.prepare(
-          request, event_shard::from_owner(owner()));
+        auto prepared = sequence_.prepare(request);
         if (!prepared) {
             return runtime::failure(prepared.error());
         }

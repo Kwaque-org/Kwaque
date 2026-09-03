@@ -1,0 +1,286 @@
+diff --git a/include/seastar/core/metrics.hh b/include/seastar/core/metrics.hh
+index 5e97e1e..52e2f72 100644
+--- a/include/seastar/core/metrics.hh
++++ b/include/seastar/core/metrics.hh
+@@ -414,7 +414,7 @@ struct metric_definition_impl {
+     metric_definition_impl& operator ()(bool enabled);
+     metric_definition_impl& operator ()(const label_instance& label);
+     metric_definition_impl& operator ()(skip_when_empty skip) noexcept;
+-    metric_definition_impl& aggregate(const std::vector<label>& labels) noexcept;
++    metric_definition_impl& aggregate(const std::vector<label>& labels);
+     metric_definition_impl& set_skip_when_empty(bool skip=true) noexcept;
+     metric_definition_impl& set_type(const sstring& type_name);
+     metric_definition_impl(
+diff --git a/include/seastar/core/metrics_api.hh b/include/seastar/core/metrics_api.hh
+index 2ef0734..168c001 100644
+--- a/include/seastar/core/metrics_api.hh
++++ b/include/seastar/core/metrics_api.hh
+@@ -277,7 +277,11 @@ class registered_metric final {
+
+ using register_ref = shared_ptr<registered_metric>;
+ using metric_instances = std::map<internalized_holder, register_ref, std::less<>>;
+-using metrics_registration = std::vector<register_ref>;
++struct metric_registration {
++    register_ref metric;
++    sstring family_name;
++};
++using metrics_registration = std::vector<metric_registration>;
+
+ class metric_groups_impl : public metric_groups_def {
+     int _handle;
+@@ -477,6 +481,7 @@ class impl {
+     internalized_labels_ref internalize_labels(labels_type labels);
+     void update_aggregate_labels(const metric_id& id, const std::vector<label>& aggregate_labels);
+     void remove_registration(const metric_id& id);
++    void remove_registration(const metric_id& id, const sstring& family_name);
+     future<> stop() {
+         return make_ready_future<>();
+     }
+@@ -545,8 +550,10 @@ class impl {
+     void remove_metric_replica_family(const seastar::sstring& name,
+                                       int destination_handle) const;
+     void remove_metric_replica(const metric_id& id,
++                               const sstring& family_name,
+                                const shared_ptr<impl>& destination) const;
+-    void remove_metric_replica_if_required(const metric_id& id) const;
++    void remove_metric_replica_if_required(const metric_id& id,
++                                           const sstring& family_name) const;
+ };
+
+ const value_map& get_value_map(int handle = default_handle());
+diff --git a/include/seastar/core/metrics_registration.hh b/include/seastar/core/metrics_registration.hh
+index 4324492..1fd1530 100644
+--- a/include/seastar/core/metrics_registration.hh
++++ b/include/seastar/core/metrics_registration.hh
+@@ -67,7 +67,7 @@ class metric_groups;
+ class metric_definition {
+     std::unique_ptr<impl::metric_definition_impl> _impl;
+ public:
+-    metric_definition(const impl::metric_definition_impl& impl) noexcept;
++    metric_definition(const impl::metric_definition_impl& impl);
+     metric_definition(metric_definition&& m) noexcept;
+     ~metric_definition();
+     friend metric_groups;
+@@ -94,7 +94,7 @@ class metric_group_definition {
+ class metric_groups {
+     std::unique_ptr<impl::metric_groups_def> _impl;
+ public:
+-    explicit metric_groups(int handle = default_handle()) noexcept;
++    explicit metric_groups(int handle = default_handle());
+     metric_groups(metric_groups&&) = default;
+     virtual ~metric_groups();
+     metric_groups& operator=(metric_groups&&) = default;
+@@ -159,7 +159,7 @@ class metric_groups {
+  */
+ class metric_group : public metric_groups {
+ public:
+-    explicit metric_group(int handle = default_handle()) noexcept;
++    explicit metric_group(int handle = default_handle());
+     metric_group(const metric_group&) = delete;
+     metric_group(metric_group&&) = default;
+     virtual ~metric_group();
+diff --git a/src/core/metrics.cc b/src/core/metrics.cc
+index 2dfd4ba..66019bc 100644
+--- a/src/core/metrics.cc
++++ b/src/core/metrics.cc
+@@ -45,7 +45,7 @@ int default_handle() {
+
+ double_registration::double_registration(std::string what): std::runtime_error(what) {}
+
+-metric_groups::metric_groups(int handle) noexcept : _impl(impl::create_metric_groups(handle)) {
++metric_groups::metric_groups(int handle) : _impl(impl::create_metric_groups(handle)) {
+ }
+
+ void metric_groups::clear() {
+@@ -66,7 +66,7 @@ metric_groups& metric_groups::add_group(const group_name_type& name, const std::
+     _impl->add_group(name, l);
+     return *this;
+ }
+-metric_group::metric_group(int handle) noexcept : metric_groups(handle) {}
++metric_group::metric_group(int handle) : metric_groups(handle) {}
+ metric_group::~metric_group() = default;
+ metric_group::metric_group(const group_name_type& name, std::initializer_list<metric_definition> l, int handle) : metric_groups({metric_group_definition(name, l)}, handle) {
+ }
+@@ -82,7 +82,7 @@ metric_definition::metric_definition(metric_definition&& m) noexcept : _impl(std
+
+ metric_definition::~metric_definition()  = default;
+
+-metric_definition::metric_definition(impl::metric_definition_impl const& m) noexcept :
++metric_definition::metric_definition(impl::metric_definition_impl const& m) :
+     _impl(std::make_unique<impl::metric_definition_impl>(m)) {
+ }
+
+@@ -333,7 +333,7 @@ metric_definition_impl& metric_definition_impl::set_type(const sstring& type_nam
+     return *this;
+ }
+
+-metric_definition_impl& metric_definition_impl::aggregate(const std::vector<label>& _labels) noexcept {
++metric_definition_impl& metric_definition_impl::aggregate(const std::vector<label>& _labels) {
+     aggregate_labels.reserve(_labels.size());
+     std::transform(_labels.begin(), _labels.end(),std::back_inserter(aggregate_labels),
+             [](const label& l) { return l.name(); });
+@@ -352,8 +352,9 @@ std::unique_ptr<metric_groups_def> create_metric_groups(int handle) {
+ metric_groups_impl::metric_groups_impl(int handle) : _handle(handle) {}
+
+ metric_groups_impl::~metric_groups_impl() {
+-    for (const auto& i : _registration) {
+-        unregister_metric(i->info().id, _handle);
++    for (const auto& registration : _registration) {
++        _impl->remove_registration(registration.metric->info().id,
++                                   registration.family_name);
+     }
+ }
+
+@@ -374,18 +375,22 @@ metric_groups_impl& metric_groups_impl::add_metric(group_name_type name, const m
+         _impl = get_local_impl(_handle);
+     }
+
+-    auto internalized_labels = get_local_impl(_handle)->internalize_labels(md._impl->labels);
++    _registration.reserve(_registration.size() + 1);
++
++    auto internalized_labels = _impl->internalize_labels(md._impl->labels);
+
+     metric_id id(name, md._impl->name, internalized_labels);
++    auto family_name = id.full_name();
+
+-    auto reg = get_local_impl(_handle)->add_registration(
++    auto reg = _impl->add_registration(
+             id, md._impl->type, md._impl->f, md._impl->d, md._impl->enabled, md._impl->_skip_when_empty, md._impl->aggregate_labels);
+
+-    _registration.push_back(std::move(reg));
++    _registration.push_back({std::move(reg), std::move(family_name)});
+     return *this;
+ }
+
+ metric_groups_impl& metric_groups_impl::add_group(group_name_type name, const std::vector<metric_definition>& l) {
++    _registration.reserve(_registration.size() + l.size());
+     for (auto i = l.begin(); i != l.end(); ++i) {
+         add_metric(name, *(i->_impl.get()));
+     }
+@@ -393,6 +398,7 @@ metric_groups_impl& metric_groups_impl::add_group(group_name_type name, const st
+ }
+
+ metric_groups_impl& metric_groups_impl::add_group(group_name_type name, const std::initializer_list<metric_definition>& l) {
++    _registration.reserve(_registration.size() + l.size());
+     for (auto i = l.begin(); i != l.end(); ++i) {
+         add_metric(name, *i);
+     }
+@@ -435,9 +441,14 @@ shared_ptr<impl> get_local_impl(int handle) {
+ }
+
+ void impl::remove_registration(const metric_id& id) {
+-    remove_metric_replica_if_required(id);
++    auto family_name = id.full_name();
++    remove_registration(id, family_name);
++}
+
+-    auto i = get_value_map().find(id.full_name());
++void impl::remove_registration(const metric_id& id, const sstring& family_name) {
++    remove_metric_replica_if_required(id, family_name);
++
++    auto i = get_value_map().find(family_name);
+     if (i != get_value_map().end()) {
+         auto j = i->second.find(id.labels());
+         if (j != i->second.end()) {
+@@ -463,21 +474,24 @@ void impl::remove_metric_replica_family(const seastar::sstring& name,
+     for (const auto& metric_instance: entry->second) {
+         const auto& registered_metric = metric_instance.second;
+         remove_metric_replica(registered_metric->get_id(),
++                              name,
+                               destination);
+     }
+ }
+
+ void impl::remove_metric_replica(const metric_id& id,
++                                 const sstring& family_name,
+                                  const shared_ptr<impl>& destination) const {
+-    destination->remove_registration(id);
++    destination->remove_registration(id, family_name);
+ }
+
+-void impl::remove_metric_replica_if_required(const metric_id& id) const {
+-    auto [begin, end] = _metric_families_to_replicate.equal_range(id.full_name());
++void impl::remove_metric_replica_if_required(const metric_id& id,
++                                             const sstring& family_name) const {
++    auto [begin, end] = _metric_families_to_replicate.equal_range(family_name);
+
+     for (; begin != end; ++begin) {
+         auto destination = get_local_impl(begin->second);
+-        remove_metric_replica(id, destination);
++        remove_metric_replica(id, family_name, destination);
+     }
+ }
+
+@@ -635,32 +649,49 @@ register_ref impl::add_registration(const metric_id& id, const metric_type& type
+     }
+
+     sstring name = id.full_name();
+-    if (_value_map.find(name) != _value_map.end()) {
+-        auto& metric = _value_map[name];
+-        if (metric.find(rm->info().id.labels()) != metric.end()) {
+-            throw double_registration(fmt::format("registering metrics twice for metrics: {} with labels {}", name, rm->info().id.labels()));
+-        }
+-        if (metric.info().type != type.base_type) {
+-            throw std::runtime_error("registering metrics " + name + " registered with different type.");
+-        }
+-        metric[rm->info().id.internalized_labels()] = rm;
+-        for (auto&& i : rm->info().id.labels()) {
+-            _labels.insert(i.first);
++    auto existing = _value_map.find(name);
++    if (existing != _value_map.end()
++            && existing->second.find(rm->info().id.labels()) != existing->second.end()) {
++        throw double_registration(fmt::format("registering metrics twice for metrics: {} with labels {}", name, rm->info().id.labels()));
++    }
++    try {
++        if (existing != _value_map.end()) {
++            auto& metric = existing->second;
++            if (metric.info().type != type.base_type) {
++                throw std::runtime_error("registering metrics " + name + " registered with different type.");
++            }
++            metric[rm->info().id.internalized_labels()] = rm;
++            for (auto&& i : rm->info().id.labels()) {
++                _labels.insert(i.first);
++            }
++        } else {
++            _value_map[name].info().type = type.base_type;
++            _value_map[name].info().d = d;
++            _value_map[name].info().inherit_type = type.type_name;
++            _value_map[name].info().name = id.full_name();
++            _value_map[name].info().aggregate_labels = aggregate_labels;
++            impl::update_aggregate(_value_map[name].info());
++            _value_map[name][rm->info().id.internalized_labels()] = rm;
+         }
+-    } else {
+-        _value_map[name].info().type = type.base_type;
+-        _value_map[name].info().d = d;
+-        _value_map[name].info().inherit_type = type.type_name;
+-        _value_map[name].info().name = id.full_name();
+-        _value_map[name].info().aggregate_labels = aggregate_labels;
+-        impl::update_aggregate(_value_map[name].info());
+-        _value_map[name][rm->info().id.internalized_labels()] = rm;
+-    }
+-    dirty();
++        dirty();
+
+-    replicate_metric_if_required(rm);
++        replicate_metric_if_required(rm);
+
+-    return rm;
++        return rm;
++    } catch (...) {
++        auto registered = _value_map.find(name);
++        if (registered != _value_map.end()) {
++            auto instance = registered->second.find(rm->info().id.labels());
++            if (instance != registered->second.end()) {
++                registered->second.erase(instance);
++            }
++            if (registered->second.empty()) {
++                _value_map.erase(registered);
++            }
++            dirty();
++        }
++        throw;
++    }
+ }
+
+ void impl::update_aggregate_labels(const metric_id& id,

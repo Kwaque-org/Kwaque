@@ -43,6 +43,12 @@ def declare_native_dependencies():
     http_archive(
         name = "seastar",
         build_file = "//bazel/thirdparty:seastar.BUILD",
+        patch_args = ["-p1"],
+        patch_tool = "patch",
+        patches = [
+            "//bazel/thirdparty:seastar-chunked-vector-exception-safety.patch",
+            "//bazel/thirdparty:seastar-metrics-registration-exception-safety.patch",
+        ],
         sha256 = "5918f72ec59c159a8d2fe36870e7d30c6e61426fde766d7dd6853fa7f9871f7f",
         strip_prefix = "seastar-{}".format(SEASTAR_REVISION),
         url = "https://github.com/redpanda-data/seastar/archive/{}.tar.gz".format(SEASTAR_REVISION),
@@ -51,6 +57,8 @@ def declare_native_dependencies():
     http_archive(
         name = "unordered_dense",
         build_file = "//bazel/thirdparty:unordered_dense.BUILD",
+        patch_args = ["-p1"],
+        patches = ["//bazel/thirdparty:unordered-dense-exception-safety.patch"],
         sha256 = "8393d08b2a41949c70345926515036df55643e80118b608bcec6f4202d4a3026",
         strip_prefix = "unordered_dense-f30ed41b58af8c79788e8581fe57a6faf856258e",
         url = "https://github.com/martinus/unordered_dense/archive/f30ed41b58af8c79788e8581fe57a6faf856258e.tar.gz",

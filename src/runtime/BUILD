@@ -38,6 +38,10 @@ kwaque_cc_library(
     name = "operation_statistics",
     hdrs = ["operation_statistics.h"],
     visibility = ["//visibility:public"],
+    deps = [
+        ":shard_affinity",
+        "@seastar",
+    ],
 )
 
 kwaque_cc_library(

@@ -38,8 +38,14 @@ configure_make(
         "--runstatedir=/var/run/hwloc",
     ],
     env = {
-        "CFLAGS": "-ffile-prefix-map=$$EXT_BUILD_ROOT=.",
-        "CXXFLAGS": "-ffile-prefix-map=$$EXT_BUILD_ROOT=.",
+        "CFLAGS": " ".join([
+            "-ffile-prefix-map=$$EXT_BUILD_ROOT=.",
+            "-ffile-prefix-map=$${EXT_BUILD_ROOT%%/sandbox/*}/external=external",
+        ]),
+        "CXXFLAGS": " ".join([
+            "-ffile-prefix-map=$$EXT_BUILD_ROOT=.",
+            "-ffile-prefix-map=$${EXT_BUILD_ROOT%%/sandbox/*}/external=external",
+        ]),
         "HWLOC_BUILD_JOBS": "$(BUILD_JOBS)",
     },
     lib_source = ":srcs",

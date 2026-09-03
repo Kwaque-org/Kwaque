@@ -92,22 +92,19 @@ production_event_sink::emit(const event_request& request) noexcept {
     if (stopped_) {
         return runtime::failure(sink_error(errc::closed));
     }
-    auto prepared = sequence_.prepare(
-      request, event_shard::from_owner(owner()));
+    auto prepared = sequence_.prepare(request);
     if (!prepared) {
         return runtime::failure(prepared.error());
     }
     const auto& value = prepared->value();
     const auto level = native_level(value.severity());
-    if (logger_->is_enabled(level)) {
-        const auto epoch = sequence_.identity().epoch;
-        auto append = [&value, epoch](log_iterator output) {
-            return append_event(output, value, epoch);
-        };
-        seastar::logger::lambda_log_writer<decltype(append)> writer{
-          std::move(append)};
-        logger_->log(level, writer);
-    }
+    const auto epoch = sequence_.identity().epoch;
+    auto append = [&value, epoch](log_iterator output) {
+        return append_event(output, value, epoch);
+    };
+    seastar::logger::lambda_log_writer<decltype(append)> writer{
+      std::move(append)};
+    logger_->log(level, writer);
     prepared->commit();
     return {};
 }

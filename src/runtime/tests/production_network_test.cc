@@ -71,6 +71,29 @@ SEASTAR_TEST_CASE(production_network_shared_contract) {
       run_shared_contract(std::move(backend)));
 }
 
+SEASTAR_TEST_CASE(
+  production_listener_retains_statistics_after_factory_destruction) {
+    std::optional<kwaque::runtime::production::listener> listening;
+    {
+        kwaque::runtime::production::network backend;
+        auto result = co_await backend.listen(
+          kwaque::runtime::network_endpoint{loopback_address, 0}, {});
+        BOOST_REQUIRE(result.has_value());
+        listening.emplace(std::move(*result));
+    }
+
+    const auto closed = co_await listening->close();
+    BOOST_REQUIRE(closed.has_value());
+    BOOST_CHECK(
+      listening->statistics()
+      == (kwaque::runtime::operation_statistics_snapshot{
+        .active = 0,
+        .accepted = 2,
+        .completed = 2,
+      }));
+    listening.reset();
+}
+
 SEASTAR_TEST_CASE(production_network_moves_idle_native_owners_after_use) {
     kwaque::runtime::production::network backend;
     auto original_listener = co_await backend.listen(

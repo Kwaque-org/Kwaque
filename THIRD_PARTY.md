@@ -40,7 +40,7 @@ embedded source file is authoritative.
 | lksctp-tools (`lksctp`) | 1.0.19 | https://github.com/sctp/lksctp-tools | LGPL-2.1-or-later | Compile-time header only; license bundled | SCTP declarations required by the selected Seastar BUILD graph; implementation objects are not linked |
 | OpenSSL | 3.5.7 | https://github.com/openssl/openssl | Apache-2.0 | Bundled shared libraries; license bundled | TLS and cryptography for Seastar |
 | Ragel | 26.04.0-20260414092900-8841e561489e | https://www.colm.net/open-source/ragel/ | MIT | Build only | Generate Seastar protocol parsers at build time |
-| `unordered_dense` | `f30ed41b58af8c79788e8581fe57a6faf856258e` | https://github.com/martinus/unordered_dense | MIT | Compile-time header; license bundled | Hash containers required by Seastar |
+| `unordered_dense` | `f30ed41b58af8c79788e8581fe57a6faf856258e` | https://github.com/martinus/unordered_dense | MIT | Compile-time header; license bundled | Hash containers required by Seastar; patched for move and growth exception safety |
 
 ## Embedded source material
 

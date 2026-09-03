@@ -72,6 +72,24 @@ fault_descriptor(builtin_fault_point point) {
 
 class fixed_injector final {
 public:
+    class preparation final {
+    public:
+        [[nodiscard]] fault_decision preview() const noexcept {
+            return decision_;
+        }
+        [[nodiscard]] result<fault_decision> commit() noexcept {
+            return decision_;
+        }
+
+    private:
+        friend class fixed_injector;
+
+        explicit preparation(fault_decision decision) noexcept
+          : decision_(decision) {}
+
+        fault_decision decision_;
+    };
+
     explicit fixed_injector(fault_decision decision = {}) noexcept
       : decision_(decision) {}
 
@@ -82,6 +100,16 @@ public:
             return kwaque::runtime::failure(*failure_);
         }
         return decision_;
+    }
+
+    result<preparation> prepare(
+      const fault_request& request, monotonic_time, monotonic_time) noexcept {
+        ++calls_;
+        last_ = request;
+        if (failure_) {
+            return kwaque::runtime::failure(*failure_);
+        }
+        return preparation{decision_};
     }
 
     void fail(kwaque::errc code) noexcept {
@@ -97,6 +125,38 @@ private:
     std::optional<operation_error> failure_;
     std::optional<fault_request> last_;
     std::size_t calls_{0};
+};
+
+class reentrant_injector final {
+public:
+    explicit reentrant_injector(failure_probe& probe) noexcept
+      : probe_(&probe) {}
+
+    result<fixed_injector::preparation> prepare(
+      const fault_request& request,
+      monotonic_time now,
+      monotonic_time maximum_deadline) noexcept {
+        const auto nested = probe_->evaluate(
+          nested_,
+          builtin_fault_point::environment_start,
+          now,
+          maximum_deadline);
+        nested_error_ = nested ? kwaque::errc::success : nested.error().code();
+        return outer_.prepare(request, now, maximum_deadline);
+    }
+
+    [[nodiscard]] std::optional<kwaque::errc> nested_error() const noexcept {
+        return nested_error_;
+    }
+    [[nodiscard]] std::size_t nested_calls() const noexcept {
+        return nested_.calls();
+    }
+
+private:
+    failure_probe* probe_;
+    fixed_injector outer_;
+    fixed_injector nested_;
+    std::optional<kwaque::errc> nested_error_;
 };
 
 class allocation_failing_timer final {
@@ -123,6 +183,10 @@ private:
 };
 
 static_assert(kwaque::runtime::fault_injector<fixed_injector>);
+static_assert(kwaque::runtime::testing::failure_probe_injector<fixed_injector>);
+static_assert(
+  kwaque::runtime::testing::failure_probe_injector<reentrant_injector>);
+static_assert(kwaque::runtime::testing::failure_probe_injector<fault_schedule>);
 static_assert(kwaque::runtime::timer_service<allocation_failing_timer>);
 static_assert(!std::is_copy_constructible_v<failure_probe>);
 static_assert(!std::is_move_constructible_v<failure_probe>);
@@ -265,6 +329,25 @@ SEASTAR_TEST_CASE(failure_probe_assigns_exact_independent_occurrences) {
     BOOST_CHECK(rejected.error().code() == kwaque::errc::invalid_argument);
     BOOST_CHECK_EQUAL(injector.calls(), logical_failure_points.size() * 3U);
     BOOST_CHECK(!probe.occurrences(builtin_fault_point::timer).has_value());
+    co_return;
+}
+
+SEASTAR_TEST_CASE(failure_probe_rejects_same_point_reentry) {
+    failure_probe probe;
+    reentrant_injector injector{probe};
+    const auto evaluated = probe.evaluate(
+      injector,
+      builtin_fault_point::environment_start,
+      monotonic_time{},
+      monotonic_time{100});
+    BOOST_REQUIRE(evaluated.has_value());
+    BOOST_REQUIRE(injector.nested_error().has_value());
+    BOOST_CHECK(*injector.nested_error() == kwaque::errc::unavailable);
+    BOOST_CHECK_EQUAL(injector.nested_calls(), 0U);
+    const auto count = probe.occurrences(
+      builtin_fault_point::environment_start);
+    BOOST_REQUIRE(count.has_value());
+    BOOST_CHECK_EQUAL(*count, 1U);
     co_return;
 }
 
@@ -645,6 +728,32 @@ SEASTAR_TEST_CASE(
       builtin_fault_point::queue_admission);
     BOOST_REQUIRE(skipped_count.has_value());
     BOOST_CHECK_EQUAL(*skipped_count, 2U);
+    co_return;
+}
+
+SEASTAR_TEST_CASE(
+  failure_probe_uses_its_deadline_limit_before_schedule_commit) {
+    seastar::chunked_vector<fault_rule> rules;
+    rules.push_back(rule(
+      105,
+      builtin_fault_point::environment_start,
+      fault_decision::make_delay(monotonic_duration{75})));
+    fixture environment{std::move(rules)};
+
+    const auto evaluated = environment.probe.evaluate(
+      *environment.faults,
+      builtin_fault_point::environment_start,
+      environment.events.now(),
+      monotonic_time{50});
+    BOOST_REQUIRE(!evaluated.has_value());
+    BOOST_CHECK(evaluated.error().code() == kwaque::errc::out_of_range);
+    BOOST_CHECK(environment.trace.entries().empty());
+    BOOST_CHECK_EQUAL(environment.faults->evaluations(), 0U);
+    BOOST_CHECK_EQUAL(environment.faults->applied_decisions(), 0U);
+    const auto count = environment.probe.occurrences(
+      builtin_fault_point::environment_start);
+    BOOST_REQUIRE(count.has_value());
+    BOOST_CHECK_EQUAL(*count, 0U);
     co_return;
 }
 

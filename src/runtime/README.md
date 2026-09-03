@@ -14,6 +14,13 @@ approved owned value. Cross-shard invocation retains callable and argument state
 through asynchronous completion unless a function pointer's declared parameters
 prove the direct value-only native path safe.
 
+Production operation counters retain direct fixed-width updates. Adapters and
+returned handles use a shard-checked lightweight native shared owner only for
+the lifetime of the counter block, ensuring an accepted file or network
+operation cannot reference statistics destroyed with a backend. Each adapter
+caches the retained block's direct pointer at construction, so operation updates
+perform no reference-count or duplicate affinity work.
+
 Closing a task scope first closes admission and requests abort, then waits for
 all accepted work. `admission_closed()` reports only the first condition; the
 future returned by `close()` is the drain-completion boundary.

@@ -509,13 +509,6 @@ make_event_field(event_public_text value) noexcept {
 
 class event_shard final {
 public:
-    constexpr explicit event_shard(std::uint32_t value) noexcept
-      : value_(value) {}
-
-    [[nodiscard]] static constexpr event_shard
-    from_owner(runtime::owner_shard owner) noexcept {
-        return event_shard{static_cast<std::uint32_t>(owner.value())};
-    }
     [[nodiscard]] constexpr std::uint32_t value() const noexcept {
         return value_;
     }
@@ -523,6 +516,16 @@ public:
     auto operator<=>(const event_shard&) const = default;
 
 private:
+    friend struct event_codec_access;
+    friend class event_sequence;
+
+    constexpr explicit event_shard(std::uint32_t value) noexcept
+      : value_(value) {}
+    [[nodiscard]] static constexpr event_shard
+    from_owner(runtime::owner_shard owner) noexcept {
+        return event_shard{static_cast<std::uint32_t>(owner.value())};
+    }
+
     std::uint32_t value_;
 };
 
@@ -532,6 +535,8 @@ struct event_request_context final {
     runtime::monotonic_time monotonic;
     runtime::wall_time wall;
     resource::workload_class workload;
+
+    bool operator==(const event_request_context&) const = default;
 };
 
 [[nodiscard]] runtime::result<void>
@@ -582,7 +587,6 @@ public:
 
 private:
     friend struct event_codec_access;
-    friend class event_request;
     friend class event_sequence;
 
     [[nodiscard]] static runtime::result<event> make(
@@ -624,32 +628,30 @@ public:
     event_request& operator=(event_request&&) noexcept = default;
 
     [[nodiscard]] constexpr std::uint32_t schema_version() const noexcept {
-        return value_.schema_version();
+        return event_schema_version;
     }
     [[nodiscard]] constexpr event_kind kind() const noexcept {
-        return value_.kind();
+        return context_.kind;
     }
-    [[nodiscard]] std::string_view name() const noexcept {
-        return value_.name();
-    }
+    [[nodiscard]] std::string_view name() const noexcept;
     [[nodiscard]] constexpr event_severity severity() const noexcept {
-        return value_.severity();
+        return context_.severity;
     }
     [[nodiscard]] constexpr runtime::monotonic_time monotonic() const noexcept {
-        return value_.monotonic();
+        return context_.monotonic;
     }
     [[nodiscard]] constexpr runtime::wall_time wall() const noexcept {
-        return value_.wall();
+        return context_.wall;
     }
     [[nodiscard]] constexpr resource::workload_class workload() const noexcept {
-        return value_.workload();
+        return context_.workload;
     }
     [[nodiscard]] constexpr std::span<const event_field>
     fields() const noexcept {
-        return value_.fields();
+        return {fields_.data(), field_count_};
     }
     [[nodiscard]] constexpr std::size_t encoded_size() const noexcept {
-        return value_.encoded_size();
+        return encoded_size_;
     }
 
     bool operator==(const event_request&) const = default;
@@ -657,10 +659,13 @@ public:
 private:
     friend class event;
 
-    explicit event_request(event value) noexcept
-      : value_(std::move(value)) {}
+    explicit event_request(const event_request_context& context) noexcept
+      : context_(context) {}
 
-    event value_;
+    event_request_context context_;
+    std::array<event_field, event_fields_max> fields_{};
+    std::uint16_t encoded_size_{0};
+    std::uint8_t field_count_{0};
 };
 
 } // namespace kwaque::observability

@@ -65,6 +65,21 @@ struct direct_operation_statistics_fixture {
     operation_statistics_snapshot statistics;
 };
 
+struct inline_probe_statistics_fixture {
+    void accept() noexcept {
+        ++statistics.active;
+        ++statistics.accepted;
+    }
+
+    void complete(std::uint64_t bytes) noexcept {
+        statistics.completed_bytes += bytes;
+        --statistics.active;
+        ++statistics.completed;
+    }
+
+    operation_statistics_snapshot statistics;
+};
+
 struct owner_operation_statistics_fixture {
     operation_statistics statistics;
 };
@@ -579,6 +594,18 @@ PERF_TEST_F(direct_operation_statistics_fixture, accepted_terminal_update) {
         perf_tests::do_not_optimize(statistics.active);
         --statistics.active;
         ++statistics.completed;
+    }
+    perf_tests::do_not_optimize(statistics.accepted);
+    perf_tests::do_not_optimize(statistics.completed);
+    perf_tests::do_not_optimize(statistics.completed_bytes);
+    return inner_iterations;
+}
+
+PERF_TEST_F(inline_probe_statistics_fixture, accepted_terminal_update) {
+    for (std::size_t index = 0; index < inner_iterations; ++index) {
+        accept();
+        perf_tests::do_not_optimize(statistics.active);
+        complete(UINT64_C(4096));
     }
     perf_tests::do_not_optimize(statistics.accepted);
     perf_tests::do_not_optimize(statistics.completed);

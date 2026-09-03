@@ -1,0 +1,250 @@
+diff --git a/include/ankerl/unordered_dense.h b/include/ankerl/unordered_dense.h
+index 287283f..8b634a1 100644
+--- a/include/ankerl/unordered_dense.h
++++ b/include/ankerl/unordered_dense.h
+@@ -477,6 +477,12 @@ using detect_iterator = typename T::iterator;
+ template <typename T>
+ using detect_reserve = decltype(std::declval<T&>().reserve(size_t{}));
+
++template <typename T>
++using detect_resize = decltype(std::declval<T&>().resize(size_t{}));
++
++template <typename T>
++using detect_pop_back_n = decltype(std::declval<T&>().pop_back_n(size_t{}));
++
+ // enable_if helpers
+
+ template <typename Mapped>
+@@ -493,6 +499,12 @@ constexpr bool is_neither_convertible_v = !std::is_convertible_v<From, To1> && !
+ template <typename T>
+ constexpr bool has_reserve = is_detected_v<detect_reserve, T>;
+
++template <typename T>
++constexpr bool has_resize = is_detected_v<detect_resize, T>;
++
++template <typename T>
++constexpr bool has_pop_back_n = is_detected_v<detect_pop_back_n, T>;
++
+ // base type for map has mapped_type
+ template <class T>
+ struct base_table_type_map {
+@@ -958,13 +970,11 @@ class table : public std::conditional_t<is_map_v<T>, base_table_type_map<T>, bas
+     void copy_buckets(table const& other) {
+         // assumes m_values has already the correct data copied over.
+         if (empty()) {
+-            // when empty, at least allocate an initial buckets and clear them.
+-            allocate_buckets_from_shift();
+-            clear_buckets();
++            // Empty tables need no buckets. The first insertion allocates them.
++            m_shifts = initial_shifts;
+         } else {
+-            m_shifts = other.m_shifts;
+-            allocate_buckets_from_shift();
++            allocate_buckets_from_shift(other.m_shifts);
+             if constexpr (IsSegmented || !std::is_same_v<BucketContainer, default_container_t>) {
+                 for (auto i = 0UL; i < bucket_count(); ++i) {
+                     at(m_buckets, i) = at(other.m_buckets, i);
+                 }
+@@ -987,18 +997,58 @@ class table : public std::conditional_t<is_map_v<T>, base_table_type_map<T>, bas
+         m_max_bucket_capacity = 0;
+     }
+
+-    void allocate_buckets_from_shift() {
+-        auto num_buckets = calc_num_buckets(m_shifts);
++    void allocate_buckets_from_shift(uint8_t shifts) {
++        auto num_buckets = calc_num_buckets(shifts);
+         if constexpr (IsSegmented || !std::is_same_v<BucketContainer, default_container_t>) {
+-            if constexpr (has_reserve<bucket_container_type>) {
+-                m_buckets.reserve(num_buckets);
+-            }
+-            for (size_t i = m_buckets.size(); i < num_buckets; ++i) {
+-                m_buckets.emplace_back();
++            if (num_buckets < m_buckets.size()) {
++                if constexpr (has_resize<bucket_container_type>) {
++                    m_buckets.resize(num_buckets);
++                } else if constexpr (has_pop_back_n<bucket_container_type>) {
++                    m_buckets.pop_back_n(m_buckets.size() - num_buckets);
++                } else {
++                    while (m_buckets.size() != num_buckets) {
++                        m_buckets.pop_back();
++                    }
++                }
++            } else {
++                if constexpr (has_reserve<bucket_container_type>) {
++                    m_buckets.reserve(num_buckets);
++                }
++                auto const old_num_buckets = m_buckets.size();
++                auto const append_buckets = [&] {
++                    for (size_t i = m_buckets.size(); i < num_buckets; ++i) {
++                        m_buckets.emplace_back();
++                    }
++                };
++                if constexpr (ANKERL_UNORDERED_DENSE_HAS_EXCEPTIONS()) {
++                    try {
++                        append_buckets();
++                    } catch (...) {
++                        // This pinned version wraps probes with bucket_count().
++                        // Restore the old physical size before propagating.
++                        if constexpr (has_resize<bucket_container_type>) {
++                            m_buckets.resize(old_num_buckets);
++                        } else if constexpr (has_pop_back_n<bucket_container_type>) {
++                            m_buckets.pop_back_n(m_buckets.size() - old_num_buckets);
++                        } else {
++                            while (m_buckets.size() != old_num_buckets) {
++                                m_buckets.pop_back();
++                            }
++                        }
++                        throw;
++                    }
++                } else {
++                    append_buckets();
++                }
+             }
+         } else {
+-            m_buckets.resize(num_buckets);
++            // Keep the old bucket array live until its replacement exists.
++            auto fresh = bucket_container_type(m_buckets.get_allocator());
++            fresh.resize(num_buckets);
++            m_buckets = std::move(fresh);
+         }
++        // Publish the description only after the complete array exists.
++        m_shifts = shifts;
+         if (num_buckets == max_bucket_count()) {
+             // reached the maximum, make sure we can use each bucket
+             m_max_bucket_capacity = max_bucket_count();
+@@ -1007,7 +1057,19 @@ class table : public std::conditional_t<is_map_v<T>, base_table_type_map<T>, bas
+         }
+     }
+
++    void allocate_buckets_if_none() {
++        if (ANKERL_UNORDERED_DENSE_UNLIKELY(0 == bucket_count())) {
++            allocate_buckets_from_shift(m_shifts);
++            clear_buckets();
++        }
++    }
++
+     void clear_buckets() {
++        // Empty tables intentionally have no bucket array until first insert.
++        // Avoid passing a null pointer to memset even with a zero length.
++        if (0 == bucket_count()) {
++            return;
++        }
+         if constexpr (IsSegmented || !std::is_same_v<BucketContainer, default_container_t>) {
+             for (auto&& e : m_buckets) {
+                 std::memset(&e, 0, sizeof(e));
+@@ -1035,11 +1097,18 @@ class table : public std::conditional_t<is_map_v<T>, base_table_type_map<T>, bas
+             m_values.pop_back();
+             on_error_bucket_overflow();
+         }
+-        --m_shifts;
+-        if constexpr (!IsSegmented || std::is_same_v<BucketContainer, default_container_t>) {
+-            deallocate_buckets();
++        if constexpr (ANKERL_UNORDERED_DENSE_HAS_EXCEPTIONS()) {
++            try {
++                allocate_buckets_from_shift(static_cast<uint8_t>(m_shifts - 1));
++            } catch (...) {
++                // do_place_element() appended this value before growing.
++                // Remove it so a failed insert has no visible effect.
++                m_values.pop_back();
++                throw;
++            }
++        } else {
++            allocate_buckets_from_shift(static_cast<uint8_t>(m_shifts - 1));
+         }
+-        allocate_buckets_from_shift();
+         clear_and_fill_buckets_from_values();
+     }
+
+@@ -1127,6 +1196,7 @@ class table : public std::conditional_t<is_map_v<T>, base_table_type_map<T>, bas
+
+     template <typename K, typename... Args>
+     auto do_try_emplace(K&& key, Args&&... args) -> std::pair<iterator, bool> {
++        allocate_buckets_if_none();
+         auto hash = mixed_hash(key);
+         auto dist_and_fingerprint = dist_and_fingerprint_from_hash(hash);
+         auto bucket_idx = bucket_idx_from_hash(hash);
+@@ -1216,11 +1286,9 @@ class table : public std::conditional_t<is_map_v<T>, base_table_type_map<T>, bas
+         , m_buckets(alloc_or_container)
+         , m_hash(hash)
+         , m_equal(equal) {
++        // A default-constructed table allocates its buckets on first insert.
+         if (0 != bucket_count) {
+             reserve(bucket_count);
+-        } else {
+-            allocate_buckets_from_shift();
+-            clear_buckets();
+         }
+     }
+
+@@ -1321,8 +1389,6 @@ class table : public std::conditional_t<is_map_v<T>, base_table_type_map<T>, bas
+                 m_max_load_factor = std::exchange(other.m_max_load_factor, default_max_load_factor);
+                 m_hash = std::exchange(other.m_hash, {});
+                 m_equal = std::exchange(other.m_equal, {});
+-                other.allocate_buckets_from_shift();
+-                other.clear_buckets();
+             } else {
+                 // set max_load_factor *before* copying the other's buckets, so we have the same
+                 // behavior
+@@ -1442,7 +1508,10 @@ class table : public std::conditional_t<is_map_v<T>, base_table_type_map<T>, bas
+     // nonstandard API: *this is emptied.
+     // Also see "A Standard flat_map" https://www.open-std.org/jtc1/sc22/wg21/docs/papers/2022/p0429r9.pdf
+     auto extract() && -> value_container_type {
+-        return std::move(m_values);
++        auto values = std::move(m_values);
++        m_values.clear();
++        clear_buckets();
++        return values;
+     }
+
+     // nonstandard API:
+@@ -1453,9 +1522,7 @@ class table : public std::conditional_t<is_map_v<T>, base_table_type_map<T>, bas
+         }
+         auto shifts = calc_shifts_for_size(container.size());
+         if (0 == bucket_count() || shifts < m_shifts || container.get_allocator() != m_values.get_allocator()) {
+-            m_shifts = shifts;
+-            deallocate_buckets();
+-            allocate_buckets_from_shift();
++            allocate_buckets_from_shift(shifts);
+         }
+         clear_buckets();
+
+@@ -1546,6 +1613,7 @@ class table : public std::conditional_t<is_map_v<T>, base_table_type_map<T>, bas
+               typename KE = KeyEqual,
+               std::enable_if_t<!is_map_v<Q> && is_transparent_v<H, KE>, bool> = true>
+     auto emplace(K&& key) -> std::pair<iterator, bool> {
++        allocate_buckets_if_none();
+         auto hash = mixed_hash(key);
+         auto dist_and_fingerprint = dist_and_fingerprint_from_hash(hash);
+         auto bucket_idx = bucket_idx_from_hash(hash);
+@@ -1566,6 +1634,8 @@ class table : public std::conditional_t<is_map_v<T>, base_table_type_map<T>, bas
+
+     template <class... Args>
+     auto emplace(Args&&... args) -> std::pair<iterator, bool> {
++        allocate_buckets_if_none();
++
+         // we have to instantiate the value_type to be able to access the key.
+         // 1. emplace_back the object so it is constructed. 2. If the key is already there, pop it later in the loop.
+         auto& key = get_key(m_values.emplace_back(std::forward<Args>(args)...));
+@@ -1880,10 +1950,8 @@ class table : public std::conditional_t<is_map_v<T>, base_table_type_map<T>, bas
+         count = (std::min)(count, max_size());
+         auto shifts = calc_shifts_for_size((std::max)(count, size()));
+         if (shifts != m_shifts) {
+-            m_shifts = shifts;
+-            deallocate_buckets();
++            allocate_buckets_from_shift(shifts);
+             m_values.shrink_to_fit();
+-            allocate_buckets_from_shift();
+             clear_and_fill_buckets_from_values();
+         }
+     }
+@@ -1896,9 +1964,7 @@ class table : public std::conditional_t<is_map_v<T>, base_table_type_map<T>, bas
+         }
+         auto shifts = calc_shifts_for_size((std::max)(capa, size()));
+         if (0 == bucket_count() || shifts < m_shifts) {
+-            m_shifts = shifts;
+-            deallocate_buckets();
+-            allocate_buckets_from_shift();
++            allocate_buckets_from_shift(shifts);
+             clear_and_fill_buckets_from_values();
+         }
+     }

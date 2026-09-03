@@ -1,5 +1,5 @@
 load("//bazel:build.bzl", "kwaque_cc_library")
-load("//bazel:test.bzl", "kwaque_cc_seastar_test")
+load("//bazel:test.bzl", "kwaque_cc_benchmark", "kwaque_cc_seastar_test")
 
 package(default_visibility = ["//visibility:private"])
 
@@ -33,14 +33,27 @@ kwaque_cc_library(
 )
 
 kwaque_cc_library(
+    name = "event_identity",
+    srcs = ["event_identity.cc"],
+    hdrs = ["event_identity.h"],
+    visibility = ["//visibility:public"],
+    deps = ["//src/runtime:error"],
+)
+
+kwaque_cc_library(
     name = "event_sequence",
     srcs = ["event_sequence.cc"],
     hdrs = ["event_sequence.h"],
-    visibility = ["//visibility:public"],
+    visibility = [
+        "//src/observability:__pkg__",
+        "//src/simulation:__pkg__",
+    ],
     deps = [
         ":event",
+        ":event_identity",
         "//src/base:invariant",
         "//src/runtime:error",
+        "//src/runtime:shard_affinity",
     ],
 )
 
@@ -60,7 +73,7 @@ kwaque_cc_library(
     deps = [
         ":event",
         ":event_codec",
-        ":event_sequence",
+        ":event_identity",
         "//src/base",
         "//src/runtime:error",
         "@seastar",
@@ -125,6 +138,8 @@ kwaque_cc_seastar_test(
         ":event_codec",
         ":event_log",
         ":event_sequence",
+        ":event_sequence_test_access",
+        "//src/base",
     ],
 )
 
@@ -162,4 +177,21 @@ kwaque_cc_seastar_test(
     cpu = 1,
     memory = "128MiB",
     deps = ["//src/runtime:shard_affinity"],
+)
+
+kwaque_cc_benchmark(
+    name = "event_bench",
+    srcs = ["event_bench.cc"],
+    memory = "192MiB",
+    deps = [
+        ":capture_event_sink",
+        ":event",
+        ":event_identity",
+        ":event_log",
+        ":event_sequence",
+        ":event_sink",
+        "//src/resource:workload_class",
+        "//src/runtime:time",
+        "@seastar",
+    ],
 )

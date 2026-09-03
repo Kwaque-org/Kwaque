@@ -103,12 +103,12 @@ class PackageContentsTest(unittest.TestCase):
                 if b"__asan_init" in contents or b"__ubsan_handle" in contents:
                     continue
                 for marker in forbidden:
-                    self.assertNotIn(
-                        marker,
-                        contents,
-                        f"{member.name} embeds the build path {marker!r}, which "
-                        f"changes between builds and breaks reproducibility",
-                    )
+                    if marker in contents:
+                        self.fail(
+                            f"{member.name} embeds the build path {marker!r}, "
+                            "which changes between builds and breaks "
+                            "reproducibility"
+                        )
 
     def test_checksum_matches_archive(self) -> None:
         archive = Path(sys.argv[1])

@@ -2281,7 +2281,6 @@ seastar::future<runtime::result<fake_listener>> fake_network::listen(
         listener->stop_event = std::move(stop_terminal->first);
         listener->stop_trace = std::move(stop_terminal->second);
         impl::bind_operation binding{.listener = listener_id};
-        auto waiting = binding.done.get_future();
         auto operation = std::make_unique<impl::operation_state>(
           operation_id,
           impl::operation_payload{
@@ -2346,13 +2345,13 @@ seastar::future<runtime::result<fake_listener>> fake_network::listen(
             impl_->commit_cursor(
               selected_port->endpoint.address(), selected_port->next_cursor);
         }
-        std::get<impl::bind_operation>(
-          impl_->find_operation(operation_id)->payload)
-          .event = *scheduled;
+        auto& committed = std::get<impl::bind_operation>(
+          impl_->find_operation(operation_id)->payload);
+        committed.event = *scheduled;
         impl_->issue_listener_id();
         impl_->issue_operation_id();
         impl_->activated_ = true;
-        return waiting;
+        return committed.done.get_future();
     } catch (...) {
         return seastar::current_exception_as_future<
           runtime::result<fake_listener>>();

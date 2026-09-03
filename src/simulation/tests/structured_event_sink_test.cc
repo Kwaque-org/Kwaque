@@ -1,6 +1,6 @@
 #include "src/observability/event.h"
+#include "src/observability/event_identity.h"
 #include "src/observability/event_log.h"
-#include "src/observability/event_sequence.h"
 #include "src/simulation/event_sink.h"
 
 #include <seastar/core/coroutine.hh>

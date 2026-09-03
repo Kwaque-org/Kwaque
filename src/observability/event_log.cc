@@ -267,7 +267,7 @@ event_log_artifact::append(std::span<const std::uint8_t> bytes) {
         }
         auto& tail = chunks_.back();
         const auto count = std::min(
-          bytes.size(), maximum_contiguous_allocation_bytes - tail.size());
+          bytes.size(), tail.capacity() - tail.size());
         const auto prefix = bytes.first(count);
         tail.insert(tail.end(), prefix.begin(), prefix.end());
         bytes = bytes.subspan(count);

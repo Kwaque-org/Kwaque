@@ -17,8 +17,7 @@ event_log_sink::emit(const observability::event_request& request) noexcept {
     if (stopped_) {
         return runtime::failure(sink_error(errc::closed));
     }
-    auto prepared = sequence_.prepare(
-      request, observability::event_shard::from_owner(owner()));
+    auto prepared = sequence_.prepare(request);
     if (!prepared) {
         return runtime::failure(prepared.error());
     }

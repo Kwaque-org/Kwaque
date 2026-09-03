@@ -251,6 +251,10 @@ public:
 
     [[nodiscard]] runtime::result<prepared_fault_evaluation>
     prepare(const runtime::fault_request& request) noexcept;
+    [[nodiscard]] runtime::result<prepared_fault_evaluation> prepare(
+      const runtime::fault_request& request,
+      runtime::monotonic_time now,
+      runtime::monotonic_time maximum_deadline) noexcept;
     [[nodiscard]] runtime::result<runtime::fault_decision>
     evaluate(const runtime::fault_request& request) noexcept;
 

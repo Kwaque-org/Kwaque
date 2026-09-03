@@ -3317,9 +3317,12 @@ fake_file_system::apply_open(metadata_operation& metadata, bool& open_slot) {
         return runtime::failure(file_error(errc::queue_full));
     }
 
-    // Allocate every handle object before create/truncate can mutate namespace
-    // or file state. The handle begins uncommitted, so unwinding these owners
-    // cannot release a reference that was never made visible.
+    // Allocate every ownership block before create/truncate can mutate
+    // namespace or file state. The native handle begins uncommitted, so
+    // unwinding these owners cannot release a reference that was never made
+    // visible. The concrete runtime handle is assembled only after commit
+    // because its lifecycle requires an explicit close once constructed.
+    runtime::operation_statistics_owner statistics;
     auto handle = seastar::make_lw_shared<open_handle_state>();
     seastar::file native{seastar::make_shared<native_file_impl>(
       *this, id, metadata.open_options.access, generation_, handle)};
@@ -3387,7 +3390,8 @@ fake_file_system::apply_open(metadata_operation& metadata, bool& open_slot) {
         --pending_opens_;
         open_slot = false;
     }
-    return runtime::file{std::move(native)};
+    return runtime::file{
+      std::move(native), runtime::file_io_limits{}, std::move(statistics)};
 }
 
 runtime::result<fake_file_system::pending_value>

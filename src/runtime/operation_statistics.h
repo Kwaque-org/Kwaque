@@ -1,6 +1,10 @@
 #ifndef KWAQUE_SRC_RUNTIME_OPERATION_STATISTICS_H_
 #define KWAQUE_SRC_RUNTIME_OPERATION_STATISTICS_H_
 
+#include "src/runtime/shard_affinity.h"
+
+#include <seastar/core/shared_ptr.hh>
+
 #include <cstdint>
 #include <utility>
 
@@ -88,6 +92,65 @@ private:
     }
 
     operation_statistics_snapshot values_;
+};
+
+// Copyable ownership for one direct statistics block. Runtime handles retain a
+// copy so an accepted operation and its counters cannot outlive the storage.
+// Counter updates still target operation_statistics directly and allocate no
+// per-operation state.
+class operation_statistics_owner final {
+public:
+    operation_statistics_owner()
+      : value_(seastar::make_lw_shared<operation_statistics>()) {}
+    ~operation_statistics_owner() { owner_.assert_current(); }
+
+    operation_statistics_owner(const operation_statistics_owner& other) noexcept
+      : owner_(other.owner_)
+      , value_(current_value(other)) {}
+    operation_statistics_owner&
+    operator=(const operation_statistics_owner& other) noexcept {
+        owner_.assert_current();
+        other.owner_.assert_current();
+        value_ = other.value_;
+        return *this;
+    }
+    operation_statistics_owner(operation_statistics_owner&& other) noexcept
+      : owner_(other.owner_)
+      , value_(current_value(other)) {}
+    operation_statistics_owner&
+    operator=(operation_statistics_owner&& other) noexcept {
+        owner_.assert_current();
+        other.owner_.assert_current();
+        value_ = other.value_;
+        return *this;
+    }
+
+    [[nodiscard]] operation_statistics* operator->() noexcept {
+        owner_.assert_current();
+        return value_.get();
+    }
+    [[nodiscard]] const operation_statistics* operator->() const noexcept {
+        owner_.assert_current();
+        return value_.get();
+    }
+    [[nodiscard]] operation_statistics& get() noexcept {
+        owner_.assert_current();
+        return *value_;
+    }
+    [[nodiscard]] const operation_statistics& get() const noexcept {
+        owner_.assert_current();
+        return *value_;
+    }
+
+private:
+    [[nodiscard]] static const seastar::lw_shared_ptr<operation_statistics>&
+    current_value(const operation_statistics_owner& other) noexcept {
+        other.owner_.assert_current();
+        return other.value_;
+    }
+
+    owner_shard owner_;
+    seastar::lw_shared_ptr<operation_statistics> value_;
 };
 
 } // namespace kwaque::runtime

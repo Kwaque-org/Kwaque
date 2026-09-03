@@ -1,7 +1,9 @@
+#include "src/base/allocation.h"
 #include "src/observability/event.h"
 #include "src/observability/event_codec.h"
 #include "src/observability/event_log.h"
 #include "src/observability/event_sequence.h"
+#include "src/observability/testing/event_sequence_test_access.h"
 
 #include <seastar/core/coroutine.hh>
 #include <seastar/testing/test_case.hh>
@@ -42,8 +44,8 @@ using kwaque::observability::event_request;
 using kwaque::observability::event_request_context;
 using kwaque::observability::event_schema_version;
 using kwaque::observability::event_sequence;
+using kwaque::observability::event_sequence_test_access;
 using kwaque::observability::event_severity;
-using kwaque::observability::event_shard;
 using kwaque::observability::event_sink_epoch;
 using kwaque::observability::event_sink_identity;
 using kwaque::observability::event_stable_id;
@@ -76,8 +78,7 @@ identity(std::uint64_t epoch_value = 1, std::uint8_t digest_seed = 0x10) {
 }
 
 event stamp(event_sequence& sequence, const event_request& request) {
-    auto prepared = sequence.prepare(
-      request, event_shard::from_owner(kwaque::runtime::owner_shard{}));
+    auto prepared = event_sequence_test_access::prepare(sequence, request);
     BOOST_REQUIRE(prepared.has_value());
     auto value = prepared->value();
     prepared->commit();
@@ -117,8 +118,8 @@ event_request make_file_request() {
 }
 
 event make_file_event() {
-    event_sequence sequence{identity()};
-    return stamp(sequence, make_file_request());
+    auto sequence = event_sequence_test_access::make(identity());
+    return stamp(*sequence, make_file_request());
 }
 
 event_request make_large_fault_request() {
@@ -168,8 +169,8 @@ event_request make_large_fault_request() {
 }
 
 event make_large_fault_event() {
-    event_sequence sequence{identity()};
-    return stamp(sequence, make_large_fault_request());
+    auto sequence = event_sequence_test_access::make(identity());
+    return stamp(*sequence, make_large_fault_request());
 }
 
 event_log_limits limits(std::uint32_t entries, std::uint64_t encoded_bytes) {
@@ -422,10 +423,10 @@ SEASTAR_TEST_CASE(event_log_is_reserved_bounded_and_canonical) {
     BOOST_CHECK(
       duplicate_sequence.error().code() == kwaque::errc::invalid_argument);
 
-    event_sequence count_sequence{sink_identity};
-    const auto first = stamp(count_sequence, request);
-    const auto second = stamp(count_sequence, request);
-    const auto third = stamp(count_sequence, request);
+    auto count_sequence = event_sequence_test_access::make(sink_identity);
+    const auto first = stamp(*count_sequence, request);
+    const auto second = stamp(*count_sequence, request);
+    const auto third = stamp(*count_sequence, request);
     const auto record_bytes = canonical_event_log_record_prefix_size
                               + first.encoded_size();
     event_log count_limited{
@@ -445,9 +446,9 @@ SEASTAR_TEST_CASE(event_log_is_reserved_bounded_and_canonical) {
     BOOST_CHECK(saturated.error().code() == kwaque::errc::resource_exhausted);
     BOOST_CHECK(count_limited.entries().size() == 2U);
 
-    event_sequence byte_sequence{sink_identity};
-    const auto byte_first = stamp(byte_sequence, request);
-    const auto byte_second = stamp(byte_sequence, request);
+    auto byte_sequence = event_sequence_test_access::make(sink_identity);
+    const auto byte_first = stamp(*byte_sequence, request);
+    const auto byte_second = stamp(*byte_sequence, request);
     event_log byte_limited{
       sink_identity,
       limits(2, canonical_event_log_header_encoded_size + record_bytes)};
@@ -556,11 +557,30 @@ SEASTAR_TEST_CASE(event_log_decode_rejects_malformed_artifacts) {
     co_return;
 }
 
+SEASTAR_TEST_CASE(event_log_artifact_underestimated_hint_stays_chunk_bounded) {
+    kwaque::observability::event_log_artifact artifact{64};
+    const std::array<std::uint8_t, 32> prefix{};
+    BOOST_REQUIRE(artifact.append(prefix).has_value());
+    const std::vector<std::uint8_t> remaining(
+      kwaque::maximum_contiguous_allocation_bytes, std::uint8_t{0x5a});
+    BOOST_REQUIRE(artifact.append(remaining).has_value());
+    BOOST_CHECK(
+      artifact.size()
+      == kwaque::maximum_contiguous_allocation_bytes + prefix.size());
+    BOOST_REQUIRE_GT(artifact.chunks().size(), 1U);
+    for (const auto& chunk : artifact.chunks()) {
+        BOOST_CHECK_LE(
+          chunk.capacity(), kwaque::maximum_contiguous_allocation_bytes);
+        BOOST_CHECK_LE(chunk.size(), chunk.capacity());
+    }
+    co_return;
+}
+
 SEASTAR_TEST_CASE(large_event_logs_require_cooperative_codec_paths) {
     constexpr std::uint32_t entries{1'025};
     const auto request = make_large_fault_request();
-    event_sequence sizing_sequence{identity()};
-    const auto source = stamp(sizing_sequence, request);
+    auto sizing_sequence = event_sequence_test_access::make(identity());
+    const auto source = stamp(*sizing_sequence, request);
     const auto record_bytes = canonical_event_log_record_prefix_size
                               + source.encoded_size();
     const auto sink_identity = identity();
@@ -570,9 +590,9 @@ SEASTAR_TEST_CASE(large_event_logs_require_cooperative_codec_paths) {
         entries,
         canonical_event_log_header_encoded_size
           + static_cast<std::uint64_t>(entries) * record_bytes)};
-    event_sequence log_sequence{sink_identity};
+    auto log_sequence = event_sequence_test_access::make(sink_identity);
     for (std::uint32_t index = 0; index < entries; ++index) {
-        BOOST_REQUIRE(log.append(stamp(log_sequence, request)).has_value());
+        BOOST_REQUIRE(log.append(stamp(*log_sequence, request)).has_value());
     }
     const auto synchronous = log.encode();
     BOOST_REQUIRE(!synchronous.has_value());

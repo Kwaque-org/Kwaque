@@ -16,15 +16,8 @@ namespace {
 
 } // namespace
 
-runtime::result<event_sink_epoch>
-event_sink_epoch::make(std::uint64_t value) noexcept {
-    if (value == 0) {
-        return runtime::failure(sequence_error(errc::invalid_argument));
-    }
-    return event_sink_epoch{value};
-}
-
 event_sequence::~event_sequence() {
+    assert_current();
     KWAQUE_INVARIANT(
       invariant_id{"KQ-EVENT-SEQUENCE-RESERVATION"},
       !reserved_,
@@ -45,13 +38,15 @@ void event_sequence::reservation::commit() noexcept {
     if (owner_ == nullptr) {
         return;
     }
+    owner_->assert_current();
     owner_->last_sequence_ = value_.sequence();
     owner_->release();
     owner_ = nullptr;
 }
 
-runtime::result<event_sequence::reservation> event_sequence::prepare(
-  const event_request& request, event_shard shard) noexcept {
+runtime::result<event_sequence::reservation>
+event_sequence::prepare(const event_request& request) noexcept {
+    assert_current();
     if (reserved_) {
         return runtime::failure(sequence_error(errc::unavailable));
     }
@@ -63,7 +58,8 @@ runtime::result<event_sequence::reservation> event_sequence::prepare(
           runtime::operation_context_key::limit, last_sequence_));
         return runtime::failure(std::move(error));
     }
-    auto value = event::from_request(request, shard, last_sequence_ + 1U);
+    auto value = event::from_request(
+      request, event_shard::from_owner(owner()), last_sequence_ + 1U);
     reserved_ = true;
     return reservation{*this, std::move(value)};
 }

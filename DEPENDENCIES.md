@@ -14,16 +14,53 @@ the build and lock files are dependency pins.
 | Linux aarch64 sysroot | Ubuntu 22.04, `2026-05-05` snapshot | Hermetic headers and libraries |
 | Protobuf | `33.5` | Pinned |
 | Seastar | `a6ac2ff6190a4a9dce5059991355703e1073d11f` | Compatibility pin |
+| `unordered_dense` | `f30ed41b58af8c79788e8581fe57a6faf856258e` | Compatibility pin with exception-safety corrections |
 
 The Seastar archive at this baseline has SHA-256
 `5918f72ec59c159a8d2fe36870e7d30c6e61426fde766d7dd6853fa7f9871f7f`.
 The archive is the Seastar fork maintained by Redpanda, selected as part of a
 single compatibility family with the Protobuf and toolchain versions above.
+The Bazel repository rule applies a narrow metrics exception-safety patch. It
+allows metric-group and metric-definition construction plus aggregate-label
+allocation failures to propagate, reserves native registration bookkeeping
+before registry insertion, and removes a partially inserted series if
+registration fails. It also stores each sanitized family name in that reserved
+bookkeeping before publication and reuses it for allocation-free destruction
+and replica removal instead of reconstructing the name during `noexcept`
+teardown. A Seastar update must either retain that patch or prove the selected
+revision provides equivalent behavior. Non-release, non-sanitizer builds enable
+Seastar's native allocation-failure injection so the rollback boundary is
+executable; release and system-allocator sanitizer builds disable it.
+
+A second narrow Seastar patch makes its custom `chunked_vector` compatible with
+those failure guarantees: a new fragment is fully allocated before it is
+published into the outer fragment vector, capacity changes commit afterward,
+and the allocating copy surface is no longer declared `noexcept`. Together,
+these changes ensure failed segmented growth leaves the custom bucket container
+internally consistent.
+
+The Redpanda-compatible `unordered_dense` baseline remains pinned at
+`f30ed41b58af8c79788e8581fe57a6faf856258e`. Its repository rule applies narrow
+compatibility corrections for extracted, moved-from, reserve, rehash, replace,
+and insertion-growth behavior. Empty and moved-from tables no longer allocate
+replacement buckets, and bucket growth constructs its target storage before
+publishing the corresponding shift and capacity state.
+For Seastar's in-place chunked bucket container, a failed multi-fragment growth
+also removes the newly appended suffix so the older pin's physical-size-based
+probe wrap remains valid. A future dependency update must prove those
+guarantees under Seastar allocation-failure injection before removing the
+patch.
 
 The sysroot archives are published under an `llvmorg-22.1.0` release path, but
 that path identifies the sysroot artifact release rather than the selected
 compiler version. Kwaque intentionally pairs those Ubuntu 22.04 snapshots with
 the LLVM/Clang 23.1.0-rc2 toolchain pinned above.
+
+Foreign C/C++ dependency builds that contribute code to the distribution map
+both their transient execroot and Bazel's canonical external-repository root.
+The second mapping is required for Clang's resource include directory: Clang
+resolves that directory through the real toolchain location outside the action
+sandbox, and otherwise records the host-specific Bazel output base in DWARF.
 
 Adopting a newer Seastar or Protobuf revision requires isolated compatibility
 work followed by updates to this file, `THIRD_PARTY.md`, the Bazel pin and
@@ -55,10 +92,11 @@ prefix from that constant and carries the archive checksum separately;
 2. **Move the pin.** Set `SEASTAR_REVISION` in `bazel/versions.bzl` and the
    `seastar` archive `sha256` in `bazel/repositories.bzl`. These are the only two
    places a revision and its hash are declared.
-3. **Reconcile the build overlay.** Compare the upstream source and header lists
-   against `bazel/thirdparty/seastar.BUILD` and update added, removed, or renamed
-   compilation units. Do not import optional upstream features that the current
-   graph does not need.
+3. **Reconcile the build overlay and patches.** Compare the upstream source and
+   header lists against `bazel/thirdparty/seastar.BUILD`, update added, removed,
+   or renamed compilation units, and verify every Seastar patch still applies
+   and remains necessary. Do not import optional upstream features that the
+   current graph does not need.
 4. **Refresh the lockfile** and confirm it settles:
 
    ```bash

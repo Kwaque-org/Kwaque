@@ -414,7 +414,18 @@ fault_schedule::selector_result fault_schedule::select(
 
 runtime::result<prepared_fault_evaluation>
 fault_schedule::prepare(const runtime::fault_request& request) noexcept {
+    return prepare(
+      request, scheduler_->now(), scheduler_->limits().maximum_deadline());
+}
+
+runtime::result<prepared_fault_evaluation> fault_schedule::prepare(
+  const runtime::fault_request& request,
+  runtime::monotonic_time now,
+  runtime::monotonic_time maximum_deadline) noexcept {
     assert_current();
+    if (now != scheduler_->now() || now > maximum_deadline) {
+        return runtime::failure(fault_error(errc::invalid_argument));
+    }
     const auto descriptor = runtime::validate_fault_request(request);
     if (!descriptor) {
         return runtime::failure(descriptor.error());
@@ -422,16 +433,17 @@ fault_schedule::prepare(const runtime::fault_request& request) noexcept {
     const auto* rule = find_rule(request, (**descriptor).point);
     const auto selected = rule != nullptr ? select(*rule, request.occurrence)
                                           : selector_result{};
+    const auto allowed_maximum = std::min(
+      maximum_deadline, scheduler_->limits().maximum_deadline());
     if (
       rule != nullptr && selected.applied
       && rule->decision().action() == runtime::fault_action::delay) {
-        const auto deadline = scheduler_->now().checked_add(
-          *rule->decision().delay());
-        if (!deadline || *deadline > scheduler_->limits().maximum_deadline()) {
+        const auto deadline = now.checked_add(*rule->decision().delay());
+        if (!deadline || *deadline > allowed_maximum) {
             auto error = fault_error(errc::out_of_range);
             static_cast<void>(error.add_context(
               runtime::operation_context_key::limit,
-              scheduler_->limits().maximum_deadline().nanoseconds()));
+              allowed_maximum.nanoseconds()));
             return runtime::failure(std::move(error));
         }
     }

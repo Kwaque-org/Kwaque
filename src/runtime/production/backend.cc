@@ -162,7 +162,7 @@ void backend::register_metrics() {
         metrics_.emplace();
         const std::vector<metrics::label> aggregate{metrics::shard_label};
         const auto add_group = [this, &aggregate](
-                                 operation_statistics& statistics,
+                                 operation_statistics_owner& statistics,
                                  metric_id active_id,
                                  metric_id accepted_id,
                                  metric_id completed_id,
@@ -172,7 +172,7 @@ void backend::register_metrics() {
             const auto& accepted = *descriptor_for(accepted_id);
             const auto& completed = *descriptor_for(completed_id);
             const auto& rejected = *descriptor_for(rejected_id);
-            auto* values = &statistics;
+            auto* values = &statistics.get();
             std::vector<metrics::metric_definition> definitions;
             definitions.reserve(bytes_id ? 5U : 4U);
             definitions.emplace_back(
