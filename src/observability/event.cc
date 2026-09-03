@@ -636,12 +636,35 @@ runtime::result<event> event::make(
   event_shard shard,
   std::uint64_t sequence,
   std::span<const event_field> fields) noexcept {
+    if (sequence == 0) {
+        return runtime::failure(event_error(errc::invalid_argument));
+    }
+    auto request = event_request::make(context, fields);
+    if (!request) {
+        return runtime::failure(request.error());
+    }
+    return runtime::result<event>{from_request(*request, shard, sequence)};
+}
+
+event event::from_request(
+  const event_request& request,
+  event_shard shard,
+  std::uint64_t sequence) noexcept {
+    event result{request.context_, shard, sequence};
+    result.fields_ = request.fields_;
+    result.encoded_size_ = request.encoded_size_;
+    result.field_count_ = request.field_count_;
+    return result;
+}
+
+runtime::result<event_request> event_request::make(
+  const event_request_context& context,
+  std::span<const event_field> fields) noexcept {
     const auto* event_descriptor = descriptor_for(context.kind);
     if (
       event_descriptor == nullptr || !severity_is_valid(context.severity)
       || resource::workload_index(context.workload)
-           >= resource::workload_class_count
-      || sequence == 0) {
+           >= resource::workload_class_count) {
         return runtime::failure(event_error(errc::invalid_argument));
     }
     if (fields.size() > event_fields_max) {
@@ -652,7 +675,7 @@ runtime::result<event> event::make(
           event_fields_max));
     }
 
-    event result{context, shard, sequence};
+    event_request result{context};
     for (std::size_t index = 0; index < fields.size(); ++index) {
         const auto* field_descriptor = descriptor_for(fields[index].key);
         const auto text = fields[index].value.as_text();
@@ -714,27 +737,12 @@ runtime::result<event> event::make(
     }
     result.encoded_size_ = static_cast<std::uint16_t>(encoded_size);
     result.field_count_ = static_cast<std::uint8_t>(fields.size());
-    return runtime::result<event>{std::move(result)};
+    return runtime::result<event_request>{std::move(result)};
 }
 
-event event::from_request(
-  const event_request& request,
-  event_shard shard,
-  std::uint64_t sequence) noexcept {
-    auto result = request.value_;
-    result.shard_ = shard;
-    result.sequence_ = sequence;
-    return result;
-}
-
-runtime::result<event_request> event_request::make(
-  const event_request_context& context,
-  std::span<const event_field> fields) noexcept {
-    auto value = event::make(context, event_shard{0}, 1, fields);
-    if (!value) {
-        return runtime::failure(value.error());
-    }
-    return event_request{std::move(*value)};
+std::string_view event_request::name() const noexcept {
+    const auto* descriptor = descriptor_for(context_.kind);
+    return descriptor != nullptr ? descriptor->name : std::string_view{};
 }
 
 std::string_view event::name() const noexcept {

@@ -51,6 +51,11 @@ bool_flag(
 )
 
 bool_flag(
+    name = "allocation_failure_injection",
+    build_setting_default = True,
+)
+
+bool_flag(
     name = "sstring",
     build_setting_default = True,
 )
@@ -119,6 +124,13 @@ config_setting(
     name = "use_debug_allocations",
     flag_values = {
         ":debug_allocations": "true",
+    },
+)
+
+config_setting(
+    name = "use_allocation_failure_injection",
+    flag_values = {
+        ":allocation_failure_injection": "true",
     },
 )
 
@@ -609,6 +621,9 @@ cc_library(
         "//conditions:default": [],
     }) + select({
         ":use_io_uring": ["SEASTAR_HAVE_URING"],
+        "//conditions:default": [],
+    }) + select({
+        ":use_allocation_failure_injection": ["SEASTAR_ENABLE_ALLOC_FAILURE_INJECTION"],
         "//conditions:default": [],
     }) + select({
         ":with_debug": [

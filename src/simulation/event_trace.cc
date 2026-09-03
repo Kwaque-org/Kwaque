@@ -751,7 +751,7 @@ void trace_artifact::append(std::string_view bytes) {
         }
         auto& tail = chunks_.back();
         const auto count = std::min(
-          bytes.size(), maximum_contiguous_allocation_bytes - tail.size());
+          bytes.size(), tail.capacity() - tail.size());
         tail.insert(tail.end(), bytes.begin(), bytes.begin() + count);
         bytes.remove_prefix(count);
         size_ += count;

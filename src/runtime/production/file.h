@@ -5,14 +5,17 @@
 #include "src/runtime/operation_statistics.h"
 #include "src/runtime/shard_affinity.h"
 
+#include <utility>
+
 namespace kwaque::runtime::production {
 
 class file_system final : public shard_affine {
 public:
-    file_system() noexcept
-      : statistics_(&local_statistics_) {}
-    explicit file_system(operation_statistics& statistics) noexcept
-      : statistics_(&statistics) {}
+    file_system()
+      : statistics_(&statistics_owner_.get()) {}
+    explicit file_system(operation_statistics_owner statistics) noexcept
+      : statistics_owner_(std::move(statistics))
+      , statistics_(&statistics_owner_.get()) {}
 
     file_system(const file_system&) = delete;
     file_system& operator=(const file_system&) = delete;
@@ -40,7 +43,7 @@ public:
     }
 
 private:
-    operation_statistics local_statistics_;
+    operation_statistics_owner statistics_owner_;
     operation_statistics* statistics_;
 };
 

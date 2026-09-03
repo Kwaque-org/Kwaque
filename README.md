@@ -198,13 +198,14 @@ locally is a convenience rather than a requirement.
 |---|---|
 | `src/base` | Compiler attributes, strong byte and count types, typed errors, results, logging, build metadata. |
 | `src/config` | Bootstrap configuration schema, YAML decoding, validation, redacted rendering. |
-| `src/runtime` | Shard ownership and lifecycle, typed runtime failures, cross-shard value rules, statically dispatched runtime contracts, and the implemented clock, timer, random, and native-file mechanisms. |
+| `src/runtime` | Shard ownership and lifecycle, typed runtime failures, cross-shard value rules, statically dispatched runtime contracts, owner-local operation statistics, and production clock, timer, random, file, network, and DNS mechanisms. |
 | `src/bytes` | Immutable fragmented buffers, bounded construction and scatter export, checked parsing, fuzzing, and benchmarks. |
 | `src/resource` | Workload classes, process/shard resource ownership, native memory admission, and bounded work queues. |
 | `src/admin` | Administrative HTTP service, health and version responses, metric registration. |
 | `src/broker` | Broker assembly: entry point, application ownership, ordered startup, data directory, PID file. |
-| `src/simulation` | Deterministic scheduler, virtual time and timers, counter-addressed randomness, and canonical trace capture/replay. |
-| `src/model`, `src/storage`, `src/protocol`, `src/raft`, `src/metadata`, `src/cluster`, `src/replication`, `src/consumer`, `src/cloud`, `src/security`, `src/observability` | Ownership boundaries reserved for future work. Each holds a `BUILD` file and a `README.md` describing what belongs there. |
+| `src/simulation` | Deterministic scheduler, virtual time and timers, counter-addressed randomness, replayable faults, fake files/network/DNS, structured-event capture, and owner-local metrics. |
+| `src/observability` | Bounded typed structured events, canonical event logs, owner-stamped sinks, and the fixed metric descriptor inventory. |
+| `src/model`, `src/storage`, `src/protocol`, `src/raft`, `src/metadata`, `src/cluster`, `src/replication`, `src/consumer`, `src/cloud`, `src/security` | Ownership boundaries reserved for future work. Each holds a `BUILD` file and a `README.md` describing what belongs there. |
 | `proto/` | Versioned Protocol Buffers control schemas and their generated-code consumers. |
 | `conf/` | Example broker configuration. |
 | `bazel/` | Build rules, dependency declarations, third-party overlays, packaging, rule probes. |

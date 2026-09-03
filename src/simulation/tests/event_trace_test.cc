@@ -1,3 +1,4 @@
+#include "src/base/allocation.h"
 #include "src/runtime/fault.h"
 #include "src/simulation/event_trace.h"
 
@@ -249,6 +250,24 @@ TEST(EventTraceTest, LargeArtifactsRequireTheCooperativeCodec) {
     const auto encoded = captured.encode();
     ASSERT_FALSE(encoded.has_value());
     EXPECT_EQ(encoded.error().code(), kwaque::errc::resource_exhausted);
+}
+
+TEST(EventTraceTest, ArtifactUnderestimatedHintStaysChunkBounded) {
+    kwaque::simulation::trace_artifact artifact{64};
+    const std::string prefix(32, 'a');
+    artifact.append(prefix);
+    const std::string remaining(
+      kwaque::maximum_contiguous_allocation_bytes, 'b');
+    artifact.append(remaining);
+    EXPECT_EQ(
+      artifact.size(),
+      kwaque::maximum_contiguous_allocation_bytes + prefix.size());
+    ASSERT_GT(artifact.chunks().size(), 1U);
+    for (const auto& chunk : artifact.chunks()) {
+        EXPECT_LE(
+          chunk.capacity(), kwaque::maximum_contiguous_allocation_bytes);
+        EXPECT_LE(chunk.size(), chunk.capacity());
+    }
 }
 
 TEST(EventTraceTest, ParserRejectsEveryNoncanonicalBoundary) {

@@ -101,19 +101,21 @@ resolver::resolver(dns_config config)
 
 resolver::resolver(
   dns_config config, const seastar::net::dns_resolver::options& options)
-  : statistics_(&local_statistics_)
+  : statistics_(&statistics_owner_.get())
   , native_(options)
   , config_(config)
   , admission_(config) {}
 
-resolver::resolver(operation_statistics& statistics, dns_config config)
-  : resolver(statistics, config, seastar::net::dns_resolver::options{}) {}
+resolver::resolver(operation_statistics_owner statistics, dns_config config)
+  : resolver(
+      std::move(statistics), config, seastar::net::dns_resolver::options{}) {}
 
 resolver::resolver(
-  operation_statistics& statistics,
+  operation_statistics_owner statistics,
   dns_config config,
   const seastar::net::dns_resolver::options& options)
-  : statistics_(&statistics)
+  : statistics_owner_(std::move(statistics))
+  , statistics_(&statistics_owner_.get())
   , native_(options)
   , config_(config)
   , admission_(config) {}

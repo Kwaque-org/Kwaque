@@ -6,5 +6,8 @@ exports_files([
     "lz4-namespace-xxhash.patch",
     "openssl.BUILD",
     "seastar.BUILD",
+    "seastar-chunked-vector-exception-safety.patch",
+    "seastar-metrics-registration-exception-safety.patch",
+    "unordered-dense-exception-safety.patch",
     "unordered_dense.BUILD",
 ])

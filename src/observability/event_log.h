@@ -4,7 +4,7 @@
 #include "src/base/allocation.h"
 #include "src/observability/event.h"
 #include "src/observability/event_codec.h"
-#include "src/observability/event_sequence.h"
+#include "src/observability/event_identity.h"
 #include "src/runtime/error.h"
 
 #include <seastar/core/future.hh>

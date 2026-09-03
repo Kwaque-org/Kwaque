@@ -107,8 +107,9 @@ connection::connection(
   network_endpoint local,
   network_endpoint remote,
   network_connection_limits limits,
-  operation_statistics* statistics)
-  : statistics_(statistics != nullptr ? statistics : &local_statistics_)
+  operation_statistics_owner statistics)
+  : statistics_owner_(std::move(statistics))
+  , statistics_(&statistics_owner_.get())
   , native_(std::move(native))
   , input_(native_.input(
       seastar::connected_socket_input_stream_config{
@@ -138,10 +139,8 @@ owner_shard connection::prepare_move(connection& other) noexcept {
 
 connection::connection(connection&& other) noexcept
   : owner_(prepare_move(other))
-  , local_statistics_(other.local_statistics_)
-  , statistics_(
-      other.statistics_ == &other.local_statistics_ ? &local_statistics_
-                                                    : other.statistics_)
+  , statistics_owner_(std::move(other.statistics_owner_))
+  , statistics_(&statistics_owner_.get())
   , native_(std::move(other.native_))
   , input_(std::move(other.input_))
   , output_(std::move(other.output_))
@@ -676,8 +675,9 @@ listener::listener(
   seastar::server_socket native,
   network_endpoint local,
   network_connection_limits limits,
-  operation_statistics* statistics)
-  : statistics_(statistics != nullptr ? statistics : &local_statistics_)
+  operation_statistics_owner statistics)
+  : statistics_owner_(std::move(statistics))
+  , statistics_(&statistics_owner_.get())
   , native_(std::move(native))
   , local_(local)
   , limits_(limits) {}
@@ -694,10 +694,8 @@ owner_shard listener::prepare_move(listener& other) noexcept {
 
 listener::listener(listener&& other) noexcept
   : owner_(prepare_move(other))
-  , local_statistics_(other.local_statistics_)
-  , statistics_(
-      other.statistics_ == &other.local_statistics_ ? &local_statistics_
-                                                    : other.statistics_)
+  , statistics_owner_(std::move(other.statistics_owner_))
+  , statistics_(&statistics_owner_.get())
   , native_(std::move(other.native_))
   , local_(other.local_)
   , limits_(other.limits_)
@@ -754,7 +752,11 @@ listener::accept(seastar::abort_source& caller_abort) {
         const auto local = kwaque_endpoint(accepted.connection.local_address());
         const auto remote = kwaque_endpoint(accepted.remote_address);
         co_return connection{
-          std::move(accepted.connection), local, remote, limits_, statistics_};
+          std::move(accepted.connection),
+          local,
+          remote,
+          limits_,
+          statistics_owner_};
     } catch (const std::bad_alloc&) {
         throw;
     } catch (...) {
@@ -858,7 +860,7 @@ seastar::future<result<connection>> network::connect(
         const auto local = kwaque_endpoint(native.local_address());
         const auto remote = kwaque_endpoint(native.remote_address());
         co_return connection{
-          std::move(native), local, remote, limits, statistics_};
+          std::move(native), local, remote, limits, statistics_owner_};
     } catch (const std::bad_alloc&) {
         throw;
     } catch (...) {
@@ -895,7 +897,10 @@ network::listen(network_endpoint endpoint, network_listen_options options) {
           native_endpoint(endpoint), native_options);
         const auto local = kwaque_endpoint(native.local_address());
         co_return listener{
-          std::move(native), local, options.connection_limits, statistics_};
+          std::move(native),
+          local,
+          options.connection_limits,
+          statistics_owner_};
     } catch (const std::bad_alloc&) {
         throw;
     } catch (...) {

@@ -598,8 +598,9 @@ result<void> file_io_limits::validate() const noexcept {
 file::file(
   seastar::file&& native_file,
   file_io_limits limits,
-  operation_statistics* statistics)
-  : statistics_(statistics != nullptr ? statistics : &local_statistics_)
+  operation_statistics_owner statistics)
+  : statistics_owner_(std::move(statistics))
+  , statistics_(&statistics_owner_.get())
   , limits_(validated_file_io_limits(limits))
   , native_file_(require_open_file(std::move(native_file)))
   , read_operation_units_(limits_.pending_reads)
@@ -666,10 +667,8 @@ owner_shard file::prepare_move(file& other) noexcept {
 
 file::file(file&& other) noexcept
   : owner_(prepare_move(other))
-  , local_statistics_(other.local_statistics_)
-  , statistics_(
-      other.statistics_ == &other.local_statistics_ ? &local_statistics_
-                                                    : other.statistics_)
+  , statistics_owner_(std::move(other.statistics_owner_))
+  , statistics_(&statistics_owner_.get())
   , limits_(other.limits_)
   , native_file_(std::move(other.native_file_))
   , io_intent_(std::move(other.io_intent_))

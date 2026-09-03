@@ -90,8 +90,8 @@ kwaque_cc_seastar_test(
     memory = "192MiB",
     deps = [
         "//src/observability:event",
+        "//src/observability:event_identity",
         "//src/observability:event_log",
-        "//src/observability:event_sequence",
         "//src/observability:event_sink_concept",
         "//src/simulation:structured_event_sink",
     ],
@@ -203,6 +203,7 @@ kwaque_cc_test(
     name = "event_trace_test",
     srcs = ["event_trace_test.cc"],
     deps = [
+        "//src/base",
         "//src/runtime:fault_api",
         "//src/simulation:event_trace",
     ],

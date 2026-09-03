@@ -12,6 +12,7 @@
 #include <boost/test/unit_test.hpp>
 
 #include <array>
+#include <concepts>
 #include <cstddef>
 #include <cstdint>
 #include <limits>
@@ -41,8 +42,17 @@ concept has_caller_sequence = requires(const Value& value) {
     value.sequence();
 };
 
+template<typename Sequence>
+concept accepts_caller_shard = requires(
+  Sequence& sequence, const event_request& value, event_shard shard) {
+    sequence.prepare(value, shard);
+};
+
 static_assert(!has_caller_shard<event_request>);
 static_assert(!has_caller_sequence<event_request>);
+static_assert(!std::constructible_from<event_shard, std::uint32_t>);
+static_assert(!std::constructible_from<event_sequence, event_sink_identity>);
+static_assert(!accepts_caller_shard<event_sequence>);
 
 event_sink_identity
 identity(std::uint64_t epoch_value, std::uint8_t digest_value = 0x11) {
@@ -82,19 +92,18 @@ event_log_limits limits(std::uint32_t entries = 4) {
 
 std::array<std::uint64_t, 4>
 local_sequence_history(event_sink_identity sink_identity) {
-    event_sequence sequence{sink_identity};
+    auto sequence = event_sequence_test_access::make(sink_identity);
     const auto value = request();
-    const auto shard = event_shard::from_owner(kwaque::runtime::owner_shard{});
-    auto first = sequence.prepare(value, shard);
+    const auto shard = kwaque::runtime::owner_shard{}.value();
+    auto first = event_sequence_test_access::prepare(*sequence, value);
     BOOST_REQUIRE(first.has_value());
     const auto first_value = first->value().sequence();
     first->commit();
-    auto second = sequence.prepare(value, shard);
+    auto second = event_sequence_test_access::prepare(*sequence, value);
     BOOST_REQUIRE(second.has_value());
     const auto second_value = second->value().sequence();
     second->commit();
-    return {
-      shard.value(), first_value, second_value, sink_identity.epoch.value()};
+    return {shard, first_value, second_value, sink_identity.epoch.value()};
 }
 
 } // namespace
@@ -105,26 +114,27 @@ SEASTAR_TEST_CASE(event_sequence_is_transactional_and_overflow_checked) {
       event_sink_epoch::make(std::numeric_limits<std::uint64_t>::max())
         .has_value());
 
-    event_sequence sequence{identity(5)};
+    auto sequence = event_sequence_test_access::make(identity(5));
     const auto value = request();
-    const auto shard = event_shard::from_owner(kwaque::runtime::owner_shard{});
     {
-        auto uncommitted = sequence.prepare(value, shard);
+        auto uncommitted = event_sequence_test_access::prepare(
+          *sequence, value);
         BOOST_REQUIRE(uncommitted.has_value());
         BOOST_CHECK(uncommitted->value().sequence() == 1U);
-        BOOST_CHECK(sequence.last_sequence() == 0U);
-        const auto nested = sequence.prepare(value, shard);
+        BOOST_CHECK(sequence->last_sequence() == 0U);
+        const auto nested = event_sequence_test_access::prepare(
+          *sequence, value);
         BOOST_REQUIRE(!nested.has_value());
         BOOST_CHECK(nested.error().code() == kwaque::errc::unavailable);
     }
-    BOOST_CHECK(sequence.last_sequence() == 0U);
+    BOOST_CHECK(sequence->last_sequence() == 0U);
 
     std::size_t attempts = 0;
     std::uint64_t prepared_sequence = 0;
     bool prepared_without_allocation = false;
     seastar::memory::with_allocation_failures([&] {
         ++attempts;
-        auto prepared = sequence.prepare(value, shard);
+        auto prepared = event_sequence_test_access::prepare(*sequence, value);
         if (prepared) {
             prepared_sequence = prepared->value().sequence();
             prepared->commit();
@@ -134,20 +144,20 @@ SEASTAR_TEST_CASE(event_sequence_is_transactional_and_overflow_checked) {
     BOOST_CHECK(prepared_without_allocation);
     BOOST_CHECK(attempts == 1U);
     BOOST_CHECK(prepared_sequence == 1U);
-    BOOST_CHECK(sequence.last_sequence() == 1U);
+    BOOST_CHECK(sequence->last_sequence() == 1U);
 
     event_sequence_test_access::set_last_sequence(
-      sequence, std::numeric_limits<std::uint64_t>::max() - 1U);
-    auto maximum = sequence.prepare(value, shard);
+      *sequence, std::numeric_limits<std::uint64_t>::max() - 1U);
+    auto maximum = event_sequence_test_access::prepare(*sequence, value);
     BOOST_REQUIRE(maximum.has_value());
     BOOST_CHECK(
       maximum->value().sequence() == std::numeric_limits<std::uint64_t>::max());
     maximum->commit();
-    const auto overflow = sequence.prepare(value, shard);
+    const auto overflow = event_sequence_test_access::prepare(*sequence, value);
     BOOST_REQUIRE(!overflow.has_value());
     BOOST_CHECK(overflow.error().code() == kwaque::errc::out_of_range);
     BOOST_CHECK(
-      sequence.last_sequence() == std::numeric_limits<std::uint64_t>::max());
+      sequence->last_sequence() == std::numeric_limits<std::uint64_t>::max());
     co_return;
 }
 

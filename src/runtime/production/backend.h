@@ -112,10 +112,10 @@ private:
     seastar::optimized_optional<seastar::abort_source::subscription>
       parent_subscription_;
     runtime_lifetime lifetime_;
-    operation_statistics timer_statistics_;
-    operation_statistics file_statistics_;
-    operation_statistics network_statistics_;
-    operation_statistics dns_statistics_;
+    operation_statistics_owner timer_statistics_;
+    operation_statistics_owner file_statistics_;
+    operation_statistics_owner network_statistics_;
+    operation_statistics_owner dns_statistics_;
     std::optional<random_type> random_;
     std::optional<timer_type> timer_;
     std::optional<file_system_type> file_system_;

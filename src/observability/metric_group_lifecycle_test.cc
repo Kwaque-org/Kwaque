@@ -11,10 +11,12 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <new>
 #include <optional>
 #include <stdexcept>
 #include <type_traits>
 #include <utility>
+#include <vector>
 
 namespace {
 
@@ -78,6 +80,16 @@ static_assert(!std::is_copy_constructible_v<owner_local_probe>);
 static_assert(!std::is_copy_assignable_v<owner_local_probe>);
 static_assert(!std::is_move_constructible_v<owner_local_probe>);
 static_assert(!std::is_move_assignable_v<owner_local_probe>);
+static_assert(
+  !std::is_nothrow_default_constructible_v<seastar::metrics::metric_groups>);
+static_assert(!std::is_nothrow_constructible_v<
+              seastar::metrics::metric_definition,
+              const seastar::metrics::impl::metric_definition_impl&>);
+static_assert(!noexcept(
+  std::declval<seastar::metrics::impl::metric_definition_impl&>().aggregate(
+    std::declval<const std::vector<seastar::metrics::label>&>())));
+static_assert(std::is_nothrow_move_constructible_v<
+              seastar::metrics::impl::metric_registration>);
 static_assert(std::is_nothrow_destructible_v<seastar::metrics::metric_groups>);
 static_assert(noexcept(
   std::declval<std::optional<seastar::metrics::metric_groups>&>().reset()));
@@ -139,6 +151,31 @@ SEASTAR_TEST_CASE(
     probe.start();
     BOOST_CHECK(registered("value"));
     probe.stop();
+    BOOST_CHECK(!registered("value"));
+    co_return;
+}
+
+SEASTAR_TEST_CASE(
+  allocation_failure_during_native_registration_leaves_no_callback) {
+    bool leaked_registration = false;
+    std::size_t attempts = 0;
+    seastar::memory::with_allocation_failures([&] {
+        ++attempts;
+        owner_local_probe probe;
+        try {
+            probe.start();
+            probe.stop();
+        } catch (const std::bad_alloc&) {
+            leaked_registration = leaked_registration || registered("value");
+            throw;
+        }
+    });
+#if defined(SEASTAR_ENABLE_ALLOC_FAILURE_INJECTION)
+    BOOST_CHECK_GT(attempts, 1U);
+#else
+    BOOST_CHECK_EQUAL(attempts, 1U);
+#endif
+    BOOST_CHECK(!leaked_registration);
     BOOST_CHECK(!registered("value"));
     co_return;
 }

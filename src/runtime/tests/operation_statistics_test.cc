@@ -4,6 +4,7 @@
 #include <gtest/gtest.h>
 
 #include <limits>
+#include <optional>
 #include <type_traits>
 #include <utility>
 
@@ -14,6 +15,13 @@ static_assert(
 static_assert(
   sizeof(kwaque::runtime::operation_statistics)
   == sizeof(kwaque::runtime::operation_statistics_snapshot));
+static_assert(
+  std::is_copy_constructible_v<kwaque::runtime::operation_statistics_owner>);
+static_assert(std::is_nothrow_move_constructible_v<
+              kwaque::runtime::operation_statistics_owner>);
+static_assert(
+  std::is_nothrow_destructible_v<kwaque::runtime::operation_statistics_owner>);
+static_assert(sizeof(kwaque::runtime::operation_statistics_owner) <= 24U);
 
 TEST(OperationStatisticsTest, AdmissionReservationOwnsOneTerminalTransition) {
     kwaque::runtime::operation_statistics statistics;
@@ -61,6 +69,33 @@ TEST(OperationStatisticsTest, LifetimeTotalsUseUnsignedModuloArithmetic) {
     EXPECT_EQ(
       statistics.snapshot(),
       (kwaque::runtime::operation_statistics_snapshot{}));
+}
+
+TEST(
+  OperationStatisticsTest, OwnerCopiesAndMovesKeepTheDirectCounterBlockAlive) {
+    std::optional<kwaque::runtime::operation_statistics_owner> retained;
+    {
+        kwaque::runtime::operation_statistics_owner original;
+        retained.emplace(original);
+        auto copied = original;
+        auto moved = std::move(copied);
+        moved->reject();
+        original->reject();
+    }
+
+    {
+        auto reservation = retained->get().accept();
+        reservation.add_completed_bytes(23);
+    }
+    EXPECT_EQ(
+      retained->get().snapshot(),
+      (kwaque::runtime::operation_statistics_snapshot{
+        .active = 0,
+        .accepted = 1,
+        .completed = 1,
+        .rejected = 2,
+        .completed_bytes = 23,
+      }));
 }
 
 } // namespace

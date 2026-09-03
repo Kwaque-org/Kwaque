@@ -21,10 +21,10 @@ struct event_codec_access final {
 
     [[nodiscard]] static runtime::result<event> make_event(
       const event_request_context& context,
-      event_shard shard,
+      std::uint32_t shard,
       std::uint64_t sequence,
       std::span<const event_field> fields) noexcept {
-        return event::make(context, shard, sequence, fields);
+        return event::make(context, event_shard{shard}, sequence, fields);
     }
 };
 
@@ -330,7 +330,7 @@ decode_event(std::span<const std::uint8_t> encoded) noexcept {
     };
     auto decoded = event_codec_access::make_event(
       context,
-      event_shard{shard},
+      shard,
       sequence,
       std::span<const event_field>{fields.data(), field_count});
     if (!decoded || decoded->encoded_size() != encoded.size()) {

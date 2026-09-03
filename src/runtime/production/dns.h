@@ -26,9 +26,9 @@ public:
     explicit resolver(dns_config config = {});
     resolver(
       dns_config config, const seastar::net::dns_resolver::options& options);
-    resolver(operation_statistics& statistics, dns_config config = {});
+    resolver(operation_statistics_owner statistics, dns_config config = {});
     resolver(
-      operation_statistics& statistics,
+      operation_statistics_owner statistics,
       dns_config config,
       const seastar::net::dns_resolver::options& options);
     ~resolver();
@@ -61,7 +61,7 @@ private:
       seastar::gate::holder holder);
     [[nodiscard]] seastar::future<result<void>> stop_once();
 
-    operation_statistics local_statistics_;
+    operation_statistics_owner statistics_owner_;
     operation_statistics* statistics_;
     seastar::net::dns_resolver native_;
     dns_config config_;

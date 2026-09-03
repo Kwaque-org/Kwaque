@@ -14,6 +14,7 @@
 
 #include <cstdint>
 #include <optional>
+#include <utility>
 
 namespace kwaque::runtime::production {
 
@@ -25,10 +26,11 @@ enum class timer_state : std::uint8_t {
 
 class timer final {
 public:
-    timer() noexcept
-      : statistics_(&local_statistics_) {}
-    explicit timer(operation_statistics& statistics) noexcept
-      : statistics_(&statistics) {}
+    timer()
+      : statistics_(&statistics_owner_.get()) {}
+    explicit timer(operation_statistics_owner statistics) noexcept
+      : statistics_owner_(std::move(statistics))
+      , statistics_(&statistics_owner_.get()) {}
     ~timer();
 
     timer(const timer&) = delete;
@@ -52,7 +54,7 @@ private:
     [[nodiscard]] seastar::future<result<void>> stop_once();
 
     owner_shard owner_;
-    operation_statistics local_statistics_;
+    operation_statistics_owner statistics_owner_;
     operation_statistics* statistics_;
     seastar::abort_source owner_abort_;
     seastar::gate waiters_;

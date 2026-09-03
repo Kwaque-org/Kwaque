@@ -1,0 +1,62 @@
+diff --git a/include/seastar/core/chunked_vector.hh b/include/seastar/core/chunked_vector.hh
+index 2f2193c..e127e66 100644
+--- a/include/seastar/core/chunked_vector.hh
++++ b/include/seastar/core/chunked_vector.hh
+@@ -178,7 +178,7 @@ class chunked_vector {
+     }
+     ~chunked_vector() noexcept = default;
+
+-    chunked_vector copy() const noexcept { return *this; }
++    chunked_vector copy() const { return *this; }
+
+     auto get_allocator() const { return _frags.get_allocator(); }
+
+@@ -310,9 +310,12 @@ class chunked_vector {
+         static constexpr size_t elems_per_frag = calc_elems_per_frag();
+         if (new_cap > _capacity) {
+             if (_frags.empty()) {
+-                auto& frag = _frags.emplace_back();
+-                frag.reserve(std::min(elems_per_frag, new_cap));
+-                _capacity = frag.capacity();
++                typename backing_type::value_type fragment{
++                  _frags.get_allocator()};
++                fragment.reserve(std::min(elems_per_frag, new_cap));
++                const auto capacity = fragment.capacity();
++                _frags.push_back(std::move(fragment));
++                _capacity = capacity;
+             } else if (_frags.size() == 1) {
+                 auto& frag = _frags.front();
+                 frag.reserve(std::min(elems_per_frag, new_cap));
+@@ -588,12 +591,19 @@ class chunked_vector {
+             // items.
+             static constexpr size_t initial_cap = std::max(
+               1UL, 32UL / sizeof(T));
+-            _capacity = initial_cap;
+-            _frags.emplace_back(_frags.get_allocator()).reserve(_capacity);
++            typename backing_type::value_type fragment{
++              _frags.get_allocator()};
++            fragment.reserve(initial_cap);
++            const auto capacity = fragment.capacity();
++            _frags.push_back(std::move(fragment));
++            _capacity = capacity;
+             return;
+         }
+-        _frags.emplace_back(_frags.get_allocator()).reserve(elems_per_frag);
+-        _capacity += elems_per_frag;
++        typename backing_type::value_type fragment{_frags.get_allocator()};
++        fragment.reserve(elems_per_frag);
++        const auto capacity = fragment.capacity();
++        _frags.push_back(std::move(fragment));
++        _capacity += capacity;
+     }
+
+     inline void update_generation() {
+@@ -609,7 +619,7 @@ class chunked_vector {
+     chunked_vector_fill_async(chunked_vector<U>& vec, const U& value);
+     template<typename U>
+     friend future<void> chunked_vector_clear_async(chunked_vector<U>& vec);
+-    chunked_vector(const chunked_vector&) noexcept = default;
++    chunked_vector(const chunked_vector&) = default;
+
+     size_t _size{0};
+     size_t _capacity{0};

@@ -259,7 +259,7 @@ public:
     explicit file(
       seastar::file&& native_file,
       file_io_limits limits = {},
-      operation_statistics* statistics = nullptr);
+      operation_statistics_owner statistics = {});
     file(file&& other) noexcept;
     file& operator=(file&&) = delete;
     file(const file&) = delete;
@@ -338,7 +338,7 @@ private:
     [[nodiscard]] seastar::future<result<void>> close_once();
 
     owner_shard owner_;
-    operation_statistics local_statistics_;
+    operation_statistics_owner statistics_owner_;
     operation_statistics* statistics_;
     file_io_limits limits_;
     seastar::file native_file_;

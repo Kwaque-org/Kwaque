@@ -11,6 +11,7 @@
 #include <exception>
 #include <filesystem>
 #include <fstream>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <system_error>
@@ -113,6 +114,36 @@ SEASTAR_TEST_CASE(production_file_system_creates_opens_stats_and_reopens) {
         .accepted = 9,
         .completed = 9,
       }));
+}
+
+SEASTAR_TEST_CASE(
+  production_file_retains_statistics_after_factory_destruction) {
+    temporary_directory directory;
+    std::optional<kwaque::runtime::file> opened;
+    {
+        kwaque::runtime::production::file_system file_system;
+        auto result = co_await file_system.open(
+          path_of(directory.child("retained.data")),
+          {.access = kwaque::runtime::file_access::read_write,
+           .create = true,
+           .permissions = 0600U});
+        BOOST_REQUIRE(result.has_value());
+        opened.emplace(std::move(*result));
+    }
+
+    const auto size = co_await opened->size();
+    BOOST_REQUIRE(size.has_value());
+    BOOST_CHECK_EQUAL(*size, 0U);
+    const auto closed = co_await opened->close();
+    BOOST_REQUIRE(closed.has_value());
+    BOOST_CHECK(
+      opened->statistics()
+      == (kwaque::runtime::operation_statistics_snapshot{
+        .active = 0,
+        .accepted = 3,
+        .completed = 3,
+      }));
+    opened.reset();
 }
 
 SEASTAR_TEST_CASE(

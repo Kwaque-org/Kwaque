@@ -138,7 +138,7 @@ file_system::open(file_path path, file_open_options options) {
         native_options.durable = true;
         auto native = co_await seastar::open_file_dma(
           path.value(), native_open_flags(options), native_options);
-        co_return file{std::move(native), file_io_limits{}, statistics_};
+        co_return file{std::move(native), file_io_limits{}, statistics_owner_};
     } catch (const std::bad_alloc&) {
         throw;
     } catch (...) {
