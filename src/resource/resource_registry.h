@@ -74,7 +74,7 @@ enum class resource_registry_state {
 // before stop() destroys the distributed handles.
 class resource_registry final : public runtime::shard_affine {
 public:
-    resource_registry() noexcept = default;
+    resource_registry() = default;
     ~resource_registry();
 
     [[nodiscard]] seastar::future<> start(resource_config config);
@@ -120,9 +120,9 @@ resource_registry::start_with(resource_config config, Checkpoint checkpoint) {
     try {
         std::size_t point = 0;
         for (const auto classification : all_workload_classes) {
-            checkpoint(point++);
+            co_await seastar::futurize_invoke(checkpoint, point++);
             co_await create_scheduling_group(classification);
-            checkpoint(point++);
+            co_await seastar::futurize_invoke(checkpoint, point++);
             co_await create_smp_service_group(classification);
         }
     } catch (...) {

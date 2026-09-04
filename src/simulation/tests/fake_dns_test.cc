@@ -6,6 +6,7 @@
 #include "src/simulation/fake_dns.h"
 #include "src/simulation/fault_schedule.h"
 #include "src/simulation/scheduler.h"
+#include "src/simulation/scheduler_driver.h"
 
 #include <seastar/core/chunked_vector.hh>
 #include <seastar/core/coroutine.hh>
@@ -27,6 +28,8 @@
 #include <vector>
 
 namespace {
+
+using kwaque::simulation::testing::pump_until;
 
 kwaque::simulation::scheduler_limits dns_scheduler_limits() {
     auto limits = kwaque::simulation::scheduler_limits::make(
@@ -102,27 +105,6 @@ kwaque::runtime::dns_answer ipv6_answer(std::uint16_t port, std::uint64_t ttl) {
       .endpoint = kwaque::runtime::network_endpoint{*selected, port},
       .ttl = kwaque::runtime::monotonic_duration{ttl},
     };
-}
-
-template<typename T>
-seastar::future<>
-pump_until(kwaque::simulation::scheduler& events, seastar::future<T>& waiting) {
-    while (!waiting.available()) {
-        co_await seastar::yield();
-        if (waiting.available()) {
-            continue;
-        }
-        if (events.pending_events() == 0U) {
-            continue;
-        }
-        if (!events.has_ready_events()) {
-            const auto advanced = events.advance_to_next();
-            BOOST_REQUIRE(advanced.has_value());
-            BOOST_REQUIRE(advanced->has_value());
-        }
-        const auto ran = events.run_ready();
-        BOOST_REQUIRE(ran.has_value());
-    }
 }
 
 template<typename Future>

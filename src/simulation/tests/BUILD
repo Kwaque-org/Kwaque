@@ -118,6 +118,62 @@ kwaque_cc_seastar_test(
 )
 
 kwaque_cc_seastar_test(
+    name = "environment_test",
+    srcs = ["environment_test.cc"],
+    cpu = 1,
+    memory = "256MiB",
+    deps = [
+        "//src/base",
+        "//src/observability:event",
+        "//src/observability:event_log",
+        "//src/resource:resource_manager",
+        "//src/resource:workload_class",
+        "//src/runtime:dns",
+        "//src/runtime:environment",
+        "//src/runtime:fault",
+        "//src/runtime:fault_api",
+        "//src/runtime:file",
+        "//src/runtime:network",
+        "//src/runtime/testing/contracts:environment_contract",
+        "//src/runtime/testing/contracts:environment_lifecycle_contract",
+        "//src/runtime/testing/contracts:simulation_environment_component",
+        "//src/simulation:environment",
+        "//src/simulation:environment_test_support",
+        "//src/simulation:fake_dns",
+        "//src/simulation:fault_schedule",
+        "//src/simulation:scheduler",
+        "//src/simulation:scheduler_driver",
+        "//src/simulation:sha256",
+    ],
+)
+
+kwaque_cc_seastar_test(
+    name = "environment_replay_test",
+    srcs = ["environment_replay_test.cc"],
+    cpu = 1,
+    memory = "256MiB",
+    deps = [
+        "//src/base",
+        "//src/observability:event",
+        "//src/observability:event_codec",
+        "//src/observability:event_log",
+        "//src/runtime:dns",
+        "//src/runtime:fault_api",
+        "//src/runtime:file",
+        "//src/runtime:network",
+        "//src/runtime/testing/contracts:environment_contract",
+        "//src/runtime/testing/contracts:simulation_environment_component",
+        "//src/simulation:environment",
+        "//src/simulation:environment_test_support",
+        "//src/simulation:event_trace",
+        "//src/simulation:fake_dns",
+        "//src/simulation:fake_file_test_support",
+        "//src/simulation:scheduler_driver",
+        "//src/simulation:sha256",
+    ],
+)
+
+kwaque_cc_seastar_test(
     name = "failure_probe_test",
     srcs = ["failure_probe_test.cc"],
     cpu = 1,
@@ -275,6 +331,7 @@ kwaque_cc_seastar_test(
         "//src/simulation:fake_file_test_support",
         "//src/simulation:fault_schedule",
         "//src/simulation:scheduler",
+        "//src/simulation:scheduler_driver",
         "//src/simulation/tests:fake_file_model",
     ],
 )
@@ -293,6 +350,7 @@ kwaque_cc_seastar_test(
         "//src/simulation:fake_file_test_support",
         "//src/simulation:fault_schedule",
         "//src/simulation:scheduler",
+        "//src/simulation:scheduler_driver",
     ],
 )
 
@@ -311,6 +369,7 @@ kwaque_cc_seastar_test(
         "//src/simulation:fake_network_test_support",
         "//src/simulation:fault_schedule",
         "//src/simulation:scheduler",
+        "//src/simulation:scheduler_driver",
         "//src/simulation/tests:network_oracle",
     ],
 )
@@ -341,5 +400,6 @@ kwaque_cc_seastar_test(
         "//src/simulation:fake_dns",
         "//src/simulation:fault_schedule",
         "//src/simulation:scheduler",
+        "//src/simulation:scheduler_driver",
     ],
 )

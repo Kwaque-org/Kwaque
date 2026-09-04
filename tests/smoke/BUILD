@@ -25,6 +25,23 @@ py_library(
     visibility = ["//bazel/packaging:__pkg__"],
 )
 
+py_test(
+    name = "resource_memory_smoke_test",
+    size = "small",
+    timeout = "moderate",
+    srcs = ["resource_memory_smoke_test.py"],
+    args = _COMMON_ARGS,
+    data = _COMMON_DATA,
+    main = "resource_memory_smoke_test.py",
+    tags = [
+        "requires-network",
+        "resources:cpu:2",
+        "resources:memory:128",
+        "smoke",
+    ],
+    deps = [":broker_test_support"],
+)
+
 [
     py_test(
         name = test_name,

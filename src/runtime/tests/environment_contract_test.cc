@@ -409,6 +409,26 @@ SEASTAR_TEST_CASE(runtime_lifetime_waits_for_root_and_component_views) {
     BOOST_CHECK_EQUAL(backend.lifetime().leases(), 0U);
 }
 
+SEASTAR_TEST_CASE(runtime_lifetime_rejects_leases_before_activation) {
+    kwaque::runtime::runtime_lifetime lifetime;
+    BOOST_CHECK(
+      lifetime.state() == kwaque::runtime::runtime_lifetime_state::inactive);
+    BOOST_CHECK(!lifetime.acquire().has_value());
+
+    lifetime.activate();
+    BOOST_CHECK(
+      lifetime.state() == kwaque::runtime::runtime_lifetime_state::open);
+    BOOST_CHECK_THROW(lifetime.activate(), std::logic_error);
+    auto lease = lifetime.acquire();
+    BOOST_REQUIRE(lease.has_value());
+    lease.reset();
+    co_await lifetime.close();
+    BOOST_CHECK(
+      lifetime.state() == kwaque::runtime::runtime_lifetime_state::closed);
+    BOOST_CHECK(!lifetime.acquire().has_value());
+    BOOST_CHECK_THROW(lifetime.activate(), std::logic_error);
+}
+
 SEASTAR_TEST_CASE(runtime_rejects_new_views_after_backend_close_begins) {
     production_backend backend;
     std::optional<seastar::future<>> closing;
@@ -426,13 +446,12 @@ SEASTAR_TEST_CASE(runtime_rejects_new_views_after_backend_close_begins) {
 }
 
 SEASTAR_TEST_CASE(runtime_never_activated_close_completes_inline) {
-    production_backend backend;
-    auto closing = backend.lifetime().close();
+    kwaque::runtime::runtime_lifetime lifetime;
+    auto closing = lifetime.close();
     BOOST_CHECK(closing.available());
     co_await std::move(closing);
     BOOST_CHECK(
-      backend.lifetime().state()
-      == kwaque::runtime::runtime_lifetime_state::closed);
+      lifetime.state() == kwaque::runtime::runtime_lifetime_state::closed);
 }
 
 SEASTAR_TEST_CASE(component_gate_closes_before_runtime_backend_completion) {

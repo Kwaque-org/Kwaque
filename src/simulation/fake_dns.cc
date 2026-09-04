@@ -1268,12 +1268,6 @@ void fake_dns::impl::schedule_cleanup_batch() noexcept {
       event_priority::highest(),
       [this] noexcept {
           cleanup_scheduled_ = false;
-          auto replacement = scheduler_->reserve_event_slot();
-          KWAQUE_INVARIANT(
-            fake_dns_state_invariant,
-            replacement.has_value(),
-            "fake DNS cleanup lost its reserved scheduler slot");
-          cleanup_event_reservation_ = std::move(*replacement);
           if (scheduler_->discarding_failed_event()) [[unlikely]] {
               const auto* failure = scheduler_->trace_failure();
               KWAQUE_INVARIANT(
@@ -1281,9 +1275,15 @@ void fake_dns::impl::schedule_cleanup_batch() noexcept {
                 failure != nullptr,
                 "discarded fake DNS cleanup has no trace error");
               discard_all(*failure);
-          } else {
-              run_cleanup_batch();
+              return;
           }
+          auto replacement = scheduler_->reserve_event_slot();
+          KWAQUE_INVARIANT(
+            fake_dns_state_invariant,
+            replacement.has_value(),
+            "fake DNS cleanup lost its reserved scheduler slot");
+          cleanup_event_reservation_ = std::move(*replacement);
+          run_cleanup_batch();
       },
       trace_event_descriptor{
         .kind = trace_event_kind::dns,
@@ -1292,10 +1292,10 @@ void fake_dns::impl::schedule_cleanup_batch() noexcept {
       },
       event_cleanup_policy::invoke,
       std::move(cleanup_trace));
-    KWAQUE_INVARIANT(
-      fake_dns_state_invariant,
-      scheduled.has_value(),
-      "fake DNS cleanup batch could not schedule");
+    if (!scheduled) {
+        discard_all(scheduled.error());
+        return;
+    }
     cleanup_scheduled_ = true;
 }
 

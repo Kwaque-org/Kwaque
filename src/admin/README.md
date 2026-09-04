@@ -8,10 +8,11 @@ The loopback-friendly administrative HTTP service exposes:
 - `GET /metrics` for Prometheus-formatted runtime metrics.
 
 The metrics route reads the native default registry and currently publishes the
-fixed broker, task, timer, file, network, and DNS families. Shard is aggregated
-for runtime totals; no path, host, object, or other dynamic product label is
-exported. Resource-manager, bounded-queue, and simulation owners are not part of
-the current broker composition.
+fixed broker, task, timer, file, network, DNS, and resource-manager families.
+Shard is aggregated for runtime totals; resource-manager families retain only
+the fixed workload label. No path, host, object, or other dynamic product label
+is exported. Bounded-queue and simulation owners are not part of the current
+broker composition.
 
 Readiness is cleared before shutdown stops accepting administrative
 connections. Error responses use a stable JSON envelope containing `code`,

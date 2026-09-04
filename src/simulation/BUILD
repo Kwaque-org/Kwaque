@@ -61,7 +61,10 @@ kwaque_cc_library(
     name = "structured_event_sink",
     srcs = ["event_sink.cc"],
     hdrs = ["event_sink.h"],
-    visibility = ["//src/simulation:__subpackages__"],
+    visibility = [
+        "//src/runtime/testing/contracts:__pkg__",
+        "//src/simulation:__subpackages__",
+    ],
     deps = [
         "//src/observability:event",
         "//src/observability:event_log",
@@ -92,6 +95,56 @@ kwaque_cc_library(
 )
 
 kwaque_cc_library(
+    name = "environment",
+    testonly = True,
+    srcs = ["environment.cc"],
+    hdrs = ["environment.h"],
+    visibility = [
+        "//src/runtime/testing/contracts:__pkg__",
+        "//src/simulation/tests:__pkg__",
+    ],
+    deps = [
+        ":deterministic_random",
+        ":event_trace",
+        ":fake_dns",
+        ":fake_file",
+        ":fake_network",
+        ":fault_schedule",
+        ":metrics",
+        ":scheduler",
+        ":structured_event_sink",
+        ":timer",
+        ":virtual_time",
+        "//src/base:invariant",
+        "//src/observability:event",
+        "//src/observability:event_log",
+        "//src/resource:resource_config",
+        "//src/resource:resource_manager",
+        "//src/resource:resource_registry",
+        "//src/resource:resource_test_support",
+        "//src/runtime:environment",
+        "//src/runtime:error",
+        "//src/runtime:fault",
+        "//src/runtime:fault_api",
+        "//src/runtime:shard_affinity",
+        "//src/runtime:task_scope",
+        "//src/runtime/testing/failure_probe",
+        "@seastar",
+    ],
+)
+
+kwaque_cc_library(
+    name = "environment_test_support",
+    testonly = True,
+    hdrs = ["environment_test_support.h"],
+    visibility = ["//src/simulation/tests:__pkg__"],
+    deps = [
+        ":environment",
+        "@seastar",
+    ],
+)
+
+kwaque_cc_library(
     name = "scheduler",
     srcs = ["scheduler.cc"],
     hdrs = ["scheduler.h"],
@@ -113,6 +166,18 @@ kwaque_cc_library(
     hdrs = ["scheduler_test_support.h"],
     visibility = ["//src/simulation/tests:__pkg__"],
     deps = [":scheduler"],
+)
+
+kwaque_cc_library(
+    name = "scheduler_driver",
+    testonly = True,
+    hdrs = ["scheduler_driver.h"],
+    visibility = ["//src/simulation/tests:__pkg__"],
+    deps = [
+        ":scheduler",
+        "//src/base:error",
+        "@seastar",
+    ],
 )
 
 kwaque_cc_library(
@@ -143,6 +208,7 @@ kwaque_cc_library(
         "//src/runtime:error",
         "//src/runtime:shard_affinity",
         "//src/runtime:time",
+        "@seastar",
     ],
 )
 
@@ -169,6 +235,7 @@ kwaque_cc_library(
         "//src/runtime:error",
         "//src/runtime:shard_affinity_test_support",
         "//src/runtime:time",
+        "@seastar",
     ],
 )
 

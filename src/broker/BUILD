@@ -41,13 +41,15 @@ kwaque_cc_library(
         ":pid_file",
         ":service_lifecycle",
         "//src/admin:admin_server",
+        "//src/base",
         "//src/base:build_info",
         "//src/base:logging",
         "//src/config:bootstrap_config",
-        "//src/runtime:runtime_service",
-        "//src/runtime:sharded_service",
+        "//src/observability:event_identity",
+        "//src/resource:resource_config",
+        "//src/resource:resource_registry",
         "//src/runtime:stop_signal",
-        "//src/runtime/production:backend",
+        "//src/runtime/production:environment",
         "@boost//:program_options",
         "@seastar",
     ],
@@ -64,6 +66,13 @@ kwaque_cc_library(
         "@boost//:program_options",
         "@seastar",
     ],
+)
+
+kwaque_cc_library(
+    name = "application_test_support",
+    testonly = True,
+    hdrs = ["application_test_support.h"],
+    deps = [":application_internal"],
 )
 
 kwaque_cc_binary(
@@ -94,6 +103,7 @@ kwaque_cc_seastar_test(
     deps = [
         ":application",
         ":application_internal",
+        ":application_test_support",
         ":service_lifecycle",
     ],
 )
@@ -105,10 +115,12 @@ kwaque_cc_seastar_test(
     memory = "256MiB",
     deps = [
         "//src/admin:admin_server",
+        "//src/base",
         "//src/base:metric_schema",
-        "//src/runtime:runtime_service",
-        "//src/runtime:sharded_service",
-        "//src/runtime/production:backend",
+        "//src/observability:event_identity",
+        "//src/resource:resource_config",
+        "//src/resource:resource_registry",
+        "//src/runtime/production:environment",
     ],
 )
 

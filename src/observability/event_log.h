@@ -57,6 +57,9 @@ public:
         return chunks_;
     }
 
+    [[nodiscard]] bool
+    operator==(const event_log_artifact& other) const noexcept;
+
 private:
     std::deque<std::vector<std::uint8_t>> chunks_;
     std::uint64_t size_{0};
@@ -171,13 +174,53 @@ private:
 
 class event_log final {
 public:
+    class reservation final {
+    public:
+        reservation() noexcept = default;
+        ~reservation();
+
+        reservation(const reservation&) = delete;
+        reservation& operator=(const reservation&) = delete;
+        reservation(reservation&& other) noexcept;
+        reservation& operator=(reservation&& other) noexcept;
+
+        [[nodiscard]] bool active() const noexcept { return owner_ != nullptr; }
+        [[nodiscard]] std::uint32_t entries() const noexcept {
+            return entries_;
+        }
+        [[nodiscard]] std::uint64_t encoded_bytes() const noexcept {
+            return encoded_bytes_;
+        }
+        void release() noexcept;
+
+    private:
+        friend class event_log;
+
+        reservation(
+          event_log& owner,
+          std::uint32_t entries,
+          std::uint64_t encoded_bytes) noexcept
+          : owner_(&owner)
+          , entries_(entries)
+          , encoded_bytes_(encoded_bytes) {}
+
+        event_log* owner_{nullptr};
+        std::uint32_t entries_{0};
+        std::uint64_t encoded_bytes_{0};
+    };
+
     event_log(event_sink_identity identity, event_log_limits limits);
+    ~event_log();
     event_log(const event_log&) = delete;
     event_log& operator=(const event_log&) = delete;
     event_log(event_log&&) = delete;
     event_log& operator=(event_log&&) = delete;
 
+    [[nodiscard]] runtime::result<reservation>
+    reserve(std::uint32_t entries, std::uint64_t encoded_bytes) noexcept;
     [[nodiscard]] runtime::result<void> append(const event& value) noexcept;
+    [[nodiscard]] runtime::result<void>
+    append(const event& value, reservation& reserved) noexcept;
 
     [[nodiscard]] runtime::result<event_log_artifact> encode() const;
     [[nodiscard]] seastar::future<runtime::result<event_log_artifact>>
@@ -210,10 +253,17 @@ public:
     }
 
 private:
+    [[nodiscard]] runtime::result<void>
+    append_with(const event& value, reservation* reserved) noexcept;
+    void consume(reservation& reserved, std::uint64_t encoded_bytes) noexcept;
+    void release(std::uint32_t entries, std::uint64_t encoded_bytes) noexcept;
+
     event_sink_identity identity_;
     event_log_limits limits_;
     event_entry_log entries_;
     std::uint64_t encoded_bytes_{canonical_event_log_header_encoded_size};
+    std::uint32_t reserved_entries_{0};
+    std::uint64_t reserved_bytes_{0};
 };
 
 } // namespace kwaque::observability

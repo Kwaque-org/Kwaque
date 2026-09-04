@@ -1,4 +1,4 @@
-#include "src/runtime/runtime_service.h"
+#include "src/runtime/task_scope.h"
 
 #include <seastar/core/future.hh>
 
@@ -10,14 +10,13 @@
 namespace {
 
 TEST(
-  RuntimeServiceInvariantDeathTest,
-  RejectsDestructionWhilePendingWorkKeepsTaskScopeOpen) {
+  TaskScopeInvariantDeathTest,
+  RejectsDestructionWhilePendingWorkKeepsScopeOpen) {
     EXPECT_DEATH(
       {
           seastar::promise<> release;
-          kwaque::runtime::runtime_service service;
-          service.start().get();
-          const auto accepted = service.tasks().spawn(
+          kwaque::runtime::task_scope scope;
+          const auto accepted = scope.spawn(
             [pending = release.get_future()]() mutable {
                 return std::move(pending);
             });

@@ -4,22 +4,36 @@
 #include "src/broker/pid_file.h"
 #include "src/broker/service_lifecycle.h"
 #include "src/config/bootstrap_config.h"
-#include "src/runtime/production/backend.h"
-#include "src/runtime/runtime_service.h"
-#include "src/runtime/sharded_service.h"
+#include "src/resource/resource_config.h"
+#include "src/resource/resource_registry.h"
+#include "src/runtime/production/environment.h"
 #include "src/runtime/stop_signal.h"
 
+#include <seastar/core/coroutine.hh>
 #include <seastar/core/future.hh>
 
 #include <boost/program_options/variables_map.hpp>
 
 #include <chrono>
+#include <cstdint>
+#include <exception>
 #include <filesystem>
 #include <memory>
 #include <optional>
+#include <stdexcept>
 #include <string>
 
 namespace kwaque::broker::detail {
+
+[[nodiscard]] constexpr byte_count
+reduce_minimum_shard_memory(byte_count current, byte_count observed) noexcept {
+    return observed < current ? observed : current;
+}
+
+[[nodiscard]] resource::resource_config
+production_resource_config(byte_count minimum_shard_memory);
+
+class application_test_access;
 
 class application_state final {
 public:
@@ -45,8 +59,19 @@ public:
     [[nodiscard]] const service_lifecycle* lifecycle() const noexcept;
 
 private:
+    friend class application_test_access;
+
     void capture_or_assert_owner();
     void assert_owner() const;
+    [[nodiscard]] seastar::future<byte_count> observe_minimum_shard_memory();
+    [[nodiscard]] seastar::future<> start_data_directory();
+    [[nodiscard]] seastar::future<> start_pid_file();
+    [[nodiscard]] seastar::future<>
+    start_resource_registry(byte_count minimum_shard_memory);
+    [[nodiscard]] seastar::future<> start_environments();
+    [[nodiscard]] seastar::future<> start_admin();
+    template<typename Checkpoint>
+    [[nodiscard]] seastar::future<> start_services_with(Checkpoint checkpoint);
 
     std::filesystem::path config_path_;
     std::optional<config::bootstrap_config> configuration_;
@@ -54,11 +79,47 @@ private:
     std::unique_ptr<service_lifecycle> lifecycle_;
     std::unique_ptr<pid_file> pid_file_;
     std::unique_ptr<admin::admin_server> admin_server_;
-    std::unique_ptr<runtime::sharded_service<runtime::runtime_service>>
-      runtime_service_;
-    std::unique_ptr<runtime::production::backend_owner> production_backends_;
+    std::unique_ptr<resource::resource_registry> resource_registry_;
+    std::unique_ptr<runtime::production::environment_owner> environments_;
     std::chrono::steady_clock::time_point startup_started_at_{};
     std::optional<runtime::owner_shard> owner_;
 };
+
+template<typename Checkpoint>
+seastar::future<>
+application_state::start_services_with(Checkpoint checkpoint) {
+    assert_owner();
+    if (!configuration_ || !services_constructed()) {
+        throw std::logic_error(
+          "configuration and services must be ready before startup");
+    }
+
+    std::exception_ptr startup_failure;
+    try {
+        const auto minimum_shard_memory
+          = co_await observe_minimum_shard_memory();
+        checkpoint(0);
+        co_await start_data_directory();
+        checkpoint(1);
+        co_await start_pid_file();
+        checkpoint(2);
+        co_await start_resource_registry(minimum_shard_memory);
+        checkpoint(3);
+        co_await start_environments();
+        checkpoint(4);
+        co_await start_admin();
+        checkpoint(5);
+    } catch (...) {
+        startup_failure = std::current_exception();
+    }
+
+    if (startup_failure) {
+        try {
+            co_await shutdown();
+        } catch (...) {
+        }
+        std::rethrow_exception(startup_failure);
+    }
+}
 
 } // namespace kwaque::broker::detail

@@ -226,19 +226,6 @@ kwaque_cc_library(
 )
 
 kwaque_cc_library(
-    name = "runtime_service",
-    srcs = ["runtime_service.cc"],
-    hdrs = ["runtime_service.h"],
-    visibility = ["//visibility:public"],
-    deps = [
-        ":shard_affinity",
-        ":task_scope",
-        "//src/base:metric_schema",
-        "@seastar",
-    ],
-)
-
-kwaque_cc_library(
     name = "stop_signal",
     srcs = ["stop_signal.cc"],
     hdrs = ["stop_signal.h"],

@@ -25,6 +25,19 @@ Closing a task scope first closes admission and requests abort, then waits for
 all accepted work. `admission_closed()` reports only the first condition; the
 future returned by `close()` is the drain-completion boundary.
 
+The production environment is one shard-local composition root for the task
+scope, runtime adapters, resource manager, event sink, and their metrics. It
+uses the same explicit constructed/starting/started/stopping/stopped lifecycle
+as the simulation environment. Shutdown closes component admission and drains
+capability and workload leases before destroying their owners. Terminal
+lifecycle reporting and event-sink shutdown complete before the resource
+manager releases its process-registry lease. Fault configuration and probe
+ownership are absent from the production type.
+
+Runtime capability leases remain unavailable until environment startup has
+fully prepared every adapter, resource owner, metric, and ready event. They are
+closed before teardown and cannot be reacquired after failed startup or stop.
+
 Logical file operations and network writes may span many fragments, but each
 physical file read, network read result, or staging allocation is capped at 128
 KiB. Common one-chunk native I/O keeps its direct continuation path; larger or

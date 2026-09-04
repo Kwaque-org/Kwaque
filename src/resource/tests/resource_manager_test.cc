@@ -50,6 +50,10 @@ seastar::future<> verify_local_manager(resource_manager& manager) {
     }
     for (const auto classification : all_workload_classes) {
         auto workload = manager.acquire_workload(classification);
+        if (workload.hard_budget() != manager.hard_budget(classification)) {
+            throw std::runtime_error(
+              "workload handle changed its configured memory budget");
+        }
         const auto group = workload.scheduling_group();
         co_await seastar::with_scheduling_group(group, [group] {
             if (seastar::current_scheduling_group() != group) {

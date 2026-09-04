@@ -89,7 +89,10 @@ kwaque_cc_library(
     name = "resource_test_support",
     testonly = True,
     hdrs = ["resource_test_support.h"],
-    visibility = ["//src/resource/tests:__pkg__"],
+    visibility = [
+        "//src/resource/tests:__pkg__",
+        "//src/simulation:__pkg__",
+    ],
     deps = [
         ":resource_manager",
         ":resource_registry",

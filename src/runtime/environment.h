@@ -26,15 +26,34 @@
 
 namespace kwaque::runtime {
 
+enum class environment_state : std::uint8_t {
+    constructed,
+    starting,
+    started,
+    stopping,
+    stopped,
+};
+
+template<typename Environment>
+concept environment_lifecycle = requires(Environment& environment) {
+    { environment.start() } -> std::same_as<seastar::future<>>;
+    { environment.request_abort() } -> std::same_as<void>;
+    { environment.stop() } -> std::same_as<seastar::future<>>;
+    { environment.state() } -> std::same_as<environment_state>;
+    { environment.abort_requested() } -> std::same_as<bool>;
+};
+
 enum class runtime_lifetime_state : std::uint8_t {
+    inactive,
     open,
     closing,
     closed,
 };
 
-// A backend owns this gate. Runtime roots and component capability views hold
-// native gate holders, so backend close cannot complete while a consumer still
-// refers to any seam owner.
+// A backend owns this gate. It remains inactive until every capability owner is
+// ready. Runtime roots and component capability views then hold native gate
+// holders, so backend close cannot complete while a consumer still refers to a
+// seam owner.
 class runtime_lifetime final : public shard_affine {
 public:
     runtime_lifetime() noexcept = default;
@@ -45,6 +64,7 @@ public:
     runtime_lifetime(runtime_lifetime&&) = delete;
     runtime_lifetime& operator=(runtime_lifetime&&) = delete;
 
+    void activate();
     [[nodiscard]] std::optional<seastar::gate::holder> acquire();
     [[nodiscard]] seastar::future<> close();
 
@@ -54,8 +74,8 @@ public:
 private:
     seastar::gate leases_;
     std::optional<seastar::shared_promise<>> close_done_;
-    runtime_lifetime_state state_{runtime_lifetime_state::open};
-    bool activated_{false};
+    runtime_lifetime_state state_{runtime_lifetime_state::inactive};
+    bool lease_acquired_{false};
 };
 
 template<typename Backend>
@@ -84,28 +104,31 @@ concept runtime_backend = clock_backend<Backend>
                                  } noexcept -> std::same_as<owner_shard>;
                                  {
                                      backend.lifetime()
-                                 } noexcept -> std::same_as<runtime_lifetime&>;
+                                 } -> std::same_as<runtime_lifetime&>;
                                  {
                                      backend.timer()
-                                 } noexcept -> std::same_as<
-                                   typename Backend::timer_type&>;
+                                 }
+                                 -> std::same_as<typename Backend::timer_type&>;
                                  {
                                      backend.random()
-                                 } noexcept -> std::same_as<
+                                 } -> std::same_as<
                                    typename Backend::random_type&>;
                                  {
                                      backend.file_system()
-                                 } noexcept -> std::same_as<
+                                 } -> std::same_as<
                                    typename Backend::file_system_type&>;
                                  {
                                      backend.network()
-                                 } noexcept -> std::same_as<
+                                 } -> std::same_as<
                                    typename Backend::network_type&>;
                                  {
                                      backend.dns()
-                                 } noexcept
-                                   -> std::same_as<typename Backend::dns_type&>;
+                                 } -> std::same_as<typename Backend::dns_type&>;
                              };
+
+// Runtime backend capability accessors enforce their own shard affinity. A
+// basic_runtime_view performs capability selection and lifetime ownership but
+// does not add a second affinity check to those calls.
 
 enum class runtime_capability : std::uint8_t {
     timer,
@@ -183,7 +206,6 @@ public:
     requires detail::
       has_runtime_capability<runtime_capability::timer, Capabilities...>
     {
-        assert_current();
         return backend_->timer();
     }
 
@@ -191,7 +213,6 @@ public:
     requires detail::
       has_runtime_capability<runtime_capability::random, Capabilities...>
     {
-        assert_current();
         return backend_->random();
     }
 
@@ -199,7 +220,6 @@ public:
     requires detail::
       has_runtime_capability<runtime_capability::file_system, Capabilities...>
     {
-        assert_current();
         return backend_->file_system();
     }
 
@@ -207,7 +227,6 @@ public:
     requires detail::
       has_runtime_capability<runtime_capability::network, Capabilities...>
     {
-        assert_current();
         return backend_->network();
     }
 
@@ -215,7 +234,6 @@ public:
     requires detail::
       has_runtime_capability<runtime_capability::dns, Capabilities...>
     {
-        assert_current();
         return backend_->dns();
     }
 

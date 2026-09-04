@@ -61,11 +61,17 @@ def http_get(port: int, path: str) -> tuple[int, str, str]:
 
 
 class BrokerProcess:
-    def __init__(self, binary: Path, config: Path, log_path: Path) -> None:
+    def __init__(
+        self,
+        binary: Path,
+        config: Path,
+        log_path: Path,
+        reactor_arguments: tuple[str, ...] = REACTOR_ARGUMENTS,
+    ) -> None:
         output = log_path.open("w", encoding="utf-8")
         try:
             self.process = subprocess.Popen(
-                [binary, "--config", config, *REACTOR_ARGUMENTS],
+                [binary, "--config", config, *reactor_arguments],
                 stdout=output,
                 stderr=subprocess.STDOUT,
                 text=True,

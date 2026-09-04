@@ -3,6 +3,7 @@
 
 #include <seastar/core/coroutine.hh>
 #include <seastar/testing/test_case.hh>
+#include <seastar/util/alloc_failure_injector.hh>
 
 #include <boost/test/unit_test.hpp>
 
@@ -217,5 +218,51 @@ SEASTAR_TEST_CASE(wall_adjustments_are_bounded_ordered_integer_events) {
     BOOST_CHECK(past.error().code() == kwaque::errc::invalid_argument);
     BOOST_CHECK(
       past.error().operation() == kwaque::runtime::operation_kind::clock);
+    BOOST_REQUIRE(time.stop().has_value());
+    BOOST_CHECK_EQUAL(time.offset().nanoseconds(), -100);
+    co_return;
+}
+
+SEASTAR_TEST_CASE(virtual_time_stop_cancels_pending_wall_adjustments) {
+    const auto limits = test_scheduler_limits();
+    scheduler target{limits};
+    virtual_time time{target, test_time_config(limits)};
+    clock_binding binding{time};
+
+    BOOST_REQUIRE(time.schedule_wall_offset(monotonic_time{5}, wall_offset{17})
+                    .has_value());
+    BOOST_REQUIRE(time.schedule_wall_offset(monotonic_time{7}, wall_offset{-9})
+                    .has_value());
+    BOOST_CHECK_EQUAL(time.pending_adjustments(), 2U);
+    BOOST_CHECK_EQUAL(target.pending_events(), 2U);
+
+    BOOST_REQUIRE(time.stop().has_value());
+    BOOST_REQUIRE(time.stop().has_value());
+    BOOST_CHECK_EQUAL(time.pending_adjustments(), 0U);
+    BOOST_CHECK_EQUAL(target.pending_events(), 0U);
+    BOOST_CHECK_EQUAL(time.offset().nanoseconds(), 0);
+    const auto rejected = time.schedule_wall_offset(
+      monotonic_time{9}, wall_offset{1});
+    BOOST_REQUIRE(!rejected.has_value());
+    BOOST_CHECK(rejected.error().code() == kwaque::errc::closed);
+    co_return;
+}
+
+SEASTAR_TEST_CASE(virtual_time_wall_adjustment_uses_preallocated_ownership) {
+    const auto limits = test_scheduler_limits();
+    scheduler target{limits};
+    virtual_time time{target, test_time_config(limits)};
+
+    std::size_t attempts = 0;
+    bool scheduled = false;
+    seastar::memory::with_allocation_failures([&] {
+        ++attempts;
+        scheduled = time
+                      .schedule_wall_offset(monotonic_time{5}, wall_offset{17})
+                      .has_value();
+    });
+    BOOST_REQUIRE(scheduled);
+    BOOST_CHECK_EQUAL(attempts, 1U);
+    BOOST_REQUIRE(time.stop().has_value());
     co_return;
 }

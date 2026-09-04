@@ -44,7 +44,9 @@ must be writable by the broker process. Running the committed development
 configuration does not require root privileges, device access, or privileged
 ports. Hosts must provide enough unlocked memory for the selected Seastar
 `--memory` value; production CPU, memory-locking, and filesystem tuning is not
-yet automated.
+yet automated. Workload admission is derived from the smallest shard-local
+allocator after Seastar applies `--memory`, with fixed internal reactor
+headroom; it is not a bootstrap-configuration setting.
 
 ## Quick start
 

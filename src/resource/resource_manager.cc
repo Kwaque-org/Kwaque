@@ -24,11 +24,13 @@ thread_local resource_manager* active_manager = nullptr;
 workload_handle::workload_handle(
   resource_manager& manager,
   seastar::semaphore& memory,
+  byte_count hard_budget,
   seastar::scheduling_group scheduling_group,
   seastar::smp_service_group smp_service_group,
   seastar::gate::holder lifetime) noexcept
   : manager_(&manager)
   , memory_(&memory)
+  , hard_budget_(hard_budget)
   , scheduling_group_(scheduling_group)
   , smp_service_group_(smp_service_group)
   , lifetime_(std::move(lifetime)) {}
@@ -37,6 +39,7 @@ workload_handle::workload_handle(workload_handle&& other) noexcept
   : owner_(other.owner_)
   , manager_(std::exchange(other.manager_, nullptr))
   , memory_(std::exchange(other.memory_, nullptr))
+  , hard_budget_(other.hard_budget_)
   , scheduling_group_(other.scheduling_group_)
   , smp_service_group_(other.smp_service_group_)
   , lifetime_(std::move(other.lifetime_)) {}
@@ -53,7 +56,7 @@ seastar::smp_service_group workload_handle::smp_service_group() const {
     return smp_service_group_;
 }
 
-resource_manager::resource_manager(resource_handle_set handles) noexcept
+resource_manager::resource_manager(resource_handle_set handles)
   : handles_(std::move(handles)) {}
 
 resource_manager::~resource_manager() {
@@ -305,6 +308,7 @@ resource_manager::acquire_workload(workload_class classification) {
     return workload_handle{
       *this,
       *memory_admissions_[index],
+      handles_.config().budget(classification),
       handles_.scheduling_groups_[index],
       handles_.smp_service_groups_[index],
       std::move(*lifetime)};
