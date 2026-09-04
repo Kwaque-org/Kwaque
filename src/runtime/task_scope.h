@@ -33,7 +33,7 @@ struct task_scope_statistics final {
 // owner; close first requests cancellation, then waits for every accepted task.
 class task_scope final : public shard_affine {
 public:
-    task_scope() noexcept = default;
+    task_scope() = default;
     // Parent and scope may be destroyed in either order. Destroying the parent
     // first removes propagation without requesting abort on this scope.
     explicit task_scope(seastar::abort_source& parent);

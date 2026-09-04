@@ -75,6 +75,7 @@ kwaque_cc_library(
         ":event_codec",
         ":event_identity",
         "//src/base",
+        "//src/base:invariant",
         "//src/runtime:error",
         "@seastar",
     ],

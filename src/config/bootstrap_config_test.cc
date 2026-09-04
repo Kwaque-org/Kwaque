@@ -59,6 +59,14 @@ TEST(BootstrapConfigTest, LoadsCommittedExample) {
 TEST(BootstrapConfigTest, RejectsInvalidConfiguration) {
     const std::vector<std::pair<std::string_view, config_errc>> cases{
       {"kwaque: {schema_version: 1, unknown: true}", config_errc::unknown_key},
+      {"kwaque: {schema_version: 1, runtime: {memory: 1}}",
+       config_errc::unknown_key},
+      {"kwaque: {schema_version: 1, simulation: {seed: 1}}",
+       config_errc::unknown_key},
+      {"kwaque: {schema_version: 1, resource_memory: 67108864}",
+       config_errc::unknown_key},
+      {"kwaque: {schema_version: 1, reactor_headroom: 16777216}",
+       config_errc::unknown_key},
       {"kwaque: {schema_version: 1, node_id: -1}",
        config_errc::invalid_node_id},
       {"kwaque: {schema_version: 1, data_directory: ''}",

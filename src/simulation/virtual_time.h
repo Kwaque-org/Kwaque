@@ -6,9 +6,12 @@
 #include "src/runtime/time.h"
 #include "src/simulation/scheduler.h"
 
+#include <seastar/core/chunked_vector.hh>
+
 #include <compare>
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 
 namespace kwaque::simulation {
 
@@ -81,7 +84,7 @@ private:
 
 class virtual_time final : public runtime::shard_affine {
 public:
-    virtual_time(scheduler& target, virtual_time_config config) noexcept;
+    virtual_time(scheduler& target, virtual_time_config config);
     ~virtual_time();
 
     virtual_time(const virtual_time&) = delete;
@@ -96,6 +99,7 @@ public:
 
     [[nodiscard]] runtime::result<void>
     schedule_wall_offset(runtime::monotonic_time deadline, wall_offset offset);
+    [[nodiscard]] runtime::result<void> stop() noexcept;
 
 private:
     friend class clock_binding;
@@ -103,20 +107,41 @@ private:
     friend class virtual_time_test_access;
     friend class wall_clock;
 
+    static constexpr std::size_t no_adjustment
+      = std::numeric_limits<std::size_t>::max();
+
+    struct adjustment_state final {
+        explicit adjustment_state(std::size_t next) noexcept
+          : next_free(next) {}
+
+        wall_offset offset;
+        event_id event;
+        std::size_t next_free;
+        std::size_t next_active{no_adjustment};
+        std::size_t previous_active{no_adjustment};
+        bool active{false};
+    };
+
     [[nodiscard]] static virtual_time& active() noexcept;
-    void apply_wall_adjustment(wall_offset offset) noexcept;
-    void discard_wall_adjustment() noexcept;
+    void finish_adjustment(std::size_t index, bool apply) noexcept;
+    void release_adjustment(std::size_t index) noexcept;
 
     static thread_local virtual_time* active_;
 
     scheduler* scheduler_;
     virtual_time_config config_;
     wall_offset offset_{};
+    seastar::chunked_vector<adjustment_state> adjustments_;
+    std::size_t first_adjustment_{no_adjustment};
+    std::size_t free_adjustment_{no_adjustment};
     std::size_t pending_adjustments_{0};
+    bool stopped_{false};
 };
 
 class clock_binding final {
 public:
+    [[nodiscard]] static bool available() noexcept;
+
     explicit clock_binding(virtual_time& time);
     ~clock_binding();
 

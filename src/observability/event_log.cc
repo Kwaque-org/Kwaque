@@ -1,5 +1,7 @@
 #include "src/observability/event_log.h"
 
+#include "src/base/invariant.h"
+
 #include <seastar/coroutine/maybe_yield.hh>
 
 #include <algorithm>
@@ -19,6 +21,8 @@ namespace {
 static_assert(std::is_nothrow_copy_constructible_v<event>);
 
 constexpr std::array<std::uint8_t, 4> event_log_magic{'K', 'Q', 'E', 'L'};
+constexpr invariant_id event_log_reservation_invariant{
+  "KQ-EVENT-LOG-RESERVATION"};
 
 [[nodiscard]] runtime::operation_error log_error(errc code) noexcept {
     return runtime::operation_error{
@@ -321,6 +325,42 @@ event_log_artifact::to_vector() const {
     return result;
 }
 
+bool event_log_artifact::operator==(
+  const event_log_artifact& other) const noexcept {
+    if (size_ != other.size_) {
+        return false;
+    }
+    auto left_chunk = chunks_.begin();
+    auto right_chunk = other.chunks_.begin();
+    std::size_t left_offset = 0;
+    std::size_t right_offset = 0;
+    std::uint64_t compared = 0;
+    while (compared < size_) {
+        const auto count = std::min(
+          left_chunk->size() - left_offset, right_chunk->size() - right_offset);
+        if (!std::equal(
+              left_chunk->begin() + static_cast<std::ptrdiff_t>(left_offset),
+              left_chunk->begin()
+                + static_cast<std::ptrdiff_t>(left_offset + count),
+              right_chunk->begin()
+                + static_cast<std::ptrdiff_t>(right_offset))) {
+            return false;
+        }
+        compared += count;
+        left_offset += count;
+        right_offset += count;
+        if (left_offset == left_chunk->size()) {
+            ++left_chunk;
+            left_offset = 0;
+        }
+        if (right_offset == right_chunk->size()) {
+            ++right_chunk;
+            right_offset = 0;
+        }
+    }
+    return true;
+}
+
 runtime::result<event_log_limits>
 event_log_limits::make(event_log_limit_values values) noexcept {
     if (values.entries == 0 || values.encoded_bytes == 0) {
@@ -335,12 +375,77 @@ event_log_limits::make(event_log_limit_values values) noexcept {
     return event_log_limits{values};
 }
 
+event_log::reservation::~reservation() { release(); }
+
+event_log::reservation::reservation(reservation&& other) noexcept
+  : owner_(std::exchange(other.owner_, nullptr))
+  , entries_(std::exchange(other.entries_, 0))
+  , encoded_bytes_(std::exchange(other.encoded_bytes_, 0)) {}
+
+event_log::reservation&
+event_log::reservation::operator=(reservation&& other) noexcept {
+    if (this != &other) {
+        release();
+        owner_ = std::exchange(other.owner_, nullptr);
+        entries_ = std::exchange(other.entries_, 0);
+        encoded_bytes_ = std::exchange(other.encoded_bytes_, 0);
+    }
+    return *this;
+}
+
+void event_log::reservation::release() noexcept {
+    if (owner_ == nullptr) {
+        return;
+    }
+    auto* owner = std::exchange(owner_, nullptr);
+    owner->release(
+      std::exchange(entries_, 0), std::exchange(encoded_bytes_, 0));
+}
+
 event_log::event_log(event_sink_identity identity, event_log_limits limits)
   : identity_(identity)
   , limits_(limits)
   , entries_(limits.entries()) {}
 
+event_log::~event_log() {
+    KWAQUE_INVARIANT(
+      event_log_reservation_invariant,
+      reserved_entries_ == 0 && reserved_bytes_ == 0,
+      "event log destroyed with outstanding reservations");
+}
+
+runtime::result<event_log::reservation> event_log::reserve(
+  std::uint32_t entries, std::uint64_t encoded_bytes) noexcept {
+    const auto minimum_bytes
+      = static_cast<std::uint64_t>(entries)
+        * (canonical_event_log_record_prefix_size + canonical_event_fixed_encoded_size);
+    if (entries == 0 || encoded_bytes < minimum_bytes) {
+        return runtime::failure(log_error(errc::invalid_argument));
+    }
+    if (
+      entries > limits_.entries() - entries_.size()
+      || reserved_entries_ > limits_.entries() - entries_.size() - entries
+      || encoded_bytes > limits_.encoded_bytes() - encoded_bytes_
+      || reserved_bytes_
+           > limits_.encoded_bytes() - encoded_bytes_ - encoded_bytes) {
+        return runtime::failure(log_error(errc::resource_exhausted));
+    }
+    reserved_entries_ += entries;
+    reserved_bytes_ += encoded_bytes;
+    return reservation{*this, entries, encoded_bytes};
+}
+
 runtime::result<void> event_log::append(const event& value) noexcept {
+    return append_with(value, nullptr);
+}
+
+runtime::result<void>
+event_log::append(const event& value, reservation& reserved) noexcept {
+    return append_with(value, &reserved);
+}
+
+runtime::result<void>
+event_log::append_with(const event& value, reservation* reserved) noexcept {
     if (
       value.sequence() != entries_.size() + 1U
       || (!entries_.empty() && value.shard() != entries_[0].shard())) {
@@ -348,22 +453,53 @@ runtime::result<void> event_log::append(const event& value) noexcept {
     }
     const auto record_bytes = canonical_event_log_record_prefix_size
                               + value.encoded_size();
-    if (
-      entries_.size() == limits_.entries()
-      || record_bytes > limits_.encoded_bytes() - encoded_bytes_) {
+    if (reserved != nullptr) {
+        if (
+          reserved->owner_ != this || reserved->entries_ == 0
+          || reserved->encoded_bytes_ < record_bytes) {
+            return runtime::failure(log_error(errc::invalid_argument));
+        }
+    } else if (
+      entries_.size() + reserved_entries_ == limits_.entries()
+      || record_bytes
+           > limits_.encoded_bytes() - encoded_bytes_ - reserved_bytes_) {
         return runtime::failure(log_limit_error(
           errc::resource_exhausted,
-          entries_.size() == limits_.entries()
+          entries_.size() + reserved_entries_ == limits_.entries()
             ? runtime::operation_context_key::items
             : runtime::operation_context_key::bytes,
-          entries_.size() == limits_.entries() ? entries_.size() + 1U
-                                               : encoded_bytes_ + record_bytes,
-          entries_.size() == limits_.entries() ? limits_.entries()
-                                               : limits_.encoded_bytes()));
+          entries_.size() + reserved_entries_ == limits_.entries()
+            ? entries_.size() + reserved_entries_ + 1U
+            : encoded_bytes_ + reserved_bytes_ + record_bytes,
+          entries_.size() + reserved_entries_ == limits_.entries()
+            ? limits_.entries()
+            : limits_.encoded_bytes()));
     }
     entries_.append(value);
     encoded_bytes_ += record_bytes;
+    if (reserved != nullptr) {
+        consume(*reserved, record_bytes);
+    }
     return {};
+}
+
+void event_log::consume(
+  reservation& reserved, std::uint64_t encoded_bytes) noexcept {
+    --reserved.entries_;
+    reserved.encoded_bytes_ -= encoded_bytes;
+    --reserved_entries_;
+    reserved_bytes_ -= encoded_bytes;
+    if (reserved.entries_ == 0) {
+        release(0, reserved.encoded_bytes_);
+        reserved.encoded_bytes_ = 0;
+        reserved.owner_ = nullptr;
+    }
+}
+
+void event_log::release(
+  std::uint32_t entries, std::uint64_t encoded_bytes) noexcept {
+    reserved_entries_ -= entries;
+    reserved_bytes_ -= encoded_bytes;
 }
 
 runtime::result<event_log_artifact> event_log::encode() const {

@@ -6,6 +6,7 @@
 #include "src/simulation/fake_file_test_support.h"
 #include "src/simulation/fault_schedule.h"
 #include "src/simulation/scheduler.h"
+#include "src/simulation/scheduler_driver.h"
 
 #include <seastar/core/coroutine.hh>
 #include <seastar/core/future.hh>
@@ -51,6 +52,7 @@ using kwaque::simulation::trace_digest;
 using kwaque::simulation::trace_header;
 using kwaque::simulation::trace_limit_values;
 using kwaque::simulation::trace_limits;
+using kwaque::simulation::testing::pump_until;
 
 constexpr std::uint64_t seed{UINT64_C(0x4b5146494c455250)};
 
@@ -251,26 +253,6 @@ struct fixture final {
         files = std::move(*filesystem);
     }
 };
-
-template<typename T>
-seastar::future<> pump_until(scheduler& events, seastar::future<T>& waiting) {
-    while (!waiting.available()) {
-        while (events.pending_events() == 0U && !waiting.available()) {
-            co_await seastar::yield();
-        }
-        if (waiting.available()) {
-            break;
-        }
-        if (!events.has_ready_events()) {
-            const auto advanced = events.advance_to_next();
-            BOOST_REQUIRE(advanced.has_value());
-            BOOST_REQUIRE(advanced->has_value());
-        }
-        const auto ran = events.run_ready();
-        BOOST_REQUIRE(ran.has_value());
-        co_await seastar::yield();
-    }
-}
 
 template<typename Future>
 seastar::future<> require_ready_success(Future& waiting) {

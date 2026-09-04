@@ -25,7 +25,7 @@ text(kwaque::observability::event_public_text value) {
     return *made;
 }
 
-kwaque::observability::event_request make_event() {
+kwaque::observability::event_request make_event(std::uint64_t monotonic = 17) {
     using kwaque::observability::event_field;
     using kwaque::observability::event_field_key;
     using kwaque::observability::event_field_value;
@@ -47,7 +47,7 @@ kwaque::observability::event_request make_event() {
       kwaque::observability::event_request_context{
         .kind = kwaque::observability::event_kind::dns_completion,
         .severity = kwaque::observability::event_severity::info,
-        .monotonic = kwaque::runtime::monotonic_time{17},
+        .monotonic = kwaque::runtime::monotonic_time{monotonic},
         .wall = kwaque::runtime::wall_time{23},
         .workload = kwaque::resource::workload_class::metadata,
       },
@@ -144,9 +144,129 @@ SEASTAR_TEST_CASE(simulation_event_sink_records_identical_canonical_events) {
     co_return;
 }
 
+SEASTAR_TEST_CASE(simulation_event_reservation_protects_terminal_capacity) {
+    kwaque::simulation::event_log_sink sink{identity(), limits()};
+    const auto value = make_event();
+    auto terminal = sink.reserve(
+      1,
+      kwaque::observability::canonical_event_log_record_prefix_size
+        + value.encoded_size());
+    BOOST_REQUIRE(terminal.has_value());
+
+    BOOST_REQUIRE(sink.emit(value).has_value());
+    const auto saturated = sink.emit(value);
+    BOOST_REQUIRE(!saturated.has_value());
+    BOOST_CHECK(saturated.error().code() == kwaque::errc::resource_exhausted);
+    BOOST_REQUIRE(sink.emit_reserved(value, *terminal).has_value());
+    BOOST_CHECK(!terminal->active());
+    BOOST_CHECK_EQUAL(sink.events().entries().size(), 2U);
+    BOOST_REQUIRE(sink.stop().has_value());
+    co_return;
+}
+
+SEASTAR_TEST_CASE(simulation_event_reservation_releases_unused_capacity) {
+    kwaque::simulation::event_log_sink sink{identity(), limits()};
+    const auto value = make_event();
+    {
+        auto unused = sink.reserve(
+          1,
+          kwaque::observability::canonical_event_log_record_prefix_size
+            + value.encoded_size());
+        BOOST_REQUIRE(unused.has_value());
+        BOOST_CHECK(unused->active());
+    }
+    BOOST_REQUIRE(sink.emit(value).has_value());
+    BOOST_REQUIRE(sink.emit(value).has_value());
+    BOOST_REQUIRE(sink.stop().has_value());
+    const auto after_stop = sink.reserve(
+      1,
+      kwaque::observability::canonical_event_log_record_prefix_size
+        + value.encoded_size());
+    BOOST_REQUIRE(!after_stop.has_value());
+    BOOST_CHECK(after_stop.error().code() == kwaque::errc::closed);
+    co_return;
+}
+
 SEASTAR_TEST_CASE(simulation_event_sequences_ignore_task_and_allocator_noise) {
     const auto direct = co_await capture_history(false);
     const auto perturbed = co_await capture_history(true);
     BOOST_CHECK(direct == perturbed);
+    co_return;
+}
+
+SEASTAR_TEST_CASE(simulation_event_replay_compares_before_publication) {
+    kwaque::simulation::event_log_sink captured{identity(), limits()};
+    BOOST_REQUIRE(captured.emit(make_event()).has_value());
+    const auto encoded = captured.events().encode();
+    BOOST_REQUIRE(encoded.has_value());
+    auto expected = kwaque::observability::event_log::decode(
+      *encoded, captured.events().limits());
+    BOOST_REQUIRE(expected.has_value());
+    auto replayed = kwaque::simulation::event_log_sink::replay(
+      identity(), limits(), std::move(*expected));
+    BOOST_REQUIRE(replayed.has_value());
+
+    const auto mismatch = (*replayed)->emit(make_event(18));
+    BOOST_REQUIRE(!mismatch.has_value());
+    BOOST_CHECK(mismatch.error().code() == kwaque::errc::replay_divergence);
+    BOOST_REQUIRE(mismatch.error().context_at(0).has_value());
+    BOOST_CHECK_EQUAL(mismatch.error().context_at(0)->value, 1U);
+    BOOST_REQUIRE(mismatch.error().context_at(1).has_value());
+    BOOST_CHECK_EQUAL(
+      mismatch.error().context_at(1)->value,
+      static_cast<std::uint8_t>(
+        kwaque::simulation::event_replay_difference::value));
+    BOOST_CHECK_EQUAL((*replayed)->last_sequence(), 0U);
+    BOOST_CHECK((*replayed)->events().entries().empty());
+    BOOST_REQUIRE((*replayed)->replay_failure() != nullptr);
+    BOOST_REQUIRE((*replayed)->stop().has_value());
+    BOOST_REQUIRE(captured.stop().has_value());
+    co_return;
+}
+
+SEASTAR_TEST_CASE(simulation_event_replay_detects_missing_and_extra_values) {
+    kwaque::simulation::event_log_sink captured{identity(), limits()};
+    BOOST_REQUIRE(captured.emit(make_event()).has_value());
+    const auto encoded = captured.events().encode();
+    BOOST_REQUIRE(encoded.has_value());
+
+    {
+        auto expected = kwaque::observability::event_log::decode(
+          *encoded, captured.events().limits());
+        BOOST_REQUIRE(expected.has_value());
+        auto replayed = kwaque::simulation::event_log_sink::replay(
+          identity(), limits(), std::move(*expected));
+        BOOST_REQUIRE(replayed.has_value());
+        const auto missing = (*replayed)->finish_replay();
+        BOOST_REQUIRE(!missing.has_value());
+        BOOST_CHECK(missing.error().code() == kwaque::errc::replay_divergence);
+        BOOST_REQUIRE(missing.error().context_at(1).has_value());
+        BOOST_CHECK_EQUAL(
+          missing.error().context_at(1)->value,
+          static_cast<std::uint8_t>(
+            kwaque::simulation::event_replay_difference::actual_missing));
+        BOOST_REQUIRE((*replayed)->stop().has_value());
+    }
+    {
+        auto expected = kwaque::observability::event_log::decode(
+          *encoded, captured.events().limits());
+        BOOST_REQUIRE(expected.has_value());
+        auto replayed = kwaque::simulation::event_log_sink::replay(
+          identity(), limits(), std::move(*expected));
+        BOOST_REQUIRE(replayed.has_value());
+        BOOST_REQUIRE((*replayed)->emit(make_event()).has_value());
+        const auto extra = (*replayed)->emit(make_event());
+        BOOST_REQUIRE(!extra.has_value());
+        BOOST_CHECK(extra.error().code() == kwaque::errc::replay_divergence);
+        BOOST_REQUIRE(extra.error().context_at(1).has_value());
+        BOOST_CHECK_EQUAL(
+          extra.error().context_at(1)->value,
+          static_cast<std::uint8_t>(
+            kwaque::simulation::event_replay_difference::expected_missing));
+        BOOST_CHECK_EQUAL((*replayed)->last_sequence(), 1U);
+        BOOST_CHECK_EQUAL((*replayed)->events().entries().size(), 1U);
+        BOOST_REQUIRE((*replayed)->stop().has_value());
+    }
+    BOOST_REQUIRE(captured.stop().has_value());
     co_return;
 }

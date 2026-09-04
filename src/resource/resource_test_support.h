@@ -18,13 +18,21 @@ public:
 
     [[nodiscard]] static seastar::future<> fail_before_creation(
       resource_registry& registry, resource_config config, std::size_t point) {
-        return registry.start_with(
-          std::move(config), [point](std::size_t current) {
+        return start_with(
+          registry, std::move(config), [point](std::size_t current) {
               if (current == point) {
                   throw std::runtime_error(
                     "injected resource group creation failure");
               }
           });
+    }
+
+    template<typename Checkpoint>
+    [[nodiscard]] static seastar::future<> start_with(
+      resource_registry& registry,
+      resource_config config,
+      Checkpoint checkpoint) {
+        return registry.start_with(std::move(config), std::move(checkpoint));
     }
 };
 

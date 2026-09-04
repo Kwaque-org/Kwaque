@@ -67,6 +67,9 @@ SEASTAR_TEST_CASE(
           static_cast<void>(original_workload.scheduling_group()),
           std::logic_error);
         BOOST_CHECK(!moved_workload.scheduling_group().is_main());
+        BOOST_CHECK(
+          moved_workload.hard_budget()
+          == manager.hard_budget(workload_class::metadata));
     }
 
     std::vector<seastar::scheduling_group> scheduling_groups;

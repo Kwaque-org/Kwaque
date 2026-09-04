@@ -17,8 +17,16 @@ runtime_lifetime::~runtime_lifetime() {
     KWAQUE_INVARIANT(
       runtime_lifetime_invariant,
       (state_ == runtime_lifetime_state::closed && leases_.get_count() == 0)
-        || (state_ == runtime_lifetime_state::open && !activated_ && leases_.get_count() == 0),
+        || (state_ == runtime_lifetime_state::inactive && leases_.get_count() == 0),
       "runtime lifetime destroyed before explicit close completed");
+}
+
+void runtime_lifetime::activate() {
+    assert_current();
+    if (state_ != runtime_lifetime_state::inactive) {
+        throw std::logic_error("runtime lifetime cannot be activated");
+    }
+    state_ = runtime_lifetime_state::open;
 }
 
 std::optional<seastar::gate::holder> runtime_lifetime::acquire() {
@@ -26,7 +34,7 @@ std::optional<seastar::gate::holder> runtime_lifetime::acquire() {
     if (state_ != runtime_lifetime_state::open) {
         return std::nullopt;
     }
-    activated_ = true;
+    lease_acquired_ = true;
     return leases_.try_hold();
 }
 
@@ -40,7 +48,9 @@ seastar::future<> runtime_lifetime::close() {
                  ? close_done_->get_shared_future()
                  : seastar::make_ready_future<>();
     }
-    if (!activated_ && leases_.get_count() == 0) {
+    if (
+      state_ == runtime_lifetime_state::inactive
+      || (!lease_acquired_ && leases_.get_count() == 0)) {
         state_ = runtime_lifetime_state::closed;
         return seastar::make_ready_future<>();
     }

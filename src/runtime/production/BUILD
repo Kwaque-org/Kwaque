@@ -90,11 +90,12 @@ kwaque_cc_library(
 )
 
 kwaque_cc_library(
-    name = "backend",
-    srcs = ["backend.cc"],
-    hdrs = ["backend.h"],
+    name = "environment",
+    srcs = ["environment.cc"],
+    hdrs = ["environment.h"],
     visibility = [
         "//src/broker:__pkg__",
+        "//src/runtime/testing/contracts:__pkg__",
         "//src/runtime/tests:__pkg__",
     ],
     deps = [
@@ -106,23 +107,25 @@ kwaque_cc_library(
         ":timer",
         "//src/base:invariant",
         "//src/base:metric_schema",
+        "//src/observability:event_sink",
+        "//src/resource:resource_manager",
         "//src/runtime:environment",
         "//src/runtime:error",
         "//src/runtime:operation_statistics",
-        "//src/runtime:runtime_service",
         "//src/runtime:shard_affinity",
         "//src/runtime:sharded_service",
+        "//src/runtime:task_scope",
         "@seastar",
     ],
 )
 
 kwaque_cc_library(
-    name = "backend_test_support",
+    name = "environment_test_support",
     testonly = True,
-    hdrs = ["backend_test_support.h"],
+    hdrs = ["environment_test_support.h"],
     visibility = ["//src/runtime/tests:__pkg__"],
     deps = [
-        ":backend",
+        ":environment",
         "@seastar",
     ],
 )

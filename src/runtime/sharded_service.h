@@ -124,7 +124,7 @@ private:
     }
 
 public:
-    explicit sharded_service(seastar::smp_service_group service_group) noexcept
+    explicit sharded_service(seastar::smp_service_group service_group)
       : service_group_(service_group) {}
 
     ~sharded_service() {

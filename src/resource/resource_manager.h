@@ -45,6 +45,10 @@ public:
     // owned dispatch result promptly and continue under a component gate after
     // releasing the limited slot.
     [[nodiscard]] seastar::smp_service_group smp_service_group() const;
+    [[nodiscard]] byte_count hard_budget() const {
+        assert_live();
+        return hard_budget_;
+    }
     // Cache this native handle during component startup and use Seastar's
     // try_get_units/get_units directly. This lease must outlive the resulting
     // semaphore_units and pending waits. Each component must reject requests
@@ -57,6 +61,7 @@ private:
     workload_handle(
       resource_manager& manager,
       seastar::semaphore& memory,
+      byte_count hard_budget,
       seastar::scheduling_group scheduling_group,
       seastar::smp_service_group smp_service_group,
       seastar::gate::holder lifetime) noexcept;
@@ -70,6 +75,7 @@ private:
     runtime::owner_shard owner_;
     resource_manager* manager_;
     seastar::semaphore* memory_;
+    byte_count hard_budget_;
     seastar::scheduling_group scheduling_group_;
     seastar::smp_service_group smp_service_group_;
     seastar::gate::holder lifetime_;
@@ -89,7 +95,7 @@ enum class resource_manager_state {
 // holds the manager gate for that complete component lifetime.
 class resource_manager final : public runtime::shard_affine {
 public:
-    explicit resource_manager(resource_handle_set handles) noexcept;
+    explicit resource_manager(resource_handle_set handles);
     ~resource_manager();
 
     [[nodiscard]] seastar::future<> start();

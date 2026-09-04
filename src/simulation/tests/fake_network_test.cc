@@ -7,6 +7,7 @@
 #include "src/simulation/fake_network_test_support.h"
 #include "src/simulation/fault_schedule.h"
 #include "src/simulation/scheduler.h"
+#include "src/simulation/scheduler_driver.h"
 #include "src/simulation/tests/network_oracle.h"
 
 #include <seastar/core/chunked_vector.hh>
@@ -31,6 +32,8 @@
 #include <vector>
 
 namespace {
+
+using kwaque::simulation::testing::pump_until;
 
 constexpr auto loopback = kwaque::runtime::network_address::ipv4(
   {std::byte{127}, std::byte{0}, std::byte{0}, std::byte{1}});
@@ -131,27 +134,6 @@ kwaque::simulation::fault_rule network_write_rule(
       kwaque::runtime::builtin_fault_point::network_write,
       occurrence,
       decision);
-}
-
-template<typename T>
-seastar::future<>
-pump_until(kwaque::simulation::scheduler& events, seastar::future<T>& waiting) {
-    while (!waiting.available()) {
-        co_await seastar::yield();
-        if (waiting.available()) {
-            continue;
-        }
-        if (events.pending_events() == 0U) {
-            continue;
-        }
-        if (!events.has_ready_events()) {
-            const auto advanced = events.advance_to_next();
-            BOOST_REQUIRE(advanced.has_value());
-            BOOST_REQUIRE(advanced->has_value());
-        }
-        const auto ran = events.run_ready();
-        BOOST_REQUIRE(ran.has_value());
-    }
 }
 
 template<typename Future>

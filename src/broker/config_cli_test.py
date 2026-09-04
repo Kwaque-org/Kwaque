@@ -52,8 +52,17 @@ RUNTIME_METRICS = frozenset(
         "kwaque_runtime_dns_rejected_total",
     }
 )
-PRODUCT_METRICS = ADMIN_METRICS | RUNTIME_METRICS
-SHARD_AGGREGATED_METRICS = RUNTIME_METRICS | {
+RESOURCE_METRICS = frozenset(
+    {
+        "kwaque_resource_manager_memory_available_bytes",
+        "kwaque_resource_manager_memory_configured_bytes",
+        "kwaque_resource_manager_memory_used_bytes",
+        "kwaque_resource_manager_memory_waiters",
+    }
+)
+WORKLOAD_COUNT = 8
+PRODUCT_METRICS = ADMIN_METRICS | RUNTIME_METRICS | RESOURCE_METRICS
+SHARD_AGGREGATED_METRICS = RUNTIME_METRICS | RESOURCE_METRICS | {
     "kwaque_broker_http_requests_total"
 }
 PRODUCT_PREFIXES = (
@@ -63,10 +72,10 @@ PRODUCT_PREFIXES = (
     "kwaque_runtime_file_",
     "kwaque_runtime_network_",
     "kwaque_runtime_dns_",
+    "kwaque_resource_manager_",
 )
 DEFERRED_PREFIXES = (
     "kwaque_bounded_queue_",
-    "kwaque_resource_manager_",
     "kwaque_simulation_",
 )
 
@@ -169,40 +178,53 @@ def verify_product_metrics(exposition: str, *, aggregated: bool) -> None:
         )
     for name in PRODUCT_METRICS:
         matching = metric_samples(exposition, name)
-        expected_samples = (
-            1
-            if aggregated
-            or name in ADMIN_METRICS - {"kwaque_broker_http_requests_total"}
-            else 2
-        )
+        if name in RESOURCE_METRICS:
+            expected_samples = WORKLOAD_COUNT if aggregated else 2 * WORKLOAD_COUNT
+            expected_labels = {"workload"} if aggregated else {"shard", "workload"}
+        else:
+            expected_samples = (
+                1
+                if aggregated
+                or name in ADMIN_METRICS
+                - {"kwaque_broker_http_requests_total"}
+                else 2
+            )
+            expected_labels = (
+                set()
+                if aggregated and name in SHARD_AGGREGATED_METRICS
+                else {"shard"}
+            )
         if len(matching) != expected_samples:
             raise AssertionError(
                 f"expected {expected_samples} sample(s) for {name!r}: {matching}"
             )
         for sample in matching:
             labels = label_names(sample)
-            if not labels.issubset({"shard"}):
+            if not labels.issubset({"shard", "workload"}):
                 raise AssertionError(
                     f"metric {name!r} exposed forbidden labels: {sorted(labels)}"
                 )
-            if aggregated:
-                expected_labels = (
-                    set() if name in SHARD_AGGREGATED_METRICS else {"shard"}
-                )
-                if labels != expected_labels:
-                    raise AssertionError(
-                        f"metric {name!r} has labels {sorted(labels)}, "
-                        f"expected {sorted(expected_labels)}"
-                    )
-            if not aggregated and labels != {"shard"}:
+            if labels != expected_labels:
                 raise AssertionError(
-                    f"unaggregated metric {name!r} lost its native shard label"
+                    f"metric {name!r} has labels {sorted(labels)}, "
+                    f"expected {sorted(expected_labels)}"
                 )
-        if not aggregated and expected_samples == 2:
+        if not aggregated and (
+            name in RESOURCE_METRICS or expected_samples == 2
+        ):
             for shard in (0, 1):
-                if not any(f'shard="{shard}"' in sample for sample in matching):
+                shard_samples = [
+                    sample
+                    for sample in matching
+                    if f'shard="{shard}"' in sample
+                ]
+                expected_shard_samples = (
+                    WORKLOAD_COUNT if name in RESOURCE_METRICS else 1
+                )
+                if len(shard_samples) != expected_shard_samples:
                     raise AssertionError(
-                        f"metric {name!r} omitted shard {shard}: {matching}"
+                        f"metric {name!r} expected {expected_shard_samples} "
+                        f"sample(s) for shard {shard}: {matching}"
                     )
     deferred = {
         sample_name(line)
@@ -329,10 +351,10 @@ def main() -> None:
                 "node_id=0",
                 "build version=",
                 "runtime shards=2",
-                "memory_bytes=",
+                "minimum_shard_memory_bytes=",
                 "reactor_backend=",
-                "runtime service ready shard=0",
-                "runtime service ready shard=1",
+                "runtime environment ready shard=0",
+                "runtime environment ready shard=1",
             ):
                 if expected not in output:
                     raise AssertionError(
@@ -343,8 +365,8 @@ def main() -> None:
                 (
                     "startup stage=data_directory state=ready",
                     "startup stage=pid_file state=ready",
-                    "startup stage=runtime_service state=ready",
-                    "startup stage=runtime_backend state=ready",
+                    "startup stage=resource_registry state=ready",
+                    "startup stage=runtime_environment state=ready",
                     "startup stage=admin state=ready",
                 ),
             )

@@ -60,8 +60,7 @@ runtime::result<virtual_time_config> virtual_time_config::make(
     return virtual_time_config{values, limits.maximum_deadline()};
 }
 
-virtual_time::virtual_time(
-  scheduler& target, virtual_time_config config) noexcept
+virtual_time::virtual_time(scheduler& target, virtual_time_config config)
   : scheduler_(&target)
   , config_(config) {
     assert_current();
@@ -69,6 +68,14 @@ virtual_time::virtual_time(
       virtual_time_config_invariant,
       config_.maximum_deadline() == scheduler_->limits().maximum_deadline(),
       "virtual time and scheduler limits differ");
+    const auto capacity = static_cast<std::size_t>(
+      scheduler_->limits().pending_events());
+    adjustments_.reserve(capacity);
+    for (std::size_t index = 0; index < capacity; ++index) {
+        adjustments_.emplace_back(
+          index + 1U == capacity ? no_adjustment : index + 1U);
+    }
+    free_adjustment_ = 0;
 }
 
 virtual_time::~virtual_time() {
@@ -78,7 +85,8 @@ virtual_time::~virtual_time() {
     }
     KWAQUE_INVARIANT(
       virtual_time_drained_invariant,
-      active_ != this && pending_adjustments_ == 0,
+      active_ != this && first_adjustment_ == no_adjustment
+        && pending_adjustments_ == 0,
       "virtual time destroyed while active");
 }
 
@@ -114,6 +122,9 @@ std::size_t virtual_time::pending_adjustments() const {
 runtime::result<void> virtual_time::schedule_wall_offset(
   runtime::monotonic_time deadline, wall_offset offset) {
     assert_current();
+    if (stopped_) {
+        return runtime::failure(clock_error(errc::closed));
+    }
     if (offset.magnitude() > config_.maximum_wall_adjustment().nanoseconds()) {
         auto error = clock_error(errc::out_of_range);
         static_cast<void>(error.add_context(
@@ -123,26 +134,73 @@ runtime::result<void> virtual_time::schedule_wall_offset(
           config_.maximum_wall_adjustment().nanoseconds()));
         return runtime::failure(std::move(error));
     }
-    auto scheduled = scheduler_->schedule(
-      deadline,
-      event_priority::normal(),
-      [this, offset] noexcept {
-          if (scheduler_->discarding_failed_event()) [[unlikely]] {
-              discard_wall_adjustment();
-          } else {
-              apply_wall_adjustment(offset);
-          }
-      },
-      trace_event_descriptor{
-        .kind = trace_event_kind::wall_adjustment,
-        .value = std::bit_cast<std::uint64_t>(offset.nanoseconds()),
-        .effect = trace_action::wall_adjusted,
-      },
-      event_cleanup_policy::invoke);
-    if (!scheduled) {
-        return runtime::failure(clock_error(scheduled.error()));
+    KWAQUE_INVARIANT(
+      virtual_time_drained_invariant,
+      free_adjustment_ != no_adjustment,
+      "virtual wall adjustment capacity diverged from scheduler capacity");
+    const auto index = free_adjustment_;
+    auto& adjustment = adjustments_[index];
+    free_adjustment_ = adjustment.next_free;
+    adjustment.offset = offset;
+    adjustment.next_active = first_adjustment_;
+    adjustment.previous_active = no_adjustment;
+    adjustment.active = true;
+    if (first_adjustment_ != no_adjustment) {
+        adjustments_[first_adjustment_].previous_active = index;
     }
+    first_adjustment_ = index;
     ++pending_adjustments_;
+    try {
+        auto scheduled = scheduler_->schedule(
+          deadline,
+          event_priority::normal(),
+          [this, index] noexcept {
+              finish_adjustment(index, !scheduler_->discarding_failed_event());
+          },
+          trace_event_descriptor{
+            .kind = trace_event_kind::wall_adjustment,
+            .value = std::bit_cast<std::uint64_t>(offset.nanoseconds()),
+            .effect = trace_action::wall_adjusted,
+          },
+          event_cleanup_policy::invoke);
+        if (!scheduled) {
+            release_adjustment(index);
+            return runtime::failure(clock_error(scheduled.error()));
+        }
+        adjustment.event = *scheduled;
+    } catch (...) {
+        release_adjustment(index);
+        throw;
+    }
+    return {};
+}
+
+runtime::result<void> virtual_time::stop() noexcept {
+    assert_current();
+    if (stopped_) {
+        return {};
+    }
+    if (scheduler_->trace_failed()) {
+        static_cast<void>(scheduler_->discard_failed());
+        if (pending_adjustments_ != 0) {
+            return runtime::failure(clock_error(errc::replay_divergence));
+        }
+        stopped_ = true;
+        return {};
+    }
+    while (first_adjustment_ != no_adjustment) {
+        const auto index = first_adjustment_;
+        const auto canceled = scheduler_->cancel(adjustments_[index].event);
+        if (!canceled) {
+            return runtime::failure(clock_error(canceled.error()));
+        }
+        KWAQUE_INVARIANT(
+          virtual_time_drained_invariant,
+          *canceled,
+          "virtual wall adjustment was not pending during stop");
+        release_adjustment(index);
+    }
+    stopped_ = true;
     return {};
 }
 
@@ -154,23 +212,40 @@ virtual_time& virtual_time::active() noexcept {
     return *active_;
 }
 
-void virtual_time::apply_wall_adjustment(wall_offset offset) noexcept {
+void virtual_time::finish_adjustment(std::size_t index, bool apply) noexcept {
     assert_current();
     KWAQUE_INVARIANT(
       virtual_time_drained_invariant,
-      pending_adjustments_ != 0,
+      index < adjustments_.size() && adjustments_[index].active,
       "virtual wall adjustment count underflow");
-    offset_ = offset;
+    if (apply) {
+        offset_ = adjustments_[index].offset;
+    }
+    release_adjustment(index);
+}
+
+void virtual_time::release_adjustment(std::size_t index) noexcept {
+    auto& adjustment = adjustments_[index];
+    if (adjustment.previous_active == no_adjustment) {
+        first_adjustment_ = adjustment.next_active;
+    } else {
+        adjustments_[adjustment.previous_active].next_active
+          = adjustment.next_active;
+    }
+    if (adjustment.next_active != no_adjustment) {
+        adjustments_[adjustment.next_active].previous_active
+          = adjustment.previous_active;
+    }
+    adjustment.active = false;
+    adjustment.next_active = no_adjustment;
+    adjustment.previous_active = no_adjustment;
+    adjustment.next_free = free_adjustment_;
+    free_adjustment_ = index;
     --pending_adjustments_;
 }
 
-void virtual_time::discard_wall_adjustment() noexcept {
-    assert_current();
-    KWAQUE_INVARIANT(
-      virtual_time_drained_invariant,
-      pending_adjustments_ != 0,
-      "virtual wall adjustment discard count underflow");
-    --pending_adjustments_;
+bool clock_binding::available() noexcept {
+    return virtual_time::active_ == nullptr;
 }
 
 clock_binding::clock_binding(virtual_time& time)

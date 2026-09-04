@@ -485,6 +485,8 @@ public:
     using network_type = contract_network;
     using dns_type = contract_dns;
 
+    contract_backend_common() { lifetime_.activate(); }
+
     ~contract_backend_common() {
         lifetime_.close().get();
         dns_.stop().get();
@@ -492,12 +494,30 @@ public:
     }
 
     owner_shard owner() const noexcept { return lifetime_.owner(); }
-    runtime_lifetime& lifetime() noexcept { return lifetime_; }
-    timer_type& timer() noexcept { return timer_; }
-    random_type& random() noexcept { return random_; }
-    file_system_type& file_system() noexcept { return file_system_; }
-    network_type& network() noexcept { return network_; }
-    dns_type& dns() noexcept { return dns_; }
+    runtime_lifetime& lifetime() {
+        lifetime_.assert_current();
+        return lifetime_;
+    }
+    timer_type& timer() {
+        lifetime_.assert_current();
+        return timer_;
+    }
+    random_type& random() {
+        lifetime_.assert_current();
+        return random_;
+    }
+    file_system_type& file_system() {
+        lifetime_.assert_current();
+        return file_system_;
+    }
+    network_type& network() {
+        lifetime_.assert_current();
+        return network_;
+    }
+    dns_type& dns() {
+        lifetime_.assert_current();
+        return dns_;
+    }
 
 private:
     runtime_lifetime lifetime_;

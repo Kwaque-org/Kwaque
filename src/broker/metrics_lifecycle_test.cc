@@ -1,8 +1,10 @@
 #include "src/admin/admin_server.h"
 #include "src/base/metric_schema.h"
-#include "src/runtime/production/backend.h"
-#include "src/runtime/runtime_service.h"
-#include "src/runtime/sharded_service.h"
+#include "src/base/units.h"
+#include "src/observability/event_identity.h"
+#include "src/resource/resource_config.h"
+#include "src/resource/resource_registry.h"
+#include "src/runtime/production/environment.h"
 
 #include <seastar/core/coroutine.hh>
 #include <seastar/core/map_reduce.hh>
@@ -100,28 +102,52 @@ private:
     std::optional<seastar::metrics::metric_groups> metrics_;
 };
 
+kwaque::resource::resource_config resource_config() {
+    auto configured = kwaque::resource::resource_config::from_total_memory(
+      kwaque::byte_count{std::uint64_t{128} * 1'024U * 1'024U});
+    BOOST_REQUIRE(configured.has_value());
+    return *configured;
+}
+
+kwaque::observability::event_sink_identity event_identity() {
+    auto epoch = kwaque::observability::event_sink_epoch::make(1);
+    BOOST_REQUIRE(epoch.has_value());
+    return {
+      .epoch = *epoch,
+      .configuration_digest = {},
+    };
+}
+
+seastar::logger& environment_logger() {
+    static seastar::logger value{"kwaque-environment-metrics-test"};
+    return value;
+}
+
 } // namespace
 
 SEASTAR_TEST_CASE(runtime_and_admin_metrics_follow_endpoint_lifecycle) {
     BOOST_REQUIRE_EQUAL(seastar::this_smp_shard_count(), 2U);
-    kwaque::runtime::sharded_service<kwaque::runtime::runtime_service> runtimes{
-      seastar::default_smp_service_group()};
-    kwaque::runtime::production::backend_owner backends{
+    kwaque::resource::resource_registry registry;
+    kwaque::runtime::production::environment_owner environments{
       seastar::default_smp_service_group()};
     kwaque::admin::admin_server admin;
 
-    co_await runtimes.start();
+    co_await registry.start(resource_config());
+    co_await environments.start(
+      kwaque::runtime::production::environment_dependencies{
+        registry.handles(), environment_logger(), event_identity()});
     co_await require_metric_range(
       kwaque::metric_id::task_active,
       kwaque::metric_id::task_abort_requests_total,
       2U);
-    co_await kwaque::runtime::production::start_backends(backends, runtimes);
     co_await require_metric_range(
       kwaque::metric_id::timer_active,
       kwaque::metric_id::dns_rejected_total,
       2U);
-    co_await require_registration_count(
-      full_name(kwaque::metric_id::memory_configured_bytes), 0U);
+    co_await require_metric_range(
+      kwaque::metric_id::memory_configured_bytes,
+      kwaque::metric_id::memory_waiters,
+      2U);
 
     co_await admin.start("127.0.0.1", 0, seastar::this_smp_shard_count());
     co_await admin.mark_ready(std::chrono::steady_clock::duration::zero());
@@ -140,7 +166,7 @@ SEASTAR_TEST_CASE(runtime_and_admin_metrics_follow_endpoint_lifecycle) {
       kwaque::metric_id::dns_rejected_total,
       2U);
 
-    co_await backends.stop();
+    co_await environments.stop();
     co_await require_metric_range(
       kwaque::metric_id::timer_active,
       kwaque::metric_id::dns_rejected_total,
@@ -148,13 +174,12 @@ SEASTAR_TEST_CASE(runtime_and_admin_metrics_follow_endpoint_lifecycle) {
     co_await require_metric_range(
       kwaque::metric_id::task_active,
       kwaque::metric_id::task_abort_requests_total,
-      2U);
-
-    co_await runtimes.stop();
-    co_await require_metric_range(
-      kwaque::metric_id::task_active,
-      kwaque::metric_id::task_abort_requests_total,
       0U);
+    co_await require_metric_range(
+      kwaque::metric_id::memory_configured_bytes,
+      kwaque::metric_id::memory_waiters,
+      0U);
+    co_await registry.stop();
 }
 
 SEASTAR_TEST_CASE(admin_registration_failure_removes_partial_owner_metrics) {
