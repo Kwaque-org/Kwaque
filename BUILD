@@ -5,6 +5,12 @@ alias(
 )
 
 filegroup(
+    name = "ci_workflow",
+    srcs = [".github/workflows/ci.yml"],
+    visibility = ["//tools:__pkg__"],
+)
+
+filegroup(
     name = "test_suppressions",
     testonly = True,
     srcs = [
@@ -62,4 +68,16 @@ exports_files(
         "NOTICE",
     ],
     visibility = ["//visibility:public"],
+)
+
+filegroup(
+    name = "fuzz_workflow",
+    srcs = [".github/workflows/fuzz.yml"],
+    visibility = ["//tools:__pkg__"],
+)
+
+filegroup(
+    name = "bazel_config",
+    srcs = [".bazelrc"],
+    visibility = ["//tools:__pkg__"],
 )

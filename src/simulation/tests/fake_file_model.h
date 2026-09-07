@@ -54,6 +54,10 @@ enum class storage_fault_action : std::uint8_t {
     crash,
     drop_completion,
     partial_resize,
+    short_operation,
+    corrupt,
+    torn_write,
+    misdirect,
 };
 
 struct storage_fault_rule final {
@@ -218,6 +222,7 @@ private:
             selected = &create(command.source);
         }
         ++selected->write_occurrences;
+        std::optional<storage_fault_rule> chosen;
         for (const auto& rule : fault_rules_) {
             if (
               rule.point != storage_command_kind::write
@@ -232,16 +237,74 @@ private:
                 crash();
                 return storage_outcome::aborted;
             }
+            chosen = rule;
             break;
         }
-        const auto end = static_cast<std::size_t>(command.position)
-                         + command.length;
+        auto position = static_cast<std::size_t>(command.position);
+        auto length = static_cast<std::size_t>(command.length);
+        std::optional<std::size_t> changed_byte;
+        std::uint8_t changed_bit = 0;
+        if (chosen && length != 0) {
+            const auto coordinate = random_coordinate::make(
+              random_domain::fault_decision,
+              chosen->id,
+              selected->write_occurrences);
+            if (!coordinate) {
+                return storage_outcome::io_failure;
+            }
+            auto random = deterministic_random{fault_seed_}.stream(*coordinate);
+            if (
+              chosen->action == storage_fault_action::torn_write
+              && length > 1) {
+                length = 1U + *runtime::uniform_u64(random, length - 1U);
+            } else if (chosen->action == storage_fault_action::corrupt) {
+                changed_byte = *runtime::uniform_u64(random, length);
+                changed_bit = static_cast<std::uint8_t>(
+                  *runtime::uniform_u64(random, 8));
+            } else if (chosen->action == storage_fault_action::misdirect) {
+                // Enumerate legal disjoint destinations independently of the
+                // sparse implementation's interval arithmetic.
+                std::size_t alternatives = 0;
+                for (std::size_t candidate = 0;
+                     candidate + length <= selected->visible_bytes.size();
+                     ++candidate) {
+                    if (
+                      candidate + length <= position
+                      || candidate >= position + length) {
+                        ++alternatives;
+                    }
+                }
+                if (alternatives != 0) {
+                    auto chosen_index = *runtime::uniform_u64(
+                      random, alternatives);
+                    for (std::size_t candidate = 0;
+                         candidate + length <= selected->visible_bytes.size();
+                         ++candidate) {
+                        if (
+                          (candidate + length <= position
+                           || candidate >= position + length)
+                          && chosen_index-- == 0) {
+                            position = candidate;
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        const auto end = position + length;
         selected->visible_bytes.resize(
           std::max(selected->visible_bytes.size(), end));
         std::fill_n(
-          selected->visible_bytes.begin() + command.position,
-          command.length,
+          selected->visible_bytes.begin()
+            + static_cast<std::ptrdiff_t>(position),
+          length,
           command.value);
+        if (changed_byte) {
+            selected->visible_bytes[position + *changed_byte] ^= std::byte{
+              static_cast<std::uint8_t>(1U << changed_bit)};
+        }
+        // Positioned public writes retry short native writes. Torn writes
+        // deliberately report a full completion while retaining only a prefix.
         return storage_outcome::success;
     }
 

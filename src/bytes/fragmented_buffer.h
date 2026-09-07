@@ -8,10 +8,13 @@
 #include <seastar/core/temporary_buffer.hh>
 #include <seastar/net/packet.hh>
 
+#include <boost/container/devector.hpp>
+
 #include <cstddef>
 #include <cstdint>
-#include <deque>
 #include <iterator>
+#include <limits>
+#include <memory>
 #include <span>
 #include <string_view>
 #include <vector>
@@ -59,8 +62,9 @@ private:
 
 // Where a bounded scatter export stopped so the next batch resumes exactly
 // where the previous one ended. The first successful export binds the cursor
-// to that buffer and its presentation generation; another buffer or a trim is
-// rejected without changing the cursor.
+// to that buffer and its presentation generation. Moving from, replacing, or
+// trimming the originating buffer invalidates the cursor. A cursor is usable
+// only during the lifetime of its originating buffer object.
 class fragmented_buffer;
 
 class scatter_cursor final {
@@ -166,6 +170,13 @@ private:
         seastar::temporary_buffer<char> storage;
         byte_count retained_bytes;
     };
+    using fragment_storage = boost::container::
+      devector<owned_fragment, std::allocator<owned_fragment>>;
+    // Default 1.6x growth with relocation below 90% occupancy keeps capacity
+    // below twice the fragment ceiling. Exact reservations use fresh storage.
+    static_assert(
+      sizeof(owned_fragment) * 2U * max_buffer_fragments
+      <= maximum_contiguous_allocation_bytes);
 
 public:
     using fragment_type = seastar::temporary_buffer<char>;
@@ -200,10 +211,10 @@ public:
         friend class fragmented_buffer;
 
         explicit const_iterator(
-          std::deque<owned_fragment>::const_iterator position) noexcept
+          fragment_storage::const_iterator position) noexcept
           : position_(position) {}
 
-        std::deque<owned_fragment>::const_iterator position_{};
+        fragment_storage::const_iterator position_{};
     };
 
     fragmented_buffer() noexcept = default;
@@ -251,7 +262,17 @@ public:
     // Zero-copy: the result references the same bytes through independent
     // ownership. Not const because taking a share converts fragment ownership
     // to a counted form, which the source records.
-    [[nodiscard]] fragmented_buffer share();
+    [[nodiscard]] fragmented_buffer share() {
+        fragmented_buffer shared;
+        shared.fragments_.reserve_back(fragments_.size());
+        for (auto& fragment : fragments_) {
+            shared.fragments_.emplace_back(
+              fragment.storage.share(), fragment.retained_bytes);
+        }
+        shared.size_ = size_;
+        shared.retained_bytes_ = retained_bytes_;
+        return shared;
+    }
     [[nodiscard]] result<fragmented_buffer>
     share(byte_count offset, byte_count length);
 
@@ -273,6 +294,8 @@ public:
     // linearization happens. The batch owns shared claims on every exported
     // span, so it remains valid if this buffer is trimmed, moved, or destroyed.
     // Conversion to mutable native iovec belongs inside the I/O adapter.
+    // Rejection leaves the cursor unchanged. Exhausting the presentation
+    // generation space rejects further exports with resource_exhausted.
     [[nodiscard]] result<scatter_batch> export_scatter(
       std::size_t max_vectors, byte_count max_bytes, scatter_cursor& cursor);
 
@@ -293,18 +316,26 @@ public:
 private:
     friend class fragmented_buffer_builder;
     friend class fragmented_buffer_parser;
+    friend class fragmented_buffer_test_access;
     friend class runtime::detail::fragmented_buffer_io_access;
 
     fragmented_buffer(
-      std::deque<owned_fragment> fragments,
+      fragment_storage fragments,
       byte_count size,
       byte_count retained_bytes) noexcept;
 
     [[nodiscard]] static result<byte_count>
-    total_size(const std::deque<owned_fragment>& fragments) noexcept;
+    total_size(const fragment_storage& fragments) noexcept;
     void drop_empty_fragments();
+    void invalidate_presentation() noexcept {
+        // Never reuse a presentation number. At exhaustion the buffer remains
+        // usable, but scatter export rejects both existing and fresh cursors.
+        if (generation_ != std::numeric_limits<std::uint64_t>::max()) {
+            ++generation_;
+        }
+    }
 
-    std::deque<owned_fragment> fragments_;
+    fragment_storage fragments_;
     byte_count size_;
     byte_count retained_bytes_;
     std::uint64_t generation_{0};

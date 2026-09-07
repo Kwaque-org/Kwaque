@@ -119,39 +119,43 @@ inline seastar::future<> serve_dns_queries(
     auto input = native.input();
     auto output = native.output();
 
-    bool first_query = true;
-    while (true) {
-        const auto length = co_await input.read_exactly(2);
-        if (length.empty()) {
-            break;
-        }
-        require_dns_fixture(length.size() == 2, "DNS length is truncated");
-        const auto query_bytes = read_dns_be16(length.get());
-        const auto query = co_await input.read_exactly(query_bytes);
-        require_dns_fixture(
-          query.size() == query_bytes, "DNS query body is truncated");
+    const auto exchange = [&] -> seastar::future<> {
+        bool first_query = true;
+        while (true) {
+            const auto length = co_await input.read_exactly(2);
+            if (length.empty()) {
+                break;
+            }
+            require_dns_fixture(length.size() == 2, "DNS length is truncated");
+            const auto query_bytes = read_dns_be16(length.get());
+            const auto query = co_await input.read_exactly(query_bytes);
+            require_dns_fixture(
+              query.size() == query_bytes, "DNS query body is truncated");
 
-        if (first_query && query_received != nullptr) {
-            query_received->set_value();
-        }
-        if (first_query && release_response) {
-            co_await std::move(*release_response);
-        }
+            if (first_query && query_received != nullptr) {
+                query_received->set_value();
+            }
+            if (first_query && release_response) {
+                co_await std::move(*release_response);
+            }
 
-        const auto response = make_dns_response(query, answers, response_code);
-        if (first_query && split_response) {
-            co_await output.write(response.data(), 3);
+            const auto response = make_dns_response(
+              query, answers, response_code);
+            if (first_query && split_response) {
+                co_await output.write(response.data(), 3);
+                co_await output.flush();
+                co_await seastar::yield();
+                co_await output.write(response.data() + 3, response.size() - 3);
+            } else {
+                co_await output.write(response.data(), response.size());
+            }
             co_await output.flush();
-            co_await seastar::yield();
-            co_await output.write(response.data() + 3, response.size() - 3);
-        } else {
-            co_await output.write(response.data(), response.size());
+            first_query = false;
         }
-        co_await output.flush();
-        first_query = false;
-    }
-    co_await output.close();
-    co_await input.close();
+    };
+    co_await exchange().finally([&output, &input] {
+        return output.close().finally([&input] { return input.close(); });
+    });
 }
 
 inline seastar::server_socket make_dns_listener() {

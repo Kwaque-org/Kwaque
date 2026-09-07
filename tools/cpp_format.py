@@ -50,7 +50,7 @@ def selected_files(root: Path, scope: str, explicit: list[str]) -> list[Path]:
     if explicit:
         candidates = [Path(value) for value in explicit]
     elif scope == "all":
-        candidates = git_paths(root, ["ls-files", "-z"])
+        candidates = git_paths(root, ["ls-files", "--cached", "--others", "--exclude-standard", "-z"])
     else:
         candidates = []
         candidates.extend(git_paths(root, ["diff", "--name-only", "-z", "HEAD", "--"]))

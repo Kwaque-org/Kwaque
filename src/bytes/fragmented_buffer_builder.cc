@@ -249,6 +249,9 @@ fragmented_buffer_builder::append_fragment_copy(const fragment_type& fragment) {
     if (auto appendable = ensure_appendable(byte_count{length}); !appendable) {
         return appendable;
     }
+    if (length > config_.max_fragment_bytes.value()) {
+        return failure(errc::resource_exhausted);
+    }
     if (length == 0) {
         return {};
     }
@@ -364,7 +367,7 @@ fragmented_buffer_builder::append_buffer(fragmented_buffer&& other) {
     other.fragments_.clear();
     other.size_ = byte_count{};
     other.retained_bytes_ = byte_count{};
-    ++other.generation_;
+    other.invalidate_presentation();
     for (auto& fragment : donated) {
         append_prevalidated_fragment(std::move(fragment));
     }
@@ -405,7 +408,8 @@ result<fragmented_buffer> fragmented_buffer_builder::finish() {
     tail_used_ = 0;
     last_allocation_ = 0;
 
-    std::deque<fragmented_buffer::owned_fragment> published_fragments;
+    fragmented_buffer::fragment_storage published_fragments;
+    published_fragments.reserve_back(fragments.size());
     for (auto& fragment : fragments) {
         published_fragments.push_back(std::move(fragment));
     }

@@ -92,6 +92,8 @@ public:
     // Copies external storage into frozen builder ownership. External
     // temporary buffers may have writable aliases, so zero-copy publication is
     // reserved for append_buffer() of an already-published Kwaque buffer.
+    // Rejects a fragment above max_fragment_bytes before allocating or changing
+    // the builder. Use append() to split a longer contiguous byte range.
     [[nodiscard]] result<void>
     append_fragment_copy(const fragment_type& fragment);
     // Splices another published buffer's fragments in, applying the same

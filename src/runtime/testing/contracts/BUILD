@@ -32,7 +32,9 @@ kwaque_cc_library(
         "//src/simulation/tests:__pkg__",
     ],
     deps = [
+        ":cleanup",
         ":environment_component",
+        "//src/base:error",
         "//src/observability:event_sink_concept",
         "//src/resource:resource_manager",
         "//src/runtime:environment",
@@ -81,12 +83,16 @@ kwaque_cc_library(
 kwaque_cc_library(
     name = "network_contract",
     testonly = True,
-    hdrs = ["network_contract.h"],
+    hdrs = [
+        "network_contract.h",
+        "network_contract_failure_cases.h",
+    ],
     visibility = [
         "//src/runtime/tests:__pkg__",
         "//src/simulation/tests:__pkg__",
     ],
     deps = [
+        ":cleanup",
         "//src/bytes:fragmented_buffer_builder",
         "//src/runtime:network",
         "@seastar",
@@ -139,6 +145,20 @@ kwaque_cc_library(
     visibility = ["//src/runtime/tests:__pkg__"],
     deps = [
         "//src/runtime:dns",
+        "@seastar",
+    ],
+)
+
+kwaque_cc_library(
+    name = "cleanup",
+    testonly = True,
+    hdrs = ["cleanup.h"],
+    visibility = [
+        "//src/runtime/tests:__pkg__",
+        "//src/simulation/tests:__pkg__",
+    ],
+    deps = [
+        "//src/runtime:error",
         "@seastar",
     ],
 )

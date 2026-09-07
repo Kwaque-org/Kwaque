@@ -3,6 +3,44 @@ load("@rules_python//python:defs.bzl", "py_binary", "py_library", "py_test")
 package(default_visibility = ["//visibility:private"])
 
 py_binary(
+    name = "compare_benchmarks",
+    srcs = ["compare_benchmarks.py"],
+    main = "compare_benchmarks.py",
+    tags = ["manual"],
+    visibility = ["//visibility:public"],
+)
+
+py_library(
+    name = "compare_benchmarks_lib",
+    srcs = ["compare_benchmarks.py"],
+)
+
+py_test(
+    name = "compare_benchmarks_test",
+    size = "small",
+    srcs = ["compare_benchmarks_test.py"],
+    main = "compare_benchmarks_test.py",
+    deps = [":compare_benchmarks_lib"],
+)
+
+py_test(
+    name = "check_ci_coverage_test",
+    size = "small",
+    srcs = ["check_ci_coverage_test.py"],
+    args = [
+        "$(rootpath //:ci_workflow)",
+        "$(rootpath //:fuzz_workflow)",
+        "$(rootpath //:bazel_config)",
+    ],
+    data = [
+        "//:bazel_config",
+        "//:ci_workflow",
+        "//:fuzz_workflow",
+    ],
+    main = "check_ci_coverage_test.py",
+)
+
+py_binary(
     name = "buildifier_check",
     srcs = ["run_buildifier.py"],
     args = [
@@ -64,6 +102,28 @@ py_binary(
     deps = [":cross_shard_usage_lib"],
 )
 
+py_binary(
+    name = "check_determinism",
+    srcs = ["check_determinism.py"],
+    main = "check_determinism.py",
+    visibility = ["//visibility:public"],
+    deps = [":cross_shard_usage_lib"],
+)
+
+py_library(
+    name = "determinism_lib",
+    srcs = ["check_determinism.py"],
+    deps = [":cross_shard_usage_lib"],
+)
+
+py_test(
+    name = "check_determinism_test",
+    size = "small",
+    srcs = ["check_determinism_test.py"],
+    main = "check_determinism_test.py",
+    deps = [":determinism_lib"],
+)
+
 py_library(
     name = "cross_shard_usage_lib",
     srcs = ["check_cross_shard_usage.py"],
@@ -80,11 +140,13 @@ py_binary(
     main = "compilation_database.py",
     tags = ["manual"],
     visibility = ["//visibility:public"],
+    deps = [":clang_tidy_lib"],
 )
 
 py_library(
     name = "compilation_database_lib",
     srcs = ["compilation_database.py"],
+    deps = [":clang_tidy_lib"],
 )
 
 py_binary(
@@ -195,4 +257,37 @@ py_test(
     srcs = ["compilation_database_test.py"],
     main = "compilation_database_test.py",
     deps = [":compilation_database_lib"],
+)
+
+py_library(
+    name = "clang_tidy_lib",
+    srcs = ["run_clang_tidy.py"],
+)
+
+py_test(
+    name = "run_clang_tidy_test",
+    size = "small",
+    srcs = ["run_clang_tidy_test.py"],
+    main = "run_clang_tidy_test.py",
+    deps = [":clang_tidy_lib"],
+)
+
+py_test(
+    name = "check_generated_artifacts_test",
+    size = "small",
+    srcs = [
+        "check_generated_artifacts.py",
+        "check_generated_artifacts_test.py",
+    ],
+    main = "check_generated_artifacts_test.py",
+)
+
+py_test(
+    name = "cpp_format_test",
+    size = "small",
+    srcs = [
+        "cpp_format.py",
+        "cpp_format_test.py",
+    ],
+    main = "cpp_format_test.py",
 )

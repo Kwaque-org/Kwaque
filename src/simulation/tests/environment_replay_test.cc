@@ -1,3 +1,4 @@
+#include "src/base/error.h"
 #include "src/base/units.h"
 #include "src/observability/event.h"
 #include "src/observability/event_codec.h"
@@ -25,6 +26,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <exception>
 #include <memory>
 #include <span>
 #include <stdexcept>
@@ -370,6 +372,35 @@ event rewrite_event(
     return std::move(*decoded);
 }
 
+// Classify every cause: an expected divergence must not mask a cleanup defect.
+bool is_replay_divergence(
+  const std::exception_ptr& failure, std::size_t remaining_depth = 8) {
+    if (!failure || remaining_depth == 0) {
+        return false;
+    }
+    try {
+        std::rethrow_exception(failure);
+    } catch (const std::system_error& error) {
+        return error.code() == make_error_code(kwaque::errc::replay_divergence);
+    } catch (const seastar::nested_exception& error) {
+        return is_replay_divergence(error.inner, remaining_depth - 1)
+               && is_replay_divergence(error.outer, remaining_depth - 1);
+    } catch (...) {
+        return false;
+    }
+}
+
+void require_replay_drained(environment& target) {
+    BOOST_CHECK(target.state() == kwaque::runtime::environment_state::stopped);
+    BOOST_CHECK_EQUAL(target.event_scheduler().pending_events(), 0U);
+    BOOST_CHECK_EQUAL(
+      environment_test_access::network_owner(target).active_operations(), 0U);
+    auto& dns = environment_test_access::dns_owner(target);
+    BOOST_CHECK_EQUAL(dns.pending_queries(), 0U);
+    BOOST_CHECK_EQUAL(dns.waiting_queries(), 0U);
+    BOOST_CHECK(!dns.active());
+}
+
 enum class event_mutation : std::uint8_t {
     queue_value,
     queue_reordered,
@@ -427,6 +458,49 @@ std::unique_ptr<environment> make_replay_environment(
 
 } // namespace
 
+SEASTAR_TEST_CASE(environment_replay_exception_matching_checks_every_cause) {
+    const auto divergence = std::make_exception_ptr(
+      std::system_error(make_error_code(kwaque::errc::replay_divergence)));
+    const auto io_failure = std::make_exception_ptr(
+      std::system_error(make_error_code(kwaque::errc::io_failure)));
+    const auto untyped = std::make_exception_ptr(
+      std::runtime_error("replay divergence"));
+    const auto wrong_category = std::make_exception_ptr(
+      std::system_error(
+        static_cast<int>(kwaque::errc::replay_divergence),
+        std::generic_category()));
+    BOOST_CHECK(is_replay_divergence(divergence));
+    BOOST_CHECK(!is_replay_divergence({}));
+    BOOST_CHECK(!is_replay_divergence(io_failure));
+    BOOST_CHECK(!is_replay_divergence(untyped));
+    BOOST_CHECK(!is_replay_divergence(wrong_category));
+    const auto expected_pair = std::make_exception_ptr(
+      seastar::nested_exception{divergence, divergence});
+    BOOST_CHECK(is_replay_divergence(expected_pair));
+    for (const auto& unexpected :
+         std::array{io_failure, untyped, wrong_category}) {
+        BOOST_CHECK(!is_replay_divergence(
+          std::make_exception_ptr(
+            seastar::nested_exception{unexpected, divergence})));
+        BOOST_CHECK(!is_replay_divergence(
+          std::make_exception_ptr(
+            seastar::nested_exception{divergence, unexpected})));
+        BOOST_CHECK(!is_replay_divergence(
+          std::make_exception_ptr(
+            seastar::nested_exception{
+              expected_pair,
+              std::make_exception_ptr(
+                seastar::nested_exception{unexpected, divergence})})));
+    }
+    auto too_deep = divergence;
+    for (std::size_t depth = 0; depth < 8; ++depth) {
+        too_deep = std::make_exception_ptr(
+          seastar::nested_exception{divergence, std::move(too_deep)});
+    }
+    BOOST_CHECK(!is_replay_divergence(too_deep));
+    co_return;
+}
+
 SEASTAR_TEST_CASE(environment_capture_replays_both_artifacts_byte_identically) {
     const auto captured = co_await capture();
     const auto replayed = co_await replay(captured);
@@ -476,10 +550,14 @@ SEASTAR_TEST_CASE(environment_scheduler_replay_diverges_before_file_effect) {
             input(),
             expectation(),
             scheduler_driver{target->event_scheduler()}));
-    } catch (const std::runtime_error&) {
+    } catch (...) {
+        if (!is_replay_divergence(std::current_exception())) {
+            throw;
+        }
         diverged = true;
     }
     BOOST_REQUIRE(diverged);
+    require_replay_drained(*target);
     BOOST_REQUIRE(target->trace().failure() != nullptr);
     BOOST_CHECK(
       target->trace().failure()->code() == kwaque::errc::replay_divergence);
@@ -510,10 +588,14 @@ SEASTAR_TEST_CASE(environment_event_replay_rejects_before_following_effect) {
                 input(),
                 expectation(),
                 scheduler_driver{target->event_scheduler()}));
-        } catch (const std::runtime_error&) {
+        } catch (...) {
+            if (!is_replay_divergence(std::current_exception())) {
+                throw;
+            }
             diverged = true;
         }
         BOOST_REQUIRE(diverged);
+        require_replay_drained(*target);
         BOOST_REQUIRE(target->event_sink().replay_failure() != nullptr);
         BOOST_CHECK(
           target->event_sink().replay_failure()->code()
@@ -549,10 +631,14 @@ SEASTAR_TEST_CASE(environment_event_replay_detects_missing_and_extra_events) {
                 input(),
                 expectation(),
                 scheduler_driver{target->event_scheduler()}));
-        } catch (const std::runtime_error&) {
+        } catch (...) {
+            if (!is_replay_divergence(std::current_exception())) {
+                throw;
+            }
             diverged = true;
         }
         BOOST_REQUIRE(diverged);
+        require_replay_drained(*target);
         BOOST_REQUIRE(target->event_sink().replay_failure() != nullptr);
         BOOST_CHECK_EQUAL(target->event_sink().events().entries().size(), 4U);
     }

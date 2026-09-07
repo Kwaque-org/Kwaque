@@ -46,9 +46,14 @@ random_view_type acquire_random_view(basic_runtime<backend_type>& runtime) {
 
 struct runtime_contract_fixture {
     backend_type backend;
+    backend_type* direct_backend{&backend};
     basic_runtime<backend_type> runtime{backend};
     random_view_type random_view{acquire_random_view(runtime)};
     testing::contract_random* cached_random{&random_view.random()};
+};
+
+struct disabled_fault_policy {
+    backend_type backend;
 };
 
 struct network_admission_fixture {
@@ -71,8 +76,11 @@ struct inline_probe_statistics_fixture {
         ++statistics.accepted;
     }
 
-    void complete(std::uint64_t bytes) noexcept {
+    void add_completed_bytes(std::uint64_t bytes) noexcept {
         statistics.completed_bytes += bytes;
+    }
+
+    void complete() noexcept {
         --statistics.active;
         ++statistics.completed;
     }
@@ -84,13 +92,37 @@ struct owner_operation_statistics_fixture {
     operation_statistics statistics;
 };
 
+struct native_admission_subject {
+    const network_connection_limits limits{
+      .pending_write_bytes = maximum_pending_network_write_bytes,
+      .pending_writes = maximum_pending_network_writes,
+    };
+    seastar::semaphore operation_units{limits.pending_writes};
+    seastar::semaphore byte_units{limits.pending_write_bytes.value()};
+};
+
+[[nodiscard, gnu::noinline, gnu::aligned(64)]] bool
+native_admission_rejected(native_admission_subject& subject) noexcept {
+    auto operation = seastar::try_get_units(subject.operation_units, 1);
+    if (!operation) {
+        return true;
+    }
+    auto bytes = seastar::try_get_units(subject.byte_units, 1);
+    return !bytes;
+}
+
+[[nodiscard, gnu::noinline, gnu::aligned(64)]] bool
+kwaque_admission_rejected(network_write_admission& subject) noexcept {
+    return !subject.try_acquire(byte_count{1});
+}
+
 class network_count_saturation_fixture {
 public:
     network_count_saturation_fixture() {
         for (std::size_t index = 0; index < direct_.size(); ++index) {
             auto direct_operation = seastar::try_get_units(
-              direct_operations_, 1);
-            auto direct_bytes = seastar::try_get_units(direct_bytes_, 1);
+              native_.operation_units, 1);
+            auto direct_bytes = seastar::try_get_units(native_.byte_units, 1);
             auto admitted = admission_.try_acquire(byte_count{1});
             if (!direct_operation || !direct_bytes || !admitted) {
                 std::terminate();
@@ -101,13 +133,12 @@ public:
         }
     }
 
-    [[nodiscard, gnu::noinline]] bool direct_rejected() noexcept {
-        auto operation = seastar::try_get_units(direct_operations_, 1);
-        return !operation;
+    [[nodiscard]] native_admission_subject& direct_subject() noexcept {
+        return native_;
     }
 
-    [[nodiscard, gnu::noinline]] bool kwaque_rejected() noexcept {
-        return !admission_.try_acquire(byte_count{1});
+    [[nodiscard]] network_write_admission& kwaque_subject() noexcept {
+        return admission_;
     }
 
 private:
@@ -122,13 +153,8 @@ private:
         seastar::semaphore_units<> bytes;
     };
 
-    seastar::semaphore direct_operations_{maximum_pending_network_writes};
-    seastar::semaphore direct_bytes_{
-      maximum_pending_network_write_bytes.value()};
-    network_write_admission admission_{network_connection_limits{
-      .pending_write_bytes = maximum_pending_network_write_bytes,
-      .pending_writes = maximum_pending_network_writes,
-    }};
+    native_admission_subject native_;
+    network_write_admission admission_{native_.limits};
     std::
       array<std::optional<direct_reservation>, maximum_pending_network_writes>
         direct_;
@@ -141,36 +167,32 @@ private:
 class network_byte_saturation_fixture {
 public:
     network_byte_saturation_fixture() {
+        direct_operation_.emplace(
+          seastar::get_units(direct_.operation_units, 1).get());
         direct_bytes_.emplace(
           seastar::get_units(
-            direct_byte_units_, maximum_pending_network_write_bytes.value())
+            direct_.byte_units, direct_.limits.pending_write_bytes.value())
             .get());
         auto admitted = admission_.try_acquire(
-          maximum_pending_network_write_bytes);
+          direct_.limits.pending_write_bytes);
         if (!admitted) {
             std::terminate();
         }
         admitted_.emplace(std::move(*admitted));
     }
 
-    [[nodiscard, gnu::noinline]] bool direct_rejected() noexcept {
-        auto operation = seastar::try_get_units(direct_operations_, 1);
-        auto bytes = seastar::try_get_units(direct_byte_units_, 1);
-        return operation.has_value() && !bytes;
+    [[nodiscard]] native_admission_subject& direct_subject() noexcept {
+        return direct_;
     }
 
-    [[nodiscard, gnu::noinline]] bool kwaque_rejected() noexcept {
-        return !admission_.try_acquire(byte_count{1});
+    [[nodiscard]] network_write_admission& kwaque_subject() noexcept {
+        return admission_;
     }
 
 private:
-    seastar::semaphore direct_operations_{maximum_pending_network_writes};
-    seastar::semaphore direct_byte_units_{
-      maximum_pending_network_write_bytes.value()};
-    network_write_admission admission_{network_connection_limits{
-      .pending_write_bytes = maximum_pending_network_write_bytes,
-      .pending_writes = maximum_pending_network_writes,
-    }};
+    native_admission_subject direct_;
+    network_write_admission admission_{direct_.limits};
+    std::optional<seastar::semaphore_units<>> direct_operation_;
     std::optional<seastar::semaphore_units<>> direct_bytes_;
     std::optional<network_write_admission::reservation> admitted_;
 };
@@ -178,6 +200,14 @@ private:
 struct native_timer_fixture {
     seastar::abort_source abort;
 };
+
+// The first timer lets the benchmark collector attach before explicit
+// measurement windows begin.
+bool timer_sample_bootstrap{false};
+
+PERF_PRE_RUN_HOOK([](const seastar::sstring&, const seastar::sstring&) {
+    timer_sample_bootstrap = true;
+});
 
 class equal_shape_native_timer_fixture {
 public:
@@ -319,13 +349,14 @@ public:
         }
     }
 
-    [[gnu::noinline]] seastar::future<> execute() {
+    [[gnu::noinline]] seastar::future<std::size_t> execute() {
         return resolve(query_).then([](result<dns_result> resolved) {
             if (
               !resolved || resolved->answers().size() != 1
               || resolved->answers()[0].endpoint.port() != 33145) {
                 std::terminate();
             }
+            return std::size_t{1};
         });
     }
 
@@ -377,7 +408,7 @@ public:
         }
     }
 
-    [[gnu::noinline]] seastar::future<> execute() {
+    [[gnu::noinline]] seastar::future<std::size_t> execute() {
         return resolver_.resolve(query_, abort_)
           .then([](result<dns_result> resolved) {
               if (
@@ -385,6 +416,7 @@ public:
                 || resolved->answers()[0].endpoint.port() != 33145) {
                   std::terminate();
               }
+              return std::size_t{1};
           });
     }
 
@@ -411,11 +443,20 @@ std::uint64_t compiled_fault_path(Backend& backend) noexcept {
     }
 }
 
+template<typename Source>
+[[gnu::noinline, gnu::aligned(64)]] std::size_t
+wall_clock_sample(Source read) noexcept {
+    for (std::size_t index = 0; index < inner_iterations; ++index) {
+        perf_tests::do_not_optimize(read());
+    }
+    return inner_iterations;
+}
+
 } // namespace
 
 PERF_TEST_F(runtime_contract_fixture, direct_backend_random_next) {
     for (std::size_t index = 0; index < inner_iterations; ++index) {
-        perf_tests::do_not_optimize(backend.random().next_u64());
+        perf_tests::do_not_optimize(direct_backend->random().next_u64());
     }
     return inner_iterations;
 }
@@ -456,45 +497,66 @@ PERF_TEST(production_clock, direct_native_wall_now) {
 }
 
 PERF_TEST(production_clock, validated_native_wall_now) {
-    for (std::size_t index = 0; index < inner_iterations; ++index) {
+    return wall_clock_sample([] {
         const auto native
           = seastar::lowres_system_clock::now().time_since_epoch().count();
         const auto nanoseconds
           = static_cast<__int128_t>(native)
             * production::detail::wall_nanosecond_scale::num;
-        perf_tests::do_not_optimize(
-          wall_time{static_cast<wall_time::rep>(nanoseconds)});
-    }
-    return inner_iterations;
+        return wall_time{static_cast<wall_time::rep>(nanoseconds)};
+    });
 }
 
 PERF_TEST(production_clock, converted_wall_now) {
-    for (std::size_t index = 0; index < inner_iterations; ++index) {
-        perf_tests::do_not_optimize(production::wall_clock::now());
-    }
-    return inner_iterations;
+    return wall_clock_sample([] { return production::wall_clock::now(); });
 }
 
 PERF_TEST_F(native_timer_fixture, zero_deadline_completion) {
+    const bool measured = !std::exchange(timer_sample_bootstrap, false);
+    if (measured) {
+        perf_tests::start_measuring_time();
+    }
     return seastar::sleep_abortable<seastar::lowres_clock>(
-      seastar::lowres_clock::duration::zero(), abort);
+             seastar::lowres_clock::duration::zero(), abort)
+      .then([measured] {
+          if (measured) {
+              perf_tests::stop_measuring_time();
+          }
+          return measured ? std::size_t{1} : std::size_t{0};
+      });
 }
 
 PERF_TEST_F(equal_shape_native_timer_fixture, zero_deadline_completion) {
+    const bool measured = !std::exchange(timer_sample_bootstrap, false);
+    if (measured) {
+        perf_tests::start_measuring_time();
+    }
     return execute(production::monotonic_clock::now())
-      .then([](result<void> outcome) {
+      .then([measured](result<void> outcome) {
           if (!outcome) {
               std::terminate();
           }
+          if (measured) {
+              perf_tests::stop_measuring_time();
+          }
+          return measured ? std::size_t{1} : std::size_t{0};
       });
 }
 
 PERF_TEST_F(kwaque_timer_fixture, zero_deadline_completion) {
+    const bool measured = !std::exchange(timer_sample_bootstrap, false);
+    if (measured) {
+        perf_tests::start_measuring_time();
+    }
     return service.sleep_until(production::monotonic_clock::now(), abort)
-      .then([](result<void> outcome) {
+      .then([measured](result<void> outcome) {
           if (!outcome) {
               std::terminate();
           }
+          if (measured) {
+              perf_tests::stop_measuring_time();
+          }
+          return measured ? std::size_t{1} : std::size_t{0};
       });
 }
 
@@ -541,36 +603,42 @@ PERF_TEST_F(pcg64_raw_fixture, rational_chance) {
 }
 
 PERF_TEST_F(xoshiro_fill_8_fixture, canonical_fill) {
-    fill_bytes(source, std::span<std::byte>{output});
-    perf_tests::do_not_optimize(output.front());
+    for (std::size_t index = 0; index < inner_iterations; ++index) {
+        fill_bytes(source, std::span<std::byte>{output});
+        perf_tests::do_not_optimize(output);
+    }
+    return inner_iterations;
 }
 
 PERF_TEST_F(pcg64_fill_8_fixture, canonical_fill) {
-    fill_bytes(source, std::span<std::byte>{output});
-    perf_tests::do_not_optimize(output.front());
+    for (std::size_t index = 0; index < inner_iterations; ++index) {
+        fill_bytes(source, std::span<std::byte>{output});
+        perf_tests::do_not_optimize(output);
+    }
+    return inner_iterations;
 }
 
 PERF_TEST_F(xoshiro_fill_64_fixture, canonical_fill) {
     fill_bytes(source, std::span<std::byte>{output});
-    perf_tests::do_not_optimize(output.front());
+    perf_tests::do_not_optimize(output);
 }
 
 PERF_TEST_F(pcg64_fill_64_fixture, canonical_fill) {
     fill_bytes(source, std::span<std::byte>{output});
-    perf_tests::do_not_optimize(output.front());
+    perf_tests::do_not_optimize(output);
 }
 
 PERF_TEST_F(xoshiro_fill_4096_fixture, canonical_fill) {
     fill_bytes(source, std::span<std::byte>{output});
-    perf_tests::do_not_optimize(output.front());
+    perf_tests::do_not_optimize(output);
 }
 
 PERF_TEST_F(pcg64_fill_4096_fixture, canonical_fill) {
     fill_bytes(source, std::span<std::byte>{output});
-    perf_tests::do_not_optimize(output.front());
+    perf_tests::do_not_optimize(output);
 }
 
-PERF_TEST(disabled_fault_policy, baseline_noop) {
+PERF_TEST_F(disabled_fault_policy, baseline_noop) {
     std::uint64_t result = 0;
     for (std::size_t index = 0; index < inner_iterations; ++index) {
         perf_tests::do_not_optimize(result);
@@ -578,8 +646,7 @@ PERF_TEST(disabled_fault_policy, baseline_noop) {
     return inner_iterations;
 }
 
-PERF_TEST(disabled_fault_policy, compiled_out) {
-    backend_type backend;
+PERF_TEST_F(disabled_fault_policy, compiled_out) {
     for (std::size_t index = 0; index < inner_iterations; ++index) {
         perf_tests::do_not_optimize(compiled_fault_path(backend));
     }
@@ -591,25 +658,30 @@ PERF_TEST_F(direct_operation_statistics_fixture, accepted_terminal_update) {
         ++statistics.active;
         ++statistics.accepted;
         statistics.completed_bytes += UINT64_C(4096);
-        perf_tests::do_not_optimize(statistics.active);
+        const auto active = statistics.active;
+        perf_tests::do_not_optimize(active);
         --statistics.active;
         ++statistics.completed;
     }
-    perf_tests::do_not_optimize(statistics.accepted);
-    perf_tests::do_not_optimize(statistics.completed);
-    perf_tests::do_not_optimize(statistics.completed_bytes);
+    const auto snapshot = statistics;
+    perf_tests::do_not_optimize(snapshot.accepted);
+    perf_tests::do_not_optimize(snapshot.completed);
+    perf_tests::do_not_optimize(snapshot.completed_bytes);
     return inner_iterations;
 }
 
 PERF_TEST_F(inline_probe_statistics_fixture, accepted_terminal_update) {
     for (std::size_t index = 0; index < inner_iterations; ++index) {
         accept();
-        perf_tests::do_not_optimize(statistics.active);
-        complete(UINT64_C(4096));
+        add_completed_bytes(UINT64_C(4096));
+        const auto active = statistics.active;
+        perf_tests::do_not_optimize(active);
+        complete();
     }
-    perf_tests::do_not_optimize(statistics.accepted);
-    perf_tests::do_not_optimize(statistics.completed);
-    perf_tests::do_not_optimize(statistics.completed_bytes);
+    const auto snapshot = statistics;
+    perf_tests::do_not_optimize(snapshot.accepted);
+    perf_tests::do_not_optimize(snapshot.completed);
+    perf_tests::do_not_optimize(snapshot.completed_bytes);
     return inner_iterations;
 }
 
@@ -617,7 +689,8 @@ PERF_TEST_F(owner_operation_statistics_fixture, accepted_terminal_update) {
     for (std::size_t index = 0; index < inner_iterations; ++index) {
         auto reservation = statistics.accept();
         reservation.add_completed_bytes(UINT64_C(4096));
-        perf_tests::do_not_optimize(statistics.snapshot().active);
+        const auto active = statistics.active();
+        perf_tests::do_not_optimize(active);
     }
     const auto snapshot = statistics.snapshot();
     perf_tests::do_not_optimize(snapshot.accepted);
@@ -633,7 +706,6 @@ PERF_TEST_F(network_admission_fixture, direct_native_try_acquire_release) {
         if (!operation || !bytes) [[unlikely]] {
             std::terminate();
         }
-        perf_tests::do_not_optimize(operation->count());
         perf_tests::do_not_optimize(bytes->count());
     }
     return inner_iterations;
@@ -642,14 +714,18 @@ PERF_TEST_F(network_admission_fixture, direct_native_try_acquire_release) {
 PERF_TEST_F(network_admission_fixture, kwaque_try_acquire_release) {
     for (std::size_t index = 0; index < inner_iterations; ++index) {
         auto reservation = admission.try_acquire(byte_count{write_bytes});
+        if (!reservation) [[unlikely]] {
+            std::terminate();
+        }
         perf_tests::do_not_optimize(reservation->bytes().value());
     }
     return inner_iterations;
 }
 
 PERF_TEST_F(network_count_saturation_fixture, direct_count_rejection) {
+    auto& subject = direct_subject();
     for (std::size_t index = 0; index < inner_iterations; ++index) {
-        if (!direct_rejected()) [[unlikely]] {
+        if (!native_admission_rejected(subject)) [[unlikely]] {
             std::terminate();
         }
     }
@@ -657,8 +733,9 @@ PERF_TEST_F(network_count_saturation_fixture, direct_count_rejection) {
 }
 
 PERF_TEST_F(network_count_saturation_fixture, kwaque_count_rejection) {
+    auto& subject = kwaque_subject();
     for (std::size_t index = 0; index < inner_iterations; ++index) {
-        if (!kwaque_rejected()) [[unlikely]] {
+        if (!kwaque_admission_rejected(subject)) [[unlikely]] {
             std::terminate();
         }
     }
@@ -666,8 +743,9 @@ PERF_TEST_F(network_count_saturation_fixture, kwaque_count_rejection) {
 }
 
 PERF_TEST_F(network_byte_saturation_fixture, direct_byte_rejection) {
+    auto& subject = direct_subject();
     for (std::size_t index = 0; index < inner_iterations; ++index) {
-        if (!direct_rejected()) [[unlikely]] {
+        if (!native_admission_rejected(subject)) [[unlikely]] {
             std::terminate();
         }
     }
@@ -675,8 +753,9 @@ PERF_TEST_F(network_byte_saturation_fixture, direct_byte_rejection) {
 }
 
 PERF_TEST_F(network_byte_saturation_fixture, kwaque_byte_rejection) {
+    auto& subject = kwaque_subject();
     for (std::size_t index = 0; index < inner_iterations; ++index) {
-        if (!kwaque_rejected()) [[unlikely]] {
+        if (!kwaque_admission_rejected(subject)) [[unlikely]] {
             std::terminate();
         }
     }

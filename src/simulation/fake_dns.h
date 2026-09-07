@@ -72,6 +72,9 @@ public:
     [[nodiscard]] runtime::result<void>
     remove_record(const runtime::dns_query& key);
 
+    // Named queries reserve the time required by earlier active/queued lookups
+    // and their own selected latency before admission. A query that cannot
+    // finish within the scheduler's time bound is rejected with out_of_range.
     [[nodiscard]] seastar::future<runtime::result<runtime::dns_result>>
     resolve(runtime::dns_query query, seastar::abort_source& caller_abort);
     void request_abort();

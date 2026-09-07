@@ -161,4 +161,30 @@ TEST(RandomContractTest, FillsCanonicalLittleEndianWordsAndTail) {
     EXPECT_EQ(source.next, 2U);
 }
 
+TEST(RandomContractTest, FillsUnalignedSpansWithoutExtraDrawsOrOverwrites) {
+    constexpr std::byte sentinel{0xa5};
+    for (std::size_t length = 0; length <= 25; ++length) {
+        SCOPED_TRACE(length);
+        sequence_source source{
+          {UINT64_C(0x0807060504030201),
+           UINT64_C(0x100f0e0d0c0b0a09),
+           UINT64_C(0x1817161514131211),
+           UINT64_C(0x201f1e1d1c1b1a19)}};
+        alignas(std::uint64_t) std::array<std::byte, 27> output;
+        output.fill(sentinel);
+
+        kwaque::runtime::fill_bytes(
+          source, std::span<std::byte>{output}.subspan(1, length));
+
+        EXPECT_EQ(source.next, (length + 7U) / 8U);
+        EXPECT_EQ(output.front(), sentinel);
+        for (std::size_t index = 0; index < length; ++index) {
+            EXPECT_EQ(output[index + 1U], static_cast<std::byte>(index + 1U));
+        }
+        for (std::size_t index = length + 1U; index < output.size(); ++index) {
+            EXPECT_EQ(output[index], sentinel);
+        }
+    }
+}
+
 } // namespace

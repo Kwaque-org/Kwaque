@@ -39,7 +39,7 @@ and the allocating copy surface is no longer declared `noexcept`. Together,
 these changes ensure failed segmented growth leaves the custom bucket container
 internally consistent.
 
-The Redpanda-compatible `unordered_dense` baseline remains pinned at
+The `unordered_dense` baseline remains pinned at
 `f30ed41b58af8c79788e8581fe57a6faf856258e`. Its repository rule applies narrow
 compatibility corrections for extracted, moved-from, reserve, rehash, replace,
 and insertion-growth behavior. Empty and moved-from tables no longer allocate

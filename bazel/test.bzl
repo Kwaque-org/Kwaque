@@ -24,6 +24,17 @@ def _merged_env(extra):
     result.update(extra)
     return result
 
+def kwaque_py_native_test(name, srcs = [], data = [], main = None):
+    """Defines a Python subprocess test with the native sanitizer environment."""
+    py_test(
+        name = name,
+        srcs = srcs,
+        data = data + _SANITIZER_DATA,
+        env = _merged_env({}),
+        main = main,
+        size = "small",
+    )
+
 def _parse_memory_mib(value):
     suffixes = [
         ("GiB", 1024),
@@ -181,6 +192,7 @@ def kwaque_cc_benchmark(
         srcs = [],
         deps = [],
         args = [],
+        local_defines = [],
         cpu = 1,
         memory = "128MiB",
         tags = []):
@@ -202,6 +214,7 @@ def kwaque_cc_benchmark(
         copts = kwaque_copts(),
         deps = deps + ["@seastar//:benchmark"],
         features = ["layering_check"],
+        local_defines = local_defines,
         tags = _resource_tags(cpu, memory) + ["benchmark"] + tags,
         testonly = True,
     )
@@ -259,6 +272,27 @@ def kwaque_cc_fuzz_test(
         main = "//bazel:fuzz_test_wrapper.py",
         size = "small",
         tags = ["fuzz"] + tags,
-        timeout = "short",
+        timeout = "moderate",
         target_compatible_with = compatibility,
+    )
+
+def kwaque_fuzz_signal_canary_test(name, runner, seed):
+    """Verify a deliberate reactor signal produces a replayable crash artifact."""
+    py_test(
+        name = name,
+        srcs = [
+            "//bazel:fuzz_signal_canary_test.py",
+            "//bazel:fuzz_test_wrapper.py",
+        ],
+        args = ["$(rootpath {})".format(runner), "$(rootpath {})".format(seed)],
+        data = [runner, seed] + _SANITIZER_DATA,
+        env = _merged_env({}),
+        main = "//bazel:fuzz_signal_canary_test.py",
+        size = "small",
+        tags = ["fuzz", "resources:cpu:1", "resources:memory:256"],
+        timeout = "moderate",
+        target_compatible_with = select({
+            "//bazel:fuzz_build": [],
+            "//conditions:default": ["@platforms//:incompatible"],
+        }),
     )

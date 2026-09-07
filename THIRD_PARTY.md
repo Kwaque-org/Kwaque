@@ -19,6 +19,7 @@ embedded source file is authoritative.
 | `buildifier_prebuilt` | 8.2.0.2 | https://github.com/keith/buildifier-prebuilt | Apache-2.0 | Build only | Hermetic Buildifier formatting and checks |
 | `rhysd/actionlint` | 1.7.12 | https://github.com/rhysd/actionlint | MIT | CI only | GitHub Actions workflow validation |
 | `actions/checkout` | 6.0.1 | https://github.com/actions/checkout | MIT | CI only | CI source checkout |
+| `actions/upload-artifact` | 4.6.2 | https://github.com/actions/upload-artifact | MIT | CI only | Retain fuzz logs and failure inputs |
 | `bazel-contrib/setup-bazel` | 0.19.0 | https://github.com/bazel-contrib/setup-bazel | Apache-2.0 | CI only | Bazel installation and CI caches |
 | `rules_boost` | `f5b0f8c904f2487d8f5a9a956d4388724e627210` | https://github.com/nelhage/rules_boost | Apache-2.0 | Build only | Bazel rules for Boost |
 | Boost | 1.84.0 | https://github.com/boostorg/boost | BSL-1.0 | Static link input; license bundled | Seastar runtime and test dependencies |

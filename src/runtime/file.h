@@ -271,10 +271,49 @@ public:
     // cancels every accepted native read/write request through this file's
     // io_intent. Reads and writes therefore need no second per-operation
     // cancellation mechanism or adapter object.
-    [[nodiscard]] seastar::future<result<file_read_result>>
-    read(file_position position, byte_count maximum_bytes);
-    [[nodiscard]] seastar::future<result<byte_count>>
-    write(file_position position, bytes::fragmented_buffer data);
+    [[nodiscard, gnu::always_inline]] seastar::future<result<file_read_result>>
+    read(file_position position, byte_count maximum_bytes) {
+        owner_.assert_current();
+        if (
+          auto valid = validate_file_read_request(position, maximum_bytes);
+          !valid) {
+            statistics_->reject();
+            result<file_read_result> outcome = failure(valid.error());
+            return seastar::make_ready_future<result<file_read_result>>(
+              std::move(outcome));
+        }
+        if (auto rejected = operation_rejection()) {
+            statistics_->reject();
+            result<file_read_result> outcome = failure(std::move(*rejected));
+            return seastar::make_ready_future<result<file_read_result>>(
+              std::move(outcome));
+        }
+        if (maximum_bytes > limits_.pending_read_bytes) {
+            statistics_->reject();
+            result<file_read_result> outcome = failure(
+              operation_error{errc::out_of_range, operation_kind::file});
+            return seastar::make_ready_future<result<file_read_result>>(
+              std::move(outcome));
+        }
+        return read_validated(position, maximum_bytes);
+    }
+    [[nodiscard, gnu::always_inline]] seastar::future<result<byte_count>>
+    write(file_position position, bytes::fragmented_buffer data) {
+        owner_.assert_current();
+        if (auto valid = validate_file_write_request(position, data); !valid) {
+            statistics_->reject();
+            result<byte_count> outcome = failure(valid.error());
+            return seastar::make_ready_future<result<byte_count>>(
+              std::move(outcome));
+        }
+        if (auto rejected = operation_rejection()) {
+            statistics_->reject();
+            result<byte_count> outcome = failure(std::move(*rejected));
+            return seastar::make_ready_future<result<byte_count>>(
+              std::move(outcome));
+        }
+        return write_validated(position, data);
+    }
     [[nodiscard]] seastar::future<result<void>> flush();
     [[nodiscard]] seastar::future<result<void>> truncate(std::uint64_t size);
     [[nodiscard]] seastar::future<result<std::uint64_t>> size();
@@ -322,13 +361,29 @@ private:
 
     [[nodiscard]] static bool move_is_idle(const file& other) noexcept;
     [[nodiscard]] static owner_shard prepare_move(file& other) noexcept;
-    [[nodiscard]] std::optional<operation_error> operation_rejection() const;
+    [[nodiscard]] std::optional<operation_error> operation_rejection() const {
+        if (moved_from_ || state_ != file_state::open) {
+            return operation_error{errc::closed, operation_kind::file};
+        }
+        if (abort_requested_) {
+            return operation_error{errc::aborted, operation_kind::file};
+        }
+        return std::nullopt;
+    }
     [[nodiscard]] std::optional<admission_reservation>
     try_acquire_read(byte_count bytes) noexcept;
     [[nodiscard]] std::optional<seastar::semaphore_units<>>
     try_acquire_metadata() noexcept;
     [[nodiscard]] std::optional<admission_reservation>
     try_acquire_queued_write(byte_count bytes) noexcept;
+    [[nodiscard]] seastar::future<result<file_read_result>>
+    read_validated(file_position position, byte_count maximum_bytes);
+    [[nodiscard]] seastar::future<result<byte_count>>
+    write_validated(file_position position, bytes::fragmented_buffer& data);
+    [[nodiscard]] seastar::future<result<byte_count>> write_general(
+      file_position position,
+      bytes::fragmented_buffer& data,
+      std::optional<seastar::semaphore_units<>> serialization);
     [[nodiscard]] seastar::future<result<file_read_result>> read_chunked(
       file_position position,
       byte_count maximum_bytes,

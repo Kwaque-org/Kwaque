@@ -229,6 +229,7 @@ public:
         event_trace::reservation parked_trace;
         runtime::fault_object_key fault_object;
         event_id event;
+        runtime::monotonic_time scheduled_deadline;
         dns_trace_phase trace_phase;
         query_phase phase{query_phase::queued};
         bool named{true};
@@ -298,6 +299,8 @@ public:
     find_query(query_token token) const noexcept;
     void issue_query_id() noexcept;
     void issue_record_id() noexcept;
+    [[nodiscard]] runtime::result<runtime::monotonic_time> completion_deadline(
+      runtime::monotonic_duration latency, bool named) const noexcept;
     void start_next() noexcept;
     void schedule_result(query_token token) noexcept;
     void complete_result(query_token token) noexcept;
@@ -727,10 +730,7 @@ seastar::future<runtime::result<runtime::dns_result>> fake_dns::resolve(
         }
         selected->latency = *delayed;
     }
-    if (!add_deadline(
-          scheduler_->now(),
-          selected->latency,
-          scheduler_->limits().maximum_deadline())) {
+    if (!impl_->completion_deadline(selected->latency, named)) {
         return ready_failure<runtime::dns_result>(errc::out_of_range);
     }
 
@@ -881,6 +881,35 @@ void fake_dns::impl::issue_record_id() noexcept {
     }
 }
 
+runtime::result<runtime::monotonic_time> fake_dns::impl::completion_deadline(
+  runtime::monotonic_duration latency, bool named) const noexcept {
+    auto start = scheduler_->now();
+    const auto maximum = scheduler_->limits().maximum_deadline();
+    if (named) {
+        if (active_query_) {
+            const auto* active = find_query(*active_query_);
+            KWAQUE_INVARIANT(
+              fake_dns_state_invariant,
+              active != nullptr && active->phase == query_phase::active,
+              "fake DNS deadline admission lost its active query");
+            start = std::max(start, active->scheduled_deadline);
+        }
+        // Sum only live queued work. Canceled FIFO tokens and parked promises
+        // consume no resolver time, and the fixed slot table bounds this scan.
+        for (const auto& query : queries_) {
+            if (!query || query->phase != query_phase::queued) {
+                continue;
+            }
+            const auto next = add_deadline(start, query->latency, maximum);
+            if (!next) {
+                return runtime::failure(next.error());
+            }
+            start = *next;
+        }
+    }
+    return add_deadline(start, latency, maximum);
+}
+
 void fake_dns::impl::start_next() noexcept {
     if (active_query_) {
         return;
@@ -956,6 +985,7 @@ void fake_dns::impl::schedule_result(query_token token) noexcept {
       scheduled.has_value(),
       "prepared fake DNS result could not schedule");
     query->event = *scheduled;
+    query->scheduled_deadline = *deadline;
 }
 
 void fake_dns::impl::complete_result(query_token token) noexcept {

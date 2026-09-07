@@ -7,11 +7,24 @@
 
 #include <cstdint>
 #include <optional>
+#include <stdexcept>
+#include <utility>
 
 namespace kwaque::runtime::production {
 
 class network_test_access final {
 public:
+    [[nodiscard]] static connection make_connection(
+      seastar::connected_socket native,
+      network_endpoint local,
+      network_endpoint remote,
+      network_connection_limits limits = {}) {
+        if (!limits.validate()) {
+            throw std::invalid_argument("invalid network connection limits");
+        }
+        return connection{std::move(native), local, remote, limits};
+    }
+
     [[nodiscard]] static std::optional<seastar::semaphore_units<>>
     hold_write_serializer(connection& target) {
         target.owner_.assert_current();

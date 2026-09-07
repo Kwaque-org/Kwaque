@@ -1,0 +1,53 @@
+name: Scheduled fuzzing
+
+on:
+  schedule:
+    - cron: '23 2 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  stateful-fuzz:
+    name: ASan and UBSan (${{ matrix.target }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      max-parallel: 4
+      matrix:
+        target:
+          - scheduler_fuzz
+          - fault_schedule_fuzz
+          - fake_file_fuzz
+          - fake_network_fuzz
+    steps:
+      - name: Check out source
+        uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # 6.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/setup-build
+      - name: Run a bounded stateful campaign
+        env:
+          FUZZ_TARGET: ${{ matrix.target }}
+        run: >-
+          bazel test --config=ci --config=fuzz
+          --test_output=all --test_timeout=720
+          --test_env=KWAQUE_FUZZ_MINIMIZE_SECONDS=30
+          --test_arg=-max_total_time=600
+          "//src/simulation/tests:${FUZZ_TARGET}"
+      - name: Retain logs and original and minimized failure inputs
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # 4.6.2
+        with:
+          name: fuzz-${{ matrix.target }}-${{ github.run_attempt }}
+          path: |
+            bazel-testlogs/**/test.log
+            bazel-testlogs/**/test.outputs/**
+          retention-days: 30
+          if-no-files-found: warn

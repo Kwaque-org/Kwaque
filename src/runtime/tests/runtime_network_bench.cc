@@ -3,6 +3,11 @@
 #include "src/runtime/network.h"
 #include "src/runtime/production/network.h"
 
+#ifdef KWAQUE_CONTROLLED_NETWORK_BENCH
+#include "src/runtime/production/network_test_support.h"
+#include "src/runtime/tests/network_benchmark_transport.h"
+#endif
+
 #include <seastar/core/abort_source.hh>
 #include <seastar/core/coroutine.hh>
 #include <seastar/core/gate.hh>
@@ -39,9 +44,46 @@ constexpr std::size_t concurrent_total_bytes = concurrent_writer_count
                                                * concurrent_write_bytes;
 const std::string concurrent_benchmark_payload(concurrent_total_bytes, 'q');
 
-seastar::socket_address native_loopback(std::uint16_t port = 0) {
-    return seastar::make_ipv4_address({0x7f000001U, port});
-}
+// Complete the first exchange before opening per-exchange measurement windows.
+bool network_sample_bootstrap{false};
+
+PERF_PRE_RUN_HOOK([](const seastar::sstring&, const seastar::sstring&) {
+    network_sample_bootstrap = true;
+});
+
+struct native_benchmark_pair {
+    std::optional<seastar::server_socket> listener;
+    seastar::connected_socket client;
+    seastar::connected_socket server;
+
+    explicit native_benchmark_pair(bool concurrent = false) {
+#ifdef KWAQUE_CONTROLLED_NETWORK_BENCH
+        static_cast<void>(concurrent);
+        auto connected = testing::make_controlled_pair();
+        client = std::move(connected.client);
+        server = std::move(connected.server);
+#else
+        seastar::listen_options options;
+        if (concurrent) {
+            options.so_sndbuf = 4096;
+        }
+        listener.emplace(
+          seastar::listen(
+            seastar::make_ipv4_address({0x7f000001U, 0}), options));
+        auto accepting = listener->accept();
+        client = seastar::connect(listener->local_address()).get();
+        server = std::move(accepting).get().connection;
+#endif
+        client.set_nodelay(true);
+        server.set_nodelay(true);
+    }
+
+    ~native_benchmark_pair() {
+        if (listener) {
+            listener->abort_accept();
+        }
+    }
+};
 
 network_endpoint kwaque_loopback(std::uint16_t port = 0) {
     return network_endpoint{
@@ -161,42 +203,43 @@ bytes::fragmented_buffer make_payload(
 class native_raw_network_fixture {
 public:
     native_raw_network_fixture()
-      : listener_(seastar::listen(native_loopback()))
-      , source_(network_benchmark_bytes) {
+      : source_(network_benchmark_bytes) {
         std::memset(source_.get_write(), 'n', source_.size());
-        auto accepting = listener_.accept();
-        client_ = seastar::connect(listener_.local_address()).get();
-        server_ = std::move(accepting).get().connection;
-        input_.emplace(server_.input());
-        output_.emplace(client_.output());
+        input_.emplace(sockets_.server.input());
+        output_.emplace(sockets_.client.output());
     }
 
     ~native_raw_network_fixture() {
         output_->close().get();
         input_->close().get();
-        listener_.abort_accept();
     }
 
-    [[gnu::noinline]] seastar::future<> execute() {
+    [[gnu::noinline]] seastar::future<std::size_t> execute() {
+        const bool measured = !std::exchange(network_sample_bootstrap, false);
+        if (measured) {
+            perf_tests::start_measuring_time();
+        }
         auto reading = input_->read_exactly(network_benchmark_bytes);
         return output_->write(source_.share())
           .then([this] { return output_->flush(); })
           .then([reading = std::move(reading)] mutable {
               return std::move(reading);
           })
-          .then([](seastar::temporary_buffer<char> received) {
+          .then([measured](seastar::temporary_buffer<char> received) {
               if (
                 received.size() != network_benchmark_bytes
                 || received.get()[0] != 'n') {
                   std::terminate();
               }
+              if (measured) {
+                  perf_tests::stop_measuring_time();
+              }
+              return measured ? std::size_t{1} : std::size_t{0};
           });
     }
 
 private:
-    seastar::server_socket listener_;
-    seastar::connected_socket client_;
-    seastar::connected_socket server_;
+    native_benchmark_pair sockets_;
     std::optional<seastar::input_stream<char>> input_;
     std::optional<seastar::output_stream<char>> output_;
     seastar::temporary_buffer<char> source_;
@@ -206,13 +249,9 @@ template<std::size_t FragmentCount>
 class native_batched_network_fixture {
 public:
     native_batched_network_fixture()
-      : listener_(seastar::listen(native_loopback()))
-      , source_(make_payload<FragmentCount>()) {
-        auto accepting = listener_.accept();
-        client_ = seastar::connect(listener_.local_address()).get();
-        server_ = std::move(accepting).get().connection;
-        input_.emplace(server_.input());
-        output_.emplace(client_.output());
+      : source_(make_payload<FragmentCount>()) {
+        input_.emplace(sockets_.server.input());
+        output_.emplace(sockets_.client.output());
     }
 
     ~native_batched_network_fixture() {
@@ -221,10 +260,13 @@ public:
         auto serialization = seastar::get_units(serializer_, 1).get();
         output_->close().get();
         input_->close().get();
-        listener_.abort_accept();
     }
 
-    [[gnu::noinline]] seastar::future<> execute() {
+    [[gnu::noinline]] seastar::future<std::size_t> execute() {
+        const bool measured = !std::exchange(network_sample_bootstrap, false);
+        if (measured) {
+            perf_tests::start_measuring_time();
+        }
         auto data = source_.share();
         owner_.assert_current();
         if (
@@ -257,10 +299,14 @@ public:
               }
               return std::move(reading);
           })
-          .then([](result<void> received) {
+          .then([measured](result<void> received) {
               if (!received) {
                   std::terminate();
               }
+              if (measured) {
+                  perf_tests::stop_measuring_time();
+              }
+              return measured ? std::size_t{1} : std::size_t{0};
           });
     }
 
@@ -303,9 +349,7 @@ private:
         }
     }
 
-    seastar::server_socket listener_;
-    seastar::connected_socket client_;
-    seastar::connected_socket server_;
+    native_benchmark_pair sockets_;
     std::optional<seastar::input_stream<char>> input_;
     std::optional<seastar::output_stream<char>> output_;
     network_connection_limits limits_;
@@ -329,6 +373,21 @@ class kwaque_network_fixture {
 public:
     kwaque_network_fixture()
       : source_(make_payload<FragmentCount>()) {
+#ifdef KWAQUE_CONTROLLED_NETWORK_BENCH
+        auto connected = testing::make_controlled_pair();
+        client_.emplace(
+          production::network_test_access::make_connection(
+            std::move(connected.client),
+            kwaque_loopback(1),
+            kwaque_loopback(2),
+            {}));
+        server_.emplace(
+          production::network_test_access::make_connection(
+            std::move(connected.server),
+            kwaque_loopback(2),
+            kwaque_loopback(1),
+            {}));
+#else
         auto listening = backend_.listen(kwaque_loopback(), {}).get();
         if (!listening) {
             std::terminate();
@@ -348,18 +407,24 @@ public:
         }
         client_.emplace(std::move(*connected));
         server_.emplace(std::move(*accepted));
+#endif
     }
 
     ~kwaque_network_fixture() {
         const auto client_closed = client_->close().get();
         const auto server_closed = server_->close().get();
-        const auto listener_closed = listener_->close().get();
+        const auto listener_closed = listener_ ? listener_->close().get()
+                                               : result<void>{};
         if (!client_closed || !server_closed || !listener_closed) {
             std::terminate();
         }
     }
 
-    [[gnu::noinline]] seastar::future<> execute() {
+    [[gnu::noinline]] seastar::future<std::size_t> execute() {
+        const bool measured = !std::exchange(network_sample_bootstrap, false);
+        if (measured) {
+            perf_tests::start_measuring_time();
+        }
         auto reading = read_kwaque_exactly(
           *server_, read_abort_, network_benchmark_payload);
         return client_->write(source_.share(), write_abort_)
@@ -369,10 +434,14 @@ public:
               }
               return std::move(reading);
           })
-          .then([](result<void> received) {
+          .then([measured](result<void> received) {
               if (!received) {
                   std::terminate();
               }
+              if (measured) {
+                  perf_tests::stop_measuring_time();
+              }
+              return measured ? std::size_t{1} : std::size_t{0};
           });
     }
 
@@ -391,13 +460,10 @@ private:
 class native_concurrent_network_fixture {
 public:
     native_concurrent_network_fixture()
-      : listener_(make_listener())
+      : sockets_(true)
       , source_(make_payload<1>(concurrent_write_bytes, 'q')) {
-        auto accepting = listener_.accept();
-        client_ = seastar::connect(listener_.local_address()).get();
-        server_ = std::move(accepting).get().connection;
-        input_.emplace(client_.input());
-        output_.emplace(server_.output());
+        input_.emplace(sockets_.client.input());
+        output_.emplace(sockets_.server.output());
     }
 
     ~native_concurrent_network_fixture() {
@@ -406,10 +472,13 @@ public:
         auto serialization = seastar::get_units(serializer_, 1).get();
         output_->close().get();
         input_->close().get();
-        listener_.abort_accept();
     }
 
-    [[gnu::noinline]] seastar::future<> execute() {
+    [[gnu::noinline]] seastar::future<std::size_t> execute() {
+        const bool measured = !std::exchange(network_sample_bootstrap, false);
+        if (measured) {
+            perf_tests::start_measuring_time();
+        }
         auto reading = read_native_exactly(
           *input_,
           input_operations_,
@@ -449,20 +518,18 @@ public:
               }
               return std::move(reading);
           })
-          .then([](result<void> received) {
+          .then([measured](result<void> received) {
               if (!received) {
                   std::terminate();
               }
+              if (measured) {
+                  perf_tests::stop_measuring_time();
+              }
+              return measured ? std::size_t{1} : std::size_t{0};
           });
     }
 
 private:
-    static seastar::server_socket make_listener() {
-        seastar::listen_options options;
-        options.so_sndbuf = 4096;
-        return seastar::listen(native_loopback(), options);
-    }
-
     seastar::future<result<void>> write_one(
       bytes::fragmented_buffer data,
       seastar::semaphore_units<> operation_reservation,
@@ -472,8 +539,9 @@ private:
         static_cast<void>(byte_reservation);
         static_cast<void>(holder);
         try {
-            auto serialization = co_await seastar::get_units(
-              serializer_, 1, write_abort_);
+            auto serialization
+              = co_await seastar::coroutine::without_preemption_check(
+                seastar::get_units(serializer_, 1, write_abort_));
             if (
               write_abort_.abort_requested() || abort_requested_
               || state_ != network_connection_state::open
@@ -502,9 +570,7 @@ private:
         }
     }
 
-    seastar::server_socket listener_;
-    seastar::connected_socket client_;
-    seastar::connected_socket server_;
+    native_benchmark_pair sockets_;
     std::optional<seastar::input_stream<char>> input_;
     std::optional<seastar::output_stream<char>> output_;
     network_connection_limits limits_;
@@ -527,6 +593,21 @@ class kwaque_concurrent_network_fixture {
 public:
     kwaque_concurrent_network_fixture()
       : source_(make_payload<1>(concurrent_write_bytes, 'q')) {
+#ifdef KWAQUE_CONTROLLED_NETWORK_BENCH
+        auto connected = testing::make_controlled_pair();
+        client_.emplace(
+          production::network_test_access::make_connection(
+            std::move(connected.client),
+            kwaque_loopback(1),
+            kwaque_loopback(2),
+            {}));
+        server_.emplace(
+          production::network_test_access::make_connection(
+            std::move(connected.server),
+            kwaque_loopback(2),
+            kwaque_loopback(1),
+            {}));
+#else
         auto listening = backend_
                            .listen(
                              kwaque_loopback(),
@@ -550,18 +631,24 @@ public:
         }
         client_.emplace(std::move(*connected));
         server_.emplace(std::move(*accepted));
+#endif
     }
 
     ~kwaque_concurrent_network_fixture() {
         const auto server_closed = server_->close().get();
         const auto client_closed = client_->close().get();
-        const auto listener_closed = listener_->close().get();
+        const auto listener_closed = listener_ ? listener_->close().get()
+                                               : result<void>{};
         if (!server_closed || !client_closed || !listener_closed) {
             std::terminate();
         }
     }
 
-    [[gnu::noinline]] seastar::future<> execute() {
+    [[gnu::noinline]] seastar::future<std::size_t> execute() {
+        const bool measured = !std::exchange(network_sample_bootstrap, false);
+        if (measured) {
+            perf_tests::start_measuring_time();
+        }
         auto reading = read_kwaque_exactly(
           *client_, read_abort_, concurrent_benchmark_payload);
         std::vector<seastar::future<result<void>>> writers;
@@ -579,10 +666,14 @@ public:
               }
               return std::move(reading);
           })
-          .then([](result<void> received) {
+          .then([measured](result<void> received) {
               if (!received) {
                   std::terminate();
               }
+              if (measured) {
+                  perf_tests::stop_measuring_time();
+              }
+              return measured ? std::size_t{1} : std::size_t{0};
           });
     }
 

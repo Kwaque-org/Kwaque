@@ -21,6 +21,7 @@ kwaque_cc_library(
     deps = [
         "//src/base",
         "//src/base:error",
+        "@boost//:container",
         "@seastar",
     ],
 )
@@ -77,6 +78,10 @@ kwaque_cc_seastar_gtest(
 kwaque_cc_fuzz_test(
     name = "fragmented_buffer_fuzz",
     srcs = ["fragmented_buffer_fuzz.cc"],
+    args = [
+        "-max_len=4096",
+        "-rss_limit_mb=512",
+    ],
     corpus = [
         "testdata/fragmented_buffer_fuzz_corpus/append_parse.bin",
         "testdata/fragmented_buffer_fuzz_corpus/empty.bin",
@@ -100,6 +105,7 @@ kwaque_cc_benchmark(
         ":fragmented_buffer_builder",
         ":fragmented_buffer_parser",
         "//src/base",
+        "//src/base:error",
         "@seastar",
     ],
 )

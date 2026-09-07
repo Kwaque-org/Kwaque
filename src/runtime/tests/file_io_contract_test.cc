@@ -159,6 +159,79 @@ TEST(FileIoContractTest, NativeAdoptionTracksHiddenRetainedBacking) {
     EXPECT_EQ(buffer.fragment_count(), 1U);
 }
 
+TEST(
+  FileIoContractTest,
+  NativeAdoptionPreservesOwnershipAcrossFrontRemovalAndGrowth) {
+    using access = kwaque::runtime::detail::fragmented_buffer_io_access;
+    constexpr std::array values{'a', 'b', 'c', 'd', 'e', 'f', 'g'};
+    std::array<const char*, values.size()> backing{};
+    auto make_fragment = [&](std::size_t index) {
+        seastar::temporary_buffer<char> storage{index + 2U};
+        storage.get_write()[0] = values[index];
+        backing[index] = storage.get();
+        storage.trim(1);
+        return storage;
+    };
+    auto buffer = access::adopt(make_fragment(0), kwaque::byte_count{2});
+    std::uint64_t retained = 2;
+    for (std::size_t index = 1; index < 4; ++index) {
+        const auto charge = static_cast<std::uint64_t>(index + 2U);
+        ASSERT_TRUE(
+          access::append_adopted(
+            buffer, make_fragment(index), kwaque::byte_count{charge})
+            .has_value());
+        retained += charge;
+    }
+    EXPECT_TRUE(buffer.content_equals("abcd"));
+    EXPECT_EQ(buffer.retained_bytes(), kwaque::byte_count{retained});
+    auto consumer = access::consume(buffer);
+    for (std::size_t index = 0; index < 2; ++index) {
+        auto owned = consumer.take_front();
+        ASSERT_EQ(owned.size(), 1U);
+        EXPECT_EQ(owned.get(), backing[index]);
+        EXPECT_EQ(owned.get()[0], values[index]);
+        retained -= static_cast<std::uint64_t>(index + 2U);
+        EXPECT_EQ(buffer.retained_bytes(), kwaque::byte_count{retained});
+    }
+
+    for (std::size_t index = 4; index < values.size(); ++index) {
+        const auto charge = static_cast<std::uint64_t>(index + 2U);
+        ASSERT_TRUE(
+          access::append_adopted(
+            buffer, make_fragment(index), kwaque::byte_count{charge})
+            .has_value());
+        retained += charge;
+        EXPECT_EQ(buffer.size().value(), index - 1U);
+        EXPECT_EQ(buffer.fragment_count(), index - 1U);
+        EXPECT_EQ(buffer.retained_bytes(), kwaque::byte_count{retained});
+        auto shared = buffer.share();
+        EXPECT_TRUE(shared.content_equals(buffer));
+        EXPECT_EQ(shared.retained_bytes(), buffer.retained_bytes());
+        for (std::size_t current = 2; current <= index; ++current) {
+            const auto fragment = buffer.fragment_at(current - 2U);
+            ASSERT_TRUE(fragment.has_value());
+            ASSERT_EQ(fragment->size(), 1U);
+            EXPECT_EQ(fragment->data(), backing[current]);
+            EXPECT_EQ(fragment->data()[0], values[current]);
+        }
+    }
+    EXPECT_TRUE(buffer.content_equals("cdefg"));
+    for (std::size_t index = 2; index < values.size(); ++index) {
+        auto owned = consumer.take_front();
+        ASSERT_EQ(owned.size(), 1U);
+        EXPECT_EQ(owned.get(), backing[index]);
+        EXPECT_EQ(owned.get()[0], values[index]);
+        retained -= static_cast<std::uint64_t>(index + 2U);
+        EXPECT_EQ(buffer.size().value(), values.size() - index - 1U);
+        EXPECT_EQ(buffer.fragment_count(), values.size() - index - 1U);
+        EXPECT_EQ(buffer.retained_bytes(), kwaque::byte_count{retained});
+    }
+    EXPECT_TRUE(buffer.empty());
+    EXPECT_EQ(buffer.retained_bytes(), kwaque::byte_count{});
+    EXPECT_EQ(buffer.begin(), buffer.end());
+    EXPECT_TRUE(consumer.take_front().empty());
+}
+
 TEST(FileIoContractTest, ReadResultCarriesExplicitEofAndOwningBytes) {
     auto data = kwaque::bytes::fragmented_buffer::copy_of(
       std::span<const char>{"short", 5});

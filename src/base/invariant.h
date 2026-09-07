@@ -47,8 +47,8 @@ inline constexpr std::size_t max_invariant_expression_size = 128;
 inline constexpr std::size_t max_invariant_context_size = 160;
 inline constexpr std::size_t max_invariant_diagnostic_size = 2048;
 
-[[noreturn]] void invariant_failed(
-  invariant_id id,
+[[gnu::cold]] [[noreturn]] void invariant_failed(
+  const invariant_id& id,
   std::string_view expression,
   std::string_view context,
   std::source_location location = std::source_location::current());

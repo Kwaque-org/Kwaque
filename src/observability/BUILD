@@ -141,7 +141,14 @@ kwaque_cc_seastar_test(
         ":event_sequence",
         ":event_sequence_test_access",
         "//src/base",
+        "@openssl",
     ],
+)
+
+test_suite(
+    name = "event_codec_goldens",
+    tests = [":event_codec_test"],
+    visibility = ["//src/simulation/tests:__pkg__"],
 )
 
 kwaque_cc_seastar_test(
