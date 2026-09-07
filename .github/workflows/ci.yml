@@ -33,26 +33,23 @@ jobs:
           rhysd/actionlint@sha256:b1934ee5f1c509618f2508e6eb47ee0d3520686341fec936f3b79331f9315667
 
   build:
-    name: Build (${{ matrix.config }})
+    name: Release build including tests and benchmarks
     runs-on: ubuntu-24.04
     timeout-minutes: 90
-    strategy:
-      fail-fast: false
-      matrix:
-        config:
-          - ci-debug
-          - ci-release
     steps:
       - name: Check out source
         uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # 6.0.1
         with:
           persist-credentials: false
       - uses: ./.github/actions/setup-build
-      - name: Build broker
-        run: bazel build --config="${{ matrix.config }}" //:kwaque
+      - name: Build all ordinary targets
+        run: >-
+          bazel build --config=ci-release
+          --build_tag_filters=-fuzz,-manual
+          //...
 
   test:
-    name: Unit and smoke tests
+    name: Debug unit and smoke tests
     runs-on: ubuntu-24.04
     timeout-minutes: 90
     steps:
@@ -63,9 +60,16 @@ jobs:
       - uses: ./.github/actions/setup-build
       - name: Run unit and smoke tests
         run: >-
-          bazel test --config=ci
+          bazel test --config=ci-debug
+          --build_tag_filters=-fuzz,-manual
           --test_tag_filters=-fuzz,-manual
           //...
+
+      - name: Repeat the real adapter and environment contracts in sandboxes
+        run: >-
+          bazel test --config=ci-debug --spawn_strategy=sandboxed
+          --runs_per_test=10 --cache_test_results=no
+          //src/runtime/tests:hermetic_contracts
 
   sanitizer:
     name: ASan and UBSan
@@ -80,8 +84,34 @@ jobs:
       - name: Execute tests with sanitizers
         run: >-
           bazel test --config=ci-sanitizer
+          --build_tag_filters=-fuzz,-manual
           --test_tag_filters=-fuzz,-manual
           //...
+
+  goldens:
+    name: Determinism goldens (${{ matrix.runner }}, ${{ matrix.config }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        runner:
+          - ubuntu-24.04
+          - ubuntu-24.04-arm
+        config:
+          - ci-debug
+          - ci-release
+    steps:
+      - name: Check out source
+        uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # 6.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/setup-build
+      - name: Execute the canonical golden suite
+        run: >-
+          bazel test --config="${{ matrix.config }}"
+          --cache_test_results=no
+          //src/simulation/tests:determinism_goldens
 
   cpp-format:
     name: C++ and Bazel formatting
@@ -110,15 +140,36 @@ jobs:
           persist-credentials: false
       - uses: ./.github/actions/setup-build
       - name: Materialize generated analysis inputs
-        run: bazel build --config=ci-debug //:kwaque
+        run: >-
+          bazel build --config=ci-debug
+          --build_tag_filters=-fuzz,-manual //...
       - name: Generate compilation database
         run: >-
-          bazel run --lockfile_mode=error //tools:compile_commands --
+          bazel run --config=ci-debug --lockfile_mode=error //tools:compile_commands --
           --config=ci-debug
       - name: Run baseline checks
-        run: bazel run --lockfile_mode=error //tools:clang_tidy
+        run: bazel run --config=ci-debug --lockfile_mode=error //tools:clang_tidy
       - name: Run strict production checks
-        run: bazel run --lockfile_mode=error //tools:clang_tidy_strict
+        run: bazel run --config=ci-debug --lockfile_mode=error //tools:clang_tidy_strict
+
+  clang-tidy-fuzz:
+    name: Clang tidy for fuzz sources
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - name: Check out source
+        uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # 6.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/setup-build
+      - name: Materialize fuzz analysis inputs
+        run: bazel build --config=ci --config=fuzz --build_tag_filters=fuzz //...
+      - name: Generate the fuzz compilation database
+        run: >-
+          bazel run --config=ci --config=fuzz --lockfile_mode=error //tools:compile_commands --
+          --fuzz-only --config=ci --config=fuzz
+      - name: Check fuzz translation units and their dependencies
+        run: bazel run --config=ci --config=fuzz --lockfile_mode=error //tools:clang_tidy
 
   repository-checks:
     name: Repository integrity
@@ -140,29 +191,50 @@ jobs:
         run: bazel run --lockfile_mode=error //tools:check_cross_shard_usage
       - name: Check runtime dependency boundaries
         run: bazel run --lockfile_mode=error //tools:check_runtime_boundaries
+      - name: Check deterministic source boundaries
+        run: bazel run --lockfile_mode=error //tools:check_determinism
       - name: Check module lock
         run: |
           bazel mod deps --lockfile_mode=update
           git diff --exit-code -- MODULE.bazel.lock
 
   fuzz-smoke:
-    name: Bounded fuzz smoke
+    name: ASan and UBSan fuzz smoke
     runs-on: ubuntu-24.04
-    timeout-minutes: 30
+    timeout-minutes: 90
     steps:
       - name: Check out source
         uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # 6.0.1
         with:
           persist-credentials: false
       - uses: ./.github/actions/setup-build
-      - name: Run configuration and control-message fuzzers
+      - name: Run every fixed-corpus fuzz smoke and the signal artifact canary
         run: >-
           bazel test --config=ci --config=fuzz
+          --keep_going --test_output=all --test_arg=-seed=1
+          --test_env=KWAQUE_FUZZ_MINIMIZE_SECONDS=30
+          --test_arg=-max_total_time=2
           //src/config:bootstrap_config_fuzz
           //proto/kwaque/common/v1:build_info_fuzz
+          //src/bytes:fragmented_buffer_fuzz
+          //src/simulation/tests:scheduler_fuzz
+          //src/simulation/tests:fault_schedule_fuzz
+          //src/simulation/tests:fake_file_fuzz
+          //src/simulation/tests:fake_network_fuzz
+          //src/simulation/tests:signal_canary_test
+      - name: Retain fuzz logs and failure inputs
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # 4.6.2
+        with:
+          name: fuzz-smoke-${{ github.run_attempt }}
+          path: |
+            bazel-testlogs/**/test.log
+            bazel-testlogs/**/test.outputs/**
+          retention-days: 30
+          if-no-files-found: warn
 
   arm-build:
-    name: Build Linux aarch64 broker
+    name: Linux aarch64 release build and runtime tests
     needs: build
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 90
@@ -172,8 +244,11 @@ jobs:
         with:
           persist-credentials: false
       - uses: ./.github/actions/setup-build
-      - name: Build broker
-        run: bazel build --config=ci-release //:kwaque
+      - name: Build all ordinary targets
+        run: >-
+          bazel build --config=ci-release
+          --build_tag_filters=-fuzz,-manual
+          //...
       - name: Test deterministic runtime on aarch64 release
         run: >-
           bazel test --config=ci-release
@@ -191,9 +266,3 @@ jobs:
           //src/simulation/tests:fake_file_test
           //src/simulation/tests:fake_file_runtime_test
           //src/simulation/tests:fake_file_replay_test
-      - name: Test deterministic vectors on aarch64 debug
-        run: >-
-          bazel test --config=ci-debug
-          //src/simulation/tests:philox_kat_test
-          //src/simulation/tests:deterministic_random_test
-          //src/simulation/tests:event_trace_test

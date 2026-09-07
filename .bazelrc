@@ -50,7 +50,7 @@ build:debugger --strip=never
 build:debug --config=debugger
 build:debug --copt=-O1
 
-build:fuzz --config=dev-base
+build:fuzz --config=san-all
 build:fuzz --define=kwaque_fuzz=1
 build:fuzz --copt=-O1
 build:fuzz --copt=-fsanitize=fuzzer-no-link

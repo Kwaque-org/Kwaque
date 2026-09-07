@@ -2,14 +2,13 @@
 #include "src/runtime/task_scope.h"
 
 #include <seastar/core/coroutine.hh>
-#include <seastar/core/sleep.hh>
+#include <seastar/core/future.hh>
 #include <seastar/core/smp.hh>
 #include <seastar/testing/test_case.hh>
 
 #include <boost/test/unit_test.hpp>
 
 #include <atomic>
-#include <chrono>
 #include <cstddef>
 #include <functional>
 #include <limits>
@@ -98,19 +97,22 @@ private:
 class delayed_completion final {
 public:
     delayed_completion(
-      lifecycle_counters& counters, seastar::shard_id shard) noexcept
+      lifecycle_counters& counters,
+      seastar::shard_id shard,
+      seastar::future<> released) noexcept
       : counters_(counters)
-      , shard_(shard) {}
+      , shard_(shard)
+      , released_(std::move(released)) {}
 
     seastar::future<> operator()() {
-        using namespace std::chrono_literals;
-        co_await seastar::sleep(20ms);
+        co_await std::move(released_);
         counters_.completions[shard_].fetch_add(1, std::memory_order_relaxed);
     }
 
 private:
     lifecycle_counters& counters_;
     seastar::shard_id shard_;
+    seastar::future<> released_;
 };
 
 class delayed_service final : public kwaque::runtime::shard_affine {
@@ -127,7 +129,8 @@ public:
     seastar::future<> start() {
         assert_current();
         const auto spawned = tasks_.spawn(
-          delayed_completion{counters_, owner().value()});
+          delayed_completion{
+            counters_, owner().value(), release_.get_future()});
         if (!spawned) {
             throw std::logic_error("delayed task was rejected");
         }
@@ -139,6 +142,10 @@ public:
     void request_abort() {
         assert_current();
         tasks_.request_abort();
+        if (!released_) {
+            released_ = true;
+            release_.set_value();
+        }
     }
 
     seastar::future<> stop() {
@@ -151,6 +158,8 @@ public:
 private:
     lifecycle_counters& counters_;
     kwaque::runtime::task_scope tasks_;
+    seastar::promise<> release_;
+    bool released_{false};
 };
 
 class failing_stop_service final : public kwaque::runtime::shard_affine {

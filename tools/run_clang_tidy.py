@@ -5,7 +5,10 @@ import json
 import os
 import subprocess
 import sys
+import xml.etree.ElementTree as ET
 from pathlib import Path
+
+PRODUCTION_DATABASE_DIRECTORY = Path(".cache") / "clang-tidy-production"
 
 
 def workspace_root() -> Path:
@@ -38,10 +41,58 @@ def resolve_runfile(path: str) -> Path:
 def is_production_source(path: str) -> bool:
     source = Path(path)
     return (
-        source.parts[0] in {"src", "proto"}
-        and "tests" not in source.parts
-        and not source.name.endswith(("_test.cc", "_fuzz.cc"))
+        bool(source.parts)
+        and source.parts[0] in {"src", "proto"}
+        and source.suffix.lower() in {".c", ".cc", ".cpp", ".cxx"}
+        and not {"tests", "testing"}.intersection(source.parts)
+        and not path.startswith("src/simulation/")
+        and not source.name.endswith(("_test.cc", "_fuzz.cc", "_bench.cc"))
     )
+
+
+def production_targets_from_query(query_xml: str) -> dict[str, set[str]]:
+    targets = {}
+    for rule in ET.fromstring(query_xml).findall("rule"):
+        if rule.get("class") not in {"cc_library", "cc_binary"}:
+            continue
+        testonly = rule.find('boolean[@name="testonly"]')
+        if testonly is not None and testonly.get("value") != "false":
+            continue
+        for value in rule.findall('list[@name="srcs"]/label'):
+            label = value.get("value", "")
+            if label.startswith("//") and ":" in label:
+                path = label[2:].replace(":", "/", 1)
+                if is_production_source(path):
+                    targets.setdefault(rule.get("name"), set()).add(path)
+    return targets
+
+
+def production_sources_from_query(query_xml: str) -> set[str]:
+    return set().union(*production_targets_from_query(query_xml).values())
+
+
+def production_targets(root: Path) -> dict[str, set[str]]:
+    result = subprocess.run(
+        ["bazel", "query", 'kind("cc_library|cc_binary", //src/... union //proto/...)',
+         "--output=xml", "--noimplicit_deps", "--notool_deps"],
+        cwd=root, text=True, stdout=subprocess.PIPE, check=True)
+    return production_targets_from_query(result.stdout)
+
+
+def select_files(entries: list[dict], requested: list[str], production: set[str] | None) -> list[str]:
+    if not entries or any(not isinstance(entry.get("file"), str) for entry in entries):
+        raise ValueError("compilation database has no valid source inventory")
+    available = {entry["file"] for entry in entries}
+    if set(requested) - available:
+        raise ValueError("requested sources are missing from the compilation database")
+    selected = set(requested) if requested else available
+    if production is not None:
+        if not requested and production - available:
+            raise ValueError("production compilation database is incomplete; regenerate it in debug mode")
+        selected &= production
+    if not selected:
+        raise ValueError("no C++ files selected; check the database and target scope")
+    return sorted(selected)
 
 
 def main() -> int:
@@ -55,7 +106,8 @@ def main() -> int:
     arguments = parser.parse_args()
 
     root = workspace_root()
-    database = root / "compile_commands.json"
+    database_root = root / PRODUCTION_DATABASE_DIRECTORY if arguments.production_only else root
+    database = database_root / "compile_commands.json"
     if not database.is_file():
         print(
             "compile_commands.json is missing; run bazel run //tools:compile_commands",
@@ -64,19 +116,15 @@ def main() -> int:
         return 2
 
     entries = json.loads(database.read_text())
-    available = sorted({entry["file"] for entry in entries})
-    selected = arguments.files or available
-    if arguments.production_only:
-        selected = [path for path in selected if is_production_source(path)]
-    if not selected:
-        print("No C++ files selected.")
-        return 0
+    selected = select_files(
+        entries, arguments.files,
+        set().union(*production_targets(root).values()) if arguments.production_only else None)
 
     command = [
         str(resolve_runfile(arguments.tool)),
         "--quiet",
         f"--config-file={root / arguments.config}",
-        f"-p={root}",
+        f"-p={database_root}",
         *selected,
     ]
     return subprocess.run(command, cwd=root, check=False).returncode

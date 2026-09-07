@@ -8,9 +8,11 @@
 #include "src/runtime/network.h"
 #include "src/runtime/production/environment.h"
 #include "src/runtime/production/environment_test_support.h"
+#include "src/runtime/testing/contracts/cleanup.h"
 #include "src/runtime/testing/contracts/dns_test_server.h"
 #include "src/runtime/testing/contracts/environment_contract.h"
 #include "src/runtime/testing/contracts/environment_lifecycle_contract.h"
+#include "src/runtime/testing/test_directory.h"
 
 #include <seastar/core/coroutine.hh>
 #include <seastar/core/file.hh>
@@ -200,16 +202,14 @@ SEASTAR_TEST_CASE(production_environment_satisfies_shared_lifecycle_contract) {
 SEASTAR_TEST_CASE(production_environment_satisfies_component_contract) {
     seastar::tmp_dir directory;
     auto dns_listener = kwaque::runtime::testing::make_dns_listener();
-    auto serving_dns = kwaque::runtime::testing::serve_dns_queries(
-      dns_listener, {{{127, 0, 0, 42}, 7}}, true);
+    std::optional<seastar::future<>> serving_dns;
     kwaque::resource::resource_registry registry;
     bool registry_started = false;
     std::exception_ptr first_failure;
 
     try {
         co_await directory.create(
-          std::filesystem::temp_directory_path()
-          / "kwaque-environment-contract-XXXXXX");
+          kwaque::runtime::testing::test_directory_template());
         const auto component_directory = directory.get_path() / "component";
         co_await registry.start(resource_config());
         registry_started = true;
@@ -220,6 +220,9 @@ SEASTAR_TEST_CASE(production_environment_satisfies_component_contract) {
                 environment_logger(),
                 event_identity(50),
                 kwaque::runtime::testing::dns_resolver_options(dns_listener)}};
+            serving_dns.emplace(
+              kwaque::runtime::testing::serve_dns_queries(
+                dns_listener, {{{127, 0, 0, 42}, 7}}, true));
             co_await kwaque::runtime::testing::run_environment_contract(
               target,
               kwaque::runtime::testing::environment_component_input{
@@ -260,27 +263,23 @@ SEASTAR_TEST_CASE(production_environment_satisfies_component_contract) {
 
     dns_listener.abort_accept();
     try {
-        co_await direct_driver{}.lifecycle(std::move(serving_dns));
-    } catch (...) {
-        if (!first_failure) {
-            first_failure = std::current_exception();
+        if (serving_dns) {
+            co_await direct_driver{}.lifecycle(std::move(*serving_dns));
         }
+    } catch (...) {
+        kwaque::runtime::testing::retain_cleanup_failure(first_failure);
     }
     if (registry_started) {
         try {
             co_await registry.stop();
         } catch (...) {
-            if (!first_failure) {
-                first_failure = std::current_exception();
-            }
+            kwaque::runtime::testing::retain_cleanup_failure(first_failure);
         }
     }
     try {
         co_await directory.remove();
     } catch (...) {
-        if (!first_failure) {
-            first_failure = std::current_exception();
-        }
+        kwaque::runtime::testing::retain_cleanup_failure(first_failure);
     }
     if (first_failure) {
         std::rethrow_exception(first_failure);

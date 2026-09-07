@@ -3,11 +3,15 @@
 #include "src/runtime/fragmented_buffer_internal.h"
 
 #include <seastar/core/coroutine.hh>
+#include <seastar/core/deleter.hh>
 #include <seastar/core/file.hh>
 #include <seastar/core/future.hh>
+#include <seastar/core/memory.hh>
 #include <seastar/core/shared_ptr.hh>
 #include <seastar/core/temporary_buffer.hh>
 #include <seastar/testing/test_case.hh>
+#include <seastar/util/alloc_failure_injector.hh>
+#include <seastar/util/later.hh>
 
 #include <boost/test/unit_test.hpp>
 #include <sys/stat.h>
@@ -16,6 +20,7 @@
 #include <array>
 #include <cstdlib>
 #include <cstring>
+#include <exception>
 #include <functional>
 #include <limits>
 #include <new>
@@ -50,6 +55,7 @@ struct file_probe final {
     std::uint64_t size{0};
     std::uintptr_t bulk_read_address{0};
     std::size_t maximum_write_result{std::numeric_limits<std::size_t>::max()};
+    std::size_t delayed_write_index{0};
     unsigned memory_alignment{4096};
     unsigned read_alignment{4096};
     unsigned write_alignment{4096};
@@ -90,7 +96,9 @@ public:
             .size = size,
             .address = reinterpret_cast<std::uintptr_t>(buffer),
           });
-        if (probe_.delayed_write && !probe_.delayed_write_consumed) {
+        if (
+          probe_.delayed_write && !probe_.delayed_write_consumed
+          && probe_.writes.size() == probe_.delayed_write_index + 1U) {
             probe_.delayed_write_consumed = true;
             return probe_.delayed_write->get_future();
         }
@@ -238,6 +246,51 @@ kwaque::bytes::fragmented_buffer aligned_data(std::size_t size, char value) {
     std::memset(storage.get_write(), value, storage.size());
     return kwaque::runtime::detail::fragmented_buffer_io_access::adopt(
       std::move(storage), kwaque::byte_count{size});
+}
+
+std::string staging_contents(std::size_t size) {
+    return std::string(size / 2U, 'a') + std::string(size - size / 2U, 'z');
+}
+
+kwaque::bytes::fragmented_buffer
+staging_data(bool fragmented, std::size_t size) {
+    using access = kwaque::runtime::detail::fragmented_buffer_io_access;
+    if (fragmented) {
+        kwaque::bytes::fragmented_buffer data;
+        for (std::size_t offset = 0; offset < size;) {
+            const auto count = std::min<std::size_t>(2048, size - offset);
+            seastar::temporary_buffer<char> fragment{count};
+            std::memset(
+              fragment.get_write(), offset < size / 2U ? 'a' : 'z', count);
+            if (!access::append_adopted(
+                  data, std::move(fragment), kwaque::byte_count{count})) {
+                throw std::runtime_error("staging input construction failed");
+            }
+            offset += count;
+        }
+        return data;
+    }
+    auto storage = seastar::temporary_buffer<char>::aligned(4096, size + 4096U);
+    const auto retained = kwaque::byte_count{storage.size()};
+    storage.trim_front(1);
+    storage.trim(size);
+    std::memset(storage.get_write(), 'a', size / 2U);
+    std::memset(storage.get_write() + size / 2U, 'z', size - size / 2U);
+    return access::adopt(std::move(storage), retained);
+}
+
+void complete_delayed_write(file_probe& probe, std::size_t written) {
+    const auto& submitted = probe.writes[probe.delayed_write_index];
+    const auto end = submitted.position + written;
+    if (probe.storage.size() < end) {
+        probe.storage.resize(static_cast<std::size_t>(end), '\0');
+    }
+    std::memcpy(
+      probe.storage.data() + static_cast<std::size_t>(submitted.position),
+      reinterpret_cast<const void*>(submitted.address),
+      written);
+    probe.size = std::max(probe.size, end);
+    probe.delayed_write->set_value(written);
 }
 
 } // namespace
@@ -666,6 +719,323 @@ SEASTAR_TEST_CASE(file_write_coalesces_fragment_batch_without_native_iovecs) {
     BOOST_REQUIRE(close_result.has_value());
 }
 
+SEASTAR_TEST_CASE(file_aligned_fragments_keep_independent_native_dma_storage) {
+    using access = kwaque::runtime::detail::fragmented_buffer_io_access;
+    file_probe probe;
+    probe.storage.assign(4096, 'p');
+    probe.size = probe.storage.size();
+    auto owner = make_file(probe);
+    auto first = seastar::temporary_buffer<char>::aligned(4096, 4096);
+    auto second = seastar::temporary_buffer<char>::aligned(4096, 4096);
+    std::memset(first.get_write(), 'a', first.size());
+    std::memset(second.get_write(), 'z', second.size());
+    const auto first_address = reinterpret_cast<std::uintptr_t>(first.get());
+    const auto second_address = reinterpret_cast<std::uintptr_t>(second.get());
+    auto data = access::adopt(std::move(first), kwaque::byte_count{4096});
+    const auto appended = access::append_adopted(
+      data, std::move(second), kwaque::byte_count{4096});
+    BOOST_REQUIRE(appended.has_value());
+    const auto written = co_await owner.write(
+      kwaque::runtime::file_position{4096}, std::move(data));
+    const auto closed = co_await owner.close();
+    BOOST_REQUIRE(written.has_value());
+    BOOST_CHECK_EQUAL(written->value(), 8192U);
+    BOOST_REQUIRE_EQUAL(probe.writes.size(), 2U);
+    BOOST_CHECK_EQUAL(probe.writes[0].position, 4096U);
+    BOOST_CHECK_EQUAL(probe.writes[1].position, 8192U);
+    BOOST_CHECK_EQUAL(probe.writes[0].size, 4096U);
+    BOOST_CHECK_EQUAL(probe.writes[1].size, 4096U);
+    BOOST_CHECK_EQUAL(probe.writes[0].address, first_address);
+    BOOST_CHECK_EQUAL(probe.writes[1].address, second_address);
+    BOOST_CHECK(probe.reads.empty());
+    BOOST_CHECK_EQUAL(probe.sizes, 0U);
+    BOOST_CHECK_EQUAL(probe.truncates, 0U);
+    BOOST_CHECK(
+      std::string_view(probe.storage.data(), probe.storage.size())
+      == std::string(4096, 'p') + staging_contents(8192));
+    BOOST_REQUIRE(closed.has_value());
+}
+
+SEASTAR_TEST_CASE(file_staging_alignment_padding_is_not_written) {
+    for (const bool fragmented : {false, true}) {
+        file_probe probe;
+        probe.memory_alignment = 8192;
+        probe.storage.assign(12288, 'p');
+        probe.size = probe.storage.size();
+        auto owner = make_file(probe);
+        const auto written = co_await owner.write(
+          kwaque::runtime::file_position{4096}, staging_data(fragmented, 4096));
+        const auto closed = co_await owner.close();
+        BOOST_REQUIRE(written.has_value());
+        BOOST_CHECK_EQUAL(written->value(), 4096U);
+        BOOST_REQUIRE_EQUAL(probe.writes.size(), 1U);
+        BOOST_CHECK_EQUAL(probe.writes[0].position, 4096U);
+        BOOST_CHECK_EQUAL(probe.writes[0].size, 4096U);
+        BOOST_CHECK_EQUAL(probe.writes[0].address % 8192U, 0U);
+        BOOST_CHECK_EQUAL(probe.size, 12288U);
+        BOOST_CHECK(probe.reads.empty());
+        BOOST_CHECK_EQUAL(probe.sizes, 0U);
+        BOOST_CHECK_EQUAL(probe.truncates, 0U);
+        BOOST_CHECK_EQUAL(owner.statistics().completed_bytes, 4096U);
+        BOOST_CHECK(
+          std::string_view(probe.storage.data(), probe.storage.size())
+          == std::string(4096, 'p') + staging_contents(4096)
+               + std::string(4096, 'p'));
+        BOOST_REQUIRE(closed.has_value());
+    }
+}
+
+SEASTAR_TEST_CASE(file_staging_observes_abort_from_released_source_ownership) {
+    file_probe probe;
+    auto owner = make_file(probe);
+    bool source_released = false;
+    auto backing = seastar::temporary_buffer<char>::aligned(4096, 8192);
+    std::memset(backing.get_write(), 's', backing.size());
+    auto* source = backing.get_write() + 1;
+    auto fragment = seastar::temporary_buffer<char>::maybe_unsafe_from_deleter(
+      source,
+      4096,
+      seastar::make_deleter(
+        [backing = std::move(backing), &owner, &source_released] noexcept {
+            static_cast<void>(backing);
+            source_released = true;
+            owner.request_abort();
+        }));
+    auto data = kwaque::runtime::detail::fragmented_buffer_io_access::adopt(
+      std::move(fragment), kwaque::byte_count{8192});
+    const auto written = co_await owner.write(
+      kwaque::runtime::file_position{0}, std::move(data));
+    const auto statistics = owner.statistics();
+    const bool source_aborted = owner.abort_requested();
+    const bool admission_idle = kwaque::runtime::file_test_access::move_is_idle(
+      owner);
+    const auto closed = co_await owner.close();
+    BOOST_CHECK(source_released);
+    BOOST_CHECK(source_aborted);
+    BOOST_REQUIRE(!written.has_value());
+    BOOST_CHECK(written.error().code() == kwaque::errc::aborted);
+    BOOST_CHECK(probe.writes.empty());
+    BOOST_CHECK_EQUAL(statistics.accepted, 1U);
+    BOOST_CHECK_EQUAL(statistics.completed, 1U);
+    BOOST_CHECK_EQUAL(statistics.active, 0U);
+    BOOST_CHECK_EQUAL(statistics.completed_bytes, 0U);
+    BOOST_CHECK(admission_idle);
+    BOOST_REQUIRE(closed.has_value());
+    BOOST_CHECK_EQUAL(probe.closes, 1U);
+}
+
+SEASTAR_TEST_CASE(file_ready_staging_allocates_only_one_native_buffer) {
+    for (const bool fragmented : {false, true}) {
+        file_probe probe;
+        probe.writes.reserve(1);
+        probe.storage.assign(4096, '\0');
+        auto owner = make_file(probe);
+        auto data = staging_data(fragmented, 4096);
+        const auto expected = staging_contents(4096);
+#if !defined(SEASTAR_DEBUG) && !defined(SEASTAR_DEFAULT_ALLOCATOR)
+        const auto before = seastar::memory::stats().mallocs();
+#endif
+        auto writing = owner.write(
+          kwaque::runtime::file_position{0}, std::move(data));
+#if !defined(SEASTAR_DEBUG) && !defined(SEASTAR_DEFAULT_ALLOCATOR)
+        const auto after = seastar::memory::stats().mallocs();
+        BOOST_CHECK_EQUAL(after - before, 1U);
+#endif
+#if !defined(SEASTAR_DEBUG)
+        BOOST_CHECK(writing.available());
+#endif
+        const auto written = co_await std::move(writing);
+        const auto closed = co_await owner.close();
+        BOOST_REQUIRE(written.has_value());
+        BOOST_CHECK_EQUAL(written->value(), 4096U);
+        BOOST_REQUIRE_EQUAL(probe.writes.size(), 1U);
+        BOOST_CHECK_EQUAL(probe.writes[0].size, 4096U);
+        BOOST_CHECK_EQUAL(probe.writes[0].address % 4096U, 0U);
+        BOOST_CHECK_EQUAL(probe.sizes, 0U);
+        BOOST_CHECK_EQUAL(probe.truncates, 0U);
+        BOOST_CHECK(
+          std::string_view(probe.storage.data(), probe.storage.size())
+          == expected);
+        BOOST_REQUIRE(closed.has_value());
+    }
+}
+
+SEASTAR_TEST_CASE(file_pending_staging_retains_bytes_and_serializes_truncate) {
+    for (const bool fragmented : {false, true}) {
+        file_probe probe;
+        probe.delayed_write.emplace();
+        probe.storage.assign(8192, 'p');
+        probe.size = probe.storage.size();
+        auto owner = make_file(probe);
+        auto writing = owner.write(
+          kwaque::runtime::file_position{4096}, staging_data(fragmented, 4096));
+        auto truncating = owner.truncate(8192);
+        const bool serialization_held
+          = !writing.available() && !truncating.available()
+            && probe.truncates == 0
+            && !kwaque::runtime::file_test_access::move_is_idle(owner);
+        co_await seastar::yield();
+        BOOST_REQUIRE_EQUAL(probe.writes.size(), 1U);
+        complete_delayed_write(probe, 4096);
+        const auto written = co_await std::move(writing);
+        const auto truncated = co_await std::move(truncating);
+        const auto closed = co_await owner.close();
+        BOOST_CHECK(serialization_held);
+        BOOST_REQUIRE(written.has_value());
+        BOOST_CHECK_EQUAL(written->value(), 4096U);
+        BOOST_REQUIRE(truncated.has_value());
+        BOOST_CHECK_EQUAL(probe.writes.size(), 1U);
+        BOOST_CHECK_EQUAL(probe.truncates, 1U);
+        BOOST_CHECK(
+          std::string_view(probe.storage.data(), probe.storage.size())
+          == std::string(4096, 'p') + staging_contents(4096));
+        BOOST_REQUIRE(closed.has_value());
+    }
+}
+
+SEASTAR_TEST_CASE(file_close_and_abort_drain_pending_staging) {
+    for (const bool fragmented : {false, true}) {
+        for (const bool abort : {false, true}) {
+            file_probe probe;
+            probe.delayed_write.emplace();
+            auto owner = make_file(probe);
+            auto writing = owner.write(
+              kwaque::runtime::file_position{0},
+              staging_data(fragmented, 4096));
+            if (abort) {
+                owner.request_abort();
+                const auto rejected = co_await owner.size();
+                BOOST_CHECK(!rejected.has_value());
+                if (!rejected) {
+                    BOOST_CHECK(
+                      rejected.error().code() == kwaque::errc::aborted);
+                }
+            }
+            auto closing = owner.close();
+            const bool close_waited = !writing.available()
+                                      && !closing.available()
+                                      && probe.closes == 0;
+            co_await seastar::yield();
+            BOOST_REQUIRE_EQUAL(probe.writes.size(), 1U);
+            complete_delayed_write(probe, 4096);
+            const auto written = co_await std::move(writing);
+            const auto closed = co_await std::move(closing);
+            BOOST_CHECK(close_waited);
+            BOOST_REQUIRE(written.has_value());
+            BOOST_CHECK_EQUAL(written->value(), 4096U);
+            BOOST_CHECK_EQUAL(owner.statistics().active, 0U);
+            BOOST_CHECK_EQUAL(owner.statistics().completed_bytes, 4096U);
+            BOOST_CHECK_EQUAL(probe.closes, 1U);
+            BOOST_CHECK(
+              std::string_view(probe.storage.data(), probe.storage.size())
+              == staging_contents(4096));
+            BOOST_REQUIRE(closed.has_value());
+        }
+    }
+}
+
+SEASTAR_TEST_CASE(
+  file_staged_short_writes_recover_with_required_memory_alignment) {
+    for (const bool fragmented : {false, true}) {
+        for (const unsigned memory_alignment : {4096U, 8192U}) {
+            file_probe probe;
+            probe.memory_alignment = memory_alignment;
+            probe.maximum_write_result = 4096;
+            probe.delayed_write.emplace();
+            probe.delayed_write_index = 1;
+            probe.storage.assign(4096, 'p');
+            probe.size = probe.storage.size();
+            auto owner = make_file(probe);
+            auto writing = owner.write(
+              kwaque::runtime::file_position{4096},
+              staging_data(fragmented, 8192));
+            while (!probe.delayed_write_consumed && !writing.available()) {
+                co_await seastar::yield();
+            }
+            auto closing = owner.close();
+            const bool recovery_held = !writing.available()
+                                       && !closing.available()
+                                       && probe.closes == 0;
+            if (probe.delayed_write_consumed) {
+                complete_delayed_write(probe, 4096);
+            }
+            const auto written = co_await std::move(writing);
+            const auto closed = co_await std::move(closing);
+            BOOST_CHECK(recovery_held);
+            BOOST_REQUIRE(written.has_value());
+            BOOST_CHECK_EQUAL(written->value(), 8192U);
+            BOOST_REQUIRE_EQUAL(probe.writes.size(), 2U);
+            BOOST_CHECK_EQUAL(probe.writes[0].position, 4096U);
+            BOOST_CHECK_EQUAL(probe.writes[0].size, 8192U);
+            BOOST_CHECK_EQUAL(probe.writes[1].position, 8192U);
+            BOOST_CHECK_EQUAL(probe.writes[1].size, 4096U);
+            BOOST_CHECK_EQUAL(probe.writes[0].address % memory_alignment, 0U);
+            BOOST_CHECK_EQUAL(probe.writes[1].address % memory_alignment, 0U);
+            if (memory_alignment == 8192U) {
+                BOOST_CHECK_NE(
+                  probe.writes[1].address, probe.writes[0].address + 4096U);
+            }
+            BOOST_CHECK_EQUAL(probe.sizes, 0U);
+            BOOST_CHECK_EQUAL(probe.truncates, 0U);
+            BOOST_CHECK_EQUAL(owner.statistics().active, 0U);
+            BOOST_CHECK_EQUAL(owner.statistics().completed_bytes, 8192U);
+            BOOST_CHECK(
+              std::string_view(probe.storage.data(), probe.storage.size())
+              == std::string(4096, 'p') + staging_contents(8192));
+            BOOST_REQUIRE(closed.has_value());
+        }
+    }
+}
+
+SEASTAR_TEST_CASE(
+  file_staging_allocation_failure_releases_admission_for_retry) {
+#if defined(SEASTAR_ENABLE_ALLOC_FAILURE_INJECTION)
+    for (const bool fragmented : {false, true}) {
+        file_probe probe;
+        auto owner = make_file(probe);
+        auto data = staging_data(fragmented, 4096);
+        std::optional<
+          seastar::future<kwaque::runtime::result<kwaque::byte_count>>>
+          writing;
+        bool escaped = false;
+        auto& injector = seastar::memory::local_failure_injector();
+        injector.fail_after(0);
+        try {
+            writing.emplace(
+              owner.write(kwaque::runtime::file_position{0}, std::move(data)));
+        } catch (...) {
+            escaped = true;
+        }
+        const bool injected = injector.failed();
+        injector.cancel();
+        BOOST_CHECK(injected);
+        BOOST_CHECK(!escaped);
+        if (writing) {
+            BOOST_REQUIRE(writing->available());
+            BOOST_CHECK_THROW(std::move(*writing).get(), std::bad_alloc);
+        }
+        BOOST_CHECK(probe.writes.empty());
+        BOOST_CHECK(kwaque::runtime::file_test_access::move_is_idle(owner));
+        BOOST_CHECK_EQUAL(owner.queued_writes(), 0U);
+        BOOST_CHECK_EQUAL(owner.queued_write_bytes().value(), 0U);
+        const auto statistics = owner.statistics();
+        BOOST_CHECK_EQUAL(statistics.active, 0U);
+        BOOST_CHECK_EQUAL(statistics.completed, statistics.accepted);
+        const auto retried = co_await owner.write(
+          kwaque::runtime::file_position{0}, staging_data(fragmented, 4096));
+        const auto closed = co_await owner.close();
+        BOOST_REQUIRE(retried.has_value());
+        BOOST_CHECK_EQUAL(retried->value(), 4096U);
+        BOOST_CHECK_EQUAL(probe.writes.size(), 1U);
+        BOOST_CHECK(
+          std::string_view(probe.storage.data(), probe.storage.size())
+          == staging_contents(4096));
+        BOOST_REQUIRE(closed.has_value());
+    }
+#endif
+    co_return;
+}
+
 SEASTAR_TEST_CASE(file_write_staging_never_exceeds_contiguous_ceiling) {
     file_probe probe;
     auto owner = make_file(probe);
@@ -763,6 +1133,99 @@ SEASTAR_TEST_CASE(file_write_restores_logical_size_after_tail_extension) {
     BOOST_CHECK_EQUAL(probe.storage[4998], 'e');
     BOOST_CHECK(std::string_view(probe.storage.data() + 4999, 4) == "tail");
     BOOST_REQUIRE(close_result.has_value());
+}
+
+SEASTAR_TEST_CASE(file_ready_native_write_rejects_zero_and_excess_progress) {
+    for (const bool staged : {false, true}) {
+        for (const auto reported : {std::size_t{0}, std::size_t{4097}}) {
+            file_probe probe;
+            probe.delayed_write.emplace();
+            probe.delayed_write->set_value(reported);
+            auto owner = make_file(probe);
+            auto data = staged ? staging_data(true, 4096)
+                               : aligned_data(4096, 'w');
+            const auto written = co_await owner.write(
+              kwaque::runtime::file_position{0}, std::move(data));
+            const auto statistics = owner.statistics();
+            const bool admission_idle
+              = kwaque::runtime::file_test_access::move_is_idle(owner);
+            const auto closed = co_await owner.close();
+            BOOST_REQUIRE(!written.has_value());
+            BOOST_CHECK(written.error().code() == kwaque::errc::io_failure);
+            BOOST_CHECK_EQUAL(probe.writes.size(), 1U);
+            BOOST_CHECK_EQUAL(statistics.accepted, 1U);
+            BOOST_CHECK_EQUAL(statistics.completed, 1U);
+            BOOST_CHECK_EQUAL(statistics.active, 0U);
+            BOOST_CHECK_EQUAL(statistics.completed_bytes, 0U);
+            BOOST_CHECK(admission_idle);
+            BOOST_REQUIRE(closed.has_value());
+            BOOST_CHECK_EQUAL(probe.closes, 1U);
+        }
+    }
+}
+
+SEASTAR_TEST_CASE(file_ready_native_write_preserves_dependency_failure_kinds) {
+    for (const bool staged : {false, true}) {
+        for (const bool allocation_failure : {false, true}) {
+            file_probe probe;
+            probe.delayed_write.emplace();
+            if (allocation_failure) {
+                probe.delayed_write->set_exception(std::bad_alloc{});
+            } else {
+                probe.delayed_write->set_exception(
+                  std::system_error(
+                    std::make_error_code(std::errc::no_space_on_device)));
+            }
+            auto owner = make_file(probe);
+            auto data = staged ? staging_data(true, 4096)
+                               : aligned_data(4096, 'w');
+            std::optional<
+              seastar::future<kwaque::runtime::result<kwaque::byte_count>>>
+              writing;
+            bool escaped = false;
+            try {
+                writing.emplace(owner.write(
+                  kwaque::runtime::file_position{0}, std::move(data)));
+            } catch (...) {
+                escaped = true;
+            }
+            std::optional<kwaque::runtime::result<kwaque::byte_count>> written;
+            bool allocation_observed = false;
+            bool unexpected_exception = false;
+            if (writing) {
+                try {
+                    written.emplace(co_await std::move(*writing));
+                } catch (const std::bad_alloc&) {
+                    allocation_observed = true;
+                } catch (...) {
+                    unexpected_exception = true;
+                }
+            }
+            const auto statistics = owner.statistics();
+            const bool admission_idle
+              = kwaque::runtime::file_test_access::move_is_idle(owner);
+            const auto closed = co_await owner.close();
+            BOOST_CHECK(!escaped);
+            BOOST_CHECK(!unexpected_exception);
+            BOOST_CHECK_EQUAL(allocation_observed, allocation_failure);
+            if (allocation_failure) {
+                BOOST_CHECK(!written.has_value());
+            } else {
+                BOOST_REQUIRE(written.has_value());
+                BOOST_REQUIRE(!written->has_value());
+                BOOST_CHECK(
+                  written->error().code() == kwaque::errc::resource_exhausted);
+            }
+            BOOST_CHECK_EQUAL(probe.writes.size(), 1U);
+            BOOST_CHECK_EQUAL(statistics.accepted, 1U);
+            BOOST_CHECK_EQUAL(statistics.completed, 1U);
+            BOOST_CHECK_EQUAL(statistics.active, 0U);
+            BOOST_CHECK_EQUAL(statistics.completed_bytes, 0U);
+            BOOST_CHECK(admission_idle);
+            BOOST_REQUIRE(closed.has_value());
+            BOOST_CHECK_EQUAL(probe.closes, 1U);
+        }
+    }
 }
 
 SEASTAR_TEST_CASE(file_write_retries_aligned_short_native_writes) {

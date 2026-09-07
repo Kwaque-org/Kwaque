@@ -3,11 +3,16 @@
 
 #include "src/bytes/fragmented_buffer_builder.h"
 #include "src/runtime/network.h"
+#include "src/runtime/testing/contracts/cleanup.h"
 
 #include <seastar/core/abort_source.hh>
 #include <seastar/core/coroutine.hh>
 #include <seastar/core/future.hh>
+#include <seastar/core/lowres_clock.hh>
 #include <seastar/core/temporary_buffer.hh>
+#include <seastar/core/timed_out_error.hh>
+#include <seastar/core/timer.hh>
+#include <seastar/util/optimized_optional.hh>
 
 #include <algorithm>
 #include <array>
@@ -15,6 +20,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <exception>
 #include <optional>
 #include <span>
 #include <stdexcept>
@@ -27,6 +33,56 @@ namespace kwaque::runtime::testing {
 inline constexpr std::size_t network_contract_clients{3};
 inline constexpr std::size_t network_contract_stream_chunks{1'000};
 inline constexpr std::size_t network_contract_stream_chunk_bytes{8U * 1024U};
+
+// A watchdog cancels the scenario and joins its original future. Reporting a
+// timeout never detaches the resource-owning coroutine or its cleanup.
+class network_contract_watchdog final {
+public:
+    explicit network_contract_watchdog(seastar::abort_source& cancel)
+      : cancel_(cancel)
+      , timer_([this] noexcept {
+          expired_ = true;
+          cancel_.request_abort();
+      }) {}
+
+    void arm(seastar::lowres_clock::time_point deadline) {
+        timer_.rearm(deadline);
+    }
+
+    network_contract_watchdog(const network_contract_watchdog&) = delete;
+    network_contract_watchdog&
+    operator=(const network_contract_watchdog&) = delete;
+    network_contract_watchdog(network_contract_watchdog&&) = delete;
+    network_contract_watchdog& operator=(network_contract_watchdog&&) = delete;
+
+    seastar::future<> join(seastar::future<> operation) {
+        std::exception_ptr failure;
+        try {
+            co_await std::move(operation);
+        } catch (...) {
+            failure = std::current_exception();
+        }
+        timer_.cancel();
+        if (expired_) {
+            auto timeout = std::make_exception_ptr(seastar::timed_out_error{});
+            if (failure) {
+                throw seastar::nested_exception{
+                  std::move(failure), std::move(timeout)};
+            }
+            std::rethrow_exception(timeout);
+        }
+        if (failure) {
+            std::rethrow_exception(failure);
+        }
+    }
+
+    [[nodiscard]] bool expired() const noexcept { return expired_; }
+
+private:
+    seastar::abort_source& cancel_;
+    seastar::timer<seastar::lowres_clock> timer_;
+    bool expired_{false};
+};
 
 namespace network_contract_detail {
 
@@ -58,6 +114,239 @@ inline void require_value(result<void> outcome, std::string_view operation) {
     if (!outcome) {
         contract_failure(
           std::string{operation} + " failed: " + outcome.error().render());
+    }
+}
+
+template<typename Resource>
+class owned_resource final {
+public:
+    void start(seastar::future<result<Resource>> acquisition) {
+        require(!pending_ && !value_, "resource slot is already occupied");
+        pending_.emplace(std::move(acquisition));
+    }
+
+    seastar::future<result<void>> finish() {
+        require(pending_.has_value(), "resource slot has no acquisition");
+        auto acquisition = std::move(*pending_);
+        pending_.reset();
+        auto acquired = co_await seastar::coroutine::without_preemption_check(
+          std::move(acquisition));
+        if (!acquired) {
+            co_return failure(acquired.error());
+        }
+        value_.emplace(std::move(*acquired));
+        if (aborted_) {
+            value_->request_abort();
+        }
+        co_return result<void>{};
+    }
+
+    [[nodiscard]] Resource& get() {
+        require(value_.has_value(), "resource slot has no owner");
+        return *value_;
+    }
+
+    [[nodiscard]] bool pending() const noexcept { return pending_.has_value(); }
+    void request_abort() {
+        aborted_ = true;
+        if (value_) {
+            value_->request_abort();
+        }
+    }
+
+    seastar::future<> close(std::exception_ptr& failure) {
+        if (!value_) {
+            co_return;
+        }
+        // A failed allocation may precede the native owner's closing state.
+        // Retry once so a transient failure cannot leave that owner open;
+        // retain both the initiating error and any later cleanup failure.
+        for (unsigned attempt = 0; attempt < 2; ++attempt) {
+            try {
+                require_cleanup(co_await value_->close());
+                co_return;
+            } catch (...) {
+                retain_cleanup_failure(failure);
+            }
+        }
+    }
+
+private:
+    std::optional<seastar::future<result<Resource>>> pending_;
+    std::optional<Resource> value_;
+    bool aborted_{false};
+};
+
+template<typename T>
+seastar::future<result<T>>
+take_future(std::optional<seastar::future<result<T>>>& pending) {
+    require(pending.has_value(), "operation slot is empty");
+    auto operation = std::move(*pending);
+    pending.reset();
+    return operation;
+}
+
+template<typename T>
+seastar::future<result<T>>
+take_pending(std::optional<seastar::future<result<T>>>& pending) {
+    co_return co_await take_future(pending);
+}
+
+template<typename T>
+void require_drained(const result<T>& outcome) {
+    if (
+      !outcome && outcome.error().code() != errc::aborted
+      && outcome.error().code() != errc::closed) {
+        contract_failure(
+          "network cleanup operation failed: " + outcome.error().render());
+    }
+}
+
+// Every scenario owns its acquisitions and parked operations before starting
+// concurrent work. A failed assertion cannot unwind an open native owner, and
+// cancellation reaches handles that arrive after the cancellation request.
+template<network_backend Backend>
+class scenario_owner final {
+public:
+    explicit scenario_owner(seastar::abort_source& cancel)
+      : subscription_(cancel.subscribe([this] noexcept { request_abort(); })) {
+        if (cancel.abort_requested()) {
+            request_abort();
+        }
+    }
+
+    void request_abort() noexcept {
+        for (auto& source : accept_aborts) {
+            source.request_abort();
+        }
+        for (auto& source : connect_aborts) {
+            source.request_abort();
+        }
+        for (auto& source : read_aborts) {
+            source.request_abort();
+        }
+        for (auto& source : write_aborts) {
+            source.request_abort();
+        }
+        const auto abort_owner = [this](auto& resource) noexcept {
+            try {
+                resource.request_abort();
+            } catch (...) {
+                if (!abort_failure_) {
+                    abort_failure_ = std::current_exception();
+                }
+            }
+        };
+        for (auto& resource : listeners) {
+            abort_owner(resource);
+        }
+        for (auto& resource : clients) {
+            abort_owner(resource);
+        }
+        for (auto& resource : servers) {
+            abort_owner(resource);
+        }
+    }
+
+    seastar::future<> close(std::exception_ptr& failure) {
+        request_abort();
+        subscription_ = {};
+        if (abort_failure_) {
+            try {
+                std::rethrow_exception(abort_failure_);
+            } catch (...) {
+                retain_cleanup_failure(failure);
+            }
+        }
+        for (auto& resource : listeners) {
+            co_await drain_acquisition(resource, failure);
+        }
+        for (auto& resource : clients) {
+            co_await drain_acquisition(resource, failure);
+        }
+        for (auto& resource : servers) {
+            co_await drain_acquisition(resource, failure);
+        }
+        for (auto& operation : reads) {
+            co_await drain_operation(operation, failure);
+        }
+        for (auto& operation : writes) {
+            co_await drain_operation(operation, failure);
+        }
+        for (auto& resource : servers) {
+            co_await resource.close(failure);
+        }
+        for (auto& resource : clients) {
+            co_await resource.close(failure);
+        }
+        for (auto& resource : listeners) {
+            co_await resource.close(failure);
+        }
+    }
+
+    std::array<owned_resource<typename Backend::listener_type>, 3> listeners;
+    std::array<
+      owned_resource<typename Backend::connection_type>,
+      network_contract_clients>
+      clients;
+    std::array<
+      owned_resource<typename Backend::connection_type>,
+      network_contract_clients>
+      servers;
+    std::array<seastar::abort_source, network_contract_clients> accept_aborts;
+    std::array<seastar::abort_source, network_contract_clients> connect_aborts;
+    std::array<seastar::abort_source, network_contract_clients> read_aborts;
+    std::array<seastar::abort_source, network_contract_clients> write_aborts;
+    std::array<std::optional<seastar::future<result<network_read_result>>>, 2>
+      reads;
+    std::array<std::optional<seastar::future<result<void>>>, 3> writes;
+
+private:
+    template<typename Resource>
+    static seastar::future<> drain_acquisition(
+      owned_resource<Resource>& resource, std::exception_ptr& failure) {
+        if (resource.pending()) {
+            try {
+                require_drained(co_await resource.finish());
+            } catch (...) {
+                retain_cleanup_failure(failure);
+            }
+        }
+    }
+
+    template<typename T>
+    static seastar::future<> drain_operation(
+      std::optional<seastar::future<result<T>>>& pending,
+      std::exception_ptr& failure) {
+        if (pending) {
+            try {
+                require_drained(co_await take_pending(pending));
+            } catch (...) {
+                retain_cleanup_failure(failure);
+            }
+        }
+    }
+
+    std::exception_ptr abort_failure_;
+    seastar::optimized_optional<seastar::abort_source::subscription>
+      subscription_;
+};
+
+template<network_backend Backend, typename Function>
+seastar::future<>
+run_scenario(Backend& backend, seastar::abort_source& cancel, Function body) {
+    scenario_owner<Backend> owner{cancel};
+    std::exception_ptr failure;
+    try {
+        cancel.check();
+        co_await body(backend, owner);
+        cancel.check();
+    } catch (...) {
+        failure = std::current_exception();
+    }
+    co_await owner.close(failure);
+    if (failure) {
+        std::rethrow_exception(failure);
     }
 }
 
@@ -201,22 +490,24 @@ inline std::string indexed_payload(std::size_t index, std::size_t size) {
 }
 
 template<network_backend Backend>
-seastar::future<> round_trip(Backend& backend) {
-    auto listener = require_value(
-      co_await backend.listen(network_endpoint{loopback_address, 0}, {}),
-      "network listen");
-    seastar::abort_source accept_abort;
-    seastar::abort_source connect_abort;
-    auto accepting = listener.accept(accept_abort);
-    auto client = require_value(
-      co_await backend.connect(
-        listener.local_endpoint(),
-        std::nullopt,
-        network_connection_limits{},
-        connect_abort),
-      "network connect");
-    auto server = require_value(
-      co_await std::move(accepting), "network accept");
+seastar::future<>
+round_trip_body(Backend& backend, scenario_owner<Backend>& owner) {
+    owner.listeners[0].start(
+      backend.listen(network_endpoint{loopback_address, 0}, {}));
+    require_value(co_await owner.listeners[0].finish(), "network listen");
+    auto& listener = owner.listeners[0].get();
+    auto& accept_abort = owner.accept_aborts[0];
+    auto& connect_abort = owner.connect_aborts[0];
+    owner.servers[0].start(listener.accept(accept_abort));
+    owner.clients[0].start(backend.connect(
+      listener.local_endpoint(),
+      std::nullopt,
+      network_connection_limits{},
+      connect_abort));
+    require_value(co_await owner.clients[0].finish(), "network connect");
+    require_value(co_await owner.servers[0].finish(), "network accept");
+    auto& client = owner.clients[0].get();
+    auto& server = owner.servers[0].get();
     require(
       client.remote_endpoint() == listener.local_endpoint(),
       "client remote endpoint differs from the listener");
@@ -225,9 +516,9 @@ seastar::future<> round_trip(Backend& backend) {
         && server.local_endpoint() == client.remote_endpoint(),
       "accepted connection endpoints are not reciprocal");
 
-    seastar::abort_source read_abort;
-    seastar::abort_source write_abort;
-    auto first_read = server.read(byte_count{64}, read_abort);
+    auto& read_abort = owner.read_aborts[0];
+    auto& write_abort = owner.write_aborts[0];
+    owner.reads[0].emplace(server.read(byte_count{64}, read_abort));
     const auto concurrent = co_await server.read(byte_count{64}, read_abort);
     require(
       !concurrent && concurrent.error().code() == errc::unavailable,
@@ -235,7 +526,7 @@ seastar::future<> round_trip(Backend& backend) {
     require_value(
       co_await client.write(make_bytes("hello"), write_abort), "client write");
     auto received = require_value(
-      co_await std::move(first_read), "server read");
+      co_await take_pending(owner.reads[0]), "server read");
     require(
       !received.eof() && received.data().content_equals("hello"),
       "round-trip request bytes changed");
@@ -259,10 +550,12 @@ seastar::future<> round_trip(Backend& backend) {
     const auto reply = co_await read_exactly(client, 5, read_abort);
     require(reply == "world", "round-trip response bytes changed");
 
-    auto first = client.write(make_bytes("first-"), write_abort);
-    auto second = client.write(make_bytes("second"), write_abort);
-    require_value(co_await std::move(first), "first ordered write");
-    require_value(co_await std::move(second), "second ordered write");
+    owner.writes[0].emplace(client.write(make_bytes("first-"), write_abort));
+    owner.writes[1].emplace(client.write(make_bytes("second"), write_abort));
+    require_value(
+      co_await take_pending(owner.writes[0]), "first ordered write");
+    require_value(
+      co_await take_pending(owner.writes[1]), "second ordered write");
     const auto ordered = co_await read_exactly(server, 12, read_abort);
     require(ordered == "first-second", "serialized writes changed order");
 
@@ -295,71 +588,68 @@ seastar::future<> round_trip(Backend& backend) {
 }
 
 template<network_backend Backend>
-seastar::future<> connection_errors(Backend& backend) {
-    auto refused_listener = require_value(
-      co_await backend.listen(network_endpoint{loopback_address, 0}, {}),
-      "refused-listener setup");
+seastar::future<>
+connection_errors_body(Backend& backend, scenario_owner<Backend>& owner) {
+    owner.listeners[0].start(
+      backend.listen(network_endpoint{loopback_address, 0}, {}));
+    require_value(
+      co_await owner.listeners[0].finish(), "refused-listener setup");
+    auto& refused_listener = owner.listeners[0].get();
     const auto refused_endpoint = refused_listener.local_endpoint();
     require_value(co_await refused_listener.close(), "refused-listener close");
-    seastar::abort_source refused_abort;
-    auto refused = co_await backend.connect(
+    auto& refused_abort = owner.connect_aborts[0];
+    owner.clients[0].start(backend.connect(
       refused_endpoint,
       std::nullopt,
       network_connection_limits{},
-      refused_abort);
+      refused_abort));
+    const auto refused = co_await owner.clients[0].finish();
     if (refused) {
-        auto unexpected = std::move(*refused);
-        require_value(
-          co_await unexpected.close(), "unexpected refused connection close");
         throw std::runtime_error("missing listener accepted a connection");
     }
     require(
       refused.error().code() == errc::network_failure,
       "missing listener did not fail as a network error");
 
-    auto listener = require_value(
-      co_await backend.listen(network_endpoint{loopback_address, 0}, {}),
-      "duplicate-listener setup");
-    auto duplicate = co_await backend.listen(listener.local_endpoint(), {});
+    owner.listeners[1].start(
+      backend.listen(network_endpoint{loopback_address, 0}, {}));
+    require_value(
+      co_await owner.listeners[1].finish(), "duplicate-listener setup");
+    auto& listener = owner.listeners[1].get();
+    owner.listeners[2].start(backend.listen(listener.local_endpoint(), {}));
+    const auto duplicate = co_await owner.listeners[2].finish();
     if (duplicate) {
-        auto unexpected = std::move(*duplicate);
-        require_value(
-          co_await unexpected.close(), "unexpected duplicate close");
-        require_value(co_await listener.close(), "duplicate-listener cleanup");
         throw std::runtime_error("duplicate listener bind succeeded");
     }
     require(
       duplicate.error().code() == errc::network_failure,
       "duplicate listener bind did not return a network error");
 
-    seastar::abort_source preaborted;
+    auto& preaborted = owner.connect_aborts[1];
     preaborted.request_abort();
-    auto aborted_connect = co_await backend.connect(
+    owner.clients[1].start(backend.connect(
       listener.local_endpoint(),
       std::nullopt,
       network_connection_limits{},
-      preaborted);
+      preaborted));
+    const auto aborted_connect = co_await owner.clients[1].finish();
     if (aborted_connect) {
-        auto unexpected = std::move(*aborted_connect);
-        require_value(
-          co_await unexpected.close(), "unexpected aborted connection close");
-        require_value(
-          co_await listener.close(), "pre-aborted listener cleanup");
         throw std::runtime_error("pre-aborted connect succeeded");
     }
     require(
       aborted_connect.error().code() == errc::aborted,
       "pre-aborted connect was not rejected");
 
-    seastar::abort_source first_abort;
-    auto first_accept = listener.accept(first_abort);
-    seastar::abort_source second_abort;
-    const auto second_accept = co_await listener.accept(second_abort);
+    auto& first_abort = owner.accept_aborts[0];
+    owner.servers[0].start(listener.accept(first_abort));
+    auto& second_abort = owner.accept_aborts[1];
+    owner.servers[1].start(listener.accept(second_abort));
+    const auto second_accept = co_await owner.servers[1].finish();
     require(
       !second_accept && second_accept.error().code() == errc::unavailable,
       "listener admitted concurrent accepts");
     listener.request_abort();
-    const auto aborted_accept = co_await std::move(first_accept);
+    const auto aborted_accept = co_await owner.servers[0].finish();
     require(
       !aborted_accept && aborted_accept.error().code() == errc::aborted,
       "listener abort did not terminate accept");
@@ -367,87 +657,78 @@ seastar::future<> connection_errors(Backend& backend) {
 }
 
 template<network_backend Backend>
-seastar::future<> multiple_clients(Backend& backend) {
-    using connection = typename Backend::connection_type;
-    auto listener = require_value(
-      co_await backend.listen(
-        network_endpoint{loopback_address, 0},
-        network_listen_options{.backlog = 8}),
-      "multi-client listen");
-    using connect_future = decltype(backend.connect(
-      listener.local_endpoint(),
-      std::nullopt,
-      network_connection_limits{},
-      std::declval<seastar::abort_source&>()));
-    std::array<seastar::abort_source, network_contract_clients> connect_aborts;
-    std::array<std::optional<connect_future>, network_contract_clients>
-      connects;
-    for (std::size_t index = 0; index < connects.size(); ++index) {
-        connects[index].emplace(backend.connect(
+seastar::future<>
+multiple_clients_body(Backend& backend, scenario_owner<Backend>& owner) {
+    owner.listeners[0].start(backend.listen(
+      network_endpoint{loopback_address, 0},
+      network_listen_options{.backlog = 8}));
+    require_value(co_await owner.listeners[0].finish(), "multi-client listen");
+    auto& listener = owner.listeners[0].get();
+    for (std::size_t index = 0; index < owner.clients.size(); ++index) {
+        owner.clients[index].start(backend.connect(
           listener.local_endpoint(),
           std::nullopt,
           network_connection_limits{},
-          connect_aborts[index]));
+          owner.connect_aborts[index]));
     }
 
-    std::array<seastar::abort_source, network_contract_clients> accept_aborts;
-    std::array<std::optional<connection>, network_contract_clients> clients;
-    std::array<std::optional<connection>, network_contract_clients> servers;
-    for (std::size_t index = 0; index < clients.size(); ++index) {
-        auto accepting = listener.accept(accept_aborts[index]);
-        clients[index].emplace(require_value(
-          co_await std::move(*connects[index]), "multi-client connect"));
-        connects[index].reset();
-        servers[index].emplace(
-          require_value(co_await std::move(accepting), "multi-client accept"));
+    for (std::size_t index = 0; index < owner.clients.size(); ++index) {
+        owner.servers[index].start(listener.accept(owner.accept_aborts[index]));
+        require_value(
+          co_await owner.clients[index].finish(), "multi-client connect");
+        require_value(
+          co_await owner.servers[index].finish(), "multi-client accept");
     }
 
     std::array<std::string, network_contract_clients> payloads;
-    std::array<seastar::abort_source, network_contract_clients> write_aborts;
-    std::array<seastar::abort_source, network_contract_clients> read_aborts;
-    for (std::size_t index = 0; index < clients.size(); ++index) {
+    for (std::size_t index = 0; index < owner.clients.size(); ++index) {
         payloads[index] = indexed_payload(index, 64);
         require_value(
-          co_await clients[index]->write(
-            make_bytes(payloads[index]), write_aborts[index]),
+          co_await owner.clients[index].get().write(
+            make_bytes(payloads[index]), owner.write_aborts[index]),
           "multi-client write");
     }
-    for (std::size_t index = 0; index < servers.size(); ++index) {
+    for (std::size_t index = 0; index < owner.servers.size(); ++index) {
         co_await echo_exact_bytes(
-          *servers[index],
+          owner.servers[index].get(),
           payloads[index],
-          read_aborts[index],
-          write_aborts[index]);
+          owner.read_aborts[index],
+          owner.write_aborts[index]);
     }
-    for (std::size_t index = 0; index < clients.size(); ++index) {
+    for (std::size_t index = 0; index < owner.clients.size(); ++index) {
         co_await require_exact_bytes(
-          *clients[index], payloads[index], read_aborts[index]);
+          owner.clients[index].get(),
+          payloads[index],
+          owner.read_aborts[index]);
     }
-    for (std::size_t index = 0; index < clients.size(); ++index) {
-        require_value(co_await clients[index]->close(), "multi-client close");
-        require_value(co_await servers[index]->close(), "multi-server close");
+    for (std::size_t index = 0; index < owner.clients.size(); ++index) {
+        require_value(
+          co_await owner.clients[index].get().close(), "multi-client close");
+        require_value(
+          co_await owner.servers[index].get().close(), "multi-server close");
     }
     require_value(co_await listener.close(), "multi-client listener close");
 }
 
 template<network_backend Backend>
-seastar::future<> long_stream(Backend& backend) {
-    auto listener = require_value(
-      co_await backend.listen(network_endpoint{loopback_address, 0}, {}),
-      "stream listen");
-    seastar::abort_source accept_abort;
-    seastar::abort_source connect_abort;
-    auto accepting = listener.accept(accept_abort);
-    auto client = require_value(
-      co_await backend.connect(
-        listener.local_endpoint(),
-        std::nullopt,
-        network_connection_limits{},
-        connect_abort),
-      "stream connect");
-    auto server = require_value(co_await std::move(accepting), "stream accept");
-    seastar::abort_source write_abort;
-    seastar::abort_source read_abort;
+seastar::future<>
+long_stream_body(Backend& backend, scenario_owner<Backend>& owner) {
+    owner.listeners[0].start(
+      backend.listen(network_endpoint{loopback_address, 0}, {}));
+    require_value(co_await owner.listeners[0].finish(), "stream listen");
+    auto& listener = owner.listeners[0].get();
+    owner.servers[0].start(listener.accept(owner.accept_aborts[0]));
+    owner.clients[0].start(backend.connect(
+      listener.local_endpoint(),
+      std::nullopt,
+      network_connection_limits{},
+      owner.connect_aborts[0]));
+    require_value(co_await owner.clients[0].finish(), "stream connect");
+    require_value(co_await owner.servers[0].finish(), "stream accept");
+    auto& client = owner.clients[0].get();
+    auto& server = owner.servers[0].get();
+    auto& write_abort = owner.write_aborts[0];
+    auto& read_abort = owner.read_aborts[0];
     for (std::size_t index = 0; index < network_contract_stream_chunks;
          ++index) {
         const auto expected = indexed_payload(
@@ -464,28 +745,28 @@ seastar::future<> long_stream(Backend& backend) {
 }
 
 template<network_backend Backend>
-seastar::future<> active_read_abort(Backend& backend) {
-    auto listener = require_value(
-      co_await backend.listen(network_endpoint{loopback_address, 0}, {}),
-      "abort-read listen");
-    seastar::abort_source accept_abort;
-    seastar::abort_source connect_abort;
-    auto accepting = listener.accept(accept_abort);
-    auto client = require_value(
-      co_await backend.connect(
-        listener.local_endpoint(),
-        std::nullopt,
-        network_connection_limits{},
-        connect_abort),
-      "abort-read connect");
-    auto server = require_value(
-      co_await std::move(accepting), "abort-read accept");
+seastar::future<>
+active_read_abort_body(Backend& backend, scenario_owner<Backend>& owner) {
+    owner.listeners[0].start(
+      backend.listen(network_endpoint{loopback_address, 0}, {}));
+    require_value(co_await owner.listeners[0].finish(), "abort-read listen");
+    auto& listener = owner.listeners[0].get();
+    owner.servers[0].start(listener.accept(owner.accept_aborts[0]));
+    owner.clients[0].start(backend.connect(
+      listener.local_endpoint(),
+      std::nullopt,
+      network_connection_limits{},
+      owner.connect_aborts[0]));
+    require_value(co_await owner.clients[0].finish(), "abort-read connect");
+    require_value(co_await owner.servers[0].finish(), "abort-read accept");
+    auto& client = owner.clients[0].get();
+    auto& server = owner.servers[0].get();
 
-    seastar::abort_source read_abort;
-    auto reading = server.read(byte_count{64}, read_abort);
-    require(!reading.available(), "active read completed before owner abort");
+    owner.reads[0].emplace(server.read(byte_count{64}, owner.read_aborts[0]));
+    require(
+      !owner.reads[0]->available(), "active read completed before owner abort");
     server.request_abort();
-    const auto aborted = co_await std::move(reading);
+    const auto aborted = co_await take_pending(owner.reads[0]);
     require(
       !aborted && aborted.error().code() == errc::aborted,
       "owner abort did not terminate the active read");
@@ -495,58 +776,64 @@ seastar::future<> active_read_abort(Backend& backend) {
 }
 
 template<network_backend Backend>
-seastar::future<> saturation_and_abort(Backend& backend) {
+seastar::future<>
+saturation_and_abort_body(Backend& backend, scenario_owner<Backend>& owner) {
     const network_connection_limits limits{
       .pending_write_bytes = byte_count{2U * 1024U * 1024U},
       .pending_writes = 2,
     };
-    auto listener = require_value(
-      co_await backend.listen(
-        network_endpoint{loopback_address, 0},
-        network_listen_options{
-          .backlog = 8,
-          .receive_buffer_bytes = byte_count{4'096},
-          .send_buffer_bytes = byte_count{4'096},
-          .reuse_address = true,
-          .connection_limits = limits,
-        }),
-      "saturation listen");
-    seastar::abort_source accept_abort;
-    seastar::abort_source connect_abort;
-    auto accepting = listener.accept(accept_abort);
-    auto client = require_value(
-      co_await backend.connect(
-        listener.local_endpoint(),
-        std::nullopt,
-        network_connection_limits{},
-        connect_abort),
-      "saturation connect");
-    auto server = require_value(
-      co_await std::move(accepting), "saturation accept");
+    owner.listeners[0].start(backend.listen(
+      network_endpoint{loopback_address, 0},
+      network_listen_options{
+        .backlog = 8,
+        .receive_buffer_bytes = byte_count{4'096},
+        .send_buffer_bytes = byte_count{4'096},
+        .reuse_address = true,
+        .connection_limits = limits,
+      }));
+    require_value(co_await owner.listeners[0].finish(), "saturation listen");
+    auto& listener = owner.listeners[0].get();
+    owner.servers[0].start(listener.accept(owner.accept_aborts[0]));
+    owner.clients[0].start(backend.connect(
+      listener.local_endpoint(),
+      std::nullopt,
+      network_connection_limits{},
+      owner.connect_aborts[0]));
+    require_value(co_await owner.clients[0].finish(), "saturation connect");
+    require_value(co_await owner.servers[0].finish(), "saturation accept");
+    auto& client = owner.clients[0].get();
+    auto& server = owner.servers[0].get();
 
-    seastar::abort_source active_abort;
-    auto active = server.write(
-      repeated_bytes(1024U * 1024U, 'a'), active_abort);
-    require(!active.available(), "saturation active write completed too early");
-    seastar::abort_source queued_abort;
-    auto queued = server.write(make_bytes("q"), queued_abort);
-    require(!queued.available(), "saturation queued write completed too early");
-    seastar::abort_source rejected_abort;
-    auto rejecting = server.write(make_bytes("s"), rejected_abort);
+    owner.writes[0].emplace(
+      server.write(repeated_bytes(1024U * 1024U, 'a'), owner.write_aborts[0]));
     require(
-      rejecting.available(), "write saturation did not reject synchronously");
-    const auto rejected = rejecting.get();
+      !owner.writes[0]->available(),
+      "saturation active write completed too early");
+    auto& queued_abort = owner.write_aborts[1];
+    owner.writes[1].emplace(server.write(make_bytes("q"), queued_abort));
+    require(
+      !owner.writes[1]->available(),
+      "saturation queued write completed too early");
+    owner.writes[2].emplace(
+      server.write(make_bytes("s"), owner.write_aborts[2]));
+    require(
+      owner.writes[2]->available(),
+      "write saturation did not reject synchronously");
+    const auto rejected = take_future(owner.writes[2]).get();
     require(
       !rejected && rejected.error().code() == errc::queue_full,
       "write saturation did not return queue_full");
 
     queued_abort.request_abort();
-    const auto canceled = co_await std::move(queued);
+    const auto canceled = co_await take_pending(owner.writes[1]);
     require(
       !canceled && canceled.error().code() == errc::aborted,
       "queued write cancellation was not typed");
+    require(
+      !owner.writes[0]->available(),
+      "active write was not backpressured through queued cancellation");
     server.request_abort();
-    const auto aborted = co_await std::move(active);
+    const auto aborted = co_await take_pending(owner.writes[0]);
     require(
       !aborted && aborted.error().code() == errc::aborted,
       "owner abort did not terminate active write");
@@ -555,16 +842,77 @@ seastar::future<> saturation_and_abort(Backend& backend) {
     require_value(co_await listener.close(), "saturation listener close");
 }
 
+template<network_backend Backend>
+seastar::future<>
+round_trip(Backend& backend, seastar::abort_source* cancel = nullptr) {
+    seastar::abort_source local_cancel;
+    co_await run_scenario(
+      backend, cancel ? *cancel : local_cancel, round_trip_body<Backend>);
+}
+
+template<network_backend Backend>
+seastar::future<>
+connection_errors(Backend& backend, seastar::abort_source* cancel = nullptr) {
+    seastar::abort_source local_cancel;
+    co_await run_scenario(
+      backend,
+      cancel ? *cancel : local_cancel,
+      connection_errors_body<Backend>);
+}
+
+template<network_backend Backend>
+seastar::future<>
+multiple_clients(Backend& backend, seastar::abort_source* cancel = nullptr) {
+    seastar::abort_source local_cancel;
+    co_await run_scenario(
+      backend, cancel ? *cancel : local_cancel, multiple_clients_body<Backend>);
+}
+
+template<network_backend Backend>
+seastar::future<>
+long_stream(Backend& backend, seastar::abort_source* cancel = nullptr) {
+    seastar::abort_source local_cancel;
+    co_await run_scenario(
+      backend, cancel ? *cancel : local_cancel, long_stream_body<Backend>);
+}
+
+template<network_backend Backend>
+seastar::future<>
+active_read_abort(Backend& backend, seastar::abort_source* cancel = nullptr) {
+    seastar::abort_source local_cancel;
+    co_await run_scenario(
+      backend,
+      cancel ? *cancel : local_cancel,
+      active_read_abort_body<Backend>);
+}
+
+template<network_backend Backend>
+seastar::future<> saturation_and_abort(
+  Backend& backend, seastar::abort_source* cancel = nullptr) {
+    seastar::abort_source local_cancel;
+    co_await run_scenario(
+      backend,
+      cancel ? *cancel : local_cancel,
+      saturation_and_abort_body<Backend>);
+}
+
 } // namespace network_contract_detail
 
 template<network_backend Backend>
+seastar::future<>
+run_network_contract(Backend& backend, seastar::abort_source& cancel) {
+    co_await network_contract_detail::round_trip(backend, &cancel);
+    co_await network_contract_detail::connection_errors(backend, &cancel);
+    co_await network_contract_detail::multiple_clients(backend, &cancel);
+    co_await network_contract_detail::long_stream(backend, &cancel);
+    co_await network_contract_detail::active_read_abort(backend, &cancel);
+    co_await network_contract_detail::saturation_and_abort(backend, &cancel);
+}
+
+template<network_backend Backend>
 seastar::future<> run_network_contract(Backend& backend) {
-    co_await network_contract_detail::round_trip(backend);
-    co_await network_contract_detail::connection_errors(backend);
-    co_await network_contract_detail::multiple_clients(backend);
-    co_await network_contract_detail::long_stream(backend);
-    co_await network_contract_detail::active_read_abort(backend);
-    co_await network_contract_detail::saturation_and_abort(backend);
+    seastar::abort_source cancel;
+    co_await run_network_contract(backend, cancel);
 }
 
 } // namespace kwaque::runtime::testing

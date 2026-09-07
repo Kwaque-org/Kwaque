@@ -657,9 +657,11 @@ public:
             free_packets.push_back(slot);
         }
         flows.reserve(config_.maximum_active_flows);
+        staged_remaining_.reserve(config_.maximum_active_flows);
         for (std::uint16_t slot = 0; slot < config_.maximum_active_flows;
              ++slot) {
             flows.emplace_back();
+            staged_remaining_.emplace_back();
             free_flows.push_back(slot);
         }
         bandwidth_->reset();
@@ -690,6 +692,7 @@ public:
     seastar::chunked_vector<packet_state> packets;
     seastar::chunked_fifo<std::uint32_t, 128, 512> free_packets;
     seastar::chunked_vector<flow_state> flows;
+    seastar::chunked_vector<bandwidth_fraction> staged_remaining_;
     seastar::chunked_fifo<std::uint16_t, 128, 1> free_flows;
     deterministic_random random_;
     std::unique_ptr<bandwidth_planner> bandwidth_;
@@ -730,6 +733,7 @@ public:
     bool stop_batch_scheduled_{false};
     bool stop_resources_released_{false};
     bool forcing_discard_{false};
+    bool terminal_schedule_failed_{false};
     bool activated_{false};
 
     [[nodiscard]] listener_state* find_listener(std::uint64_t id) noexcept {
@@ -869,7 +873,7 @@ public:
       const control_operation* staged_control = nullptr,
       const staged_flow_start* staged_start = nullptr) noexcept;
     void complete_bandwidth() noexcept;
-    void finish_flow(std::uint16_t flow_slot) noexcept;
+    [[nodiscard]] bool finish_flow(std::uint16_t flow_slot) noexcept;
     void complete_gap(std::uint64_t pair, std::uint8_t direction) noexcept;
     void complete_delivery(std::uint32_t slot, std::uint64_t packet) noexcept;
     void release_sequences(std::uint64_t pair, std::uint8_t direction) noexcept;
@@ -888,7 +892,7 @@ public:
       runtime::network_address target,
       bandwidth_capacity capacity);
     void complete_control(std::uint64_t operation) noexcept;
-    void schedule_ready_delivery(link_state& link) noexcept;
+    [[nodiscard]] bool schedule_ready_delivery(link_state& link) noexcept;
     void complete_ready_delivery(
       directed_link_key link,
       std::uint32_t slot,
@@ -1618,6 +1622,10 @@ seastar::future<runtime::result<void>> fake_network::stop() {
     } catch (...) {
         return seastar::current_exception_as_future<runtime::result<void>>();
     }
+    if (const auto* failure = scheduler_->trace_failure()) {
+        impl_->force_discard_all(*failure);
+        return impl_->stop_done_->get_shared_future();
+    }
     try {
         if (auto prepared = impl_->prepare_stop_batches(); !prepared) {
             impl_->stop_done_.reset();
@@ -1832,7 +1840,6 @@ seastar::future<runtime::result<void>> fake_network::impl::submit_control(
           .rebalance_trace = std::move(*rebalance_trace),
           .wake_trace = std::move(*wake_trace),
         };
-        auto waiting = control.done.get_future();
         auto operation = std::make_unique<operation_state>(
           operation_id,
           operation_payload{
@@ -1871,15 +1878,16 @@ seastar::future<runtime::result<void>> fake_network::impl::submit_control(
             return seastar::make_ready_future<runtime::result<void>>(
               runtime::failure(scheduled.error()));
         }
-        std::get<control_operation>(find_operation(operation_id)->payload).event
-          = *scheduled;
+        auto& committed = std::get<control_operation>(
+          find_operation(operation_id)->payload);
+        committed.event = *scheduled;
         ++active_controls;
         issue_operation_id();
         if (inserted_link) {
             issue_link_id();
         }
         activated_ = true;
-        return waiting;
+        return committed.done.get_future();
     } catch (...) {
         operations.erase(operation_id);
         if (inserted_link) {
@@ -1929,7 +1937,7 @@ void fake_network::impl::complete_control(std::uint64_t operation_id) noexcept {
     case control_kind::unclog: {
         auto* link = find_link(key);
         link->clogged = false;
-        schedule_ready_delivery(*link);
+        applied = schedule_ready_delivery(*link);
         break;
     }
     case control_kind::egress:
@@ -1964,6 +1972,9 @@ void fake_network::impl::complete_control(std::uint64_t operation_id) noexcept {
                                : network_error(errc::replay_divergence)));
     } else {
         done.set_value(runtime::result<void>{});
+    }
+    if (terminal_schedule_failed_) {
+        force_discard_all(*scheduler_->trace_failure());
     }
 }
 
@@ -2685,7 +2696,6 @@ seastar::future<runtime::result<fake_connection>> fake_network::connect(
           .parked_trace = std::move(*connect_parked_trace),
           .fault = prepared_fault->decision,
         };
-        auto waiting = connecting.done.get_future();
         auto operation = std::make_unique<impl::operation_state>(
           operation_id,
           impl::operation_payload{
@@ -2794,7 +2804,7 @@ seastar::future<runtime::result<fake_connection>> fake_network::connect(
         impl_->issue_pair_id();
         impl_->issue_operation_id();
         impl_->activated_ = true;
-        return waiting;
+        return connect_state.done.get_future();
     } catch (...) {
         impl_->operations.erase(operation_id);
         impl_->pairs.erase(pair_id);
@@ -3206,7 +3216,6 @@ seastar::future<runtime::result<fake_connection>> fake_network::accept(
           .parked_trace = std::move(*accept_parked_trace),
           .fault = prepared_fault->decision,
         };
-        auto waiting = accepting.done.get_future();
         auto operation = std::make_unique<impl::operation_state>(
           operation_id,
           impl::operation_payload{
@@ -3236,7 +3245,9 @@ seastar::future<runtime::result<fake_connection>> fake_network::accept(
                   runtime::result<fake_connection>>(
                   runtime::failure(scheduled.error()));
             }
-            return waiting;
+            return std::get<impl::accept_operation>(
+                     impl_->find_operation(operation_id)->payload)
+              .done.get_future();
         }
         if (!listener->backlog.empty()) {
             const auto pair = listener->backlog.front();
@@ -3289,7 +3300,9 @@ seastar::future<runtime::result<fake_connection>> fake_network::accept(
                   runtime::failure(scheduled.error()));
             }
         }
-        return waiting;
+        return std::get<impl::accept_operation>(
+                 impl_->find_operation(operation_id)->payload)
+          .done.get_future();
     } catch (...) {
         return seastar::current_exception_as_future<
           runtime::result<fake_connection>>();
@@ -3846,7 +3859,6 @@ fake_network::read(
           .fault_b = fault_b,
           .side = side,
         };
-        auto waiting = reading.done.get_future();
         auto operation = std::make_unique<impl::operation_state>(
           operation_id,
           impl::operation_payload{
@@ -3894,7 +3906,9 @@ fake_network::read(
                   runtime::failure(scheduled.error()));
             }
         }
-        return waiting;
+        return std::get<impl::read_operation>(
+                 impl_->find_operation(operation_id)->payload)
+          .done.get_future();
     } catch (...) {
         return seastar::current_exception_as_future<
           runtime::result<runtime::network_read_result>>();
@@ -4246,7 +4260,6 @@ seastar::future<runtime::result<void>> fake_network::write(
               .terminal_trace = std::move(terminal->second),
               .side = side,
             };
-            auto waiting = writing.done.get_future();
             auto operation = std::make_unique<impl::operation_state>(
               operation_id,
               impl::operation_payload{
@@ -4262,6 +4275,7 @@ seastar::future<runtime::result<void>> fake_network::write(
             }
             auto& stored = std::get<impl::write_operation>(
               impl_->find_operation(operation_id)->payload);
+            auto waiting = stored.done.get_future();
             stored.terminal_event.release();
             const auto code = decision.action() == runtime::fault_action::error
                                 ? errc::fault_injected
@@ -4290,6 +4304,10 @@ seastar::future<runtime::result<void>> fake_network::write(
               },
               event_cleanup_policy::invoke,
               std::move(stored.terminal_trace));
+            if (!scheduled && scheduler_->trace_failed()) {
+                impl_->force_discard_all(scheduled.error());
+                return waiting;
+            }
             KWAQUE_INVARIANT(
               fake_network_state_invariant,
               scheduled.has_value(),
@@ -4595,7 +4613,6 @@ seastar::future<runtime::result<void>> fake_network::write(
           .drop_completion = decision.action()
                              == runtime::fault_action::drop_completion,
         };
-        auto waiting = writing.done.get_future();
         auto operation = std::make_unique<impl::operation_state>(
           operation_id,
           impl::operation_payload{
@@ -4635,6 +4652,7 @@ seastar::future<runtime::result<void>> fake_network::write(
             return seastar::make_ready_future<runtime::result<void>>(
               runtime::failure(committed.error()));
         }
+        auto waiting = write_state.done.get_future();
 
         impl_->free_packets.pop_front();
         if (clone_slot) {
@@ -4778,6 +4796,9 @@ seastar::future<runtime::result<void>> fake_network::write(
         impl_->activated_ = true;
         if (direction.transmitter == impl::transmitter_state::ready) {
             impl_->start_next_packet(pair_id, side);
+        }
+        if (impl_->terminal_schedule_failed_) {
+            impl_->force_discard_all(*scheduler_->trace_failure());
         }
         return waiting;
     } catch (...) {
@@ -5053,7 +5074,7 @@ bool fake_network::impl::rebalance_bandwidth(
     std::array<std::uint16_t, maximum_bandwidth_flows> active_slots{};
     std::array<std::uint32_t, maximum_bandwidth_flows> active_packet_slots{};
     std::array<std::uint16_t, maximum_bandwidth_flows> completed_slots{};
-    std::array<bandwidth_fraction, maximum_bandwidth_flows> staged_remaining{};
+    auto& staged_remaining = staged_remaining_;
     std::size_t active_count = 0;
     std::size_t completed_count = 0;
     for (std::uint16_t slot = 0; slot < flows.size(); ++slot) {
@@ -5302,6 +5323,10 @@ bool fake_network::impl::rebalance_bandwidth(
     }
     if (bandwidth_scheduled_) {
         auto canceled = scheduler_->cancel(bandwidth_event_);
+        if (!canceled && scheduler_->trace_failed()) {
+            terminal_schedule_failed_ = true;
+            return false;
+        }
         KWAQUE_INVARIANT(
           fake_network_state_invariant,
           canceled.has_value() && *canceled,
@@ -5370,7 +5395,9 @@ bool fake_network::impl::rebalance_bandwidth(
         const auto slot = completed_slots[index];
         flows[slot].remaining = staged_remaining[slot];
         flows[slot].last_update = now;
-        finish_flow(slot);
+        if (!finish_flow(slot)) {
+            return false;
+        }
     }
     bandwidth_.swap(staged_bandwidth_);
     staged_bandwidth_->reset();
@@ -5411,6 +5438,10 @@ bool fake_network::impl::rebalance_bandwidth(
       },
       event_cleanup_policy::invoke,
       std::move(wake_trace));
+    if (!scheduled && scheduler_->trace_failed()) {
+        terminal_schedule_failed_ = true;
+        return false;
+    }
     KWAQUE_INVARIANT(
       fake_network_state_invariant,
       scheduled.has_value(),
@@ -5425,6 +5456,7 @@ bool fake_network::impl::rebalance_bandwidth(
 void fake_network::impl::complete_bandwidth() noexcept {
     bandwidth_scheduled_ = false;
     if (scheduler_->discarding_failed_event()) {
+        force_discard_all(*scheduler_->trace_failure());
         return;
     }
     auto replacement = scheduler_->reserve_event_slot();
@@ -5449,9 +5481,12 @@ void fake_network::impl::complete_bandwidth() noexcept {
       "fake bandwidth wake lost its stable flow ID");
     static_cast<void>(
       rebalance_bandwidth(std::move(trace), std::move(wake_trace), stable_id));
+    if (terminal_schedule_failed_) {
+        force_discard_all(*scheduler_->trace_failure());
+    }
 }
 
-void fake_network::impl::finish_flow(std::uint16_t flow_slot) noexcept {
+bool fake_network::impl::finish_flow(std::uint16_t flow_slot) noexcept {
     auto& flow = flows[flow_slot];
     KWAQUE_INVARIANT(
       fake_network_state_invariant,
@@ -5514,6 +5549,10 @@ void fake_network::impl::finish_flow(std::uint16_t flow_slot) noexcept {
       },
       event_cleanup_policy::invoke,
       std::move(packet.gap_trace));
+    if (!gap && scheduler_->trace_failed()) {
+        terminal_schedule_failed_ = true;
+        return false;
+    }
     KWAQUE_INVARIANT(
       fake_network_state_invariant,
       gap.has_value(),
@@ -5533,6 +5572,10 @@ void fake_network::impl::finish_flow(std::uint16_t flow_slot) noexcept {
       },
       event_cleanup_policy::invoke,
       std::move(packet.delivery_trace));
+    if (!delivery && scheduler_->trace_failed()) {
+        terminal_schedule_failed_ = true;
+        return false;
+    }
     KWAQUE_INVARIANT(
       fake_network_state_invariant,
       delivery.has_value(),
@@ -5542,7 +5585,7 @@ void fake_network::impl::finish_flow(std::uint16_t flow_slot) noexcept {
 
     const auto operation_id = std::exchange(packet.write_operation, 0U);
     if (operation_id == 0) {
-        return;
+        return true;
     }
     auto* operation = find_operation(operation_id);
     KWAQUE_INVARIANT(
@@ -5553,7 +5596,7 @@ void fake_network::impl::finish_flow(std::uint16_t flow_slot) noexcept {
     if (write.drop_completion) {
         write.abort_subscription = std::nullopt;
         write.parked = true;
-        return;
+        return true;
     }
     auto done = std::move(write.done);
     write.abort_subscription = std::nullopt;
@@ -5561,6 +5604,7 @@ void fake_network::impl::finish_flow(std::uint16_t flow_slot) noexcept {
     write.done_set = true;
     operations.erase(operation_id);
     done.set_value(runtime::result<void>{});
+    return true;
 }
 
 void fake_network::impl::complete_gap(
@@ -5578,6 +5622,9 @@ void fake_network::impl::complete_gap(
       && endpoint.output == runtime::network_half_state::open
       && !endpoint.abort_requested && !endpoint.peer_reset) {
         start_next_packet(pair_id, direction_index);
+        if (terminal_schedule_failed_) {
+            force_discard_all(*scheduler_->trace_failure());
+        }
         return;
     }
     if (direction.transmitter_slot) {
@@ -5684,9 +5731,9 @@ void fake_network::impl::apply_delivery(
     collect_pair(pair_id);
 }
 
-void fake_network::impl::schedule_ready_delivery(link_state& link) noexcept {
+bool fake_network::impl::schedule_ready_delivery(link_state& link) noexcept {
     if (link.clogged || link.ready_chain_scheduled) {
-        return;
+        return true;
     }
     while (!link.ready.empty()) {
         const auto token = link.ready.front();
@@ -5709,13 +5756,17 @@ void fake_network::impl::schedule_ready_delivery(link_state& link) noexcept {
           },
           event_cleanup_policy::invoke,
           std::move(packet->ready_trace));
+        if (!scheduled && scheduler_->trace_failed()) {
+            terminal_schedule_failed_ = true;
+            return false;
+        }
         KWAQUE_INVARIANT(
           fake_network_state_invariant,
           scheduled.has_value(),
           "fake unclog could not schedule bounded ready delivery");
         link.ready_chain_event = *scheduled;
         link.ready_chain_scheduled = true;
-        return;
+        return true;
     }
     if (!link.ready_fins.empty()) {
         const auto fin = link.ready_fins.front();
@@ -5740,6 +5791,10 @@ void fake_network::impl::schedule_ready_delivery(link_state& link) noexcept {
           },
           event_cleanup_policy::invoke,
           std::move(endpoint.fin_ready_trace));
+        if (!scheduled && scheduler_->trace_failed()) {
+            terminal_schedule_failed_ = true;
+            return false;
+        }
         KWAQUE_INVARIANT(
           fake_network_state_invariant,
           scheduled.has_value(),
@@ -5747,6 +5802,7 @@ void fake_network::impl::schedule_ready_delivery(link_state& link) noexcept {
         link.ready_chain_event = *scheduled;
         link.ready_chain_scheduled = true;
     }
+    return true;
 }
 
 void fake_network::impl::complete_ready_delivery(
@@ -5766,7 +5822,12 @@ void fake_network::impl::complete_ready_delivery(
       "fake ready-delivery chain changed order");
     link->ready.pop_front();
     apply_delivery(slot, packet_id);
-    schedule_ready_delivery(*link);
+    if (!scheduler_->trace_failed()) {
+        static_cast<void>(schedule_ready_delivery(*link));
+    }
+    if (terminal_schedule_failed_) {
+        force_discard_all(*scheduler_->trace_failure());
+    }
 }
 
 void fake_network::impl::complete_ready_fin(
@@ -5786,7 +5847,12 @@ void fake_network::impl::complete_ready_fin(
       "fake ready FIN chain changed order");
     link->ready_fins.pop_front();
     deliver_fin(fin.pair, fin.side);
-    schedule_ready_delivery(*link);
+    if (!scheduler_->trace_failed()) {
+        static_cast<void>(schedule_ready_delivery(*link));
+    }
+    if (terminal_schedule_failed_) {
+        force_discard_all(*scheduler_->trace_failure());
+    }
 }
 
 void fake_network::impl::release_sequences(

@@ -11,7 +11,6 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
-#include <deque>
 #include <span>
 #include <utility>
 
@@ -72,7 +71,7 @@ public:
     [[nodiscard]] static consumer
     consume(bytes::fragmented_buffer& buffer) noexcept {
         if (!buffer.fragments_.empty()) {
-            ++buffer.generation_;
+            buffer.invalidate_presentation();
         }
         return consumer{buffer};
     }
@@ -92,7 +91,7 @@ public:
           retained_bytes >= size
             && retained_bytes.value() <= maximum_contiguous_allocation_bytes,
           "native fragment retained backing is invalid");
-        std::deque<bytes::fragmented_buffer::owned_fragment> fragments;
+        bytes::fragmented_buffer::fragment_storage fragments;
         fragments.push_back(
           bytes::fragmented_buffer::owned_fragment{
             .storage = std::move(fragment),

@@ -10,6 +10,8 @@ from tools.compilation_database import (
     active_output_base,
     compiler_arguments,
     ensure_external_link,
+    query_expression,
+    select_commands,
 )
 
 
@@ -22,6 +24,26 @@ class CompilerArgumentsTest(unittest.TestCase):
 
     def parse(self, *arguments: str) -> tuple[str, list[str]] | None:
         return compiler_arguments(action(*arguments), self.execution_root)
+
+    def test_shared_source_keeps_all_variants_and_strict_subset_in_any_action_order(self) -> None:
+        actions = [
+            {"targetId": 1, "arguments": ["clang", "-DTEST=1", "-c", "src/model/record.cc"]},
+            {"targetId": 2, "arguments": ["clang", "-DTEST=0", "-c", "src/model/record.cc"]},
+        ]
+        targets = [{"id": 1, "label": "//src/model:test_support"},
+                   {"id": 2, "label": "//src/model:record"}]
+        for ordered in (actions, list(reversed(actions))):
+            entries = select_commands(ordered, targets, {targets[1]["label"]}, self.execution_root, Path("."))
+            self.assertEqual(len(entries), 2)
+            strict = select_commands(ordered, targets, {targets[1]["label"]}, self.execution_root, Path("."), production_only=True)
+            self.assertEqual(len(strict), 1)
+            self.assertIn("-DTEST=0", strict[0]["arguments"])
+        with self.assertRaisesRegex(RuntimeError, "target identity"):
+            select_commands(actions, [], set(), self.execution_root, Path("."))
+
+    def test_fuzz_analysis_uses_fuzz_roots_and_their_dependencies(self) -> None:
+        self.assertEqual(query_expression(True), 'mnemonic("CppCompile", deps(attr(tags, "fuzz", //...)))')
+        self.assertEqual(query_expression(False), 'mnemonic("CppCompile", deps(//... except attr(tags, "manual|fuzz", //...)))')
 
     def test_external_paths_stay_workspace_relative(self) -> None:
         """They must resolve through the workspace link, not a fixed output base."""

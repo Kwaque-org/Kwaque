@@ -313,10 +313,78 @@ public:
         return rejected_pushes_;
     }
 
-    [[nodiscard]] seastar::future<queue_result<void>>
+    [[nodiscard, gnu::always_inline]] seastar::future<queue_result<void>>
     push(T item, byte_count cost, seastar::abort_source& abort_source) {
         assert_current();
+        try {
+            if (auto invalid = validate_cost(cost)) {
+                return seastar::make_ready_future<queue_result<void>>(
+                  reject_push(std::move(*invalid)));
+            }
+            if (state_ != bounded_work_queue_state::open) {
+                return seastar::make_ready_future<queue_result<void>>(
+                  reject_push(failure(queue_failure_kind::closed, cost)));
+            }
+            if (abort_source.abort_requested()) {
+                return seastar::make_ready_future<queue_result<void>>(
+                  reject_push(failure(queue_failure_kind::aborted, cost)));
+            }
+            const bool local_capacity = can_admit_locally(cost);
+            if (config_.maximum_producer_waiters == 0 && !local_capacity) {
+                return seastar::make_ready_future<queue_result<void>>(
+                  reject_push(failure(
+                    queue_failure_kind::producer_waiters_exhausted, cost)));
+            }
+
+            return push_admitting(item, cost, abort_source, local_capacity);
+        } catch (...) {
+            return seastar::current_exception_as_future<queue_result<void>>();
+        }
+    }
+
+private:
+    [[nodiscard]] seastar::future<queue_result<void>> push_admitting(
+      T& item,
+      byte_count cost,
+      seastar::abort_source& abort_source,
+      bool local_capacity) {
         operation_token operation{*this, active_producers_};
+        auto turn = seastar::try_get_units(producer_turn_, 1);
+        if (turn && local_capacity) {
+            KWAQUE_INVARIANT(
+              memory_admission_invariant,
+              memory_admission_ != nullptr,
+              "queue has no memory admission handle");
+            auto acquired = seastar::try_get_units(
+              *memory_admission_, cost.value());
+            if (acquired) {
+                if (
+                  state_ != bounded_work_queue_state::open
+                  || abort_source.abort_requested()) {
+                    return seastar::make_ready_future<queue_result<void>>(
+                      reject_push(interruption_failure(abort_source, cost)));
+                }
+                publish_admitted(std::move(item), cost, std::move(*acquired));
+                return seastar::make_ready_future<queue_result<void>>(
+                  queue_result<void>{});
+            }
+        }
+        if (config_.maximum_producer_waiters == 0) {
+            return seastar::make_ready_future<queue_result<void>>(reject_push(
+              failure(queue_failure_kind::producer_waiters_exhausted, cost)));
+        }
+        return push_wait(std::move(item), cost, abort_source, std::move(turn));
+    }
+
+    [[nodiscard]] seastar::future<queue_result<void>> push_wait(
+      T item,
+      byte_count cost,
+      seastar::abort_source& abort_source,
+      std::optional<seastar::semaphore_units<>> incoming_turn) {
+        assert_current();
+        operation_token operation{*this, active_producers_};
+        std::optional<producer_cancellation> cancellation;
+        auto turn = std::move(incoming_turn);
         if (auto invalid = validate_cost(cost)) {
             co_return reject_push(std::move(*invalid));
         }
@@ -327,15 +395,16 @@ public:
             co_return reject_push(failure(queue_failure_kind::aborted, cost));
         }
 
-        std::optional<producer_cancellation> cancellation;
-        auto cancellation_source = [&]() -> seastar::abort_source& {
+        auto cancellation_source = [&] -> seastar::abort_source& {
             if (!cancellation) {
                 cancellation.emplace(*this, abort_source);
             }
             return cancellation->source();
         };
 
-        auto turn = seastar::try_get_units(producer_turn_, 1);
+        if (!turn) {
+            turn = seastar::try_get_units(producer_turn_, 1);
+        }
         producer_wait_token waiting{*this};
         if (!turn) {
             if (!waiting.try_engage_queued()) {
@@ -387,7 +456,7 @@ public:
         }
 
         KWAQUE_INVARIANT(
-          invariant_id{"KQ-WORK-QUEUE-MEMORY-ADMISSION"},
+          memory_admission_invariant,
           memory_admission_ != nullptr,
           "queue has no memory admission handle");
         auto acquired = seastar::try_get_units(
@@ -417,46 +486,112 @@ public:
             co_return reject_push(interruption_failure(abort_source, cost));
         }
 
-        items_.push_back(
-          admitted_item{
-            .units = std::move(*acquired),
-            .item = std::move(item),
-          });
-        const auto held = bytes_held_.checked_add(cost);
-        KWAQUE_INVARIANT(
-          invariant_id{"KQ-WORK-QUEUE-BYTE-ADMISSION"},
-          held.has_value() && *held <= config_.maximum_bytes,
-          "queue byte admission exceeded its local capacity");
-        bytes_held_ = *held;
-        consumer_condition_.signal();
-        ++accepted_pushes_;
+        publish_admitted(std::move(item), cost, std::move(*acquired));
         co_return queue_result<void>{};
     }
 
+public:
     [[nodiscard]] seastar::future<queue_result<T>>
     pop(seastar::abort_source& abort_source) {
         assert_current();
-        if (workers_started_) {
-            throw std::logic_error(
-              "manual pop is unavailable after workers start");
+        try {
+            if (workers_started_) {
+                return seastar::make_exception_future<queue_result<T>>(
+                  std::logic_error(
+                    "manual pop is unavailable after workers start"));
+            }
+            auto finish =
+              [this](queue_result<admitted_item> admitted) -> queue_result<T> {
+                if (!admitted) {
+                    return std::unexpected(std::move(admitted.error()));
+                }
+                auto item = std::move(admitted->item);
+                release_admitted(admitted->units);
+                return queue_result<T>{std::move(item)};
+            };
+            if (auto admitted = try_pop_admitted(abort_source)) {
+                return seastar::make_ready_future<queue_result<T>>(
+                  finish(std::move(*admitted)));
+            }
+            return pop_admitted_wait(abort_source).then(std::move(finish));
+        } catch (...) {
+            return seastar::current_exception_as_future<queue_result<T>>();
         }
-        auto admitted = co_await pop_admitted(abort_source);
-        if (!admitted) {
-            co_return std::unexpected(std::move(admitted.error()));
-        }
-        auto item = std::move(admitted->item);
-        release_admitted(admitted->units);
-        co_return queue_result<T>{std::move(item)};
     }
 
 private:
+    static constexpr invariant_id memory_admission_invariant{
+      "KQ-WORK-QUEUE-MEMORY-ADMISSION"};
+    static constexpr invariant_id byte_admission_invariant{
+      "KQ-WORK-QUEUE-BYTE-ADMISSION"};
+    static constexpr invariant_id byte_release_invariant{
+      "KQ-WORK-QUEUE-BYTE-RELEASE"};
+    static constexpr invariant_id active_capacity_invariant{
+      "KQ-WORK-QUEUE-ACTIVE-CAPACITY"};
+    static constexpr invariant_id active_operation_invariant{
+      "KQ-WORK-QUEUE-ACTIVE-OPERATION"};
+
     struct admitted_item final {
         seastar::semaphore_units<> units;
         T item;
     };
 
+    void publish_admitted(
+      T&& item, byte_count cost, seastar::semaphore_units<>&& acquired) {
+        items_.push_back(
+          admitted_item{
+            .units = std::move(acquired),
+            .item = std::move(item),
+          });
+        const auto held = bytes_held_.checked_add(cost);
+        KWAQUE_INVARIANT(
+          byte_admission_invariant,
+          held.has_value() && *held <= config_.maximum_bytes,
+          "queue byte admission exceeded its local capacity");
+        bytes_held_ = *held;
+        if (waiting_consumers_ != 0) {
+            consumer_condition_.signal();
+        }
+        ++accepted_pushes_;
+    }
+
     [[nodiscard]] seastar::future<queue_result<admitted_item>>
     pop_admitted(seastar::abort_source& abort_source) {
+        assert_current();
+        if (auto admitted = try_pop_admitted(abort_source)) {
+            return seastar::make_ready_future<queue_result<admitted_item>>(
+              std::move(*admitted));
+        }
+        return pop_admitted_wait(abort_source);
+    }
+
+    [[nodiscard, gnu::always_inline]] std::optional<queue_result<admitted_item>>
+    try_pop_admitted(seastar::abort_source& abort_source) {
+        operation_token operation{*this, active_consumers_};
+        if (
+          !items_.empty() || state_ != bounded_work_queue_state::open
+          || abort_source.abort_requested()) {
+            auto turn = seastar::try_get_units(consumer_turn_, 1);
+            if (turn) {
+                if (
+                  state_ != bounded_work_queue_state::open && items_.empty()) {
+                    return queue_result<admitted_item>{std::unexpected(
+                      failure(queue_failure_kind::closed, byte_count{}))};
+                }
+                if (abort_source.abort_requested()) {
+                    return queue_result<admitted_item>{std::unexpected(
+                      failure(queue_failure_kind::aborted, byte_count{}))};
+                }
+                auto admitted = std::move(items_.front());
+                items_.pop_front();
+                return queue_result<admitted_item>{std::move(admitted)};
+            }
+        }
+        return std::nullopt;
+    }
+
+    [[nodiscard]] seastar::future<queue_result<admitted_item>>
+    pop_admitted_wait(seastar::abort_source& abort_source) {
         assert_current();
         operation_token operation{*this, active_consumers_};
         consumer_wait_token waiting{*this};
@@ -491,7 +626,7 @@ private:
 
             waiting.engage();
             auto subscription = abort_source.subscribe(
-              [this]() noexcept { consumer_condition_.broadcast(); });
+              [this] noexcept { consumer_condition_.broadcast(); });
             if (abort_source.abort_requested()) {
                 continue;
             }
@@ -535,7 +670,7 @@ private:
           : queue_(queue)
           , active_(active) {
             KWAQUE_INVARIANT(
-              invariant_id{"KQ-WORK-QUEUE-ACTIVE-CAPACITY"},
+              active_capacity_invariant,
               active_ != std::numeric_limits<std::size_t>::max(),
               "queue operation counter overflow");
             ++active_;
@@ -544,7 +679,7 @@ private:
         operation_token& operator=(const operation_token&) = delete;
         ~operation_token() {
             KWAQUE_INVARIANT(
-              invariant_id{"KQ-WORK-QUEUE-ACTIVE-OPERATION"},
+              active_operation_invariant,
               active_ != 0,
               "queue operation counter underflow");
             --active_;
@@ -603,12 +738,12 @@ private:
         producer_cancellation(
           bounded_work_queue& queue, seastar::abort_source& caller)
           : queue_(queue)
-          , caller_subscription_(caller.subscribe(
-              [this]() noexcept { combined_.request_abort(); }))
+          , caller_subscription_(
+              caller.subscribe([this] noexcept { combined_.request_abort(); }))
           , queue_subscription_(queue_.producer_abort_.subscribe(
-              [this]() noexcept { combined_.request_abort(); }))
+              [this] noexcept { combined_.request_abort(); }))
           , wakeup_subscription_(combined_.subscribe(
-              [this]() noexcept { queue_.producer_condition_.broadcast(); })) {
+              [this] noexcept { queue_.producer_condition_.broadcast(); })) {
             if (
               caller.abort_requested()
               || queue_.producer_abort_.abort_requested()) {
@@ -858,12 +993,14 @@ private:
         const auto remaining = bytes_held_.checked_sub(
           byte_count{units.count()});
         KWAQUE_INVARIANT(
-          invariant_id{"KQ-WORK-QUEUE-BYTE-RELEASE"},
+          byte_release_invariant,
           remaining.has_value(),
           "queue released more bytes than it held");
         bytes_held_ = *remaining;
         units.return_all();
-        producer_condition_.signal();
+        if (admitting_producers_ != 0) {
+            producer_condition_.signal();
+        }
         maybe_finish_close();
     }
 

@@ -4,8 +4,10 @@
 #include "src/bytes/fragmented_buffer_builder.h"
 
 #include <seastar/core/deleter.hh>
+#include <seastar/core/memory.hh>
 #include <seastar/core/temporary_buffer.hh>
 #include <seastar/net/packet.hh>
+#include <seastar/util/alloc_failure_injector.hh>
 
 #include <gtest/gtest.h>
 
@@ -14,6 +16,9 @@
 #include <cstddef>
 #include <cstdint>
 #include <initializer_list>
+#include <limits>
+#include <new>
+#include <optional>
 #include <span>
 #include <string>
 #include <string_view>
@@ -22,6 +27,13 @@
 #include <vector>
 
 namespace kwaque::bytes {
+
+class fragmented_buffer_test_access final {
+public:
+    static void set_last_usable_generation(fragmented_buffer& buffer) noexcept {
+        buffer.generation_ = std::numeric_limits<std::uint64_t>::max() - 1;
+    }
+};
 
 namespace {
 
@@ -139,6 +151,140 @@ TEST(FragmentedBuffer, MoveTransfersOwnershipAndClearsSource) {
     // NOLINTEND(bugprone-use-after-move)
 }
 
+TEST(FragmentedBuffer, MoveAssignmentInvalidatesBothScatterPresentations) {
+    auto destination = fragmented({"abcde"});
+    auto source = fragmented({"12345"});
+    scatter_cursor destination_cursor;
+    scatter_cursor source_cursor;
+    auto destination_batch = destination.export_scatter(
+      1, byte_count{2}, destination_cursor);
+    auto source_batch = source.export_scatter(1, byte_count{2}, source_cursor);
+    ASSERT_TRUE(destination_batch.has_value());
+    ASSERT_TRUE(source_batch.has_value());
+
+    destination = std::move(source);
+    const auto old_destination_cursor = destination_cursor;
+    auto rejected = destination.export_scatter(
+      1, byte_count{5}, destination_cursor);
+    ASSERT_FALSE(rejected.has_value());
+    EXPECT_EQ(rejected.error(), make_error_code(errc::invalid_argument));
+    EXPECT_EQ(destination_cursor, old_destination_cursor);
+    EXPECT_FALSE(
+      destination.export_scatter(1, byte_count{5}, source_cursor).has_value());
+
+    // A moved-from buffer is still a live object; neither its empty state nor
+    // a replacement presentation can make its old cursor valid again.
+    // NOLINTBEGIN(bugprone-use-after-move)
+    EXPECT_FALSE(
+      source.export_scatter(1, byte_count{5}, source_cursor).has_value());
+    source = fragmented({"67890"});
+    EXPECT_FALSE(
+      source.export_scatter(1, byte_count{5}, source_cursor).has_value());
+    // NOLINTEND(bugprone-use-after-move)
+
+    scatter_cursor current;
+    auto current_batch = destination.export_scatter(1, byte_count{5}, current);
+    ASSERT_TRUE(current_batch.has_value());
+    EXPECT_TRUE(current_batch->complete());
+    EXPECT_EQ(
+      (std::string_view{(*current_batch)[0].data, (*current_batch)[0].size}),
+      "12345");
+    EXPECT_EQ(
+      (std::string_view{
+        (*destination_batch)[0].data, (*destination_batch)[0].size}),
+      "ab");
+    EXPECT_EQ(
+      (std::string_view{(*source_batch)[0].data, (*source_batch)[0].size}),
+      "12");
+    destination = fragmented({"vwxyz"});
+    EXPECT_FALSE(
+      destination.export_scatter(1, byte_count{5}, destination_cursor)
+        .has_value());
+    EXPECT_FALSE(
+      destination.export_scatter(1, byte_count{5}, current).has_value());
+}
+
+TEST(FragmentedBuffer, MoveConstructionAndRoundTripDoNotReviveScatterCursors) {
+    auto source = fragmented({"abcde"});
+    scatter_cursor cursor;
+    auto batch = source.export_scatter(1, byte_count{2}, cursor);
+    ASSERT_TRUE(batch.has_value());
+    const auto original_cursor = cursor;
+
+    auto moved = std::move(source);
+    EXPECT_FALSE(moved.export_scatter(1, byte_count{5}, cursor).has_value());
+    // NOLINTBEGIN(bugprone-use-after-move)
+    EXPECT_FALSE(source.export_scatter(1, byte_count{5}, cursor).has_value());
+    source = std::move(moved);
+    EXPECT_FALSE(source.export_scatter(1, byte_count{5}, cursor).has_value());
+    EXPECT_EQ(cursor, original_cursor);
+    EXPECT_TRUE(source.content_equals("abcde"));
+    // NOLINTEND(bugprone-use-after-move)
+
+    fragmented_buffer empty;
+    scatter_cursor empty_cursor;
+    ASSERT_TRUE(
+      empty.export_scatter(1, byte_count{1}, empty_cursor).has_value());
+    auto moved_empty = std::move(empty);
+    // NOLINTBEGIN(bugprone-use-after-move)
+    EXPECT_FALSE(
+      empty.export_scatter(1, byte_count{1}, empty_cursor).has_value());
+    empty = std::move(moved_empty);
+    EXPECT_FALSE(
+      empty.export_scatter(1, byte_count{1}, empty_cursor).has_value());
+    // NOLINTEND(bugprone-use-after-move)
+}
+
+TEST(FragmentedBuffer, SelfMovePreservesTheScatterPresentation) {
+    auto buffer = fragmented({"abcde"});
+    scatter_cursor cursor;
+    ASSERT_TRUE(buffer.export_scatter(1, byte_count{2}, cursor).has_value());
+    auto& alias = buffer;
+    buffer = std::move(alias);
+    auto remaining = buffer.export_scatter(1, byte_count{5}, cursor);
+    ASSERT_TRUE(remaining.has_value());
+    EXPECT_TRUE(remaining->complete());
+    EXPECT_EQ(
+      (std::string_view{(*remaining)[0].data, (*remaining)[0].size}), "cde");
+}
+
+TEST(FragmentedBuffer, PresentationExhaustionNeverWrapsOrTransfersIdentity) {
+    auto buffer = fragmented({"abcde"});
+    fragmented_buffer_test_access::set_last_usable_generation(buffer);
+    scatter_cursor last_cursor;
+    ASSERT_TRUE(
+      buffer.export_scatter(1, byte_count{2}, last_cursor).has_value());
+    ASSERT_TRUE(buffer.trim_front(byte_count{1}).has_value());
+    auto stale = buffer.export_scatter(1, byte_count{5}, last_cursor);
+    ASSERT_FALSE(stale.has_value());
+    EXPECT_EQ(stale.error(), make_error_code(errc::invalid_argument));
+
+    scatter_cursor fresh;
+    const auto unbound = fresh;
+    auto exhausted = buffer.export_scatter(1, byte_count{5}, fresh);
+    ASSERT_FALSE(exhausted.has_value());
+    EXPECT_EQ(exhausted.error(), make_error_code(errc::resource_exhausted));
+    EXPECT_EQ(fresh, unbound);
+    ASSERT_TRUE(buffer.trim_back(byte_count{1}).has_value());
+    buffer = fragmented({"12345"});
+    EXPECT_FALSE(buffer.export_scatter(1, byte_count{5}, fresh).has_value());
+    EXPECT_TRUE(buffer.content_equals("12345"));
+
+    // A new owner has its own presentation space. Its exhausted source keeps
+    // rejecting cursors after move construction and subsequent replacement.
+    auto new_owner = std::move(buffer);
+    ASSERT_TRUE(new_owner.export_scatter(1, byte_count{5}, fresh).has_value());
+    // NOLINTBEGIN(bugprone-use-after-move)
+    buffer = fragmented({"67890"});
+    scatter_cursor source_cursor;
+    auto source_exhausted = buffer.export_scatter(
+      1, byte_count{5}, source_cursor);
+    ASSERT_FALSE(source_exhausted.has_value());
+    EXPECT_EQ(
+      source_exhausted.error(), make_error_code(errc::resource_exhausted));
+    // NOLINTEND(bugprone-use-after-move)
+}
+
 TEST(FragmentedBuffer, EnforcesThePublishedFragmentCeiling) {
     std::vector<fragment_type> too_many;
     too_many.reserve(max_buffer_fragments + 1);
@@ -217,6 +363,48 @@ TEST(FragmentedBuffer, ShareIsZeroCopyAndOutlivesItsSource) {
     }
     EXPECT_EQ(contents(derived), expected);
     EXPECT_EQ(derived.fragment_at(0)->data(), backing[0]);
+}
+
+TEST(FragmentedBuffer, WarmShareAllocatesOneDescriptorBlock) {
+#if defined(SEASTAR_DEFAULT_ALLOCATOR)
+    GTEST_SKIP() << "native allocation counters require the Seastar allocator";
+#else
+    for (const std::size_t count :
+         {std::size_t{1},
+          std::size_t{64},
+          std::size_t{65},
+          max_buffer_fragments}) {
+        std::vector<fragment_type> fragments;
+        fragments.reserve(count);
+        for (std::size_t index = 0; index < count; ++index) {
+            fragments.push_back(fragment_of("x"));
+        }
+        auto source = fragmented_buffer::copy_from_fragments(fragments);
+        ASSERT_TRUE(source.has_value());
+        // Match steady-state sharing: the first share establishes the native
+        // reference counts, independently of descriptor storage allocation.
+        auto first_share = source->share();
+        const auto before = seastar::memory::stats().mallocs();
+        auto shared = source->share();
+        const auto after = seastar::memory::stats().mallocs();
+        EXPECT_EQ(after - before, 1U);
+        EXPECT_EQ(shared.fragment_count(), count);
+        EXPECT_EQ(shared.retained_bytes(), source->retained_bytes());
+        for (std::size_t index = 0; index < count; ++index) {
+            EXPECT_EQ(
+              shared.fragment_at(index)->data(),
+              source->fragment_at(index)->data());
+        }
+        const auto before_trim = seastar::memory::stats().mallocs();
+        const auto trimmed = shared.trim_front(byte_count{count - 1U});
+        const auto after_trim = seastar::memory::stats().mallocs();
+        ASSERT_TRUE(trimmed.has_value());
+        EXPECT_EQ(after_trim, before_trim);
+        EXPECT_EQ(shared.fragment_count(), 1U);
+        EXPECT_EQ(shared.retained_bytes().value(), 1U);
+        EXPECT_EQ(contents(first_share), std::string(count, 'x'));
+    }
+#endif
 }
 
 TEST(FragmentedBuffer, SlicedShareSpansFragmentBoundaries) {
@@ -842,6 +1030,97 @@ TEST(BufferBuilder, ExternalFragmentsAreFrozenThenPackedOrLinked) {
     // Sealing the tail exposes only the bytes that were written.
     EXPECT_EQ(published->fragment_at(0)->size(), 8U);
     EXPECT_EQ(published->fragment_at(2)->size(), 5U);
+}
+
+TEST(BufferBuilder, ExternalFragmentCeilingsRejectBeforeAllocationOrMutation) {
+    for (const std::size_t ceiling :
+         {std::size_t{8},
+          std::size_t{8192},
+          maximum_contiguous_allocation_bytes}) {
+        fragmented_buffer_builder_config config;
+        config.initial_fragment_bytes = byte_count{ceiling};
+        config.max_fragment_bytes = byte_count{ceiling};
+        fragmented_buffer_builder builder{config};
+        ASSERT_TRUE(builder.append(std::string_view{"head"}).has_value());
+        const auto size = builder.size();
+        const auto retained = builder.retained_bytes();
+        const auto fragments = builder.fragment_count();
+        const auto tail = builder.tail_capacity();
+        std::vector<char> backing(ceiling + 1, 'x');
+        auto oversized = borrowed_fragment(backing);
+
+        std::optional<result<void>> rejected;
+        auto& injector = seastar::memory::local_failure_injector();
+        const auto allocations = injector.alloc_count();
+        injector.fail_after(0);
+        try {
+            rejected.emplace(builder.append_fragment_copy(oversized));
+        } catch (...) {
+            injector.cancel();
+            throw;
+        }
+        const bool injected = injector.failed();
+        const auto allocations_after_rejection = injector.alloc_count();
+        injector.cancel();
+        EXPECT_FALSE(injected);
+        EXPECT_EQ(allocations_after_rejection, allocations);
+        ASSERT_TRUE(rejected.has_value());
+        ASSERT_FALSE(rejected->has_value());
+        EXPECT_EQ(rejected->error(), make_error_code(errc::resource_exhausted));
+        EXPECT_EQ(builder.size(), size);
+        EXPECT_EQ(builder.retained_bytes(), retained);
+        EXPECT_EQ(builder.fragment_count(), fragments);
+        EXPECT_EQ(builder.tail_capacity(), tail);
+
+        auto exact = borrowed_fragment(std::span<char>{backing}.first(ceiling));
+        ASSERT_TRUE(builder.append_fragment_copy(exact).has_value());
+        auto published = builder.finish();
+        ASSERT_TRUE(published.has_value());
+        EXPECT_EQ(published->size().value(), ceiling + 4U);
+        ASSERT_EQ(published->fragment_count(), 2U);
+        EXPECT_EQ(published->fragment_at(0)->bytes(), "head");
+        EXPECT_EQ(published->fragment_at(1)->size(), ceiling);
+        EXPECT_EQ(
+          published->fragment_at(1)->bytes(),
+          (std::string_view{backing.data(), ceiling}));
+        backing[0] = 'y';
+        EXPECT_EQ(published->fragment_at(1)->data()[0], 'x');
+    }
+}
+
+TEST(BufferBuilder, ExternalCloneAllocationFailureLeavesTheBuilderUsable) {
+#if !defined(SEASTAR_ENABLE_ALLOC_FAILURE_INJECTION)
+    GTEST_SKIP() << "allocation failure injection is not enabled";
+#else
+    fragmented_buffer_builder builder;
+    ASSERT_TRUE(builder.append(std::string_view{"head"}).has_value());
+    auto source = fragment_of(std::string(8192, 'x'));
+    const auto size = builder.size();
+    const auto retained = builder.retained_bytes();
+    const auto fragments = builder.fragment_count();
+    const auto tail = builder.tail_capacity();
+    auto& injector = seastar::memory::local_failure_injector();
+    bool failed = false;
+    injector.fail_after(0);
+    try {
+        static_cast<void>(builder.append_fragment_copy(source));
+    } catch (const std::bad_alloc&) {
+        failed = injector.failed();
+    } catch (...) {
+        injector.cancel();
+        throw;
+    }
+    injector.cancel();
+    ASSERT_TRUE(failed);
+    EXPECT_EQ(builder.size(), size);
+    EXPECT_EQ(builder.retained_bytes(), retained);
+    EXPECT_EQ(builder.fragment_count(), fragments);
+    EXPECT_EQ(builder.tail_capacity(), tail);
+    ASSERT_TRUE(builder.append(std::string_view{"tail"}).has_value());
+    auto published = builder.finish();
+    ASSERT_TRUE(published.has_value());
+    EXPECT_TRUE(published->content_equals("headtail"));
+#endif
 }
 
 TEST(BufferBuilder, AppendBufferSplicesAndEmptiesTheSource) {

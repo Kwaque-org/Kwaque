@@ -82,92 +82,224 @@ the default is `conf/kwaque.yaml` relative to the working directory.
 
 ## Development
 
-These are the canonical commands. Continuous integration runs the same targets
-through the `ci`, `ci-debug`, `ci-release`, and `ci-sanitizer` configurations,
-which add `-Werror` for first-party sources and serialize test execution.
-
-Build configurations are defined in [`.bazelrc`](.bazelrc): `dev` for the normal
-build-and-test cycle (light optimization plus AddressSanitizer), `debug` for
-full sanitizers, `release` for optimized and hardened binaries, `debugger` for
-unoptimized debugging, and `fuzz` for libFuzzer targets. Personal overrides
+Keep related commands in the same build configuration: switching configurations
+can invalidate Bazel's analysis cache and rebuild dependencies. Personal overrides
 belong in an untracked `user.bazelrc`.
 
-### Build
+`ci-debug` enables first-party warnings as errors. `ci-release` selects optimized,
+hardened binaries. `ci-sanitizer` runs with ASan and UBSan, and `fuzz` combines
+libFuzzer with ASan and UBSan. The normal developer `dev` configuration uses light
+optimization and ASan. All configurations are defined in [`.bazelrc`](.bazelrc).
+
+### Ordinary tests and builds
+
+Run all ordinary tests, including reactor, smoke, and packaging tests:
 
 ```bash
-bazel build --config=dev //:kwaque         # fast developer build
-bazel build --config=release //:kwaque     # optimized, hardened
+bazel test --config=ci-debug \
+  --build_tag_filters=-fuzz,-manual --test_tag_filters=-fuzz,-manual //...
 ```
 
-### Test
+Release coverage builds tests and benchmarks as well as libraries and the broker:
 
 ```bash
-bazel test --config=dev //...              # unit, reactor, smoke, packaging
-bazel test --config=debug //...            # same suite under ASan and UBSan
+bazel build --config=ci-release --build_tag_filters=-fuzz,-manual //...
 ```
 
-Both commands include the subprocess smoke tests. Fuzz targets are skipped
-unless the `fuzz` configuration is selected. Select a single class of work with
-the tags carried by every test target:
+Run the ordinary suite with sanitizers:
 
 ```bash
-bazel test --config=dev --test_tag_filters=smoke //...
-bazel query 'attr(tags, benchmark, //...)'
+bazel test --config=ci-sanitizer \
+  --build_tag_filters=-fuzz,-manual --test_tag_filters=-fuzz,-manual //...
+```
+
+The real adapter and environment suite uses loopback networking, an in-process
+DNS server, and directories below `TEST_TMPDIR`. Cleanup is awaited and failures
+propagate. To repeat that focused suite in sandboxes:
+
+```bash
+bazel test --config=ci-debug --spawn_strategy=sandboxed \
+  --runs_per_test=10 --cache_test_results=no //src/runtime/tests:hermetic_contracts
+```
+
+### Determinism goldens
+
+The same fixed random, fault-decision, trace, terminal-digest, and structured-event
+constants run on x86-64 and native AArch64 under both debug and release in CI.
+Run the suite locally with either configuration:
+
+```bash
+bazel test --config=ci-debug //src/simulation/tests:determinism_goldens
+bazel test --config=ci-release //src/simulation/tests:determinism_goldens
 ```
 
 ### Bounded fuzzing
 
+The PR smoke exercises every configuration, control-message, fragmented-buffer,
+scheduler, fault-schedule, fake-file, and fake-network fuzzer. Each target starts
+with a checked-in corpus and a two-second fuzzing budget:
+
 ```bash
-bazel test --config=fuzz \
+bazel test --config=ci --config=fuzz --keep_going --test_output=all \
+  --test_env=KWAQUE_FUZZ_MINIMIZE_SECONDS=30 \
+  --test_arg=-seed=1 --test_arg=-max_total_time=2 \
   //src/config:bootstrap_config_fuzz \
-  //proto/kwaque/common/v1:build_info_fuzz
+  //proto/kwaque/common/v1:build_info_fuzz \
+  //src/bytes:fragmented_buffer_fuzz \
+  //src/simulation/tests:scheduler_fuzz \
+  //src/simulation/tests:fault_schedule_fuzz \
+  //src/simulation/tests:fake_file_fuzz \
+  //src/simulation/tests:fake_network_fuzz \
+  //src/simulation/tests:signal_canary_test
 ```
 
-Each fuzz test runs for a bounded duration with fixed input and memory limits
-and seeds itself from the committed corpus. Pass a longer budget explicitly with
-`--test_arg=-max_total_time=60`.
+The buffer/parser input cap is 4 KiB; stateful inputs are capped at 16 KiB and
+have additional command, callback, object, and retained-byte limits. Every
+stateful input owns a fresh fixture and drains it before returning.
+
+The scheduled workflow gives each stateful fuzzer ten minutes. To run that
+campaign locally:
+
+```bash
+bazel test --config=ci --config=fuzz --keep_going --test_output=all \
+  --test_timeout=720 --test_env=KWAQUE_FUZZ_MINIMIZE_SECONDS=30 \
+  --test_arg=-max_total_time=600 \
+  //src/simulation/tests:scheduler_fuzz \
+  //src/simulation/tests:fault_schedule_fuzz \
+  //src/simulation/tests:fake_file_fuzz \
+  //src/simulation/tests:fake_network_fuzz
+```
+
+The `ci` configuration runs local tests one at a time, so four healthy ten-minute
+campaigns take about forty minutes plus build time. The native per-input timeout
+and external watchdog also bound stuck inputs. Diagnostic minimization after a
+failure has a separate budget; the original failure status is preserved.
+
+The wrapper resolves runfiles before changing the child's working directory.
+Writable corpora stay below `TEST_TMPDIR`; logs and original/minimized failure
+inputs go into Bazel's test undeclared outputs, alongside `test.log` under
+`bazel-testlogs`. CI uploads these outputs even after failure. Keep a fixed failure's
+reproducer in the corresponding checked-in corpus when landing its fix.
+
+`signal_canary_test` verifies an intentional reactor crash, minimization, and
+fresh-process replay and should pass. Its underlying manual
+`signal_canary_fuzz` target intentionally fails when run directly.
+
+### Reproduction replay
+
+A semantic mismatch prints a canonical block from `KQREPRO 01` through
+`END KQREPRO`. It contains the input and configuration, schema identities, typed
+outcome, terminal digest, scheduler trace, and structured events. Extract that
+whole block into a file outside the checkout, set `reproduction` to that file's
+path, and feed it to the replay runner:
+
+```bash
+bazel run --config=ci-debug //src/simulation/tests:fuzz_replay < "$reproduction"
+```
+
+Exit 0 means the recorded outcome and
+artifacts were reproduced, 1 means replay differed, and 2 means the envelope was
+invalid. A sanitizer signal may terminate before an envelope is emitted; retain
+its native crash input and harness identity for replay through the same fuzzer.
+
+The current harness version is 2; earlier harness versions are rejected before
+scenario execution. Input and configuration are bounded at 16 KiB each, and the
+structured-event log at 128 KiB. Scheduler traces are bounded at 128 KiB for
+scheduler/rule cases, 1 MiB for file histories, and 4 MiB for concurrent network
+histories. Large traces use the cooperative chunked codec; output lines remain
+at most 4 KiB. A replay difference reports the artifact and first entry's context.
+
+The subprocess reproduction test checks capture, replay, mutations, and portable
+output and retains its canonical sample in test undeclared outputs:
+
+```bash
+bazel test --config=ci-debug //src/simulation/tests:fuzz_reproduction_test
+```
 
 ### Benchmarks
 
+Use release binaries for measurements. List the available benchmark binaries and
+cases before selecting comparable work:
+
 ```bash
-bazel run --config=dev //bazel/tests:empty_benchmark -- --list
-bazel run --config=release //bazel/tests:empty_benchmark
+bazel query 'attr(tags, benchmark, //...)'
+bazel run --config=ci-release //src/runtime/tests:runtime_contract_bench -- --list
 ```
 
-Benchmark numbers are only meaningful from a `release` build; the sanitizer-based
-`dev` and `debug` configurations are far slower.
+The byte, runtime-contract, event, and simulation binaries include buffer, queue,
+scheduler, trace, event, fake-file, network, and bandwidth cases. Simulation
+absolute timings are informational. The paired comparison tool uses three
+randomized rounds with at least seven samples per invocation, checks allocation
+and task counts, and rejects a median paired timing regression above five percent.
+A speed win requires all three rounds to be below the baseline.
 
-### Formatting
+Build the release binary, then write results to a fresh directory outside the
+checkout. This example compares the paired queue-admission cases:
 
 ```bash
-bazel run //tools:format_cpp_changed          # format C++ touched by your branch
-bazel run //tools:format_cpp_all              # format every tracked C++ file
-bazel run //tools:format_cpp_changed -- --check   # report without writing
-bazel run //tools:buildifier_check            # check BUILD and .bzl files
-bazel run //tools:buildifier_fix              # rewrite BUILD and .bzl files
+bazel build --config=ci-release //src/runtime/tests:runtime_contract_bench
+mkdir -p "$HOME/.cache/kwaque"
+kwaque_results="$(mktemp -d "$HOME/.cache/kwaque/bench.XXXXXXXX")"
+python3 tools/compare_benchmarks.py \
+  --binary bazel-bin/src/runtime/tests/runtime_contract_bench \
+  --pair native_queue_admission.admit_pop_charge4096=kwaque_queue_admission.admit_pop_charge4096 \
+  --output-dir "$kwaque_results/queue"
+```
+
+The tool retains native JSON, logs, invocation order, and a comparison manifest.
+Equal work and fixture boundaries still require review; a passing time ratio
+alone does not establish an equivalent workload.
+
+### Formatting and repository checks
+
+```bash
+bazel run //tools:format_cpp_changed -- --check
+bazel run //tools:buildifier_check
+python3 tools/check_generated_artifacts.py
+python3 tools/check_dependency_inventory.py
+python3 tools/check_bazel_package_cycles.py
+python3 tools/check_cross_shard_usage.py
+python3 -m tools.check_runtime_boundaries
+python3 tools/check_determinism.py
+```
+
+The determinism checker is a lexical tripwire; executable goldens and noise tests
+remain necessary. Run the Python tooling tests directly without compiling C++:
+
+```bash
+python3 -B -m unittest discover -s tools -p '*_test.py'
+python3 -B -m unittest bazel.fuzz_test_wrapper_test
 ```
 
 ### Static analysis
 
-clang-tidy reads the generated compilation database, so regenerate it after
-changing build files or adding sources:
+Generate a fresh compilation database in the same configuration as the inputs
+being analyzed. Ordinary analysis includes tests, benchmarks, and simulation;
+strict analysis selects production sources using Bazel target ownership and
+package boundaries:
 
 ```bash
-bazel run //tools:compile_commands
-bazel run //tools:clang_tidy            # baseline checks, all sources
-bazel run //tools:clang_tidy_strict     # stricter profile, production sources
+bazel build --config=ci-debug --build_tag_filters=-fuzz,-manual //...
+bazel run --config=ci-debug //tools:compile_commands -- --config=ci-debug
+bazel run --config=ci-debug //tools:clang_tidy
+bazel run --config=ci-debug //tools:clang_tidy_strict
 ```
 
-### Repository checks
+Fuzz-only translation units need the fuzz configuration. CI runs this in a
+separate job, using ordinary checks for the fuzzers and their dependencies:
 
 ```bash
-bazel run //tools:check_dependency_inventory   # MODULE.bazel vs THIRD_PARTY.md
-bazel run //tools:check_generated_artifacts    # reject tracked build output
-bazel run //tools:check_bazel_package_cycles   # package graph must stay acyclic
-bazel run //tools:check_cross_shard_usage       # enforce shared-nothing transfers
-bazel run //tools:check_runtime_boundaries      # keep real/test backends separated
-bazel mod tidy                                 # must leave the lockfile unchanged
+bazel build --config=ci --config=fuzz --build_tag_filters=fuzz //...
+bazel run --config=ci --config=fuzz //tools:compile_commands -- --fuzz-only --config=ci --config=fuzz
+bazel run --config=ci --config=fuzz //tools:clang_tidy
 ```
+
+The databases remain ignored. Ordinary analysis retains every distinct compile
+variant of a source file; strict analysis uses the production commands in
+`.cache/clang-tidy-production/compile_commands.json`. Regenerate the debug
+database before returning to strict analysis after fuzz work. The generator
+adjusts compiler flags for workspace analysis; normal builds continue to enforce
+strict header layering.
 
 ### Package
 
@@ -190,7 +322,7 @@ pre-commit run --all-files
 ```
 
 The hooks cover whitespace, end-of-file newlines, C++ formatting, Bazel
-formatting, and the tracked-artifact guard. They require `pre-commit` on the
+formatting, and generated-artifact checks. They require `pre-commit` on the
 host; every hook is also enforced in continuous integration, so installing them
 locally is a convenience rather than a requirement.
 

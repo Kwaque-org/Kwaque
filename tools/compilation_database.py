@@ -8,6 +8,11 @@ import sys
 from pathlib import Path
 from typing import Any
 
+try:
+    from tools.run_clang_tidy import PRODUCTION_DATABASE_DIRECTORY, production_targets
+except ModuleNotFoundError:
+    from run_clang_tidy import PRODUCTION_DATABASE_DIRECTORY, production_targets
+
 CPP_SUFFIXES = frozenset({".c", ".cc", ".cpp", ".cxx"})
 
 # Paths that the build records as compiled-in-place locations. They are dropped
@@ -135,7 +140,35 @@ def compiler_arguments(
     return source, kept
 
 
-def generate(extra_bazel_args: list[str]) -> int:
+def select_commands(actions: list[dict], targets: list[dict], production: set[str],
+                    execution_root: Path, root: Path, *, production_only: bool = False) -> list[dict]:
+    labels = {str(target["id"]): target["label"] for target in targets}
+    candidates = {}
+    for action in actions:
+        parsed = compiler_arguments(action, execution_root)
+        if parsed is None:
+            continue
+        source, arguments = parsed
+        label = labels.get(str(action.get("targetId")))
+        if label is None:
+            raise RuntimeError("a workspace compilation action has no target identity")
+        if production_only and label not in production:
+            continue
+        entry = {"directory": str(root), "file": source, "arguments": arguments}
+        if "-o" in arguments:
+            entry["output"] = arguments[arguments.index("-o") + 1]
+        # Keep every distinct compile variant; native tooling supports multiple
+        # commands per source. Strict analysis gets a separate production subset.
+        candidates[(source, tuple(arguments))] = entry
+    return [candidates[key] for key in sorted(candidates)]
+
+
+def query_expression(fuzz_only: bool) -> str:
+    roots = 'attr(tags, "fuzz", //...)' if fuzz_only else '//... except attr(tags, "manual|fuzz", //...)'
+    return f'mnemonic("CppCompile", deps({roots}))'
+
+
+def generate(extra_bazel_args: list[str], *, fuzz_only: bool = False) -> int:
     root = workspace_root()
     # Pin every nested invocation to the base the workspace already points at.
     # Without this the nested bazel would silently pick its own default base and
@@ -147,7 +180,7 @@ def generate(extra_bazel_args: list[str]) -> int:
         "bazel",
         f"--output_base={output_base}",
         "aquery",
-        'mnemonic("CppCompile", //...)',
+        query_expression(fuzz_only),
         "--output=jsonproto",
         "--include_artifacts=false",
         "--features=-compiler_param_file",
@@ -166,25 +199,20 @@ def generate(extra_bazel_args: list[str]) -> int:
         text=True,
         stdout=subprocess.PIPE,
     )
-    actions = json.loads(result.stdout).get("actions", [])
-    entries: dict[str, dict[str, Any]] = {}
-    for action in actions:
-        parsed = compiler_arguments(action, execution_root)
-        if parsed is None:
-            continue
-        source, arguments = parsed
-        entries[source] = {
-            "directory": str(root),
-            "file": source,
-            "arguments": arguments,
-        }
-
-    output = [entries[key] for key in sorted(entries)]
+    response = json.loads(result.stdout)
+    production = set(production_targets(root))
+    output = select_commands(response.get("actions", []), response.get("targets", []),
+                             production, execution_root, root)
+    strict = select_commands(response.get("actions", []), response.get("targets", []),
+                             production, execution_root, root, production_only=True)
     if not output:
         raise RuntimeError("Bazel returned no workspace C++ compilation actions")
     destination = root / "compile_commands.json"
     destination.write_text(json.dumps(output, indent=2) + "\n")
-    print(f"Wrote {len(output)} entries to {destination}")
+    strict_directory = root / PRODUCTION_DATABASE_DIRECTORY
+    strict_directory.mkdir(parents=True, exist_ok=True)
+    (strict_directory / "compile_commands.json").write_text(json.dumps(strict, indent=2) + "\n")
+    print(f"Wrote {len(output)} ordinary and {len(strict)} production compilation commands")
     return 0
 
 
@@ -192,8 +220,9 @@ def main() -> int:
     parser = argparse.ArgumentParser(
         description="Generate compile_commands.json from Bazel"
     )
-    _, bazel_args = parser.parse_known_args()
-    return generate(bazel_args)
+    parser.add_argument("--fuzz-only", action="store_true", help="describe fuzz targets and their dependencies")
+    arguments, bazel_args = parser.parse_known_args()
+    return generate(bazel_args, fuzz_only=arguments.fuzz_only)
 
 
 if __name__ == "__main__":

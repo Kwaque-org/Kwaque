@@ -123,8 +123,8 @@ thread_local testing::invariant_observer current_observer = nullptr;
 
 } // namespace
 
-[[noreturn]] void invariant_failed(
-  invariant_id id,
+[[gnu::cold]] [[noreturn]] void invariant_failed(
+  const invariant_id& id,
   std::string_view expression,
   std::string_view context,
   std::source_location location) {

@@ -148,6 +148,31 @@ struct native_bulk_read_request final {
     };
 }
 
+[[nodiscard, gnu::noinline]] seastar::temporary_buffer<char>
+stage_aligned_write(
+  bytes::fragmented_buffer& data,
+  std::uint64_t data_size,
+  std::uint64_t memory_alignment) {
+    const auto allocation = round_up(data_size, memory_alignment);
+    KWAQUE_INVARIANT(
+      file_alignment_invariant,
+      allocation <= maximum_contiguous_allocation_bytes,
+      "file staging exceeded its contiguous allocation limit");
+    auto fragment = seastar::temporary_buffer<char>::aligned(
+      static_cast<std::size_t>(memory_alignment),
+      static_cast<std::size_t>(allocation));
+    auto consumer = detail::fragmented_buffer_io_access::consume(data);
+    const auto staged = consumer.copy_front_to(
+      std::span<char>{
+        fragment.get_write(), static_cast<std::size_t>(data_size)});
+    KWAQUE_INVARIANT(
+      file_consumption_invariant,
+      staged == data_size && data.empty(),
+      "fragmented write ended before its declared size");
+    fragment.trim(static_cast<std::size_t>(data_size));
+    return fragment;
+}
+
 } // namespace
 
 class file::writer final {
@@ -758,16 +783,6 @@ void file::request_abort() {
     io_intent_.cancel();
 }
 
-std::optional<operation_error> file::operation_rejection() const {
-    if (moved_from_ || state_ != file_state::open) {
-        return file_error(errc::closed);
-    }
-    if (abort_requested_) {
-        return file_error(errc::aborted);
-    }
-    return std::nullopt;
-}
-
 seastar::future<result<void>> file::flush() {
     owner_.assert_current();
     if (auto rejected = operation_rejection()) {
@@ -797,29 +812,7 @@ seastar::future<result<void>> file::flush() {
 }
 
 seastar::future<result<file_read_result>>
-file::read(file_position position, byte_count maximum_bytes) {
-    owner_.assert_current();
-    if (
-      auto valid = validate_file_read_request(position, maximum_bytes);
-      !valid) {
-        statistics_->reject();
-        result<file_read_result> outcome = failure(valid.error());
-        return seastar::make_ready_future<result<file_read_result>>(
-          std::move(outcome));
-    }
-    if (auto rejected = operation_rejection()) {
-        statistics_->reject();
-        result<file_read_result> outcome = failure(std::move(*rejected));
-        return seastar::make_ready_future<result<file_read_result>>(
-          std::move(outcome));
-    }
-    if (maximum_bytes > limits_.pending_read_bytes) {
-        statistics_->reject();
-        result<file_read_result> outcome = failure(
-          file_error(errc::out_of_range));
-        return seastar::make_ready_future<result<file_read_result>>(
-          std::move(outcome));
-    }
+file::read_validated(file_position position, byte_count maximum_bytes) {
     auto admission = try_acquire_read(maximum_bytes);
     if (!admission) {
         statistics_->reject();
@@ -928,87 +921,125 @@ seastar::future<result<file_read_result>> file::read_chunked(
 }
 
 seastar::future<result<byte_count>>
-file::write(file_position position, bytes::fragmented_buffer data) {
-    owner_.assert_current();
-    if (auto valid = validate_file_write_request(position, data); !valid) {
-        statistics_->reject();
-        result<byte_count> outcome = failure(valid.error());
-        return seastar::make_ready_future<result<byte_count>>(
-          std::move(outcome));
-    }
-    if (auto rejected = operation_rejection()) {
-        statistics_->reject();
-        result<byte_count> outcome = failure(std::move(*rejected));
-        return seastar::make_ready_future<result<byte_count>>(
-          std::move(outcome));
-    }
-    const auto append_alignment = disk_write_dma_alignment_;
-    const auto memory_alignment = memory_dma_alignment_;
-    const auto data_size = data.size().value();
-    const bool has_one_fragment = data.fragment_count() == 1;
-    const auto only_fragment = has_one_fragment ? *data.begin()
-                                                : bytes::fragment_view{};
-    auto serialization = seastar::try_get_units(write_serialization_, 1);
-    if (
-      serialization && has_one_fragment
-      && is_aligned(position.value(), append_alignment)
-      && is_aligned(data_size, append_alignment)
-      && data_size <= append_chunk_limit_
-      && is_aligned(only_fragment.data(), memory_alignment)) {
-        auto metric = statistics_->accept();
-        auto consumer = detail::fragmented_buffer_io_access::consume(data);
-        auto fragment = consumer.take_front();
-        const auto expected = fragment.size();
-        return native_file_
-          .dma_write(position.value(), fragment.get(), expected, &io_intent_)
-          .then_wrapped(
-            [this,
-             position = position.value(),
-             data = std::move(data),
-             fragment = std::move(fragment),
-             serialization = std::move(*serialization),
-             metric = std::move(metric),
-             expected,
-             append_alignment,
-             memory_alignment](seastar::future<std::size_t> completed) mutable
-              -> seastar::future<result<byte_count>> {
-                try {
-                    const auto written = completed.get();
-                    if (written == 0 || written > expected) {
-                        result<byte_count> outcome = failure(
-                          file_error(errc::io_failure));
-                        return seastar::make_ready_future<result<byte_count>>(
-                          std::move(outcome));
-                    }
-                    if (written == expected) {
-                        metric.add_completed_bytes(
-                          static_cast<std::uint64_t>(expected));
-                        result<byte_count> outcome = byte_count{
-                          static_cast<std::uint64_t>(expected)};
-                        return seastar::make_ready_future<result<byte_count>>(
-                          std::move(outcome));
-                    }
-                    return writer::finish_direct(
-                      *this,
-                      position,
-                      std::move(data),
-                      std::move(fragment),
-                      std::move(serialization),
-                      written,
-                      append_alignment,
-                      memory_alignment,
-                      std::move(metric));
-                } catch (const std::bad_alloc&) {
-                    return seastar::current_exception_as_future<
-                      result<byte_count>>();
-                } catch (...) {
-                    result<byte_count> outcome = failure(
-                      file_error_from_exception(std::current_exception()));
+file::write_validated(file_position position, bytes::fragmented_buffer& data) {
+    try {
+        const auto append_alignment = disk_write_dma_alignment_;
+        const auto memory_alignment = memory_dma_alignment_;
+        const auto data_size = data.size().value();
+        const bool has_one_fragment = data.fragment_count() == 1;
+        const auto front_fragment = *data.begin();
+        const bool aligned_front = is_aligned(
+          front_fragment.data(), memory_alignment);
+        auto serialization = seastar::try_get_units(write_serialization_, 1);
+        if (
+          serialization && is_aligned(position.value(), append_alignment)
+          && is_aligned(data_size, append_alignment)
+          && data_size <= append_chunk_limit_
+          && (has_one_fragment || front_fragment.size() < append_alignment || !aligned_front)) {
+            auto metric = statistics_->accept();
+            seastar::temporary_buffer<char> fragment;
+            if (has_one_fragment && aligned_front) {
+                auto consumer = detail::fragmented_buffer_io_access::consume(
+                  data);
+                fragment = consumer.take_front();
+            } else {
+                fragment = stage_aligned_write(
+                  data, data_size, memory_alignment);
+            }
+            if (auto rejected = operation_rejection()) {
+                return seastar::make_ready_future<result<byte_count>>(
+                  failure(std::move(*rejected)));
+            }
+            const auto expected = fragment.size();
+            auto completed = native_file_.dma_write(
+              position.value(), fragment.get(), expected, &io_intent_);
+#ifndef SEASTAR_DEBUG
+            // Match native ready completion without constructing pending state.
+            if (completed.available()) {
+                const auto written = completed.get();
+                if (written == 0 || written > expected) {
                     return seastar::make_ready_future<result<byte_count>>(
-                      std::move(outcome));
+                      failure(file_error(errc::io_failure)));
                 }
-            });
+                if (written == expected) {
+                    metric.add_completed_bytes(
+                      static_cast<std::uint64_t>(expected));
+                    return seastar::make_ready_future<result<byte_count>>(
+                      byte_count{static_cast<std::uint64_t>(expected)});
+                }
+                return writer::finish_direct(
+                  *this,
+                  position.value(),
+                  std::move(data),
+                  std::move(fragment),
+                  std::move(*serialization),
+                  written,
+                  append_alignment,
+                  memory_alignment,
+                  std::move(metric));
+            }
+#endif
+            return std::move(completed).then_wrapped(
+              [this,
+               position = position.value(),
+               data = std::move(data),
+               fragment = std::move(fragment),
+               serialization = std::move(*serialization),
+               metric = std::move(metric),
+               expected,
+               append_alignment,
+               memory_alignment](seastar::future<std::size_t> completed) mutable
+                -> seastar::future<result<byte_count>> {
+                  try {
+                      const auto written = completed.get();
+                      if (written == 0 || written > expected) {
+                          result<byte_count> outcome = failure(
+                            file_error(errc::io_failure));
+                          return seastar::make_ready_future<result<byte_count>>(
+                            std::move(outcome));
+                      }
+                      if (written == expected) {
+                          metric.add_completed_bytes(
+                            static_cast<std::uint64_t>(expected));
+                          result<byte_count> outcome = byte_count{
+                            static_cast<std::uint64_t>(expected)};
+                          return seastar::make_ready_future<result<byte_count>>(
+                            std::move(outcome));
+                      }
+                      return writer::finish_direct(
+                        *this,
+                        position,
+                        std::move(data),
+                        std::move(fragment),
+                        std::move(serialization),
+                        written,
+                        append_alignment,
+                        memory_alignment,
+                        std::move(metric));
+                  } catch (const std::bad_alloc&) {
+                      return seastar::current_exception_as_future<
+                        result<byte_count>>();
+                  } catch (...) {
+                      result<byte_count> outcome = failure(
+                        file_error_from_exception(std::current_exception()));
+                      return seastar::make_ready_future<result<byte_count>>(
+                        std::move(outcome));
+                  }
+              });
+        }
+        return write_general(position, data, std::move(serialization));
+    } catch (const std::bad_alloc&) {
+        return seastar::current_exception_as_future<result<byte_count>>();
+    } catch (...) {
+        return seastar::make_ready_future<result<byte_count>>(
+          failure(file_error_from_exception(std::current_exception())));
     }
+}
+
+seastar::future<result<byte_count>> file::write_general(
+  file_position position,
+  bytes::fragmented_buffer& data,
+  std::optional<seastar::semaphore_units<>> serialization) {
     std::optional<admission_reservation> queued;
     if (!serialization) {
         queued = try_acquire_queued_write(data.retained_bytes());

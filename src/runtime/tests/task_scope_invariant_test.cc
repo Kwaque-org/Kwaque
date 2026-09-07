@@ -17,7 +17,7 @@ TEST(
           seastar::promise<> release;
           kwaque::runtime::task_scope scope;
           const auto accepted = scope.spawn(
-            [pending = release.get_future()]() mutable {
+            [pending = release.get_future()] mutable {
                 return std::move(pending);
             });
           if (!accepted.has_value()) {

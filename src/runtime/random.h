@@ -4,9 +4,11 @@
 #include "src/runtime/error.h"
 
 #include <algorithm>
+#include <bit>
 #include <concepts>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <span>
 
 namespace kwaque::runtime {
@@ -108,6 +110,13 @@ void fill_bytes(Source& source, std::span<std::byte> destination) noexcept {
         auto word = source.next_u64();
         const auto count = std::min<std::size_t>(
           sizeof(word), destination.size() - offset);
+        if constexpr (std::endian::native == std::endian::little) {
+            if (count == sizeof(word)) {
+                std::memcpy(destination.data() + offset, &word, sizeof(word));
+                offset += count;
+                continue;
+            }
+        }
         for (std::size_t index = 0; index < count; ++index) {
             destination[offset + index] = static_cast<std::byte>(
               word & std::uint64_t{0xff});

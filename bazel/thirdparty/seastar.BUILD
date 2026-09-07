@@ -182,9 +182,6 @@ py_binary(
     visibility = ["//visibility:public"],
 )
 
-# the fix to the generated parsers applied in the cmake build appears to be
-# unnecessary with recent versions of ragel. omitting until needed. see
-# https://github.com/scylladb/seastar/commit/1cb8b0e for more info.
 genrule(
     name = "http_request_parser",
     srcs = ["src/http/request_parser.rl"],

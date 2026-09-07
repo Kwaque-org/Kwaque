@@ -1,9 +1,11 @@
 #ifndef KWAQUE_SRC_RUNTIME_TESTING_CONTRACTS_ENVIRONMENT_CONTRACT_H_
 #define KWAQUE_SRC_RUNTIME_TESTING_CONTRACTS_ENVIRONMENT_CONTRACT_H_
 
+#include "src/base/error.h"
 #include "src/observability/event_sink_concept.h"
 #include "src/resource/resource_manager.h"
 #include "src/runtime/environment.h"
+#include "src/runtime/testing/contracts/cleanup.h"
 #include "src/runtime/testing/contracts/environment_component.h"
 
 #include <seastar/core/coroutine.hh>
@@ -15,6 +17,7 @@
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <system_error>
 #include <type_traits>
 #include <utility>
 #include <vector>
@@ -157,9 +160,10 @@ seastar::future<environment_contract_observation> run_environment_contract(
         auto outcome = co_await environment_contract_detail::drive_operation(
           std::move(component_work), driver, *component);
         if (!outcome) {
-            environment_contract_detail::fail(
+            throw std::system_error(
+              make_error_code(outcome.error().code()),
               "environment component returned a typed failure: "
-              + outcome.error().render());
+                + outcome.error().render());
         }
         auto result = std::move(*outcome);
         environment_contract_detail::require(
@@ -255,6 +259,7 @@ seastar::future<environment_contract_observation> run_environment_contract(
                 co_await environment_contract_detail::drive_lifecycle(
                   component->stop(), driver);
             } catch (...) {
+                retain_cleanup_failure(first_failure);
             }
             component.reset();
         }
@@ -265,6 +270,7 @@ seastar::future<environment_contract_observation> run_environment_contract(
                 co_await environment_contract_detail::drive_lifecycle(
                   environment.stop(), driver);
             } catch (...) {
+                retain_cleanup_failure(first_failure);
             }
         }
         std::rethrow_exception(first_failure);

@@ -627,6 +627,139 @@ SEASTAR_TEST_CASE(fault_selectors_have_exact_window_and_draw_semantics) {
     co_return;
 }
 
+SEASTAR_TEST_CASE(fault_decisions_match_canonical_keyed_vectors) {
+    const auto ratio = kwaque::runtime::probability_ratio::make(
+      UINT64_C(0x4000000000000005), UINT64_C(0x800000000000000b));
+    BOOST_REQUIRE(ratio.has_value());
+    fixture environment;
+    seastar::chunked_vector<fault_rule> rules;
+    rules.push_back(make_rule(
+      71,
+      builtin_fault_point::file_read,
+      fault_object_key::from_u64(8),
+      1,
+      6,
+      fault_selector::rational(*ratio),
+      fault_decision::make_delay(kwaque::runtime::monotonic_duration{11})));
+    rules.push_back(make_rule(
+      72,
+      builtin_fault_point::file_write,
+      fault_object_key::from_u64(8),
+      1,
+      6,
+      fault_selector::rational(*ratio)));
+    auto schedule = environment.schedule(std::move(rules));
+
+    struct golden final {
+        builtin_fault_point point;
+        std::uint64_t rule_id;
+        std::uint64_t occurrence;
+        std::uint64_t sample;
+        std::uint64_t draws;
+        fault_action action;
+        std::uint32_t trace_result;
+    };
+    // These samples include rejection across both lanes and multiple blocks.
+    // Rule identity and occurrence select each decision independently.
+    constexpr std::array expected{
+      golden{
+        builtin_fault_point::file_read,
+        71,
+        1,
+        UINT64_C(0x0a8e88ebba778499),
+        3,
+        fault_action::delay,
+        0x102},
+      golden{
+        builtin_fault_point::file_write,
+        72,
+        1,
+        UINT64_C(0x68fd7bf001a45d6b),
+        1,
+        fault_action::none,
+        0x201},
+      golden{
+        builtin_fault_point::file_read,
+        71,
+        2,
+        UINT64_C(0x742ea16a0de9f2d2),
+        2,
+        fault_action::none,
+        0x202},
+      golden{
+        builtin_fault_point::file_write,
+        72,
+        2,
+        UINT64_C(0x359a2977a3783912),
+        1,
+        fault_action::error,
+        0x101},
+      golden{
+        builtin_fault_point::file_read,
+        71,
+        5,
+        UINT64_C(0x3422cc69ecfba2ff),
+        4,
+        fault_action::delay,
+        0x102},
+      golden{
+        builtin_fault_point::file_write,
+        72,
+        5,
+        UINT64_C(0x2d310f5f25ee7e7c),
+        1,
+        fault_action::error,
+        0x101},
+      golden{
+        builtin_fault_point::file_read,
+        71,
+        6,
+        UINT64_C(0x576a2568c0d560ba),
+        5,
+        fault_action::none,
+        0x202},
+      golden{
+        builtin_fault_point::file_write,
+        72,
+        6,
+        UINT64_C(0x080a2f155296658d),
+        1,
+        fault_action::error,
+        0x101},
+    };
+    for (std::size_t index = 0; index < expected.size(); ++index) {
+        const auto& vector = expected[index];
+        const auto evaluated = schedule->evaluate(request(
+          vector.point, vector.occurrence, fault_object_key::from_u64(8)));
+        BOOST_REQUIRE(evaluated.has_value());
+        BOOST_CHECK(evaluated->action() == vector.action);
+        if (vector.action == fault_action::delay) {
+            BOOST_REQUIRE(evaluated->delay().has_value());
+            BOOST_CHECK_EQUAL(evaluated->delay()->nanoseconds(), 11U);
+        } else {
+            BOOST_CHECK(!evaluated->delay().has_value());
+        }
+        BOOST_REQUIRE(environment.trace.entries().size() == index + 1U);
+        const auto& entry = environment.trace.entries()[index];
+        BOOST_CHECK_EQUAL(entry.sequence, index + 1U);
+        BOOST_CHECK_EQUAL(entry.time.nanoseconds(), 0U);
+        BOOST_CHECK(entry.action == trace_action::fault_evaluated);
+        BOOST_CHECK(entry.kind == trace_event_kind::fault);
+        BOOST_CHECK_EQUAL(
+          entry.domain,
+          vector.point == builtin_fault_point::file_read ? 6U : 7U);
+        BOOST_CHECK_EQUAL(entry.stable_id, vector.rule_id);
+        BOOST_CHECK_EQUAL(entry.coordinate_a, vector.occurrence);
+        BOOST_CHECK_EQUAL(entry.coordinate_b, vector.draws);
+        BOOST_CHECK_EQUAL(entry.value, vector.sample);
+        BOOST_CHECK_EQUAL(entry.result, vector.trace_result);
+    }
+    BOOST_CHECK_EQUAL(schedule->evaluations(), 8U);
+    BOOST_CHECK_EQUAL(schedule->applied_decisions(), 5U);
+    BOOST_CHECK_EQUAL(environment.events.pending_events(), 0U);
+    co_return;
+}
+
 SEASTAR_TEST_CASE(fault_preparation_rolls_back_and_commits_exactly_once) {
     fixture environment;
     seastar::chunked_vector<fault_rule> rules;

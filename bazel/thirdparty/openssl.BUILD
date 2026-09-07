@@ -4,10 +4,10 @@ load("@rules_foreign_cc//foreign_cc:defs.bzl", "configure_make")
 
 int_flag(
     name = "build_jobs",
-    # Nested Make jobs are invisible to Bazel's resource scheduler. Keep the
-    # inner build serial by default. For an isolated dependency build, override
-    # it with --@openssl//:build_jobs=N.
-    build_setting_default = 1,
+    # Bound nested Make parallelism explicitly: Bazel does not account for
+    # these inner jobs individually. Override with --@openssl//:build_jobs=N
+    # when the build host needs a different limit.
+    build_setting_default = 8,
     make_variable = "BUILD_JOBS",
 )
 

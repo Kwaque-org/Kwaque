@@ -19,17 +19,18 @@ class PackageCycleTest(unittest.TestCase):
     def test_resolves_relative_workspace_from_bazel_invocation_directory(
         self,
     ) -> None:
+        fixture_root = Path("/") / "workspace" / "kwaque"
         with patch.dict(
             os.environ,
-            {"BUILD_WORKSPACE_DIRECTORY": "/workspace/kwaque"},
+            {"BUILD_WORKSPACE_DIRECTORY": str(fixture_root)},
             clear=False,
         ):
-            self.assertEqual(resolve_workspace(Path(".")), Path("/workspace/kwaque"))
+            self.assertEqual(resolve_workspace(Path(".")), fixture_root)
             self.assertEqual(
                 resolve_workspace(Path("nested")),
-                Path("/workspace/kwaque/nested"),
+                fixture_root / "nested",
             )
-            self.assertEqual(resolve_workspace(None), Path("/workspace/kwaque"))
+            self.assertEqual(resolve_workspace(None), fixture_root)
 
     def test_accepts_acyclic_graph(self) -> None:
         graph = {

@@ -186,6 +186,41 @@ sha256_digest sha256(const trace_artifact& artifact) {
 
 } // namespace
 
+SEASTAR_TEST_CASE(deterministic_scenario_matches_canonical_terminal_digest) {
+    const auto scheduler_budget = scenario_scheduler_limits();
+    const auto trace_budget = scenario_trace_limits();
+    event_trace trace{
+      scenario_header(92, scheduler_budget, trace_budget), trace_budget};
+    std::uint64_t state = 0;
+    std::int64_t offset = 0;
+    BOOST_REQUIRE(run_scenario(trace, scheduler_budget, 92, 41, state, &offset)
+                    .has_value());
+    BOOST_TEST(state == UINT64_C(0x4090a7104867c548));
+    BOOST_TEST(offset == 20);
+
+    // The terminal snapshot is state followed by signed wall offset, each
+    // encoded as one little-endian 64-bit word independently of host layout.
+    const std::array<std::uint64_t, 2> fields{
+      state, static_cast<std::uint64_t>(offset)};
+    std::array<unsigned char, 16> encoded{};
+    for (std::size_t field = 0; field < fields.size(); ++field) {
+        for (std::size_t byte = 0; byte < sizeof(std::uint64_t); ++byte) {
+            encoded[field * sizeof(std::uint64_t) + byte]
+              = static_cast<unsigned char>(fields[field] >> (8U * byte));
+        }
+    }
+    constexpr sha256_digest expected{
+      0xb3, 0x13, 0x76, 0x44, 0x24, 0x0c, 0x6f, 0x09, 0xff, 0x0b, 0x02,
+      0x78, 0xa1, 0x61, 0xcd, 0x05, 0x5c, 0xb6, 0xfa, 0xa0, 0x03, 0x35,
+      0x1f, 0x34, 0x75, 0x25, 0x5e, 0x75, 0x66, 0x99, 0x6a, 0xea,
+    };
+    sha256_hasher hasher;
+    hasher.update(encoded.data(), encoded.size());
+    const auto actual = std::move(hasher).final();
+    BOOST_TEST(actual == expected, boost::test_tools::per_element());
+    co_return;
+}
+
 SEASTAR_TEST_CASE(deterministic_scenario_is_byte_identical_under_noise) {
     const auto scheduler_budget = scenario_scheduler_limits();
     const auto trace_budget = scenario_trace_limits();

@@ -195,7 +195,7 @@ seastar::future<Result> invoke_on_shard(
       target,
       seastar::smp_submit_to_options{service_group},
       [function = std::move(function),
-       arguments = std::tuple<Args...>{std::move(args)...}]() mutable {
+       arguments = std::tuple<Args...>{std::move(args)...}] mutable {
           return std::apply(
             [&function](Args&... values) {
                 if constexpr (

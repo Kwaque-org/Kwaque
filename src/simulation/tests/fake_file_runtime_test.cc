@@ -132,6 +132,19 @@ fault_rule rule(const storage_fault_rule& source) {
     case storage_fault_action::partial_resize:
         decision = fault_decision::make_partial_resize();
         break;
+    case storage_fault_action::short_operation:
+        decision = fault_decision::make_short_operation(
+          kwaque::byte_count{source.payload});
+        break;
+    case storage_fault_action::corrupt:
+        decision = fault_decision::make_corrupt();
+        break;
+    case storage_fault_action::torn_write:
+        decision = fault_decision::make_torn_write();
+        break;
+    case storage_fault_action::misdirect:
+        decision = fault_decision::make_misdirect();
+        break;
     }
     return rule(
       source.id,

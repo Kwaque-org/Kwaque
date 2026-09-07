@@ -98,6 +98,51 @@ TEST(DeterministicRandomTest, NamedStreamsAreIndependentAndResettable) {
     EXPECT_EQ(stream_a->next_u64(), reset_reference->next_u64());
 }
 
+TEST(DeterministicRandomTest, MatchesCanonicalSequentialStreamVectors) {
+    const deterministic_random random{UINT64_C(0x0123456789abcdef)};
+    auto source = random.stream(random_domain::runtime_stream, 11, 7);
+    auto other_id = random.stream(random_domain::runtime_stream, 12, 7);
+    auto other_domain = random.stream(random_domain::fault_decision, 11, 7);
+    ASSERT_TRUE(source && other_id && other_domain);
+
+    constexpr std::array expected{
+      UINT64_C(0xb75dbc5bfc593e00),
+      UINT64_C(0xdbdbaac22c8d36db),
+      UINT64_C(0x49f0398ddf8b67f3),
+      UINT64_C(0x4f7b8e79c0e85ae8),
+      UINT64_C(0x895752e56d402892),
+      UINT64_C(0x169f6bc6c1e0fa37),
+      UINT64_C(0xb94a580785911a15),
+      UINT64_C(0x2e2fda07260a6473),
+    };
+    for (std::size_t draw = 0; draw < expected.size(); ++draw) {
+        EXPECT_EQ(source->draw_index(), draw);
+        EXPECT_EQ(source->next_u64(), expected[draw]) << "draw=" << draw;
+        if (draw == 0) {
+            EXPECT_EQ(other_id->next_u64(), UINT64_C(0x24c8798f0927e7dd));
+            EXPECT_EQ(other_domain->next_u64(), UINT64_C(0xf72a969f2f3dac57));
+        }
+    }
+    EXPECT_EQ(source->draw_index(), expected.size());
+    EXPECT_EQ(other_id->next_u64(), UINT64_C(0x2aa5ae6e84690508));
+    EXPECT_EQ(other_domain->next_u64(), UINT64_C(0x130b37d29477092f));
+
+    source->reset(9);
+    EXPECT_EQ(source->occurrence(), 9U);
+    EXPECT_FALSE(source->exhausted());
+    constexpr std::array after_reset{
+      UINT64_C(0x1c7d903562f2dc43),
+      UINT64_C(0x3e0b5ea37c8985aa),
+      UINT64_C(0xc27cf2d39c26df13),
+      UINT64_C(0x501727778461c554),
+    };
+    for (std::size_t draw = 0; draw < after_reset.size(); ++draw) {
+        EXPECT_EQ(source->draw_index(), draw);
+        EXPECT_EQ(source->next_u64(), after_reset[draw]) << "draw=" << draw;
+    }
+    EXPECT_EQ(source->draw_index(), after_reset.size());
+}
+
 TEST(DeterministicRandomTest, SequentialExhaustionIsDetectedBeforeReuse) {
     const deterministic_random random{UINT64_MAX};
     const auto source_coordinate = coordinate(

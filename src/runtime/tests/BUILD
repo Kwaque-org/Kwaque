@@ -82,6 +82,8 @@ kwaque_cc_seastar_test(
         "//src/runtime:network",
         "//src/runtime/production:environment",
         "//src/runtime/production:environment_test_support",
+        "//src/runtime/testing:test_directory",
+        "//src/runtime/testing/contracts:cleanup",
         "//src/runtime/testing/contracts:dns_test_server",
         "//src/runtime/testing/contracts:environment_contract",
         "//src/runtime/testing/contracts:environment_lifecycle_contract",
@@ -109,6 +111,8 @@ kwaque_cc_seastar_test(
     deps = [
         "//src/runtime:file",
         "//src/runtime:fragmented_buffer_internal",
+        "//src/runtime/testing:test_directory",
+        "//src/runtime/testing/contracts:cleanup",
     ],
 )
 
@@ -120,6 +124,8 @@ kwaque_cc_seastar_test(
     deps = [
         "//src/runtime:file",
         "//src/runtime/production:file",
+        "//src/runtime/testing:test_directory",
+        "//src/runtime/testing/contracts:cleanup",
     ],
 )
 
@@ -181,6 +187,7 @@ kwaque_cc_seastar_test(
     deps = [
         "//src/runtime:dns",
         "//src/runtime/production:dns",
+        "//src/runtime/testing/contracts:cleanup",
         "//src/runtime/testing/contracts:dns_contract",
         "//src/runtime/testing/contracts:dns_test_server",
     ],
@@ -213,12 +220,18 @@ kwaque_cc_test(
 
 kwaque_cc_benchmark(
     name = "runtime_contract_bench",
-    srcs = ["runtime_contract_bench.cc"],
+    srcs = [
+        "runtime_contract_bench.cc",
+        "runtime_queue_bench.cc",
+    ],
     memory = "128MiB",
     deps = [
+        "//src/base",
+        "//src/resource:bounded_work_queue",
         "//src/runtime:environment",
         "//src/runtime:operation_statistics",
         "//src/runtime:random",
+        "//src/runtime:shard_affinity",
         "//src/runtime/production:clocks",
         "//src/runtime/production:dns",
         "//src/runtime/production:random",
@@ -250,6 +263,26 @@ kwaque_cc_benchmark(
         "//src/runtime:fragmented_buffer_internal",
         "//src/runtime:network",
         "//src/runtime/production:network",
+        "@seastar",
+    ],
+)
+
+kwaque_cc_benchmark(
+    name = "runtime_network_counter_bench",
+    srcs = [
+        "network_benchmark_transport.h",
+        "runtime_network_bench.cc",
+    ],
+    args = ["--task-quota-ms=60000"],
+    local_defines = ["KWAQUE_CONTROLLED_NETWORK_BENCH=1"],
+    memory = "128MiB",
+    deps = [
+        "//src/base",
+        "//src/bytes:fragmented_buffer",
+        "//src/runtime:fragmented_buffer_internal",
+        "//src/runtime:network",
+        "//src/runtime/production:network",
+        "//src/runtime/production:network_test_support",
         "@seastar",
     ],
 )
@@ -339,4 +372,29 @@ kwaque_cc_seastar_gtest(
     cpu = 1,
     memory = "128MiB",
     deps = ["//src/runtime:task_scope"],
+)
+
+test_suite(
+    name = "hermetic_contracts",
+    tests = [
+        ":production_dns_test",
+        ":production_environment_test",
+        ":production_file_system_test",
+        ":production_file_test",
+        ":production_network_test",
+        ":production_primitives_test",
+        ":sharded_service_test",
+        ":test_directory_test",
+    ],
+    visibility = ["//visibility:public"],
+)
+
+kwaque_cc_seastar_test(
+    name = "test_directory_test",
+    srcs = ["test_directory_test.cc"],
+    deps = [
+        "//src/runtime:error",
+        "//src/runtime/testing:test_directory",
+        "//src/runtime/testing/contracts:cleanup",
+    ],
 )

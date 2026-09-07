@@ -3,7 +3,10 @@ load("//bazel:build.bzl", "kwaque_cc_binary")
 load("//bazel:test.bzl", "kwaque_cc_test")
 
 exports_files(
-    ["fuzz_test_wrapper.py"],
+    [
+        "fuzz_signal_canary_test.py",
+        "fuzz_test_wrapper.py",
+    ],
     visibility = ["//visibility:public"],
 )
 

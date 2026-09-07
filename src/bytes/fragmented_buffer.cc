@@ -34,7 +34,7 @@ deep_copy_allocation_size(std::uint64_t remaining) noexcept {
 } // namespace
 
 fragmented_buffer::fragmented_buffer(
-  std::deque<owned_fragment> fragments,
+  fragment_storage fragments,
   byte_count size,
   byte_count retained_bytes) noexcept
   : fragments_(std::move(fragments))
@@ -44,9 +44,9 @@ fragmented_buffer::fragmented_buffer(
 fragmented_buffer::fragmented_buffer(fragmented_buffer&& other) noexcept
   : fragments_(std::move(other.fragments_))
   , size_(std::exchange(other.size_, byte_count{}))
-  , retained_bytes_(std::exchange(other.retained_bytes_, byte_count{}))
-  , generation_(std::exchange(other.generation_, 0)) {
+  , retained_bytes_(std::exchange(other.retained_bytes_, byte_count{})) {
     other.fragments_.clear();
+    other.invalidate_presentation();
 }
 
 fragmented_buffer&
@@ -56,13 +56,14 @@ fragmented_buffer::operator=(fragmented_buffer&& other) noexcept {
         other.fragments_.clear();
         size_ = std::exchange(other.size_, byte_count{});
         retained_bytes_ = std::exchange(other.retained_bytes_, byte_count{});
-        generation_ = std::exchange(other.generation_, 0);
+        invalidate_presentation();
+        other.invalidate_presentation();
     }
     return *this;
 }
 
-result<byte_count> fragmented_buffer::total_size(
-  const std::deque<owned_fragment>& fragments) noexcept {
+result<byte_count>
+fragmented_buffer::total_size(const fragment_storage& fragments) noexcept {
     std::uint64_t total = 0;
     for (const auto& fragment : fragments) {
         const auto fragment_size = static_cast<std::uint64_t>(
@@ -82,7 +83,7 @@ void fragmented_buffer::drop_empty_fragments() {
             continue;
         }
         retained_bytes_ = *retained_bytes_.checked_sub(current->retained_bytes);
-        current = fragments_.erase(current);
+        current = fragments_.erase(current, current + 1);
     }
 }
 
@@ -115,7 +116,8 @@ fragmented_buffer::copy_from_fragments(std::span<const fragment_type> source) {
         }
     }
 
-    std::deque<owned_fragment> fragments;
+    fragment_storage fragments;
+    fragments.reserve_back(fragment_count);
     for (const auto& fragment : source) {
         if (!fragment.empty()) {
             const byte_count size{static_cast<std::uint64_t>(fragment.size())};
@@ -138,7 +140,9 @@ fragmented_buffer::copy_of(std::span<const char> bytes) {
     if (bytes.size() > max_buffer_bytes.value()) {
         return failure(errc::resource_exhausted);
     }
-    std::deque<owned_fragment> fragments;
+    fragment_storage fragments;
+    fragments.reserve_back(
+      1U + (bytes.size() - 1U) / maximum_contiguous_allocation_bytes);
     std::size_t offset = 0;
     while (offset < bytes.size()) {
         const auto size = std::min(
@@ -164,18 +168,6 @@ result<fragment_view> fragmented_buffer::fragment_at(std::size_t index) const {
     return fragment_view{fragment.storage.get(), fragment.storage.size()};
 }
 
-fragmented_buffer fragmented_buffer::share() {
-    std::deque<owned_fragment> shared;
-    for (auto& fragment : fragments_) {
-        shared.push_back(
-          owned_fragment{
-            .storage = fragment.storage.share(),
-            .retained_bytes = fragment.retained_bytes,
-          });
-    }
-    return fragmented_buffer{std::move(shared), size_, retained_bytes_};
-}
-
 result<fragmented_buffer>
 fragmented_buffer::share(byte_count offset, byte_count length) {
     const auto end = offset.checked_add(length);
@@ -186,7 +178,7 @@ fragmented_buffer::share(byte_count offset, byte_count length) {
         return fragmented_buffer{};
     }
 
-    std::deque<owned_fragment> shared;
+    fragment_storage shared;
     byte_count retained;
     std::uint64_t skip = offset.value();
     std::uint64_t remaining = length.value();
@@ -229,7 +221,7 @@ fragmented_buffer fragmented_buffer::copy() const {
     const auto minimum_chunk = size_.value() / max_buffer_fragments
                                + static_cast<std::uint64_t>(
                                  size_.value() % max_buffer_fragments != 0);
-    std::deque<owned_fragment> copied;
+    fragment_storage copied;
     std::size_t source_index = 0;
     std::size_t source_offset = 0;
     std::uint64_t remaining = size_.value();
@@ -296,7 +288,7 @@ result<void> fragmented_buffer::trim_front(byte_count bytes) {
     }
     size_ = *size_.checked_sub(bytes);
     retained_bytes_ = *retained_bytes_.checked_sub(released);
-    ++generation_;
+    invalidate_presentation();
     drop_empty_fragments();
     return {};
 }
@@ -333,7 +325,7 @@ result<void> fragmented_buffer::trim_back(byte_count bytes) {
     }
     size_ = *size_.checked_sub(bytes);
     retained_bytes_ = *retained_bytes_.checked_sub(released);
-    ++generation_;
+    invalidate_presentation();
     drop_empty_fragments();
     return {};
 }
@@ -347,6 +339,9 @@ result<scatter_batch> fragmented_buffer::export_scatter(
       cursor.owner_ != nullptr
       && (cursor.owner_ != this || cursor.generation_ != generation_)) {
         return failure(errc::invalid_argument);
+    }
+    if (generation_ == std::numeric_limits<std::uint64_t>::max()) {
+        return failure(errc::resource_exhausted);
     }
     if (
       cursor.fragment_ > fragments_.size()

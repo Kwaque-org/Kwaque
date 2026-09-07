@@ -202,7 +202,7 @@ public:
     kwaque_file_fixture(const kwaque_file_fixture&) = delete;
     kwaque_file_fixture& operator=(const kwaque_file_fixture&) = delete;
 
-    [[gnu::noinline]] seastar::future<> execute() {
+    [[gnu::noinline]] seastar::future<std::size_t> execute() {
         auto fragment = source_.share(source_offset_, write_size_);
         auto data = detail::fragmented_buffer_io_access::adopt(
           std::move(fragment), byte_count{source_.size()});
@@ -211,6 +211,7 @@ public:
               if (!outcome || outcome->value() != expected) {
                   std::terminate();
               }
+              return std::size_t{1};
           });
     }
 
@@ -275,12 +276,13 @@ public:
         }
     }
 
-    [[gnu::noinline]] seastar::future<> execute() {
+    [[gnu::noinline]] seastar::future<std::size_t> execute() {
         return owner_.write(file_position{0}, source_.make())
           .then([](result<byte_count> outcome) {
               if (!outcome || outcome->value() != 4096) {
                   std::terminate();
               }
+              return std::size_t{1};
           });
     }
 
@@ -305,7 +307,7 @@ public:
         }
     }
 
-    [[gnu::noinline]] seastar::future<> execute() {
+    [[gnu::noinline]] seastar::future<std::size_t> execute() {
         auto data = source_.make();
         owner_.assert_current();
         if (
@@ -360,6 +362,7 @@ public:
               if (!outcome || outcome->value() != 4096) {
                   std::terminate();
               }
+              return std::size_t{1};
           });
     }
 
@@ -411,7 +414,7 @@ public:
     native_aligned_file_fixture&
     operator=(const native_aligned_file_fixture&) = delete;
 
-    [[gnu::noinline]] seastar::future<> execute() {
+    [[gnu::noinline]] seastar::future<std::size_t> execute() {
         auto fragment = source_.share(0, write_size_);
         auto data = detail::fragmented_buffer_io_access::adopt(
           std::move(fragment), byte_count{source_.size()});
@@ -421,10 +424,11 @@ public:
               if (!outcome || outcome->value() != expected) {
                   std::terminate();
               }
+              return std::size_t{1};
           });
     }
 
-    [[gnu::noinline]] seastar::future<> execute_out_of_line() {
+    [[gnu::noinline]] seastar::future<std::size_t> execute_out_of_line() {
         auto fragment = source_.share(0, write_size_);
         auto data = detail::fragmented_buffer_io_access::adopt(
           std::move(fragment), byte_count{source_.size()});
@@ -434,6 +438,7 @@ public:
               if (!outcome || outcome->value() != expected) {
                   std::terminate();
               }
+              return std::size_t{1};
           });
     }
 
@@ -572,7 +577,7 @@ public:
     native_raw_aligned_file_fixture&
     operator=(const native_raw_aligned_file_fixture&) = delete;
 
-    seastar::future<> execute() {
+    seastar::future<std::size_t> execute() {
         auto source = source_.share();
         return native_.dma_write(0, source.get(), source.size())
           .then([source = std::move(source)](std::size_t written) mutable {
@@ -580,6 +585,7 @@ public:
               if (written != 4096U) {
                   std::terminate();
               }
+              return std::size_t{1};
           });
     }
 
@@ -601,12 +607,13 @@ public:
         }
     }
 
-    [[gnu::noinline]] seastar::future<> execute() {
+    [[gnu::noinline]] seastar::future<std::size_t> execute() {
         return native_.dma_read_bulk<char>(0, 4096).then(
           [](seastar::temporary_buffer<char> data) {
               if (data.size() != 4096 || data.get()[0] != 'b') {
                   std::terminate();
               }
+              return std::size_t{1};
           });
     }
 
@@ -628,7 +635,7 @@ public:
         }
     }
 
-    [[gnu::noinline]] seastar::future<> execute() {
+    [[gnu::noinline]] seastar::future<std::size_t> execute() {
         owner_.assert_current();
         if (
           !validate_file_read_request(file_position{0}, byte_count{4096})
@@ -675,6 +682,7 @@ public:
                   std::string_view{benchmark_file_contents.data(), 4096})) {
                   std::terminate();
               }
+              return std::size_t{1};
           });
     }
 
@@ -706,7 +714,7 @@ public:
         }
     }
 
-    [[gnu::noinline]] seastar::future<> execute() {
+    [[gnu::noinline]] seastar::future<std::size_t> execute() {
         return owner_.read(file_position{0}, byte_count{4096})
           .then([](result<file_read_result> outcome) {
               if (
@@ -716,6 +724,7 @@ public:
                   std::string_view{benchmark_file_contents.data(), 4096})) {
                   std::terminate();
               }
+              return std::size_t{1};
           });
     }
 
@@ -753,9 +762,14 @@ PERF_TEST_F(kwaque_rmw_file_fixture, read_modify_write_6_at_101) {
     return execute();
 }
 
-PERF_TEST_F(native_fragmented_file_fixture, staged_64x64) { return execute(); }
+// Both paths include publishing frozen input and staging all 64 fragments.
+PERF_TEST_F(native_fragmented_file_fixture, freeze_and_stage_64x64) {
+    return execute();
+}
 
-PERF_TEST_F(kwaque_fragmented_file_fixture, staged_64x64) { return execute(); }
+PERF_TEST_F(kwaque_fragmented_file_fixture, freeze_and_stage_64x64) {
+    return execute();
+}
 
 PERF_TEST_F(native_raw_file_read_fixture, direct_read_4096) {
     return execute();

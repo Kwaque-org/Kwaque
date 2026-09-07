@@ -178,6 +178,99 @@ seastar::future<> capture_dns_vocabulary(
     BOOST_REQUIRE(!stopped.has_value());
 }
 
+seastar::future<> capture_dns_deadline_boundary(
+  kwaque::simulation::event_trace& trace,
+  kwaque::simulation::scheduler_limits scheduler_budget) {
+    kwaque::simulation::scheduler events{scheduler_budget, &trace};
+    seastar::chunked_vector<kwaque::simulation::fault_rule> rules;
+    rules.push_back(dns_rule(
+      301,
+      3,
+      kwaque::runtime::fault_decision::make_delay(
+        kwaque::runtime::monotonic_duration{100'000})));
+    auto made_faults = kwaque::simulation::fault_schedule::make(
+      events, trace, 29, std::move(rules));
+    BOOST_REQUIRE(made_faults.has_value());
+    auto faults = std::move(*made_faults);
+    auto made = kwaque::simulation::fake_dns::make({}, events, faults.get());
+    BOOST_REQUIRE(made.has_value());
+    auto resolver = std::move(*made);
+    const std::array keys{
+      make_query("first.test"),
+      make_query("second.test"),
+      make_query("last.test")};
+    constexpr std::array latencies{400'000U, 300'000U, 200'001U};
+    for (std::size_t index = 0; index < keys.size(); ++index) {
+        BOOST_REQUIRE(
+          resolver
+            ->add_record(
+              kwaque::simulation::fake_dns_record{
+                .key = keys[index],
+                .answers = {answer(7, keys[index].port, 13)},
+                .latency
+                = kwaque::runtime::monotonic_duration{latencies[index]},
+              })
+            .has_value());
+    }
+    seastar::abort_source abort_source;
+    auto first = resolver->resolve(keys[0], abort_source);
+    auto second = resolver->resolve(keys[1], abort_source);
+    BOOST_CHECK(!first.available());
+    BOOST_CHECK(!second.available());
+    const auto entries_before = trace.entries().size();
+    const auto bytes_before = trace.encoded_bytes();
+    const auto events_before = events.pending_events();
+    const auto names_before = resolver->retained_name_bytes();
+    auto excessive = resolver->resolve(keys[2], abort_source);
+    BOOST_REQUIRE(excessive.available());
+    const auto rejected = co_await std::move(excessive);
+    BOOST_REQUIRE(!rejected.has_value());
+    BOOST_CHECK(rejected.error().code() == kwaque::errc::out_of_range);
+    BOOST_CHECK_EQUAL(trace.entries().size(), entries_before);
+    BOOST_CHECK_EQUAL(trace.encoded_bytes(), bytes_before);
+    BOOST_CHECK_EQUAL(events.pending_events(), events_before);
+    BOOST_CHECK(resolver->retained_name_bytes() == names_before);
+    BOOST_CHECK_EQUAL(resolver->pending_queries(), 2U);
+    BOOST_CHECK_EQUAL(resolver->waiting_queries(), 1U);
+    BOOST_CHECK_EQUAL(faults->applied_decisions(), 0U);
+
+    BOOST_REQUIRE(resolver
+                    ->update_record(
+                      kwaque::simulation::fake_dns_record{
+                        .key = keys[2],
+                        .answers = {answer(7, keys[2].port, 13)},
+                        .latency = kwaque::runtime::monotonic_duration{200'000},
+                      })
+                    .has_value());
+    auto last = resolver->resolve(keys[2], abort_source);
+    BOOST_CHECK(!last.available());
+    // The rejected query retained neither its ID nor its prepared decision.
+    BOOST_CHECK_EQUAL(faults->applied_decisions(), 1U);
+    auto numeric = resolver->resolve(make_query("127.0.0.9"), abort_source);
+    BOOST_CHECK(!numeric.available());
+    co_await pump_until(events, numeric);
+    co_await require_ready_success(numeric);
+    BOOST_CHECK_EQUAL(events.now().nanoseconds(), 0U);
+    co_await pump_until(events, first);
+    co_await require_ready_success(first);
+    BOOST_CHECK_EQUAL(events.now().nanoseconds(), 400'000U);
+    BOOST_CHECK(!second.available());
+    BOOST_CHECK(!last.available());
+    co_await pump_until(events, second);
+    co_await require_ready_success(second);
+    BOOST_CHECK_EQUAL(events.now().nanoseconds(), 700'000U);
+    BOOST_CHECK(!last.available());
+    co_await pump_until(events, last);
+    co_await require_ready_success(last);
+    BOOST_CHECK(events.now() == events.limits().maximum_deadline());
+    BOOST_CHECK_EQUAL(resolver->pending_queries(), 0U);
+    BOOST_CHECK_EQUAL(resolver->waiting_queries(), 0U);
+    auto stopping = resolver->stop();
+    co_await pump_until(events, stopping);
+    co_await require_ready_success(stopping);
+    BOOST_CHECK_EQUAL(events.pending_events(), 0U);
+}
+
 } // namespace
 
 SEASTAR_TEST_CASE(fake_dns_records_are_canonical_ordered_and_transactional) {
@@ -675,6 +768,143 @@ SEASTAR_TEST_CASE(fake_dns_serializes_named_queries_and_aborts_only_waiters) {
     co_await require_ready_success(active);
     co_await pump_until(events, stopping);
     co_await require_ready_success(stopping);
+}
+
+SEASTAR_TEST_CASE(fake_dns_accounts_for_complete_fifo_deadlines_and_replays) {
+    const auto scheduler_budget = dns_scheduler_limits();
+    const auto trace_budget = dns_trace_limits();
+    const auto header = dns_trace_header(scheduler_budget, trace_budget);
+    kwaque::simulation::event_trace captured{header, trace_budget};
+    co_await capture_dns_deadline_boundary(captured, scheduler_budget);
+    auto encoded = captured.encode();
+    BOOST_REQUIRE(encoded.has_value());
+    auto decoded = kwaque::simulation::event_trace::decode(
+      *encoded, trace_budget);
+    BOOST_REQUIRE(decoded.has_value());
+    auto replay = kwaque::simulation::event_trace::replay(
+      header, trace_budget, std::move(*decoded));
+    BOOST_REQUIRE(replay.has_value());
+    co_await capture_dns_deadline_boundary(**replay, scheduler_budget);
+    BOOST_REQUIRE((*replay)->finish_replay().has_value());
+    const auto repeated = (*replay)->encode();
+    BOOST_REQUIRE(repeated.has_value());
+    BOOST_CHECK(*encoded == *repeated);
+}
+
+SEASTAR_TEST_CASE(
+  fake_dns_canceled_waiter_immediately_releases_deadline_budget) {
+    kwaque::simulation::scheduler events{dns_scheduler_limits()};
+    auto made = kwaque::simulation::fake_dns::make({}, events);
+    BOOST_REQUIRE(made.has_value());
+    auto resolver = std::move(*made);
+    const auto active_key = make_query("active.test");
+    const auto replacement_key = make_query("replacement.test");
+    BOOST_REQUIRE(resolver
+                    ->add_record(
+                      kwaque::simulation::fake_dns_record{
+                        .key = active_key,
+                        .answers = {answer(1, active_key.port, 1)},
+                        .latency = kwaque::runtime::monotonic_duration{400'000},
+                      })
+                    .has_value());
+    BOOST_REQUIRE(resolver
+                    ->add_record(
+                      kwaque::simulation::fake_dns_record{
+                        .key = replacement_key,
+                        .answers = {answer(2, replacement_key.port, 2)},
+                        .latency = kwaque::runtime::monotonic_duration{600'000},
+                      })
+                    .has_value());
+    seastar::abort_source active_abort;
+    seastar::abort_source waiting_abort;
+    auto active = resolver->resolve(active_key, active_abort);
+    auto waiting = resolver->resolve(active_key, waiting_abort);
+    BOOST_REQUIRE(
+      events.run_until(kwaque::runtime::monotonic_time{200'000}).has_value());
+    auto excessive = resolver->resolve(replacement_key, active_abort);
+    BOOST_REQUIRE(excessive.available());
+    const auto rejected = co_await std::move(excessive);
+    BOOST_REQUIRE(!rejected.has_value());
+    BOOST_CHECK(rejected.error().code() == kwaque::errc::out_of_range);
+    waiting_abort.request_abort();
+    BOOST_CHECK(!waiting.available());
+    auto replacement = resolver->resolve(replacement_key, active_abort);
+    BOOST_CHECK(!replacement.available());
+    BOOST_CHECK_EQUAL(resolver->waiting_queries(), 1U);
+    co_await pump_until(events, waiting);
+    const auto canceled = co_await std::move(waiting);
+    BOOST_REQUIRE(!canceled.has_value());
+    BOOST_CHECK(canceled.error().code() == kwaque::errc::aborted);
+    co_await pump_until(events, active);
+    co_await require_ready_success(active);
+    BOOST_CHECK_EQUAL(events.now().nanoseconds(), 400'000U);
+    co_await pump_until(events, replacement);
+    co_await require_ready_success(replacement);
+    BOOST_CHECK(events.now() == events.limits().maximum_deadline());
+    auto stopping = resolver->stop();
+    co_await pump_until(events, stopping);
+    co_await require_ready_success(stopping);
+    BOOST_CHECK_EQUAL(events.pending_events(), 0U);
+}
+
+SEASTAR_TEST_CASE(
+  fake_dns_parked_query_releases_time_before_stop_drains_active) {
+    const auto scheduler_budget = dns_scheduler_limits();
+    const auto trace_budget = dns_trace_limits();
+    kwaque::simulation::event_trace trace{
+      dns_trace_header(scheduler_budget, trace_budget), trace_budget};
+    kwaque::simulation::scheduler events{scheduler_budget, &trace};
+    seastar::chunked_vector<kwaque::simulation::fault_rule> rules;
+    rules.push_back(dns_rule(
+      401, 1, kwaque::runtime::fault_decision::make_drop_completion()));
+    auto made_faults = kwaque::simulation::fault_schedule::make(
+      events, trace, 29, std::move(rules));
+    BOOST_REQUIRE(made_faults.has_value());
+    auto faults = std::move(*made_faults);
+    auto made = kwaque::simulation::fake_dns::make({}, events, faults.get());
+    BOOST_REQUIRE(made.has_value());
+    auto resolver = std::move(*made);
+    const auto key = make_query("parked.test");
+    BOOST_REQUIRE(resolver
+                    ->add_record(
+                      kwaque::simulation::fake_dns_record{
+                        .key = key,
+                        .answers = {answer(1, key.port, 1)},
+                        .latency = kwaque::runtime::monotonic_duration{400'000},
+                      })
+                    .has_value());
+    seastar::abort_source abort_source;
+    auto parked = resolver->resolve(key, abort_source);
+    BOOST_REQUIRE(resolver
+                    ->update_record(
+                      kwaque::simulation::fake_dns_record{
+                        .key = key,
+                        .answers = {answer(1, key.port, 1)},
+                        .latency = kwaque::runtime::monotonic_duration{600'000},
+                      })
+                    .has_value());
+    auto active = resolver->resolve(key, abort_source);
+    BOOST_CHECK(!parked.available());
+    BOOST_CHECK(!active.available());
+    BOOST_REQUIRE(
+      events.run_until(kwaque::runtime::monotonic_time{400'000}).has_value());
+    BOOST_CHECK(!parked.available());
+    BOOST_CHECK(!active.available());
+    BOOST_CHECK_EQUAL(resolver->waiting_queries(), 0U);
+    BOOST_CHECK(resolver->active());
+    auto stopping = resolver->stop();
+    co_await pump_until(events, parked);
+    const auto discarded = co_await std::move(parked);
+    BOOST_REQUIRE(!discarded.has_value());
+    BOOST_CHECK(discarded.error().code() == kwaque::errc::aborted);
+    BOOST_CHECK(!active.available());
+    co_await pump_until(events, active);
+    co_await require_ready_success(active);
+    BOOST_CHECK(events.now() == events.limits().maximum_deadline());
+    co_await pump_until(events, stopping);
+    co_await require_ready_success(stopping);
+    BOOST_CHECK_EQUAL(resolver->pending_queries(), 0U);
+    BOOST_CHECK_EQUAL(events.pending_events(), 0U);
 }
 
 SEASTAR_TEST_CASE(fake_dns_stops_the_maximum_waiter_set) {

@@ -93,8 +93,12 @@ PERF_TEST(structured_event, reserved_capture) {
         }
     }
     perf_tests::stop_measuring_time();
-    perf_tests::do_not_optimize(sink.events().entries().size());
-    static_cast<void>(sink.stop());
+    if (sink.events().entries().size() != inner_iterations) {
+        throw std::logic_error("event benchmark capture count");
+    }
+    if (!sink.stop()) {
+        throw std::logic_error("event benchmark capture cleanup");
+    }
     return inner_iterations;
 }
 
@@ -110,8 +114,12 @@ PERF_TEST(structured_event, disabled_native_log) {
         }
     }
     perf_tests::stop_measuring_time();
-    perf_tests::do_not_optimize(sink.last_sequence());
-    static_cast<void>(sink.stop());
+    if (sink.last_sequence() != inner_iterations) {
+        throw std::logic_error("event benchmark disabled log count");
+    }
+    if (!sink.stop()) {
+        throw std::logic_error("event benchmark disabled log cleanup");
+    }
     return inner_iterations;
 }
 
