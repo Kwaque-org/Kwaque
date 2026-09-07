@@ -1,5 +1,5 @@
 load("//bazel:build.bzl", "kwaque_cc_library")
-load("//bazel:test.bzl", "kwaque_cc_fuzz_test", "kwaque_cc_test")
+load("//bazel:test.bzl", "kwaque_cc_fuzz_test", "kwaque_cc_seastar_test", "kwaque_cc_test")
 
 package(default_visibility = ["//visibility:private"])
 
@@ -15,6 +15,14 @@ kwaque_cc_test(
     name = "bootstrap_config_test",
     srcs = ["bootstrap_config_test.cc"],
     data = ["//conf:kwaque_config"],
+    deps = [":bootstrap_config"],
+)
+
+kwaque_cc_seastar_test(
+    name = "bootstrap_config_allocation_test",
+    srcs = ["bootstrap_config_allocation_test.cc"],
+    cpu = 1,
+    memory = "128MiB",
     deps = [":bootstrap_config"],
 )
 

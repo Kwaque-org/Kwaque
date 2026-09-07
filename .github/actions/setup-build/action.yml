@@ -1,6 +1,14 @@
 name: Set up build environment
 description: Install the pinned Bazel driver and enable shared download caches
 
+inputs:
+  cache-scope:
+    description: Build configuration sharing this disk cache
+    required: true
+  cache-write:
+    description: Whether this job is the designated writer for its cache scope
+    default: 'false'
+
 runs:
   using: composite
   steps:
@@ -15,8 +23,34 @@ runs:
       uses: bazel-contrib/setup-bazel@8cb04a772ab4c1eb984e9c1b493a182e96c5e425 # 0.19.0
       with:
         bazelisk-cache: true
-        disk-cache: ${{ github.workflow }}-${{ runner.os }}-${{ runner.arch }}
+        disk-cache: false
         repository-cache: true
+        bazelrc: build --disk_cache=${{ runner.temp }}/kwaque-bazel-disk
         cache-save: >-
           ${{ github.event_name != 'pull_request' ||
               github.event.pull_request.head.repo.full_name == github.repository }}
+    - name: Select disk cache writer
+      id: disk-cache
+      shell: bash
+      env:
+        WRITE_CACHE: >-
+          ${{ inputs.cache-write == 'true' &&
+              (github.event_name != 'pull_request' ||
+               github.event.pull_request.head.repo.full_name == github.repository) }}
+      run: echo "write=$WRITE_CACHE" >> "$GITHUB_OUTPUT"
+    - name: Restore and refresh the configuration cache
+      if: steps.disk-cache.outputs.write == 'true'
+      uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # 5.1.0
+      with:
+        path: ${{ runner.temp }}/kwaque-bazel-disk
+        key: bazel-v1-${{ runner.os }}-${{ runner.arch }}-${{ inputs.cache-scope }}-${{ github.sha }}
+        restore-keys: |
+          bazel-v1-${{ runner.os }}-${{ runner.arch }}-${{ inputs.cache-scope }}-
+    - name: Restore the configuration cache without writing
+      if: steps.disk-cache.outputs.write != 'true'
+      uses: actions/cache/restore@caa296126883cff596d87d8935842f9db880ef25 # 5.1.0
+      with:
+        path: ${{ runner.temp }}/kwaque-bazel-disk
+        key: bazel-v1-${{ runner.os }}-${{ runner.arch }}-${{ inputs.cache-scope }}-${{ github.sha }}
+        restore-keys: |
+          bazel-v1-${{ runner.os }}-${{ runner.arch }}-${{ inputs.cache-scope }}-

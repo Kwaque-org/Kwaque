@@ -62,9 +62,9 @@ RESOURCE_METRICS = frozenset(
 )
 WORKLOAD_COUNT = 8
 PRODUCT_METRICS = ADMIN_METRICS | RUNTIME_METRICS | RESOURCE_METRICS
-SHARD_AGGREGATED_METRICS = RUNTIME_METRICS | RESOURCE_METRICS | {
-    "kwaque_broker_http_requests_total"
-}
+SHARD_AGGREGATED_METRICS = (
+    RUNTIME_METRICS | RESOURCE_METRICS | {"kwaque_broker_http_requests_total"}
+)
 PRODUCT_PREFIXES = (
     "kwaque_broker_",
     "kwaque_runtime_task_",
@@ -161,9 +161,7 @@ def label_names(line: str) -> set[str]:
 
 def verify_product_metrics(exposition: str, *, aggregated: bool) -> None:
     samples = [
-        line
-        for line in exposition.splitlines()
-        if line and not line.startswith("#")
+        line for line in exposition.splitlines() if line and not line.startswith("#")
     ]
     observed = {
         sample_name(line)
@@ -185,14 +183,11 @@ def verify_product_metrics(exposition: str, *, aggregated: bool) -> None:
             expected_samples = (
                 1
                 if aggregated
-                or name in ADMIN_METRICS
-                - {"kwaque_broker_http_requests_total"}
+                or name in ADMIN_METRICS - {"kwaque_broker_http_requests_total"}
                 else 2
             )
             expected_labels = (
-                set()
-                if aggregated and name in SHARD_AGGREGATED_METRICS
-                else {"shard"}
+                set() if aggregated and name in SHARD_AGGREGATED_METRICS else {"shard"}
             )
         if len(matching) != expected_samples:
             raise AssertionError(
@@ -209,14 +204,10 @@ def verify_product_metrics(exposition: str, *, aggregated: bool) -> None:
                     f"metric {name!r} has labels {sorted(labels)}, "
                     f"expected {sorted(expected_labels)}"
                 )
-        if not aggregated and (
-            name in RESOURCE_METRICS or expected_samples == 2
-        ):
+        if not aggregated and (name in RESOURCE_METRICS or expected_samples == 2):
             for shard in (0, 1):
                 shard_samples = [
-                    sample
-                    for sample in matching
-                    if f'shard="{shard}"' in sample
+                    sample for sample in matching if f'shard="{shard}"' in sample
                 ]
                 expected_shard_samples = (
                     WORKLOAD_COUNT if name in RESOURCE_METRICS else 1
@@ -502,8 +493,7 @@ def main() -> None:
             raise AssertionError("oversized configuration unexpectedly started")
         if "configuration exceeds the maximum supported size" not in oversized.stdout:
             raise AssertionError(
-                "oversized configuration did not report its bound:\n"
-                + oversized.stdout
+                "oversized configuration did not report its bound:\n" + oversized.stdout
             )
 
 

@@ -18,6 +18,7 @@ test_suite(
         ":deterministic_random_test",
         ":event_trace_test",
         ":fault_schedule_test",
+        ":fuzz_reproduction_test",
         ":philox_kat_test",
         "//src/observability:event_codec_goldens",
     ],
@@ -106,6 +107,7 @@ kwaque_cc_binary(
 
 kwaque_py_native_test(
     name = "fuzz_reproduction_test",
+    timeout = "moderate",
     srcs = [
         "fuzz_reproduction_test.py",
         "//bazel:fuzz_test_wrapper.py",

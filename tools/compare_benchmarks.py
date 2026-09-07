@@ -24,15 +24,17 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
-
 ROUNDS = 3
 MINIMUM_RUNS = 7
 REGRESSION_RATIO = 1.05
 CASE_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)+")
 MAXIMUM_RESULT_BYTES = 2 * 1024 * 1024
 NATIVE_ARGUMENTS = (
-    "--smp=1", "--memory=512MiB", "--overprovisioned",
-    "--reactor-backend=epoll", "--blocked-reactor-notify-ms=2000000",
+    "--smp=1",
+    "--memory=512MiB",
+    "--overprovisioned",
+    "--reactor-backend=epoll",
+    "--blocked-reactor-notify-ms=2000000",
     "--no-perf-counters",
     "--overhead-threshold=0.1",
 )
@@ -68,8 +70,12 @@ class Invocation:
 
 def parse_pair(value: str) -> Pair:
     names = value.split("=")
-    if len(names) != 2 or any(len(name) > 200 or not CASE_NAME.fullmatch(name) for name in names):
-        raise ComparisonError("pair must contain two exact group.case names separated by '='")
+    if len(names) != 2 or any(
+        len(name) > 200 or not CASE_NAME.fullmatch(name) for name in names
+    ):
+        raise ComparisonError(
+            "pair must contain two exact group.case names separated by '='"
+        )
     if names[0] == names[1]:
         raise ComparisonError("baseline and candidate must be distinct cases")
     return Pair(*names)
@@ -85,7 +91,11 @@ def invocation_order(pairs: list[Pair], seed: int) -> list[Invocation]:
             roles = ["baseline", "candidate"]
             chooser.shuffle(roles)
             for role in roles:
-                order.append(Invocation(round_number, pair_index, role, getattr(pairs[pair_index], role)))
+                order.append(
+                    Invocation(
+                        round_number, pair_index, role, getattr(pairs[pair_index], role)
+                    )
+                )
     return order
 
 
@@ -95,9 +105,13 @@ def finite_number(value: Any, name: str, *, positive: bool = False) -> float:
     try:
         number = float(value)
     except (OverflowError, ValueError) as error:
-        raise ComparisonError(f"native field {name} is outside the finite range") from error
+        raise ComparisonError(
+            f"native field {name} is outside the finite range"
+        ) from error
     if not math.isfinite(number) or number < 0 or positive and number == 0:
-        raise ComparisonError(f"native field {name} must be finite and {'positive' if positive else 'nonnegative'}")
+        raise ComparisonError(
+            f"native field {name} must be finite and {'positive' if positive else 'nonnegative'}"
+        )
     return number
 
 
@@ -113,7 +127,9 @@ def parse_measurement(document: Any, case: str, runs: int) -> Measurement:
         raise ComparisonError("native JSON requires results and summary objects")
     results = document.get("results")
     if not isinstance(results, dict) or set(results) != {case}:
-        raise ComparisonError(f"native JSON must contain exactly the requested case {case}")
+        raise ComparisonError(
+            f"native JSON must contain exactly the requested case {case}"
+        )
     result = results[case]
     if not isinstance(result, dict):
         raise ComparisonError("native case result must be an object")
@@ -124,10 +140,16 @@ def parse_measurement(document: Any, case: str, runs: int) -> Measurement:
         allocations = finite_number(result["allocs"], "allocs")
         tasks = finite_number(result["tasks"], "tasks")
     except KeyError as error:
-        raise ComparisonError(f"native result is missing field {error.args[0]}") from error
+        raise ComparisonError(
+            f"native result is missing field {error.args[0]}"
+        ) from error
     if actual_runs < MINIMUM_RUNS or actual_runs != runs:
-        raise ComparisonError(f"native result must contain the requested {runs} runs (at least seven)")
-    overhead = finite_number(result["overhead"], "overhead") if "overhead" in result else None
+        raise ComparisonError(
+            f"native result must contain the requested {runs} runs (at least seven)"
+        )
+    overhead = (
+        finite_number(result["overhead"], "overhead") if "overhead" in result else None
+    )
     return Measurement(actual_runs, iterations, median, allocations, tasks, overhead)
 
 
@@ -150,29 +172,47 @@ def read_measurement(path: Path, case: str, runs: int) -> Measurement:
             encoded = source.read(MAXIMUM_RESULT_BYTES + 1)
         if len(encoded) > MAXIMUM_RESULT_BYTES:
             raise ComparisonError("native JSON exceeds the result size limit")
-        document = json.loads(encoded, object_pairs_hook=_unique_object, parse_constant=_invalid_constant)
+        document = json.loads(
+            encoded, object_pairs_hook=_unique_object, parse_constant=_invalid_constant
+        )
     except OSError as error:
-        raise ComparisonError(f"native JSON is unavailable ({error.strerror})") from error
+        raise ComparisonError(
+            f"native JSON is unavailable ({error.strerror})"
+        ) from error
     except (UnicodeError, json.JSONDecodeError) as error:
         raise ComparisonError("native JSON is malformed") from error
     return parse_measurement(document, case, runs)
 
 
-def compare_pair(pair: Pair, rounds: list[tuple[Measurement, Measurement]]) -> dict[str, Any]:
+def compare_pair(
+    pair: Pair, rounds: list[tuple[Measurement, Measurement]]
+) -> dict[str, Any]:
     if len(rounds) != ROUNDS:
-        raise ComparisonError("comparison requires exactly three complete paired rounds")
+        raise ComparisonError(
+            "comparison requires exactly three complete paired rounds"
+        )
     details = []
     counters_pass = True
     for number, (baseline, candidate) in enumerate(rounds, 1):
         ratio = candidate.median_ns / baseline.median_ns
         if not math.isfinite(ratio) or ratio <= 0:
-            raise ComparisonError("paired median ratio is outside the finite positive range")
-        counter_pass = candidate.allocations <= baseline.allocations and candidate.tasks <= baseline.tasks
+            raise ComparisonError(
+                "paired median ratio is outside the finite positive range"
+            )
+        counter_pass = (
+            candidate.allocations <= baseline.allocations
+            and candidate.tasks <= baseline.tasks
+        )
         counters_pass = counters_pass and counter_pass
-        details.append({
-            "round": number, "baseline": asdict(baseline), "candidate": asdict(candidate),
-            "median_ratio": ratio, "counters_pass": counter_pass,
-        })
+        details.append(
+            {
+                "round": number,
+                "baseline": asdict(baseline),
+                "candidate": asdict(candidate),
+                "median_ratio": ratio,
+                "counters_pass": counter_pass,
+            }
+        )
     median_ratio = statistics.median(item["median_ratio"] for item in details)
     if not counters_pass:
         status = "counter_failure"
@@ -183,8 +223,11 @@ def compare_pair(pair: Pair, rounds: list[tuple[Measurement, Measurement]]) -> d
     else:
         status = "parity"
     return {
-        **asdict(pair), "status": status, "median_ratio": median_ratio,
-        "counters_pass": counters_pass, "rounds": details,
+        **asdict(pair),
+        "status": status,
+        "median_ratio": median_ratio,
+        "counters_pass": counters_pass,
+        "rounds": details,
     }
 
 
@@ -195,18 +238,24 @@ def binary_digest(path: Path) -> str:
             while chunk := source.read(128 * 1024):
                 digest.update(chunk)
     except OSError as error:
-        raise ComparisonError(f"cannot read benchmark binary ({error.strerror})") from error
+        raise ComparisonError(
+            f"cannot read benchmark binary ({error.strerror})"
+        ) from error
     return digest.hexdigest()
 
 
 def write_manifest(directory: Path, manifest: dict[str, Any]) -> None:
     temporary = directory / "manifest.json.tmp"
-    temporary.write_text(json.dumps(manifest, indent=2, allow_nan=False) + "\n", encoding="utf-8")
+    temporary.write_text(
+        json.dumps(manifest, indent=2, allow_nan=False) + "\n", encoding="utf-8"
+    )
     temporary.replace(directory / "manifest.json")
 
 
 def select_cpu(cpu: int | None) -> tuple[int, list[int]]:
-    if cpu is not None and (isinstance(cpu, bool) or not isinstance(cpu, int) or cpu < 0):
+    if cpu is not None and (
+        isinstance(cpu, bool) or not isinstance(cpu, int) or cpu < 0
+    ):
         raise ComparisonError("CPU must be a nonnegative integer")
     try:
         allowed = sorted(os.sched_getaffinity(0))
@@ -220,32 +269,52 @@ def select_cpu(cpu: int | None) -> tuple[int, list[int]]:
     return selected, allowed
 
 
-def run_comparison(binary: Path, pairs: list[Pair], output_dir: Path, *, runs: int = 7,
-                   duration: float = 1.0, seed: int = 1, rounds: int = 3,
-                   timeout: float | None = None, cpu: int | None = None,
-                   task_quota_ms: float | None = None) -> dict[str, Any]:
+def run_comparison(
+    binary: Path,
+    pairs: list[Pair],
+    output_dir: Path,
+    *,
+    runs: int = 7,
+    duration: float = 1.0,
+    seed: int = 1,
+    rounds: int = 3,
+    timeout: float | None = None,
+    cpu: int | None = None,
+    task_quota_ms: float | None = None,
+) -> dict[str, Any]:
     if isinstance(runs, bool) or not isinstance(runs, int) or runs < MINIMUM_RUNS:
         raise ComparisonError("runs must be an integer of at least seven")
     if isinstance(rounds, bool) or rounds != ROUNDS:
         raise ComparisonError("exactly three independent paired rounds are required")
-    if isinstance(seed, bool) or not isinstance(seed, int) or not 0 < seed <= 0xffffffff:
+    if (
+        isinstance(seed, bool)
+        or not isinstance(seed, int)
+        or not 0 < seed <= 0xFFFFFFFF
+    ):
         raise ComparisonError("seed must be an integer from 1 through 4294967295")
     duration = finite_number(duration, "duration", positive=True)
     if task_quota_ms is not None:
         task_quota_ms = finite_number(task_quota_ms, "task_quota_ms", positive=True)
-    if not pairs or any(parse_pair(f"{pair.baseline}={pair.candidate}") != pair for pair in pairs):
+    if not pairs or any(
+        parse_pair(f"{pair.baseline}={pair.candidate}") != pair for pair in pairs
+    ):
         raise ComparisonError("at least one valid comparison pair is required")
     if len(set(pairs)) != len(pairs):
         raise ComparisonError("duplicate comparison pairs are not permitted")
-    timeout = finite_number(timeout if timeout is not None else max(60.0, runs * duration * 3 + 30),
-                            "timeout", positive=True)
+    timeout = finite_number(
+        timeout if timeout is not None else max(60.0, runs * duration * 3 + 30),
+        "timeout",
+        positive=True,
+    )
     selected_cpu, allowed_cpus = select_cpu(cpu)
     # Resolve both before setting a subprocess working directory. Never chdir
     # the parent, invoke a shell, build a target, or reuse old result files.
     try:
         binary = binary.expanduser().resolve(strict=True)
     except OSError as error:
-        raise ComparisonError(f"benchmark binary is unavailable ({error.strerror})") from error
+        raise ComparisonError(
+            f"benchmark binary is unavailable ({error.strerror})"
+        ) from error
     if not binary.is_file() or not os.access(binary, os.X_OK):
         raise ComparisonError("benchmark binary must be an executable regular file")
     output_dir = output_dir.expanduser().resolve()
@@ -253,17 +322,26 @@ def run_comparison(binary: Path, pairs: list[Pair], output_dir: Path, *, runs: i
     try:
         output_dir.mkdir(parents=True, exist_ok=False)
     except OSError as error:
-        raise ComparisonError(f"output directory must be new and writable ({error.strerror})") from error
+        raise ComparisonError(
+            f"output directory must be new and writable ({error.strerror})"
+        ) from error
     order = invocation_order(pairs, seed)
     manifest: dict[str, Any] = {
-        "schema_version": 1, "status": "running",
+        "schema_version": 1,
+        "status": "running",
         "binary": {"name": binary.name, "sha256": digest},
         "build_mode": "caller must provide release-build evidence",
         "configuration": {
-            "runs": runs, "rounds": ROUNDS, "duration_seconds": duration,
-            "order_seed": seed, "native_seed": seed, "timeout_seconds": timeout,
-            "cores": 1, "memory_bytes": 512 * 1024 * 1024,
-            "selected_cpu": selected_cpu, "allowed_cpus": allowed_cpus,
+            "runs": runs,
+            "rounds": ROUNDS,
+            "duration_seconds": duration,
+            "order_seed": seed,
+            "native_seed": seed,
+            "timeout_seconds": timeout,
+            "cores": 1,
+            "memory_bytes": 512 * 1024 * 1024,
+            "selected_cpu": selected_cpu,
+            "allowed_cpus": allowed_cpus,
             "thread_affinity": True,
             "task_quota_ms": task_quota_ms,
             "hardware_perf_counters": False,
@@ -272,7 +350,8 @@ def run_comparison(binary: Path, pairs: list[Pair], output_dir: Path, *, runs: i
         },
         "pairs": [asdict(pair) for pair in pairs],
         "order": [asdict(invocation) for invocation in order],
-        "invocations": [], "comparisons": [],
+        "invocations": [],
+        "comparisons": [],
     }
     measurements: dict[tuple[int, int, str], Measurement] = {}
     write_manifest(output_dir, manifest)
@@ -282,53 +361,93 @@ def run_comparison(binary: Path, pairs: list[Pair], output_dir: Path, *, runs: i
             json_name = stem + ".json"
             log_name = stem + ".log"
             arguments = [
-                *NATIVE_ARGUMENTS, f"--cpuset={selected_cpu}", "--thread-affinity=1", "--mbind=0",
-                f"--runs={runs}", f"--duration={duration:.17g}",
-                f"--random-seed={seed}", f"--test=^{re.escape(invocation.case)}$",
+                *NATIVE_ARGUMENTS,
+                f"--cpuset={selected_cpu}",
+                "--thread-affinity=1",
+                "--mbind=0",
+                f"--runs={runs}",
+                f"--duration={duration:.17g}",
+                f"--random-seed={seed}",
+                f"--test=^{re.escape(invocation.case)}$",
                 f"--json-output={json_name}",
             ]
             if task_quota_ms is not None:
                 arguments.append(f"--task-quota-ms={task_quota_ms:.17g}")
-            record = {**asdict(invocation), "json": json_name, "log": log_name,
-                      "arguments": arguments, "status": "running"}
+            record = {
+                **asdict(invocation),
+                "json": json_name,
+                "log": log_name,
+                "arguments": arguments,
+                "status": "running",
+            }
             manifest["invocations"].append(record)
             write_manifest(output_dir, manifest)
             if binary_digest(binary) != digest:
-                raise ComparisonError("benchmark binary changed before a native invocation")
+                raise ComparisonError(
+                    "benchmark binary changed before a native invocation"
+                )
             try:
                 with (output_dir / log_name).open("xb") as log:
                     result = subprocess.run(
-                        [str(binary), *arguments], cwd=output_dir,
-                        stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT,
-                        timeout=timeout, check=False, shell=False,
+                        [str(binary), *arguments],
+                        cwd=output_dir,
+                        stdin=subprocess.DEVNULL,
+                        stdout=log,
+                        stderr=subprocess.STDOUT,
+                        timeout=timeout,
+                        check=False,
+                        shell=False,
                     )
             except subprocess.TimeoutExpired as error:
-                raise ComparisonError(f"native case {invocation.case} timed out") from error
+                raise ComparisonError(
+                    f"native case {invocation.case} timed out"
+                ) from error
             except OSError as error:
-                raise ComparisonError(f"native case {invocation.case} could not execute ({error.strerror})") from error
+                raise ComparisonError(
+                    f"native case {invocation.case} could not execute ({error.strerror})"
+                ) from error
             record["returncode"] = result.returncode
             if result.returncode != 0:
-                raise ComparisonError(f"native case {invocation.case} exited with status {result.returncode}")
+                raise ComparisonError(
+                    f"native case {invocation.case} exited with status {result.returncode}"
+                )
             if binary_digest(binary) != digest:
-                raise ComparisonError("benchmark binary changed during a native invocation")
+                raise ComparisonError(
+                    "benchmark binary changed during a native invocation"
+                )
             measured = read_measurement(output_dir / json_name, invocation.case, runs)
-            measurements[(invocation.pair, invocation.round, invocation.role)] = measured
+            measurements[(invocation.pair, invocation.round, invocation.role)] = (
+                measured
+            )
             record.update(status="complete", measurement=asdict(measured))
             write_manifest(output_dir, manifest)
         for index, pair in enumerate(pairs):
-            manifest["comparisons"].append(compare_pair(pair, [
-                (measurements[index, round_number, "baseline"],
-                 measurements[index, round_number, "candidate"])
-                for round_number in range(1, ROUNDS + 1)
-            ]))
+            manifest["comparisons"].append(
+                compare_pair(
+                    pair,
+                    [
+                        (
+                            measurements[index, round_number, "baseline"],
+                            measurements[index, round_number, "candidate"],
+                        )
+                        for round_number in range(1, ROUNDS + 1)
+                    ],
+                )
+            )
         manifest["status"] = (
-            "passed" if all(item["status"] in {"win", "parity"} for item in manifest["comparisons"])
+            "passed"
+            if all(
+                item["status"] in {"win", "parity"} for item in manifest["comparisons"]
+            )
             else "failed"
         )
     except ComparisonError as error:
         manifest["status"] = "failed"
         manifest["error"] = str(error)
-        if manifest["invocations"] and manifest["invocations"][-1]["status"] == "running":
+        if (
+            manifest["invocations"]
+            and manifest["invocations"][-1]["status"] == "running"
+        ):
             manifest["invocations"][-1].update(status="failed", error=str(error))
         write_manifest(output_dir, manifest)
         raise
@@ -338,33 +457,69 @@ def run_comparison(binary: Path, pairs: list[Pair], output_dir: Path, *, runs: i
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--binary", required=True, type=Path, help="prebuilt release benchmark binary")
-    parser.add_argument("--pair", required=True, action="append", type=parse_pair,
-                        help="exact group.baseline=group.candidate names; repeat for additional pairs")
-    parser.add_argument("--output-dir", required=True, type=Path,
-                        help="new result directory on disk-backed storage")
+    parser.add_argument(
+        "--binary", required=True, type=Path, help="prebuilt release benchmark binary"
+    )
+    parser.add_argument(
+        "--pair",
+        required=True,
+        action="append",
+        type=parse_pair,
+        help="exact group.baseline=group.candidate names; repeat for additional pairs",
+    )
+    parser.add_argument(
+        "--output-dir",
+        required=True,
+        type=Path,
+        help="new result directory on disk-backed storage",
+    )
     parser.add_argument("--runs", type=int, default=MINIMUM_RUNS)
     parser.add_argument("--rounds", type=int, choices=[ROUNDS], default=ROUNDS)
-    parser.add_argument("--duration", type=float, default=1.0, help="seconds per native sample")
-    parser.add_argument("--seed", type=int, default=1, help="positive recorded ordering and native RNG seed")
-    parser.add_argument("--timeout", type=float, help="maximum seconds for each native invocation")
-    parser.add_argument("--cpu", type=int, help="allowed CPU for every native process (default: lowest allowed CPU)")
-    parser.add_argument("--task-quota-ms", type=float,
-                        help="override the native reactor task quota in milliseconds")
+    parser.add_argument(
+        "--duration", type=float, default=1.0, help="seconds per native sample"
+    )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=1,
+        help="positive recorded ordering and native RNG seed",
+    )
+    parser.add_argument(
+        "--timeout", type=float, help="maximum seconds for each native invocation"
+    )
+    parser.add_argument(
+        "--cpu",
+        type=int,
+        help="allowed CPU for every native process (default: lowest allowed CPU)",
+    )
+    parser.add_argument(
+        "--task-quota-ms",
+        type=float,
+        help="override the native reactor task quota in milliseconds",
+    )
     arguments = parser.parse_args()
     try:
-        manifest = run_comparison(arguments.binary, arguments.pair, arguments.output_dir,
-                                  runs=arguments.runs, duration=arguments.duration,
-                                  seed=arguments.seed, rounds=arguments.rounds,
-                                  timeout=arguments.timeout, cpu=arguments.cpu,
-                                  task_quota_ms=arguments.task_quota_ms)
+        manifest = run_comparison(
+            arguments.binary,
+            arguments.pair,
+            arguments.output_dir,
+            runs=arguments.runs,
+            duration=arguments.duration,
+            seed=arguments.seed,
+            rounds=arguments.rounds,
+            timeout=arguments.timeout,
+            cpu=arguments.cpu,
+            task_quota_ms=arguments.task_quota_ms,
+        )
     except (ComparisonError, OSError) as error:
         message = error.strerror if isinstance(error, OSError) else str(error)
         print(f"Benchmark comparison failed: {message}", file=sys.stderr)
         return 1
     for comparison in manifest["comparisons"]:
-        print(f"{comparison['baseline']} -> {comparison['candidate']}: "
-              f"{comparison['status']} (median ratio {comparison['median_ratio']:.6f})")
+        print(
+            f"{comparison['baseline']} -> {comparison['candidate']}: "
+            f"{comparison['status']} (median ratio {comparison['median_ratio']:.6f})"
+        )
     return 0 if manifest["status"] == "passed" else 1
 
 

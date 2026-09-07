@@ -2,6 +2,8 @@
 
 #include "src/base/error.h"
 
+#include <seastar/util/defer.hh>
+
 #include <algorithm>
 #include <bit>
 #include <cstring>
@@ -221,12 +223,12 @@ result<void> fragmented_buffer_builder::append(std::span<const char> bytes) {
     }
 
     const auto point = mark();
+    auto rollback = seastar::defer([this, point] noexcept { rewind(point); });
     std::uint64_t written = 0;
     const auto total = static_cast<std::uint64_t>(bytes.size());
     while (written < total) {
         if (tail_capacity().value() == 0) {
             if (auto grown = grow_tail(total - written); !grown) {
-                rewind(point);
                 return grown;
             }
         }
@@ -240,6 +242,7 @@ result<void> fragmented_buffer_builder::append(std::span<const char> bytes) {
         written += span;
     }
     size_ = *size_.checked_add(byte_count{written});
+    rollback.cancel();
     return {};
 }
 

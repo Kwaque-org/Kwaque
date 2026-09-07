@@ -33,7 +33,11 @@ def normalized_environment() -> dict[str, str]:
         options = environment.get(variable, "").split(":")
         for index, option in enumerate(options):
             key, separator, value = option.partition("=")
-            if separator and key in {"suppressions", "external_symbolizer_path"} and value:
+            if (
+                separator
+                and key in {"suppressions", "external_symbolizer_path"}
+                and value
+            ):
                 options[index] = f"{key}={resolve_runfile(value)}"
         environment[variable] = ":".join(options)
     return environment
@@ -45,7 +49,10 @@ def normalized_arguments(arguments: list[str]) -> list[str]:
         key, _, value = argument.partition("=")
         if key in {"-artifact_prefix", "-exact_artifact_path", "-merge_control_file"}:
             raise ValueError("artifact paths are owned by the test wrapper")
-        if key in {"-jobs", "-workers", "-fork", "-merge", "-minimize_crash"} and value != "0":
+        if (
+            key in {"-jobs", "-workers", "-fork", "-merge", "-minimize_crash"}
+            and value != "0"
+        ):
             raise ValueError("the test wrapper runs one bounded fuzz campaign")
         if key == "-dict":
             argument = f"-dict={resolve_runfile(value)}"
@@ -65,11 +72,18 @@ def positive_limit(arguments: list[str], name: str, default: int, maximum: int) 
     return value
 
 
-def run_logged(command: list[str], work: Path, environment: dict[str, str],
-               log: Path, timeout: int) -> int:
+def run_logged(
+    command: list[str], work: Path, environment: dict[str, str], log: Path, timeout: int
+) -> int:
     with log.open("w+b") as output:
-        with subprocess.Popen(command, cwd=work, env=environment, stdout=output,
-                              stderr=subprocess.STDOUT, start_new_session=True) as child:
+        with subprocess.Popen(
+            command,
+            cwd=work,
+            env=environment,
+            stdout=output,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+        ) as child:
             try:
                 status = child.wait(timeout=timeout)
             except subprocess.TimeoutExpired:
@@ -113,7 +127,9 @@ def main(argv: list[str] | None = None) -> int:
         if source.stat().st_size > maximum_length:
             raise ValueError("seed exceeds the target input limit")
 
-    temporary_root = Path(environment.get("TEST_TMPDIR") or tempfile.gettempdir()).resolve()
+    temporary_root = Path(
+        environment.get("TEST_TMPDIR") or tempfile.gettempdir()
+    ).resolve()
     temporary_root.mkdir(parents=True, exist_ok=True)
     work = Path(tempfile.mkdtemp(prefix="kwaque-fuzz-", dir=temporary_root))
     output_root = Path(environment.get("TEST_UNDECLARED_OUTPUTS_DIR") or work).resolve()
@@ -126,26 +142,58 @@ def main(argv: list[str] | None = None) -> int:
 
     environment["TMPDIR"] = str(work)
     environment["LLVM_PROFILE_FILE"] = str(work / "coverage-%p.profraw")
-    options = [str(binary), *fuzzer_args, f"-max_total_time={seconds}",
-               f"-timeout={input_timeout}", f"-max_len={maximum_length}",
-               f"-artifact_prefix={artifacts}/"]
-    inputs = [] if any(not arg.startswith("-") for arg in fuzzer_args) else [str(corpus)]
-    print(f"fuzz target: {binary.name}; campaign seconds: {seconds}; max input: {maximum_length}", flush=True)
-    status = run_logged([*options, *inputs], work, environment,
-                        artifacts / "campaign.log", seconds + input_timeout + 5)
+    options = [
+        str(binary),
+        *fuzzer_args,
+        f"-max_total_time={seconds}",
+        f"-timeout={input_timeout}",
+        f"-max_len={maximum_length}",
+        f"-artifact_prefix={artifacts}/",
+    ]
+    inputs = (
+        [] if any(not arg.startswith("-") for arg in fuzzer_args) else [str(corpus)]
+    )
+    print(
+        f"fuzz target: {binary.name}; campaign seconds: {seconds}; max input: {maximum_length}",
+        flush=True,
+    )
+    status = run_logged(
+        [*options, *inputs],
+        work,
+        environment,
+        artifacts / "campaign.log",
+        seconds + input_timeout + 5,
+    )
     if status and minimize_seconds:
         # libFuzzer owns crash reduction; keep the original even if reduction times out.
-        failures = sorted(artifacts.glob("crash-*")) + sorted(artifacts.glob("timeout-*"))
+        failures = sorted(artifacts.glob("crash-*")) + sorted(
+            artifacts.glob("timeout-*")
+        )
         for original in failures[:1]:
             minimized = artifacts / f"minimized-{original.name}"
             shutil.copyfile(original, minimized)
-            reduction_options = [str(binary), *[arg for arg in options[1:]
-                if arg.startswith("-") and not arg.startswith(("-runs=", "-max_total_time="))]]
-            run_logged([*reduction_options, "-minimize_crash=1",
-                        f"-max_total_time={minimize_seconds}",
-                        f"-exact_artifact_path={minimized}", str(original)],
-                       work, environment, artifacts / "minimize.log",
-                       minimize_seconds + input_timeout + 5)
+            reduction_options = [
+                str(binary),
+                *[
+                    arg
+                    for arg in options[1:]
+                    if arg.startswith("-")
+                    and not arg.startswith(("-runs=", "-max_total_time="))
+                ],
+            ]
+            run_logged(
+                [
+                    *reduction_options,
+                    "-minimize_crash=1",
+                    f"-max_total_time={minimize_seconds}",
+                    f"-exact_artifact_path={minimized}",
+                    str(original),
+                ],
+                work,
+                environment,
+                artifacts / "minimize.log",
+                minimize_seconds + input_timeout + 5,
+            )
     return status
 
 

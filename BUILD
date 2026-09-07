@@ -11,6 +11,12 @@ filegroup(
 )
 
 filegroup(
+    name = "ci_setup",
+    srcs = [".github/actions/setup-build/action.yml"],
+    visibility = ["//tools:__pkg__"],
+)
+
+filegroup(
     name = "test_suppressions",
     testonly = True,
     srcs = [

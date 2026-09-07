@@ -363,6 +363,7 @@ kwaque_cc_library(
         "//src/runtime:shard_affinity",
         "//src/runtime:time",
         "@abseil-cpp//absl/container:btree",
+        "@boost//:intrusive",
         "@seastar",
     ],
 )

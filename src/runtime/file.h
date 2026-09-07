@@ -312,7 +312,7 @@ public:
             return seastar::make_ready_future<result<byte_count>>(
               std::move(outcome));
         }
-        return write_validated(position, data);
+        return write_validated(position, std::move(data));
     }
     [[nodiscard]] seastar::future<result<void>> flush();
     [[nodiscard]] seastar::future<result<void>> truncate(std::uint64_t size);
@@ -378,11 +378,13 @@ private:
     try_acquire_queued_write(byte_count bytes) noexcept;
     [[nodiscard]] seastar::future<result<file_read_result>>
     read_validated(file_position position, byte_count maximum_bytes);
+    // These helpers do not suspend; pending writes must retain their payload
+    // in an owning continuation or writer before returning.
     [[nodiscard]] seastar::future<result<byte_count>>
-    write_validated(file_position position, bytes::fragmented_buffer& data);
+    write_validated(file_position position, bytes::fragmented_buffer&& data);
     [[nodiscard]] seastar::future<result<byte_count>> write_general(
       file_position position,
-      bytes::fragmented_buffer& data,
+      bytes::fragmented_buffer&& data,
       std::optional<seastar::semaphore_units<>> serialization);
     [[nodiscard]] seastar::future<result<file_read_result>> read_chunked(
       file_position position,

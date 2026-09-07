@@ -9,7 +9,7 @@ MODULE_PATTERN = re.compile(r"bazel_dep\((.*?)\)", re.DOTALL)
 NAME_PATTERN = re.compile(r'\bname\s*=\s*"([^"]+)"')
 VERSION_PATTERN = re.compile(r'\bversion\s*=\s*"([^"]+)"')
 WORKFLOW_REFERENCE_PATTERN = re.compile(
-    r"(?<![./])\b([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)@([^\s\"']+)"
+    r"(?<![./])\b([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)(?:/[A-Za-z0-9_./-]+)?@([^\s\"']+)"
 )
 
 ARCHIVE_FUNCTIONS = ("http_archive", "sysroot")

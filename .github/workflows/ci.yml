@@ -20,11 +20,19 @@ jobs:
     name: Workflow syntax
     runs-on: ubuntu-24.04
     timeout-minutes: 5
+    outputs:
+      run_checks: ${{ steps.changes.outputs.run_checks }}
     steps:
       - name: Check out source
         uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # 6.0.1
         with:
+          fetch-depth: 0
           persist-credentials: false
+      - name: Select checks from the complete change range
+        id: changes
+        run: python3 tools/ci_changes.py
+      - name: Check CI selection and coverage
+        run: python3 -m unittest tools.ci_changes_test tools.check_ci_coverage_test
       - name: Run actionlint
         run: >-
           docker run --rm
@@ -34,6 +42,8 @@ jobs:
 
   build:
     name: Release build including tests and benchmarks
+    needs: workflow-lint
+    if: needs.workflow-lint.outputs.run_checks != 'false'
     runs-on: ubuntu-24.04
     timeout-minutes: 90
     steps:
@@ -42,6 +52,9 @@ jobs:
         with:
           persist-credentials: false
       - uses: ./.github/actions/setup-build
+        with:
+          cache-scope: ci-release
+          cache-write: 'true'
       - name: Build all ordinary targets
         run: >-
           bazel build --config=ci-release
@@ -50,6 +63,8 @@ jobs:
 
   test:
     name: Debug unit and smoke tests
+    needs: workflow-lint
+    if: needs.workflow-lint.outputs.run_checks != 'false'
     runs-on: ubuntu-24.04
     timeout-minutes: 90
     steps:
@@ -58,6 +73,9 @@ jobs:
         with:
           persist-credentials: false
       - uses: ./.github/actions/setup-build
+        with:
+          cache-scope: ci-debug
+          cache-write: 'true'
       - name: Run unit and smoke tests
         run: >-
           bazel test --config=ci-debug
@@ -73,6 +91,8 @@ jobs:
 
   sanitizer:
     name: ASan and UBSan
+    needs: workflow-lint
+    if: needs.workflow-lint.outputs.run_checks != 'false'
     runs-on: ubuntu-24.04
     timeout-minutes: 90
     steps:
@@ -81,6 +101,9 @@ jobs:
         with:
           persist-credentials: false
       - uses: ./.github/actions/setup-build
+        with:
+          cache-scope: ci-sanitizer
+          cache-write: 'true'
       - name: Execute tests with sanitizers
         run: >-
           bazel test --config=ci-sanitizer
@@ -90,6 +113,7 @@ jobs:
 
   goldens:
     name: Determinism goldens (${{ matrix.runner }}, ${{ matrix.config }})
+    needs: workflow-lint
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 90
     strategy:
@@ -101,13 +125,21 @@ jobs:
         config:
           - ci-debug
           - ci-release
+    # Expand every matrix entry so its named status remains available to branch
+    # protection. Documentation-only runs skip all checkout and build steps.
     steps:
       - name: Check out source
+        if: needs.workflow-lint.outputs.run_checks != 'false'
         uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # 6.0.1
         with:
           persist-credentials: false
       - uses: ./.github/actions/setup-build
+        with:
+          cache-scope: ${{ matrix.config }}
+          cache-write: ${{ matrix.runner == 'ubuntu-24.04-arm' && matrix.config == 'ci-debug' }}
+        if: needs.workflow-lint.outputs.run_checks != 'false'
       - name: Execute the canonical golden suite
+        if: needs.workflow-lint.outputs.run_checks != 'false'
         run: >-
           bazel test --config="${{ matrix.config }}"
           --cache_test_results=no
@@ -115,6 +147,8 @@ jobs:
 
   cpp-format:
     name: C++ and Bazel formatting
+    needs: workflow-lint
+    if: needs.workflow-lint.outputs.run_checks != 'false'
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
@@ -123,6 +157,8 @@ jobs:
         with:
           persist-credentials: false
       - uses: ./.github/actions/setup-build
+        with:
+          cache-scope: tools
       - name: Check C++ formatting
         run: bazel run --lockfile_mode=error //tools:format_cpp_all -- --check
       - name: Check Bazel formatting
@@ -130,7 +166,8 @@ jobs:
 
   clang-tidy:
     name: Clang tidy
-    needs: build
+    needs: workflow-lint
+    if: needs.workflow-lint.outputs.run_checks != 'false'
     runs-on: ubuntu-24.04
     timeout-minutes: 90
     steps:
@@ -139,6 +176,8 @@ jobs:
         with:
           persist-credentials: false
       - uses: ./.github/actions/setup-build
+        with:
+          cache-scope: ci-debug
       - name: Materialize generated analysis inputs
         run: >-
           bazel build --config=ci-debug
@@ -148,12 +187,14 @@ jobs:
           bazel run --config=ci-debug --lockfile_mode=error //tools:compile_commands --
           --config=ci-debug
       - name: Run baseline checks
-        run: bazel run --config=ci-debug --lockfile_mode=error //tools:clang_tidy
+        run: bazel run --config=ci-debug --lockfile_mode=error //tools:clang_tidy -- --jobs=2
       - name: Run strict production checks
-        run: bazel run --config=ci-debug --lockfile_mode=error //tools:clang_tidy_strict
+        run: bazel run --config=ci-debug --lockfile_mode=error //tools:clang_tidy_strict -- --jobs=2
 
   clang-tidy-fuzz:
     name: Clang tidy for fuzz sources
+    needs: workflow-lint
+    if: needs.workflow-lint.outputs.run_checks != 'false'
     runs-on: ubuntu-24.04
     timeout-minutes: 90
     steps:
@@ -162,6 +203,8 @@ jobs:
         with:
           persist-credentials: false
       - uses: ./.github/actions/setup-build
+        with:
+          cache-scope: fuzz
       - name: Materialize fuzz analysis inputs
         run: bazel build --config=ci --config=fuzz --build_tag_filters=fuzz //...
       - name: Generate the fuzz compilation database
@@ -169,10 +212,12 @@ jobs:
           bazel run --config=ci --config=fuzz --lockfile_mode=error //tools:compile_commands --
           --fuzz-only --config=ci --config=fuzz
       - name: Check fuzz translation units and their dependencies
-        run: bazel run --config=ci --config=fuzz --lockfile_mode=error //tools:clang_tidy
+        run: bazel run --config=ci --config=fuzz --lockfile_mode=error //tools:clang_tidy -- --jobs=2
 
   repository-checks:
     name: Repository integrity
+    needs: workflow-lint
+    if: needs.workflow-lint.outputs.run_checks != 'false'
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
@@ -181,6 +226,9 @@ jobs:
         with:
           persist-credentials: false
       - uses: ./.github/actions/setup-build
+        with:
+          cache-scope: tools
+          cache-write: 'true'
       - name: Check generated artifacts
         run: bazel run --lockfile_mode=error //tools:check_generated_artifacts
       - name: Check dependency inventory
@@ -200,6 +248,8 @@ jobs:
 
   fuzz-smoke:
     name: ASan and UBSan fuzz smoke
+    needs: workflow-lint
+    if: needs.workflow-lint.outputs.run_checks != 'false'
     runs-on: ubuntu-24.04
     timeout-minutes: 90
     steps:
@@ -208,6 +258,9 @@ jobs:
         with:
           persist-credentials: false
       - uses: ./.github/actions/setup-build
+        with:
+          cache-scope: fuzz
+          cache-write: 'true'
       - name: Run every fixed-corpus fuzz smoke and the signal artifact canary
         run: >-
           bazel test --config=ci --config=fuzz
@@ -235,7 +288,8 @@ jobs:
 
   arm-build:
     name: Linux aarch64 release build and runtime tests
-    needs: build
+    needs: [workflow-lint, build]
+    if: needs.workflow-lint.outputs.run_checks != 'false'
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 90
     steps:
@@ -244,6 +298,9 @@ jobs:
         with:
           persist-credentials: false
       - uses: ./.github/actions/setup-build
+        with:
+          cache-scope: ci-release
+          cache-write: 'true'
       - name: Build all ordinary targets
         run: >-
           bazel build --config=ci-release

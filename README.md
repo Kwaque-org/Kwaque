@@ -91,6 +91,18 @@ hardened binaries. `ci-sanitizer` runs with ASan and UBSan, and `fuzz` combines
 libFuzzer with ASan and UBSan. The normal developer `dev` configuration uses light
 optimization and ASan. All configurations are defined in [`.bazelrc`](.bazelrc).
 
+CI skips native builds, tests, formatting, and analysis for additions or edits
+limited to README files, contributor/security documents, and prose under
+`docs/`. Workflow syntax and CI selection checks still run. Source, tests,
+build/tool configuration, dependency inventories, deletions, and unknown paths
+receive the complete checks. Manual workflow dispatches always run the full CI
+suite, as do changes whose complete Git comparison cannot be established.
+
+CI disk caches are separated by architecture and build configuration. One job
+per configuration writes a commit-specific snapshot; matching analysis and
+golden jobs restore it, falling back to an earlier snapshot for a new commit.
+Ordinary and fuzz clang-tidy jobs run independently of the release build.
+
 ### Ordinary tests and builds
 
 Run all ordinary tests, including reactor, smoke, and packaging tests:
@@ -296,10 +308,31 @@ bazel run --config=ci --config=fuzz //tools:clang_tidy
 
 The databases remain ignored. Ordinary analysis retains every distinct compile
 variant of a source file; strict analysis uses the production commands in
-`.cache/clang-tidy-production/compile_commands.json`. Regenerate the debug
-database before returning to strict analysis after fuzz work. The generator
-adjusts compiler flags for workspace analysis; normal builds continue to enforce
-strict header layering.
+`.cache/clang-tidy-production/compile_commands.json`. Fuzz-only generation updates
+the main database while preserving this production subset. Regenerate the debug
+database before returning to strict analysis after switching build configurations.
+The generator adjusts compiler flags for workspace analysis; normal builds
+continue to enforce strict header layering.
+
+Both clang-tidy commands use the parallel runner from the pinned LLVM toolchain,
+with two processes by default. CI keeps this limit to control memory use. Each
+completed file reports its elapsed time. Increase concurrency locally when
+memory permits, or select individual source files for a quick iteration:
+
+```bash
+bazel run --config=ci-debug //tools:clang_tidy -- --jobs=4
+bazel run --config=ci-debug //tools:clang_tidy_strict -- --jobs=4
+bazel run --config=ci-debug //tools:clang_tidy -- src/runtime/file.cc
+bazel run --config=ci-debug //tools:clang_tidy -- --profile src/runtime/file.cc
+```
+
+These commands reuse the prepared compilation database and generated inputs;
+keep them in the same configuration. Use `--jobs=1` to minimize concurrent memory
+use. `--profile` reports aggregated native check timings to identify expensive
+checks. A source selection still checks all of that file's compile variants.
+After changing a shared header, analyze its affected source files or run the
+complete scope. CI retains full ordinary, strict-production, and fuzz coverage.
+Bazel's disk cache speeds the preparation build; clang-tidy analysis still runs.
 
 ### Package
 

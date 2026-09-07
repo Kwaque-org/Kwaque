@@ -68,15 +68,12 @@ class RuntimeBoundaryTest(unittest.TestCase):
                 root = self.workspace(
                     {
                         "src/storage/reader.h": (
-                            "template<typename T> class basic_runtime;\n"
-                            + declaration
+                            "template<typename T> class basic_runtime;\n" + declaration
                         ),
                         "src/storage/BUILD": "",
                     }
                 )
-                self.assertIn(
-                    "broad runtime reference", "\n".join(scan(root))
-                )
+                self.assertIn("broad runtime reference", "\n".join(scan(root)))
 
     def test_rejects_broad_resource_owner_reference(self) -> None:
         for declaration in (
@@ -90,9 +87,7 @@ class RuntimeBoundaryTest(unittest.TestCase):
                         "src/storage/BUILD": "",
                     }
                 )
-                self.assertIn(
-                    "broad resource-owner reference", "\n".join(scan(root))
-                )
+                self.assertIn("broad resource-owner reference", "\n".join(scan(root)))
 
         root = self.workspace(
             {
@@ -102,9 +97,7 @@ class RuntimeBoundaryTest(unittest.TestCase):
                 "src/broker/BUILD": "",
             }
         )
-        self.assertIn(
-            "broad resource-owner reference", "\n".join(scan(root))
-        )
+        self.assertIn("broad resource-owner reference", "\n".join(scan(root)))
 
     def test_rejects_resource_to_simulation_source_dependency(self) -> None:
         root = self.workspace(
@@ -116,9 +109,7 @@ class RuntimeBoundaryTest(unittest.TestCase):
                 "src/resource/BUILD": "",
             }
         )
-        self.assertIn(
-            "resource-to-simulation source dependency", "\n".join(scan(root))
-        )
+        self.assertIn("resource-to-simulation source dependency", "\n".join(scan(root)))
 
     def test_allows_basic_runtime_declaration_owner(self) -> None:
         root = self.workspace(
@@ -171,10 +162,10 @@ class RuntimeBoundaryTest(unittest.TestCase):
                 "src/broker/BUILD": (
                     "kwaque_cc_library(\n"
                     '    name = "application_internal",\n'
-                    '    deps = [\n'
+                    "    deps = [\n"
                     '        "//src/runtime/production:environment",\n'
                     '        "//src/runtime/production:network",\n'
-                    '    ],\n'
+                    "    ],\n"
                     ")\n"
                 ),
             }
@@ -186,9 +177,7 @@ class RuntimeBoundaryTest(unittest.TestCase):
     def test_rejects_simulation_adapter_outside_tests(self) -> None:
         root = self.workspace(
             {
-                "src/storage/reader.h": (
-                    '#include "src/simulation/environment.h"\n'
-                ),
+                "src/storage/reader.h": ('#include "src/simulation/environment.h"\n'),
                 "src/storage/BUILD": (
                     "kwaque_cc_library(\n"
                     '    name = "reader",\n'
@@ -252,9 +241,7 @@ class RuntimeBoundaryTest(unittest.TestCase):
                         "src/runtime/testing/contracts/BUILD": "",
                     }
                 )
-                self.assertIn(
-                    "component retains a broad owner", "\n".join(scan(root))
-                )
+                self.assertIn("component retains a broad owner", "\n".join(scan(root)))
 
     def test_shared_environment_rule_rejects_concrete_dependency(self) -> None:
         root = self.workspace(
@@ -342,9 +329,7 @@ class RuntimeBoundaryTest(unittest.TestCase):
     def test_broker_rejects_runtime_checkpoint_state(self) -> None:
         root = self.workspace(
             {
-                "src/broker/application_internal.h": (
-                    "unsigned failure_point = 1;\n"
-                ),
+                "src/broker/application_internal.h": ("unsigned failure_point = 1;\n"),
                 "src/broker/application_test_support.h": (
                     "unsigned failure_point = 1;\n"
                 ),

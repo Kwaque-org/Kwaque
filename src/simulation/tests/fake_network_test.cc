@@ -2617,6 +2617,80 @@ SEASTAR_TEST_CASE(
     }));
 }
 
+SEASTAR_TEST_CASE(fake_network_stop_keeps_packet_id_order_after_slot_reuse) {
+    for (const std::uint32_t packet_capacity : {4U, 8'192U}) {
+        const auto scheduler_budget = bandwidth_scheduler_limits();
+        const auto trace_budget = network_trace_limits();
+        kwaque::simulation::event_trace trace{
+          network_trace_header(scheduler_budget, trace_budget), trace_budget};
+        kwaque::simulation::scheduler events{scheduler_budget, &trace};
+        auto config = kwaque::simulation::fake_network_config{};
+        config.maximum_listeners = 1;
+        config.maximum_connection_pairs = 3;
+        config.maximum_pending_connects = 3;
+        config.maximum_backlog_entries = 3;
+        config.maximum_operations = 16;
+        config.maximum_parked_operations = 16;
+        config.maximum_packets = packet_capacity;
+        config.maximum_direction_packets = 4;
+        config.maximum_links = 3;
+        config.maximum_address_entries = 8;
+        config.maximum_active_flows = 3;
+        config.maximum_controls = 3;
+        config.stop_batch = 1;
+        config.latency_min = kwaque::runtime::monotonic_duration{1'000'000'000};
+        config.latency_mean_parameter = config.latency_min;
+        auto made = kwaque::simulation::fake_network::make(config, events);
+        BOOST_REQUIRE(made.has_value());
+        auto network = std::move(*made);
+        auto peers = co_await open_many_to_one(events, *network, 3);
+        seastar::abort_source write_abort;
+        for (const std::size_t index : {2U, 0U, 1U}) {
+            auto writing = peers.clients[index].write(
+              kwaque::runtime::testing::network_contract_detail::make_bytes(
+                "x"),
+              write_abort);
+            co_await pump_until(events, writing);
+            co_await require_ready_success(writing);
+        }
+        // Retire packet 2 while packets 1 and 3 still own their slots. The
+        // small pool then reuses that slot for packet 5; slot order is not ID
+        // order.
+        peers.clients[0].request_abort();
+        for (const std::size_t index : {1U, 2U}) {
+            auto writing = peers.clients[index].write(
+              kwaque::runtime::testing::network_contract_detail::make_bytes(
+                "x"),
+              write_abort);
+            co_await pump_until(events, writing);
+            co_await require_ready_success(writing);
+        }
+        const auto trace_start = trace.entries().size();
+        auto stopping = network->stop();
+        co_await pump_until(events, stopping);
+        co_await require_ready_success(stopping);
+        std::vector<std::uint64_t> canceled_packets;
+        for (std::size_t index = trace_start; index < trace.entries().size();
+             ++index) {
+            const auto& entry = trace.entries()[index];
+            if (
+              entry.action == kwaque::simulation::trace_action::canceled
+              && entry.kind == kwaque::simulation::trace_event_kind::network
+              && entry.domain
+                   == static_cast<std::uint32_t>(
+                     kwaque::simulation::network_trace_phase::delivery)) {
+                canceled_packets.push_back(entry.stable_id);
+            }
+        }
+        const std::vector<std::uint64_t> expected{1, 3, 4, 5};
+        BOOST_CHECK(canceled_packets == expected);
+        BOOST_CHECK(
+          network->state() == kwaque::simulation::fake_network_state::stopped);
+        BOOST_CHECK_EQUAL(events.pending_events(), 0U);
+        BOOST_REQUIRE((co_await network->stop()).has_value());
+    }
+}
+
 SEASTAR_TEST_CASE(fake_network_stop_releases_clogged_ready_packet) {
     kwaque::simulation::scheduler events{bandwidth_scheduler_limits()};
     auto config = kwaque::simulation::fake_network_config{};

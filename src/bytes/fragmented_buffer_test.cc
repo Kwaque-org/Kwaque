@@ -1088,6 +1088,61 @@ TEST(BufferBuilder, ExternalFragmentCeilingsRejectBeforeAllocationOrMutation) {
     }
 }
 
+TEST(BufferBuilder, AppendAllocationFailuresRestoreTheExistingTailAndContents) {
+#if !defined(SEASTAR_ENABLE_ALLOC_FAILURE_INJECTION)
+    GTEST_SKIP() << "allocation failure injection is not enabled";
+#else
+    bool completed = false;
+    std::size_t failures = 0;
+    for (std::uint64_t fail_after = 0; fail_after < 64; ++fail_after) {
+        fragmented_buffer_builder_config config;
+        config.initial_fragment_bytes = byte_count{8};
+        config.max_fragment_bytes = byte_count{8};
+        fragmented_buffer_builder builder{config};
+        ASSERT_TRUE(builder.append(std::string_view{"head"}).has_value());
+        const auto retained = builder.retained_bytes();
+        std::optional<result<void>> appended;
+        bool threw = false;
+        auto& injector = seastar::memory::local_failure_injector();
+        injector.fail_after(fail_after);
+        try {
+            appended.emplace(
+              builder.append(std::string_view{"12345678901234567890"}));
+        } catch (const std::bad_alloc&) {
+            threw = true;
+        } catch (...) {
+            injector.cancel();
+            throw;
+        }
+        const bool injected = injector.failed();
+        injector.cancel();
+        if (injected) {
+            ++failures;
+            EXPECT_TRUE(threw);
+            EXPECT_EQ(builder.size(), byte_count{4});
+            EXPECT_EQ(builder.retained_bytes(), retained);
+            EXPECT_EQ(builder.fragment_count(), 1U);
+            EXPECT_EQ(builder.tail_capacity(), byte_count{4});
+            ASSERT_TRUE(builder.append(std::string_view{"ok"}).has_value());
+            auto published = builder.finish();
+            ASSERT_TRUE(published.has_value());
+            EXPECT_EQ(contents(*published), "headok");
+        } else {
+            EXPECT_FALSE(threw);
+            ASSERT_TRUE(appended.has_value());
+            ASSERT_TRUE(appended->has_value());
+            auto published = builder.finish();
+            ASSERT_TRUE(published.has_value());
+            EXPECT_EQ(contents(*published), "head12345678901234567890");
+            completed = true;
+            break;
+        }
+    }
+    EXPECT_TRUE(completed);
+    EXPECT_GT(failures, 0U);
+#endif
+}
+
 TEST(BufferBuilder, ExternalCloneAllocationFailureLeavesTheBuilderUsable) {
 #if !defined(SEASTAR_ENABLE_ALLOC_FAILURE_INJECTION)
     GTEST_SKIP() << "allocation failure injection is not enabled";

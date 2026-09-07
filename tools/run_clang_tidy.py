@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import subprocess
 import sys
 import xml.etree.ElementTree as ET
@@ -73,13 +74,25 @@ def production_sources_from_query(query_xml: str) -> set[str]:
 
 def production_targets(root: Path) -> dict[str, set[str]]:
     result = subprocess.run(
-        ["bazel", "query", 'kind("cc_library|cc_binary", //src/... union //proto/...)',
-         "--output=xml", "--noimplicit_deps", "--notool_deps"],
-        cwd=root, text=True, stdout=subprocess.PIPE, check=True)
+        [
+            "bazel",
+            "query",
+            'kind("cc_library|cc_binary", //src/... union //proto/...)',
+            "--output=xml",
+            "--noimplicit_deps",
+            "--notool_deps",
+        ],
+        cwd=root,
+        text=True,
+        stdout=subprocess.PIPE,
+        check=True,
+    )
     return production_targets_from_query(result.stdout)
 
 
-def select_files(entries: list[dict], requested: list[str], production: set[str] | None) -> list[str]:
+def select_files(
+    entries: list[dict], requested: list[str], production: set[str] | None
+) -> list[str]:
     if not entries or any(not isinstance(entry.get("file"), str) for entry in entries):
         raise ValueError("compilation database has no valid source inventory")
     available = {entry["file"] for entry in entries}
@@ -88,11 +101,54 @@ def select_files(entries: list[dict], requested: list[str], production: set[str]
     selected = set(requested) if requested else available
     if production is not None:
         if not requested and production - available:
-            raise ValueError("production compilation database is incomplete; regenerate it in debug mode")
+            raise ValueError(
+                "production compilation database is incomplete; regenerate it in debug mode"
+            )
         selected &= production
     if not selected:
         raise ValueError("no C++ files selected; check the database and target scope")
     return sorted(selected)
+
+
+def positive_jobs(value: str) -> int:
+    jobs = int(value)
+    if jobs <= 0:
+        raise argparse.ArgumentTypeError("jobs must be a positive integer")
+    return jobs
+
+
+def runner_command(
+    runner: Path,
+    tool: Path,
+    config: Path,
+    database_root: Path,
+    entries: list[dict],
+    selected: list[str],
+    jobs: int,
+    profile: bool,
+) -> list[str]:
+    selected_names = set(selected)
+    # The native runner accepts regular expressions over absolute source paths.
+    # Keep exact selection and every database command variant for those sources.
+    paths = sorted(
+        {
+            os.path.abspath(os.path.join(entry["directory"], entry["file"]))
+            for entry in entries
+            if entry["file"] in selected_names
+        }
+    )
+    return [
+        sys.executable,
+        "-u",
+        str(runner),
+        f"-clang-tidy-binary={tool}",
+        f"-config-file={config}",
+        f"-p={database_root}",
+        f"-j={min(jobs, len(paths))}",
+        "-quiet",
+        *(["-enable-check-profile"] if profile else []),
+        *(f"^{re.escape(path)}$" for path in paths),
+    ]
 
 
 def main() -> int:
@@ -100,13 +156,26 @@ def main() -> int:
         description="Run clang-tidy using compile_commands.json"
     )
     parser.add_argument("--tool", required=True)
+    parser.add_argument("--runner", required=True)
     parser.add_argument("--config", required=True)
     parser.add_argument("--production-only", action="store_true")
+    parser.add_argument(
+        "--jobs",
+        "-j",
+        type=positive_jobs,
+        default=2,
+        help="maximum concurrent clang-tidy processes (default: 2)",
+    )
+    parser.add_argument(
+        "--profile", action="store_true", help="report native per-check timing totals"
+    )
     parser.add_argument("files", nargs="*")
     arguments = parser.parse_args()
 
     root = workspace_root()
-    database_root = root / PRODUCTION_DATABASE_DIRECTORY if arguments.production_only else root
+    database_root = (
+        root / PRODUCTION_DATABASE_DIRECTORY if arguments.production_only else root
+    )
     database = database_root / "compile_commands.json"
     if not database.is_file():
         print(
@@ -117,16 +186,25 @@ def main() -> int:
 
     entries = json.loads(database.read_text())
     selected = select_files(
-        entries, arguments.files,
-        set().union(*production_targets(root).values()) if arguments.production_only else None)
+        entries,
+        arguments.files,
+        (
+            set().union(*production_targets(root).values())
+            if arguments.production_only
+            else None
+        ),
+    )
 
-    command = [
-        str(resolve_runfile(arguments.tool)),
-        "--quiet",
-        f"--config-file={root / arguments.config}",
-        f"-p={database_root}",
-        *selected,
-    ]
+    command = runner_command(
+        resolve_runfile(arguments.runner),
+        resolve_runfile(arguments.tool),
+        root / arguments.config,
+        database_root,
+        entries,
+        selected,
+        arguments.jobs,
+        arguments.profile,
+    )
     return subprocess.run(command, cwd=root, check=False).returncode
 
 

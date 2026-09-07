@@ -921,7 +921,7 @@ seastar::future<result<file_read_result>> file::read_chunked(
 }
 
 seastar::future<result<byte_count>>
-file::write_validated(file_position position, bytes::fragmented_buffer& data) {
+file::write_validated(file_position position, bytes::fragmented_buffer&& data) {
     try {
         const auto append_alignment = disk_write_dma_alignment_;
         const auto memory_alignment = memory_dma_alignment_;
@@ -1027,7 +1027,8 @@ file::write_validated(file_position position, bytes::fragmented_buffer& data) {
                   }
               });
         }
-        return write_general(position, data, std::move(serialization));
+        return write_general(
+          position, std::move(data), std::move(serialization));
     } catch (const std::bad_alloc&) {
         return seastar::current_exception_as_future<result<byte_count>>();
     } catch (...) {
@@ -1038,7 +1039,7 @@ file::write_validated(file_position position, bytes::fragmented_buffer& data) {
 
 seastar::future<result<byte_count>> file::write_general(
   file_position position,
-  bytes::fragmented_buffer& data,
+  bytes::fragmented_buffer&& data,
   std::optional<seastar::semaphore_units<>> serialization) {
     std::optional<admission_reservation> queued;
     if (!serialization) {

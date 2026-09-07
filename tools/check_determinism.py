@@ -17,9 +17,19 @@ from dataclasses import dataclass
 from pathlib import Path
 
 try:
-    from tools.check_cross_shard_usage import SOURCE_SUFFIXES, code_view, line_number, splice_lines
+    from tools.check_cross_shard_usage import (
+        SOURCE_SUFFIXES,
+        code_view,
+        line_number,
+        splice_lines,
+    )
 except ModuleNotFoundError:
-    from check_cross_shard_usage import SOURCE_SUFFIXES, code_view, line_number, splice_lines
+    from check_cross_shard_usage import (
+        SOURCE_SUFFIXES,
+        code_view,
+        line_number,
+        splice_lines,
+    )
 
 
 @dataclass(frozen=True)
@@ -114,7 +124,7 @@ def declaration_context(code: str, offset: int) -> tuple[bool, bool]:
     boundary = 0
     for token in re.finditer(r"[{};]", code[:offset]):
         if token.group() == "{":
-            prefix = code[boundary:token.start()]
+            prefix = code[boundary : token.start()]
             if re.search(r"\bnamespace\b[^;{}]*$", prefix):
                 contexts.append("namespace")
             elif re.search(r"\b(?:class|struct|union)\s+\w+[^;{}]*$", prefix):
@@ -129,7 +139,7 @@ def declaration_context(code: str, offset: int) -> tuple[bool, bool]:
 
 def global_random_matches(code: str):
     for match in RANDOM_DECLARATION.finditer(code):
-        if re.search(r"\b(?:class|struct|enum)\s*$", code[:match.start()]):
+        if re.search(r"\b(?:class|struct|enum)\s*$", code[: match.start()]):
             continue
         if re.fullmatch(rf"{RANDOM_TYPES}\s+\w+\s*\(", match.group()):
             depth = 1
@@ -137,7 +147,7 @@ def global_random_matches(code: str):
             while end < len(code) and depth:
                 depth += (code[end] == "(") - (code[end] == ")")
                 end += 1
-            parameters = code[match.end():end - 1].strip()
+            parameters = code[match.end() : end - 1].strip()
             # Empty parentheses declare a function, never a default-initialized
             # object. Recognize primitive-type parameter lists too, without
             # guessing whether arbitrary identifiers name types or values.
@@ -149,7 +159,7 @@ def global_random_matches(code: str):
             if re.match(r"\s*(?:noexcept\b|const\b|->|\{)", code[end:]):
                 continue
         in_body, in_class = declaration_context(code, match.start())
-        prefix = code[max(0, code.rfind(";", 0, match.start()) + 1):match.start()]
+        prefix = code[max(0, code.rfind(";", 0, match.start()) + 1) : match.start()]
         persistent = re.search(r"\b(?:static|thread_local)\b[^;{}]*$", prefix)
         persistent = persistent or re.match(r"(?:static|thread_local)\b", match.group())
         if persistent or not in_body and not in_class:
@@ -160,7 +170,14 @@ def hash_names(codes: list[str]) -> set[str]:
     aliases: set[str] = set()
     # Preserve reviewed cross-file member/parameter names even when a caller
     # scans a minimal fixture; infer newly declared container names as well.
-    names = {"objects_", "indices_", "open_objects_", "visible_pages", "durable_pages", "pages"}
+    names = {
+        "objects_",
+        "indices_",
+        "open_objects_",
+        "visible_pages",
+        "durable_pages",
+        "pages",
+    }
     for code in codes:
         for match in RULES[0].pattern.finditer(code):
             opening = code.find("<", match.start())
@@ -173,21 +190,31 @@ def hash_names(codes: list[str]) -> set[str]:
                 end += 1
             if depth:
                 continue
-            alias = re.search(r"\busing\s+(\w+)\s*=\s*(?:\w+\s*::\s*)*$", code[:match.start()])
+            alias = re.search(
+                r"\busing\s+(\w+)\s*=\s*(?:\w+\s*::\s*)*$", code[: match.start()]
+            )
             if alias:
                 aliases.add(alias.group(1))
             variable = re.match(r"\s*[*&]*\s*(\w+)\s*(?:[;={,)])", code[end:])
             if variable:
                 names.add(variable.group(1))
     if aliases:
-        pattern = re.compile(r"\b(?:" + "|".join(map(re.escape, sorted(aliases))) + r")\b\s*[*&]*\s*(\w+)\s*(?:[;={,)])")
+        pattern = re.compile(
+            r"\b(?:"
+            + "|".join(map(re.escape, sorted(aliases)))
+            + r")\b\s*[*&]*\s*(\w+)\s*(?:[;={,)])"
+        )
         for code in codes:
             names.update(match.group(1) for match in pattern.finditer(code))
     return names
 
 
 def hash_iteration_rule(names: set[str]) -> Rule:
-    name = r"\b(?:" + "|".join(map(re.escape, sorted(names))) + r")\b" if names else r"(?!)"
+    name = (
+        r"\b(?:" + "|".join(map(re.escape, sorted(names))) + r")\b"
+        if names
+        else r"(?!)"
+    )
     return Rule(
         "unordered-iteration",
         re.compile(
@@ -219,38 +246,82 @@ class Writer:
 # These declarations index state by stable IDs. Export sorts keys; page cleanup
 # and handle invalidation are commutative. No hash traversal assigns event IDs.
 ALLOWANCES = (
-    Allowance("src/simulation/fake_file.h", "unordered-state",
-              "using page_map = seastar::chunked_hash_map<std::uint64_t, page_state>;", 1,
-              "Page lookup; dirty-page lists drive writes and exports sort page indices."),
-    Allowance("src/simulation/fake_file.h", "unordered-state",
-              "using inode_map = seastar::chunked_hash_map<std::uint64_t, std::unique_ptr<inode>>;", 1,
-              "Stable-ID lookup; snapshots sort IDs and collection has an explicit worklist."),
-    Allowance("src/simulation/fake_file.h", "unordered-state",
-              "seastar::chunked_hash_map<std::uint64_t, std::size_t> indices_;", 1,
-              "Pending slot lookup; copy_keys scans owned slots, then callers sort IDs."),
-    Allowance("src/simulation/fake_file.h", "unordered-state",
-              "seastar::chunked_hash_set<std::uint64_t> open_objects_;", 1,
-              "Membership and commutative invalidation; diagnostic IDs are sorted."),
-    Allowance("src/simulation/scheduler_driver.h", "host-clock",
-              "const auto deadline = seastar::lowres_clock::now() + watchdog;", 2,
-              "External lifecycle and registered-operation watchdog deadlines."),
-    Allowance("src/simulation/scheduler_driver.h", "host-clock",
-              "if (seastar::lowres_clock::now() >= deadline) { throw scheduler_watchdog_error{}; }", 2,
-              "External timeout failure, never simulated time or artifact data."),
-    Allowance("src/runtime/testing/contracts/real_backend_conformance.h", "host-clock",
-              "return seastar::with_timeout(seastar::lowres_clock::now() + real_backend_operation_timeout, std::move(operation));", 1,
-              "External real-adapter watchdog only."),
-    Allowance("src/runtime/testing/contracts/network_contract.h", "host-clock",
-              "void arm(seastar::lowres_clock::time_point deadline) { timer_.rearm(deadline); }", 1,
-              "External network-test watchdog deadline; expiration cancels and joins the owning scenario."),
-    Allowance("src/runtime/testing/contracts/network_contract.h", "host-clock",
-              "seastar::timer<seastar::lowres_clock> timer_;", 1,
-              "One external watchdog timer; it never orders simulated network effects."),
-    Allowance("src/simulation/tests/fake_network_test.cc", "host-clock",
-              "watchdog.arm(seastar::lowres_clock::time_point{});", 1,
-              "Expired external deadline after the parked-read handshake validates cancellation and drain."),
-    Allowance("src/simulation/tests/simulation_bench.cc", "host-clock", """
-              template<typename Function>
+    Allowance(
+        "src/simulation/fake_file.h",
+        "unordered-state",
+        "using page_map = seastar::chunked_hash_map<std::uint64_t, page_state>;",
+        1,
+        "Page lookup; dirty-page lists drive writes and exports sort page indices.",
+    ),
+    Allowance(
+        "src/simulation/fake_file.h",
+        "unordered-state",
+        "using inode_map = seastar::chunked_hash_map<std::uint64_t, std::unique_ptr<inode>>;",
+        1,
+        "Stable-ID lookup; snapshots sort IDs and collection has an explicit worklist.",
+    ),
+    Allowance(
+        "src/simulation/fake_file.h",
+        "unordered-state",
+        "seastar::chunked_hash_map<std::uint64_t, std::size_t> indices_;",
+        1,
+        "Pending slot lookup; copy_keys scans owned slots, then callers sort IDs.",
+    ),
+    Allowance(
+        "src/simulation/fake_file.h",
+        "unordered-state",
+        "seastar::chunked_hash_set<std::uint64_t> open_objects_;",
+        1,
+        "Membership and commutative invalidation; diagnostic IDs are sorted.",
+    ),
+    Allowance(
+        "src/simulation/scheduler_driver.h",
+        "host-clock",
+        "const auto deadline = seastar::lowres_clock::now() + watchdog;",
+        2,
+        "External lifecycle and registered-operation watchdog deadlines.",
+    ),
+    Allowance(
+        "src/simulation/scheduler_driver.h",
+        "host-clock",
+        "if (seastar::lowres_clock::now() >= deadline) { throw scheduler_watchdog_error{}; }",
+        2,
+        "External timeout failure, never simulated time or artifact data.",
+    ),
+    Allowance(
+        "src/runtime/testing/contracts/real_backend_conformance.h",
+        "host-clock",
+        "return seastar::with_timeout(seastar::lowres_clock::now() + real_backend_operation_timeout, std::move(operation));",
+        1,
+        "External real-adapter watchdog only.",
+    ),
+    Allowance(
+        "src/runtime/testing/contracts/network_contract.h",
+        "host-clock",
+        "void arm(seastar::lowres_clock::time_point deadline) { timer_.rearm(deadline); }",
+        1,
+        "External network-test watchdog deadline; expiration cancels and joins the owning scenario.",
+    ),
+    Allowance(
+        "src/runtime/testing/contracts/network_contract.h",
+        "host-clock",
+        "seastar::timer<seastar::lowres_clock> timer_;",
+        1,
+        "One external watchdog timer; it never orders simulated network effects.",
+    ),
+    Allowance(
+        "src/simulation/tests/fake_network_test.cc",
+        "host-clock",
+        "watchdog.arm(seastar::lowres_clock::time_point{});",
+        1,
+        "Expired external deadline after the parked-read handshake validates cancellation and drain.",
+    ),
+    Allowance(
+        "src/simulation/tests/simulation_bench.cc",
+        "host-clock",
+        """
+              template<std::invocable Function>
+              requires(!std::is_void_v<std::invoke_result_t<Function>>)
               auto measure(Function&& function) {
                   const auto started = std::chrono::steady_clock::now();
                   auto result = std::forward<Function>(function)();
@@ -261,10 +332,15 @@ ALLOWANCES = (
                   ++calls;
                   return result;
               }
-              """, 1,
-              "Benchmark-only dispatch duration observation; the callback result is returned unchanged.",
-              matches_per_span=2),
-    Allowance("src/simulation/tests/simulation_bench.cc", "host-clock", """
+              """,
+        1,
+        "Benchmark-only dispatch duration observation; the callback result is returned unchanged.",
+        matches_per_span=2,
+    ),
+    Allowance(
+        "src/simulation/tests/simulation_bench.cc",
+        "host-clock",
+        """
               template<typename T>
               seastar::future<T> wait_asynchronously(seastar::future<T> pending) {
                   if (!measure_dispatch_) {
@@ -284,12 +360,18 @@ ALLOWANCES = (
                   }
                   co_return co_await std::move(pending);
               }
-              """, 1,
-              "Instrumented benchmark wait retains the shared driver's external watchdog; host time never orders events.",
-              matches_per_span=2),
-    Allowance("src/simulation/fake_file.cc", "pointer-identity",
-              "std::bit_cast<std::uintptr_t>(buffer) % _memory_dma_alignment == 0", 1,
-              "Native DMA alignment validation; address never becomes an identity."),
+              """,
+        1,
+        "Instrumented benchmark wait retains the shared driver's external watchdog; host time never orders events.",
+        matches_per_span=2,
+    ),
+    Allowance(
+        "src/simulation/fake_file.cc",
+        "pointer-identity",
+        "std::bit_cast<std::uintptr_t>(buffer) % _memory_dma_alignment == 0",
+        1,
+        "Native DMA alignment validation; address never becomes an identity.",
+    ),
 )
 
 
@@ -345,42 +427,66 @@ BYTE_COPIES = {
     ),
 }
 ALLOWANCES += tuple(
-    Allowance(path, "native-byte-layout", snippet, 1,
-              "Copies/views existing character or byte storage; integer encoding is separate.")
-    for path, snippets in BYTE_COPIES.items() for snippet in snippets
+    Allowance(
+        path,
+        "native-byte-layout",
+        snippet,
+        1,
+        "Copies/views existing character or byte storage; integer encoding is separate.",
+    )
+    for path, snippets in BYTE_COPIES.items()
+    for snippet in snippets
 ) + (
-    Allowance("src/simulation/tests/fuzz_cases.cc", "native-byte-layout",
-              "reinterpret_cast<const std::uint8_t*>(name.data())", 2,
-              "Visible/durable directory names are already character bytes."),
+    Allowance(
+        "src/simulation/tests/fuzz_cases.cc",
+        "native-byte-layout",
+        "reinterpret_cast<const std::uint8_t*>(name.data())",
+        2,
+        "Visible/durable directory names are already character bytes.",
+    ),
 )
 
 ALLOWANCES += (
-    Allowance("src/simulation/fake_file.cc", "unordered-iteration",
-              """for (auto current = file.visible_pages.begin(); current != file.visible_pages.end();) {
+    Allowance(
+        "src/simulation/fake_file.cc",
+        "unordered-iteration",
+        """for (auto current = file.visible_pages.begin(); current != file.visible_pages.end();) {
                   if (current->first >= prepared.kept_pages) { current = file.visible_pages.erase(current); }
                   else { ++current; }
-              }""", 1,
-              "Truncate erases pages above a stable numeric boundary; no ordered output."),
-    Allowance("src/simulation/fake_file.cc", "unordered-iteration",
-              """for (auto current = file.durable_pages.begin(); current != file.durable_pages.end();) {
+              }""",
+        1,
+        "Truncate erases pages above a stable numeric boundary; no ordered output.",
+    ),
+    Allowance(
+        "src/simulation/fake_file.cc",
+        "unordered-iteration",
+        """for (auto current = file.durable_pages.begin(); current != file.durable_pages.end();) {
                   const auto visible = file.visible_pages.find(current->first);
                   if (current->first >= *file.cleared_from_page
                       && (visible == file.visible_pages.end() || !visible->second.dirty)) {
                       current = file.durable_pages.erase(current);
                   } else { ++current; }
-              }""", 1,
-              "Flush deletes cleared pages; dirty-page IDs determine publishing order."),
-    Allowance("src/simulation/fake_file.cc", "unordered-iteration",
-              """for (const auto value : open_objects_) {
+              }""",
+        1,
+        "Flush deletes cleared pages; dirty-page IDs determine publishing order.",
+    ),
+    Allowance(
+        "src/simulation/fake_file.cc",
+        "unordered-iteration",
+        """for (const auto value : open_objects_) {
                   const fake_object_id id{value};
                   auto* object = find_inode(id);
                   if (object == nullptr) { continue; }
                   object->open_references = 0;
                   collect_unreachable(id);
-              }""", 1,
-              "Commutative handle invalidation with no per-object event publication."),
-    Allowance("src/simulation/fake_file_test_support.h", "unordered-iteration",
-              """for (const auto& [id, object] : filesystem.objects_) {
+              }""",
+        1,
+        "Commutative handle invalidation with no per-object event publication.",
+    ),
+    Allowance(
+        "src/simulation/fake_file_test_support.h",
+        "unordered-iteration",
+        """for (const auto& [id, object] : filesystem.objects_) {
                   static_cast<void>(id);
                   if (object->kind != fake_file_kind::regular) { continue; }
                   const auto& file = std::get<fake_file_system::regular_file_state>(object->state);
@@ -389,17 +495,25 @@ ALLOWANCES += (
                       return runtime::failure(runtime::operation_error{errc::resource_exhausted, runtime::operation_kind::file});
                   }
                   page_bytes += pages * fake_file_page_bytes;
-              }""", 1,
-              "Commutative capacity summation, with no ordered output."),
-    Allowance("src/simulation/fake_file_test_support.h", "unordered-iteration",
-              """for (const auto& [id, object] : filesystem.objects_) {
+              }""",
+        1,
+        "Commutative capacity summation, with no ordered output.",
+    ),
+    Allowance(
+        "src/simulation/fake_file_test_support.h",
+        "unordered-iteration",
+        """for (const auto& [id, object] : filesystem.objects_) {
                   static_cast<void>(object);
                   object_ids.push_back(id);
               }
-              std::ranges::sort(object_ids);""", 1,
-              "ID collection and mandatory sorting before digesting."),
-    Allowance("src/simulation/fake_file_test_support.h", "unordered-iteration",
-              """for (const auto& [id, object] : filesystem.objects_) {
+              std::ranges::sort(object_ids);""",
+        1,
+        "ID collection and mandatory sorting before digesting.",
+    ),
+    Allowance(
+        "src/simulation/fake_file_test_support.h",
+        "unordered-iteration",
+        """for (const auto& [id, object] : filesystem.objects_) {
                   fake_inode_snapshot copy{
                     .id = id, .kind = object->kind,
                     .open_references = object->open_references,
@@ -431,42 +545,64 @@ ALLOWANCES += (
                   }
                   result.objects.push_back(std::move(copy));
               }
-              std::ranges::sort(result.objects, {}, &fake_inode_snapshot::id);""", 1,
-              "Complete indexed snapshots and mandatory ID sort before return."),
-    Allowance("src/simulation/fake_file_test_support.h", "unordered-iteration",
-              """for (const auto id : filesystem.open_objects_) { open_ids.push_back(id); }
-              std::ranges::sort(open_ids);""", 1,
-              "Collects IDs that are sorted before digesting."),
-    Allowance("src/simulation/fake_file_test_support.h", "unordered-iteration",
-              """for (const auto& [index, page] : pages) {
+              std::ranges::sort(result.objects, {}, &fake_inode_snapshot::id);""",
+        1,
+        "Complete indexed snapshots and mandatory ID sort before return.",
+    ),
+    Allowance(
+        "src/simulation/fake_file_test_support.h",
+        "unordered-iteration",
+        """for (const auto id : filesystem.open_objects_) { open_ids.push_back(id); }
+              std::ranges::sort(open_ids);""",
+        1,
+        "Collects IDs that are sorted before digesting.",
+    ),
+    Allowance(
+        "src/simulation/fake_file_test_support.h",
+        "unordered-iteration",
+        """for (const auto& [index, page] : pages) {
                   static_cast<void>(page); indices.push_back(index);
               }
-              std::ranges::sort(indices);""", 1,
-              "Collects numeric page indices that are sorted before digesting."),
-    Allowance("src/simulation/fake_file_test_support.h", "unordered-iteration",
-              """for (const auto& [index, state] : pages) {
+              std::ranges::sort(indices);""",
+        1,
+        "Collects numeric page indices that are sorted before digesting.",
+    ),
+    Allowance(
+        "src/simulation/fake_file_test_support.h",
+        "unordered-iteration",
+        """for (const auto& [index, state] : pages) {
                   const auto offset = index * fake_file_page_bytes;
                   if (offset >= destination.size()) { continue; }
                   const auto count = std::min<std::size_t>(fake_file_page_bytes, destination.size() - offset);
                   std::memcpy(destination.data() + offset, state.bytes->data(), count);
-              }""", 1,
-              "Copies pages into disjoint index-addressed destination ranges."),
+              }""",
+        1,
+        "Copies pages into disjoint index-addressed destination ranges.",
+    ),
 )
 for _path, _size, _version in (
     ("src/simulation/bandwidth.cc", "sizeof(version)", "0x01"),
     ("src/simulation/tests/network_oracle.cc", "1", "1"),
 ):
     ALLOWANCES += (
-        Allowance(_path, "native-byte-layout",
-                  f"const unsigned char version{{{_version}}}; update(&version, {_size});", 1,
-                  "Single-byte format version; no integer object-layout dependency."),
+        Allowance(
+            _path,
+            "native-byte-layout",
+            f"const unsigned char version{{{_version}}}; update(&version, {_size});",
+            1,
+            "Single-byte format version; no integer object-layout dependency.",
+        ),
     )
     for _tag in (0, 1, 2):
         _tag_size = "sizeof(tag)" if _size != "1" else "1"
         ALLOWANCES += (
-            Allowance(_path, "native-byte-layout",
-                      f"const unsigned char tag{{{_tag}}}; update(&tag, {_tag_size});", 1,
-                      "Single-byte rate tag; multibyte fields use fixed-endian writers."),
+            Allowance(
+                _path,
+                "native-byte-layout",
+                f"const unsigned char tag{{{_tag}}}; update(&tag, {_tag_size});",
+                1,
+                "Single-byte rate tag; multibyte fields use fixed-endian writers.",
+            ),
         )
 
 # Signed integer bit patterns are independent of pointer identities. Keep each
@@ -490,16 +626,25 @@ INTEGER_BIT_CASTS = {
     ),
 }
 ALLOWANCES += tuple(
-    Allowance(path, "pointer-identity", snippet, 1,
-              "Preserves a signed integer bit pattern; the source is not an address.")
-    for path, snippets in INTEGER_BIT_CASTS.items() for snippet in snippets
+    Allowance(
+        path,
+        "pointer-identity",
+        snippet,
+        1,
+        "Preserves a signed integer bit pattern; the source is not an address.",
+    )
+    for path, snippets in INTEGER_BIT_CASTS.items()
+    for snippet in snippets
 )
 
 
 # Pin the arithmetic in named canonical writers. This checks presence and
 # shape, not reachability; executable goldens establish the actual wire bytes.
 WRITERS = (
-    Writer("src/simulation/event_trace.cc", "fixed-width hexadecimal fields", """
+    Writer(
+        "src/simulation/event_trace.cc",
+        "fixed-width hexadecimal fields",
+        """
         void append_hex(Output& output, Integer value, std::size_t width) {
             constexpr std::string_view digits{"0123456789abcdef"};
             for (std::size_t index = 0; index < width; ++index) {
@@ -507,8 +652,12 @@ WRITERS = (
                 output.push_back(digits[(static_cast<std::uint64_t>(value) >> shift) & 0xfU]);
             }
         }
-    """),
-    Writer("src/observability/event_codec.cc", "little-endian event integers", """
+    """,
+    ),
+    Writer(
+        "src/observability/event_codec.cc",
+        "little-endian event integers",
+        """
         bool append_integer(Integer value) noexcept {
             using unsigned_type = std::make_unsigned_t<Integer>;
             auto encoded = static_cast<unsigned_type>(value);
@@ -518,8 +667,12 @@ WRITERS = (
             }
             return true;
         }
-    """),
-    Writer("src/observability/event_log.cc", "little-endian event-log integers", """
+    """,
+    ),
+    Writer(
+        "src/observability/event_log.cc",
+        "little-endian event-log integers",
+        """
         append_integer(event_log_artifact& output, Integer value) {
             using unsigned_type = std::make_unsigned_t<Integer>;
             auto encoded = static_cast<unsigned_type>(value);
@@ -531,8 +684,12 @@ WRITERS = (
             }
             return {};
         }
-    """),
-    Writer("src/simulation/tests/fuzz_cases.cc", "little-endian terminal digest", """
+    """,
+    ),
+    Writer(
+        "src/simulation/tests/fuzz_cases.cc",
+        "little-endian terminal digest",
+        """
         void integer(Integer value) {
             using unsigned_type = std::make_unsigned_t<Integer>;
             static_assert(sizeof(Integer) <= sizeof(std::uint64_t));
@@ -541,8 +698,12 @@ WRITERS = (
             for (auto& byte : bytes) { byte = static_cast<std::uint8_t>(encoded & 0xffU); encoded >>= 8U; }
             hasher_.update(bytes.data(), bytes.size());
         }
-    """),
-    Writer("src/simulation/tests/fuzz_reproduction.cc", "big-endian envelope digest", """
+    """,
+    ),
+    Writer(
+        "src/simulation/tests/fuzz_reproduction.cc",
+        "big-endian envelope digest",
+        """
         const auto update_integer = [&hasher]<typename Integer>(Integer value) {
             using unsigned_type = std::make_unsigned_t<Integer>;
             static_assert(sizeof(Integer) <= sizeof(std::uint64_t));
@@ -553,9 +714,13 @@ WRITERS = (
             }
             hasher.update(bytes.data(), bytes.size());
         };
-    """),
-    Writer("src/simulation/bandwidth.cc", "big-endian multiprecision digest",
-           "boost::multiprecision::export_bits(value, bytes.begin(), 8U, true);"),
+    """,
+    ),
+    Writer(
+        "src/simulation/bandwidth.cc",
+        "big-endian multiprecision digest",
+        "boost::multiprecision::export_bits(value, bytes.begin(), 8U, true);",
+    ),
 )
 
 
@@ -580,16 +745,23 @@ def masked_code(source: str) -> tuple[str, tuple[int, ...]]:
     logical, offsets = splice_lines(source)
     separated = re.sub(
         r"(?<![\w'])\d(?:[eEpP][+-]|[0-9A-Za-z_.]|'[0-9A-Za-z_])*",
-        lambda match: match.group().replace("'", " "), logical,
+        lambda match: match.group().replace("'", " "),
+        logical,
     )
     code, _ = code_view(separated)
-    code = re.sub(r"^[ \t]*#[ \t]*include[^\r\n]*",
-                  lambda match: " " * len(match.group()), code, flags=re.MULTILINE)
+    code = re.sub(
+        r"^[ \t]*#[ \t]*include[^\r\n]*",
+        lambda match: " " * len(match.group()),
+        code,
+        flags=re.MULTILINE,
+    )
     return code, offsets
 
 
 def compact(code: str) -> tuple[str, tuple[int, ...]]:
-    positions = tuple(index for index, character in enumerate(code) if not character.isspace())
+    positions = tuple(
+        index for index, character in enumerate(code) if not character.isspace()
+    )
     return "".join(code[index] for index in positions), positions
 
 
@@ -606,8 +778,11 @@ def occurrences(code: str, snippet: str) -> list[tuple[int, int]]:
     return spans
 
 
-def scan(root: Path, allowances: tuple[Allowance, ...] = ALLOWANCES,
-         writers: tuple[Writer, ...] = WRITERS) -> list[str]:
+def scan(
+    root: Path,
+    allowances: tuple[Allowance, ...] = ALLOWANCES,
+    writers: tuple[Writer, ...] = WRITERS,
+) -> list[str]:
     violations: list[str] = []
     sources = {
         path.relative_to(root).as_posix(): path.read_text(encoding="utf-8")
@@ -615,21 +790,41 @@ def scan(root: Path, allowances: tuple[Allowance, ...] = ALLOWANCES,
         if path.is_file() and is_deterministic_source(path.relative_to(root))
     }
     prepared = {name: masked_code(source) for name, source in sources.items()}
-    rules = RULES + (hash_iteration_rule(hash_names([code for code, _ in prepared.values()])),)
+    rules = RULES + (
+        hash_iteration_rule(hash_names([code for code, _ in prepared.values()])),
+    )
     approved: dict[tuple[str, str], list[tuple[int, int]]] = {}
     rule_names = {rule.name for rule in rules}
     for allowance in allowances:
+        if (
+            allowance.rule not in rule_names
+            or not allowance.reason
+            or allowance.count <= 0
+            or allowance.matches_per_span <= 0
+        ):
+            violations.append(
+                f"{allowance.path}:1: invalid-allowance: specify a known rule, reason, and positive span/match counts"
+            )
+            continue
         code, offsets = prepared.get(allowance.path, ("", ()))
-        spans = occurrences(code, allowance.code)
-        if (allowance.rule not in rule_names or not allowance.reason
-                or allowance.count <= 0 or allowance.matches_per_span <= 0):
-            violations.append(f"{allowance.path}:1: invalid-allowance: specify a known rule, reason, and positive span/match counts")
+        try:
+            spans = occurrences(code, allowance.code)
+        except ValueError as error:
+            violations.append(f"{allowance.path}:1: invalid-allowance: {error}")
             continue
         rule = next(rule for rule in rules if rule.name == allowance.rule)
-        relevant = [span for span in spans
-                    if sum(1 for _ in rule.pattern.finditer(code, *span)) == allowance.matches_per_span]
+        relevant = [
+            span
+            for span in spans
+            if sum(1 for _ in rule.pattern.finditer(code, *span))
+            == allowance.matches_per_span
+        ]
         if len(spans) != allowance.count or len(relevant) != len(spans):
-            line = line_number(sources[allowance.path], offsets[spans[0][0]]) if spans else 1
+            line = (
+                line_number(sources[allowance.path], offsets[spans[0][0]])
+                if spans
+                else 1
+            )
             violations.append(
                 f"{allowance.path}:{line}: stale-allowance: expected {allowance.count} exact "
                 f"{allowance.rule} span(s) with {allowance.matches_per_span} match(es) each, "
@@ -641,7 +836,10 @@ def scan(root: Path, allowances: tuple[Allowance, ...] = ALLOWANCES,
         for rule in rules:
             spans = approved.get((name, rule.name), ())
             for match in rule.pattern.finditer(code):
-                if any(start <= match.start() and match.end() <= end for start, end in spans):
+                if any(
+                    start <= match.start() and match.end() <= end
+                    for start, end in spans
+                ):
                     continue
                 line = line_number(sources[name], offsets[match.start()])
                 violations.append(f"{name}:{line}: {rule.name}: {rule.remediation}")
@@ -664,14 +862,19 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--workspace", type=Path)
     arguments = parser.parse_args()
-    root = (arguments.workspace or Path(os.environ.get("BUILD_WORKSPACE_DIRECTORY", Path.cwd()))).resolve()
+    root = (
+        arguments.workspace
+        or Path(os.environ.get("BUILD_WORKSPACE_DIRECTORY", Path.cwd()))
+    ).resolve()
     if not (root / "src").is_dir():
         parser.error("workspace must contain a src directory")
     violations = scan(root)
     if violations:
         print("\n".join(violations), file=sys.stderr)
         return 1
-    print("Determinism source tripwires passed; executable goldens and noise tests are still required")
+    print(
+        "Determinism source tripwires passed; executable goldens and noise tests are still required"
+    )
     return 0
 
 

@@ -84,6 +84,18 @@ class DependencyInventoryTest(unittest.TestCase):
         errors = workflow_dependency_errors(["uses: unknown/action@v1"], inventory)
         self.assertEqual(len(errors), 2)
 
+    def test_subactions_require_an_inventoried_repository_and_immutable_pin(
+        self,
+    ) -> None:
+        inventory = "| `actions/cache` | 5.1.0 |\n"
+        pinned = "uses: actions/cache/restore@" + "a" * 40
+        self.assertEqual(workflow_dependency_errors([pinned], inventory), [])
+        self.assertEqual(len(workflow_dependency_errors([pinned], "")), 1)
+        self.assertEqual(
+            workflow_dependency_errors(["uses: actions/cache/restore@v5"], inventory),
+            ["workflow dependency 'actions/cache' is not immutably pinned"],
+        )
+
     def test_extracts_pinned_archive_versions(self) -> None:
         """Literal prefixes, templated prefixes, and prefix-less sysroots all resolve."""
         self.assertEqual(

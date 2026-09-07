@@ -223,6 +223,52 @@ SEASTAR_TEST_CASE(wall_adjustments_are_bounded_ordered_integer_events) {
     co_return;
 }
 
+SEASTAR_TEST_CASE(wall_adjustment_saturation_is_transactional_and_reusable) {
+    const auto limits = scheduler_limits::make(
+      scheduler_limit_values{
+        .pending_events = 1,
+        .events_per_pump = 1,
+        .total_events = 8,
+        .maximum_deadline = monotonic_time{100},
+      });
+    BOOST_REQUIRE(limits.has_value());
+    scheduler target{*limits};
+    virtual_time time{target, test_time_config(*limits)};
+    BOOST_REQUIRE(time.schedule_wall_offset(monotonic_time{50}, wall_offset{7})
+                    .has_value());
+    BOOST_REQUIRE(target.run_until(monotonic_time{10}).has_value());
+
+    const auto full = time.schedule_wall_offset(
+      monotonic_time{60}, wall_offset{9});
+    const auto past = time.schedule_wall_offset(
+      monotonic_time{9}, wall_offset{9});
+    const auto beyond = time.schedule_wall_offset(
+      monotonic_time{101}, wall_offset{9});
+    BOOST_REQUIRE(!full.has_value());
+    BOOST_CHECK(full.error().code() == kwaque::errc::queue_full);
+    BOOST_CHECK(
+      full.error().operation() == kwaque::runtime::operation_kind::clock);
+    BOOST_REQUIRE(!past.has_value());
+    BOOST_CHECK(past.error().code() == kwaque::errc::invalid_argument);
+    BOOST_REQUIRE(!beyond.has_value());
+    BOOST_CHECK(beyond.error().code() == kwaque::errc::out_of_range);
+    BOOST_CHECK_EQUAL(time.pending_adjustments(), 1U);
+    BOOST_CHECK_EQUAL(target.pending_events(), 1U);
+    BOOST_CHECK_EQUAL(time.offset().nanoseconds(), 0);
+    BOOST_CHECK_EQUAL(time.monotonic_now().nanoseconds(), 10U);
+
+    BOOST_REQUIRE(target.run_until(monotonic_time{50}).has_value());
+    BOOST_CHECK_EQUAL(time.offset().nanoseconds(), 7);
+    BOOST_CHECK_EQUAL(time.pending_adjustments(), 0U);
+    BOOST_REQUIRE(time.schedule_wall_offset(monotonic_time{70}, wall_offset{-3})
+                    .has_value());
+    BOOST_REQUIRE(target.run_until(monotonic_time{70}).has_value());
+    BOOST_CHECK_EQUAL(time.offset().nanoseconds(), -3);
+    BOOST_CHECK_EQUAL(target.pending_events(), 0U);
+    BOOST_REQUIRE(time.stop().has_value());
+    co_return;
+}
+
 SEASTAR_TEST_CASE(virtual_time_stop_cancels_pending_wall_adjustments) {
     const auto limits = test_scheduler_limits();
     scheduler target{limits};
