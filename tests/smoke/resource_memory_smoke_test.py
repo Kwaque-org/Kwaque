@@ -21,9 +21,7 @@ MINIMUM_SHARD_MEMORY_BYTES = 64 * 1024 * 1024
 SYSTEM_ALLOCATOR_WARNING = (
     "Seastar compiled with default allocator, --memory option won't take effect"
 )
-CONFIGURED_MEMORY_METRIC = (
-    "kwaque_resource_manager_memory_configured_bytes"
-)
+CONFIGURED_MEMORY_METRIC = "kwaque_resource_manager_memory_configured_bytes"
 
 
 def reactor_arguments(shards: int) -> tuple[str, ...]:
@@ -97,15 +95,12 @@ class ResourceMemorySmokeTest(unittest.TestCase):
                         self.assertEqual(content_type, "text/plain")
                         self.assertEqual(
                             configured_memory(metrics),
-                            shards
-                            * (observed_minimum - REACTOR_HEADROOM_BYTES),
+                            shards * (observed_minimum - REACTOR_HEADROOM_BYTES),
                         )
 
                         output = broker.stop(signal.SIGTERM)
                         assert_clean_shutdown(output)
-                        self.assertFalse(
-                            (data_directory / "kwaque.pid").exists()
-                        )
+                        self.assertFalse((data_directory / "kwaque.pid").exists())
                     finally:
                         broker.kill_if_running()
 

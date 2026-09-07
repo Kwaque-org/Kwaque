@@ -16,6 +16,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <concepts>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
@@ -26,6 +27,7 @@
 #include <string>
 #include <string_view>
 #include <system_error>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
@@ -44,7 +46,9 @@ struct callback_measurements {
     std::uint64_t calls{0};
     std::uint64_t worst_nanoseconds{0};
 
-    template<typename Function>
+    // Measures value-returning submissions/steps; callers validate the result.
+    template<std::invocable Function>
+    requires(!std::is_void_v<std::invoke_result_t<Function>>)
     auto measure(Function&& function) {
         // Includes scheduler dispatch, or owning write submission when the
         // rebalance is synchronous. This is an upper bound on callback work.
@@ -289,6 +293,7 @@ struct bandwidth_fixture {
             throw std::runtime_error("bandwidth benchmark solve");
         }
         perf_tests::do_not_optimize(planner->allocation_digest().words);
+        perf_tests::stop_measuring_time();
         const auto count = planner->allocation_count();
         if (count != flow_count) {
             throw std::runtime_error("bandwidth benchmark allocation count");
@@ -302,7 +307,6 @@ struct bandwidth_fixture {
                 throw std::runtime_error("bandwidth benchmark fixed rate");
             }
         }
-        perf_tests::stop_measuring_time();
         add_flow_calls += count;
         ++solve_calls;
         return count;
@@ -315,6 +319,7 @@ struct bandwidth_fixture {
             throw std::runtime_error("bandwidth benchmark oracle solve");
         }
         perf_tests::do_not_optimize(solution->digest.words);
+        perf_tests::stop_measuring_time();
         const auto count = solution->allocations.size();
         if (count != flow_count) {
             throw std::runtime_error("bandwidth benchmark oracle count");
@@ -328,7 +333,6 @@ struct bandwidth_fixture {
                 throw std::runtime_error("bandwidth benchmark oracle rate");
             }
         }
-        perf_tests::stop_measuring_time();
         ++oracle_solve_calls;
         return count;
     }
@@ -367,6 +371,7 @@ public:
         servers_.reserve(flow_count_);
         writes_.reserve(flow_count_);
         prepared_payloads_.reserve(flow_count_);
+        received_payloads_.reserve(flow_count_);
         source_ = runtime::testing::network_contract_detail::repeated_bytes(
           integrated_payload_bytes, 'b');
         try {
@@ -392,6 +397,7 @@ public:
         }
 
         writes_.clear();
+        received_payloads_.clear();
         perf_tests::start_measuring_time();
         for (auto& client : clients_) {
             writes_.push_back(client.write(source_.share(), write_abort_));
@@ -404,15 +410,57 @@ public:
               server.read(byte_count{integrated_payload_bytes}, read_abort_));
             if (
               !received || received->eof()
-              || received->data().size().value() != integrated_payload_bytes
-              || !received->data().content_equals(expected_contents_)) {
+              || received->data().size().value() != integrated_payload_bytes) {
+                throw std::runtime_error("network benchmark read mismatch");
+            }
+            received_payloads_.push_back(std::move(*received).take_data());
+        }
+        perf_tests::stop_measuring_time();
+        for (const auto& received : received_payloads_) {
+            if (!received.content_equals(expected_contents_)) {
                 throw std::runtime_error("network benchmark read mismatch");
             }
         }
         const auto completed = clients_.size();
+        received_payloads_.clear();
         writes_.clear();
-        perf_tests::stop_measuring_time();
         co_return completed;
+    }
+
+    seastar::future<std::size_t> stop_active() {
+        measurement_label_ = "stop_active";
+        if (network_->state() != fake_network_state::open) {
+            co_await restart_environment();
+        }
+        co_await prepare_transition(true);
+        for (std::size_t index = 0; index < flow_count_; ++index) {
+            submit(index);
+            if ((index + 1U) % benchmark_batch == 0) {
+                co_await seastar::yield();
+            }
+        }
+        perf_tests::start_measuring_time();
+        measure_dispatch_ = true;
+        const auto stopped = co_await wait_asynchronously(network_->stop());
+        measure_dispatch_ = false;
+        perf_tests::stop_measuring_time();
+        require(stopped);
+        for (auto& writing : writes_) {
+            const auto result = co_await std::move(writing);
+            if (result || result.error().code() != errc::aborted) {
+                throw std::runtime_error(
+                  "network stop benchmark write terminal");
+            }
+        }
+        if (
+          network_->state() != fake_network_state::stopped
+          || events_->pending_events() != 0
+          || network_->active_operations() != 0) {
+            throw std::runtime_error("network stop benchmark retained work");
+        }
+        writes_.clear();
+        prepared_payloads_.clear();
+        co_return flow_count_;
     }
 
     seastar::future<std::size_t> start_rebalance() {
@@ -653,6 +701,7 @@ private:
 
     seastar::future<> stop_environment() {
         measure_dispatch_ = false;
+        received_payloads_.clear();
         if (network_) {
             require(co_await wait_asynchronously(network_->stop()));
         }
@@ -800,6 +849,7 @@ private:
     std::optional<seastar::future<runtime::result<fake_connection>>>
       pending_accept_;
     std::vector<bytes::fragmented_buffer> prepared_payloads_;
+    std::vector<bytes::fragmented_buffer> received_payloads_;
     bytes::fragmented_buffer source_;
     callback_measurements measurements_;
     const char* measurement_label_{"transmit_read"};
@@ -888,6 +938,14 @@ PERF_TEST_CN(integrated_many_to_one_fixture, transmit_read_8x4096) {
 PERF_TEST_CN(integrated_one_to_many_fixture, transmit_read_8x4096) {
     return execute();
 }
+
+PERF_TEST_CN(rebalance_1_fixture, stop_active) { return stop_active(); }
+
+PERF_TEST_CN(rebalance_8_fixture, stop_active) { return stop_active(); }
+
+PERF_TEST_CN(rebalance_32_fixture, stop_active) { return stop_active(); }
+
+PERF_TEST_CN(rebalance_96_fixture, stop_active) { return stop_active(); }
 
 PERF_TEST_CN(rebalance_1_fixture, active_flow_start) {
     return start_rebalance();

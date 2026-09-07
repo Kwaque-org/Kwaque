@@ -134,10 +134,20 @@ runtime::result<void> virtual_time::schedule_wall_offset(
           config_.maximum_wall_adjustment().nanoseconds()));
         return runtime::failure(std::move(error));
     }
-    KWAQUE_INVARIANT(
-      virtual_time_drained_invariant,
-      free_adjustment_ != no_adjustment,
-      "virtual wall adjustment capacity diverged from scheduler capacity");
+    const trace_event_descriptor descriptor{
+      .kind = trace_event_kind::wall_adjustment,
+      .value = std::bit_cast<std::uint64_t>(offset.nanoseconds()),
+      .effect = trace_action::wall_adjusted,
+    };
+    if (free_adjustment_ == no_adjustment) {
+        const auto admission = scheduler_->can_schedule(
+          deadline, descriptor, event_cleanup_policy::invoke);
+        KWAQUE_INVARIANT(
+          virtual_time_drained_invariant,
+          !admission.has_value(),
+          "virtual wall adjustment capacity diverged from scheduler capacity");
+        return runtime::failure(clock_error(admission.error()));
+    }
     const auto index = free_adjustment_;
     auto& adjustment = adjustments_[index];
     free_adjustment_ = adjustment.next_free;
@@ -157,11 +167,7 @@ runtime::result<void> virtual_time::schedule_wall_offset(
           [this, index] noexcept {
               finish_adjustment(index, !scheduler_->discarding_failed_event());
           },
-          trace_event_descriptor{
-            .kind = trace_event_kind::wall_adjustment,
-            .value = std::bit_cast<std::uint64_t>(offset.nanoseconds()),
-            .effect = trace_action::wall_adjusted,
-          },
+          descriptor,
           event_cleanup_policy::invoke);
         if (!scheduled) {
             release_adjustment(index);

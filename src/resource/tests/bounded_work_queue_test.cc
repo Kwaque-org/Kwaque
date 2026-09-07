@@ -9,6 +9,7 @@
 #include <seastar/core/abort_source.hh>
 #include <seastar/core/coroutine.hh>
 #include <seastar/core/future.hh>
+#include <seastar/core/lowres_clock.hh>
 #include <seastar/core/memory.hh>
 #include <seastar/core/shared_future.hh>
 #include <seastar/testing/test_case.hh>
@@ -20,6 +21,7 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <limits>
@@ -37,11 +39,15 @@ namespace {
 static_assert(sizeof(queue_failure) < sizeof(runtime::operation_error));
 
 bounded_work_queue_config queue_config(
-  std::uint64_t items, std::uint64_t bytes, std::size_t producer_waiters) {
+  std::uint64_t items,
+  std::uint64_t bytes,
+  std::size_t producer_waiters,
+  std::size_t manual_consumer_waiters = 64) {
     return bounded_work_queue_config{
       .maximum_items = item_count{items},
       .maximum_bytes = byte_count{bytes},
       .maximum_producer_waiters = producer_waiters,
+      .maximum_manual_consumer_waiters = manual_consumer_waiters,
     };
 }
 
@@ -138,6 +144,48 @@ SEASTAR_TEST_CASE(
 }
 
 SEASTAR_TEST_CASE(
+  bounded_work_queue_push_move_abort_precedes_waiter_saturation) {
+    bounded_work_queue<move_callback_item> queue{queue_config(1, 10, 1)};
+    seastar::abort_source abort_source;
+    seastar::abort_source newcomer_abort;
+    bool armed = false;
+    bool called = false;
+    seastar::noncopyable_function<void() noexcept> callback = [&] noexcept {
+        called = true;
+        newcomer_abort.request_abort();
+    };
+    BOOST_REQUIRE(
+      (co_await queue.push(
+         move_callback_item{1, armed, callback}, byte_count{10}, abort_source))
+        .has_value());
+    auto head = queue.push(
+      move_callback_item{2, armed, callback}, byte_count{1}, abort_source);
+    BOOST_REQUIRE(!head.available());
+    BOOST_CHECK_EQUAL(queue.waiting_producers(), 1U);
+    BOOST_CHECK(!called);
+
+    // The prvalue enters push directly. Its subsequent move into push_wait
+    // aborts after public validation, with no queued-producer slot available.
+    armed = true;
+    const auto rejected = co_await queue.push(
+      move_callback_item{3, armed, callback}, byte_count{1}, newcomer_abort);
+    const auto pending_producers = queue.waiting_producers();
+    auto closing = queue.close(queue_close_mode::abort);
+    const auto interrupted_head = co_await std::move(head);
+    co_await std::move(closing);
+
+    BOOST_CHECK(called);
+    BOOST_CHECK(!armed);
+    BOOST_REQUIRE(!rejected.has_value());
+    BOOST_CHECK(rejected.error().kind == queue_failure_kind::aborted);
+    BOOST_CHECK_EQUAL(pending_producers, 1U);
+    BOOST_REQUIRE(!interrupted_head.has_value());
+    BOOST_CHECK(interrupted_head.error().kind == queue_failure_kind::closed);
+    BOOST_CHECK_EQUAL(queue.waiting_producers(), 0U);
+    BOOST_CHECK_EQUAL(queue.bytes().value(), 0U);
+}
+
+SEASTAR_TEST_CASE(
   bounded_work_queue_ready_consumer_prevents_reentrant_worker_start) {
     resource_registry registry;
     co_await registry.start(manager_config());
@@ -221,6 +269,9 @@ SEASTAR_TEST_CASE(bounded_work_queue_ready_push_avoids_coroutine_allocation) {
 SEASTAR_TEST_CASE(
   bounded_work_queue_ready_push_allocation_failure_is_exceptional_future) {
 #if defined(SEASTAR_ENABLE_ALLOC_FAILURE_INJECTION)
+    // Keep this queue unwarmed: its first item insertion allocates storage.
+    // The injector targets that push allocation. If item storage becomes
+    // preallocated, this fixture needs another real push allocation site.
     bounded_work_queue<int> queue{queue_config(1, 10, 0)};
     seastar::abort_source abort_source;
     std::optional<seastar::future<queue_result<void>>> pushing;
@@ -234,7 +285,9 @@ SEASTAR_TEST_CASE(
     }
     const bool injected = injector.failed();
     injector.cancel();
-    BOOST_CHECK(injected);
+    BOOST_CHECK_MESSAGE(
+      injected,
+      "first push did not allocate; review the unwarmed item-storage fixture");
     BOOST_CHECK(!escaped);
     if (pushing) {
         BOOST_REQUIRE(pushing->available());
@@ -280,7 +333,7 @@ SEASTAR_TEST_CASE(bounded_work_queue_ready_pop_avoids_coroutine_allocation) {
 }
 
 SEASTAR_TEST_CASE(
-  bounded_work_queue_worker_pop_allocation_failure_stays_in_future) {
+  bounded_work_queue_manual_pop_after_workers_bad_alloc_stays_in_future) {
 #if defined(SEASTAR_ENABLE_ALLOC_FAILURE_INJECTION)
     resource_registry registry;
     co_await registry.start(manager_config());
@@ -299,6 +352,8 @@ SEASTAR_TEST_CASE(
           [](std::exception_ptr) noexcept {});
         BOOST_REQUIRE_EQUAL(queue.configured_workers(), 1U);
 
+        // Manual pop is rejected after workers start. Exercise allocation
+        // failure in that rejection path, before any consumer admission.
         std::optional<seastar::future<queue_result<int>>> popping;
         bool escaped = false;
         auto& injector = seastar::memory::local_failure_injector();
@@ -379,6 +434,78 @@ SEASTAR_TEST_CASE(
     BOOST_CHECK_EQUAL(*second_item, 11);
     BOOST_CHECK_EQUAL(queue.bytes().value(), 0U);
     co_await queue.close(queue_close_mode::drain);
+}
+
+SEASTAR_TEST_CASE(
+  bounded_work_queue_bounds_manual_consumers_and_reuses_capacity) {
+    bounded_work_queue<int> queue{queue_config(1, 10, 0, 2)};
+    seastar::abort_source first_abort;
+    seastar::abort_source second_abort;
+    seastar::abort_source next_abort;
+    auto first = queue.pop(first_abort);
+    auto second = queue.pop(second_abort);
+    BOOST_CHECK(!first.available());
+    BOOST_CHECK(!second.available());
+    BOOST_CHECK_EQUAL(queue.waiting_consumers(), 2U);
+    auto rejected = queue.pop(next_abort);
+    BOOST_REQUIRE(rejected.available());
+    const auto exhausted = rejected.get();
+    BOOST_REQUIRE(!exhausted.has_value());
+    BOOST_CHECK(
+      exhausted.error().kind == queue_failure_kind::consumer_waiters_exhausted);
+    BOOST_CHECK(exhausted.error().code() == errc::resource_exhausted);
+    BOOST_CHECK_EQUAL(queue.waiting_consumers(), 2U);
+
+    first_abort.request_abort();
+    const auto canceled = co_await std::move(first);
+    BOOST_REQUIRE(!canceled.has_value());
+    BOOST_CHECK(canceled.error().kind == queue_failure_kind::aborted);
+    BOOST_CHECK_EQUAL(queue.waiting_consumers(), 1U);
+    auto next = queue.pop(next_abort);
+    BOOST_CHECK(!next.available());
+    BOOST_CHECK_EQUAL(queue.waiting_consumers(), 2U);
+    auto closing = queue.close(queue_close_mode::abort);
+    const auto second_result = co_await std::move(second);
+    const auto next_result = co_await std::move(next);
+    co_await std::move(closing);
+    BOOST_REQUIRE(!second_result.has_value());
+    BOOST_REQUIRE(!next_result.has_value());
+    BOOST_CHECK(second_result.error().kind == queue_failure_kind::closed);
+    BOOST_CHECK(next_result.error().kind == queue_failure_kind::closed);
+    BOOST_CHECK_EQUAL(queue.waiting_consumers(), 0U);
+    BOOST_CHECK_EQUAL(queue.bytes().value(), 0U);
+}
+
+SEASTAR_TEST_CASE(
+  bounded_work_queue_zero_manual_waiters_preserves_ready_and_error_paths) {
+    BOOST_CHECK(
+      !queue_config(
+         1,
+         10,
+         0,
+         bounded_work_queue_config::maximum_supported_manual_consumer_waiters
+           + 1)
+         .validate()
+         .has_value());
+    bounded_work_queue<int> queue{queue_config(1, 10, 0, 0)};
+    seastar::abort_source abort_source;
+    const auto empty = co_await queue.pop(abort_source);
+    BOOST_REQUIRE(!empty.has_value());
+    BOOST_CHECK(
+      empty.error().kind == queue_failure_kind::consumer_waiters_exhausted);
+    BOOST_REQUIRE(
+      (co_await queue.push(42, byte_count{1}, abort_source)).has_value());
+    const auto ready = co_await queue.pop(abort_source);
+    BOOST_REQUIRE(ready.has_value());
+    BOOST_CHECK_EQUAL(*ready, 42);
+    abort_source.request_abort();
+    const auto aborted = co_await queue.pop(abort_source);
+    BOOST_REQUIRE(!aborted.has_value());
+    BOOST_CHECK(aborted.error().kind == queue_failure_kind::aborted);
+    co_await queue.close(queue_close_mode::abort);
+    const auto closed = co_await queue.pop(abort_source);
+    BOOST_REQUIRE(!closed.has_value());
+    BOOST_CHECK(closed.error().kind == queue_failure_kind::closed);
 }
 
 SEASTAR_TEST_CASE(bounded_work_queue_saturates_each_admission_dimension) {
@@ -705,6 +832,35 @@ SEASTAR_TEST_CASE(bounded_work_queue_bounds_both_producer_populations) {
     BOOST_CHECK_EQUAL(queue.waiting_producers(), 0U);
     BOOST_CHECK_EQUAL(queue.bytes().value(), 0U);
     co_await queue.close(queue_close_mode::drain);
+}
+
+SEASTAR_TEST_CASE(
+  managed_workers_wait_when_manual_consumer_waiting_is_disabled) {
+    resource_registry registry;
+    co_await registry.start(manager_config());
+    resource_manager manager{registry.handles()};
+    co_await manager.start();
+    {
+        bounded_work_queue<int> queue{
+          queue_config(2, 20, 0, 0), manager, workload_class::maintenance};
+        queue.start_workers(
+          bounded_queue_worker_config{.workers = 2, .maximum_error_reports = 0},
+          [](int) { return seastar::make_ready_future<>(); },
+          [](std::exception_ptr) noexcept {});
+        const auto deadline = seastar::lowres_clock::now()
+                              + std::chrono::seconds{10};
+        while (queue.waiting_consumers() != 2
+               && seastar::lowres_clock::now() < deadline) {
+            co_await seastar::yield();
+        }
+        const auto waiting = queue.waiting_consumers();
+        co_await queue.close(queue_close_mode::abort);
+        BOOST_CHECK_EQUAL(waiting, 2U);
+        BOOST_CHECK_EQUAL(queue.waiting_consumers(), 0U);
+        BOOST_CHECK_EQUAL(queue.active_workers(), 0U);
+    }
+    co_await manager.stop();
+    co_await registry.stop();
 }
 
 SEASTAR_TEST_CASE(bounded_work_queue_integrates_and_isolates_workers) {

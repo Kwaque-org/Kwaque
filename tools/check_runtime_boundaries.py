@@ -21,9 +21,7 @@ REVERSE_INCLUDE = re.compile(
 CONCRETE_ENVIRONMENT_INCLUDE = re.compile(
     r'^\s*#\s*include\s*[<"]src/(?:runtime/production|simulation)/', re.MULTILINE
 )
-RESOURCE_INCLUDE = re.compile(
-    r'^\s*#\s*include\s*[<"]src/resource/', re.MULTILINE
-)
+RESOURCE_INCLUDE = re.compile(r'^\s*#\s*include\s*[<"]src/resource/', re.MULTILINE)
 SIMULATION_TYPE_REFERENCE = re.compile(
     r"\b(?:kwaque::)?simulation::|\bnamespace\s+kwaque::simulation\b"
 )
@@ -49,8 +47,8 @@ APPLICATION_TEST_SUPPORT_DEPENDENCY = re.compile(
     r'"(?::|//src/broker:)application_test_support"'
 )
 BOOTSTRAP_TUNING_LITERAL = re.compile(
-    r'''["'](?:runtime|simulation|resource_memory|resource_total_memory|'''
-    r'''reactor_headroom|scheduler|event_log|fault_rules)["']'''
+    r"""["'](?:runtime|simulation|resource_memory|resource_total_memory|"""
+    r"""reactor_headroom|scheduler|event_log|fault_rules)["']"""
 )
 BOOTSTRAP_TUNING_YAML_KEY = re.compile(
     r"^\s*(?:runtime|simulation|resource_memory|resource_total_memory|"
@@ -103,6 +101,7 @@ BROKER_RUNTIME_CHECKPOINT = re.compile(
     r"\bfailure_point\b|\bfail_at_start_boundary\b|\bstart_checkpoint_failure\b"
 )
 
+
 def is_test_path(path: Path) -> bool:
     return path.name.endswith(
         ("_test.cc", "_test.h", "_test_support.h", "_bench.cc")
@@ -123,7 +122,9 @@ def build_files(root: Path) -> list[Path]:
 
 def code_match_lines(text: str, pattern: re.Pattern[str]) -> list[int]:
     code, offsets = code_view(text)
-    return [line_number(text, offsets[match.start()]) for match in pattern.finditer(code)]
+    return [
+        line_number(text, offsets[match.start()]) for match in pattern.finditer(code)
+    ]
 
 
 def text_match_lines(text: str, pattern: re.Pattern[str]) -> list[int]:
@@ -202,7 +203,9 @@ def scan(root: Path) -> list[str]:
             for line in text_match_lines(text, CONCRETE_ENVIRONMENT_INCLUDE):
                 if text.splitlines()[line - 1].strip() in allowed:
                     continue
-                violations.append(f"{relative}:{line}: concrete runtime adapter include")
+                violations.append(
+                    f"{relative}:{line}: concrete runtime adapter include"
+                )
 
         if production_file:
             for line in text_match_lines(text, REVERSE_INCLUDE):
@@ -222,9 +225,7 @@ def scan(root: Path) -> list[str]:
             for line in code_match_lines(text, BROAD_RUNTIME_REFERENCE):
                 violations.append(f"{relative}:{line}: broad runtime reference")
             for line in code_match_lines(text, BROAD_RESOURCE_MANAGER_REFERENCE):
-                violations.append(
-                    f"{relative}:{line}: broad resource-owner reference"
-                )
+                violations.append(f"{relative}:{line}: broad resource-owner reference")
             if path not in RESOURCE_COMPOSITION_HEADERS:
                 for line in code_match_lines(text, BROAD_RESOURCE_REGISTRY_REFERENCE):
                     violations.append(
@@ -251,9 +252,7 @@ def scan(root: Path) -> list[str]:
                 dependencies = DEPENDENCY_LIST.search(rule.group())
                 if dependencies is None:
                     continue
-                concrete = CONCRETE_ENVIRONMENT_DEPENDENCY.search(
-                    dependencies.group(1)
-                )
+                concrete = CONCRETE_ENVIRONMENT_DEPENDENCY.search(dependencies.group(1))
                 if concrete is not None:
                     line = 1 + text.count(
                         "\n",
@@ -267,10 +266,9 @@ def scan(root: Path) -> list[str]:
         if path == "src/broker/BUILD":
             for rule in LIBRARY_RULE.finditer(text):
                 name = RULE_NAME.search(rule.group())
-                if (
-                    EXPORTED_INTERNAL_COMPOSITION_HEADER.search(rule.group())
-                    and PUBLIC_VISIBILITY.search(rule.group())
-                ):
+                if EXPORTED_INTERNAL_COMPOSITION_HEADER.search(
+                    rule.group()
+                ) and PUBLIC_VISIBILITY.search(rule.group()):
                     line = 1 + text.count("\n", 0, rule.start())
                     violations.append(
                         f"{relative}:{line}: internal composition header "
@@ -286,10 +284,9 @@ def scan(root: Path) -> list[str]:
                         f"{relative}:{line}: application checkpoint support "
                         "is not test-only"
                     )
-                if (
-                    not TEST_ONLY.search(rule.group())
-                    and APPLICATION_TEST_SUPPORT_DEPENDENCY.search(rule.group())
-                ):
+                if not TEST_ONLY.search(
+                    rule.group()
+                ) and APPLICATION_TEST_SUPPORT_DEPENDENCY.search(rule.group()):
                     line = 1 + text.count("\n", 0, rule.start())
                     violations.append(
                         f"{relative}:{line}: production library depends on "

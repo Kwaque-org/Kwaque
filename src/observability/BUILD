@@ -141,7 +141,6 @@ kwaque_cc_seastar_test(
         ":event_sequence",
         ":event_sequence_test_access",
         "//src/base",
-        "@openssl",
     ],
 )
 

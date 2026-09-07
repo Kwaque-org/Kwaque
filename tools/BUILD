@@ -2,6 +2,16 @@ load("@rules_python//python:defs.bzl", "py_binary", "py_library", "py_test")
 
 package(default_visibility = ["//visibility:private"])
 
+py_test(
+    name = "ci_changes_test",
+    size = "small",
+    srcs = [
+        "ci_changes.py",
+        "ci_changes_test.py",
+    ],
+    main = "ci_changes_test.py",
+)
+
 py_binary(
     name = "compare_benchmarks",
     srcs = ["compare_benchmarks.py"],
@@ -31,9 +41,11 @@ py_test(
         "$(rootpath //:ci_workflow)",
         "$(rootpath //:fuzz_workflow)",
         "$(rootpath //:bazel_config)",
+        "$(rootpath //:ci_setup)",
     ],
     data = [
         "//:bazel_config",
+        "//:ci_setup",
         "//:ci_workflow",
         "//:fuzz_workflow",
     ],
@@ -180,10 +192,12 @@ py_binary(
     srcs = ["run_clang_tidy.py"],
     args = [
         "--tool=$(rlocationpath @current_llvm_toolchain_llvm//:clang-tidy)",
+        "--runner=$(rlocationpath @current_llvm_toolchain_llvm//:bin/run-clang-tidy)",
         "--config=.clang-tidy",
     ],
     data = [
         "//:.clang-tidy",
+        "@current_llvm_toolchain_llvm//:bin/run-clang-tidy",
         "@current_llvm_toolchain_llvm//:clang-tidy",
     ],
     main = "run_clang_tidy.py",
@@ -196,11 +210,13 @@ py_binary(
     srcs = ["run_clang_tidy.py"],
     args = [
         "--tool=$(rlocationpath @current_llvm_toolchain_llvm//:clang-tidy)",
+        "--runner=$(rlocationpath @current_llvm_toolchain_llvm//:bin/run-clang-tidy)",
         "--config=.clang-tidy-strict",
         "--production-only",
     ],
     data = [
         "//:.clang-tidy-strict",
+        "@current_llvm_toolchain_llvm//:bin/run-clang-tidy",
         "@current_llvm_toolchain_llvm//:clang-tidy",
     ],
     main = "run_clang_tidy.py",
@@ -268,6 +284,10 @@ py_test(
     name = "run_clang_tidy_test",
     size = "small",
     srcs = ["run_clang_tidy_test.py"],
+    data = ["@current_llvm_toolchain_llvm//:bin/run-clang-tidy"],
+    env = {
+        "KWAQUE_TEST_TIDY_RUNNER": "$(rlocationpath @current_llvm_toolchain_llvm//:bin/run-clang-tidy)",
+    },
     main = "run_clang_tidy_test.py",
     deps = [":clang_tidy_lib"],
 )

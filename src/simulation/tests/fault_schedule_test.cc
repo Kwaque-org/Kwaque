@@ -628,6 +628,16 @@ SEASTAR_TEST_CASE(fault_selectors_have_exact_window_and_draw_semantics) {
 }
 
 SEASTAR_TEST_CASE(fault_decisions_match_canonical_keyed_vectors) {
+    static_assert(
+      kwaque::runtime::descriptor_for(builtin_fault_point::file_read)
+          ->id.value()
+        == 6U,
+      "file_read trace domain must remain 6 for replay compatibility");
+    static_assert(
+      kwaque::runtime::descriptor_for(builtin_fault_point::file_write)
+          ->id.value()
+        == 7U,
+      "file_write trace domain must remain 7 for replay compatibility");
     const auto ratio = kwaque::runtime::probability_ratio::make(
       UINT64_C(0x4000000000000005), UINT64_C(0x800000000000000b));
     BOOST_REQUIRE(ratio.has_value());
@@ -747,7 +757,7 @@ SEASTAR_TEST_CASE(fault_decisions_match_canonical_keyed_vectors) {
         BOOST_CHECK(entry.kind == trace_event_kind::fault);
         BOOST_CHECK_EQUAL(
           entry.domain,
-          vector.point == builtin_fault_point::file_read ? 6U : 7U);
+          kwaque::runtime::descriptor_for(vector.point)->id.value());
         BOOST_CHECK_EQUAL(entry.stable_id, vector.rule_id);
         BOOST_CHECK_EQUAL(entry.coordinate_a, vector.occurrence);
         BOOST_CHECK_EQUAL(entry.coordinate_b, vector.draws);

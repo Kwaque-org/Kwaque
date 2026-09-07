@@ -17,14 +17,24 @@ def disable_core_dumps() -> None:
 
 class SeastarFuzzBridgeTest(unittest.TestCase):
     def run_canary(self, mode: str) -> subprocess.CompletedProcess[str]:
-        with tempfile.TemporaryDirectory(prefix="fuzz-bridge-", dir=os.environ["TEST_TMPDIR"]) as directory:
+        with tempfile.TemporaryDirectory(
+            prefix="fuzz-bridge-", dir=os.environ["TEST_TMPDIR"]
+        ) as directory:
             environment = dict(os.environ)
             environment["TMPDIR"] = directory
-            environment["LLVM_PROFILE_FILE"] = str(Path(directory) / "canary-%p.profraw")
+            environment["LLVM_PROFILE_FILE"] = str(
+                Path(directory) / "canary-%p.profraw"
+            )
             return subprocess.run(
-                [str(CANARY), mode], cwd=directory, env=environment,
-                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
-                timeout=30, check=False, preexec_fn=disable_core_dumps,
+                [str(CANARY), mode],
+                cwd=directory,
+                env=environment,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=30,
+                check=False,
+                preexec_fn=disable_core_dumps,
             )
 
     def test_normal_inputs_join_and_finalize(self) -> None:

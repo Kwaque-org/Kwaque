@@ -25,8 +25,12 @@ managed queue draws native units from the same per-class semaphore as direct
 reservations and reserves one waiter slot for the producer holding its admission
 turn. Its optional worker set is owned by the queue, is started at most once,
 and retains each item's memory units until that item's handler completes.
-Per-queue worker and producer-waiter ceilings also prevent task metadata from
-becoming an unaccounted memory multiplier.
+Per-queue worker, producer-waiter, and manual-consumer ceilings also prevent task
+metadata from becoming an unaccounted memory multiplier. Manual consumers default
+to at most 64 pending waits, with a configurable limit from zero to 64. Saturation
+returns `consumer_waiters_exhausted` before another wait is retained; a zero limit
+permits ready pops only. Cancellation and completion return capacity. Managed
+consumers instead use their configured worker count as the bound.
 
 Components obtain one move-only workload lease during startup. It supplies the
 copyable scheduling/SMP handles and a shard-local native memory semaphore while

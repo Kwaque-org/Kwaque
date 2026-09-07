@@ -36,10 +36,12 @@ namespace kwaque::resource {
 
 struct bounded_work_queue_config final {
     static constexpr std::size_t maximum_supported_producer_waiters = 256;
+    static constexpr std::size_t maximum_supported_manual_consumer_waiters = 64;
 
     item_count maximum_items;
     byte_count maximum_bytes;
     std::size_t maximum_producer_waiters{0};
+    std::size_t maximum_manual_consumer_waiters{64};
 
     [[nodiscard]] result<void> validate() const noexcept {
         // Every admitted item costs at least one byte, so an item bound above
@@ -48,7 +50,9 @@ struct bounded_work_queue_config final {
           maximum_items.value() == 0 || maximum_bytes.value() < 2
           || maximum_bytes.value() > seastar::semaphore::max_counter()
           || maximum_items.value() > maximum_bytes.value()
-          || maximum_producer_waiters > maximum_supported_producer_waiters) {
+          || maximum_producer_waiters > maximum_supported_producer_waiters
+          || maximum_manual_consumer_waiters
+               > maximum_supported_manual_consumer_waiters) {
             return failure(errc::invalid_argument);
         }
         return {};
@@ -63,6 +67,7 @@ enum class queue_failure_kind {
     invalid_cost,
     oversized,
     producer_waiters_exhausted,
+    consumer_waiters_exhausted,
 };
 
 struct queue_failure final {
@@ -81,6 +86,7 @@ struct queue_failure final {
         case queue_failure_kind::oversized:
             return errc::out_of_range;
         case queue_failure_kind::producer_waiters_exhausted:
+        case queue_failure_kind::consumer_waiters_exhausted:
             return errc::resource_exhausted;
         }
         return errc::invariant_violation;
@@ -136,6 +142,8 @@ struct bounded_queue_worker_config final {
 // producers are suspended at once; one of those slots is reserved for the
 // producer holding the admission turn, so a later arrival can never displace
 // the producer already at the head of the admission order.
+// Manual consumer waiters have a separate bound; managed consumers are bounded
+// by their worker count. A zero manual bound permits only ready pops.
 template<typename T>
 requires std::is_nothrow_move_constructible_v<T>
 class bounded_work_queue final : public runtime::shard_affine {
@@ -385,9 +393,9 @@ private:
         operation_token operation{*this, active_producers_};
         std::optional<producer_cancellation> cancellation;
         auto turn = std::move(incoming_turn);
-        if (auto invalid = validate_cost(cost)) {
-            co_return reject_push(std::move(*invalid));
-        }
+        // push() validated the immutable cost bounds. Moving T into this
+        // coroutine can reenter the queue or abort the caller, so recheck
+        // lifecycle state before waiter admission.
         if (state_ != bounded_work_queue_state::open) {
             co_return reject_push(failure(queue_failure_kind::closed, cost));
         }
@@ -587,6 +595,10 @@ private:
                 return queue_result<admitted_item>{std::move(admitted)};
             }
         }
+        if (auto rejected = consumer_wait_rejection(abort_source)) {
+            return queue_result<admitted_item>{
+              std::unexpected(std::move(*rejected))};
+        }
         return std::nullopt;
     }
 
@@ -597,7 +609,19 @@ private:
         consumer_wait_token waiting{*this};
         auto turn = seastar::try_get_units(consumer_turn_, 1);
         if (!turn) {
-            waiting.engage();
+            if (state_ != bounded_work_queue_state::open && items_.empty()) {
+                co_return std::unexpected(
+                  failure(queue_failure_kind::closed, byte_count{}));
+            }
+            if (abort_source.abort_requested()) {
+                co_return std::unexpected(
+                  failure(queue_failure_kind::aborted, byte_count{}));
+            }
+            if (!waiting.try_engage()) {
+                co_return std::unexpected(failure(
+                  queue_failure_kind::consumer_waiters_exhausted,
+                  byte_count{}));
+            }
             try {
                 turn = co_await seastar::coroutine::without_preemption_check(
                   seastar::get_units(consumer_turn_, 1, abort_source));
@@ -624,7 +648,11 @@ private:
                 co_return queue_result<admitted_item>{std::move(admitted)};
             }
 
-            waiting.engage();
+            if (!waiting.try_engage()) {
+                co_return std::unexpected(failure(
+                  queue_failure_kind::consumer_waiters_exhausted,
+                  byte_count{}));
+            }
             auto subscription = abort_source.subscribe(
               [this] noexcept { consumer_condition_.broadcast(); });
             if (abort_source.abort_requested()) {
@@ -868,11 +896,15 @@ private:
             }
         }
 
-        void engage() noexcept {
+        [[nodiscard]] bool try_engage() noexcept {
             if (!engaged_) {
+                if (queue_.waiting_consumers_ >= queue_.consumer_wait_limit()) {
+                    return false;
+                }
                 ++queue_.waiting_consumers_;
                 engaged_ = true;
             }
+            return true;
         }
 
     private:
@@ -930,6 +962,26 @@ private:
         return config_.maximum_producer_waiters == 0
                  ? 0
                  : config_.maximum_producer_waiters - 1;
+    }
+
+    [[nodiscard]] std::size_t consumer_wait_limit() const noexcept {
+        return workers_started_ ? worker_config_->workers
+                                : config_.maximum_manual_consumer_waiters;
+    }
+
+    [[nodiscard]] std::optional<queue_failure> consumer_wait_rejection(
+      const seastar::abort_source& abort_source) const noexcept {
+        if (state_ != bounded_work_queue_state::open && items_.empty()) {
+            return failure(queue_failure_kind::closed, byte_count{});
+        }
+        if (abort_source.abort_requested()) {
+            return failure(queue_failure_kind::aborted, byte_count{});
+        }
+        if (waiting_consumers_ >= consumer_wait_limit()) {
+            return failure(
+              queue_failure_kind::consumer_waiters_exhausted, byte_count{});
+        }
+        return std::nullopt;
     }
 
     [[nodiscard]] bool can_admit_locally(byte_count cost) const {

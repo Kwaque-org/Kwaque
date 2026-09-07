@@ -1,15 +1,21 @@
 from __future__ import annotations
 
+import io
+import json
 import os
 import tempfile
 import unittest
+from contextlib import redirect_stdout
 from pathlib import Path
+from unittest import mock
 
 from tools.compilation_database import (
     EXTERNAL_LINK_TARGET,
+    PRODUCTION_DATABASE_DIRECTORY,
     active_output_base,
     compiler_arguments,
     ensure_external_link,
+    generate,
     query_expression,
     select_commands,
 )
@@ -25,25 +31,50 @@ class CompilerArgumentsTest(unittest.TestCase):
     def parse(self, *arguments: str) -> tuple[str, list[str]] | None:
         return compiler_arguments(action(*arguments), self.execution_root)
 
-    def test_shared_source_keeps_all_variants_and_strict_subset_in_any_action_order(self) -> None:
+    def test_shared_source_keeps_all_variants_and_strict_subset_in_any_action_order(
+        self,
+    ) -> None:
         actions = [
-            {"targetId": 1, "arguments": ["clang", "-DTEST=1", "-c", "src/model/record.cc"]},
-            {"targetId": 2, "arguments": ["clang", "-DTEST=0", "-c", "src/model/record.cc"]},
+            {
+                "targetId": 1,
+                "arguments": ["clang", "-DTEST=1", "-c", "src/model/record.cc"],
+            },
+            {
+                "targetId": 2,
+                "arguments": ["clang", "-DTEST=0", "-c", "src/model/record.cc"],
+            },
         ]
-        targets = [{"id": 1, "label": "//src/model:test_support"},
-                   {"id": 2, "label": "//src/model:record"}]
+        targets = [
+            {"id": 1, "label": "//src/model:test_support"},
+            {"id": 2, "label": "//src/model:record"},
+        ]
         for ordered in (actions, list(reversed(actions))):
-            entries = select_commands(ordered, targets, {targets[1]["label"]}, self.execution_root, Path("."))
+            entries = select_commands(
+                ordered, targets, {targets[1]["label"]}, self.execution_root, Path(".")
+            )
             self.assertEqual(len(entries), 2)
-            strict = select_commands(ordered, targets, {targets[1]["label"]}, self.execution_root, Path("."), production_only=True)
+            strict = select_commands(
+                ordered,
+                targets,
+                {targets[1]["label"]},
+                self.execution_root,
+                Path("."),
+                production_only=True,
+            )
             self.assertEqual(len(strict), 1)
             self.assertIn("-DTEST=0", strict[0]["arguments"])
         with self.assertRaisesRegex(RuntimeError, "target identity"):
             select_commands(actions, [], set(), self.execution_root, Path("."))
 
     def test_fuzz_analysis_uses_fuzz_roots_and_their_dependencies(self) -> None:
-        self.assertEqual(query_expression(True), 'mnemonic("CppCompile", deps(attr(tags, "fuzz", //...)))')
-        self.assertEqual(query_expression(False), 'mnemonic("CppCompile", deps(//... except attr(tags, "manual|fuzz", //...)))')
+        self.assertEqual(
+            query_expression(True),
+            'mnemonic("CppCompile", deps(attr(tags, "fuzz", //...)))',
+        )
+        self.assertEqual(
+            query_expression(False),
+            'mnemonic("CppCompile", deps(//... except attr(tags, "manual|fuzz", //...)))',
+        )
 
     def test_external_paths_stay_workspace_relative(self) -> None:
         """They must resolve through the workspace link, not a fixed output base."""
@@ -99,6 +130,101 @@ class CompilerArgumentsTest(unittest.TestCase):
         self.assertIsNone(self.parse("clang", "-c", "src/base/notes.txt"))
         self.assertIsNone(self.parse("clang", "-c", "external/seastar/src/core.cc"))
         self.assertIsNone(self.parse())
+
+
+class DatabaseGenerationTest(unittest.TestCase):
+    production = {
+        "//src/base:error": {"src/base/error.cc"},
+        "//src/broker:application": {"src/broker/application.cc"},
+    }
+    ordinary_sources = (
+        ("//src/base:error", "src/base/error.cc"),
+        ("//src/broker:application", "src/broker/application.cc"),
+        ("//src/base:error_test", "src/base/error_test.cc"),
+    )
+    fuzz_source = (
+        "//src/simulation/tests:scheduler_fuzz_runner",
+        "src/simulation/tests/scheduler_fuzz.cc",
+    )
+
+    def setUp(self) -> None:
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        base = Path(directory.name) / "base"
+        output = base / "execroot" / "_main" / "bazel-out"
+        output.mkdir(parents=True)
+        (base / "external").mkdir()
+        self.root = Path(directory.name) / "workspace"
+        self.root.mkdir()
+        (self.root / "bazel-out").symlink_to(output)
+        (self.root / "external").symlink_to(EXTERNAL_LINK_TARGET)
+        self.strict_database = (
+            self.root / PRODUCTION_DATABASE_DIRECTORY / "compile_commands.json"
+        )
+
+    def run_generator(
+        self, sources: tuple[tuple[str, str], ...], *, fuzz_only: bool = False
+    ) -> list[dict]:
+        mode = "-DFUZZ=1" if fuzz_only else "-DORDINARY=1"
+        response = {
+            "targets": [
+                {"id": index, "label": label}
+                for index, (label, _) in enumerate(sources)
+            ],
+            "actions": [
+                {"targetId": index, "arguments": ["clang", mode, "-c", source]}
+                for index, (_, source) in enumerate(sources)
+            ],
+        }
+        with (
+            mock.patch(
+                "tools.compilation_database.workspace_root", return_value=self.root
+            ),
+            mock.patch(
+                "tools.compilation_database.production_targets",
+                return_value=self.production,
+            ),
+            mock.patch(
+                "tools.compilation_database.subprocess.run",
+                return_value=mock.Mock(stdout=json.dumps(response)),
+            ),
+            redirect_stdout(io.StringIO()),
+        ):
+            self.assertEqual(generate([], fuzz_only=fuzz_only), 0)
+        return json.loads((self.root / "compile_commands.json").read_text())
+
+    def test_ordinary_generation_writes_the_complete_production_subset(self) -> None:
+        entries = self.run_generator(self.ordinary_sources)
+        self.assertEqual(
+            {entry["file"] for entry in entries},
+            {source for _, source in self.ordinary_sources},
+        )
+        strict = json.loads(self.strict_database.read_text())
+        self.assertEqual(
+            {entry["file"] for entry in strict}, set().union(*self.production.values())
+        )
+        self.assertTrue(all("-DORDINARY=1" in entry["arguments"] for entry in strict))
+
+    def test_fuzz_generation_preserves_the_ordinary_production_database(self) -> None:
+        for dependencies in ((), (self.ordinary_sources[0],)):
+            with self.subTest(production_dependencies=dependencies):
+                self.run_generator(self.ordinary_sources)
+                original = self.strict_database.read_bytes()
+                entries = self.run_generator(
+                    (self.fuzz_source, *dependencies), fuzz_only=True
+                )
+                self.assertEqual(self.strict_database.read_bytes(), original)
+                self.assertEqual(
+                    {entry["file"] for entry in entries},
+                    {source for _, source in (self.fuzz_source, *dependencies)},
+                )
+                self.assertTrue(
+                    all("-DFUZZ=1" in entry["arguments"] for entry in entries)
+                )
+
+    def test_fuzz_generation_does_not_create_a_production_database(self) -> None:
+        self.run_generator((self.fuzz_source,), fuzz_only=True)
+        self.assertFalse(self.strict_database.parent.exists())
 
 
 class ExternalLinkTest(unittest.TestCase):

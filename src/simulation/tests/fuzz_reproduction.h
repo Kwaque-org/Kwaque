@@ -70,6 +70,8 @@ fuzz_configuration(fuzz_harness harness);
 
 class fuzz_reproduction final {
 public:
+    // Requires a seastar::thread context (for example, seastar::async):
+    // trace validation calls get() on a potentially pending decode future.
     [[nodiscard]] static runtime::result<fuzz_reproduction> make(
       fuzz_harness harness,
       std::uint32_t harness_version,
@@ -161,6 +163,8 @@ digest_events(const observability::event_log_artifact& events);
 
 [[nodiscard]] runtime::result<void>
 write_fuzz_reproduction(std::ostream& output, const fuzz_reproduction& value);
+// Requires a seastar::thread context (for example, seastar::async):
+// validation delegates to fuzz_reproduction::make(), which may wait with get().
 [[nodiscard]] runtime::result<fuzz_reproduction>
 read_fuzz_reproduction(std::istream& input);
 

@@ -24,7 +24,7 @@ def _merged_env(extra):
     result.update(extra)
     return result
 
-def kwaque_py_native_test(name, srcs = [], data = [], main = None):
+def kwaque_py_native_test(name, srcs = [], data = [], main = None, timeout = None):
     """Defines a Python subprocess test with the native sanitizer environment."""
     py_test(
         name = name,
@@ -33,6 +33,7 @@ def kwaque_py_native_test(name, srcs = [], data = [], main = None):
         env = _merged_env({}),
         main = main,
         size = "small",
+        timeout = timeout,
     )
 
 def _parse_memory_mib(value):

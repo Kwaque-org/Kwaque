@@ -140,8 +140,15 @@ def compiler_arguments(
     return source, kept
 
 
-def select_commands(actions: list[dict], targets: list[dict], production: set[str],
-                    execution_root: Path, root: Path, *, production_only: bool = False) -> list[dict]:
+def select_commands(
+    actions: list[dict],
+    targets: list[dict],
+    production: set[str],
+    execution_root: Path,
+    root: Path,
+    *,
+    production_only: bool = False,
+) -> list[dict]:
     labels = {str(target["id"]): target["label"] for target in targets}
     candidates = {}
     for action in actions:
@@ -164,7 +171,11 @@ def select_commands(actions: list[dict], targets: list[dict], production: set[st
 
 
 def query_expression(fuzz_only: bool) -> str:
-    roots = 'attr(tags, "fuzz", //...)' if fuzz_only else '//... except attr(tags, "manual|fuzz", //...)'
+    roots = (
+        'attr(tags, "fuzz", //...)'
+        if fuzz_only
+        else '//... except attr(tags, "manual|fuzz", //...)'
+    )
     return f'mnemonic("CppCompile", deps({roots}))'
 
 
@@ -200,19 +211,39 @@ def generate(extra_bazel_args: list[str], *, fuzz_only: bool = False) -> int:
         stdout=subprocess.PIPE,
     )
     response = json.loads(result.stdout)
-    production = set(production_targets(root))
-    output = select_commands(response.get("actions", []), response.get("targets", []),
-                             production, execution_root, root)
-    strict = select_commands(response.get("actions", []), response.get("targets", []),
-                             production, execution_root, root, production_only=True)
+    production = set() if fuzz_only else set(production_targets(root))
+    output = select_commands(
+        response.get("actions", []),
+        response.get("targets", []),
+        production,
+        execution_root,
+        root,
+    )
+    strict = None
+    if not fuzz_only:
+        strict = select_commands(
+            response.get("actions", []),
+            response.get("targets", []),
+            production,
+            execution_root,
+            root,
+            production_only=True,
+        )
     if not output:
         raise RuntimeError("Bazel returned no workspace C++ compilation actions")
     destination = root / "compile_commands.json"
     destination.write_text(json.dumps(output, indent=2) + "\n")
-    strict_directory = root / PRODUCTION_DATABASE_DIRECTORY
-    strict_directory.mkdir(parents=True, exist_ok=True)
-    (strict_directory / "compile_commands.json").write_text(json.dumps(strict, indent=2) + "\n")
-    print(f"Wrote {len(output)} ordinary and {len(strict)} production compilation commands")
+    if strict is None:
+        print(f"Wrote {len(output)} fuzz compilation commands")
+    else:
+        strict_directory = root / PRODUCTION_DATABASE_DIRECTORY
+        strict_directory.mkdir(parents=True, exist_ok=True)
+        (strict_directory / "compile_commands.json").write_text(
+            json.dumps(strict, indent=2) + "\n"
+        )
+        print(
+            f"Wrote {len(output)} ordinary and {len(strict)} production compilation commands"
+        )
     return 0
 
 
@@ -220,7 +251,11 @@ def main() -> int:
     parser = argparse.ArgumentParser(
         description="Generate compile_commands.json from Bazel"
     )
-    parser.add_argument("--fuzz-only", action="store_true", help="describe fuzz targets and their dependencies")
+    parser.add_argument(
+        "--fuzz-only",
+        action="store_true",
+        help="describe fuzz targets and their dependencies",
+    )
     arguments, bazel_args = parser.parse_known_args()
     return generate(bazel_args, fuzz_only=arguments.fuzz_only)
 

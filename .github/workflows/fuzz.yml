@@ -32,6 +32,8 @@ jobs:
         with:
           persist-credentials: false
       - uses: ./.github/actions/setup-build
+        with:
+          cache-scope: fuzz
       - name: Run a bounded stateful campaign
         env:
           FUZZ_TARGET: ${{ matrix.target }}

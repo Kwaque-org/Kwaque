@@ -14,6 +14,8 @@
 
 #include <absl/container/btree_map.h>
 #include <absl/container/btree_set.h>
+#include <boost/intrusive/list.hpp>
+#include <boost/intrusive/list_hook.hpp>
 
 #include <algorithm>
 #include <array>
@@ -291,7 +293,6 @@ public:
         bool closing{false};
         bool closed{false};
         bool handle_owned{false};
-        bool stop_prepared{false};
     };
 
     struct endpoint_state final {
@@ -388,7 +389,6 @@ public:
         event_trace::reservation reset_trace;
         bool reset_applied{false};
         std::uint8_t stop_terminals_pending{0};
-        bool stop_prepared{false};
     };
 
     struct bind_operation final {
@@ -528,7 +528,10 @@ public:
         std::uint64_t id{0};
     };
 
+    using order_hook = boost::intrusive::list_member_hook<>;
+
     struct packet_state final {
+        order_hook order;
         std::uint64_t id{0};
         std::uint32_t slot{0};
         std::uint64_t pair{0};
@@ -585,6 +588,7 @@ public:
           , latency_min(minimum_latency)
           , latency_mean_parameter(mean_parameter) {}
 
+        order_hook order;
         std::uint64_t id;
         directed_link_key key;
         bandwidth_capacity capacity;
@@ -598,6 +602,16 @@ public:
         bool clogged{false};
         bool ready_chain_scheduled{false};
     };
+
+    using packet_order = boost::intrusive::list<
+      packet_state,
+      boost::intrusive::
+        member_hook<packet_state, order_hook, &packet_state::order>,
+      boost::intrusive::constant_time_size<false>>;
+    using link_order = boost::intrusive::list<
+      link_state,
+      boost::intrusive::member_hook<link_state, order_hook, &link_state::order>,
+      boost::intrusive::constant_time_size<false>>;
 
     using operation_payload = std::variant<
       bind_operation,
@@ -621,7 +635,6 @@ public:
         parked_credit parked;
         scheduler::event_slot_reservation stop_event;
         event_trace::reservation stop_trace;
-        bool stop_scheduled{false};
         bool stop_needs_completion{true};
     };
 
@@ -683,6 +696,7 @@ public:
     absl::btree_map<std::uint64_t, std::unique_ptr<pair_state>> pairs;
     absl::btree_map<std::uint64_t, std::unique_ptr<operation_state>> operations;
     absl::btree_map<directed_link_key, std::unique_ptr<link_state>> links;
+    link_order ordered_links;
     absl::btree_map<runtime::network_address, bandwidth_capacity> egress_limits;
     absl::btree_map<runtime::network_address, bandwidth_capacity>
       ingress_limits;
@@ -690,6 +704,7 @@ public:
     absl::btree_map<runtime::network_address, std::uint16_t> port_cursors;
     std::vector<std::uint64_t> work_ids;
     seastar::chunked_vector<packet_state> packets;
+    packet_order ordered_packets;
     seastar::chunked_fifo<std::uint32_t, 128, 512> free_packets;
     seastar::chunked_vector<flow_state> flows;
     seastar::chunked_vector<bandwidth_fraction> staged_remaining_;
@@ -715,6 +730,9 @@ public:
     std::uint64_t next_packet_id{1};
     std::uint64_t next_link_id{1};
     std::uint64_t next_stop_batch_id{1};
+    std::uint64_t stop_operation_after{0};
+    std::uint64_t stop_pair_after{0};
+    std::uint64_t stop_listener_after{0};
     std::uint32_t pending_connects{0};
     std::uint32_t backlog_entries{0};
     std::uint32_t live_packets{0};
@@ -735,6 +753,40 @@ public:
     bool forcing_discard_{false};
     bool terminal_schedule_failed_{false};
     bool activated_{false};
+
+    // IDs increase at insertion. Intrusive order adds no allocation and
+    // survives packet-slot reuse and key-ordered link-map insertion/erasure.
+    void track_packet(packet_state& packet) noexcept {
+        KWAQUE_INVARIANT(
+          fake_network_state_invariant,
+          !packet.order.is_linked()
+            && (ordered_packets.empty() || ordered_packets.back().id < packet.id),
+          "fake packet insertion order is not monotonic");
+        ordered_packets.push_back(packet);
+    }
+
+    void track_link(link_state& link) noexcept {
+        KWAQUE_INVARIANT(
+          fake_network_state_invariant,
+          !link.order.is_linked()
+            && (ordered_links.empty() || ordered_links.back().id < link.id),
+          "fake link insertion order is not monotonic");
+        ordered_links.push_back(link);
+    }
+
+    void erase_link(const directed_link_key& key) noexcept {
+        const auto found = links.find(key);
+        if (found == links.end()) {
+            return;
+        }
+        ordered_links.erase(ordered_links.iterator_to(*found->second));
+        links.erase(found);
+    }
+
+    void clear_links() noexcept {
+        ordered_links.clear();
+        links.clear();
+    }
 
     [[nodiscard]] listener_state* find_listener(std::uint64_t id) noexcept {
         const auto found = listeners.find(id);
@@ -1818,6 +1870,7 @@ seastar::future<runtime::result<void>> fake_network::impl::submit_control(
               fake_network_state_invariant,
               inserted.second,
               "fake control duplicated a prepared link");
+            track_link(*inserted.first->second);
             inserted_link = true;
         }
         if (
@@ -1866,7 +1919,7 @@ seastar::future<runtime::result<void>> fake_network::impl::submit_control(
         if (!scheduled) {
             operations.erase(operation_id);
             if (inserted_link) {
-                links.erase(key);
+                erase_link(key);
             }
             if (inserted_address) {
                 if (kind == control_kind::egress) {
@@ -1891,7 +1944,7 @@ seastar::future<runtime::result<void>> fake_network::impl::submit_control(
     } catch (...) {
         operations.erase(operation_id);
         if (inserted_link) {
-            links.erase(key);
+            erase_link(key);
         }
         if (inserted_address) {
             if (kind == control_kind::egress) {
@@ -2010,6 +2063,7 @@ fake_network::~fake_network() {
         && impl_->packet_retained_bytes.value() == 0
         && impl_->active_controls == 0
         && impl_->free_packets.size() == config_.maximum_packets
+        && impl_->ordered_packets.empty()
         && impl_->free_flows.size() == config_.maximum_active_flows
         && !impl_->bandwidth_scheduled_ && impl_->stop_batches_.empty()
         && !impl_->stop_batch_scheduled_
@@ -2021,7 +2075,7 @@ fake_network::~fake_network() {
         && impl_->staged_bandwidth_->resource_count() == 0
         && impl_->staged_bandwidth_->membership_count() == 0,
       "fake network destroyed with live ownership");
-    impl_->links.clear();
+    impl_->clear_links();
 }
 
 fake_connection::fake_connection(
@@ -4629,6 +4683,7 @@ seastar::future<runtime::result<void>> fake_network::write(
               inserted.second,
               "fake network duplicated a prepared directed link");
             link = inserted.first->second.get();
+            impl_->track_link(*link);
             inserted_link = true;
         }
         auto* inserted = impl_->find_operation(operation_id);
@@ -4638,7 +4693,7 @@ seastar::future<runtime::result<void>> fake_network::write(
         if (!write_state.abort_subscription) {
             impl_->operations.erase(operation_id);
             if (inserted_link) {
-                impl_->links.erase(link_key);
+                impl_->erase_link(link_key);
             }
             return ready_failure<void>(errc::aborted);
         }
@@ -4647,7 +4702,7 @@ seastar::future<runtime::result<void>> fake_network::write(
         if (!committed) {
             impl_->operations.erase(operation_id);
             if (inserted_link) {
-                impl_->links.erase(link_key);
+                impl_->erase_link(link_key);
             }
             return seastar::make_ready_future<runtime::result<void>>(
               runtime::failure(committed.error()));
@@ -4785,6 +4840,10 @@ seastar::future<runtime::result<void>> fake_network::write(
         impl_->packet_retained_bytes
           = *impl_->packet_retained_bytes.checked_add(
             byte_count{retained_required});
+        impl_->track_packet(packet);
+        if (clone_slot) {
+            impl_->track_packet(impl_->packets[*clone_slot]);
+        }
         impl_->issue_operation_id();
         impl_->issue_packet_id();
         if (clone_slot) {
@@ -4804,7 +4863,7 @@ seastar::future<runtime::result<void>> fake_network::write(
     } catch (...) {
         impl_->operations.erase(operation_id);
         if (inserted_link && link != nullptr && link->packets == 0) {
-            impl_->links.erase(link_key);
+            impl_->erase_link(link_key);
         }
         return seastar::current_exception_as_future<runtime::result<void>>();
     }
@@ -5949,7 +6008,7 @@ void fake_network::impl::destroy_packet(std::uint32_t slot) noexcept {
     auto& packet = packets[slot];
     KWAQUE_INVARIANT(
       fake_network_state_invariant,
-      packet.phase != packet_phase::free,
+      packet.phase != packet_phase::free && packet.order.is_linked(),
       "fake packet released twice");
     auto* pair = find_pair(packet.pair);
     KWAQUE_INVARIANT(
@@ -5965,6 +6024,7 @@ void fake_network::impl::destroy_packet(std::uint32_t slot) noexcept {
       "fake packet count underflow");
     --direction.packet_count;
     --live_packets;
+    ordered_packets.erase(ordered_packets.iterator_to(packet));
     packet_logical_bytes = *packet_logical_bytes.checked_sub(
       packet.logical_charge);
     packet_retained_bytes = *packet_retained_bytes.checked_sub(
@@ -6991,73 +7051,49 @@ void fake_network::impl::schedule_stop_batch() noexcept {
 
 fake_network::impl::operation_state*
 fake_network::impl::next_stop_operation() noexcept {
-    for (auto& [id, operation] : operations) {
-        static_cast<void>(id);
-        if (!operation->stop_scheduled) {
-            return operation.get();
-        }
+    const auto found = operations.upper_bound(stop_operation_after);
+    if (found == operations.end()) {
+        return nullptr;
     }
-    return nullptr;
+    stop_operation_after = found->first;
+    return found->second.get();
 }
 
 fake_network::impl::packet_state*
 fake_network::impl::next_stop_packet() noexcept {
-    packet_state* selected = nullptr;
-    for (auto& packet : packets) {
-        if (
-          packet.phase != packet_phase::free
-          && (selected == nullptr || packet.id < selected->id)) {
-            selected = &packet;
-        }
-    }
-    return selected;
+    return ordered_packets.empty() ? nullptr : &ordered_packets.front();
 }
 
 fake_network::impl::pair_state* fake_network::impl::next_stop_pair() noexcept {
-    for (auto& [id, pair] : pairs) {
-        static_cast<void>(id);
-        if (!pair->stop_prepared) {
-            return pair.get();
-        }
+    const auto found = pairs.upper_bound(stop_pair_after);
+    if (found == pairs.end()) {
+        return nullptr;
     }
-    return nullptr;
+    stop_pair_after = found->first;
+    return found->second.get();
 }
 
 fake_network::impl::listener_state*
 fake_network::impl::next_stop_listener() noexcept {
-    for (auto& [id, listener] : listeners) {
-        static_cast<void>(id);
-        if (!listener->stop_prepared) {
-            return listener.get();
-        }
+    const auto found = listeners.upper_bound(stop_listener_after);
+    if (found == listeners.end()) {
+        return nullptr;
     }
-    return nullptr;
+    stop_listener_after = found->first;
+    return found->second.get();
 }
 
 fake_network::impl::link_state* fake_network::impl::next_stop_link() noexcept {
-    link_state* selected = nullptr;
-    for (auto& [key, link] : links) {
-        static_cast<void>(key);
-        if (selected == nullptr || link->id < selected->id) {
-            selected = link.get();
-        }
-    }
-    return selected;
+    return ordered_links.empty() ? nullptr : &ordered_links.front();
 }
 
 bool fake_network::impl::has_stop_preparation_work() const noexcept {
     if (!stop_resources_released_ || live_packets != 0 || !links.empty()) {
         return true;
     }
-    return std::ranges::any_of(
-             operations,
-             [](const auto& entry) { return !entry.second->stop_scheduled; })
-           || std::ranges::any_of(
-             pairs,
-             [](const auto& entry) { return !entry.second->stop_prepared; })
-           || std::ranges::any_of(listeners, [](const auto& entry) {
-                  return !entry.second->stop_prepared;
-              });
+    return operations.upper_bound(stop_operation_after) != operations.end()
+           || pairs.upper_bound(stop_pair_after) != pairs.end()
+           || listeners.upper_bound(stop_listener_after) != listeners.end();
 }
 
 void fake_network::impl::run_stop_batch() noexcept {
@@ -7204,7 +7240,6 @@ void fake_network::impl::prepare_stop_operation(
       },
       operation.payload);
 
-    operation.stop_scheduled = true;
     operation.stop_event.release();
     const auto id = operation.id;
     auto terminal = scheduler_->schedule(
@@ -7272,7 +7307,6 @@ void fake_network::impl::prepare_stop_pair(pair_state& pair) noexcept {
             static_cast<void>(scheduler_->cancel(id));
         }
     };
-    pair.stop_prepared = true;
     pair.stop_terminals_pending = 2;
     if (pair.backlog_listener) {
         if (
@@ -7360,7 +7394,6 @@ void fake_network::impl::prepare_stop_pair(pair_state& pair) noexcept {
 
 void fake_network::impl::prepare_stop_listener(
   listener_state& listener) noexcept {
-    listener.stop_prepared = true;
     if (listener.close_event_id.valid()) {
         static_cast<void>(scheduler_->cancel(listener.close_event_id));
     }
@@ -7417,7 +7450,7 @@ void fake_network::impl::discard_stop_link(link_state& link) noexcept {
     link.ready.clear();
     link.ready_fins.clear();
     const auto key = link.key;
-    links.erase(key);
+    erase_link(key);
 }
 
 void fake_network::impl::complete_stop_operation(
@@ -7511,6 +7544,7 @@ void fake_network::impl::maybe_finish_stop() noexcept {
         && ingress_limits.empty() && port_cursors.empty()
         && fault_occurrences_.empty() && links.empty() && !bandwidth_scheduled_
         && free_packets.size() == config_.maximum_packets
+        && ordered_packets.empty() && ordered_links.empty()
         && free_flows.size() == config_.maximum_active_flows
         && bandwidth_->allocation_count() == 0
         && bandwidth_->resource_count() == 0
@@ -7556,10 +7590,8 @@ void fake_network::impl::force_discard_all(
           },
           operation->payload);
     }
-    for (auto& packet : packets) {
-        if (packet.phase != packet_phase::free) {
-            discard_stop_packet(packet);
-        }
+    while (!ordered_packets.empty()) {
+        discard_stop_packet(ordered_packets.front());
     }
     for (auto& [id, pair] : pairs) {
         static_cast<void>(id);
@@ -7582,7 +7614,7 @@ void fake_network::impl::force_discard_all(
       fake_network_drained_invariant,
       parked_operations == 0,
       "fake network discard retained parked-operation credits");
-    links.clear();
+    clear_links();
     listener_registry.clear();
     connection_locals.clear();
     egress_limits.clear();

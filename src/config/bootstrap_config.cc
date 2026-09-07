@@ -65,7 +65,7 @@ validation_result validate_keys(
 }
 
 template<typename Value>
-bool converts_to(const YAML::Node& node) noexcept {
+bool converts_to(const YAML::Node& node) {
     try {
         static_cast<void>(node.as<Value>());
         return true;

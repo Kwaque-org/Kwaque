@@ -10,7 +10,6 @@
 #include <seastar/util/alloc_failure_injector.hh>
 
 #include <boost/test/unit_test.hpp>
-#include <openssl/sha.h>
 
 #include <algorithm>
 #include <array>
@@ -378,7 +377,7 @@ SEASTAR_TEST_CASE(event_codec_rejects_noncanonical_and_malformed_bytes) {
     co_return;
 }
 
-SEASTAR_TEST_CASE(event_log_matches_complete_golden_bytes_and_digest) {
+SEASTAR_TEST_CASE(event_log_matches_complete_golden_bytes) {
     // The complete two-record schema-1 artifact fixes the log header, record
     // boundaries, sequence progression, and all five field representations.
     static constexpr std::array<std::uint8_t, 438> expected_bytes{
@@ -420,12 +419,6 @@ SEASTAR_TEST_CASE(event_log_matches_complete_golden_bytes_and_digest) {
       0x00, 0x00, 0x00, 0x80, 0x0e, 0x00, 0x07, 0x03, 0x01, 0x00, 0x65, 0x6e,
       0x61, 0x62, 0x6c, 0x65, 0x64, 0x01,
     };
-    static constexpr std::array<std::uint8_t, SHA256_DIGEST_LENGTH>
-      expected_digest{
-        0x3a, 0xd0, 0x62, 0x4c, 0x9b, 0xed, 0x47, 0x80, 0xdf, 0x4a, 0x91,
-        0x51, 0x9d, 0xf3, 0x16, 0xa0, 0xb1, 0x0d, 0xdc, 0x58, 0x47, 0xda,
-        0x15, 0xd1, 0xae, 0xbe, 0x9c, 0x55, 0xd0, 0x9d, 0x91, 0xe8,
-    };
     const auto sink_identity = identity();
     const auto fixture_limits = limits(2, expected_bytes.size());
     event_log source{sink_identity, fixture_limits};
@@ -441,11 +434,6 @@ SEASTAR_TEST_CASE(event_log_matches_complete_golden_bytes_and_digest) {
     std::array<std::uint8_t, expected_bytes.size()> actual_bytes{};
     BOOST_REQUIRE(encoded->copy_to(0, actual_bytes));
     BOOST_CHECK(actual_bytes == expected_bytes);
-    std::array<std::uint8_t, SHA256_DIGEST_LENGTH> actual_digest{};
-    BOOST_REQUIRE(
-      SHA256(actual_bytes.data(), actual_bytes.size(), actual_digest.data())
-      == actual_digest.data());
-    BOOST_CHECK(actual_digest == expected_digest);
 
     const auto decoded = event_log::decode(
       std::span<const std::uint8_t>{expected_bytes}, fixture_limits);

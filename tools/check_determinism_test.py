@@ -7,13 +7,25 @@ from pathlib import Path
 
 try:
     from tools.check_determinism import (
-        ALLOWANCES, WRITERS, Allowance, Writer, is_deterministic_source,
-        masked_code, occurrences, scan,
+        ALLOWANCES,
+        WRITERS,
+        Allowance,
+        Writer,
+        is_deterministic_source,
+        masked_code,
+        occurrences,
+        scan,
     )
 except ModuleNotFoundError:
     from check_determinism import (
-        ALLOWANCES, WRITERS, Allowance, Writer, is_deterministic_source,
-        masked_code, occurrences, scan,
+        ALLOWANCES,
+        WRITERS,
+        Allowance,
+        Writer,
+        is_deterministic_source,
+        masked_code,
+        occurrences,
+        scan,
     )
 
 
@@ -89,8 +101,13 @@ class DeterminismSourceTest(unittest.TestCase):
                 with self.subTest(rule=rule, snippet=snippet):
                     self.write("// heading\n" + snippet)
                     failures = self.scan()
-                    self.assertTrue(any(f":2: {rule}: " in failure for failure in failures), failures)
-                    self.assertTrue(all(len(failure.split(": ")[-1]) > 20 for failure in failures))
+                    self.assertTrue(
+                        any(f":2: {rule}: " in failure for failure in failures),
+                        failures,
+                    )
+                    self.assertTrue(
+                        all(len(failure.split(": ")[-1]) > 20 for failure in failures)
+                    )
 
     def test_ordered_integer_and_bytewise_operations_are_permitted(self) -> None:
         self.write("""
@@ -110,7 +127,7 @@ class DeterminismSourceTest(unittest.TestCase):
         self.assertEqual(self.scan(), [])
 
     def test_comments_literals_and_includes_do_not_trigger(self) -> None:
-        self.write(r'''
+        self.write(r"""
             #include <seastar/core/lowres_clock.hh>
             // std::unordered_map<int,int> and std::chrono::steady_clock
             /* memcpy(output, &header, sizeof(header)); */
@@ -118,13 +135,15 @@ class DeterminismSourceTest(unittest.TestCase):
             auto raw = R"tag(std::bit_cast<std::uint64_t>(pointer))tag";
             auto prefixed = u8R"x(std::as_bytes(value))x";
             auto character = 'a';
-        ''')
+        """)
         self.assertEqual(self.scan(), [])
 
     def test_comments_and_line_splices_cannot_hide_tokens(self) -> None:
-        self.write("std::unor\\\ndered_map /* separator */ <int,int> values;\r\n"
-                   "auto now = std::chrono::steady_clock /* separator */ ::now();\r"
-                   "std::uni\\\nform_int_distribution<int> random;\n")
+        self.write(
+            "std::unor\\\ndered_map /* separator */ <int,int> values;\r\n"
+            "auto now = std::chrono::steady_clock /* separator */ ::now();\r"
+            "std::uni\\\nform_int_distribution<int> random;\n"
+        )
         failures = self.scan()
         self.assertTrue(any(":1: unordered-state:" in item for item in failures))
         self.assertTrue(any(":3: host-clock:" in item for item in failures))
@@ -144,15 +163,21 @@ class DeterminismSourceTest(unittest.TestCase):
 
     def test_scope_includes_deterministic_tests_and_canonical_code(self) -> None:
         for path in (
-            "src/simulation/new_file.cc", "src/simulation/tests/new_test.cc",
+            "src/simulation/new_file.cc",
+            "src/simulation/tests/new_test.cc",
             "src/runtime/testing/contracts/new_contract.h",
             "src/runtime/tests/new_determinism_test.cc",
             "src/runtime/tests/time_random_contract_test.cc",
-            "src/observability/event_codec.cc", "src/observability/event_bench.cc",
+            "src/observability/event_codec.cc",
+            "src/observability/event_bench.cc",
         ):
             self.assertTrue(is_deterministic_source(Path(path)), path)
-        for path in ("src/broker/application.cc", "src/runtime/production/random.cc",
-                     "src/simulation/README.md", "src/simulation/tests/testdata/input.script"):
+        for path in (
+            "src/broker/application.cc",
+            "src/runtime/production/random.cc",
+            "src/simulation/README.md",
+            "src/simulation/tests/testdata/input.script",
+        ):
             self.assertFalse(is_deterministic_source(Path(path)), path)
 
     def test_namespace_and_static_inferred_random_sources_are_rejected(self) -> None:
@@ -182,7 +207,9 @@ class DeterminismSourceTest(unittest.TestCase):
 
     def test_lookup_declaration_does_not_permit_ordering_traversal(self) -> None:
         declaration = "seastar::chunked_hash_map<int, int> ready;"
-        allowance = Allowance(self.path, "unordered-state", declaration, 1, "Lookup only")
+        allowance = Allowance(
+            self.path, "unordered-state", declaration, 1, "Lookup only"
+        )
         for traversal in (
             "for (auto& item : ready) { emit(item); }",
             "auto it = ready.begin();",
@@ -222,7 +249,9 @@ class DeterminismSourceTest(unittest.TestCase):
 
     def test_hash_alias_member_and_parameter_traversals_are_checked(self) -> None:
         declaration = "using index_type = seastar::chunked_hash_map<int, int>;"
-        allowance = Allowance(self.path, "unordered-state", declaration, 1, "Lookup only")
+        allowance = Allowance(
+            self.path, "unordered-state", declaration, 1, "Lookup only"
+        )
         self.write(declaration + """
             index_type queue;
             void export_values(index_type& values, index_type *ready) {
@@ -245,18 +274,27 @@ class DeterminismSourceTest(unittest.TestCase):
                     target.write_text((allowance.code + "\n") * allowance.count)
                     code = masked_code(target.read_text())[0]
                     companions = tuple(
-                        other for other in ALLOWANCES
-                        if other != allowance and other.path == allowance.path
+                        other
+                        for other in ALLOWANCES
+                        if other != allowance
+                        and other.path == allowance.path
                         and len(occurrences(code, other.code)) == other.count
                     )
                     self.assertEqual(scan(root, (allowance, *companions), ()), [])
                     failures = scan(root, companions, ())
-                    self.assertEqual(len(failures), allowance.count * allowance.matches_per_span)
-                    self.assertTrue(all(f": {allowance.rule}: " in item for item in failures))
+                    self.assertEqual(
+                        len(failures), allowance.count * allowance.matches_per_span
+                    )
+                    self.assertTrue(
+                        all(f": {allowance.rule}: " in item for item in failures)
+                    )
 
-    def test_benchmark_clock_allowances_pin_complete_bodies_and_both_reads(self) -> None:
+    def test_benchmark_clock_allowances_pin_complete_bodies_and_both_reads(
+        self,
+    ) -> None:
         allowances = tuple(
-            allowance for allowance in ALLOWANCES
+            allowance
+            for allowance in ALLOWANCES
             if allowance.path == "src/simulation/tests/simulation_bench.cc"
             and allowance.rule == "host-clock"
         )
@@ -273,13 +311,17 @@ class DeterminismSourceTest(unittest.TestCase):
 
                 # Retaining both clocks does not permit an unreviewed change
                 # to measurement data flow or the watchdog's control flow.
-                self.write(allowance.code.replace("{", "{ alter_state();", 1), allowance.path)
+                self.write(
+                    allowance.code.replace("{", "{ alter_state();", 1), allowance.path
+                )
                 failures = self.scan((allowance,))
                 self.assertTrue(any("stale-allowance:" in item for item in failures))
                 self.assertEqual(sum(": host-clock:" in item for item in failures), 2)
 
                 extra_clock = "auto unreviewed = std::chrono::steady_clock::now();"
-                self.write(allowance.code.replace("{", "{" + extra_clock, 1), allowance.path)
+                self.write(
+                    allowance.code.replace("{", "{" + extra_clock, 1), allowance.path
+                )
                 failures = self.scan((allowance,))
                 self.assertTrue(any("stale-allowance:" in item for item in failures))
                 self.assertEqual(sum(": host-clock:" in item for item in failures), 3)
@@ -299,11 +341,21 @@ class DeterminismSourceTest(unittest.TestCase):
                 self.write(modified, allowance.path)
                 failures = self.scan((allowance,))
                 self.assertTrue(any("stale-allowance:" in item for item in failures))
-                self.assertTrue(any(": unordered-iteration:" in item for item in failures))
+                self.assertTrue(
+                    any(": unordered-iteration:" in item for item in failures)
+                )
                 # A surrounding loop is not allowed to lose its canonical sort.
                 if "std::ranges::sort" in allowance.code:
-                    self.write(allowance.code.replace("std::ranges::sort", "unsorted_export"), allowance.path)
-                    self.assertTrue(any("stale-allowance:" in item for item in self.scan((allowance,))))
+                    self.write(
+                        allowance.code.replace("std::ranges::sort", "unsorted_export"),
+                        allowance.path,
+                    )
+                    self.assertTrue(
+                        any(
+                            "stale-allowance:" in item
+                            for item in self.scan((allowance,))
+                        )
+                    )
                 (self.root / allowance.path).unlink()
 
     def test_allowance_cannot_cover_another_expression_file_or_occurrence(self) -> None:
@@ -320,11 +372,17 @@ class DeterminismSourceTest(unittest.TestCase):
         self.assertEqual(sum(": host-clock:" in item for item in failures), 2)
 
     def test_deleted_modified_or_no_longer_relevant_allowances_fail(self) -> None:
-        allowance = Allowance(self.path, "host-clock", "steady_clock::now()", 1, "External watchdog")
+        allowance = Allowance(
+            self.path, "host-clock", "steady_clock::now()", 1, "External watchdog"
+        )
         for source in ("", "system_clock::now()", "// steady_clock::now()"):
             self.write(source)
-            self.assertTrue(any("stale-allowance:" in item for item in self.scan((allowance,))))
-        harmless = Allowance(self.path, "host-clock", "return 1;", 1, "Invalid stale seam")
+            self.assertTrue(
+                any("stale-allowance:" in item for item in self.scan((allowance,)))
+            )
+        harmless = Allowance(
+            self.path, "host-clock", "return 1;", 1, "Invalid stale seam"
+        )
         self.write("return 1;")
         self.assertIn("stale-allowance:", self.scan((harmless,))[0])
         (self.root / self.path).unlink()
@@ -332,12 +390,48 @@ class DeterminismSourceTest(unittest.TestCase):
 
     def test_allowance_requires_a_rule_count_and_reason(self) -> None:
         self.write("steady_clock::now();")
-        for rule, count, reason in (("unknown", 1, "reason"), ("host-clock", 0, "reason"),
-                                    ("host-clock", 1, "")):
-            allowance = Allowance(self.path, rule, "steady_clock::now();", count, reason)
-            self.assertTrue(any("invalid-allowance:" in item for item in self.scan((allowance,))))
-        allowance = Allowance(self.path, "host-clock", "steady_clock::now();", 1, "reason", 0)
-        self.assertTrue(any("invalid-allowance:" in item for item in self.scan((allowance,))))
+        valid = Allowance(self.path, "host-clock", "steady_clock::now();", 1, "reason")
+        invalid = (
+            replace(valid, rule="unknown"),
+            replace(valid, count=0),
+            replace(valid, count=-1),
+            replace(valid, reason=""),
+            replace(valid, matches_per_span=0),
+            replace(valid, matches_per_span=-1),
+        )
+        for allowance in invalid:
+            for code in (valid.code, "", "// no reviewed code"):
+                with self.subTest(allowance=allowance, code=code):
+                    failures = self.scan((replace(allowance, code=code),))
+                    self.assertTrue(
+                        any(
+                            "invalid-allowance: specify a known rule" in item
+                            for item in failures
+                        )
+                    )
+                    self.assertEqual(
+                        sum(": host-clock:" in item for item in failures), 1
+                    )
+
+    def test_allowance_requires_code_tokens_and_does_not_stop_scanning(self) -> None:
+        clock = "auto time = steady_clock::now();"
+        self.write(clock + "\nstd::mt19937 generator;")
+        valid = Allowance(self.path, "host-clock", clock, 1, "Benchmark duration")
+        for code in ("", " \t\r\n", "// no code", "/* no code */", "#include <random>"):
+            with self.subTest(code=code):
+                empty = Allowance(
+                    self.path, "random-source", code, 1, "Invalid empty span"
+                )
+                failures = self.scan((empty, valid))
+                self.assertIn(
+                    f"{self.path}:1: invalid-allowance: reviewed code span must contain code tokens",
+                    failures,
+                )
+                self.assertEqual(
+                    sum(": random-source:" in item for item in failures), 1
+                )
+                self.assertFalse(any(": host-clock:" in item for item in failures))
+                self.assertEqual(len(failures), 2)
 
     def test_every_canonical_writer_must_remain_present(self) -> None:
         for writer in WRITERS:
