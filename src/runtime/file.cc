@@ -95,8 +95,6 @@ operation_error file_error_from_exception(std::exception_ptr exception) {
         return file_error(errc::aborted);
     } catch (const std::system_error& error) {
         return file_error(map_system_error(error.code()));
-    } catch (...) {
-        return file_error(errc::io_failure);
     }
 }
 
@@ -1032,8 +1030,10 @@ file::write_validated(file_position position, bytes::fragmented_buffer&& data) {
     } catch (const std::bad_alloc&) {
         return seastar::current_exception_as_future<result<byte_count>>();
     } catch (...) {
-        return seastar::make_ready_future<result<byte_count>>(
-          failure(file_error_from_exception(std::current_exception())));
+        return seastar::futurize_invoke(
+          [exception = std::current_exception()]() -> result<byte_count> {
+              return failure(file_error_from_exception(exception));
+          });
     }
 }
 

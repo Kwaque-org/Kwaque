@@ -24,6 +24,7 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <exception>
 #include <limits>
 #include <new>
 #include <optional>
@@ -37,6 +38,8 @@ namespace kwaque::resource {
 namespace {
 
 static_assert(sizeof(queue_failure) < sizeof(runtime::operation_error));
+
+class optional_item_failure final : public std::exception {};
 
 bounded_work_queue_config queue_config(
   std::uint64_t items,
@@ -922,11 +925,20 @@ SEASTAR_TEST_CASE(bounded_work_queue_integrates_and_isolates_workers) {
           }
           co_await release.get_shared_future();
           if (item == 3 || item == 4) {
-              throw std::runtime_error("synthetic handler failure");
+              throw optional_item_failure{};
           }
           completed.push_back(item);
       },
-      [&reporter_calls](std::exception_ptr) noexcept { ++reporter_calls; });
+      [&reporter_calls](std::exception_ptr) noexcept { ++reporter_calls; },
+      [](const std::exception_ptr& failure) noexcept {
+          try {
+              std::rethrow_exception(failure);
+          } catch (const optional_item_failure&) {
+              return true;
+          } catch (...) {
+              return false;
+          }
+      });
     BOOST_CHECK_THROW(
       queue.start_workers(
         bounded_queue_worker_config{

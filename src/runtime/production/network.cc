@@ -57,7 +57,8 @@ errc map_network_system_error(const std::error_code& error) noexcept {
     return errc::network_failure;
 }
 
-operation_error network_error_from_exception(std::exception_ptr exception) {
+operation_error network_error_from_exception(
+  std::exception_ptr exception, bool aborted = false) {
     try {
         std::rethrow_exception(std::move(exception));
     } catch (const std::bad_alloc&) {
@@ -65,9 +66,8 @@ operation_error network_error_from_exception(std::exception_ptr exception) {
     } catch (const seastar::abort_requested_exception&) {
         return network_error(errc::aborted);
     } catch (const std::system_error& error) {
-        return network_error(map_network_system_error(error.code()));
-    } catch (...) {
-        return network_error(errc::network_failure);
+        return network_error(
+          aborted ? errc::aborted : map_network_system_error(error.code()));
     }
 }
 
@@ -268,11 +268,8 @@ seastar::future<result<network_read_result>> connection::read(
             } catch (const std::bad_alloc&) {
                 throw;
             } catch (...) {
-                if (abort_requested_) {
-                    return failure(network_error(errc::aborted));
-                }
-                return failure(
-                  network_error_from_exception(std::current_exception()));
+                return failure(network_error_from_exception(
+                  std::current_exception(), abort_requested_));
             }
         });
 }
@@ -339,9 +336,8 @@ seastar::future<result<void>> connection::write(
                           result<void>>();
                     } catch (...) {
                         result<void> outcome = failure(
-                          abort_requested_ ? network_error(errc::aborted)
-                                           : network_error_from_exception(
-                                               std::current_exception()));
+                          network_error_from_exception(
+                            std::current_exception(), abort_requested_));
                         return seastar::make_ready_future<result<void>>(
                           std::move(outcome));
                     }
@@ -379,10 +375,8 @@ seastar::future<result<void>> connection::write(
                           } catch (const std::bad_alloc&) {
                               throw;
                           } catch (...) {
-                              return failure(
-                                abort_requested_ ? network_error(errc::aborted)
-                                                 : network_error_from_exception(
-                                                     std::current_exception()));
+                              return failure(network_error_from_exception(
+                                std::current_exception(), abort_requested_));
                           }
                       });
                 });
@@ -436,11 +430,8 @@ seastar::future<result<void>> connection::write_acquired(
     } catch (const std::bad_alloc&) {
         throw;
     } catch (...) {
-        if (abort_requested_) {
-            co_return failure(network_error(errc::aborted));
-        }
-        co_return failure(
-          network_error_from_exception(std::current_exception()));
+        co_return failure(network_error_from_exception(
+          std::current_exception(), abort_requested_));
     }
 }
 
@@ -484,11 +475,9 @@ seastar::future<result<void>> connection::write_general(
     } catch (const std::bad_alloc&) {
         throw;
     } catch (...) {
-        if (abort_requested_ || caller_abort.abort_requested()) {
-            co_return failure(network_error(errc::aborted));
-        }
-        co_return failure(
-          network_error_from_exception(std::current_exception()));
+        co_return failure(network_error_from_exception(
+          std::current_exception(),
+          abort_requested_ || caller_abort.abort_requested()));
     }
 }
 
@@ -505,11 +494,8 @@ connection::flush_preceding_batch_after_cancellation() {
     } catch (const std::bad_alloc&) {
         throw;
     } catch (...) {
-        if (abort_requested_) {
-            co_return failure(network_error(errc::aborted));
-        }
-        co_return failure(
-          network_error_from_exception(std::current_exception()));
+        co_return failure(network_error_from_exception(
+          std::current_exception(), abort_requested_));
     }
 }
 
@@ -638,32 +624,34 @@ seastar::future<result<void>> connection::close_once() {
       [this] { native_ = seastar::connected_socket{}; });
     static_cast<void>(release_native);
     std::optional<operation_error> first_error;
+    std::exception_ptr first_exception;
+    auto record_failure = [&](std::exception_ptr exception) noexcept {
+        try {
+            auto error = network_error_from_exception(exception);
+            if (!first_error) {
+                first_error = std::move(error);
+            }
+        } catch (...) {
+            if (!first_exception) {
+                first_exception = std::current_exception();
+            }
+        }
+    };
     try {
         auto serialization
           = co_await seastar::coroutine::without_preemption_check(
             seastar::get_units(write_serializer_, 1));
-        try {
-            co_await output_.close();
-        } catch (const std::bad_alloc&) {
-            throw;
-        } catch (...) {
-            first_error = network_error_from_exception(
-              std::current_exception());
-        }
-        try {
-            co_await input_.close();
-        } catch (const std::bad_alloc&) {
-            throw;
-        } catch (...) {
-            if (!first_error) {
-                first_error = network_error_from_exception(
-                  std::current_exception());
-            }
-        }
-    } catch (const std::bad_alloc&) {
-        throw;
+        co_await output_.close();
     } catch (...) {
-        first_error = network_error_from_exception(std::current_exception());
+        record_failure(std::current_exception());
+    }
+    try {
+        co_await input_.close();
+    } catch (...) {
+        record_failure(std::current_exception());
+    }
+    if (first_exception) {
+        std::rethrow_exception(first_exception);
     }
     if (first_error) {
         co_return failure(std::move(*first_error));
@@ -760,11 +748,9 @@ listener::accept(seastar::abort_source& caller_abort) {
     } catch (const std::bad_alloc&) {
         throw;
     } catch (...) {
-        if (aborted_ || caller_abort.abort_requested()) {
-            co_return failure(network_error(errc::aborted));
-        }
-        co_return failure(
-          network_error_from_exception(std::current_exception()));
+        co_return failure(network_error_from_exception(
+          std::current_exception(),
+          aborted_ || caller_abort.abort_requested()));
     }
 }
 
@@ -864,11 +850,8 @@ seastar::future<result<connection>> network::connect(
     } catch (const std::bad_alloc&) {
         throw;
     } catch (...) {
-        if (caller_abort.abort_requested()) {
-            co_return failure(network_error(errc::aborted));
-        }
-        co_return failure(
-          network_error_from_exception(std::current_exception()));
+        co_return failure(network_error_from_exception(
+          std::current_exception(), caller_abort.abort_requested()));
     }
 }
 

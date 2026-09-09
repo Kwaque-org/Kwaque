@@ -2,6 +2,7 @@
 
 #include "src/runtime/shard_affinity.h"
 
+#include <seastar/core/abort_source.hh>
 #include <seastar/core/future.hh>
 
 #include <chrono>
@@ -21,8 +22,13 @@ public:
     admin_server(admin_server&&) = delete;
     admin_server& operator=(admin_server&&) = delete;
 
-    [[nodiscard]] seastar::future<>
-    start(std::string address, std::uint16_t port, unsigned shard_count);
+    // A supplied abort source belongs to the calling shard and must outlive
+    // the returned future.
+    [[nodiscard]] seastar::future<> start(
+      std::string address,
+      std::uint16_t port,
+      unsigned shard_count,
+      const seastar::abort_source* startup_abort = nullptr);
     [[nodiscard]] seastar::future<>
     mark_ready(std::chrono::steady_clock::duration startup_duration);
     [[nodiscard]] seastar::future<> begin_shutdown();

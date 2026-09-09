@@ -99,12 +99,22 @@ seastar::future<result<void>> timer::sleep_until(
 
     seastar::abort_source sleep_abort;
     auto caller_subscription = caller_abort.subscribe(
-      [&sleep_abort](const std::optional<std::exception_ptr>&) noexcept {
-          sleep_abort.request_abort();
+      [&sleep_abort](
+        const std::optional<std::exception_ptr>& exception) noexcept {
+          if (exception) {
+              sleep_abort.request_abort_ex(*exception);
+          } else {
+              sleep_abort.request_abort();
+          }
       });
     auto owner_subscription = owner_abort_.subscribe(
-      [&sleep_abort](const std::optional<std::exception_ptr>&) noexcept {
-          sleep_abort.request_abort();
+      [&sleep_abort](
+        const std::optional<std::exception_ptr>& exception) noexcept {
+          if (exception) {
+              sleep_abort.request_abort_ex(*exception);
+          } else {
+              sleep_abort.request_abort();
+          }
       });
     if (!caller_subscription || !owner_subscription) {
         sleep_abort.request_abort();
@@ -120,8 +130,6 @@ seastar::future<result<void>> timer::sleep_until(
         co_return failure(timer_error(errc::aborted));
     } catch (const std::system_error& error) {
         co_return failure(timer_error(map_timer_system_error(error.code())));
-    } catch (...) {
-        co_return failure(timer_error(errc::unavailable));
     }
 }
 

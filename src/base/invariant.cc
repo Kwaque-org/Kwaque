@@ -6,11 +6,12 @@
 
 #include <algorithm>
 #include <array>
+#include <cerrno>
 #include <charconv>
 #include <cstdint>
-#include <cstdio>
 #include <cstdlib>
 #include <system_error>
+#include <unistd.h>
 
 namespace kwaque {
 
@@ -96,6 +97,20 @@ std::string_view basename(std::string_view path) noexcept {
                                                : path.substr(separator + 1);
 }
 
+void write_diagnostic(std::string_view message) noexcept {
+    while (!message.empty()) {
+        const auto written = ::write(
+          STDERR_FILENO, message.data(), message.size());
+        if (written < 0 && errno == EINTR) {
+            continue;
+        }
+        if (written <= 0) {
+            return;
+        }
+        message.remove_prefix(static_cast<std::size_t>(written));
+    }
+}
+
 diagnostic_buffer format_violation(
   invariant_id id,
   std::string_view expression,
@@ -136,10 +151,8 @@ thread_local testing::invariant_observer current_observer = nullptr;
     }
 #endif
 
-    static_cast<void>(std::fwrite(
-      diagnostic.view().data(), 1, diagnostic.view().size(), stderr));
-    static_cast<void>(std::fputc('\n', stderr));
-    static_cast<void>(std::fflush(stderr));
+    write_diagnostic(diagnostic.view());
+    write_diagnostic("\n");
     std::abort();
 }
 

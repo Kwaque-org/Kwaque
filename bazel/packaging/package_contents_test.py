@@ -19,6 +19,7 @@ class PackageContentsTest(unittest.TestCase):
             f"{root}/README.md",
             f"{root}/THIRD_PARTY.md",
             f"{root}/bin/kwaque",
+            f"{root}/bin/kwaque_native",
             f"{root}/etc/kwaque/kwaque.yaml",
             f"{root}/lib/libcrypto.so.3",
             f"{root}/lib/libssl.so.3",
@@ -59,7 +60,15 @@ class PackageContentsTest(unittest.TestCase):
                 self.assertEqual(member.mode & 0o777, 0o755)
             else:
                 self.assertTrue(member.isfile())
-                expected_mode = 0o755 if member.name == f"{root}/bin/kwaque" else 0o644
+                expected_mode = (
+                    0o755
+                    if member.name
+                    in {
+                        f"{root}/bin/kwaque",
+                        f"{root}/bin/kwaque_native",
+                    }
+                    else 0o644
+                )
                 self.assertEqual(member.mode & 0o777, expected_mode)
 
     def test_binaries_embed_no_absolute_build_paths(self) -> None:

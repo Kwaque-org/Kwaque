@@ -105,8 +105,17 @@ admin_server::~admin_server() {
 }
 
 seastar::future<> admin_server::start(
-  std::string address, std::uint16_t port, unsigned shard_count) {
+  std::string address,
+  std::uint16_t port,
+  unsigned shard_count,
+  const seastar::abort_source* startup_abort) {
     assert_current();
+    const auto check_abort = [startup_abort] {
+        if (startup_abort != nullptr) {
+            startup_abort->check();
+        }
+    };
+    check_abort();
     if (
       impl_->state_ != impl::lifecycle::constructed
       || impl_->operation_active_) {
@@ -119,32 +128,39 @@ seastar::future<> admin_server::start(
     try {
         co_await impl_->states_.start();
         impl_->states_started_ = true;
+        check_abort();
         co_await impl_->states_.invoke_on_all(
           [](admin_state& state) { state.register_metrics(); });
+        check_abort();
 
         co_await impl_->server_.start("kwaque-admin");
         impl_->server_started_ = true;
+        check_abort();
         auto* states = &impl_->states_;
         const auto version_json = impl_->version_json_;
         co_await impl_->server_.set_routes(
           [states, version_json](seastar::httpd::routes& routes) {
               register_routes(routes, states->local(), version_json);
           });
+        check_abort();
 
         seastar::prometheus::config prometheus_config;
         prometheus_config.prefix = "kwaque";
         co_await seastar::prometheus::start(
           impl_->server_, std::move(prometheus_config));
+        check_abort();
 
         seastar::listen_options options;
         options.reuse_address = true;
         co_await impl_->server_.listen(
           seastar::socket_address{seastar::net::inet_address(address), port},
           options);
+        check_abort();
         co_await impl_->states_.invoke_on_all(
           [shard_count](admin_state& state) {
               state.listener_started(shard_count);
           });
+        check_abort();
     } catch (...) {
         startup_failure = std::current_exception();
     }

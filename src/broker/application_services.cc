@@ -39,13 +39,25 @@ void application_state::assert_owner() const {
     owner_->assert_current();
 }
 
+void application_state::initialize_stop_signal(bool install_signal_handlers) {
+    capture_or_assert_owner();
+    if (stop_signal_ != nullptr) {
+        throw std::logic_error(
+          "application stop signal is already initialized");
+    }
+    stop_signal_ = std::make_unique<runtime::stop_signal>(
+      install_signal_handlers);
+}
+
 void application_state::construct_services(bool install_signal_handlers) {
     capture_or_assert_owner();
     if (services_constructed()) {
         throw std::logic_error("application services are already constructed");
     }
-    stop_signal_ = std::make_unique<runtime::stop_signal>(
-      install_signal_handlers);
+    if (stop_signal_ == nullptr) {
+        initialize_stop_signal(install_signal_handlers);
+    }
+    stop_signal_->abort_source().check();
     lifecycle_ = std::make_unique<service_lifecycle>(
       stop_signal_->abort_source());
     admin_server_ = std::make_unique<admin::admin_server>();

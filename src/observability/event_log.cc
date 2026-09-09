@@ -527,9 +527,10 @@ runtime::result<event_log_artifact> event_log::encode() const {
             return runtime::failure(appended.error());
         }
     }
-    if (output.size() != encoded_bytes_) {
-        return runtime::failure(log_error(errc::invariant_violation));
-    }
+    KWAQUE_INVARIANT(
+      invariant_id{"KQ-EVENT-LOG-ENCODE-SIZE"},
+      output.size() == encoded_bytes_,
+      "event log encoded size differs from its accounting");
     return runtime::result<event_log_artifact>{std::move(output)};
 }
 

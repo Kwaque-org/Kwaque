@@ -10,6 +10,7 @@
 #include <cstdint>
 #include <limits>
 #include <new>
+#include <system_error>
 
 namespace kwaque::runtime::production {
 
@@ -43,7 +44,7 @@ template<seed_entropy Entropy>
         return seed;
     } catch (const std::bad_alloc&) {
         throw;
-    } catch (...) {
+    } catch (const std::system_error&) {
         return failure(
           operation_error{errc::unavailable, operation_kind::random});
     }

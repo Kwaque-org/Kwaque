@@ -1,10 +1,35 @@
+load("//bazel:build.bzl", "kwaque_cc_binary")
 load(
     "//bazel:test.bzl",
     "kwaque_cc_seastar_test",
     "kwaque_cc_test",
+    "kwaque_py_native_test",
 )
 
 package(default_visibility = ["//visibility:private"])
+
+kwaque_cc_binary(
+    name = "queue_worker_failure_probe",
+    testonly = True,
+    srcs = ["queue_worker_failure_probe.cc"],
+    deps = [
+        "//src/base",
+        "//src/resource:bounded_work_queue",
+        "//src/resource:resource_config",
+        "//src/resource:resource_manager",
+        "//src/resource:resource_registry",
+        "//src/resource:workload_class",
+        "//src/runtime:task_scope",
+        "@seastar",
+    ],
+)
+
+kwaque_py_native_test(
+    name = "queue_worker_failure_test",
+    timeout = "moderate",
+    srcs = ["queue_worker_failure_test.py"],
+    data = [":queue_worker_failure_probe"],
+)
 
 kwaque_cc_test(
     name = "workload_class_test",

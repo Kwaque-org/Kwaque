@@ -1,8 +1,24 @@
 load("@rules_python//python:defs.bzl", "py_test")
 load("//bazel:build.bzl", "kwaque_cc_binary", "kwaque_cc_library")
-load("//bazel:test.bzl", "kwaque_cc_seastar_test", "kwaque_cc_test")
+load("//bazel:launcher.bzl", "kwaque_launcher")
+load("//bazel:test.bzl", "kwaque_cc_seastar_test", "kwaque_cc_test", "kwaque_py_native_test")
 
 package(default_visibility = ["//visibility:private"])
+
+kwaque_cc_library(
+    name = "startup_policy",
+    srcs = ["startup_policy.cc"],
+    hdrs = ["startup_policy.h"],
+    deps = [
+        "//src/base:build_info",
+        "//src/config:bootstrap_config",
+        "//src/resource:resource_config",
+        "@boost//:any",
+        "@boost//:program_options",
+        "@openssl",
+        "@seastar",
+    ],
+)
 
 kwaque_cc_library(
     name = "service_lifecycle",
@@ -40,9 +56,11 @@ kwaque_cc_library(
         ":data_directory",
         ":pid_file",
         ":service_lifecycle",
+        ":startup_policy",
         "//src/admin:admin_server",
         "//src/base",
         "//src/base:build_info",
+        "//src/base:invariant",
         "//src/base:logging",
         "//src/config:bootstrap_config",
         "//src/observability:event_identity",
@@ -62,6 +80,7 @@ kwaque_cc_library(
     visibility = ["//visibility:public"],
     deps = [
         ":application_internal",
+        ":startup_policy",
         "//src/base:build_info",
         "@boost//:program_options",
         "@seastar",
@@ -76,11 +95,96 @@ kwaque_cc_library(
 )
 
 kwaque_cc_binary(
-    name = "kwaque",
+    name = "kwaque_native",
     srcs = ["main.cc"],
     data = ["//conf:kwaque_config"],
-    visibility = ["//visibility:public"],
+    visibility = ["//bazel/packaging:__pkg__"],
     deps = [":application"],
+)
+
+kwaque_launcher(
+    name = "kwaque",
+    srcs = [
+        "cpu_features.c",
+        "cpu_features.h",
+        "launcher.c",
+    ],
+    data = [":kwaque_native"],
+    visibility = ["//visibility:public"],
+)
+
+kwaque_launcher(
+    name = "launcher_fixture",
+    testonly = True,
+    srcs = [
+        "cpu_features.h",
+        "cpu_features_fixture.c",
+        "launcher.c",
+    ],
+)
+
+py_test(
+    name = "launcher_test",
+    size = "small",
+    srcs = ["launcher_test.py"],
+    args = [
+        "$(rootpath :launcher_fixture)",
+        "$(rootpath :kwaque)",
+    ],
+    data = [
+        ":kwaque",
+        ":launcher_fixture",
+    ],
+    main = "launcher_test.py",
+)
+
+kwaque_cc_test(
+    name = "startup_policy_test",
+    srcs = ["startup_policy_test.cc"],
+    deps = [
+        ":startup_policy",
+        "//src/base",
+        "//src/base:build_info",
+        "@boost//:program_options",
+        "@seastar",
+    ],
+)
+
+kwaque_cc_binary(
+    name = "failure_policy_probe",
+    testonly = True,
+    srcs = ["failure_policy_test.cc"],
+    deps = [
+        ":startup_policy",
+        "//src/base",
+        "//src/base:error",
+        "//src/base:invariant",
+        "//src/resource:bounded_work_queue",
+        "//src/runtime:shard_affinity",
+        "@boost//:program_options",
+        "@seastar",
+    ],
+)
+
+kwaque_py_native_test(
+    name = "failure_policy_test",
+    timeout = "moderate",
+    srcs = ["failure_policy_test.py"],
+    data = [":failure_policy_probe"],
+)
+
+kwaque_cc_seastar_test(
+    name = "startup_configuration_test",
+    srcs = ["startup_configuration_test.cc"],
+    cpu = 2,
+    memory = "256MiB",
+    deps = [
+        ":application_internal",
+        ":application_test_support",
+        ":startup_policy",
+        "//src/admin:admin_server",
+        "@boost//:program_options",
+    ],
 )
 
 kwaque_cc_test(

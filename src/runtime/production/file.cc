@@ -72,8 +72,6 @@ operation_error file_system_error_from_exception(std::exception_ptr exception) {
         return file_system_error(errc::aborted);
     } catch (const std::system_error& error) {
         return file_system_error(map_file_system_error(error.code()));
-    } catch (...) {
-        return file_system_error(errc::io_failure);
     }
 }
 
@@ -191,7 +189,20 @@ file_system::list(file_path path, directory_listing_limits limits) {
     seastar::file directory;
     seastar::chunked_vector<directory_entry> entries;
     std::optional<operation_error> rejected;
+    std::optional<operation_error> operational_failure;
     std::exception_ptr exception;
+    auto record_failure = [&](std::exception_ptr failure) noexcept {
+        try {
+            auto error = file_system_error_from_exception(failure);
+            if (!operational_failure) {
+                operational_failure = std::move(error);
+            }
+        } catch (...) {
+            if (!exception) {
+                exception = std::current_exception();
+            }
+        }
+    };
     try {
         directory = co_await seastar::open_directory(path.value());
         std::uint64_t name_bytes = 0;
@@ -242,29 +253,22 @@ file_system::list(file_path path, directory_listing_limits limits) {
                   });
             }
         }
-    } catch (const std::bad_alloc&) {
-        exception = std::current_exception();
     } catch (...) {
-        exception = std::current_exception();
+        record_failure(std::current_exception());
     }
 
     if (directory) {
         try {
             co_await directory.close();
         } catch (...) {
-            if (!exception) {
-                exception = std::current_exception();
-            }
+            record_failure(std::current_exception());
         }
     }
     if (exception) {
-        try {
-            std::rethrow_exception(exception);
-        } catch (const std::bad_alloc&) {
-            throw;
-        } catch (...) {
-            co_return failure(file_system_error_from_exception(exception));
-        }
+        std::rethrow_exception(exception);
+    }
+    if (operational_failure) {
+        co_return failure(std::move(*operational_failure));
     }
     if (rejected) {
         co_return failure(std::move(*rejected));

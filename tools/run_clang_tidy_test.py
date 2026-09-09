@@ -4,6 +4,7 @@ import argparse
 import json
 import os
 import re
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -22,6 +23,19 @@ def rule(name: str, source: str, testonly: bool = False) -> str:
         f'<boolean name="testonly" value="{str(testonly).lower()}"/>'
         f'<list name="srcs"><label value="{source}"/></list></rule>'
     )
+
+
+def write_python_executable(
+    path: Path, source: str, interpreter: str = sys.executable
+) -> None:
+    script = path.with_name(path.name + ".py")
+    script.write_text(source)
+    # Bazel's interpreter path can exceed the kernel's shebang length limit.
+    path.write_text(
+        "#!/bin/sh\n"
+        f'exec {shlex.quote(interpreter)} {shlex.quote(str(script))} "$@"\n'
+    )
+    path.chmod(0o700)
 
 
 class ClangTidySelectionTest(unittest.TestCase):
@@ -138,6 +152,39 @@ class ClangTidySelectionTest(unittest.TestCase):
 
 
 class NativeParallelRunnerTest(unittest.TestCase):
+    def test_fixture_handles_long_quoted_interpreter_and_script_paths(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            interpreter = (
+                root
+                / ("python runtime's directory " + "x" * 100)
+                / ("nested directory " + "y" * 100)
+                / "python3"
+            )
+            interpreter.parent.mkdir(parents=True)
+            interpreter.symlink_to(sys.executable)
+            self.assertGreater(len(os.fsencode(interpreter)), 256)
+            fake = root / "fake tool's executable"
+            write_python_executable(
+                fake,
+                "import json, sys\n"
+                "print(json.dumps([sys.executable, *sys.argv[1:]]))\n"
+                "sys.exit(7)\n",
+                str(interpreter),
+            )
+            arguments = ["argument with spaces", "quote's", "$(printf unexpected)"]
+            result = subprocess.run(
+                [str(fake), *arguments],
+                cwd=interpreter.parent,
+                env={**os.environ, "PATH": ""},
+                text=True,
+                capture_output=True,
+                timeout=10,
+            )
+            self.assertEqual(result.returncode, 7, result.stderr)
+            self.assertEqual(json.loads(result.stdout), [str(interpreter), *arguments])
+            self.assertEqual(result.stderr, "")
+
     @unittest.skipUnless(
         os.environ.get("KWAQUE_TEST_TIDY_RUNNER"),
         "native runner supplied by the Bazel test target",
@@ -165,7 +212,9 @@ class NativeParallelRunnerTest(unittest.TestCase):
             database.write_text(json.dumps(entries))
             original = database.read_bytes()
             fake = root / "fake-clang-tidy"
-            fake.write_text(f"#!{sys.executable}\n" + textwrap.dedent("""\
+            write_python_executable(
+                fake,
+                textwrap.dedent("""\
                 import fcntl, json, pathlib, sys, time
                 if '-list-checks' in sys.argv:
                     sys.exit(0)
@@ -196,8 +245,8 @@ class NativeParallelRunnerTest(unittest.TestCase):
                 if name == 'failure.cc':
                     print('expected diagnostic', file=sys.stderr)
                     sys.exit(7)
-                """))
-            fake.chmod(0o700)
+                """),
+            )
             (root / ".clang-tidy").write_text("Checks: '*'\n")
             environment = dict(os.environ)
             environment["BUILD_WORKSPACE_DIRECTORY"] = str(root)

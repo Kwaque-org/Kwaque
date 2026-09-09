@@ -12,8 +12,9 @@ _PACKAGE_NAMES = {
 }
 
 patched_binary(
-    name = "packaged_kwaque",
-    binary = "//src/broker:kwaque",
+    name = "packaged_kwaque_native",
+    out = "kwaque_native",
+    binary = "//src/broker:kwaque_native",
 )
 
 runtime_libraries(
@@ -23,7 +24,10 @@ runtime_libraries(
 
 pkg_files(
     name = "binary_files",
-    srcs = [":packaged_kwaque"],
+    srcs = [
+        ":packaged_kwaque_native",
+        "//src/broker:kwaque",
+    ],
     attributes = pkg_attributes(
         gid = 0,
         mode = "0755",

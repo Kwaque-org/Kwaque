@@ -35,6 +35,10 @@ binaries target the Ubuntu 22.04 userspace baseline and require glibc 2.35 or
 newer. A Linux 5.15 or newer kernel is the supported baseline for the Seastar
 runtime and its io_uring backend.
 
+The `kwaque` entry point checks the required CPU instructions before loading the
+native broker. Keep the packaged `bin/kwaque` and `bin/kwaque_native` together;
+launch through `kwaque` so the prerequisite check runs first.
+
 Seastar's default reactor backend is `linux-aio`. The broker also accepts
 `--reactor-backend=io_uring`, `epoll`, or `asymmetric_io_uring`; see
 [Troubleshooting](#troubleshooting) for choosing between them.
@@ -44,9 +48,11 @@ must be writable by the broker process. Running the committed development
 configuration does not require root privileges, device access, or privileged
 ports. Hosts must provide enough unlocked memory for the selected Seastar
 `--memory` value; production CPU, memory-locking, and filesystem tuning is not
-yet automated. Workload admission is derived from the smallest shard-local
-allocator after Seastar applies `--memory`, with fixed internal reactor
-headroom; it is not a bootstrap-configuration setting.
+yet automated. Native-allocator builds derive workload admission from the
+smallest shard-local allocator after Seastar applies `--memory`, with fixed
+internal reactor headroom. System-allocator/sanitizer builds currently derive
+diagnostic admission from synthetic allocator statistics, identified explicitly
+in startup output; `--memory` does not cap their process allocations.
 
 ## Quick start
 
@@ -79,6 +85,30 @@ bazel run --config=dev //:kwaque -- --version
 Configuration keys, defaults, and validation rules live in
 [`conf/kwaque.yaml`](conf/kwaque.yaml). Pass a different file with `--config`;
 the default is `conf/kwaque.yaml` relative to the working directory.
+
+The broker reads native runtime options from its command line and explicitly
+selected `--io-properties` or `--io-properties-file` input. It does not load
+personal `~/.config/seastar/seastar.conf` or `io.conf` files, and the two explicit
+I/O sources cannot be combined. Enabled `--unsafe-bypass-fsync`,
+`--kernel-page-cache`, and `--relaxed-dma` are rejected before reactor startup in
+every broker profile.
+
+Startup records the resolved profile, allocator/instrumentation capabilities,
+requested runtime settings, and available observations before creating broker
+data-directory state. The configuration checksum is SHA256 of the exact bytes
+loaded for parsing; changing the file afterward affects a later launch, not the
+current snapshot. Native settings such as device NOWAIT or successful NUMA binding
+are marked unobserved where the option value cannot prove the result.
+`developer_mode` does not implicitly change CPU placement, polling, allocator,
+or durability. Non-loopback admin configuration emits an unauthenticated/TLS
+exposure warning; the current admin API remains health, version, and metrics only.
+
+Native-allocator broker builds abort when managed allocation cannot succeed after
+reclaim. Configured admission limits still return typed errors, and injected
+allocation failures remain exceptions for testing. System-allocator builds require
+explicit `developer_mode: true` for diagnostic use and report native OOM abort as
+unavailable. The presence-only `--abort-on-seastar-bad-alloc` option cannot disable
+the broker default or enable native allocator behavior in a system-allocator build.
 
 ## Development
 

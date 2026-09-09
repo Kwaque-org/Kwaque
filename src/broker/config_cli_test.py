@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
+import os
 import re
 import signal
 import socket
@@ -15,6 +17,7 @@ from pathlib import Path
 
 REACTOR_ARGUMENTS = ("--smp=2", "--memory=128M", "--overprovisioned")
 STARTUP_ATTEMPTS = 5
+ADMIN_EXPOSURE_WARNING = "admin API is exposed without authentication or TLS"
 
 ADMIN_METRICS = frozenset(
     {
@@ -87,7 +90,12 @@ def reserve_loopback_port() -> int:
 
 
 def write_test_config(
-    template: Path, output: Path, data_directory: Path, port: int
+    template: Path,
+    output: Path,
+    data_directory: Path,
+    port: int,
+    *,
+    address: str | None = None,
 ) -> None:
     contents = template.read_text(encoding="utf-8")
     contents, directory_count = re.subn(
@@ -100,6 +108,12 @@ def write_test_config(
     )
     if directory_count != 1 or port_count != 1:
         raise AssertionError(f"unable to specialize configuration template {template}")
+    if address is not None:
+        contents, address_count = re.subn(
+            r"(?m)^(\s*address:)\s*.*$", rf'\1 "{address}"', contents
+        )
+        if address_count != 1:
+            raise AssertionError(f"unable to specialize admin address in {template}")
     output.write_text(contents, encoding="utf-8")
 
 
@@ -229,7 +243,13 @@ def verify_product_metrics(exposition: str, *, aggregated: bool) -> None:
 
 
 class RunningBroker:
-    def __init__(self, binary: Path, log_path: Path, *arguments: str) -> None:
+    def __init__(
+        self,
+        binary: Path,
+        log_path: Path,
+        *arguments: str,
+        environment: dict[str, str] | None = None,
+    ) -> None:
         output = log_path.open("w", encoding="utf-8")
         try:
             self.process = subprocess.Popen(
@@ -237,6 +257,7 @@ class RunningBroker:
                 stdout=output,
                 stderr=subprocess.STDOUT,
                 text=True,
+                env=environment,
             )
         finally:
             output.close()
@@ -285,16 +306,21 @@ def start_broker(
     name: str,
     template: Path,
     data_directory: Path,
+    *arguments: str,
+    environment: dict[str, str] | None = None,
+    address: str | None = None,
 ) -> tuple[RunningBroker, Path, int, str]:
     for attempt in range(1, STARTUP_ATTEMPTS + 1):
         port = reserve_loopback_port()
         config = logs / f"{name}-{attempt}.yaml"
-        write_test_config(template, config, data_directory, port)
+        write_test_config(template, config, data_directory, port, address=address)
         broker = RunningBroker(
             binary,
             logs / f"{name}-{attempt}.log",
             "--config",
             str(config),
+            *arguments,
+            environment=environment,
         )
         try:
             output = broker.wait_for("startup stage=admin state=ready")
@@ -322,21 +348,317 @@ def assert_ordered(output: str, expected: tuple[str, ...]) -> None:
         position = found + len(value)
 
 
+def assert_startup_rejected(
+    binary: Path,
+    directory: Path,
+    *arguments: str,
+    expected: tuple[str, ...],
+    environment: dict[str, str],
+    before_reactor: bool = False,
+    after_configuration: bool = False,
+) -> None:
+    before = set(directory.rglob("*"))
+    result = subprocess.run(
+        [binary, *arguments, *REACTOR_ARGUMENTS],
+        check=False,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        timeout=15.0,
+        env=environment,
+        cwd=directory,
+    )
+    if result.returncode <= 0 or (before_reactor and result.returncode != 2):
+        raise AssertionError(
+            f"expected startup rejection for {arguments}, "
+            f"got exit {result.returncode}:\n{result.stdout}"
+        )
+    for value in expected:
+        if value not in result.stdout:
+            raise AssertionError(
+                f"startup rejection did not report {value!r}:\n{result.stdout}"
+            )
+    if after_configuration:
+        if result.stdout.count("configuration loaded ") != 1:
+            raise AssertionError(
+                f"profile rejection did not load one configuration:\n{result.stdout}"
+            )
+    elif "configuration loaded" in result.stdout:
+        raise AssertionError(f"rejected startup loaded configuration:\n{result.stdout}")
+    for forbidden in ("startup stage=", "runtime shards="):
+        if forbidden in result.stdout:
+            raise AssertionError(
+                f"rejected startup reached {forbidden!r}:\n{result.stdout}"
+            )
+    after = set(directory.rglob("*"))
+    if after != before:
+        raise AssertionError(
+            "rejected startup changed the working directory: "
+            f"created={sorted(after - before)} removed={sorted(before - after)}"
+        )
+
+
+def verify_configuration_rejections(
+    binary: Path, directory: Path, environment: dict[str, str]
+) -> None:
+    cases = (
+        ("missing-file", None, "unable to read configuration file"),
+        ("malformed", "kwaque: [", "unable to parse YAML"),
+        (
+            "missing-setting",
+            "kwaque: {node_id: 0}",
+            "required configuration key is missing",
+        ),
+        (
+            "duplicate-setting",
+            "kwaque: {schema_version: 1, schema_version: 1}",
+            "duplicate configuration key",
+        ),
+        (
+            "unknown-setting",
+            "kwaque: {schema_version: 1, unknown: true}",
+            "unknown configuration key",
+        ),
+        (
+            "oversized",
+            "x" * (64 * 1024 + 1),
+            "configuration exceeds the maximum supported size",
+        ),
+    )
+    for name, contents, expected in cases:
+        config = directory / f"{name}.yaml"
+        if contents is not None:
+            config.write_text(contents, encoding="utf-8")
+        assert_startup_rejected(
+            binary,
+            directory,
+            "--config",
+            str(config),
+            expected=(expected,),
+            environment=environment,
+        )
+
+    config = directory / "missing-file.yaml"
+    for arguments, expected in (
+        (("--config", str(config), "--config", str(config)), "--config"),
+        (("--unknown-broker-option",), "--unknown-broker-option"),
+    ):
+        assert_startup_rejected(
+            binary,
+            directory,
+            *arguments,
+            expected=(expected,),
+            environment=environment,
+            before_reactor=True,
+        )
+
+
+def verify_runtime_rejections(
+    binary: Path,
+    directory: Path,
+    templates: tuple[Path, Path],
+    environment: dict[str, str],
+) -> None:
+    unsafe_options = (
+        (("--unsafe-bypass-fsync=true",), "unsafe-bypass-fsync"),
+        (("--unsafe-bypass-fsync", "true"), "unsafe-bypass-fsync"),
+        (("--kernel-page-cache=true",), "kernel-page-cache"),
+        (("--kernel-page-cache", "true"), "kernel-page-cache"),
+        (("--relaxed-dma",), "relaxed-dma"),
+    )
+    io_properties = directory / "io-properties.yaml"
+    io_properties.write_text("disks: []\n", encoding="utf-8")
+    for index, template in enumerate(templates):
+        config = directory / f"runtime-policy-{index}.yaml"
+        write_test_config(
+            template,
+            config,
+            directory / f"rejected-data-{index}",
+            reserve_loopback_port(),
+        )
+        for arguments, option in unsafe_options:
+            assert_startup_rejected(
+                binary,
+                directory,
+                "--config",
+                str(config),
+                *arguments,
+                expected=(f"{option} is not supported by the broker",),
+                environment=environment,
+                before_reactor=True,
+            )
+        assert_startup_rejected(
+            binary,
+            directory,
+            "--config",
+            str(config),
+            "--io-properties=disks: []",
+            "--io-properties-file",
+            str(io_properties),
+            expected=("io-properties and io-properties-file cannot be used together",),
+            environment=environment,
+            before_reactor=True,
+        )
+
+
+def verify_startup_policy(output: str, config: Path, profile: str) -> dict[str, str]:
+    policies = [
+        line.partition("startup policy ")[2]
+        for line in output.splitlines()
+        if "startup policy " in line
+    ]
+    if len(policies) != 1:
+        raise AssertionError(f"expected one resolved startup policy:\n{output}")
+    fields = dict(re.findall(r"(?:^| )([a-z_]+)=([^ ]+)", policies[0]))
+    contents = config.read_bytes()
+    expected = {
+        "profile": profile,
+        "configuration_checksum_algorithm": "sha256",
+        "configuration_checksum": hashlib.sha256(contents).hexdigest(),
+        "configuration_bytes": str(len(contents)),
+    }
+    for key, value in expected.items():
+        if fields.get(key) != value:
+            raise AssertionError(
+                f"startup policy expected {key}={value}: {policies[0]}"
+            )
+    allocator = fields.get("allocator")
+    if allocator not in ("seastar", "system"):
+        raise AssertionError(
+            f"startup policy omitted allocator capability: {policies[0]}"
+        )
+    expected_stats = "native" if allocator == "seastar" else "synthetic"
+    if fields.get("allocator_stats") != expected_stats:
+        raise AssertionError(
+            f"startup policy misreported allocator stats: {policies[0]}"
+        )
+    for key in ("allocation_injection", "oom_abort_effective"):
+        if fields.get(key) not in ("true", "false"):
+            raise AssertionError(f"startup policy omitted {key}: {policies[0]}")
+    expected_abort = "true" if allocator == "seastar" else "false"
+    expected_capability = "native" if allocator == "seastar" else "unavailable"
+    if (
+        fields["oom_abort_effective"] != expected_abort
+        or fields.get("oom_abort_requested") != expected_abort
+        or fields.get("oom_abort_capability") != expected_capability
+    ):
+        raise AssertionError(f"allocator OOM policy is inconsistent: {policies[0]}")
+    if output.count("configuration loaded ") != 1:
+        raise AssertionError(f"configuration was not loaded exactly once:\n{output}")
+    assert_ordered(
+        output, ("startup policy ", "startup stage=data_directory state=ready")
+    )
+    return fields
+
+
+def verify_explicit_io_sources(
+    binary: Path,
+    directory: Path,
+    templates: tuple[Path, Path],
+    environment: dict[str, str],
+    alternate_profile: str,
+) -> None:
+    personal_config = directory / "hostile-home" / ".config" / "seastar"
+    personal_config.mkdir(parents=True)
+    (personal_config / "seastar.conf").write_text(
+        "unsafe-bypass-fsync=true\nkernel-page-cache=true\nrelaxed-dma=true\n",
+        encoding="utf-8",
+    )
+    (personal_config / "io.conf").write_text(
+        f"io-properties-file={directory / 'missing-personal-io.yaml'}\n"
+        "unknown-runtime-option=true\n",
+        encoding="utf-8",
+    )
+    hostile_environment = {**environment, "HOME": str(personal_config.parent.parent)}
+    io_properties = directory / "io-properties.yaml"
+    io_properties.write_text("disks: []\n", encoding="utf-8")
+    for name, template, profile, arguments in (
+        ("inline-io", templates[0], "development", ("--io-properties=disks: []",)),
+        (
+            "file-io",
+            templates[1],
+            alternate_profile,
+            ("--io-properties-file", str(io_properties)),
+        ),
+    ):
+        broker, config, _, output = start_broker(
+            binary,
+            directory,
+            name,
+            template,
+            directory / f"{name}-data",
+            *arguments,
+            environment=hostile_environment,
+        )
+        try:
+            verify_startup_policy(output, config, profile)
+            output = broker.stop()
+            if output.count("configuration loaded ") != 1:
+                raise AssertionError(
+                    f"configuration was reread after startup:\n{output}"
+                )
+        finally:
+            broker.kill_if_running()
+
+
+def verify_remote_admin_warning(
+    binary: Path,
+    directory: Path,
+    template: Path,
+    environment: dict[str, str],
+) -> None:
+    broker, config, _, output = start_broker(
+        binary,
+        directory,
+        "remote-admin",
+        template,
+        directory / "remote-admin-data",
+        environment=environment,
+        address="0.0.0.0",
+    )
+    try:
+        verify_startup_policy(output, config, "development")
+        if output.count(ADMIN_EXPOSURE_WARNING) != 1:
+            raise AssertionError(f"remote admin did not report its exposure:\n{output}")
+        assert_ordered(
+            output,
+            (ADMIN_EXPOSURE_WARNING, "startup stage=data_directory state=ready"),
+        )
+        broker.stop()
+    finally:
+        broker.kill_if_running()
+
+
 def main() -> None:
-    binary = Path(sys.argv[1])
-    default_template = Path(sys.argv[2])
-    alternate_template = Path(sys.argv[3])
+    binary = Path(sys.argv[1]).resolve()
+    default_template = Path(sys.argv[2]).resolve()
+    alternate_template = Path(sys.argv[3]).resolve()
 
     with tempfile.TemporaryDirectory() as directory:
         logs = Path(directory)
+        home = logs / "home"
+        home.mkdir()
+        environment = {**os.environ, "HOME": str(home)}
+        verify_configuration_rejections(binary, logs, environment)
+        verify_runtime_rejections(
+            binary, logs, (default_template, alternate_template), environment
+        )
         default, default_config, default_port, output = start_broker(
             binary,
             logs,
             "default",
             default_template,
             logs / "default-data",
+            "--unsafe-bypass-fsync=false",
+            "--kernel-page-cache=false",
+            environment=environment,
         )
         try:
+            policy = verify_startup_policy(output, default_config, "development")
+            if ADMIN_EXPOSURE_WARNING in output:
+                raise AssertionError(
+                    f"loopback admin reported remote exposure:\n{output}"
+                )
             for expected in (
                 f"configuration loaded path={default_config}",
                 "node_id=0",
@@ -428,20 +750,61 @@ def main() -> None:
         finally:
             default.kill_if_running()
 
+        alternate_profile = "production"
+        if policy["allocator"] == "system":
+            rejected = logs / "production-system-allocator.yaml"
+            write_test_config(
+                alternate_template,
+                rejected,
+                logs / "production-system-data",
+                reserve_loopback_port(),
+            )
+            assert_startup_rejected(
+                binary,
+                logs,
+                "--config",
+                str(rejected),
+                expected=("production broker requires the native Seastar allocator",),
+                environment=environment,
+                after_configuration=True,
+            )
+            contents, count = re.subn(
+                r"(?m)^(\s*developer_mode:)\s*false\s*$",
+                r"\1 true",
+                alternate_template.read_text(encoding="utf-8"),
+            )
+            if count != 1:
+                raise AssertionError(
+                    "alternate template must explicitly select production"
+                )
+            alternate_template = logs / "alternate-development-template.yaml"
+            alternate_template.write_text(contents, encoding="utf-8")
+            alternate_profile = "development"
+
         alternate, alternate_config, alternate_port, output = start_broker(
             binary,
             logs,
             "alternate",
             alternate_template,
             logs / "alternate-data",
+            "--unsafe-bypass-fsync",
+            "false",
+            "--kernel-page-cache",
+            "false",
+            environment=environment,
         )
         try:
+            verify_startup_policy(output, alternate_config, alternate_profile)
+            if ADMIN_EXPOSURE_WARNING in output:
+                raise AssertionError(
+                    f"loopback admin reported remote exposure:\n{output}"
+                )
             expected_path = f"configuration loaded path={alternate_config}"
             for expected in (
                 expected_path,
                 "node_id=7",
                 f"admin_port={alternate_port}",
-                "developer_mode=false",
+                f"developer_mode={'true' if alternate_profile == 'development' else 'false'}",
             ):
                 if expected not in output:
                     raise AssertionError(
@@ -460,6 +823,7 @@ def main() -> None:
                 stderr=subprocess.STDOUT,
                 text=True,
                 timeout=15.0,
+                env=environment,
             )
             if contender.returncode == 0:
                 raise AssertionError("second broker unexpectedly acquired the PID file")
@@ -474,27 +838,14 @@ def main() -> None:
         finally:
             alternate.kill_if_running()
 
-        oversized_config = logs / "oversized.yaml"
-        oversized_config.write_bytes(b"x" * (64 * 1024 + 1))
-        oversized = subprocess.run(
-            [
-                binary,
-                "--config",
-                str(oversized_config),
-                *REACTOR_ARGUMENTS,
-            ],
-            check=False,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            timeout=15.0,
+        verify_explicit_io_sources(
+            binary,
+            logs,
+            (default_template, alternate_template),
+            environment,
+            alternate_profile,
         )
-        if oversized.returncode == 0:
-            raise AssertionError("oversized configuration unexpectedly started")
-        if "configuration exceeds the maximum supported size" not in oversized.stdout:
-            raise AssertionError(
-                "oversized configuration did not report its bound:\n" + oversized.stdout
-            )
+        verify_remote_admin_warning(binary, logs, default_template, environment)
 
 
 if __name__ == "__main__":

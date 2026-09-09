@@ -15,11 +15,21 @@
 
 namespace kwaque::broker {
 
-seastar::future<> prepare_data_directory(const std::filesystem::path& path) {
+seastar::future<> prepare_data_directory(
+  const std::filesystem::path& path,
+  const seastar::abort_source* startup_abort) {
+    const auto check_abort = [startup_abort] {
+        if (startup_abort != nullptr) {
+            startup_abort->check();
+        }
+    };
+    check_abort();
     const std::string directory = path.string();
     co_await seastar::recursive_touch_directory(directory);
+    check_abort();
 
     const seastar::stat_data status = co_await seastar::file_stat(directory);
+    check_abort();
     if (status.type != seastar::directory_entry_type::directory) {
         throw std::runtime_error(
           "data directory path is not a directory: " + directory);
@@ -48,9 +58,11 @@ seastar::future<> prepare_data_directory(const std::filesystem::path& path) {
         // cleanup.
         created = true; // NOLINT(clang-analyzer-deadcode.DeadStores)
         co_await file.close();
+        check_abort();
         co_await seastar::remove_file(probe);
         created = false;
         co_await seastar::sync_directory(directory);
+        check_abort();
     } catch (...) {
         failure = std::current_exception();
     }

@@ -112,6 +112,9 @@ public:
 
     [[nodiscard]] environment_state state() const;
     [[nodiscard]] bool abort_requested() const;
+    // Tasks handle expected operational failures before returning to this
+    // owner. Any escaping exception terminates the runtime immediately;
+    // long-running workers also select task_lifetime::until_abort.
     [[nodiscard]] task_scope& tasks();
     [[nodiscard]] resource::resource_manager& resource_manager();
     [[nodiscard]] observability::production_event_sink& event_sink();
@@ -120,6 +123,7 @@ private:
     friend class environment_test_access;
 
     void assert_runtime_available(bool owner_present) const;
+    void initialize_task_scope();
     void request_abort_unchecked() noexcept;
     static void throw_if_failed(const result<void>& outcome);
     [[nodiscard]] result<void> emit_lifecycle(
@@ -174,7 +178,7 @@ seastar::future<> environment::start_with(Checkpoint checkpoint) {
           observability::event_public_text::operation_environment_start,
           observability::event_severity::info));
         checkpoint(0);
-        tasks_.emplace();
+        initialize_task_scope();
         if (abort_requested_) {
             throw seastar::abort_requested_exception{};
         }
