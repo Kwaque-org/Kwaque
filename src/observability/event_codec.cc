@@ -1,5 +1,7 @@
 #include "src/observability/event_codec.h"
 
+#include "src/base/invariant.h"
+
 #include <array>
 #include <bit>
 #include <cstddef>
@@ -214,32 +216,36 @@ runtime::result<encoded_event> encode_event(const event& value) noexcept {
     encoded_event output;
     event_encoding_writer writer{output};
     const auto name = value.name();
-    if (
-      name.empty() || name.size() > std::numeric_limits<std::uint8_t>::max()
-      || value.fields().size() > std::numeric_limits<std::uint8_t>::max()
-      || !writer.append_integer(event_schema_version)
-      || !writer.append_integer(static_cast<std::uint16_t>(value.kind()))
-      || !writer.append_byte(static_cast<std::uint8_t>(name.size()))
-      || !writer.append_text(name)
-      || !writer.append_byte(static_cast<std::uint8_t>(value.severity()))
-      || !writer.append_integer(value.monotonic().nanoseconds())
-      || !writer.append_integer(
-        std::bit_cast<std::uint64_t>(value.wall().unix_nanoseconds()))
-      || !writer.append_integer(value.shard().value())
-      || !writer.append_byte(static_cast<std::uint8_t>(value.workload()))
-      || !writer.append_integer(value.sequence())
-      || !writer.append_byte(
-        static_cast<std::uint8_t>(value.fields().size()))) {
-        return runtime::failure(codec_error(errc::invariant_violation));
-    }
+    const bool header_encoded
+      = !name.empty() && name.size() <= std::numeric_limits<std::uint8_t>::max()
+        && value.fields().size() <= std::numeric_limits<std::uint8_t>::max()
+        && writer.append_integer(event_schema_version)
+        && writer.append_integer(static_cast<std::uint16_t>(value.kind()))
+        && writer.append_byte(static_cast<std::uint8_t>(name.size()))
+        && writer.append_text(name)
+        && writer.append_byte(static_cast<std::uint8_t>(value.severity()))
+        && writer.append_integer(value.monotonic().nanoseconds())
+        && writer.append_integer(
+          std::bit_cast<std::uint64_t>(value.wall().unix_nanoseconds()))
+        && writer.append_integer(value.shard().value())
+        && writer.append_byte(static_cast<std::uint8_t>(value.workload()))
+        && writer.append_integer(value.sequence())
+        && writer.append_byte(static_cast<std::uint8_t>(value.fields().size()));
+    KWAQUE_INVARIANT(
+      invariant_id{"KQ-EVENT-ENCODE-HEADER"},
+      header_encoded,
+      "validated event header exceeds its encoding bounds");
     for (const auto& field : value.fields()) {
-        if (!append_field(writer, field)) {
-            return runtime::failure(codec_error(errc::invariant_violation));
-        }
+        const bool field_encoded = append_field(writer, field);
+        KWAQUE_INVARIANT(
+          invariant_id{"KQ-EVENT-ENCODE-FIELD"},
+          field_encoded,
+          "validated event field exceeds its encoding bounds");
     }
-    if (output.size() != value.encoded_size()) {
-        return runtime::failure(codec_error(errc::invariant_violation));
-    }
+    KWAQUE_INVARIANT(
+      invariant_id{"KQ-EVENT-ENCODE-SIZE"},
+      output.size() == value.encoded_size(),
+      "validated event encoded size differs from its accounting");
     return output;
 }
 

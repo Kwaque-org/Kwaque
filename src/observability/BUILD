@@ -1,5 +1,5 @@
 load("//bazel:build.bzl", "kwaque_cc_library")
-load("//bazel:test.bzl", "kwaque_cc_benchmark", "kwaque_cc_seastar_test")
+load("//bazel:test.bzl", "kwaque_cc_benchmark", "kwaque_cc_seastar_test", "kwaque_cc_test")
 
 package(default_visibility = ["//visibility:private"])
 
@@ -28,6 +28,7 @@ kwaque_cc_library(
     visibility = ["//visibility:public"],
     deps = [
         ":event",
+        "//src/base:invariant",
         "//src/runtime:error",
     ],
 )
@@ -118,6 +119,21 @@ kwaque_cc_library(
         ":event_sink_concept",
         "//src/runtime:error",
         "//src/runtime:shard_affinity",
+    ],
+)
+
+kwaque_cc_test(
+    name = "event_codec_invariant_test",
+    srcs = ["event_codec_invariant_test.cc"],
+    deps = [
+        ":event",
+        ":event_codec",
+        ":event_identity",
+        ":event_log",
+        ":event_sequence",
+        ":event_sequence_test_access",
+        "//src/resource:workload_class",
+        "//src/runtime:time",
     ],
 )
 

@@ -116,6 +116,15 @@ seastar::future<> environment::start() {
     return start_with([](std::size_t) noexcept {});
 }
 
+void environment::initialize_task_scope() {
+    tasks_.emplace([](std::exception_ptr) noexcept {
+        invariant_failed(
+          invariant_id{"KQ-PROD-ENVIRONMENT-TASK"},
+          "runtime owned task must handle expected operational failure",
+          "unexpected exception escaped production runtime work");
+    });
+}
+
 void environment::assert_runtime_available(bool owner_present) const {
     const auto lifetime_state = lifetime_.state();
     if (

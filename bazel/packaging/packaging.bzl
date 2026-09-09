@@ -2,7 +2,7 @@
 
 def _patched_binary_impl(ctx):
     binary = ctx.file.binary
-    output = ctx.actions.declare_file("kwaque")
+    output = ctx.actions.declare_file(ctx.attr.out)
     ctx.actions.run(
         arguments = [
             "--set-rpath",
@@ -22,6 +22,7 @@ patched_binary = rule(
     implementation = _patched_binary_impl,
     attrs = {
         "binary": attr.label(allow_single_file = True, mandatory = True),
+        "out": attr.string(default = "kwaque"),
         "_patchelf": attr.label(
             allow_single_file = True,
             cfg = "exec",

@@ -25,6 +25,14 @@ Closing a task scope first closes admission and requests abort, then waits for
 all accepted work. `admission_closed()` reports only the first condition; the
 future returned by `close()` is the drain-completion boundary.
 
+A scope can retain an owner callback that receives its first failure immediately,
+before close. Required workers select `task_lifetime::until_abort`; returning
+before cancellation is fatal. Production environment tasks handle expected
+operational errors before returning to their scope, whose terminal callback
+aborts on an escaping failure. A callback that throws is itself fatal. Native
+adapters translate recognized operational exceptions; unrelated exceptions keep
+their identity through cleanup and reach the owning service.
+
 The production environment is one shard-local composition root for the task
 scope, runtime adapters, resource manager, event sink, and their metrics. It
 uses the same explicit constructed/starting/started/stopping/stopped lifecycle

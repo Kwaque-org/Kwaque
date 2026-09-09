@@ -32,6 +32,11 @@ returns `consumer_waiters_exhausted` before another wait is retained; a zero lim
 permits ready pops only. Cancellation and completion return capacity. Managed
 consumers instead use their configured worker count as the bound.
 
+Started workers are required until queue shutdown. Optional item failures must
+be explicitly recognized by the owner's failure classifier before bounded error
+reporting can continue processing. An unclassified failure or a throwing classifier
+or reporter is fatal, including when the reporting budget is exhausted.
+
 Components obtain one move-only workload lease during startup. It supplies the
 copyable scheduling/SMP handles and a shard-local native memory semaphore while
 preventing manager/registry teardown. The lease must outlive all units and

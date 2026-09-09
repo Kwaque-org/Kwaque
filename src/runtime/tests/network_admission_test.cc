@@ -7,8 +7,10 @@
 
 #include <boost/test/unit_test.hpp>
 
+#include <exception>
 #include <optional>
 #include <span>
+#include <stdexcept>
 #include <utility>
 
 SEASTAR_TEST_CASE(network_write_admission_bounds_operations_and_bytes) {
@@ -197,4 +199,33 @@ SEASTAR_TEST_CASE(dns_admission_abort_rejects_new_and_wakes_queued_work) {
     active.reset();
     BOOST_CHECK(!admission.active());
     co_return;
+}
+
+SEASTAR_TEST_CASE(dns_admission_preserves_unclassified_waiter_failure) {
+    kwaque::runtime::dns_admission admission{kwaque::runtime::dns_config{
+      .maximum_waiters = 1,
+      .maximum_results = 8,
+    }};
+    seastar::abort_source active_abort;
+    auto acquired = co_await admission.acquire(active_abort);
+    BOOST_REQUIRE(acquired.has_value());
+    std::optional active{std::move(*acquired)};
+    seastar::abort_source waiting_abort;
+    auto waiting = admission.acquire(waiting_abort);
+    BOOST_CHECK(!waiting.available());
+    const auto failure = std::make_exception_ptr(
+      std::logic_error("unexpected DNS admission failure"));
+    waiting_abort.request_abort_ex(failure);
+    std::exception_ptr observed;
+    try {
+        static_cast<void>(co_await std::move(waiting));
+    } catch (...) {
+        observed = std::current_exception();
+    }
+    active.reset();
+    BOOST_CHECK(observed == failure);
+    BOOST_CHECK_EQUAL(admission.waiters(), 0U);
+    BOOST_CHECK(!admission.active());
+    auto retry = co_await admission.acquire(active_abort);
+    BOOST_REQUIRE(retry.has_value());
 }

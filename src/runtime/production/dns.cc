@@ -54,8 +54,6 @@ operation_error dns_error_from_exception(std::exception_ptr exception) {
         return dns_error(errc::aborted);
     } catch (const std::system_error& error) {
         return dns_error(map_dns_system_error(error.code()));
-    } catch (...) {
-        return dns_error(errc::dns_failure);
     }
 }
 

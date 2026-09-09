@@ -150,7 +150,9 @@ class bounded_work_queue final : public runtime::shard_affine {
 public:
     using handler_type = seastar::noncopyable_function<seastar::future<>(T)>;
     using reporter_type
-      = seastar::noncopyable_function<void(std::exception_ptr) noexcept>;
+      = seastar::noncopyable_function<void(std::exception_ptr)>;
+    using expected_failure_type
+      = seastar::noncopyable_function<bool(const std::exception_ptr&)>;
 
     explicit bounded_work_queue(bounded_work_queue_config config)
       : config_(validate_or_throw(config))
@@ -174,10 +176,15 @@ public:
         producer_turn_.ensure_space_for_waiters(max_queued_producers());
     }
 
+    // Workers are required until queue shutdown. Optional item work may name
+    // its expected exception families explicitly; all other escaping failures
+    // terminate the owner. The classifier and reporter must not throw and are
+    // retained through close. Report limits never suppress failure escalation.
     void start_workers(
       bounded_queue_worker_config config,
       handler_type handler,
-      reporter_type reporter) {
+      reporter_type reporter,
+      expected_failure_type expected_failure = {}) {
         assert_current();
         if (workers_started_) {
             throw std::logic_error("queue workers already started");
@@ -206,11 +213,18 @@ public:
         worker_config_ = config;
         handler_ = std::move(handler);
         reporter_ = std::move(reporter);
-        tasks_.emplace();
+        expected_failure_ = std::move(expected_failure);
+        tasks_.emplace([](std::exception_ptr) noexcept {
+            invariant_failed(
+              invariant_id{"KQ-QUEUE-WORKER-FAILED"},
+              "required queue worker must remain available",
+              "unexpected exception escaped queue worker");
+        });
         workers_started_ = true;
         for (std::size_t index = 0; index < config.workers; ++index) {
             const auto accepted = tasks_->spawn(
-              [this] { return worker_loop(); });
+              [this] { return worker_loop(); },
+              runtime::task_lifetime::until_abort);
             KWAQUE_INVARIANT(
               invariant_id{"KQ-QUEUE-WORKER-SPAWNED"},
               accepted.has_value(),
@@ -1004,9 +1018,18 @@ private:
                 if (
                   popped.error().kind == queue_failure_kind::closed
                   || popped.error().kind == queue_failure_kind::aborted) {
+                    KWAQUE_INVARIANT(
+                      invariant_id{"KQ-QUEUE-WORKER-EXIT"},
+                      state_ != bounded_work_queue_state::open
+                        || tasks_->abort_requested(),
+                      "queue worker exited while admission remains open");
+                    tasks_->request_abort();
                     co_return;
                 }
-                throw std::logic_error("queue worker received a pop failure");
+                invariant_failed(
+                  invariant_id{"KQ-QUEUE-WORKER-POP"},
+                  "managed worker pop must succeed or stop",
+                  "queue worker received an impossible admission failure");
             }
 
             processing_item processing{*this, std::move(*popped)};
@@ -1020,13 +1043,35 @@ private:
                       return invoke_handler(processing.take());
                   });
             } catch (...) {
+                const auto failure = std::current_exception();
+                bool expected = false;
+                if (expected_failure_) {
+                    try {
+                        expected = expected_failure_(failure);
+                    } catch (...) {
+                        invariant_failed(
+                          invariant_id{"KQ-QUEUE-FAILURE-CLASSIFIER"},
+                          "failure classifier must not throw",
+                          "queue owner failed while classifying item failure");
+                    }
+                }
+                if (!expected) {
+                    throw;
+                }
                 KWAQUE_INVARIANT(
                   invariant_id{"KQ-QUEUE-WORKER-REPORTER"},
                   static_cast<bool>(reporter_),
                   "started queue workers have no reporter");
                 if (reported_errors_ < worker_config_->maximum_error_reports) {
                     increment(reported_errors_);
-                    reporter_(std::current_exception());
+                    try {
+                        reporter_(failure);
+                    } catch (...) {
+                        invariant_failed(
+                          invariant_id{"KQ-QUEUE-FAILURE-REPORTER"},
+                          "failure reporter must not throw",
+                          "queue owner failed while reporting item failure");
+                    }
                 } else {
                     increment(suppressed_errors_);
                 }
@@ -1130,6 +1175,7 @@ private:
     std::optional<bounded_queue_worker_config> worker_config_;
     handler_type handler_;
     reporter_type reporter_;
+    expected_failure_type expected_failure_;
     std::optional<runtime::task_scope> tasks_;
     byte_count bytes_held_;
     bounded_work_queue_state state_{bounded_work_queue_state::open};

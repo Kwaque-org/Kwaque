@@ -43,6 +43,20 @@ public:
                && target.resource_registry_ == nullptr
                && target.environments_ == nullptr;
     }
+
+    [[nodiscard]] static const configuration_identity&
+    identity(const application_state& target) {
+        return target.configuration_identity_.value();
+    }
+
+    [[nodiscard]] static const config::bootstrap_config&
+    configuration(const application_state& target) {
+        return target.configuration_.value();
+    }
+
+    static void request_stop(application_state& target) {
+        target.stop_signal_->request_stop();
+    }
 };
 
 } // namespace kwaque::broker::detail

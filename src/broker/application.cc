@@ -2,6 +2,7 @@
 
 #include "src/base/build_info.h"
 #include "src/broker/application_internal.h"
+#include "src/broker/startup_policy.h"
 
 #include <seastar/core/app-template.hh>
 #include <seastar/core/thread.hh>
@@ -39,11 +40,13 @@ int application::run(int argc, char** argv) {
         return EXIT_SUCCESS;
     }
 
-    seastar::app_template::config app_config;
+    seastar::app_template::seastar_options app_config;
     app_config.name = "Kwaque";
     app_config.description = "Kwaque distributed log broker";
     app_config.auto_handle_sigint_sigterm = false;
+    detail::configure_allocation_failure_policy(app_config);
     seastar::app_template app(std::move(app_config));
+    app.set_configuration_reader(detail::validate_runtime_configuration);
     app.add_options()(
       "config",
       boost::program_options::value<std::string>()->default_value(
@@ -51,8 +54,9 @@ int application::run(int argc, char** argv) {
       "Path to the Kwaque bootstrap configuration file");
 
     return app.run(argc, argv, [this, &app] {
-        return seastar::async(
-          [this, &app] { return state_->execute(app.configuration()); });
+        return seastar::async([this, &app] {
+            return state_->execute(app.configuration(), app.options());
+        });
     });
 }
 

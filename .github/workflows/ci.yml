@@ -309,6 +309,13 @@ jobs:
       - name: Test deterministic runtime on aarch64 release
         run: >-
           bazel test --config=ci-release
+          //src/broker:launcher_test
+          //src/broker:startup_policy_test
+          //src/broker:startup_configuration_test
+          //src/broker:failure_policy_test
+          //src/broker:config_cli_test
+          //src/resource/tests:queue_worker_failure_test
+          //src/observability:event_codec_invariant_test
           //src/runtime/tests:operation_error_test
           //src/simulation/tests:scheduler_test
           //src/simulation/tests:virtual_time_test

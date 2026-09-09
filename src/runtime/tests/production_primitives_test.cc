@@ -15,10 +15,12 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <exception>
 #include <limits>
 #include <new>
 #include <span>
 #include <stdexcept>
+#include <system_error>
 #include <type_traits>
 #include <utility>
 
@@ -31,7 +33,9 @@ using kwaque::runtime::production::wall_clock;
 
 class failing_entropy final {
 public:
-    std::uint32_t operator()() { throw std::runtime_error("entropy failed"); }
+    std::uint32_t operator()() {
+        throw std::system_error(std::make_error_code(std::errc::io_error));
+    }
 };
 
 class allocation_failing_entropy final {
@@ -233,6 +237,50 @@ SEASTAR_TEST_CASE(
     BOOST_REQUIRE(seeded.has_value());
     static_cast<void>(seeded->next_u64());
     co_return;
+}
+
+SEASTAR_TEST_CASE(production_random_preserves_unclassified_entropy_failures) {
+    const std::array failures{
+      std::make_exception_ptr(std::runtime_error("unexpected entropy failure")),
+      std::make_exception_ptr(std::logic_error("invalid entropy state")),
+    };
+    for (const auto& failure : failures) {
+        auto entropy = [&failure]() -> std::uint32_t {
+            std::rethrow_exception(failure);
+        };
+        std::exception_ptr observed;
+        try {
+            static_cast<void>(
+              kwaque::runtime::production::detail::read_entropy_seed(entropy));
+        } catch (...) {
+            observed = std::current_exception();
+        }
+        BOOST_CHECK(observed == failure);
+    }
+    co_return;
+}
+
+SEASTAR_TEST_CASE(
+  production_timer_preserves_unclassified_cancellation_failure) {
+    timer service;
+    seastar::abort_source caller_abort;
+    const auto deadline = monotonic_clock::now().checked_add(
+      kwaque::runtime::monotonic_duration{60'000'000'000U});
+    BOOST_REQUIRE(deadline.has_value());
+    auto waiting = service.sleep_until(*deadline, caller_abort);
+    const auto failure = std::make_exception_ptr(
+      std::logic_error("unexpected timer cancellation failure"));
+    caller_abort.request_abort_ex(failure);
+    std::exception_ptr observed;
+    try {
+        static_cast<void>(co_await std::move(waiting));
+    } catch (...) {
+        observed = std::current_exception();
+    }
+    const auto stopped = co_await service.stop();
+    BOOST_CHECK(observed == failure);
+    BOOST_REQUIRE(stopped.has_value());
+    BOOST_CHECK_EQUAL(service.statistics().active, 0U);
 }
 
 SEASTAR_TEST_CASE(production_random_uses_shared_bounded_and_fill_algorithms) {

@@ -183,7 +183,7 @@ dns_admission::acquire(seastar::abort_source& abort_source) {
           dns_error(closed_ ? errc::aborted : errc::unavailable));
     } catch (...) {
         --waiters_;
-        co_return failure(dns_error(errc::unavailable));
+        throw;
     }
 }
 

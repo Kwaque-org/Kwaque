@@ -8,6 +8,7 @@
 #include <seastar/core/abort_source.hh>
 #include <seastar/core/coroutine.hh>
 #include <seastar/core/lowres_clock.hh>
+#include <seastar/net/stack.hh>
 #include <seastar/testing/test_case.hh>
 #include <seastar/util/later.hh>
 
@@ -17,11 +18,13 @@
 #include <chrono>
 #include <cstddef>
 #include <exception>
+#include <memory>
 #include <new>
 #include <optional>
 #include <span>
 #include <stdexcept>
 #include <string_view>
+#include <system_error>
 #include <utility>
 
 namespace {
@@ -80,6 +83,123 @@ private:
     close_probe_state* state_;
 };
 
+struct transport_failure_probe final {
+    std::exception_ptr read_failure;
+    std::exception_ptr write_failure;
+    std::exception_ptr input_close_failure;
+    std::exception_ptr output_close_failure;
+    std::optional<seastar::promise<seastar::temporary_buffer<char>>>
+      pending_read;
+    unsigned input_closes{0};
+    unsigned output_closes{0};
+    bool socket_destroyed{false};
+};
+
+class failing_source final : public seastar::data_source_impl {
+public:
+    explicit failing_source(transport_failure_probe& probe) noexcept
+      : probe_(probe) {}
+
+    seastar::future<seastar::temporary_buffer<char>> get() final {
+        if (probe_.pending_read) {
+            return probe_.pending_read->get_future();
+        }
+        if (probe_.read_failure) {
+            return seastar::make_exception_future<
+              seastar::temporary_buffer<char>>(probe_.read_failure);
+        }
+        return seastar::make_ready_future<seastar::temporary_buffer<char>>();
+    }
+    seastar::future<> close() final {
+        ++probe_.input_closes;
+        return probe_.input_close_failure
+                 ? seastar::make_exception_future<>(probe_.input_close_failure)
+                 : seastar::make_ready_future<>();
+    }
+
+private:
+    transport_failure_probe& probe_;
+};
+
+class failing_sink final : public seastar::data_sink_impl {
+public:
+    explicit failing_sink(transport_failure_probe& probe) noexcept
+      : probe_(probe) {}
+
+    seastar::future<>
+    put(std::span<seastar::temporary_buffer<char>> buffers) final {
+        for (auto& buffer : buffers) {
+            buffer = {};
+        }
+        return probe_.write_failure
+                 ? seastar::make_exception_future<>(probe_.write_failure)
+                 : seastar::make_ready_future<>();
+    }
+    seastar::future<> close() final {
+        ++probe_.output_closes;
+        return probe_.output_close_failure
+                 ? seastar::make_exception_future<>(probe_.output_close_failure)
+                 : seastar::make_ready_future<>();
+    }
+    std::size_t buffer_size() const noexcept final { return 4096; }
+
+private:
+    transport_failure_probe& probe_;
+};
+
+class failing_socket final : public seastar::net::connected_socket_impl {
+public:
+    explicit failing_socket(transport_failure_probe& probe) noexcept
+      : probe_(probe) {}
+    ~failing_socket() final { probe_.socket_destroyed = true; }
+    seastar::data_source source() final {
+        return seastar::data_source{std::make_unique<failing_source>(probe_)};
+    }
+    seastar::data_sink sink() final {
+        return seastar::data_sink{std::make_unique<failing_sink>(probe_)};
+    }
+    void shutdown_input() final {}
+    void shutdown_output() final {}
+    void set_nodelay(bool) final {}
+    bool get_nodelay() const final { return true; }
+    void set_keepalive(bool) final {}
+    bool get_keepalive() const final { return false; }
+    void set_keepalive_parameters(const seastar::net::keepalive_params&) final {
+    }
+    seastar::net::keepalive_params get_keepalive_parameters() const final {
+        return seastar::net::tcp_keepalive_params{
+          std::chrono::seconds{0}, std::chrono::seconds{0}, 0};
+    }
+    void set_sockopt(int, int, const void*, std::size_t) final {
+        throw std::system_error(
+          std::make_error_code(std::errc::operation_not_supported));
+    }
+    int get_sockopt(int, int, void*, std::size_t) const final {
+        throw std::system_error(
+          std::make_error_code(std::errc::operation_not_supported));
+    }
+    seastar::socket_address local_address() const final {
+        return seastar::make_ipv4_address({0x7f000001U, 1});
+    }
+    seastar::socket_address remote_address() const final {
+        return seastar::make_ipv4_address({0x7f000001U, 2});
+    }
+    seastar::future<> wait_input_shutdown() final {
+        return seastar::make_ready_future<>();
+    }
+
+private:
+    transport_failure_probe& probe_;
+};
+
+kwaque::runtime::production::connection
+make_failing_connection(transport_failure_probe& probe) {
+    return kwaque::runtime::production::network_test_access::make_connection(
+      seastar::connected_socket{std::make_unique<failing_socket>(probe)},
+      kwaque::runtime::network_endpoint{loopback_address, 1},
+      kwaque::runtime::network_endpoint{loopback_address, 2});
+}
+
 } // namespace
 
 SEASTAR_TEST_CASE(production_network_connect_abort_guard_owns_subscription) {
@@ -95,6 +215,131 @@ SEASTAR_TEST_CASE(production_network_connect_abort_guard_owns_subscription) {
     caller_abort.request_abort();
     BOOST_CHECK_EQUAL(socket.shutdowns, 1U);
     co_return;
+}
+
+SEASTAR_TEST_CASE(
+  production_network_preserves_unknown_read_failure_after_abort) {
+    transport_failure_probe probe;
+    probe.pending_read.emplace();
+    auto connection = make_failing_connection(probe);
+    seastar::abort_source caller_abort;
+    auto reading = connection.read(kwaque::byte_count{8}, caller_abort);
+    BOOST_CHECK(!reading.available());
+    const auto failure = std::make_exception_ptr(
+      std::logic_error("unexpected native read failure"));
+    connection.request_abort();
+    probe.pending_read->set_exception(failure);
+    std::exception_ptr observed;
+    try {
+        static_cast<void>(co_await std::move(reading));
+    } catch (...) {
+        observed = std::current_exception();
+    }
+    const auto closed = co_await connection.close();
+    BOOST_CHECK(observed == failure);
+    BOOST_REQUIRE(closed.has_value());
+    BOOST_CHECK_EQUAL(connection.statistics().active, 0U);
+    BOOST_CHECK(probe.socket_destroyed);
+}
+
+SEASTAR_TEST_CASE(production_network_keeps_native_system_errors_operational) {
+    const std::array cases{
+      std::pair{std::errc::no_buffer_space, kwaque::errc::resource_exhausted},
+      std::pair{std::errc::timed_out, kwaque::errc::timed_out},
+      std::pair{std::errc::connection_reset, kwaque::errc::network_failure},
+    };
+    for (const auto& [native, expected] : cases) {
+        transport_failure_probe probe;
+        probe.read_failure = std::make_exception_ptr(
+          std::system_error(std::make_error_code(native)));
+        auto connection = make_failing_connection(probe);
+        seastar::abort_source caller_abort;
+        const auto read = co_await connection.read(
+          kwaque::byte_count{8}, caller_abort);
+        const auto closed = co_await connection.close();
+        BOOST_REQUIRE(!read.has_value());
+        BOOST_CHECK(read.error().code() == expected);
+        BOOST_REQUIRE(closed.has_value());
+    }
+}
+
+SEASTAR_TEST_CASE(production_network_preserves_unclassified_write_failures) {
+    transport_failure_probe probe;
+    probe.write_failure = std::make_exception_ptr(
+      std::runtime_error("unexpected native write failure"));
+    auto connection = make_failing_connection(probe);
+    seastar::abort_source caller_abort;
+    std::exception_ptr observed;
+    try {
+        static_cast<void>(
+          co_await connection.write(bytes("payload"), caller_abort));
+    } catch (...) {
+        observed = std::current_exception();
+    }
+    const auto closed = co_await connection.close();
+    BOOST_CHECK(observed == probe.write_failure);
+    BOOST_REQUIRE(closed.has_value());
+    BOOST_CHECK_EQUAL(connection.statistics().active, 0U);
+}
+
+SEASTAR_TEST_CASE(production_network_preserves_unknown_write_waiter_failure) {
+    transport_failure_probe probe;
+    auto connection = make_failing_connection(probe);
+    auto serialization
+      = kwaque::runtime::production::network_test_access::hold_write_serializer(
+        connection);
+    BOOST_REQUIRE(serialization.has_value());
+    seastar::abort_source caller_abort;
+    auto writing = connection.write(bytes("payload"), caller_abort);
+    BOOST_CHECK(!writing.available());
+    const auto failure = std::make_exception_ptr(
+      std::logic_error("unexpected write admission failure"));
+    caller_abort.request_abort_ex(failure);
+    std::exception_ptr observed;
+    try {
+        static_cast<void>(co_await std::move(writing));
+    } catch (...) {
+        observed = std::current_exception();
+    }
+    serialization.reset();
+    const auto closed = co_await connection.close();
+    BOOST_CHECK(observed == failure);
+    BOOST_REQUIRE(closed.has_value());
+    BOOST_CHECK_EQUAL(connection.statistics().active, 0U);
+}
+
+SEASTAR_TEST_CASE(production_network_close_cleans_both_streams_before_rethrow) {
+    const auto operational = std::make_exception_ptr(
+      std::system_error(std::make_error_code(std::errc::connection_reset)));
+    const auto unexpected = std::make_exception_ptr(
+      std::logic_error("unexpected stream close failure"));
+    const auto allocation = std::make_exception_ptr(std::bad_alloc{});
+    const std::array cases{
+      std::pair{unexpected, operational},
+      std::pair{operational, unexpected},
+      std::pair{allocation, operational},
+    };
+    for (const auto& [output_failure, input_failure] : cases) {
+        transport_failure_probe probe;
+        probe.output_close_failure = output_failure;
+        probe.input_close_failure = input_failure;
+        auto connection = make_failing_connection(probe);
+        const auto expected = output_failure == operational ? input_failure
+                                                            : output_failure;
+        for (unsigned attempt = 0; attempt < 2; ++attempt) {
+            std::exception_ptr observed;
+            try {
+                static_cast<void>(co_await connection.close());
+            } catch (...) {
+                observed = std::current_exception();
+            }
+            BOOST_CHECK(observed == expected);
+        }
+        BOOST_CHECK_EQUAL(probe.output_closes, 1U);
+        BOOST_CHECK_EQUAL(probe.input_closes, 1U);
+        BOOST_CHECK(probe.socket_destroyed);
+        BOOST_CHECK_EQUAL(connection.statistics().active, 0U);
+    }
 }
 
 SEASTAR_TEST_CASE(network_contract_retries_failure_before_native_close_state) {

@@ -18,9 +18,6 @@ from tests.smoke.broker_test_support import (
 TOTAL_MEMORY_BYTES = 128 * 1024 * 1024
 REACTOR_HEADROOM_BYTES = 16 * 1024 * 1024
 MINIMUM_SHARD_MEMORY_BYTES = 64 * 1024 * 1024
-SYSTEM_ALLOCATOR_WARNING = (
-    "Seastar compiled with default allocator, --memory option won't take effect"
-)
 CONFIGURED_MEMORY_METRIC = "kwaque_resource_manager_memory_configured_bytes"
 
 
@@ -82,9 +79,10 @@ class ResourceMemorySmokeTest(unittest.TestCase):
                         observed_minimum = int(match.group(2))
                         expected_minimum = TOTAL_MEMORY_BYTES // shards
                         self.assertEqual(observed_shards, shards)
-                        if SYSTEM_ALLOCATOR_WARNING in output:
+                        if "allocator_stats=synthetic" in output:
                             self.assertNotEqual(observed_minimum, 0)
                         else:
+                            self.assertIn("allocator_stats=native", output)
                             self.assertEqual(observed_minimum, expected_minimum)
                         self.assertGreaterEqual(
                             observed_minimum, MINIMUM_SHARD_MEMORY_BYTES

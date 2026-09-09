@@ -10,6 +10,7 @@
 #include <filesystem>
 #include <string>
 #include <unistd.h>
+#include <utility>
 
 namespace {
 
@@ -75,4 +76,40 @@ SEASTAR_TEST_CASE(data_directory_rejects_read_only_path) {
         rejected = true;
     }
     BOOST_CHECK(rejected);
+}
+
+SEASTAR_TEST_CASE(data_directory_abort_before_start_creates_nothing) {
+    temporary_directory directory;
+    seastar::abort_source abort;
+    abort.request_abort();
+    bool canceled = false;
+    try {
+        co_await kwaque::broker::prepare_data_directory(
+          directory.path(), &abort);
+    } catch (const seastar::abort_requested_exception&) {
+        canceled = true;
+    }
+    BOOST_CHECK(canceled);
+    BOOST_CHECK(!std::filesystem::exists(directory.path()));
+}
+
+SEASTAR_TEST_CASE(data_directory_abort_during_io_precedes_probe_validation) {
+    temporary_directory directory;
+    std::filesystem::create_directories(directory.path());
+    BOOST_REQUIRE_EQUAL(::chmod(directory.path().c_str(), 0555), 0);
+    seastar::abort_source abort;
+    auto preparing = kwaque::broker::prepare_data_directory(
+      directory.path(), &abort);
+    // Native filesystem work is pending before the owner can process its
+    // completion. The next validation/probe step must observe the stop.
+    BOOST_REQUIRE(!preparing.available());
+    abort.request_abort();
+    bool canceled = false;
+    try {
+        co_await std::move(preparing);
+    } catch (const seastar::abort_requested_exception&) {
+        canceled = true;
+    }
+    BOOST_CHECK(canceled);
+    BOOST_CHECK(std::filesystem::is_empty(directory.path()));
 }
