@@ -80,6 +80,7 @@ kwaque_cc_seastar_test(
         "//src/runtime:environment",
         "//src/runtime:file",
         "//src/runtime:network",
+        "//src/runtime:task_scope",
         "//src/runtime/production:environment",
         "//src/runtime/production:environment_test_support",
         "//src/runtime/testing:test_directory",

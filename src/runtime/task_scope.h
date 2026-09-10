@@ -68,6 +68,10 @@ public:
     [[nodiscard]] result<void>
     spawn(Func&& task, task_lifetime lifetime = task_lifetime::finite) {
         assert_current();
+        if (admission_closed_) {
+            return failure(
+              operation_error{errc::closed, operation_kind::resource});
+        }
         auto holder = gate_.try_hold();
         if (!holder) {
             return failure(
@@ -86,6 +90,9 @@ public:
         return {};
     }
 
+    // Close admission synchronously before notifying cancellation subscribers.
+    // Existing work remains owned until close() completes.
+    void close_admission() noexcept;
     void request_abort();
     [[nodiscard]] seastar::future<> close();
 
@@ -118,6 +125,7 @@ private:
     std::exception_ptr first_failure_;
     task_scope_statistics statistics_;
     bool closing_{false};
+    bool admission_closed_{false};
 };
 
 } // namespace kwaque::runtime

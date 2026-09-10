@@ -51,13 +51,37 @@ seastar::future<int> exercise(std::string_view scenario) {
 #else
     constexpr bool injection_available = false;
 #endif
+#if defined(__OPTIMIZE__)
+    constexpr bool optimized = true;
+#else
+    constexpr bool optimized = false;
+#endif
+#if __has_feature(address_sanitizer)
+    constexpr bool asan = true;
+#else
+    constexpr bool asan = false;
+#endif
+#if __has_feature(undefined_behavior_sanitizer)
+    constexpr bool ubsan = true;
+#else
+    constexpr bool ubsan = false;
+#endif
+    constexpr bool sanitized = asan || ubsan;
     require(
       abort_enabled == native_allocator, "unexpected effective OOM policy");
+    require(
+      native_allocator || !injection_available,
+      "system allocator cannot enable allocation injection");
     std::printf(
-      "allocator=%s abort=%s injection=%s\n",
+      "allocator=%s abort=%s injection=%s optimized=%s sanitized=%s asan=%s "
+      "ubsan=%s\n",
       native_allocator ? "native" : "system",
       abort_enabled ? "true" : "false",
-      injection_available ? "true" : "false");
+      injection_available ? "true" : "false",
+      optimized ? "true" : "false",
+      sanitized ? "true" : "false",
+      asan ? "true" : "false",
+      ubsan ? "true" : "false");
     std::fflush(stdout);
 
     if (scenario == "effective") {

@@ -66,8 +66,6 @@ errc map_file_system_error(const std::error_code& error) noexcept {
 operation_error file_system_error_from_exception(std::exception_ptr exception) {
     try {
         std::rethrow_exception(std::move(exception));
-    } catch (const std::bad_alloc&) {
-        throw;
     } catch (const seastar::cancelled_error&) {
         return file_system_error(errc::aborted);
     } catch (const std::system_error& error) {

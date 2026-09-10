@@ -42,6 +42,12 @@ boost_dependencies = use_extension(
 use_repo(boost_dependencies, "boost")
 
 single_version_override(
+    module_name = "abseil-cpp",
+    patch_strip = 1,
+    patches = ["//bazel/thirdparty:abseil-clang-23-lifetime-capture.patch"],
+)
+
+single_version_override(
     module_name = "crc32c",
     patch_strip = 1,
     patches = ["//bazel/thirdparty:crc32c-license.patch"],

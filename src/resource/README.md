@@ -32,6 +32,13 @@ returns `consumer_waiters_exhausted` before another wait is retained; a zero lim
 permits ready pops only. Cancellation and completion return capacity. Managed
 consumers instead use their configured worker count as the bound.
 
+Inline queue items are limited to 8 KiB; larger payloads use bounded buffer
+owners or handles. Linked FIFO chunks keep each storage allocation within
+128 KiB and retain one empty chunk for reuse. Abort closes admission immediately,
+then discards queued items in yielding batches. Await `close()` before releasing
+the queue or its dependencies; canceled-producer completion alone is not a drain
+completion signal.
+
 Started workers are required until queue shutdown. Optional item failures must
 be explicitly recognized by the owner's failure classifier before bounded error
 reporting can continue processing. An unclassified failure or a throwing classifier

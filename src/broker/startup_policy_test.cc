@@ -66,6 +66,10 @@ TEST(StartupPolicyTest, SystemAllocatorRequiresExplicitDevelopmentProfile) {
     EXPECT_NO_THROW(validate_broker_profile(configuration));
 #endif
     configuration.developer_mode = true;
+#if defined(SEASTAR_DEFAULT_ALLOCATOR)
+    EXPECT_THROW(validate_broker_profile(configuration), std::runtime_error);
+#endif
+    configuration.diagnostic_memory_per_shard_bytes = 134217728U;
     EXPECT_NO_THROW(validate_broker_profile(configuration));
 }
 
@@ -243,6 +247,24 @@ TEST(StartupPolicyTest, RecognizesNumericLoopbackAddressesWithoutAReactor) {
       std::invalid_argument);
 }
 
+TEST(StartupPolicyTest, ReportsDisabledAndDeveloperCrashLoopLimiting) {
+    const seastar::app_template::seastar_options runtime;
+    kwaque::config::bootstrap_config configuration;
+    const auto identity = identify_configuration("fixture");
+    const auto resources = test_resources();
+    configuration.crash_loop_limit.reset();
+    auto policy = render_startup_policy(
+      runtime, configuration, identity, resources, 2, "epoll");
+    EXPECT_EQ(policy_field(policy, "crash_loop_limit"), "null");
+    EXPECT_EQ(policy_field(policy, "crash_loop_limiting"), "false");
+    configuration.crash_loop_limit = 5;
+    configuration.developer_mode = true;
+    policy = render_startup_policy(
+      runtime, configuration, identity, resources, 2, "epoll");
+    EXPECT_EQ(policy_field(policy, "crash_loop_limit"), "5");
+    EXPECT_EQ(policy_field(policy, "crash_loop_limiting"), "false");
+}
+
 TEST(StartupPolicyTest, ReportsCapabilitiesAndResolvedProfile) {
     const seastar::app_template::seastar_options runtime;
     kwaque::config::bootstrap_config configuration;
@@ -252,12 +274,16 @@ TEST(StartupPolicyTest, ReportsCapabilitiesAndResolvedProfile) {
       runtime, configuration, identity, resources, 2, "epoll");
     EXPECT_EQ(policy_field(policy, "profile"), "production");
     EXPECT_EQ(policy_field(policy, "developer_mode"), "false");
+    EXPECT_EQ(policy_field(policy, "crash_loop_limit"), "5");
+    EXPECT_EQ(policy_field(policy, "crash_loop_limiting"), "true");
     EXPECT_EQ(
       policy_field(policy, "build_mode"), kwaque::build_info::build_mode());
     EXPECT_EQ(policy_field(policy, "compiler"), kwaque::build_info::compiler());
     EXPECT_EQ(policy_field(policy, "shards_requested"), "automatic");
     EXPECT_EQ(policy_field(policy, "shards_observed"), "2");
     EXPECT_EQ(policy_field(policy, "task_quota_ms_requested"), "0.500000");
+    EXPECT_EQ(policy_field(policy, "stall_threshold_ms_requested"), "25");
+    EXPECT_EQ(policy_field(policy, "stall_reports_per_minute_requested"), "5");
     EXPECT_EQ(policy_field(policy, "memory_requested_bytes"), "unspecified");
     EXPECT_EQ(policy_field(policy, "linux_aio_nowait_requested"), "automatic");
     EXPECT_EQ(policy_field(policy, "io_properties_source"), "none");
@@ -277,7 +303,8 @@ TEST(StartupPolicyTest, ReportsCapabilitiesAndResolvedProfile) {
     EXPECT_EQ(policy_field(policy, "allocator"), "system");
     EXPECT_EQ(policy_field(policy, "allocator_stats"), "synthetic");
     EXPECT_EQ(
-      policy_field(policy, "class_budget_source"), "synthetic_allocator_stats");
+      policy_field(policy, "class_budget_source"),
+      "explicit_diagnostic_budget");
     EXPECT_EQ(policy_field(policy, "memory_option_effect"), "unsupported");
     EXPECT_EQ(policy_field(policy, "oom_abort_effective"), "false");
 #else

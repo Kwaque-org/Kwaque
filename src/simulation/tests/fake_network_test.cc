@@ -723,6 +723,7 @@ SEASTAR_TEST_CASE(fake_network_bind_allocation_failure_is_transactional) {
       kwaque::runtime::result<kwaque::simulation::fake_listener>>>
       accepted;
     bool unexpected_failure = false;
+    bool injected = false;
     seastar::memory::with_allocation_failures([&] {
         try {
             auto attempt = network->listen(
@@ -734,8 +735,15 @@ SEASTAR_TEST_CASE(fake_network_bind_allocation_failure_is_transactional) {
             const auto outcome = attempt.get();
             unexpected_failure = !outcome.has_value();
         } catch (const std::bad_alloc&) {
+            injected = injected
+                       || seastar::memory::local_failure_injector().failed();
         }
     });
+#if defined(SEASTAR_ENABLE_ALLOC_FAILURE_INJECTION)
+    BOOST_CHECK(injected);
+#else
+    BOOST_CHECK(!injected);
+#endif
     BOOST_CHECK(!unexpected_failure);
     BOOST_REQUIRE(accepted.has_value());
     co_await pump_until(events, *accepted);

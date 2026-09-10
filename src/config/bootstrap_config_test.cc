@@ -41,6 +41,9 @@ TEST(BootstrapConfigTest, HasSafeDefaults) {
     EXPECT_EQ(configuration.admin_port, 9644);
     EXPECT_EQ(configuration.level, log_level::info);
     EXPECT_FALSE(configuration.developer_mode);
+    EXPECT_FALSE(configuration.storage_strict_data_init);
+    EXPECT_EQ(configuration.crash_loop_limit, 5U);
+    EXPECT_FALSE(configuration.diagnostic_memory_per_shard_bytes);
 }
 
 TEST(BootstrapConfigTest, LoadsCommittedExample) {
@@ -54,11 +57,28 @@ TEST(BootstrapConfigTest, LoadsCommittedExample) {
     EXPECT_EQ(configuration->admin_port, 9644);
     EXPECT_EQ(configuration->level, log_level::info);
     EXPECT_TRUE(configuration->developer_mode);
+    EXPECT_FALSE(configuration->storage_strict_data_init);
+    EXPECT_EQ(configuration->diagnostic_memory_per_shard_bytes, 134217728U);
 }
 
 TEST(BootstrapConfigTest, RejectsInvalidConfiguration) {
     const std::vector<std::pair<std::string_view, config_errc>> cases{
       {"kwaque: {schema_version: 1, unknown: true}", config_errc::unknown_key},
+      {"kwaque: {schema_version: 1, storage_strict_data_init: []}",
+       config_errc::invalid_type},
+      {"kwaque: {schema_version: 1, crash_loop_limit: -1}",
+       config_errc::invalid_crash_loop_limit},
+      {"kwaque: {schema_version: 1, crash_loop_limit: 4294967296}",
+       config_errc::invalid_crash_loop_limit},
+      {"kwaque: {schema_version: 1, crash_loop_limit: []}",
+       config_errc::invalid_type},
+      {"kwaque: {schema_version: 1, diagnostic_memory_per_shard_bytes: -1}",
+       config_errc::invalid_memory_budget},
+      {"kwaque: {schema_version: 1, diagnostic_memory_per_shard_bytes: 0}",
+       config_errc::invalid_memory_budget},
+      {"kwaque: {schema_version: 1, diagnostic_memory_per_shard_bytes: "
+       "18446744073709551615}",
+       config_errc::invalid_type},
       {"kwaque: {schema_version: 1, runtime: {memory: 1}}",
        config_errc::unknown_key},
       {"kwaque: {schema_version: 1, simulation: {seed: 1}}",
@@ -113,6 +133,21 @@ TEST(BootstrapConfigTest, RejectsInvalidConfiguration) {
         EXPECT_FALSE(configuration.error().field.empty());
         EXPECT_FALSE(configuration.error().message.empty());
     }
+}
+
+TEST(BootstrapConfigTest, PreservesExplicitHostAndDiagnosticPolicies) {
+    const auto configuration = parse_bootstrap_config(
+      "kwaque: {schema_version: 1, storage_strict_data_init: true, "
+      "diagnostic_memory_per_shard_bytes: 100663296}");
+    ASSERT_TRUE(configuration);
+    EXPECT_TRUE(configuration->storage_strict_data_init);
+    EXPECT_EQ(configuration->diagnostic_memory_per_shard_bytes, 100663296U);
+    const auto rendered = render_config(*configuration);
+    EXPECT_NE(
+      rendered.find("storage_strict_data_init=true"), std::string::npos);
+    EXPECT_NE(
+      rendered.find("diagnostic_memory_per_shard_bytes=100663296"),
+      std::string::npos);
 }
 
 TEST(BootstrapConfigTest, PreservesExplicitStringScalars) {
@@ -218,3 +253,30 @@ TEST(BootstrapConfigTest, BoundsAndEscapesErrorRendering) {
 }
 
 } // namespace
+
+TEST(BootstrapConfigLimitTest, AcceptsZeroAndLargestCrashLoopLimit) {
+    for (const auto& value : {std::string{"0"}, std::string{"4294967295"}}) {
+        const auto parsed = kwaque::config::parse_bootstrap_config(
+          "kwaque: {schema_version: 1, crash_loop_limit: " + value + "}");
+        ASSERT_TRUE(parsed);
+        ASSERT_TRUE(parsed->crash_loop_limit);
+        EXPECT_EQ(std::to_string(*parsed->crash_loop_limit), value);
+        EXPECT_NE(
+          kwaque::config::render_config(*parsed).find(
+            "crash_loop_limit=" + value),
+          std::string::npos);
+    }
+}
+
+TEST(BootstrapConfigLimitTest, NullDisablesTheFiniteCrashLoopLimit) {
+    for (const auto value : {"null", "~", ""}) {
+        const auto parsed = kwaque::config::parse_bootstrap_config(
+          std::string{"kwaque: {schema_version: 1, crash_loop_limit: "} + value
+          + "}");
+        ASSERT_TRUE(parsed);
+        EXPECT_FALSE(parsed->crash_loop_limit);
+        EXPECT_NE(
+          kwaque::config::render_config(*parsed).find("crash_loop_limit=null"),
+          std::string::npos);
+    }
+}

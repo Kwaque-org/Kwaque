@@ -11,8 +11,9 @@
 namespace kwaque::broker {
 
 service_lifecycle::service_lifecycle(
-  seastar::abort_source& abort_source) noexcept
-  : abort_source_(abort_source) {}
+  seastar::abort_source& abort_source, bool rollback_on_start_failure) noexcept
+  : abort_source_(abort_source)
+  , rollback_on_start_failure_(rollback_on_start_failure) {}
 
 service_lifecycle::~service_lifecycle() {
     assert_current();
@@ -25,6 +26,11 @@ service_lifecycle::~service_lifecycle() {
 
 seastar::future<>
 service_lifecycle::start_step(action start, action stop_action) {
+    return start_step("service", std::move(start), std::move(stop_action));
+}
+
+seastar::future<> service_lifecycle::start_step(
+  std::string_view name, action start, action stop_action) {
     assert_current();
     if (state_ != service_lifecycle_state::open || operation_active_) {
         throw std::logic_error("service lifecycle is not open for startup");
@@ -33,6 +39,7 @@ service_lifecycle::start_step(action start, action stop_action) {
         throw std::invalid_argument(
           "service lifecycle actions must be present");
     }
+    shutdown_stage_name owned_name{name};
     operation_active_ = true;
 
     std::exception_ptr startup_failure;
@@ -40,7 +47,7 @@ service_lifecycle::start_step(action start, action stop_action) {
         abort_source_.check();
         // Register cleanup before invoking start. No allocation can occur
         // between successful start completion and durable rollback ownership.
-        started_.push_back(std::move(stop_action));
+        started_.push_back({std::move(owned_name), std::move(stop_action)});
         co_await start();
         abort_source_.check();
     } catch (...) {
@@ -48,9 +55,11 @@ service_lifecycle::start_step(action start, action stop_action) {
     }
     operation_active_ = false;
     if (startup_failure) {
-        try {
-            co_await stop();
-        } catch (...) {
+        if (rollback_on_start_failure_) {
+            try {
+                co_await stop();
+            } catch (...) {
+            }
         }
         std::rethrow_exception(startup_failure);
     }
@@ -87,11 +96,14 @@ seastar::future<> service_lifecycle::stop() {
 seastar::future<> service_lifecycle::stop_once() {
     std::exception_ptr first_failure;
     while (!started_.empty()) {
-        action stop_action = std::move(started_.back());
+        stop_step step = std::move(started_.back());
         started_.pop_back();
+        shutdown_watchdog watchdog{std::move(step.name)};
         try {
-            co_await stop_action();
+            co_await step.stop();
+            watchdog.finish();
         } catch (...) {
+            watchdog.fail();
             if (!first_failure) {
                 first_failure = std::current_exception();
             }

@@ -29,16 +29,58 @@ kwaque_cc_library(
 )
 
 kwaque_cc_library(
+    name = "admin_limits",
+    hdrs = ["admin_limits.h"],
+    visibility = ["//src/broker:__pkg__"],
+)
+
+kwaque_cc_library(
     name = "admin_server",
     srcs = ["admin_server.cc"],
     hdrs = ["admin_server.h"],
     visibility = ["//src/broker:__pkg__"],
     deps = [
+        ":admin_limits",
         ":admin_responses",
         ":admin_state",
         "//src/base:invariant",
         "//src/runtime:shard_affinity",
         "@seastar",
+    ],
+)
+
+kwaque_cc_seastar_gtest(
+    name = "admin_memory_test",
+    timeout = "moderate",
+    srcs = ["admin_memory_test.cc"],
+    cpu = 2,
+    memory = "256MiB",
+    deps = [
+        ":admin_limits",
+        ":admin_server",
+    ],
+)
+
+kwaque_cc_library(
+    name = "admin_server_test_support",
+    testonly = True,
+    hdrs = ["admin_server_test_support.h"],
+    deps = [
+        ":admin_server",
+        "@seastar",
+    ],
+)
+
+kwaque_cc_seastar_gtest(
+    name = "admin_resource_test",
+    timeout = "moderate",
+    srcs = ["admin_resource_test.cc"],
+    cpu = 2,
+    memory = "256MiB",
+    deps = [
+        ":admin_limits",
+        ":admin_server",
+        ":admin_server_test_support",
     ],
 )
 

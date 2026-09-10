@@ -8,6 +8,8 @@
 
 #include <chrono>
 #include <filesystem>
+#include <fstream>
+#include <stdexcept>
 #include <string>
 #include <unistd.h>
 #include <utility>
@@ -112,4 +114,35 @@ SEASTAR_TEST_CASE(data_directory_abort_during_io_precedes_probe_validation) {
     }
     BOOST_CHECK(canceled);
     BOOST_CHECK(std::filesystem::is_empty(directory.path()));
+}
+
+SEASTAR_TEST_CASE(data_directory_mount_marker_is_optional_and_never_created) {
+    temporary_directory directory;
+    co_await kwaque::broker::prepare_data_directory(directory.path());
+    BOOST_CHECK(
+      !std::filesystem::exists(directory.path() / ".kwaque_data_dir"));
+}
+
+SEASTAR_TEST_CASE(data_directory_missing_mount_marker_precedes_mutation) {
+    temporary_directory directory;
+    bool rejected = false;
+    try {
+        co_await kwaque::broker::prepare_data_directory(
+          directory.path(), nullptr, true);
+    } catch (const std::invalid_argument&) {
+        rejected = true;
+    }
+    BOOST_CHECK(rejected);
+    BOOST_CHECK(!std::filesystem::exists(directory.path()));
+}
+
+SEASTAR_TEST_CASE(data_directory_accepts_preexisting_mount_marker) {
+    temporary_directory directory;
+    std::filesystem::create_directories(directory.path());
+    const auto marker = directory.path() / ".kwaque_data_dir";
+    std::ofstream(marker).close();
+    co_await kwaque::broker::prepare_data_directory(
+      directory.path(), nullptr, true);
+    BOOST_CHECK(std::filesystem::exists(marker));
+    BOOST_CHECK_EQUAL(std::filesystem::file_size(marker), 0U);
 }

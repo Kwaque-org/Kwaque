@@ -17,7 +17,8 @@ namespace kwaque::broker {
 
 seastar::future<> prepare_data_directory(
   const std::filesystem::path& path,
-  const seastar::abort_source* startup_abort) {
+  const seastar::abort_source* startup_abort,
+  bool require_mount_marker) {
     const auto check_abort = [startup_abort] {
         if (startup_abort != nullptr) {
             startup_abort->check();
@@ -25,6 +26,17 @@ seastar::future<> prepare_data_directory(
     };
     check_abort();
     const std::string directory = path.string();
+    if (require_mount_marker) {
+        const auto marker = (path / ".kwaque_data_dir").string();
+        const bool exists = co_await seastar::file_exists(marker);
+        check_abort();
+        if (!exists) {
+            throw std::invalid_argument(
+              "data directory mount marker is missing; verify the expected "
+              "filesystem is mounted: "
+              + marker);
+        }
+    }
     co_await seastar::recursive_touch_directory(directory);
     check_abort();
 

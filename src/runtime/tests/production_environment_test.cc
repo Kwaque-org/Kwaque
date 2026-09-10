@@ -4,10 +4,12 @@
 #include "src/resource/resource_registry.h"
 #include "src/runtime/cross_shard.h"
 #include "src/runtime/dns.h"
+#include "src/runtime/environment.h"
 #include "src/runtime/file.h"
 #include "src/runtime/network.h"
 #include "src/runtime/production/environment.h"
 #include "src/runtime/production/environment_test_support.h"
+#include "src/runtime/task_scope.h"
 #include "src/runtime/testing/contracts/cleanup.h"
 #include "src/runtime/testing/contracts/dns_test_server.h"
 #include "src/runtime/testing/contracts/environment_contract.h"
@@ -361,6 +363,97 @@ SEASTAR_TEST_CASE(production_environment_stop_waits_for_retained_leases) {
         co_await std::move(*stopping);
         BOOST_CHECK(
           target.state() == kwaque::runtime::environment_state::stopped);
+    }
+    co_await registry.stop();
+}
+
+SEASTAR_TEST_CASE(
+  production_environment_closes_admission_before_abort_callbacks) {
+    kwaque::resource::resource_registry registry;
+    co_await registry.start(resource_config());
+    {
+        kwaque::runtime::production::environment target{
+          kwaque::runtime::production::environment_dependencies{
+            registry.handles(), environment_logger(), event_identity(5)}};
+        co_await target.start();
+        std::optional<seastar::future<>> stopping;
+        {
+            kwaque::runtime::basic_runtime root{target};
+            auto acquired
+              = root.view<kwaque::runtime::runtime_capability::random>();
+            BOOST_REQUIRE(acquired.has_value());
+            auto capability = std::move(*acquired);
+            seastar::promise<> release;
+            unsigned completions = 0;
+            BOOST_REQUIRE(target.tasks()
+                            .spawn(
+                              [pending = release.get_future(),
+                               &capability,
+                               &completions]() mutable -> seastar::future<> {
+                                  co_await std::move(pending);
+                                  static_cast<void>(
+                                    capability.random().next_u64());
+                                  ++completions;
+                              })
+                            .has_value());
+
+            unsigned notifications = 0;
+            unsigned rejected_invocations = 0;
+            bool task_rejected = false;
+            bool lease_rejected = false;
+            bool view_rejected = false;
+            bool admission_closed = false;
+            auto subscription = target.tasks().abort_source().subscribe(
+              [&] noexcept {
+                  ++notifications;
+                  admission_closed = target.tasks().admission_closed();
+                  const auto task = target.tasks().spawn([&] {
+                      ++rejected_invocations;
+                      return seastar::make_ready_future<>();
+                  });
+                  task_rejected = !task.has_value()
+                                  && task.error().code()
+                                       == kwaque::errc::closed;
+                  lease_rejected = !target.lifetime().acquire().has_value();
+                  const auto view
+                    = root.view<kwaque::runtime::runtime_capability::random>();
+                  view_rejected = !view.has_value()
+                                  && view.error().code()
+                                       == kwaque::errc::closed;
+              });
+            target.request_abort();
+            target.request_abort();
+            BOOST_CHECK_EQUAL(notifications, 1U);
+            BOOST_CHECK(admission_closed);
+            BOOST_CHECK(task_rejected);
+            BOOST_CHECK(lease_rejected);
+            BOOST_CHECK(view_rejected);
+            BOOST_CHECK_EQUAL(rejected_invocations, 0U);
+            BOOST_CHECK_EQUAL(target.tasks().statistics().accepted, 1U);
+            BOOST_CHECK_EQUAL(target.tasks().statistics().abort_requests, 1U);
+            BOOST_CHECK_THROW(
+              kwaque::runtime::basic_runtime{target}, std::logic_error);
+            BOOST_CHECK(
+              target.lifetime().state()
+              == kwaque::runtime::runtime_lifetime_state::open);
+            static_cast<void>(capability.random().next_u64());
+
+            stopping.emplace(target.stop());
+            co_await seastar::yield();
+            BOOST_CHECK(!stopping->available());
+            BOOST_CHECK_EQUAL(completions, 0U);
+            release.set_value();
+            co_await seastar::yield();
+            BOOST_CHECK_EQUAL(completions, 1U);
+            BOOST_CHECK(!stopping->available());
+            static_cast<void>(capability.random().next_u64());
+        }
+        co_await std::move(*stopping);
+        BOOST_CHECK(
+          target.state() == kwaque::runtime::environment_state::stopped);
+        BOOST_CHECK(
+          kwaque::runtime::production::environment_test_access::
+            components_released(target));
     }
     co_await registry.stop();
 }

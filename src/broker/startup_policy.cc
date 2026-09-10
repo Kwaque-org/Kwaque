@@ -1,5 +1,6 @@
 #include "src/broker/startup_policy.h"
 
+#include "src/admin/admin_limits.h"
 #include "src/base/build_info.h"
 
 #include <seastar/core/memory.hh>
@@ -119,6 +120,11 @@ void validate_broker_profile(const config::bootstrap_config& configuration) {
           "production broker requires the native Seastar allocator; "
           "set developer_mode=true for diagnostic use");
     }
+    if (!configuration.diagnostic_memory_per_shard_bytes) {
+        throw std::runtime_error(
+          "system-allocator diagnostic broker requires "
+          "diagnostic_memory_per_shard_bytes");
+    }
 #else
     static_cast<void>(configuration);
 #endif
@@ -173,7 +179,7 @@ std::string render_startup_policy(
     constexpr std::string_view allocator = "system";
     constexpr std::string_view allocator_stats = "synthetic";
     constexpr std::string_view class_budget_source
-      = "synthetic_allocator_stats";
+      = "explicit_diagnostic_budget";
     constexpr std::string_view memory_option_effect = "unsupported";
 #else
     constexpr std::string_view allocator = "seastar";
@@ -222,12 +228,38 @@ std::string render_startup_policy(
       resources.total_memory().value());
     const std::string headroom = std::to_string(
       resources.reactor_headroom().value());
+    const std::string admin_memory = std::to_string(
+      resources.admin_memory_reservation().value());
+    const std::string production_floor = std::to_string(
+      resource::resource_config::production_baseline_memory().value()
+      + resources.admin_memory_reservation().value());
     const std::string idle_poll_time = std::to_string(
       reactor.idle_poll_time_us.get_value());
     const std::string task_quota = std::to_string(
       reactor.task_quota_ms.get_value());
+    const std::string stall_threshold = std::to_string(
+      reactor.blocked_reactor_notify_ms.get_value());
+    const std::string stall_reports = std::to_string(
+      reactor.blocked_reactor_reports_per_minute.get_value());
     const std::string configuration_bytes = std::to_string(identity.bytes);
     const std::string admin_port = std::to_string(configuration.admin_port);
+    const std::string crash_loop_limit = configuration.crash_loop_limit
+                                           ? std::to_string(
+                                               *configuration.crash_loop_limit)
+                                           : "null";
+    const std::string admin_connections = std::to_string(
+      admin::connections_per_shard);
+    const std::string admin_request_line = std::to_string(
+      admin::request_line_bytes);
+    const std::string admin_headers = std::to_string(admin::header_bytes);
+    const std::string admin_header_count = std::to_string(admin::header_count);
+    const std::string admin_header_seconds = std::to_string(
+      admin::header_timeout.count());
+    const std::string admin_exchange_seconds = std::to_string(
+      admin::exchange_timeout.count());
+    const std::string scrape_response_bytes = std::to_string(
+      admin::metrics_response_bytes);
+    const std::string admin_shares = std::to_string(admin::scheduling_shares);
     const std::string_view io_properties_source = smp.io_properties_file
                                                     ? "file"
                                                   : smp.io_properties ? "inline"
@@ -266,6 +298,13 @@ std::string render_startup_policy(
       config_value{"runtime_configuration_source", "command_line", safe},
       config_value{
         "developer_mode", bool_value(configuration.developer_mode), safe},
+      config_value{"crash_loop_limit", crash_loop_limit, safe},
+      config_value{
+        "crash_loop_limiting",
+        bool_value(
+          !configuration.developer_mode
+          && configuration.crash_loop_limit.has_value()),
+        safe},
       config_value{"shards_requested", requested_shards, safe},
       config_value{"shards_observed", shards, safe},
       config_value{"cpuset_requested", cpuset, safe},
@@ -279,6 +318,13 @@ std::string render_startup_policy(
       config_value{"class_budget_source", class_budget_source, safe},
       config_value{"class_budget_input_bytes", class_budget, safe},
       config_value{"reactor_headroom_bytes", headroom, safe},
+      config_value{"admin_memory_reservation_bytes", admin_memory, safe},
+      config_value{
+        "production_suitability_floor_bytes", production_floor, safe},
+      config_value{
+        "native_reclaim_observation",
+        allocator == "system" ? "unsupported" : "unobserved",
+        safe},
       config_value{
         "reactor_backend_requested",
         reactor.reactor_backend.get_selected_candidate_name(),
@@ -313,6 +359,8 @@ std::string render_startup_policy(
         safe},
       config_value{"polling_observed", "unobserved", safe},
       config_value{"task_quota_ms_requested", task_quota, safe},
+      config_value{"stall_threshold_ms_requested", stall_threshold, safe},
+      config_value{"stall_reports_per_minute_requested", stall_reports, safe},
       config_value{
         "unsafe_bypass_fsync",
         bool_value(reactor.unsafe_bypass_fsync.get_value()),
@@ -323,11 +371,24 @@ std::string render_startup_policy(
         safe},
       config_value{"relaxed_dma", bool_value(reactor.relaxed_dma), safe},
       config_value{"io_properties_source", io_properties_source, safe},
+      config_value{
+        "storage_strict_data_init",
+        bool_value(configuration.storage_strict_data_init),
+        safe},
       config_value{"configuration_checksum_algorithm", "sha256", safe},
       config_value{"configuration_checksum", identity.checksum_view(), safe},
       config_value{"configuration_bytes", configuration_bytes, safe},
       config_value{"admin_address", configuration.admin_address, safe},
       config_value{"admin_port", admin_port, safe},
+      config_value{"admin_connections_per_shard", admin_connections, safe},
+      config_value{"admin_request_line_bytes", admin_request_line, safe},
+      config_value{"admin_header_bytes", admin_headers, safe},
+      config_value{"admin_header_count", admin_header_count, safe},
+      config_value{"admin_header_timeout_seconds", admin_header_seconds, safe},
+      config_value{
+        "admin_exchange_timeout_seconds", admin_exchange_seconds, safe},
+      config_value{"admin_metrics_response_bytes", scrape_response_bytes, safe},
+      config_value{"admin_scheduling_shares", admin_shares, safe},
       config_value{
         "admin_exposure",
         admin_is_loopback(configuration.admin_address) ? "loopback"

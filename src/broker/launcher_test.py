@@ -18,6 +18,64 @@ X86_REQUIRED = sum(1 << bit for bit in (0, 1, 9, 13, 19, 20, 23, 32))
 ARM_REQUIRED = sum(1 << bit for bit in (0, 1, 3, 4, 5, 6, 7))
 
 
+def host_runtime_libraries(machine: int, interpreter: bytes) -> set[str]:
+    interpreters = {
+        62: b"/lib64/ld-linux-x86-64.so.2\0",  # EM_X86_64
+        183: b"/lib/ld-linux-aarch64.so.1\0",  # EM_AARCH64
+    }
+    if machine not in interpreters:
+        raise AssertionError(f"unsupported launcher ELF machine: {machine}")
+    if interpreter != interpreters[machine]:
+        raise AssertionError(f"unexpected launcher interpreter: {interpreter!r}")
+    allowed = {"libc.so.6", "libm.so.6"}
+    if machine == 183:
+        # The AArch64 C runtime imports its stack guard from the system loader,
+        # which is already loaded through the verified ELF interpreter above.
+        allowed.add("ld-linux-aarch64.so.1")
+    return allowed
+
+
+class HostRuntimePolicyTest(unittest.TestCase):
+    def test_arm_accepts_its_system_loader_dependency(self) -> None:
+        allowed = host_runtime_libraries(183, b"/lib/ld-linux-aarch64.so.1\0")
+        self.assertEqual(allowed, {"libc.so.6", "libm.so.6", "ld-linux-aarch64.so.1"})
+
+    def test_x86_retains_its_existing_library_restriction(self) -> None:
+        allowed = host_runtime_libraries(62, b"/lib64/ld-linux-x86-64.so.2\0")
+        self.assertEqual(allowed, {"libc.so.6", "libm.so.6"})
+
+    def test_rejects_unexpected_interpreters_and_architectures(self) -> None:
+        for machine, interpreter in (
+            (183, b"/lib64/ld-linux-x86-64.so.2\0"),
+            (62, b"/lib/ld-linux-aarch64.so.1\0"),
+            (183, b"/tmp/ld-linux-aarch64.so.1\0"),
+            (183, b""),
+            (0, b"/lib/ld-linux-aarch64.so.1\0"),
+        ):
+            with self.subTest(machine=machine, interpreter=interpreter):
+                with self.assertRaises(AssertionError):
+                    host_runtime_libraries(machine, interpreter)
+
+    def test_neither_architecture_permits_cpp_or_instrumentation_libraries(
+        self,
+    ) -> None:
+        for machine, interpreter in (
+            (62, b"/lib64/ld-linux-x86-64.so.2\0"),
+            (183, b"/lib/ld-linux-aarch64.so.1\0"),
+        ):
+            with self.subTest(machine=machine):
+                allowed = host_runtime_libraries(machine, interpreter)
+                for forbidden in (
+                    "libstdc++.so.6",
+                    "libc++.so.1",
+                    "libgcc_s.so.1",
+                    "libunwind.so.1",
+                    "libasan.so.8",
+                    "libubsan.so.1",
+                ):
+                    self.assertNotIn(forbidden, allowed)
+
+
 def elf_sections(binary: Path) -> dict[str, bytes]:
     contents = binary.read_bytes()
     header = struct.unpack_from("<16sHHIQQQIHHHHHH", contents)
@@ -189,7 +247,10 @@ class LauncherTest(unittest.TestCase):
     def test_production_launcher_has_no_broker_or_instrumentation_dependencies(
         self,
     ) -> None:
-        sections = elf_sections(Path(sys.argv[2]))
+        binary = Path(sys.argv[2])
+        sections = elf_sections(binary)
+        machine = struct.unpack_from("<H", binary.read_bytes(), 18)[0]
+        allowed = host_runtime_libraries(machine, sections.get(".interp", b""))
         strings = sections[".dynstr"]
         needed = {
             strings[value : strings.index(0, value)].decode("ascii")
@@ -199,7 +260,12 @@ class LauncherTest(unittest.TestCase):
         # The toolchain can retain libm from its default link flags. Both
         # libraries belong to the supported host C runtime.
         self.assertIn("libc.so.6", needed)
-        self.assertLessEqual(needed, {"libc.so.6", "libm.so.6"})
+        self.assertLessEqual(
+            needed,
+            allowed,
+            f"ELF machine={machine}: unexpected libraries={sorted(needed - allowed)}; "
+            f"DT_NEEDED={sorted(needed)}",
+        )
         symbols = sections.get(".strtab", b"") + strings
         for forbidden in (
             b"__asan_",

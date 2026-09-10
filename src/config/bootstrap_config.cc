@@ -207,13 +207,16 @@ bootstrap_config_result decode_bootstrap_config(const YAML::Node& root) {
           "required configuration root is missing"));
     }
 
-    constexpr std::array<std::string_view, 6> settings_keys{
+    constexpr std::array<std::string_view, 9> settings_keys{
       "schema_version",
       "node_id",
       "data_directory",
       "admin",
       "log_level",
-      "developer_mode"};
+      "developer_mode",
+      "storage_strict_data_init",
+      "crash_loop_limit",
+      "diagnostic_memory_per_shard_bytes"};
     if (
       auto validated = validate_keys(settings, "kwaque", settings_keys);
       !validated) {
@@ -337,6 +340,23 @@ bootstrap_config_result decode_bootstrap_config(const YAML::Node& root) {
         configuration.level = *level;
     }
 
+    if (settings["crash_loop_limit"] && settings["crash_loop_limit"].IsNull()) {
+        configuration.crash_loop_limit.reset();
+    } else if (settings["crash_loop_limit"]) {
+        const auto limit = required_scalar<std::int64_t>(
+          settings, "crash_loop_limit", "kwaque.crash_loop_limit");
+        if (!limit) {
+            return std::unexpected(limit.error());
+        }
+        if (*limit < 0 || *limit > std::numeric_limits<std::uint32_t>::max()) {
+            return std::unexpected(make_error(
+              config_errc::invalid_crash_loop_limit,
+              "kwaque.crash_loop_limit",
+              "crash loop limit must be an unsigned 32-bit integer"));
+        }
+        configuration.crash_loop_limit = static_cast<std::uint32_t>(*limit);
+    }
+
     if (settings["developer_mode"]) {
         const auto developer_mode = required_scalar<bool>(
           settings, "developer_mode", "kwaque.developer_mode");
@@ -344,6 +364,34 @@ bootstrap_config_result decode_bootstrap_config(const YAML::Node& root) {
             return std::unexpected(developer_mode.error());
         }
         configuration.developer_mode = *developer_mode;
+    }
+
+    if (settings["storage_strict_data_init"]) {
+        const auto strict = required_scalar<bool>(
+          settings,
+          "storage_strict_data_init",
+          "kwaque.storage_strict_data_init");
+        if (!strict) {
+            return std::unexpected(strict.error());
+        }
+        configuration.storage_strict_data_init = *strict;
+    }
+    if (settings["diagnostic_memory_per_shard_bytes"]) {
+        const auto memory = required_scalar<std::int64_t>(
+          settings,
+          "diagnostic_memory_per_shard_bytes",
+          "kwaque.diagnostic_memory_per_shard_bytes");
+        if (!memory) {
+            return std::unexpected(memory.error());
+        }
+        if (*memory <= 0) {
+            return std::unexpected(make_error(
+              config_errc::invalid_memory_budget,
+              "kwaque.diagnostic_memory_per_shard_bytes",
+              "diagnostic memory budget must be a positive finite byte count"));
+        }
+        configuration.diagnostic_memory_per_shard_bytes
+          = static_cast<std::uint64_t>(*memory);
     }
 
     return configuration;
@@ -436,8 +484,16 @@ std::string render_config(const bootstrap_config& configuration) {
     const std::string node_id = std::to_string(configuration.node_id);
     const std::string data_directory = configuration.data_directory.string();
     const std::string admin_port = std::to_string(configuration.admin_port);
+    const std::string crash_loop_limit = configuration.crash_loop_limit
+                                           ? std::to_string(
+                                               *configuration.crash_loop_limit)
+                                           : "null";
     const std::string developer_mode = configuration.developer_mode ? "true"
                                                                     : "false";
+    const std::string diagnostic_memory
+      = configuration.diagnostic_memory_per_shard_bytes
+          ? std::to_string(*configuration.diagnostic_memory_per_shard_bytes)
+          : "unspecified";
     const std::array values{
       config_value{"schema_version", schema_version, config_visibility::safe},
       config_value{"node_id", node_id, config_visibility::safe},
@@ -448,6 +504,16 @@ std::string render_config(const bootstrap_config& configuration) {
       config_value{
         "log_level", to_string(configuration.level), config_visibility::safe},
       config_value{"developer_mode", developer_mode, config_visibility::safe},
+      config_value{
+        "crash_loop_limit", crash_loop_limit, config_visibility::safe},
+      config_value{
+        "storage_strict_data_init",
+        configuration.storage_strict_data_init ? "true" : "false",
+        config_visibility::safe},
+      config_value{
+        "diagnostic_memory_per_shard_bytes",
+        diagnostic_memory,
+        config_visibility::safe},
     };
     return render_config(values);
 }

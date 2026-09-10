@@ -82,6 +82,11 @@ void task_scope::request_abort_unchecked() noexcept {
     }
 }
 
+void task_scope::close_admission() noexcept {
+    assert_current();
+    admission_closed_ = true;
+}
+
 void task_scope::request_abort() {
     assert_current();
     request_abort_unchecked();
@@ -102,6 +107,7 @@ seastar::future<> task_scope::close() {
     assert_current();
     if (!closing_) {
         closing_ = true;
+        close_admission();
         auto completion = close_once().then_wrapped(
           [this](seastar::future<> closed) noexcept {
               try {
@@ -123,7 +129,7 @@ bool task_scope::abort_requested() const {
 
 bool task_scope::admission_closed() const {
     assert_current();
-    return gate_.is_closed();
+    return admission_closed_;
 }
 
 std::size_t task_scope::task_count() const {

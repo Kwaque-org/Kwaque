@@ -7,7 +7,6 @@
 #include <seastar/util/log-level.hh>
 
 #include <array>
-#include <new>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -75,10 +74,6 @@ seastar::future<loaded_configuration_result> load_configuration_file(
           path, [&abort_source](seastar::input_stream<char>& input) {
               return read_configuration_bytes(input, abort_source);
           });
-    } catch (const std::bad_alloc&) {
-        throw;
-    } catch (const seastar::abort_requested_exception&) {
-        throw;
     } catch (const std::system_error&) {
         co_return std::unexpected(
           config::config_error{

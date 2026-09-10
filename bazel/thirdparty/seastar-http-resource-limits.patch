@@ -1,0 +1,961 @@
+diff --git a/include/seastar/core/metrics_api.hh b/include/seastar/core/metrics_api.hh
+--- a/include/seastar/core/metrics_api.hh
++++ b/include/seastar/core/metrics_api.hh
+@@ -24,9 +24,11 @@
+ #include <seastar/core/metrics.hh>
+ #include <seastar/core/shared_ptr.hh>
+ #include <seastar/core/sharded.hh>
++#include <seastar/core/semaphore.hh>
+ #include <boost/functional/hash.hpp>
+ 
+ #include <deque>
++#include <optional>
+ 
+ /*!
+  * \file metrics_api.hh
+@@ -446,7 +448,19 @@
+ using metric_metadata = std::vector<metric_family_metadata>;
+ using metric_values = std::deque<value_vector>;
+ 
++// Bounds include container capacity before cloning or sampling. Registered
++// callbacks are trusted: copying each function target must allocate at most
++// 256 bytes, and invocation must have separately bounded temporary allocation.
++struct snapshot_limits {
++    size_t families = 256;
++    size_t series = 1024;
++    size_t metadata_bytes = 1408 * 1024;
++    size_t value_bytes = 640 * 1024;
++    size_t histogram_buckets = 128;
++};
++
+ struct values_copy {
++    semaphore_units<> admission;
+     shared_ptr<metric_metadata> metadata;
+     metric_values values;
+ };
+@@ -461,6 +475,7 @@
+     value_map _value_map;
+     config _config;
+     bool _dirty = true;
++    bool _cached_functions_bounded = false;
+     shared_ptr<metric_metadata> _metadata;
+     std::set<sstring> _labels;
+     std::vector<std::deque<metric_function>> _current_metrics;
+@@ -492,11 +507,11 @@
+         _config = c;
+     }
+ 
+-    shared_ptr<metric_metadata> metadata();
++    shared_ptr<metric_metadata> metadata(bool release_cached_functions = false);
+ 
+     std::vector<std::deque<metric_function>>& functions();
+ 
+-    void update_metrics_if_needed();
++    void update_metrics_if_needed(bool release_cached_functions = false);
+ 
+     void dirty() {
+         _dirty = true;
+@@ -559,7 +574,7 @@
+ const value_map& get_value_map(int handle = default_handle());
+ using values_reference = shared_ptr<values_copy>;
+ 
+-foreign_ptr<values_reference> get_values(int handle = default_handle());
++foreign_ptr<values_reference> get_values(int handle = default_handle(), std::optional<snapshot_limits> limits = std::nullopt);
+ 
+ shared_ptr<impl> get_local_impl(int handle = default_handle());
+ 
+diff --git a/include/seastar/core/prometheus.hh b/include/seastar/core/prometheus.hh
+--- a/include/seastar/core/prometheus.hh
++++ b/include/seastar/core/prometheus.hh
+@@ -56,6 +56,11 @@
+     sstring prefix = "seastar"; //!< a prefix that will be added to metric names
+     bool allow_protobuf = false; // protobuf support is experimental and off by default
+     int handle = metrics::default_handle(); //!< Handle that specifies which metric implementation to query
++    std::optional<metrics::impl::snapshot_limits> snapshot_bounds;
++    size_t max_scrape_shards = 1024;
++    size_t max_format_bytes = 64 * 1024;
++    size_t max_response_bytes = 4 * 1024 * 1024;
++    size_t max_aggregate_bytes = 64 * 1024;
+     sstring route = "/metrics"; //!< Name of the route on which to expose the metrics
+ };
+ 
+diff --git a/include/seastar/http/httpd.hh b/include/seastar/http/httpd.hh
+--- a/include/seastar/http/httpd.hh
++++ b/include/seastar/http/httpd.hh
+@@ -40,6 +40,8 @@
+ #include <seastar/net/tls.hh>
+ #include <seastar/core/shared_ptr.hh>
+ #include <seastar/core/scheduling.hh>
++#include <seastar/core/semaphore.hh>
++#include <sys/socket.h>
+ 
+ namespace seastar {
+ 
+@@ -60,7 +62,19 @@
+     http_stats(http_server& server, const sstring& name);
+ };
+ 
++// Optional bounds for a bodyless, single-exchange administrative endpoint.
++// Timers are absolute lifetimes, not idle timers renewed by received bytes.
++struct request_limits {
++    size_t connections = 4;
++    size_t request_line_bytes = 2048;
++    size_t header_bytes = 8192;
++    size_t header_count = 32;
++    std::chrono::milliseconds header_timeout{5000};
++    std::chrono::milliseconds exchange_timeout{15000};
++};
++
+ class connection : public boost::intrusive::list_base_hook<> {
++    friend class http_server_tester;
+     http_server& _server;
+     connected_socket _fd;
+     std::optional<session_dn> _tls_dn;
+@@ -76,13 +90,15 @@
+     // null element marks eof
+     queue<std::unique_ptr<http::reply>> _replies { 10 };
+     bool _done = false;
++    timer<> _header_deadline{[this] { _done = true; shutdown(); }};
++    timer<> _exchange_deadline{[this] { _done = true; shutdown(); }};
+     const bool _tls;
+     int _listener_idx;
+ public:
+-    connection(http_server& server, connected_socket&& fd, bool tls, int listener_idx)
++    connection(http_server& server, connected_socket&& fd, bool tls, int listener_idx, connected_socket_input_stream_config input_config = {})
+             : _server(server)
+             , _fd(std::move(fd))
+-            , _read_buf(_fd.input())
++            , _read_buf(_fd.input(input_config))
+             , _write_buf(_fd.output())
+             , _client_addr(_fd.remote_address())
+             , _server_addr(_fd.local_address())
+@@ -91,10 +107,10 @@
+         on_new_connection();
+     }
+     connection(http_server& server, connected_socket&& fd,
+-            socket_address client_addr, socket_address server_addr, bool tls, int listener_idx)
++            socket_address client_addr, socket_address server_addr, bool tls, int listener_idx, connected_socket_input_stream_config input_config = {})
+             : _server(server)
+             , _fd(std::move(fd))
+-            , _read_buf(_fd.input())
++            , _read_buf(_fd.input(input_config))
+             , _write_buf(_fd.output())
+             , _client_addr(std::move(client_addr))
+             , _server_addr(std::move(server_addr))
+@@ -144,6 +160,8 @@
+     gate _task_gate;
+     std::optional<net::keepalive_params> _keepalive_params;
+     std::optional<scheduling_group> _request_scheduling_group;
++    std::optional<request_limits> _request_limits;
++    std::optional<semaphore> _connection_slots;
+ public:
+     routes _routes;
+     using connection = seastar::httpd::connection;
+@@ -151,6 +169,9 @@
+     explicit http_server(const sstring& name) : _stats(*this, name) {
+         _date_format_timer.arm_periodic(1s);
+     }
++
++    // Configure before listen(). Units are held through connection destruction.
++    void set_request_limits(request_limits limits);
+ 
+     void set_keepalive_parameters(std::optional<net::keepalive_params> params) {
+         _keepalive_params = std::move(params);
+@@ -209,7 +230,7 @@
+     static sstring http_date();
+ private:
+     future<> do_accept_one(int which, bool with_tls);
+-    future<> do_process_connection(connected_socket conn_fd, socket_address remote_address, bool tls, int listener_idx);
++    future<> do_process_connection(connected_socket conn_fd, socket_address remote_address, bool tls, int listener_idx, semaphore_units<> units);
+     boost::intrusive::list<connection> _connections;
+     friend class seastar::httpd::connection;
+     friend class http_server_tester;
+@@ -217,6 +238,12 @@
+ 
+ class http_server_tester {
+ public:
++    static void set_connection_send_buffer(http_server& server, int bytes) {
++        for (auto& connection : server._connections) {
++            connection._fd.set_sockopt(SOL_SOCKET, SO_SNDBUF, &bytes, sizeof(bytes));
++        }
++    }
++
+     static std::vector<server_socket>& listeners(http_server& server) {
+         return server._listeners;
+     }
+diff --git a/src/core/metrics.cc b/src/core/metrics.cc
+--- a/src/core/metrics.cc
++++ b/src/core/metrics.cc
+@@ -21,6 +21,8 @@
+ 
+ 
+ #include <memory>
++#include <limits>
++#include <stdexcept>
+ #include <regex>
+ #include <random>
+ #include <variant>
+@@ -503,17 +505,135 @@
+     return get_local_impl(handle)->get_value_map();
+ }
+ 
+-foreign_ptr<values_reference> get_values(int handle) {
++namespace {
++
++// The native deque uses approximately 4 KiB blocks for these small elements.
++// Include one spare block, pointer-map growth and allocator rounding. This is
++// intentionally a capacity charge, not sizeof(T) times the live element count.
++template<typename T>
++size_t snapshot_deque_bytes(size_t count) {
++    static_assert(sizeof(T) < 256);
++    constexpr size_t elements_per_block = 4096 / sizeof(T);
++    constexpr size_t block_and_map_bytes = 4096 + 128;
++    const auto blocks = count / elements_per_block + 1;
++    if (blocks > (std::numeric_limits<size_t>::max() - sizeof(std::deque<T>) - 128) / block_and_map_bytes) {
++        throw std::length_error("metrics container capacity limit exceeded");
++    }
++    return sizeof(std::deque<T>) + 128 + blocks * block_and_map_bytes;
++}
++
++size_t snapshot_string_bytes(size_t size) {
++    // Snapshot strings were length-checked below; include the terminator,
++    // allocation rounding and space during a possible replacement allocation.
++    return 2 * (size + 1) + 64;
++}
++
++} // namespace
++
++foreign_ptr<values_reference> get_values(int handle, std::optional<snapshot_limits> limits) {
++    static thread_local semaphore snapshot_slot{1};
++    semaphore_units<> admission;
++    auto impl = get_local_impl(handle);
++    size_t remaining_values = limits ? limits->value_bytes : 0;
++    const auto charge_value = [&](size_t bytes) {
++        if (limits) {
++            if (bytes > remaining_values) {
++                throw std::length_error("metrics snapshot value limit exceeded");
++            }
++            remaining_values -= bytes;
++        }
++    };
++    if (limits) {
++        auto units = try_get_units(snapshot_slot, 1);
++        if (!units) {
++            throw std::runtime_error("metrics snapshot capacity exhausted");
++        }
++        admission = std::move(*units);
++        const auto& registry = impl->get_value_map();
++        size_t remaining_series = limits->series;
++        size_t remaining_metadata = limits->metadata_bytes;
++        const auto charge = [&remaining_metadata](size_t bytes) {
++            if (bytes > remaining_metadata) {
++                throw std::length_error("metrics metadata limit exceeded");
++            }
++            remaining_metadata -= bytes;
++        };
++        if (registry.size() > limits->families) {
++            throw std::length_error("metrics family limit exceeded");
++        }
++        // Include the shared snapshot/admission object, outer value deque,
++        // both metadata/cache vectors and their allocator rounding. Bounded
++        // dirty-cache rebuilds release previous capacities before replacement.
++        charge_value(512);
++        charge_value(snapshot_deque_bytes<value_vector>(registry.size()));
++        charge(512);
++        charge(2 * registry.size() * (sizeof(metric_family_metadata) + sizeof(std::deque<metric_function>)));
++        for (const auto& [name, family] : registry) {
++            if (name.size() > 4096 || family.info().d.str().size() > 4096
++                    || family.info().inherit_type.size() > 4096) {
++                throw std::length_error("metrics family string limit exceeded");
++            }
++            charge(snapshot_deque_bytes<metric_series_metadata>(family.size()));
++            charge(snapshot_deque_bytes<metric_function>(family.size()));
++            charge(snapshot_string_bytes(family.info().inherit_type.size()));
++            charge(snapshot_string_bytes(name.size()));
++            charge(snapshot_string_bytes(family.info().d.str().size()));
++            charge_value(snapshot_deque_bytes<metric_value>(family.size()));
++            if (family.info().aggregate_labels.size() > 16) {
++                throw std::length_error("metrics aggregate label limit exceeded");
++            }
++            for (const auto& label : family.info().aggregate_labels) {
++                if (label.size() > 128) {
++                    throw std::length_error("metrics aggregate label length exceeded");
++                }
++                charge(snapshot_string_bytes(label.size()) + 64);
++            }
++            for (const auto& [labels, metric] : family) {
++                if (!remaining_series) {
++                    throw std::length_error("metrics series limit exceeded");
++                }
++                --remaining_series;
++                // metric_id duplicates both strings for each cached series;
++                // std::function may also clone a bounded, non-inline target.
++                charge(256);
++                const auto& id = metric->get_id();
++                if (id.group_name().size() > 4096 || id.name().size() > 4096) {
++                    throw std::length_error("metrics series name limit exceeded");
++                }
++                charge(snapshot_string_bytes(id.group_name().size()));
++                charge(snapshot_string_bytes(id.name().size()));
++                if (labels.labels().size() > 16) {
++                    throw std::length_error("metrics label count limit exceeded");
++                }
++                for (const auto& [key, value] : labels.labels()) {
++                    if (key.size() > 128 || value.value().size() > 2048) {
++                        throw std::length_error("metrics label length exceeded");
++                    }
++                    charge(128);
++                    charge(snapshot_string_bytes(key.size()));
++                    charge(snapshot_string_bytes(value.value().size()));
++                }
++            }
++        }
++    }
+     shared_ptr<values_copy> res_ref = ::seastar::make_shared<values_copy>();
+-    auto& res = *(res_ref.get());
++    auto& res = *res_ref;
++    res.admission = std::move(admission);
+     auto& mv = res.values;
+-    auto impl = get_local_impl(handle);
+-    res.metadata = impl->metadata();
+-    auto & functions = impl->functions();
+-    for (auto&& i : functions) {
++    res.metadata = impl->metadata(limits.has_value());
++    auto& functions = impl->functions();
++    for (auto&& family : functions) {
+         value_vector values;
+-        for (auto&& v : i) {
+-            values.emplace_back(v());
++        for (auto&& function : family) {
++            auto value = function();
++            if (limits && (value.type() == data_type::HISTOGRAM || value.type() == data_type::SUMMARY)) {
++                const auto& buckets = value.get_histogram().buckets;
++                if (buckets.capacity() > limits->histogram_buckets) {
++                    throw std::length_error("metrics histogram bucket limit exceeded");
++                }
++                charge_value(2 * buckets.capacity() * sizeof(histogram_bucket) + 64);
++            }
++            values.emplace_back(std::move(value));
+         }
+         mv.emplace_back(std::move(values));
+     }
+@@ -596,11 +716,22 @@
+                                   family_info.aggregate_labels);
+ }
+ 
+-void impl::update_metrics_if_needed() {
++void impl::update_metrics_if_needed(bool release_cached_functions) {
++    if (release_cached_functions && !_cached_functions_bounded) {
++        // A clean unbounded rebuild may retain an older, larger vector/deque
++        // capacity. Mark dirty before forcing the first bounded replacement,
++        // so an exception cannot expose a partially rebuilt clean cache.
++        _dirty = true;
++    }
+     if (_dirty) {
+         // Forcing the metadata to an empty initialization
+         // Will prevent using corrupted data if an exception is thrown
+         _metadata = ::seastar::make_shared<metric_metadata>();
++        if (release_cached_functions) {
++            // clear() retains deque blocks and vector capacity. An admitted
++            // snapshot must not inherit a previous larger cache's allocation.
++            decltype(_current_metrics){}.swap(_current_metrics);
++        }
+ 
+         auto mt_ref = ::seastar::make_shared<metric_metadata>();
+         auto &mt = *(mt_ref.get());
+@@ -626,14 +757,15 @@
+         // Maybe we didn't use all the original size
+         _current_metrics.resize(i);
+         _metadata = mt_ref;
++        _cached_functions_bounded = release_cached_functions;
+         _dirty = false;
+ 
+         gc_internalized_labels();
+     }
+ }
+ 
+-shared_ptr<metric_metadata> impl::metadata() {
+-    update_metrics_if_needed();
++shared_ptr<metric_metadata> impl::metadata(bool release_cached_functions) {
++    update_metrics_if_needed(release_cached_functions);
+     return _metadata;
+ }
+ 
+diff --git a/src/core/prometheus-impl.hh b/src/core/prometheus-impl.hh
+--- a/src/core/prometheus-impl.hh
++++ b/src/core/prometheus-impl.hh
+@@ -24,6 +24,8 @@
+ #include <seastar/core/metrics.hh>
+ #include <seastar/core/metrics_api.hh>
+ #include <string_view>
++#include <optional>
++#include <stdexcept>
+ 
+ #include <vector>
+ #include <string>
+@@ -54,11 +56,15 @@
+         construct(labels, aggr_labels);
+     }
+ 
+-    void construct(const metrics::impl::labels_type& labels, const label_list& aggr_labels) {
++    void construct(const metrics::impl::labels_type& labels, const label_list& aggr_labels,
++            std::optional<size_t> key_limit = std::nullopt) {
+         key.clear();
+         for (auto& [lkey, lvalue] : labels) {
+             std::string_view key_view = lkey;
+             if (!internal::is_aggregated(aggr_labels, key_view)) {
++                if (key_limit && lkey.size() + lvalue.value().size() + 2 > *key_limit - key.size()) {
++                    throw std::length_error("metrics aggregation key limit exceeded");
++                }
+                 key += key_view;
+                 key += '\n';
+                 key += lvalue.value();
+@@ -130,9 +136,41 @@
+      *
+      */
+     void add(const seastar::metrics::impl::metric_value& m, const labels_type& input_labels) noexcept {
+-        scratch_key.construct(input_labels, _labels_to_aggregate_by);
++        add_impl(m, input_labels, nullptr);
++    }
++
++    void add(const seastar::metrics::impl::metric_value& m, const labels_type& input_labels, size_t& remaining_bytes) {
++        add_impl(m, input_labels, &remaining_bytes);
++    }
++
++private:
++    void add_impl(const seastar::metrics::impl::metric_value& m, const labels_type& input_labels, size_t* remaining_bytes) {
++        // A bounded key uses at most 32 KiB of text; its reusable string can
++        // retain at most 64 KiB with the pinned string growth policy.
++        scratch_key.construct(input_labels, _labels_to_aggregate_by,
++                remaining_bytes ? std::optional<size_t>{32 * 1024} : std::nullopt);
++        const auto charge = [remaining_bytes](size_t bytes) {
++            if (remaining_bytes) {
++                if (bytes > *remaining_bytes) {
++                    throw std::length_error("metrics aggregation limit exceeded");
++                }
++                *remaining_bytes -= bytes;
++            }
++        };
+         auto i = _values.find(scratch_key);
+         if (i == _values.end()) {
++            if (remaining_bytes) {
++                size_t bytes = 512 + 4 * scratch_key.key.size();
++                for (const auto& [key, value] : input_labels) {
++                    if (!internal::is_aggregated(_labels_to_aggregate_by, key)) {
++                        bytes += 256;
++                    }
++                }
++                if (m.type() == metrics::impl::data_type::HISTOGRAM || m.type() == metrics::impl::data_type::SUMMARY) {
++                    bytes += m.get_histogram().buckets.size() * sizeof(metrics::histogram_bucket);
++                }
++                charge(bytes);
++            }
+             labels_type labels;
+             for (auto& l : input_labels) {
+                 if (!internal::is_aggregated(_labels_to_aggregate_by, l.first)) {
+@@ -141,9 +179,21 @@
+             }
+             _values.emplace(scratch_key, labels_value{std::move(labels), m});
+         } else {
++            if (remaining_bytes && (m.type() == metrics::impl::data_type::HISTOGRAM || m.type() == metrics::impl::data_type::SUMMARY)
++                    && m.get_histogram().sample_count != 0) {
++                auto& retained = std::get<metrics::histogram>(i->second.m.u).buckets;
++                const auto required = m.get_histogram().buckets.size();
++                if (required > retained.capacity()) {
++                    // Reserve explicitly so the native merge cannot grow
++                    // geometrically beyond the charged retained capacity.
++                    charge((required - retained.capacity()) * sizeof(metrics::histogram_bucket));
++                    retained.reserve(required);
++                }
++            }
+             i->second.m += m;
+         }
+     }
++public:
+     const auto& get_values() const noexcept {
+         return _values;
+     }
+diff --git a/src/core/prometheus.cc b/src/core/prometheus.cc
+--- a/src/core/prometheus.cc
++++ b/src/core/prometheus.cc
+@@ -43,6 +43,8 @@
+ #include <seastar/core/thread.hh>
+ #include <seastar/core/loop.hh>
+ #include <seastar/util/assert.hh>
++#include <limits>
++#include <stdexcept>
+ #include <ranges>
+ #include <regex>
+ #include <string_view>
+@@ -109,6 +111,7 @@
+ // Inspired by log_buf.
+ class fmt_buf {
+     char* _current;
++    size_t _limit;
+     std::vector<char> buffer;
+ private:
+ 
+@@ -118,7 +121,10 @@
+ 
+     auto& realloc_buffer_and_append(char c) {
+         auto current_size = size();  // Save size before resizing
+-        buffer.resize(buffer.size() * 2);
++        if (buffer.size() >= _limit) {
++            throw std::length_error("metrics formatting limit exceeded");
++        }
++        buffer.resize(std::min(buffer.size() * 2, _limit));
+         _current = buffer.data() + current_size;
+         *_current++ = c;
+         return *this;
+@@ -127,7 +133,10 @@
+ public:
+     static constexpr size_t initial_size = 1024;
+ 
+-    fmt_buf() {
++    explicit fmt_buf(size_t limit = std::numeric_limits<size_t>::max()) : _limit(limit) {
++        if (limit < initial_size) {
++            throw std::invalid_argument("metrics formatting limit is below initial buffer size");
++        }
+         buffer.resize(initial_size);
+         _current = buffer.data();
+     }
+@@ -151,7 +160,7 @@
+     const char* data() const noexcept { return buffer.data(); }
+     char* data() noexcept { return buffer.data(); }
+ 
+-    auto& append(char c) noexcept {
++    auto& append(char c) {
+         if (_current == buf_end()) [[unlikely]] {
+             return realloc_buffer_and_append(c);
+         }
+@@ -211,7 +220,7 @@
+ 
+         explicit inserter_iterator(fmt_buf& buf) noexcept : _buf(&buf) { }
+ 
+-        void operator=(char c) noexcept {
++        void operator=(char c) {
+             _buf->append(c);
+         }
+ 
+@@ -561,15 +570,26 @@
+     /** @} */
+ };
+ 
+-static future<> get_map_value(metrics_families_per_shard& vec, int handle) {
++static future<> get_map_value(metrics_families_per_shard& vec, const config& ctx) {
++    if (ctx.snapshot_bounds && this_smp_shard_count() > ctx.max_scrape_shards) {
++        throw std::length_error("metrics scrape shard limit exceeded");
++    }
+     vec.resize(this_smp_shard_count());
+-    co_await parallel_for_each(std::views::iota(0u, this_smp_shard_count()), [handle, &vec] (auto cpu) {
+-        return smp::submit_to(cpu, [handle] {
+-            return mi::get_values(handle);
+-        }).then([&vec, cpu] (auto res) {
++    // Bounded mode permits only one outstanding cross-shard dispatch. A busy
++    // source rejects without waiting while other source snapshots are held.
++    auto collect = [&ctx, &vec](unsigned cpu) {
++        return smp::submit_to(cpu, [handle = ctx.handle, limits = ctx.snapshot_bounds] {
++            return mi::get_values(handle, limits);
++        }).then([&vec, cpu](auto res) {
+             vec[cpu] = std::move(res);
+         });
+-    });
++    };
++    if (ctx.snapshot_bounds) {
++        auto shards = std::views::iota(0u, this_smp_shard_count());
++        co_await do_for_each(shards, collect);
++    } else {
++        co_await parallel_for_each(std::views::iota(0u, this_smp_shard_count()), collect);
++    }
+ }
+ 
+ /*!
+@@ -838,7 +858,7 @@
+     std::string_view name, value;
+ };
+ 
+-void write_histogram(buf_t& buf, const config& ctx, std::string_view name, const seastar::metrics::histogram& h, const labels_type& labels) noexcept {
++void write_histogram(buf_t& buf, const config& ctx, std::string_view name, const seastar::metrics::histogram& h, const labels_type& labels) {
+ 
+     auto write_one = [&] (auto v, std::string_view suffix) {
+         write_series(buf, name, labels, ctx, v, suffix);
+@@ -854,7 +874,7 @@
+     write_series(buf, name, labels, ctx, h.sample_count, "_bucket", extra_label{"le", "+Inf"} );
+ }
+ 
+-void write_summary(buf_t& buf, const config& ctx, std::string_view name, const seastar::metrics::histogram& h, const labels_type& labels) noexcept {
++void write_summary(buf_t& buf, const config& ctx, std::string_view name, const seastar::metrics::histogram& h, const labels_type& labels) {
+ 
+     auto write_one = [&] (auto v, std::string_view suffix) {
+         write_series(buf, name, labels, ctx, v, suffix);
+@@ -873,7 +893,7 @@
+     }
+ }
+ 
+-void write_value_as_string(buf_t& s, const mi::metric_value& value) noexcept {
++void write_value_as_string(buf_t& s, const mi::metric_value& value) {
+     try {
+         fmt::format_to(s.back_insert_begin(), FMT_COMPILE("{}\n"), value);
+     } catch (const std::range_error& e) {
+@@ -916,6 +936,14 @@
+     const config& ctx;
+     const metric_family_range m;
+     const write_body_args args;
++    size_t response_bytes = 0;
++
++    void charge_output(size_t bytes) {
++        if (ctx.snapshot_bounds && bytes > ctx.max_response_bytes - response_bytes) {
++            throw std::length_error("metrics response limit exceeded");
++        }
++        response_bytes += bytes;
++    }
+ 
+     future<> write_text_representation();
+     future<> write_protobuf_representation();
+@@ -923,8 +951,11 @@
+ 
+ future<> write_context::write_text_representation() {
+     return seastar::async([this] {
+-        buf_t s;
++        buf_t s(ctx.snapshot_bounds ? ctx.max_format_bytes : std::numeric_limits<size_t>::max());
+         for (metric_family& metric_family : m) {
++            if (ctx.snapshot_bounds) {
++                thread::maybe_yield();
++            }
+             if (!args.family_filter(metric_family.name())) {
+                 continue;
+             }
+@@ -932,8 +963,12 @@
+             bool found = false;
+             metric_aggregate_by_labels aggregated_values(metric_family.metadata().aggregate_labels);
+             bool should_aggregate = args.enable_aggregation && !metric_family.metadata().aggregate_labels.empty();
+-            metric_family.foreach_metric([this, &s, &found, &name, &metric_family, &aggregated_values, should_aggregate](const mi::metric_value& value, const mi::metric_series_metadata& value_info) mutable {
++            size_t remaining_aggregate_bytes = ctx.max_aggregate_bytes;
++            metric_family.foreach_metric([this, &s, &found, &name, &metric_family, &aggregated_values, &remaining_aggregate_bytes, should_aggregate](const mi::metric_value& value, const mi::metric_series_metadata& value_info) mutable {
+                 s.clear();
++                if (ctx.snapshot_bounds) {
++                    thread::maybe_yield();
++                }
+                 if ((value_info.should_skip_when_empty() && value.is_empty()) || !args.filter(value_info.labels())) {
+                     return;
+                 }
+@@ -945,7 +980,11 @@
+                     found = true;
+                 }
+                 if (should_aggregate) {
+-                    aggregated_values.add(value, value_info.labels());
++                    if (ctx.snapshot_bounds) {
++                        aggregated_values.add(value, value_info.labels(), remaining_aggregate_bytes);
++                    } else {
++                        aggregated_values.add(value, value_info.labels());
++                    }
+                 } else if (value.type() == mi::data_type::SUMMARY) {
+                     write_summary(s, ctx, name, value.get_histogram(), value_info.labels());
+                 } else if (value.type() == mi::data_type::HISTOGRAM) {
+@@ -954,6 +993,7 @@
+                     write_name_and_labels(s, name, "", value_info.labels(), ctx);
+                     write_value_as_string(s, value);
+                 }
++                charge_output(s.size());
+                 out.write(s.data(), s.size()).get();
+                 thread::maybe_yield();
+             });
+@@ -969,6 +1009,7 @@
+                         write_name_and_labels(s, name, "", labels, ctx);
+                         write_value_as_string(s, value);
+                     }
++                    charge_output(s.size());
+                     out.write(s.data(), s.size()).get();
+                     thread::maybe_yield();
+                 }
+@@ -1084,6 +1125,14 @@
+ 
+     future<std::unique_ptr<http::reply>> handle(const sstring& path,
+         std::unique_ptr<http::request> req, std::unique_ptr<http::reply> rep) override {
++        if (_ctx.snapshot_bounds) {
++            for (const auto& [key, values] : req->get_query_params()) {
++                if (key != "__name__" && key != "__help__" && key != "__aggregate__") {
++                    rep->set_status(http::reply::status_type::bad_request, "Metric label filters are not supported");
++                    return make_ready_future<std::unique_ptr<http::reply>>(std::move(rep));
++                }
++            }
++        }
+         // Build name filters from all __name__ query parameters
+         std::vector<details::name_filter> name_filters;
+         for (auto name : req->get_query_param_array("__name__")) {
+@@ -1093,9 +1142,9 @@
+             }
+         }
+         write_body_args args{
+-            .filter = make_filter(*req),
++            .filter = _ctx.snapshot_bounds ? _true_function : make_filter(*req),
+             .family_filter = details::make_family_filter(std::move(name_filters), _ctx.prefix),
+-            .use_protobuf_format = _ctx.allow_protobuf && is_accept_protobuf(req->get_header("Accept")),
++            .use_protobuf_format = !_ctx.snapshot_bounds && _ctx.allow_protobuf && is_accept_protobuf(req->get_header("Accept")),
+             .show_help = req->get_query_param("__help__") != "false",
+             .enable_aggregation = req->get_query_param("__aggregate__") != "false"
+         };
+@@ -1110,18 +1159,41 @@
+     future<> write_body(write_body_args args, output_stream<char>&& out_stream) {
+         auto s = std::move(out_stream);
+         metrics_families_per_shard families;
+-        co_await get_map_value(families, _ctx.handle);
+-        bool use_protobuf = args.use_protobuf_format;
+-
+-        write_context context{
+-            .out = s,
+-            .ctx = _ctx,
+-            .m = metric_family_range(families),
+-            .args = std::move(args)
+-        };
+-
+-        co_return co_await (use_protobuf ? context.write_protobuf_representation() : context.write_text_representation())
+-                .finally([&s] { return s.close(); });
++        std::exception_ptr failure;
++        try {
++            co_await get_map_value(families, _ctx);
++            bool use_protobuf = args.use_protobuf_format;
++            write_context context{
++                .out = s,
++                .ctx = _ctx,
++                .m = metric_family_range(families),
++                .args = std::move(args)
++            };
++            co_await (use_protobuf ? context.write_protobuf_representation() : context.write_text_representation());
++        } catch (...) {
++            failure = std::current_exception();
++        }
++        try {
++            co_await s.close();
++        } catch (...) {
++            if (!failure) {
++                failure = std::current_exception();
++            }
++        }
++        // Await source-shard destruction, including partial collection failure,
++        // before returning the HTTP task's lifetime ownership to its caller.
++        for (auto& family : families) {
++            try {
++                co_await family.destroy();
++            } catch (...) {
++                if (!failure) {
++                    failure = std::current_exception();
++                }
++            }
++        }
++        if (failure) {
++            std::rethrow_exception(failure);
++        }
+     }
+ 
+     friend details::test_access;
+diff --git a/src/http/httpd.cc b/src/http/httpd.cc
+--- a/src/http/httpd.cc
++++ b/src/http/httpd.cc
+@@ -21,6 +21,7 @@
+ 
+ 
+ #include <memory>
++#include <stdexcept>
+ #include <algorithm>
+ #include <bitset>
+ #include <cctype>
+@@ -135,6 +136,11 @@
+ }
+ 
+ void connection::on_new_connection() {
++    if (_server._request_limits) {
++        const auto& limits = *_server._request_limits;
++        _parser.set_limits(limits.request_line_bytes, limits.header_bytes, limits.header_count);
++        _exchange_deadline.arm(limits.exchange_timeout);
++    }
+     ++_server._total_connections;
+     ++_server._current_connections;
+     _fd.set_nodelay(true);
+@@ -205,7 +211,12 @@
+ 
+ future<> connection::read_one() {
+     _parser.init();
+-    return _read_buf.consume(_parser).then([this] () mutable {
++    if (_server._request_limits) {
++        _header_deadline.arm(_server._request_limits->header_timeout);
++    }
++    return _read_buf.consume(_parser).finally([this] {
++        _header_deadline.cancel();
++    }).then([this] () mutable {
+         if (_parser.eof()) {
+             _done = true;
+             return make_ready_future<>();
+@@ -229,6 +240,18 @@
+             }
+             generate_error_reply_and_close(std::move(req), http::reply::status_type::bad_request, "Can't parse the request");
+             return make_ready_future<>();
++        }
++
++        if (_server._request_limits) {
++            const auto length = req->_headers.find("Content-Length");
++            const bool has_body = req->_headers.contains("Transfer-Encoding")
++                    || (length != req->_headers.end() && (length->second.empty()
++                            || !std::all_of(length->second.begin(), length->second.end(), [](char c) { return c == '0'; })));
++            if (has_body) {
++                generate_error_reply_and_close(std::move(req), http::reply::status_type::payload_too_large,
++                        "Request bodies are not supported");
++                return make_ready_future<>();
++            }
+         }
+ 
+         size_t content_length_limit = _server.get_content_length_limit();
+@@ -366,7 +389,7 @@
+     auto resp = std::make_unique<http::reply>();
+     resp->set_version(req->_version);
+     set_headers(*resp);
+-    bool keep_alive = req->should_keep_alive();
++    bool keep_alive = !_server._request_limits && req->should_keep_alive();
+     set_header_connection(*resp, keep_alive);
+ 
+     sstring url = req->parse_query_param();
+@@ -422,6 +445,17 @@
+     } else {
+         _date_format_timer.cancel();
+     }
++}
++
++void http_server::set_request_limits(request_limits limits) {
++    if (!_listeners.empty() || _current_connections || !limits.connections
++            || !limits.request_line_bytes || !limits.header_bytes || !limits.header_count
++            || limits.request_line_bytes > limits.header_bytes
++            || limits.header_timeout <= 0ms || limits.exchange_timeout < limits.header_timeout) {
++        throw std::invalid_argument("invalid HTTP request limits or listener already started");
++    }
++    _request_limits = limits;
++    _connection_slots.emplace(limits.connections);
+ }
+ 
+ void http_server::set_request_scheduling_group(scheduling_group sg) {
+@@ -501,6 +535,16 @@
+ 
+ future<> http_server::do_accept_one(int which, bool tls) {
+     auto ar = co_await _listeners[which].accept();
++    semaphore_units<> units;
++    if (_connection_slots) {
++        auto admitted = try_get_units(*_connection_slots, 1);
++        if (!admitted) {
++            ar.connection.shutdown_input();
++            ar.connection.shutdown_output();
++            co_return;
++        }
++        units = std::move(*admitted);
++    }
+     if (_keepalive_params) {
+         ar.connection.set_keepalive(true);
+         ar.connection.set_keepalive_parameters(_keepalive_params.value());
+@@ -510,18 +554,24 @@
+     // lambda would be destroyed while its frame is still running.
+     (void)try_with_gate(_task_gate,
+             [this, conn_fd = std::move(ar.connection),
+-             remote_address = std::move(ar.remote_address), tls, which]() mutable {
+-        return do_process_connection(std::move(conn_fd), std::move(remote_address), tls, which);
++             remote_address = std::move(ar.remote_address), tls, which, units = std::move(units)]() mutable {
++        return do_process_connection(std::move(conn_fd), std::move(remote_address), tls, which, std::move(units));
+     }).handle_exception_type([] (const gate_closed_exception& e) {});
+ }
+ 
+ // Named member coroutine for per-connection processing, called from the
+ // non-coroutine lambda in try_with_gate inside do_accept_one(). Parameters
+ // are passed by value so they live safely in the coroutine frame.
+-future<> http_server::do_process_connection(connected_socket conn_fd, socket_address remote_address, bool tls, int listener_idx) {
++future<> http_server::do_process_connection(connected_socket conn_fd, socket_address remote_address, bool tls, int listener_idx, semaphore_units<> units) {
++    // Keep admission alive until the connection and all protocol work are gone.
++    static_cast<void>(units);
++    connected_socket_input_stream_config input_config;
++    if (_request_limits) {
++        input_config.max_buffer_size = input_config.buffer_size;
++    }
+     auto local_address = conn_fd.local_address();
+     auto conn = std::make_unique<connection>(*this, std::move(conn_fd),
+-            std::move(remote_address), std::move(local_address), tls, listener_idx);
++            std::move(remote_address), std::move(local_address), tls, listener_idx, input_config);
+     try {
+         co_await conn->prepare();
+     } catch (...) {
+diff --git a/src/http/request_parser.rl b/src/http/request_parser.rl
+--- a/src/http/request_parser.rl
++++ b/src/http/request_parser.rl
+@@ -23,6 +23,7 @@
+ 
+ #include <seastar/core/ragel.hh>
+ #include <memory>
++#include <limits>
+ #include <unordered_map>
+ #include <seastar/http/request.hh>
+ 
+@@ -136,14 +137,69 @@
+     sstring _field_name;
+     sstring _value;
+     state _state;
++    size_t _max_start_line = std::numeric_limits<size_t>::max();
++    size_t _max_headers = std::numeric_limits<size_t>::max();
++    size_t _max_header_count = std::numeric_limits<size_t>::max();
++    size_t _seen_bytes = 0;
++    size_t _line_bytes = 0;
++    size_t _header_count = 0;
++    bool _in_start_line = true;
++    bool _limits_done = false;
++    bool _previous_cr = false;
++
++    bool check_limits(const char* p, const char* pe) {
++        if (_max_headers == std::numeric_limits<size_t>::max()) {
++            return true;
++        }
++        // Scan only the header prefix, before Ragel can retain strings. The
++        // framing parser remains authoritative for syntax and socket ownership.
++        for (; p != pe && !_limits_done; ++p) {
++            if ((*p == '\n' && !_previous_cr) || (_previous_cr && *p != '\n')) {
++                return false;
++            }
++            _previous_cr = *p == '\r';
++            if (_seen_bytes == _max_headers || (_in_start_line && _line_bytes == _max_start_line)) {
++                return false;
++            }
++            ++_seen_bytes;
++            ++_line_bytes;
++            if (*p == '\n') {
++                if (_in_start_line) {
++                    _in_start_line = false;
++                } else if (_line_bytes == 2) {
++                    _limits_done = true;
++                } else {
++                    if (_header_count == _max_header_count) {
++                        return false;
++                    }
++                    ++_header_count;
++                }
++                _line_bytes = 0;
++            }
++        }
++        return true;
++    }
+ public:
++    void set_limits(size_t start_line, size_t headers, size_t count) {
++        _max_start_line = start_line;
++        _max_headers = headers;
++        _max_header_count = count;
++    }
+     void init() {
+         init_base();
++        _seen_bytes = _line_bytes = _header_count = 0;
++        _in_start_line = true;
++        _limits_done = false;
++        _previous_cr = false;
+         _req.reset(new http::request());
+         _state = state::eof;
+         %% write init;
+     }
+     char* parse(char* p, char* pe, char* eof) {
++        if (!check_limits(p, pe)) {
++            _state = state::error;
++            return pe;
++        }
+         sstring_builder::guard g(_builder, p, pe);
+         [[maybe_unused]] auto str = [this, &g, &p] { g.mark_end(p); return get_str(); };
+         bool done = false;

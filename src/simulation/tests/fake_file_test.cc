@@ -13,6 +13,7 @@
 #include <cstdint>
 #include <cstring>
 #include <limits>
+#include <new>
 #include <optional>
 #include <span>
 #include <string>
@@ -31,6 +32,26 @@ using kwaque::simulation::fake_object_id;
 
 static_assert(!noexcept(
   std::declval<const seastar::chunked_vector<std::uint64_t>&>().copy()));
+
+template<typename Function>
+void verify_allocation_failures(Function function) {
+    bool injected = false;
+    seastar::memory::with_allocation_failures([&] {
+        try {
+            function();
+        } catch (const std::bad_alloc&) {
+            injected = injected
+                       || seastar::memory::local_failure_injector().failed();
+            throw;
+        }
+    });
+#if defined(SEASTAR_ENABLE_ALLOC_FAILURE_INJECTION)
+    BOOST_CHECK_MESSAGE(
+      injected, "transaction did not encounter injected allocation failure");
+#else
+    BOOST_CHECK(!injected);
+#endif
+}
 
 std::unique_ptr<fake_file_system> make_filesystem(
   std::string root = "/virtual/root",
@@ -562,7 +583,7 @@ SEASTAR_TEST_CASE(fake_file_state_changes_are_allocation_transactional) {
 
     bool created_directory = false;
     bool create_directory_pristine = true;
-    seastar::memory::with_allocation_failures([&] {
+    verify_allocation_failures([&] {
         create_directory_pristine = create_directory_pristine
                                     && filesystem->object_count() == 1U
                                     && !fake_file_test_access::lookup(
@@ -579,7 +600,7 @@ SEASTAR_TEST_CASE(fake_file_state_changes_are_allocation_transactional) {
 
     bool created_file = false;
     bool create_file_pristine = true;
-    seastar::memory::with_allocation_failures([&] {
+    verify_allocation_failures([&] {
         create_file_pristine = create_file_pristine
                                && filesystem->object_count() == 2U
                                && !fake_file_test_access::lookup(
@@ -591,10 +612,11 @@ SEASTAR_TEST_CASE(fake_file_state_changes_are_allocation_transactional) {
     BOOST_CHECK(create_file_pristine);
     BOOST_REQUIRE(created_file);
 
-    const std::string payload(4'097, 'p');
+    // Cross the initial page-index bucket capacity as well as a page boundary.
+    const std::string payload(16'385, 'p');
     bool wrote = false;
     bool write_pristine = true;
-    seastar::memory::with_allocation_failures([&] {
+    verify_allocation_failures([&] {
         write_pristine
           = write_pristine
             && *fake_file_test_access::visible_size(*filesystem, original) == 0U
@@ -609,7 +631,7 @@ SEASTAR_TEST_CASE(fake_file_state_changes_are_allocation_transactional) {
 
     bool flushed = false;
     bool flush_pristine = true;
-    seastar::memory::with_allocation_failures([&] {
+    verify_allocation_failures([&] {
         flush_pristine
           = flush_pristine
             && *fake_file_test_access::durable_size(*filesystem, original) == 0U
@@ -623,7 +645,7 @@ SEASTAR_TEST_CASE(fake_file_state_changes_are_allocation_transactional) {
 
     bool renamed_file = false;
     bool rename_pristine = true;
-    seastar::memory::with_allocation_failures([&] {
+    verify_allocation_failures([&] {
         rename_pristine
           = rename_pristine
             && fake_file_test_access::lookup(*filesystem, original).has_value()
@@ -656,7 +678,7 @@ SEASTAR_TEST_CASE(fake_truncate_allocation_failure_leaves_state_unchanged) {
 
     bool resized = false;
     bool pristine_until_success = true;
-    seastar::memory::with_allocation_failures([&] {
+    verify_allocation_failures([&] {
         pristine_until_success
           = pristine_until_success
             && *fake_file_test_access::visible_size(*filesystem, file)
@@ -679,6 +701,108 @@ SEASTAR_TEST_CASE(fake_truncate_allocation_failure_leaves_state_unchanged) {
     co_return;
 }
 
+SEASTAR_TEST_CASE(fake_file_page_map_growth_failures_preserve_existing_pages) {
+    constexpr std::size_t original_page_count = 3;
+    const std::string original_contents(
+      original_page_count * kwaque::simulation::fake_file_page_bytes, 'p');
+    const std::array addition{std::byte{'z'}};
+    std::size_t failures = 0;
+    bool completed = false;
+    for (std::uint64_t fail_after = 0; fail_after < 64; ++fail_after) {
+        // Rebuild before arming: failed attempts may retain map capacity and
+        // otherwise bypass growth on later allocation indices.
+        auto filesystem = make_filesystem("/disk", 65'536);
+        const auto root = path(*filesystem, ".");
+        const auto file = path(*filesystem, "file");
+        static_cast<void>(make_durable_file(*filesystem, root, file));
+        BOOST_REQUIRE(
+          fake_file_test_access::write(
+            *filesystem, file, 0, bytes(original_contents))
+            .has_value());
+        BOOST_REQUIRE_EQUAL(
+          *fake_file_test_access::visible_page_count(*filesystem, file),
+          original_page_count);
+        std::array<const void*, original_page_count> original_pages{};
+        for (std::size_t index = 0; index < original_pages.size(); ++index) {
+            const auto page = fake_file_test_access::visible_page(
+              *filesystem, file, index);
+            BOOST_REQUIRE(page.has_value());
+            original_pages[index] = *page;
+        }
+        const auto original_retained = filesystem->retained_capacity();
+
+        // The fourth page grows the page index beyond its initial buckets.
+        std::optional<kwaque::runtime::result<kwaque::byte_count>> written;
+        bool threw = false;
+        auto& injector = seastar::memory::local_failure_injector();
+        injector.fail_after(fail_after);
+        try {
+            written.emplace(
+              fake_file_test_access::write(
+                *filesystem, file, original_contents.size(), addition));
+        } catch (const std::bad_alloc&) {
+            threw = true;
+        } catch (...) {
+            injector.cancel();
+            throw;
+        }
+        const bool injected = injector.failed();
+        injector.cancel();
+
+        if (injected) {
+            ++failures;
+            BOOST_CHECK(threw);
+            BOOST_CHECK_EQUAL(
+              *fake_file_test_access::visible_size(*filesystem, file),
+              original_contents.size());
+            BOOST_CHECK_EQUAL(
+              *fake_file_test_access::durable_size(*filesystem, file), 0U);
+            BOOST_CHECK_EQUAL(
+              *fake_file_test_access::visible_page_count(*filesystem, file),
+              original_page_count);
+            BOOST_CHECK(filesystem->retained_capacity() == original_retained);
+            for (std::size_t index = 0; index < original_pages.size();
+                 ++index) {
+                BOOST_CHECK(
+                  *fake_file_test_access::visible_page(*filesystem, file, index)
+                  == original_pages[index]);
+            }
+            BOOST_CHECK(
+              *fake_file_test_access::visible_page(
+                *filesystem, file, original_page_count)
+              == nullptr);
+            BOOST_CHECK(
+              read(*filesystem, file, 0, original_contents.size() + 1U)
+              == original_contents);
+            written.emplace(
+              fake_file_test_access::write(
+                *filesystem, file, original_contents.size(), addition));
+        } else {
+            BOOST_CHECK(!threw);
+            completed = true;
+        }
+        BOOST_REQUIRE(written.has_value());
+        BOOST_REQUIRE(written->has_value());
+        BOOST_CHECK_EQUAL((*written)->value(), 1U);
+        BOOST_CHECK_EQUAL(
+          *fake_file_test_access::visible_page_count(*filesystem, file),
+          original_page_count + 1U);
+        BOOST_CHECK(
+          read(*filesystem, file, 0, original_contents.size() + 1U)
+          == original_contents + "z");
+        if (completed) {
+            break;
+        }
+    }
+    BOOST_CHECK(completed);
+#if defined(SEASTAR_ENABLE_ALLOC_FAILURE_INJECTION)
+    BOOST_CHECK_GT(failures, 0U);
+#else
+    BOOST_CHECK_EQUAL(failures, 0U);
+#endif
+    co_return;
+}
+
 SEASTAR_TEST_CASE(fake_open_allocates_handles_before_create_or_truncate) {
     auto filesystem = make_filesystem("/disk", 65'536);
     const auto root = path(*filesystem, ".");
@@ -689,7 +813,7 @@ SEASTAR_TEST_CASE(fake_open_allocates_handles_before_create_or_truncate) {
     std::optional<kwaque::runtime::file> created_handle;
     bool create_pristine_until_success = true;
     bool create_result_valid = true;
-    seastar::memory::with_allocation_failures([&] {
+    verify_allocation_failures([&] {
         create_pristine_until_success
           = create_pristine_until_success && filesystem->object_count() == 2U
             && fake_file_test_access::open_handles(*filesystem) == 0U
@@ -722,12 +846,17 @@ SEASTAR_TEST_CASE(fake_open_allocates_handles_before_create_or_truncate) {
     std::optional<kwaque::runtime::file> truncated_handle;
     bool truncate_pristine_until_success = true;
     bool truncate_result_valid = true;
-    seastar::memory::with_allocation_failures([&] {
+    std::vector<std::byte> observed_payload(payload.size());
+    const auto expected_payload = bytes(payload);
+    verify_allocation_failures([&] {
+        const auto read_result = fake_file_test_access::read(
+          *filesystem, file, 0, std::span{observed_payload});
         truncate_pristine_until_success
           = truncate_pristine_until_success
             && *fake_file_test_access::visible_size(*filesystem, file)
                  == payload.size()
-            && read(*filesystem, file, 0, payload.size()) == payload
+            && read_result.has_value() && read_result->value() == payload.size()
+            && std::ranges::equal(observed_payload, expected_payload)
             && fake_file_test_access::open_handles(*filesystem) == 0U;
         auto opened = fake_file_test_access::open_at_completion(
           *filesystem,

@@ -48,8 +48,6 @@ errc map_dns_system_error(const std::error_code& error) noexcept {
 operation_error dns_error_from_exception(std::exception_ptr exception) {
     try {
         std::rethrow_exception(std::move(exception));
-    } catch (const std::bad_alloc&) {
-        throw;
     } catch (const seastar::abort_requested_exception&) {
         return dns_error(errc::aborted);
     } catch (const std::system_error& error) {

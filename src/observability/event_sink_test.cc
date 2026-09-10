@@ -16,6 +16,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <iostream>
+#include <new>
 #include <sstream>
 #include <streambuf>
 #include <string>
@@ -181,10 +182,22 @@ SEASTAR_TEST_CASE(production_sink_uses_native_writer_and_level_gate) {
 SEASTAR_TEST_CASE(capture_sink_is_reserved_bounded_and_stoppable) {
     const auto sink_identity = identity();
     bool construction_completed = false;
+    bool injected = false;
     seastar::memory::with_allocation_failures([&] {
-        capture_event_sink constructed{sink_identity, limits(2)};
-        construction_completed = constructed.stop().has_value();
+        try {
+            capture_event_sink constructed{sink_identity, limits(2)};
+            construction_completed = constructed.stop().has_value();
+        } catch (const std::bad_alloc&) {
+            injected = injected
+                       || seastar::memory::local_failure_injector().failed();
+            throw;
+        }
     });
+#if defined(SEASTAR_ENABLE_ALLOC_FAILURE_INJECTION)
+    BOOST_CHECK(injected);
+#else
+    BOOST_CHECK(!injected);
+#endif
     BOOST_CHECK(construction_completed);
 
     capture_event_sink sink{sink_identity, limits(2)};

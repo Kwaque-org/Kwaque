@@ -15,7 +15,7 @@ import time
 import urllib.request
 from pathlib import Path
 
-REACTOR_ARGUMENTS = ("--smp=2", "--memory=128M", "--overprovisioned")
+REACTOR_ARGUMENTS = ("--smp=2", "--memory=384M", "--overprovisioned")
 STARTUP_ATTEMPTS = 5
 ADMIN_EXPOSURE_WARNING = "admin API is exposed without authentication or TLS"
 
@@ -356,6 +356,7 @@ def assert_startup_rejected(
     environment: dict[str, str],
     before_reactor: bool = False,
     after_configuration: bool = False,
+    after_memory_observation: bool = False,
 ) -> None:
     before = set(directory.rglob("*"))
     result = subprocess.run(
@@ -385,7 +386,16 @@ def assert_startup_rejected(
             )
     elif "configuration loaded" in result.stdout:
         raise AssertionError(f"rejected startup loaded configuration:\n{result.stdout}")
-    for forbidden in ("startup stage=", "runtime shards="):
+    if after_memory_observation and "runtime shards=" not in result.stdout:
+        raise AssertionError(
+            f"startup rejection did not observe memory:\n{result.stdout}"
+        )
+    forbidden_fields = (
+        ("startup stage=",)
+        if after_memory_observation
+        else ("startup stage=", "runtime shards=")
+    )
+    for forbidden in forbidden_fields:
         if forbidden in result.stdout:
             raise AssertionError(
                 f"rejected startup reached {forbidden!r}:\n{result.stdout}"
@@ -513,6 +523,8 @@ def verify_startup_policy(output: str, config: Path, profile: str) -> dict[str, 
     contents = config.read_bytes()
     expected = {
         "profile": profile,
+        "crash_loop_limit": "5",
+        "crash_loop_limiting": "true" if profile == "production" else "false",
         "configuration_checksum_algorithm": "sha256",
         "configuration_checksum": hashlib.sha256(contents).hexdigest(),
         "configuration_bytes": str(len(contents)),
@@ -549,6 +561,151 @@ def verify_startup_policy(output: str, config: Path, profile: str) -> dict[str, 
         output, ("startup policy ", "startup stage=data_directory state=ready")
     )
     return fields
+
+
+def verify_memory_and_mount_policies(
+    binary: Path,
+    directory: Path,
+    template: Path,
+    environment: dict[str, str],
+    allocator: str,
+) -> None:
+    contents = template.read_text(encoding="utf-8")
+    budget_pattern = r"(?m)^(\s*diagnostic_memory_per_shard_bytes:)\s*\d+\s*$"
+    diagnostic_bytes = 96 * 1024 * 1024
+    selected, count = re.subn(budget_pattern, rf"\g<1> {diagnostic_bytes}", contents)
+    if count != 1:
+        raise AssertionError("development template must contain one diagnostic budget")
+    diagnostic_template = directory / "explicit-diagnostic-template.yaml"
+    diagnostic_template.write_text(selected, encoding="utf-8")
+    if allocator == "system":
+        missing_template = directory / "missing-diagnostic-template.yaml"
+        missing_template.write_text(
+            re.sub(budget_pattern, "", contents), encoding="utf-8"
+        )
+        missing_config = directory / "missing-diagnostic.yaml"
+        write_test_config(
+            missing_template,
+            missing_config,
+            directory / "missing-diagnostic-data",
+            reserve_loopback_port(),
+        )
+        assert_startup_rejected(
+            binary,
+            directory,
+            "--config",
+            str(missing_config),
+            expected=(
+                "system-allocator diagnostic broker requires diagnostic_memory_per_shard_bytes",
+            ),
+            environment=environment,
+            after_configuration=True,
+        )
+
+    broker, configuration, port, output = start_broker(
+        binary,
+        directory,
+        "explicit-diagnostic",
+        diagnostic_template,
+        directory / "explicit-diagnostic-data",
+        environment=environment,
+    )
+    try:
+        policy = verify_startup_policy(output, configuration, "development")
+        expected_budget = (
+            diagnostic_bytes if allocator == "system" else 192 * 1024 * 1024
+        )
+        if int(policy["class_budget_input_bytes"]) != expected_budget:
+            raise AssertionError(
+                f"diagnostic and native memory sources were confused:\n{output}"
+            )
+        expected_source = (
+            "explicit_diagnostic_budget" if allocator == "system" else "allocator_stats"
+        )
+        if policy["class_budget_source"] != expected_source:
+            raise AssertionError(f"incorrect workload budget source:\n{output}")
+        for name, expected in (
+            ("admin_memory_reservation_bytes", 4 * 1024 * 1024),
+            ("reactor_headroom_bytes", 16 * 1024 * 1024),
+            ("production_suitability_floor_bytes", 132 * 1024 * 1024),
+        ):
+            if int(policy[name]) != expected:
+                raise AssertionError(f"startup reservation {name} changed:\n{output}")
+        status, content_type, exposition = get(f"http://127.0.0.1:{port}/metrics")
+        samples = metric_samples(
+            exposition, "kwaque_resource_manager_memory_configured_bytes"
+        )
+        expected_total = 2 * (expected_budget - 20 * 1024 * 1024)
+        actual_total = sum(float(sample.rsplit(maxsplit=1)[1]) for sample in samples)
+        if (status, content_type, len(samples), actual_total) != (
+            200,
+            "text/plain",
+            WORKLOAD_COUNT,
+            expected_total,
+        ):
+            raise AssertionError(
+                f"workload budgets do not conserve their explicit reservations:\n{exposition}"
+            )
+        broker.stop()
+    finally:
+        broker.kill_if_running()
+
+    strict, count = re.subn(
+        r"(?m)^(\s*storage_strict_data_init:)\s*false\s*$", r"\1 true", contents
+    )
+    if count != 1:
+        raise AssertionError(
+            "development template must explicitly disable strict data initialization"
+        )
+    strict_template = directory / "strict-mount-template.yaml"
+    strict_template.write_text(strict, encoding="utf-8")
+    missing_config = directory / "missing-mount-marker.yaml"
+    missing_data = directory / "missing-mount-data"
+    write_test_config(
+        strict_template, missing_config, missing_data, reserve_loopback_port()
+    )
+    assert_startup_rejected(
+        binary,
+        directory,
+        "--config",
+        str(missing_config),
+        expected=("data directory mount marker is missing",),
+        environment=environment,
+        after_configuration=True,
+        after_memory_observation=True,
+    )
+    if missing_data.exists():
+        raise AssertionError(
+            "strict initialization created the directory being validated"
+        )
+
+    marked_data = directory / "marked-mount-data"
+    marked_data.mkdir()
+    marker = marked_data / ".kwaque_data_dir"
+    marker_contents = b"fixture mount intent\n"
+    marker.write_bytes(marker_contents)
+    broker, configuration, _, output = start_broker(
+        binary,
+        directory,
+        "marked-mount",
+        strict_template,
+        marked_data,
+        environment=environment,
+    )
+    try:
+        policy = verify_startup_policy(output, configuration, "development")
+        if policy["storage_strict_data_init"] != "true":
+            raise AssertionError(f"strict initialization was not recorded:\n{output}")
+        broker.stop()
+        if (
+            marker.read_bytes() != marker_contents
+            or (marked_data / "kwaque.pid").exists()
+        ):
+            raise AssertionError(
+                "broker shutdown changed the mount marker or retained its PID file"
+            )
+    finally:
+        broker.kill_if_running()
 
 
 def verify_explicit_io_sources(
@@ -750,6 +907,9 @@ def main() -> None:
         finally:
             default.kill_if_running()
 
+        verify_memory_and_mount_policies(
+            binary, logs, default_template, environment, policy["allocator"]
+        )
         alternate_profile = "production"
         if policy["allocator"] == "system":
             rejected = logs / "production-system-allocator.yaml"
@@ -778,7 +938,10 @@ def main() -> None:
                     "alternate template must explicitly select production"
                 )
             alternate_template = logs / "alternate-development-template.yaml"
-            alternate_template.write_text(contents, encoding="utf-8")
+            alternate_template.write_text(
+                contents + "\n  diagnostic_memory_per_shard_bytes: 134217728\n",
+                encoding="utf-8",
+            )
             alternate_profile = "development"
 
         alternate, alternate_config, alternate_port, output = start_broker(
@@ -811,6 +974,13 @@ def main() -> None:
                         f"alternate configuration missing {expected!r}:\n{output}"
                     )
 
+            crash_directory = logs / "alternate-data" / "crash_reports"
+            tracker = logs / "alternate-data" / ".kwaque-crash-loop"
+            before_reports = {
+                path.name: path.read_bytes() for path in crash_directory.iterdir()
+            }
+            before_tracker = tracker.read_bytes() if tracker.exists() else None
+
             contender = subprocess.run(
                 [
                     binary,
@@ -832,9 +1002,18 @@ def main() -> None:
                     f"second broker did not report PID lock ownership:\n{contender.stdout}"
                 )
 
+            after_reports = {
+                path.name: path.read_bytes() for path in crash_directory.iterdir()
+            }
+            after_tracker = tracker.read_bytes() if tracker.exists() else None
+            if before_reports != after_reports or before_tracker != after_tracker:
+                raise AssertionError("PID-lock contender changed crash bookkeeping")
+
             output = alternate.stop()
             if "shutdown complete" not in output:
                 raise AssertionError(f"alternate broker did not shut down:\n{output}")
+            if tracker.exists() or any(crash_directory.iterdir()):
+                raise AssertionError("clean shutdown retained crash bookkeeping")
         finally:
             alternate.kill_if_running()
 

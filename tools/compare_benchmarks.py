@@ -1,7 +1,7 @@
 """Compare prebuilt native benchmark cases with independent paired invocations.
 
-The caller supplies release-build evidence and reviews equal work. This tool
-does not build code or establish the binary's build mode. Each of three rounds
+The caller supplies release-build evidence and reviews equal work. The native
+pre-run hook reports its build capabilities and effective OOM policy. Each of three rounds
 runs each case in a fresh native process, with at least seven native samples.
 Hardware instruction/cycle counters are disabled; native allocator and reactor
 task counters remain active. This keeps the required measurements independent
@@ -29,11 +29,24 @@ MINIMUM_RUNS = 7
 REGRESSION_RATIO = 1.05
 CASE_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)+")
 MAXIMUM_RESULT_BYTES = 2 * 1024 * 1024
+MAXIMUM_PROFILE_LOG_BYTES = 2 * 1024 * 1024
+PROFILE_PREFIX = b"kwaque-benchmark-profile-v1 "
+PRODUCTION_PROFILE = {
+    "allocator": "native",
+    "injection": "false",
+    "optimized": "true",
+    "asan": "false",
+    "ubsan": "false",
+    "oom_abort": "true",
+}
 NATIVE_ARGUMENTS = (
     "--smp=1",
     "--memory=512MiB",
     "--overprovisioned",
     "--reactor-backend=epoll",
+    "--abort-on-seastar-bad-alloc",
+    "--unsafe-bypass-fsync=false",
+    "--kernel-page-cache=false",
     "--blocked-reactor-notify-ms=2000000",
     "--no-perf-counters",
     "--overhead-threshold=0.1",
@@ -42,6 +55,32 @@ NATIVE_ARGUMENTS = (
 
 class ComparisonError(ValueError):
     pass
+
+
+def read_runtime_profile(path: Path) -> dict[str, str]:
+    try:
+        with path.open("rb") as source:
+            data = source.read(MAXIMUM_PROFILE_LOG_BYTES + 1)
+    except OSError as error:
+        raise ComparisonError("cannot read benchmark profile log") from error
+    if len(data) > MAXIMUM_PROFILE_LOG_BYTES:
+        raise ComparisonError("benchmark profile log exceeds size limit")
+    lines = [line[len(PROFILE_PREFIX):] for line in data.splitlines()
+             if line.startswith(PROFILE_PREFIX)]
+    if len(lines) != 1:
+        raise ComparisonError("native benchmark must report exactly one runtime profile")
+    fields = {}
+    try:
+        for field in lines[0].decode("ascii").split():
+            key, value = field.split("=")
+            if key in fields:
+                raise ValueError("duplicate profile field")
+            fields[key] = value
+    except (UnicodeError, ValueError) as error:
+        raise ComparisonError("native benchmark reported a malformed runtime profile") from error
+    if fields != PRODUCTION_PROFILE:
+        raise ComparisonError("native benchmark does not match the production runtime profile")
+    return fields
 
 
 @dataclass(frozen=True)
@@ -347,6 +386,7 @@ def run_comparison(
             "hardware_perf_counters": False,
             "regression_ratio": REGRESSION_RATIO,
             "native_overhead_warning_ratio": 0.1,
+            "required_runtime_profile": dict(PRODUCTION_PROFILE),
         },
         "pairs": [asdict(pair) for pair in pairs],
         "order": [asdict(invocation) for invocation in order],
@@ -397,6 +437,7 @@ def run_comparison(
                         timeout=timeout,
                         check=False,
                         shell=False,
+                        env={**os.environ, "KWAQUE_REQUIRE_BENCHMARK_PROFILE": "production"},
                     )
             except subprocess.TimeoutExpired as error:
                 raise ComparisonError(
@@ -415,6 +456,7 @@ def run_comparison(
                 raise ComparisonError(
                     "benchmark binary changed during a native invocation"
                 )
+            record["runtime_profile"] = read_runtime_profile(output_dir / log_name)
             measured = read_measurement(output_dir / json_name, invocation.case, runs)
             measurements[(invocation.pair, invocation.round, invocation.role)] = (
                 measured

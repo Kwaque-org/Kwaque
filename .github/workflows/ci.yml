@@ -61,8 +61,41 @@ jobs:
           --build_tag_filters=-fuzz,-manual
           //...
 
+      - name: Verify optimized runtime and process policy
+        run: >-
+          bazel test --config=ci-release
+          //bazel/tests:seastar_gtest
+          //src/runtime/tests:reactor_smoke_test
+          //src/runtime/tests:runtime_metrics_test
+          //src/broker:failure_policy_test
+          //src/broker:crash_recorder_process_test
+
+  native-policy:
+    name: Native policy without allocation injection
+    needs: workflow-lint
+    if: needs.workflow-lint.outputs.run_checks != 'false'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - name: Check out source
+        uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # 6.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/setup-build
+        with:
+          cache-scope: ci-native
+          cache-write: 'true'
+      - name: Verify native runtime and process policy
+        run: >-
+          bazel test --config=ci-native
+          //bazel/tests:seastar_gtest
+          //src/runtime/tests:reactor_smoke_test
+          //src/runtime/tests:runtime_metrics_test
+          //src/broker:failure_policy_test
+          //src/broker:crash_recorder_process_test
+
   test:
-    name: Debug unit and smoke tests
+    name: Native allocation injection, unit and smoke tests
     needs: workflow-lint
     if: needs.workflow-lint.outputs.run_checks != 'false'
     runs-on: ubuntu-24.04
@@ -309,11 +342,25 @@ jobs:
       - name: Test deterministic runtime on aarch64 release
         run: >-
           bazel test --config=ci-release
+          //bazel/tests:seastar_gtest
+          //src/runtime/tests:reactor_smoke_test
+          //src/runtime/tests:runtime_metrics_test
           //src/broker:launcher_test
           //src/broker:startup_policy_test
           //src/broker:startup_configuration_test
           //src/broker:failure_policy_test
           //src/broker:config_cli_test
+          //src/broker:host_checks_test
+          //src/broker:broker_headroom_test
+          //src/broker:application_shutdown_test
+          //src/broker:shutdown_watchdog_test
+          //src/broker:crash_limiter_test
+          //src/broker:crash_recorder_writer_test
+          //src/broker:crash_recorder_test
+          //src/broker:crash_recorder_process_test
+          //src/resource/tests:resource_headroom_test
+          //src/admin:admin_resource_test
+          //src/admin:admin_memory_test
           //src/resource/tests:queue_worker_failure_test
           //src/observability:event_codec_invariant_test
           //src/runtime/tests:operation_error_test

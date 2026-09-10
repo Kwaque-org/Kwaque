@@ -139,6 +139,10 @@ void environment::request_abort_unchecked() noexcept {
     if (abort_requested_) {
         return;
     }
+    lifetime_.close_admission();
+    if (tasks_) {
+        tasks_->close_admission();
+    }
     abort_requested_ = true;
     if (tasks_) {
         tasks_->request_abort();

@@ -89,8 +89,6 @@ errc map_system_error(const std::error_code& error) noexcept {
 operation_error file_error_from_exception(std::exception_ptr exception) {
     try {
         std::rethrow_exception(std::move(exception));
-    } catch (const std::bad_alloc&) {
-        throw;
     } catch (const seastar::cancelled_error&) {
         return file_error(errc::aborted);
     } catch (const std::system_error& error) {
@@ -1031,7 +1029,7 @@ file::write_validated(file_position position, bytes::fragmented_buffer&& data) {
         return seastar::current_exception_as_future<result<byte_count>>();
     } catch (...) {
         return seastar::futurize_invoke(
-          [exception = std::current_exception()]() -> result<byte_count> {
+          [exception = std::current_exception()] -> result<byte_count> {
               return failure(file_error_from_exception(exception));
           });
     }
