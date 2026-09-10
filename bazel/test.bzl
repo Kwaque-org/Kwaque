@@ -77,7 +77,10 @@ def _reactor_args(cpu, memory, args, dash_dash):
         "--memory={}".format(memory),
         "--overprovisioned",
         "--smp={}".format(cpu),
-    ] + args
+    ] + select({
+        "//bazel:system_allocator": [],
+        "//conditions:default": ["--abort-on-seastar-bad-alloc"],
+    }) + args
     return (["--"] + result) if dash_dash else result
 
 def _resource_tags(cpu, memory):
@@ -132,7 +135,7 @@ def kwaque_cc_seastar_gtest(
         size = "small",
         timeout = None,
         tags = []):
-    """Defines a GoogleTest that executes on a configured Seastar reactor."""
+    """Defines a GoogleTest that executes in a configured Seastar thread."""
     cc_test(
         name = name,
         srcs = srcs,
@@ -210,10 +213,10 @@ def kwaque_cc_benchmark(
         benchmark_args = ["--blocked-reactor-notify-ms=2000000"] + benchmark_args
     cc_binary(
         name = name,
-        srcs = srcs,
+        srcs = srcs + ["//bazel:benchmark_policy.cc"],
         args = _reactor_args(cpu, memory, benchmark_args, False),
         copts = kwaque_copts(),
-        deps = deps + ["@seastar//:benchmark"],
+        deps = depset(deps + ["@seastar", "@seastar//:benchmark"]).to_list(),
         features = ["layering_check"],
         local_defines = local_defines,
         tags = _resource_tags(cpu, memory) + ["benchmark"] + tags,

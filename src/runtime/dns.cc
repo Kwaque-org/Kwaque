@@ -5,7 +5,6 @@
 #include <seastar/core/coroutine.hh>
 
 #include <algorithm>
-#include <new>
 #include <stdexcept>
 #include <string_view>
 #include <utility>
@@ -171,9 +170,6 @@ dns_admission::acquire(seastar::abort_source& abort_source) {
         --waiters_;
         active_ = true;
         co_return reservation{*this, std::move(units)};
-    } catch (const std::bad_alloc&) {
-        --waiters_;
-        throw;
     } catch (const seastar::abort_requested_exception&) {
         --waiters_;
         co_return failure(dns_error(errc::aborted));

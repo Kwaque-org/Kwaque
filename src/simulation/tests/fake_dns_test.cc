@@ -22,6 +22,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <iterator>
+#include <new>
 #include <optional>
 #include <string>
 #include <utility>
@@ -466,20 +467,32 @@ SEASTAR_TEST_CASE(fake_dns_record_allocation_failure_is_transactional) {
     const auto key = make_query("allocation.test");
     bool added = false;
     bool pristine_until_success = true;
+    bool injected = false;
     seastar::memory::with_allocation_failures([&] {
         pristine_until_success = pristine_until_success
                                  && resolver->record_count() == 0U
                                  && resolver->answer_count() == 0U
                                  && resolver->retained_name_bytes().value()
                                       == 0U;
-        added = resolver
-                  ->add_record(
-                    kwaque::simulation::fake_dns_record{
-                      .key = key,
-                      .answers = {answer(1, key.port, 1)},
-                    })
-                  .has_value();
+        try {
+            added = resolver
+                      ->add_record(
+                        kwaque::simulation::fake_dns_record{
+                          .key = key,
+                          .answers = {answer(1, key.port, 1)},
+                        })
+                      .has_value();
+        } catch (const std::bad_alloc&) {
+            injected = injected
+                       || seastar::memory::local_failure_injector().failed();
+            throw;
+        }
     });
+#if defined(SEASTAR_ENABLE_ALLOC_FAILURE_INJECTION)
+    BOOST_CHECK(injected);
+#else
+    BOOST_CHECK(!injected);
+#endif
     BOOST_CHECK(pristine_until_success);
     BOOST_REQUIRE(added);
     auto stopping = resolver->stop();

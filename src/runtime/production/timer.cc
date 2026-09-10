@@ -9,7 +9,6 @@
 
 #include <chrono>
 #include <limits>
-#include <new>
 #include <system_error>
 #include <utility>
 
@@ -124,8 +123,6 @@ seastar::future<result<void>> timer::sleep_until(
         co_await seastar::sleep_abortable<seastar::lowres_clock>(
           *duration, sleep_abort);
         co_return result<void>{};
-    } catch (const std::bad_alloc&) {
-        throw;
     } catch (const seastar::abort_requested_exception&) {
         co_return failure(timer_error(errc::aborted));
     } catch (const std::system_error& error) {

@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <expected>
 #include <filesystem>
+#include <optional>
 #include <span>
 #include <string>
 #include <string_view>
@@ -23,6 +24,9 @@ struct bootstrap_config final {
     std::uint16_t admin_port{9644};
     log_level level{log_level::info};
     bool developer_mode{false};
+    bool storage_strict_data_init{false};
+    std::optional<std::uint32_t> crash_loop_limit{5};
+    std::optional<std::uint64_t> diagnostic_memory_per_shard_bytes;
 
     bool operator==(const bootstrap_config&) const = default;
 };
@@ -41,6 +45,8 @@ enum class config_errc {
     invalid_admin_port,
     invalid_log_level,
     unsupported_schema_version,
+    invalid_memory_budget,
+    invalid_crash_loop_limit,
 };
 
 struct config_error final {

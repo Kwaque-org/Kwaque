@@ -11,6 +11,7 @@ namespace kwaque::broker {
 // the returned future.
 [[nodiscard]] seastar::future<> prepare_data_directory(
   const std::filesystem::path& path,
-  const seastar::abort_source* startup_abort = nullptr);
+  const seastar::abort_source* startup_abort = nullptr,
+  bool require_mount_marker = false);
 
 } // namespace kwaque::broker

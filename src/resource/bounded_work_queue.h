@@ -1,5 +1,6 @@
 #pragma once
 
+#include "src/base/allocation.h"
 #include "src/base/invariant.h"
 #include "src/base/result.h"
 #include "src/base/units.h"
@@ -10,20 +11,22 @@
 #include "src/runtime/task_scope.h"
 
 #include <seastar/core/abort_source.hh>
+#include <seastar/core/chunked_fifo.hh>
 #include <seastar/core/condition-variable.hh>
 #include <seastar/core/coroutine.hh>
 #include <seastar/core/future.hh>
 #include <seastar/core/semaphore.hh>
 #include <seastar/core/shared_future.hh>
 #include <seastar/core/with_scheduling_group.hh>
+#include <seastar/util/later.hh>
 #include <seastar/util/noncopyable_function.hh>
 #include <seastar/util/optimized_optional.hh>
 
 #include <algorithm>
+#include <bit>
 #include <concepts>
 #include <cstddef>
 #include <cstdint>
-#include <deque>
 #include <exception>
 #include <expected>
 #include <limits>
@@ -144,10 +147,18 @@ struct bounded_queue_worker_config final {
 // the producer already at the head of the admission order.
 // Manual consumer waiters have a separate bound; managed consumers are bounded
 // by their worker count. A zero manual bound permits only ready pops.
+// Inline items are limited to 8 KiB; larger payloads travel through bounded
+// buffer owners. Linked storage chunks keep allocations bounded independently
+// of queue capacity, and one empty chunk is retained for ready push/pop reuse.
 template<typename T>
 requires std::is_nothrow_move_constructible_v<T>
 class bounded_work_queue final : public runtime::shard_affine {
 public:
+    static constexpr std::size_t maximum_inline_item_bytes = 8U * 1'024U;
+    static_assert(
+      sizeof(T) <= maximum_inline_item_bytes,
+      "queue items larger than 8 KiB must use a bounded payload owner");
+
     using handler_type = seastar::noncopyable_function<seastar::future<>(T)>;
     using reporter_type
       = seastar::noncopyable_function<void(std::exception_ptr)>;
@@ -558,6 +569,20 @@ private:
         T item;
     };
 
+    // A native chunk holds the items, one link and two unsigned positions.
+    // Allow padding at both boundaries as well as the item's alignment.
+    static constexpr std::size_t storage_metadata_bytes
+      = sizeof(void*) + 2U * sizeof(unsigned) + 2U * alignof(admitted_item);
+    static constexpr std::size_t storage_items_per_chunk = std::bit_floor(
+      std::min<std::size_t>(
+        128U,
+        (maximum_contiguous_allocation_bytes - storage_metadata_bytes)
+          / sizeof(admitted_item)));
+    static_assert(storage_items_per_chunk != 0);
+    static_assert(
+      storage_items_per_chunk * sizeof(admitted_item) + storage_metadata_bytes
+      <= maximum_contiguous_allocation_bytes);
+
     void publish_admitted(
       T&& item, byte_count cost, seastar::semaphore_units<>&& acquired) {
         items_.push_back(
@@ -595,8 +620,7 @@ private:
           || abort_source.abort_requested()) {
             auto turn = seastar::try_get_units(consumer_turn_, 1);
             if (turn) {
-                if (
-                  state_ != bounded_work_queue_state::open && items_.empty()) {
+                if (consumers_closed()) {
                     return queue_result<admitted_item>{std::unexpected(
                       failure(queue_failure_kind::closed, byte_count{}))};
                 }
@@ -623,7 +647,7 @@ private:
         consumer_wait_token waiting{*this};
         auto turn = seastar::try_get_units(consumer_turn_, 1);
         if (!turn) {
-            if (state_ != bounded_work_queue_state::open && items_.empty()) {
+            if (consumers_closed()) {
                 co_return std::unexpected(
                   failure(queue_failure_kind::closed, byte_count{}));
             }
@@ -648,7 +672,7 @@ private:
             }
         }
         while (true) {
-            if (state_ != bounded_work_queue_state::open && items_.empty()) {
+            if (consumers_closed()) {
                 co_return std::unexpected(
                   failure(queue_failure_kind::closed, byte_count{}));
             }
@@ -985,7 +1009,7 @@ private:
 
     [[nodiscard]] std::optional<queue_failure> consumer_wait_rejection(
       const seastar::abort_source& abort_source) const noexcept {
-        if (state_ != bounded_work_queue_state::open && items_.empty()) {
+        if (consumers_closed()) {
             return failure(queue_failure_kind::closed, byte_count{});
         }
         if (abort_source.abort_requested()) {
@@ -996,6 +1020,11 @@ private:
               queue_failure_kind::consumer_waiters_exhausted, byte_count{});
         }
         return std::nullopt;
+    }
+
+    [[nodiscard]] bool consumers_closed() const noexcept {
+        return state_ == bounded_work_queue_state::aborting
+               || (state_ != bounded_work_queue_state::open && items_.empty());
     }
 
     [[nodiscard]] bool can_admit_locally(byte_count cost) const {
@@ -1116,20 +1145,36 @@ private:
         if (!producer_abort_.abort_requested()) {
             producer_abort_.request_abort();
         }
-        if (state_ == bounded_work_queue_state::aborting) {
-            while (!items_.empty()) {
-                auto& admitted = items_.front();
-                release_admitted(admitted.units);
-                items_.pop_front();
-            }
-        }
         producer_condition_.broadcast();
         consumer_condition_.broadcast();
+        close_condition_.signal();
         maybe_finish_close();
     }
 
     [[nodiscard]] seastar::future<> close_once() {
-        co_await drained_done_.get_shared_future();
+        while (state_ != bounded_work_queue_state::closed) {
+            if (can_discard_aborted_items()) {
+                // A move or destructor may reenter close(). Only this owner
+                // removes aborted items, after producer/consumer mutation has
+                // finished, and never holds a front reference over a yield.
+                static constexpr std::size_t batch_size = 64;
+                for (std::size_t count = 0;
+                     count < batch_size && !items_.empty();
+                     ++count) {
+                    release_admitted(items_.front().units);
+                    items_.pop_front();
+                }
+                maybe_finish_close();
+                if (!items_.empty()) {
+                    co_await seastar::yield();
+                }
+            } else {
+                co_await close_condition_.wait([this] {
+                    return state_ == bounded_work_queue_state::closed
+                           || can_discard_aborted_items();
+                });
+            }
+        }
         std::exception_ptr failure;
         if (tasks_) {
             try {
@@ -1145,7 +1190,15 @@ private:
         }
     }
 
+    [[nodiscard]] bool can_discard_aborted_items() const noexcept {
+        return state_ == bounded_work_queue_state::aborting && !items_.empty()
+               && active_producers_ == 0 && active_consumers_ == 0;
+    }
+
     void maybe_finish_close() noexcept {
+        if (can_discard_aborted_items()) {
+            close_condition_.signal();
+        }
         if (
           state_ != bounded_work_queue_state::open
           && state_ != bounded_work_queue_state::closed && items_.empty()
@@ -1153,9 +1206,7 @@ private:
           && waiting_consumers_ == 0 && active_producers_ == 0
           && active_consumers_ == 0 && bytes_held_.value() == 0) {
             state_ = bounded_work_queue_state::closed;
-            if (!drained_done_.available()) {
-                drained_done_.set_value();
-            }
+            close_condition_.signal();
         }
     }
 
@@ -1164,13 +1215,13 @@ private:
     resource_manager* manager_{nullptr};
     std::optional<workload_handle> workload_;
     seastar::semaphore* memory_admission_{nullptr};
-    std::deque<admitted_item> items_;
+    seastar::chunked_fifo<admitted_item, storage_items_per_chunk, 1> items_;
     seastar::semaphore producer_turn_{1};
     seastar::semaphore consumer_turn_{1};
     seastar::condition_variable producer_condition_;
     seastar::condition_variable consumer_condition_;
+    seastar::condition_variable close_condition_;
     seastar::abort_source producer_abort_;
-    seastar::shared_promise<> drained_done_;
     seastar::shared_promise<> close_done_;
     std::optional<bounded_queue_worker_config> worker_config_;
     handler_type handler_;

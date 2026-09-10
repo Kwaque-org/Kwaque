@@ -29,12 +29,36 @@ test:ci --local_test_jobs=1
 build:ci-debug --config=ci
 build:ci-debug --compilation_mode=dbg
 build:ci-debug --copt=-gline-tables-only
+build:ci-debug --@seastar//:system_allocator=False
+build:ci-debug --@seastar//:allocation_failure_injection=True
+test:ci-debug --test_env=KWAQUE_EXPECT_TEST_ALLOCATOR=native
+test:ci-debug --test_env=KWAQUE_EXPECT_TEST_INJECTION=true
+test:ci-debug --test_env=KWAQUE_EXPECT_TEST_OPTIMIZED=false
+test:ci-debug --test_env=KWAQUE_EXPECT_TEST_SANITIZED=false
+
+build:ci-native --config=ci
+build:ci-native --compilation_mode=dbg
+build:ci-native --copt=-gline-tables-only
+build:ci-native --@seastar//:system_allocator=False
+build:ci-native --@seastar//:allocation_failure_injection=False
+test:ci-native --test_env=KWAQUE_EXPECT_TEST_ALLOCATOR=native
+test:ci-native --test_env=KWAQUE_EXPECT_TEST_INJECTION=false
+test:ci-native --test_env=KWAQUE_EXPECT_TEST_OPTIMIZED=false
+test:ci-native --test_env=KWAQUE_EXPECT_TEST_SANITIZED=false
 
 build:ci-release --config=ci
 build:ci-release --config=release
+test:ci-release --test_env=KWAQUE_EXPECT_TEST_ALLOCATOR=native
+test:ci-release --test_env=KWAQUE_EXPECT_TEST_INJECTION=false
+test:ci-release --test_env=KWAQUE_EXPECT_TEST_OPTIMIZED=true
+test:ci-release --test_env=KWAQUE_EXPECT_TEST_SANITIZED=false
 
 build:ci-sanitizer --config=ci
 build:ci-sanitizer --config=debug
+test:ci-sanitizer --test_env=KWAQUE_EXPECT_TEST_ALLOCATOR=system
+test:ci-sanitizer --test_env=KWAQUE_EXPECT_TEST_INJECTION=false
+test:ci-sanitizer --test_env=KWAQUE_EXPECT_TEST_OPTIMIZED=true
+test:ci-sanitizer --test_env=KWAQUE_EXPECT_TEST_SANITIZED=true
 
 build:dev-base --config=san-asan-only
 build:dev-base --copt=-Og
@@ -85,6 +109,7 @@ build:release --compilation_mode=opt
 build:release --config=secure
 build:release --@seastar//:stack_guards=False
 build:release --@seastar//:debug=False
+build:release --@seastar//:system_allocator=False
 build:release --@seastar//:allocation_failure_injection=False
 build:release --copt=-g
 build:release --strip=never

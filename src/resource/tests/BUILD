@@ -37,6 +37,23 @@ kwaque_cc_test(
     deps = ["//src/resource:workload_class"],
 )
 
+kwaque_cc_seastar_test(
+    name = "resource_headroom_test",
+    timeout = "moderate",
+    srcs = ["resource_headroom_test.cc"],
+    cpu = 1,
+    memory = "192MiB",
+    deps = [
+        "//src/base",
+        "//src/resource:bounded_work_queue",
+        "//src/resource:resource_config",
+        "//src/resource:resource_manager",
+        "//src/resource:resource_registry",
+        "//src/resource:workload_class",
+        "//src/runtime:task_scope",
+    ],
+)
+
 kwaque_cc_test(
     name = "resource_config_test",
     srcs = ["resource_config_test.cc"],

@@ -17,6 +17,8 @@ from tests.smoke.broker_test_support import (
 
 TOTAL_MEMORY_BYTES = 128 * 1024 * 1024
 REACTOR_HEADROOM_BYTES = 16 * 1024 * 1024
+ADMIN_RESERVATION_BYTES = 4 * 1024 * 1024
+DIAGNOSTIC_MEMORY_BYTES = 128 * 1024 * 1024
 MINIMUM_SHARD_MEMORY_BYTES = 64 * 1024 * 1024
 CONFIGURED_MEMORY_METRIC = "kwaque_resource_manager_memory_configured_bytes"
 
@@ -71,21 +73,27 @@ class ResourceMemorySmokeTest(unittest.TestCase):
                         output = broker.output()
                         match = re.search(
                             r"runtime shards=(\d+) "
-                            r"minimum_shard_memory_bytes=(\d+)",
+                            r"minimum_shard_memory_bytes=(\d+|unavailable).*?"
+                            r"memory_budget_per_shard_bytes=(\d+)",
                             output,
                         )
                         self.assertIsNotNone(match, output)
                         observed_shards = int(match.group(1))
-                        observed_minimum = int(match.group(2))
+                        budget_per_shard = int(match.group(3))
                         expected_minimum = TOTAL_MEMORY_BYTES // shards
                         self.assertEqual(observed_shards, shards)
                         if "allocator_stats=synthetic" in output:
-                            self.assertNotEqual(observed_minimum, 0)
+                            self.assertEqual(match.group(2), "unavailable")
+                            self.assertEqual(budget_per_shard, DIAGNOSTIC_MEMORY_BYTES)
+                            self.assertIn(
+                                "class_budget_source=explicit_diagnostic_budget", output
+                            )
                         else:
                             self.assertIn("allocator_stats=native", output)
-                            self.assertEqual(observed_minimum, expected_minimum)
+                            self.assertEqual(int(match.group(2)), expected_minimum)
+                            self.assertEqual(budget_per_shard, expected_minimum)
                         self.assertGreaterEqual(
-                            observed_minimum, MINIMUM_SHARD_MEMORY_BYTES
+                            budget_per_shard, MINIMUM_SHARD_MEMORY_BYTES
                         )
 
                         status, content_type, metrics = http_get(port, "/metrics")
@@ -93,7 +101,12 @@ class ResourceMemorySmokeTest(unittest.TestCase):
                         self.assertEqual(content_type, "text/plain")
                         self.assertEqual(
                             configured_memory(metrics),
-                            shards * (observed_minimum - REACTOR_HEADROOM_BYTES),
+                            shards
+                            * (
+                                budget_per_shard
+                                - REACTOR_HEADROOM_BYTES
+                                - ADMIN_RESERVATION_BYTES
+                            ),
                         )
 
                         output = broker.stop(signal.SIGTERM)

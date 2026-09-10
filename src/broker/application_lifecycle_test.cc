@@ -22,6 +22,7 @@
 #include <limits>
 #include <stdexcept>
 #include <string>
+#include <system_error>
 #include <utility>
 #include <vector>
 
@@ -71,6 +72,8 @@ application_config(std::filesystem::path data_directory, std::uint16_t port) {
     auto result = kwaque::config::bootstrap_config{};
     result.data_directory = std::move(data_directory);
     result.admin_port = port;
+    result.developer_mode = true;
+    result.diagnostic_memory_per_shard_bytes = 134217728U;
     return result;
 }
 
@@ -90,12 +93,51 @@ SEASTAR_TEST_CASE(resource_configuration_uses_smallest_shard_allocator) {
           minimum, shard_memory);
     }
 
-    const auto configured = kwaque::broker::detail::production_resource_config(
-      minimum);
+    const auto configured = kwaque::broker::detail::broker_resource_config(
+      minimum, true);
     BOOST_CHECK_EQUAL(configured.total_memory().value(), 64U * mebibyte);
     BOOST_CHECK_EQUAL(
       configured.reactor_headroom().value(),
       kwaque::resource::resource_config::default_reactor_headroom().value());
+    co_return;
+}
+
+SEASTAR_TEST_CASE(
+  broker_memory_profile_keeps_suitability_and_reserves_separate) {
+    constexpr std::uint64_t mebibyte{1024U * 1024U};
+    constexpr std::uint64_t production_minimum{132U * mebibyte};
+    const auto production = kwaque::broker::detail::broker_resource_config(
+      kwaque::byte_count{production_minimum}, false);
+    BOOST_CHECK_EQUAL(
+      production.admin_memory_reservation().value(), 4U * mebibyte);
+    BOOST_CHECK_EQUAL(production.reactor_headroom().value(), 16U * mebibyte);
+    std::uint64_t shares = 0;
+    for (const auto budget : production.budgets()) {
+        shares += budget.value();
+    }
+    BOOST_CHECK_EQUAL(shares, 112U * mebibyte);
+    BOOST_CHECK_THROW(
+      static_cast<void>(kwaque::broker::detail::broker_resource_config(
+        kwaque::byte_count{production_minimum - 1U}, false)),
+      std::system_error);
+    BOOST_CHECK_THROW(
+      static_cast<void>(kwaque::broker::detail::broker_resource_config(
+        kwaque::byte_count{64U * mebibyte}, false)),
+      std::system_error);
+    const auto development = kwaque::broker::detail::broker_resource_config(
+      kwaque::byte_count{64U * mebibyte}, true);
+    BOOST_CHECK_EQUAL(development.total_memory().value(), 64U * mebibyte);
+    BOOST_CHECK_EQUAL(
+      development.admin_memory_reservation().value(), 4U * mebibyte);
+    std::uint64_t development_shares = 0;
+    for (const auto budget : development.budgets()) {
+        development_shares += budget.value();
+    }
+    BOOST_CHECK_EQUAL(development_shares, 44U * mebibyte);
+    BOOST_CHECK_THROW(
+      static_cast<void>(kwaque::broker::detail::broker_resource_config(
+        kwaque::byte_count{64U * mebibyte - 1U}, true)),
+      std::system_error);
     co_return;
 }
 

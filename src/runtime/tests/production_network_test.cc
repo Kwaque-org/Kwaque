@@ -314,18 +314,21 @@ SEASTAR_TEST_CASE(production_network_close_cleans_both_streams_before_rethrow) {
     const auto unexpected = std::make_exception_ptr(
       std::logic_error("unexpected stream close failure"));
     const auto allocation = std::make_exception_ptr(std::bad_alloc{});
-    const std::array cases{
-      std::pair{unexpected, operational},
-      std::pair{operational, unexpected},
-      std::pair{allocation, operational},
+    struct close_case final {
+        std::exception_ptr output_failure;
+        std::exception_ptr input_failure;
+        std::exception_ptr expected;
     };
-    for (const auto& [output_failure, input_failure] : cases) {
+    const std::array cases{
+      close_case{unexpected, operational, unexpected},
+      close_case{operational, unexpected, unexpected},
+      close_case{allocation, operational, allocation},
+    };
+    for (const auto& [output_failure, input_failure, expected] : cases) {
         transport_failure_probe probe;
         probe.output_close_failure = output_failure;
         probe.input_close_failure = input_failure;
         auto connection = make_failing_connection(probe);
-        const auto expected = output_failure == operational ? input_failure
-                                                            : output_failure;
         for (unsigned attempt = 0; attempt < 2; ++attempt) {
             std::exception_ptr observed;
             try {

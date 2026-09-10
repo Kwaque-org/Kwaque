@@ -29,9 +29,14 @@ void runtime_lifetime::activate() {
     state_ = runtime_lifetime_state::open;
 }
 
+void runtime_lifetime::close_admission() noexcept {
+    assert_current();
+    admission_closed_ = true;
+}
+
 std::optional<seastar::gate::holder> runtime_lifetime::acquire() {
     assert_current();
-    if (state_ != runtime_lifetime_state::open) {
+    if (state_ != runtime_lifetime_state::open || admission_closed_) {
         return std::nullopt;
     }
     lease_acquired_ = true;
@@ -40,6 +45,7 @@ std::optional<seastar::gate::holder> runtime_lifetime::acquire() {
 
 seastar::future<> runtime_lifetime::close() {
     assert_current();
+    close_admission();
     if (state_ == runtime_lifetime_state::closing) {
         return close_done_->get_shared_future();
     }

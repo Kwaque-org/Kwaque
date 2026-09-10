@@ -2,7 +2,6 @@
 
 #include <cstdint>
 #include <limits>
-#include <new>
 #include <random>
 #include <system_error>
 
@@ -20,8 +19,6 @@ result<random_source> random_source::make() {
             return failure(seed.error());
         }
         return random_source{*seed};
-    } catch (const std::bad_alloc&) {
-        throw;
     } catch (const std::system_error&) {
         return failure(
           operation_error{errc::unavailable, operation_kind::random});

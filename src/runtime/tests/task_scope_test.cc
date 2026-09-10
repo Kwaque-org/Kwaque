@@ -59,7 +59,11 @@ SEASTAR_TEST_CASE(task_scope_aborts_rejects_and_drains_owned_temporary_work) {
     BOOST_CHECK_EQUAL(scope.statistics().accepted, 1U);
     BOOST_CHECK_EQUAL(scope.statistics().completed, 0U);
 
+    bool closed_during_abort = false;
+    auto subscription = scope.abort_source().subscribe(
+      [&] noexcept { closed_during_abort = scope.admission_closed(); });
     auto closing = scope.close();
+    BOOST_CHECK(closed_during_abort);
     co_await seastar::yield();
     BOOST_CHECK(scope.abort_requested());
     BOOST_CHECK_EQUAL(scope.statistics().abort_requests, 1U);
@@ -79,6 +83,83 @@ SEASTAR_TEST_CASE(task_scope_aborts_rejects_and_drains_owned_temporary_work) {
     BOOST_CHECK_EQUAL(scope.statistics().completed, 1U);
     BOOST_CHECK_EQUAL(scope.statistics().failed, 0U);
     co_await scope.close();
+}
+
+SEASTAR_TEST_CASE(task_scope_closes_admission_before_separate_abort_and_drain) {
+    kwaque::runtime::task_scope scope;
+    seastar::promise<> release;
+    unsigned completions = 0;
+    BOOST_REQUIRE(
+      scope.spawn(delayed_task{release.get_future(), completions}).has_value());
+    unsigned abort_notifications = 0;
+    unsigned rejected_invocations = 0;
+    bool rejected_during_abort = false;
+    auto subscription = scope.abort_source().subscribe([&] noexcept {
+        ++abort_notifications;
+        const auto admitted = scope.spawn([&] {
+            ++rejected_invocations;
+            return seastar::make_ready_future<>();
+        });
+        rejected_during_abort = !admitted.has_value()
+                                && admitted.error().code()
+                                     == kwaque::errc::closed;
+    });
+
+    scope.close_admission();
+    scope.close_admission();
+    BOOST_CHECK(scope.admission_closed());
+    BOOST_CHECK(!scope.abort_requested());
+    BOOST_CHECK_EQUAL(scope.task_count(), 1U);
+    BOOST_CHECK_EQUAL(completions, 0U);
+    scope.request_abort();
+    scope.request_abort();
+    BOOST_CHECK_EQUAL(abort_notifications, 1U);
+    BOOST_CHECK(rejected_during_abort);
+    BOOST_CHECK_EQUAL(rejected_invocations, 0U);
+
+    auto closing = scope.close();
+    co_await seastar::yield();
+    BOOST_CHECK(!closing.available());
+    release.set_value();
+    co_await std::move(closing);
+    BOOST_CHECK_EQUAL(completions, 1U);
+    BOOST_CHECK_EQUAL(scope.statistics().accepted, 1U);
+    BOOST_CHECK_EQUAL(scope.statistics().completed, 1U);
+    BOOST_CHECK_EQUAL(scope.statistics().abort_requests, 1U);
+}
+
+SEASTAR_TEST_CASE(task_scope_abort_alone_preserves_task_admission) {
+    kwaque::runtime::task_scope scope;
+    bool admitted_during_abort = false;
+    bool closed_during_abort = true;
+    unsigned abort_work = 0;
+    auto subscription = scope.abort_source().subscribe([&] noexcept {
+        closed_during_abort = scope.admission_closed();
+        admitted_during_abort = scope
+                                  .spawn([&] {
+                                      ++abort_work;
+                                      return seastar::make_ready_future<>();
+                                  })
+                                  .has_value();
+    });
+    scope.request_abort();
+    BOOST_CHECK(!closed_during_abort);
+    BOOST_CHECK(admitted_during_abort);
+    BOOST_CHECK_EQUAL(abort_work, 1U);
+    BOOST_CHECK(!scope.admission_closed());
+
+    seastar::promise<> release;
+    unsigned completions = 0;
+    BOOST_REQUIRE(
+      scope.spawn(delayed_task{release.get_future(), completions}).has_value());
+    auto closing = scope.close();
+    co_await seastar::yield();
+    BOOST_CHECK(!closing.available());
+    release.set_value();
+    co_await std::move(closing);
+    BOOST_CHECK_EQUAL(completions, 1U);
+    BOOST_CHECK_EQUAL(scope.statistics().accepted, 2U);
+    BOOST_CHECK_EQUAL(scope.statistics().completed, 2U);
 }
 
 SEASTAR_TEST_CASE(

@@ -1,4 +1,5 @@
 exports_files([
+    "abseil-clang-23-lifetime-capture.patch",
     "c-ares.BUILD",
     "hwloc.BUILD",
     "liburing.patch",
@@ -7,7 +8,9 @@ exports_files([
     "openssl.BUILD",
     "seastar.BUILD",
     "seastar-chunked-vector-exception-safety.patch",
+    "seastar-http-resource-limits.patch",
     "seastar-metrics-registration-exception-safety.patch",
+    "seastar-spinlock-include.patch",
     "unordered-dense-exception-safety.patch",
     "unordered_dense.BUILD",
 ])

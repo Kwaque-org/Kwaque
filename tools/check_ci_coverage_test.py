@@ -209,6 +209,58 @@ def run_commands(job: str) -> list[str]:
     return commands
 
 
+PROFILE_EXPECTATIONS = {
+    "ci-debug": ("native", "true", "false", "false"),
+    "ci-native": ("native", "false", "false", "false"),
+    "ci-sanitizer": ("system", "false", "true", "true"),
+    "ci-release": ("native", "false", "true", "false"),
+}
+PROFILE_FIELDS = ("ALLOCATOR", "INJECTION", "OPTIMIZED", "SANITIZED")
+PROFILE_TARGETS = {
+    "//bazel/tests:seastar_gtest",
+    "//src/runtime/tests:reactor_smoke_test",
+    "//src/runtime/tests:runtime_metrics_test",
+    "//src/broker:failure_policy_test",
+    "//src/broker:crash_recorder_process_test",
+}
+
+
+def validation_profile_errors(workflow: str, config: str) -> list[str]:
+    errors = []
+    lines = set(config.splitlines())
+    for profile, expected in PROFILE_EXPECTATIONS.items():
+        for field, value in zip(PROFILE_FIELDS, expected):
+            required = f"test:{profile} --test_env=KWAQUE_EXPECT_TEST_{field}={value}"
+            if required not in lines:
+                errors.append(f"{profile}: missing independent {field} expectation")
+    jobs = job_blocks(workflow)
+    for name, profile in {
+        "test": "ci-debug",
+        "native-policy": "ci-native",
+        "sanitizer": "ci-sanitizer",
+        "build": "ci-release",
+        "arm-build": "ci-release",
+    }.items():
+        commands = run_commands(jobs.get(name, ""))
+        selected = [
+            command for command in commands
+            if command.startswith(f"bazel test --config={profile} ")
+        ]
+        if not any("//..." in command.split() for command in selected):
+            targets = {
+                word for command in selected for word in command.split()
+                if word.startswith("//")
+            }
+            if not PROFILE_TARGETS <= targets:
+                errors.append(
+                    f"{name}: execute runtime, metric and process policy fixtures"
+                )
+        configs = set(re.findall(r"--config=([a-z-]+)", " ".join(commands)))
+        if configs != {profile}:
+            errors.append(f"{name}: isolate validation profiles in separate jobs")
+    return errors
+
+
 def coverage_errors(workflow: str) -> list[str]:
     jobs = job_blocks(workflow)
     errors = []
@@ -297,6 +349,7 @@ class CiCoverageTest(unittest.TestCase):
             "build",
             "test",
             "sanitizer",
+            "native-policy",
             "goldens",
             "cpp-format",
             "clang-tidy",
@@ -338,6 +391,7 @@ class CiCoverageTest(unittest.TestCase):
             "build": "ci-release",
             "test": "ci-debug",
             "sanitizer": "ci-sanitizer",
+            "native-policy": "ci-native",
             "cpp-format": "tools",
             "repository-checks": "tools",
             "clang-tidy": "ci-debug",
@@ -351,6 +405,7 @@ class CiCoverageTest(unittest.TestCase):
                     "build",
                     "test",
                     "sanitizer",
+                    "native-policy",
                     "repository-checks",
                     "fuzz-smoke",
                     "arm-build",
@@ -468,6 +523,28 @@ class CiCoverageTest(unittest.TestCase):
                 config,
             )
         )
+
+    def test_validation_profiles_are_asserted_and_executed(self) -> None:
+        config = BAZEL_CONFIG.read_text()
+        self.assertEqual(validation_profile_errors(self.workflow, config), [])
+        for profile, expected in PROFILE_EXPECTATIONS.items():
+            for field, value in zip(PROFILE_FIELDS, expected):
+                with self.subTest(profile=profile, field=field):
+                    flag = f"test:{profile} --test_env=KWAQUE_EXPECT_TEST_{field}={value}"
+                    self.assertTrue(
+                        validation_profile_errors(self.workflow, config.replace(flag, ""))
+                    )
+        for job_name in ("build", "arm-build", "native-policy"):
+            job = job_blocks(self.workflow)[job_name]
+            for target in PROFILE_TARGETS:
+                with self.subTest(job=job_name, target=target):
+                    changed = self.workflow.replace(job, job.replace(target, ""))
+                    self.assertTrue(validation_profile_errors(changed, config))
+        native = job_blocks(self.workflow)["native-policy"]
+        changed = self.workflow.replace(
+            native, native.replace("bazel test", "bazel build")
+        )
+        self.assertTrue(validation_profile_errors(changed, config))
 
     def test_current_workflow_covers_all_required_jobs(self) -> None:
         self.assertEqual(coverage_errors(self.workflow), [])

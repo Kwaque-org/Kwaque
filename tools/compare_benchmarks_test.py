@@ -16,6 +16,10 @@ except ModuleNotFoundError:
 
 
 PAIR = driver.Pair("group.native", "group.kwaque")
+PROFILE_LINE = (
+    b"kwaque-benchmark-profile-v1 allocator=native injection=false optimized=true "
+    b"asan=false ubsan=false oom_abort=true\n"
+)
 
 
 def native_document(case: str, median: float = 10.0) -> dict:
@@ -55,10 +59,14 @@ class BenchmarkComparisonTest(unittest.TestCase):
         self.expected_cpu = 3
 
     def fake_native(
-        self, arguments, *, cwd, stdin, stdout, stderr, timeout, check, shell
+        self, arguments, *, cwd, stdin, stdout, stderr, timeout, check, shell, env
     ):
         self.assertTrue(Path(arguments[0]).is_absolute())
         self.assertIn("--no-perf-counters", arguments)
+        self.assertIn("--abort-on-seastar-bad-alloc", arguments)
+        self.assertIn("--unsafe-bypass-fsync=false", arguments)
+        self.assertIn("--kernel-page-cache=false", arguments)
+        self.assertEqual(env["KWAQUE_REQUIRE_BENCHMARK_PROFILE"], "production")
         self.assertEqual(Path(arguments[0]), self.binary)
         self.assertEqual(cwd, self.output)
         self.assertEqual(stderr, subprocess.STDOUT)
@@ -93,6 +101,7 @@ class BenchmarkComparisonTest(unittest.TestCase):
             json.dumps(native_document(case, median)), encoding="utf-8"
         )
         stdout.write(b"native stdout and warnings retained\n")
+        stdout.write(PROFILE_LINE)
         return subprocess.CompletedProcess(arguments, 0)
 
     def run_mocked(self, behavior=None, **kwargs):
@@ -103,6 +112,49 @@ class BenchmarkComparisonTest(unittest.TestCase):
                 self.binary, [PAIR], self.output, seed=41, **kwargs
             )
         return result, child
+
+    def test_runtime_profile_requires_native_optimized_oom_abort_without_instrumentation(self) -> None:
+        path = self.root / "profile.log"
+        path.write_bytes(b"startup diagnostics\n" + PROFILE_LINE)
+        self.assertEqual(driver.read_runtime_profile(path), driver.PRODUCTION_PROFILE)
+        rejected = [
+            b"startup diagnostics only\n",
+            PROFILE_LINE + PROFILE_LINE,
+            PROFILE_LINE.replace(b"allocator=native", b"allocator=system"),
+            PROFILE_LINE.replace(b"injection=false", b"injection=true"),
+            PROFILE_LINE.replace(b"optimized=true", b"optimized=false"),
+            PROFILE_LINE.replace(b"asan=false", b"asan=true"),
+            PROFILE_LINE.replace(b"ubsan=false", b"ubsan=true"),
+            PROFILE_LINE.replace(b"oom_abort=true", b"oom_abort=false"),
+            PROFILE_LINE.rstrip() + b" oom_abort=true\n",
+            PROFILE_LINE.replace(b"oom_abort=true", b"broken"),
+            PROFILE_LINE.replace(b"allocator=native", b"allocator=\xff"),
+        ]
+        for index, encoded in enumerate(rejected):
+            with self.subTest(case=index):
+                path.write_bytes(encoded)
+                with self.assertRaises(driver.ComparisonError):
+                    driver.read_runtime_profile(path)
+        path.write_bytes(PROFILE_LINE)
+        with mock.patch.object(driver, "MAXIMUM_PROFILE_LOG_BYTES", 16):
+            with self.assertRaisesRegex(driver.ComparisonError, "size limit"):
+                driver.read_runtime_profile(path)
+
+    def test_valid_measurements_with_wrong_runtime_profile_cannot_pass(self) -> None:
+        def wrong_profile(arguments, **kwargs):
+            completed = self.fake_native(arguments, **kwargs)
+            output = kwargs["stdout"]
+            output.seek(0)
+            output.truncate()
+            output.write(PROFILE_LINE.replace(b"oom_abort=true", b"oom_abort=false"))
+            return completed
+
+        with self.assertRaisesRegex(driver.ComparisonError, "runtime profile"):
+            self.run_mocked(wrong_profile)
+        manifest = json.loads((self.output / "manifest.json").read_text())
+        self.assertEqual(manifest["status"], "failed")
+        self.assertEqual(manifest["comparisons"], [])
+        self.assertEqual(manifest["invocations"][0]["status"], "failed")
 
     def test_native_schema_accepts_float_encoded_counts_and_preserves_overhead(
         self,
@@ -265,10 +317,15 @@ class BenchmarkComparisonTest(unittest.TestCase):
         self.assertEqual(result["configuration"]["selected_cpu"], 3)
         self.assertEqual(result["configuration"]["allowed_cpus"], [3, 7])
         self.assertTrue(result["configuration"]["thread_affinity"])
+        self.assertEqual(
+            result["configuration"]["required_runtime_profile"],
+            driver.PRODUCTION_PROFILE,
+        )
         self.assertIsNone(result["configuration"]["task_quota_ms"])
         self.affinity.assert_called_once_with(0)
         self.assertNotIn(str(self.root), json.dumps(result))
         for invocation in result["invocations"]:
+            self.assertEqual(invocation["runtime_profile"], driver.PRODUCTION_PROFILE)
             self.assertFalse(
                 any(
                     arg.startswith("--task-quota-ms=")
@@ -447,6 +504,7 @@ class BenchmarkComparisonTest(unittest.TestCase):
         for failure in ("exit", "timeout", "missing", "malformed"):
 
             def failed(arguments, **kwargs):
+                kwargs["stdout"].write(PROFILE_LINE)
                 if failure == "exit":
                     return subprocess.CompletedProcess(arguments, 2)
                 if failure == "timeout":

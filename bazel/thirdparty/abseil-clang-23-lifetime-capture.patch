@@ -1,0 +1,282 @@
+diff --git a/absl/base/attributes.h b/absl/base/attributes.h
+--- a/absl/base/attributes.h
++++ b/absl/base/attributes.h
+@@ -933,6 +933,23 @@
+ #else
+ #define ABSL_INTERNAL_ATTRIBUTE_CAPTURED_BY(Owner)
+ #endif
++// Internal attribute; name and documentation TBD.
++//
++// See the upstream documentation:
++// https://clang.llvm.org/docs/AttributeReference.html#lifetime_capture_by_this
++//
++// Note: ABSL_INTERNAL_ATTRIBUTE_CAPTURED_BY(this) is deprecated. Use
++// ABSL_INTERNAL_ATTRIBUTE_CAPTURED_BY_THIS instead.
++#if ABSL_HAVE_CPP_ATTRIBUTE(clang::lifetime_capture_by_this)
++#define ABSL_INTERNAL_ATTRIBUTE_CAPTURED_BY_THIS \
++  [[clang::lifetime_capture_by_this]]
++#elif ABSL_HAVE_CPP_ATTRIBUTE(clang::lifetime_capture_by)
++#define ABSL_INTERNAL_ATTRIBUTE_CAPTURED_BY_THIS \
++  ABSL_INTERNAL_ATTRIBUTE_CAPTURED_BY(this)
++#else
++#define ABSL_INTERNAL_ATTRIBUTE_CAPTURED_BY_THIS
++#endif
++
+ 
+ // ABSL_ATTRIBUTE_VIEW indicates that a type is solely a "view" of data that it
+ // points to, similarly to a span, string_view, or other non-owning reference
+diff --git a/absl/base/internal/spinlock.h b/absl/base/internal/spinlock.h
+--- a/absl/base/internal/spinlock.h
++++ b/absl/base/internal/spinlock.h
+@@ -252,7 +252,7 @@
+     : public std::lock_guard<SpinLock> {
+  public:
+   inline explicit SpinLockHolder(
+-      SpinLock& l ABSL_INTERNAL_ATTRIBUTE_CAPTURED_BY(this))
++      SpinLock& l ABSL_INTERNAL_ATTRIBUTE_CAPTURED_BY_THIS)
+       ABSL_EXCLUSIVE_LOCK_FUNCTION(l)
+       : std::lock_guard<SpinLock>(l) {}
+   ABSL_DEPRECATE_AND_INLINE()
+diff --git a/absl/container/internal/btree_container.h b/absl/container/internal/btree_container.h
+--- a/absl/container/internal/btree_container.h
++++ b/absl/container/internal/btree_container.h
+@@ -506,9 +506,9 @@
+                   0))>                                                       \
+   decltype(auto) Func(                                                       \
+       __VA_ARGS__ key_arg<K> KQual k ABSL_INTERNAL_IF_##KValue(              \
+-          ABSL_INTERNAL_ATTRIBUTE_CAPTURED_BY(this)),                        \
++          ABSL_INTERNAL_ATTRIBUTE_CAPTURED_BY_THIS),                         \
+       M MQual obj ABSL_INTERNAL_IF_##MValue(                                 \
+-          ABSL_INTERNAL_ATTRIBUTE_CAPTURED_BY(this)))                        \
++          ABSL_INTERNAL_ATTRIBUTE_CAPTURED_BY_THIS))                         \
+       ABSL_ATTRIBUTE_LIFETIME_BOUND {                                        \
+     return ABSL_INTERNAL_IF_##KValue##_OR_##MValue(                          \
+         (this->template Func<K, M, 0>), Callee)(                             \
+@@ -608,7 +608,7 @@
+           0>                                                                   \
+   decltype(auto) Func(                                                         \
+       __VA_ARGS__ key_arg<K> KQual k ABSL_INTERNAL_IF_##KValue(                \
+-          ABSL_INTERNAL_ATTRIBUTE_CAPTURED_BY(this)),                          \
++          ABSL_INTERNAL_ATTRIBUTE_CAPTURED_BY_THIS),                           \
+       Args &&...args) ABSL_ATTRIBUTE_LIFETIME_BOUND {                          \
+     return ABSL_INTERNAL_IF_##KValue((this->template Func<K, 0>), Callee)(     \
+         __VA_ARGS__ std::forward<decltype(k)>(k),                              \
+@@ -635,7 +635,7 @@
+   }
+   template <class K = key_type, int &..., EnableIf<LifetimeBoundK<K, true>> = 0>
+   mapped_type &operator[](
+-      const key_arg<K> &k ABSL_INTERNAL_ATTRIBUTE_CAPTURED_BY(this))
++      const key_arg<K> &k ABSL_INTERNAL_ATTRIBUTE_CAPTURED_BY_THIS)
+       ABSL_ATTRIBUTE_LIFETIME_BOUND {
+     return this->template operator[]<K, 0>(k);
+   }
+@@ -644,8 +644,7 @@
+     return try_emplace(std::forward<key_arg<K>>(k)).first->second;
+   }
+   template <class K = key_type, int &..., EnableIf<LifetimeBoundK<K, true>> = 0>
+-  mapped_type &operator[](key_arg<K> &&k ABSL_INTERNAL_ATTRIBUTE_CAPTURED_BY(
+-      this)) ABSL_ATTRIBUTE_LIFETIME_BOUND {
++  mapped_type &operator[](key_arg<K> &&k ABSL_INTERNAL_ATTRIBUTE_CAPTURED_BY_THIS) ABSL_ATTRIBUTE_LIFETIME_BOUND {
+     return this->template operator[]<K, 0>(std::forward<key_arg<K>>(k));
+   }
+ 
+diff --git a/absl/container/internal/raw_hash_map.h b/absl/container/internal/raw_hash_map.h
+--- a/absl/container/internal/raw_hash_map.h
++++ b/absl/container/internal/raw_hash_map.h
+@@ -130,9 +130,10 @@
+                   0))>                                                         \
+   decltype(auto) Func(                                                         \
+       __VA_ARGS__ key_arg<K> KQual k ABSL_INTERNAL_IF_##KValue(                \
+-          ABSL_INTERNAL_ATTRIBUTE_CAPTURED_BY(this)),                          \
+-      V VQual v ABSL_INTERNAL_IF_##VValue(ABSL_INTERNAL_ATTRIBUTE_CAPTURED_BY( \
+-          this))) ABSL_ATTRIBUTE_LIFETIME_BOUND {                              \
++          ABSL_INTERNAL_ATTRIBUTE_CAPTURED_BY_THIS),                           \
++      V VQual v ABSL_INTERNAL_IF_##VValue(                                     \
++          ABSL_INTERNAL_ATTRIBUTE_CAPTURED_BY_THIS))                           \
++      ABSL_ATTRIBUTE_LIFETIME_BOUND {                                          \
+     return ABSL_INTERNAL_IF_##KValue##_OR_##VValue(                            \
+         (this->template Func<K, V, 0>), Callee)(                               \
+         std::forward<decltype(k)>(k), std::forward<decltype(v)>(v)) Tail;      \
+@@ -230,7 +231,7 @@
+             typename std::enable_if<
+                 !std::is_convertible<K, const_iterator>::value, int>::type = 0>
+   std::pair<iterator, bool> try_emplace(
+-      key_arg<K>&& k ABSL_INTERNAL_ATTRIBUTE_CAPTURED_BY(this),
++      key_arg<K>&& k ABSL_INTERNAL_ATTRIBUTE_CAPTURED_BY_THIS,
+       Args&&... args) ABSL_ATTRIBUTE_LIFETIME_BOUND {
+     return this->template try_emplace<K, 0>(std::forward<key_arg<K>>(k),
+                                             std::forward<Args>(args)...);
+@@ -249,7 +250,7 @@
+             typename std::enable_if<
+                 !std::is_convertible<K, const_iterator>::value, int>::type = 0>
+   std::pair<iterator, bool> try_emplace(
+-      const key_arg<K>& k ABSL_INTERNAL_ATTRIBUTE_CAPTURED_BY(this),
++      const key_arg<K>& k ABSL_INTERNAL_ATTRIBUTE_CAPTURED_BY_THIS,
+       Args&&... args) ABSL_ATTRIBUTE_LIFETIME_BOUND {
+     return this->template try_emplace<K, 0>(k, std::forward<Args>(args)...);
+   }
+@@ -264,7 +265,7 @@
+   template <class K = key_type, class... Args,
+             EnableIf<LifetimeBoundK<K, true, K*>> = 0>
+   iterator try_emplace(const_iterator hint,
+-                       key_arg<K>&& k ABSL_INTERNAL_ATTRIBUTE_CAPTURED_BY(this),
++                       key_arg<K>&& k ABSL_INTERNAL_ATTRIBUTE_CAPTURED_BY_THIS,
+                        Args&&... args) ABSL_ATTRIBUTE_LIFETIME_BOUND {
+     return this->template try_emplace<K, 0>(hint, std::forward<key_arg<K>>(k),
+                                             std::forward<Args>(args)...);
+@@ -280,7 +281,7 @@
+             EnableIf<LifetimeBoundK<K, true>> = 0>
+   iterator try_emplace(const_iterator hint,
+                        const key_arg<K>& k
+-                           ABSL_INTERNAL_ATTRIBUTE_CAPTURED_BY(this),
++                           ABSL_INTERNAL_ATTRIBUTE_CAPTURED_BY_THIS,
+                        Args&&... args) ABSL_ATTRIBUTE_LIFETIME_BOUND {
+     return this->template try_emplace<K, 0>(hint, k,
+                                             std::forward<Args>(args)...);
+@@ -318,7 +319,7 @@
+   template <class K = key_type, class P = Policy, int&...,
+             EnableIf<LifetimeBoundK<K, true, K*>> = 0>
+   MappedReference<P> operator[](
+-      key_arg<K>&& key ABSL_INTERNAL_ATTRIBUTE_CAPTURED_BY(this))
++      key_arg<K>&& key ABSL_INTERNAL_ATTRIBUTE_CAPTURED_BY_THIS)
+       ABSL_ATTRIBUTE_LIFETIME_BOUND {
+     return this->template operator[]<K, P, 0>(std::forward<key_arg<K>>(key));
+   }
+@@ -335,7 +336,7 @@
+   template <class K = key_type, class P = Policy, int&...,
+             EnableIf<LifetimeBoundK<K, true>> = 0>
+   MappedReference<P> operator[](
+-      const key_arg<K>& key ABSL_INTERNAL_ATTRIBUTE_CAPTURED_BY(this))
++      const key_arg<K>& key ABSL_INTERNAL_ATTRIBUTE_CAPTURED_BY_THIS)
+       ABSL_ATTRIBUTE_LIFETIME_BOUND {
+     return this->template operator[]<K, P, 0>(key);
+   }
+diff --git a/absl/container/internal/raw_hash_set.h b/absl/container/internal/raw_hash_set.h
+--- a/absl/container/internal/raw_hash_set.h
++++ b/absl/container/internal/raw_hash_set.h
+@@ -2660,7 +2660,7 @@
+                                  IsLifetimeBoundAssignmentFrom<T>::value,
+                              int> = 0>
+   std::pair<iterator, bool> insert(
+-      T&& value ABSL_INTERNAL_ATTRIBUTE_CAPTURED_BY(this))
++      T&& value ABSL_INTERNAL_ATTRIBUTE_CAPTURED_BY_THIS)
+       ABSL_ATTRIBUTE_LIFETIME_BOUND {
+     return this->template insert<T, 0>(std::forward<T>(value));
+   }
+@@ -2689,7 +2689,7 @@
+                                  IsLifetimeBoundAssignmentFrom<const T&>::value,
+                              int> = 0>
+   std::pair<iterator, bool> insert(
+-      const T& value ABSL_INTERNAL_ATTRIBUTE_CAPTURED_BY(this))
++      const T& value ABSL_INTERNAL_ATTRIBUTE_CAPTURED_BY_THIS)
+       ABSL_ATTRIBUTE_LIFETIME_BOUND {
+     return this->template insert<T, 0>(value);
+   }
+@@ -2709,7 +2709,7 @@
+   }
+ #if ABSL_INTERNAL_CPLUSPLUS_LANG >= 202002L
+   std::pair<iterator, bool> insert(
+-      init_type&& value ABSL_INTERNAL_ATTRIBUTE_CAPTURED_BY(this))
++      init_type&& value ABSL_INTERNAL_ATTRIBUTE_CAPTURED_BY_THIS)
+       ABSL_ATTRIBUTE_LIFETIME_BOUND
+     requires(IsLifetimeBoundAssignmentFrom<init_type>::value)
+   {
+@@ -2731,7 +2731,7 @@
+                                  IsLifetimeBoundAssignmentFrom<T>::value,
+                              int> = 0>
+   iterator insert(const_iterator hint,
+-                  T&& value ABSL_INTERNAL_ATTRIBUTE_CAPTURED_BY(this))
++                  T&& value ABSL_INTERNAL_ATTRIBUTE_CAPTURED_BY_THIS)
+       ABSL_ATTRIBUTE_LIFETIME_BOUND {
+     return this->template insert<T, 0>(hint, std::forward<T>(value));
+   }
+diff --git a/absl/status/statusor.h b/absl/status/statusor.h
+--- a/absl/status/statusor.h
++++ b/absl/status/statusor.h
+@@ -408,7 +408,7 @@
+             typename std::enable_if<
+                 internal_statusor::IsAssignmentValid<T, U, true>::value,
+                 int>::type = 0>
+-  StatusOr& operator=(U&& v ABSL_INTERNAL_ATTRIBUTE_CAPTURED_BY(this)) {
++  StatusOr& operator=(U&& v ABSL_INTERNAL_ATTRIBUTE_CAPTURED_BY_THIS) {
+     this->Assign(std::forward<U>(v));
+     return *this;
+   }
+diff --git a/absl/synchronization/mutex.h b/absl/synchronization/mutex.h
+--- a/absl/synchronization/mutex.h
++++ b/absl/synchronization/mutex.h
+@@ -621,7 +621,7 @@
+ 
+   // Calls `mu.lock()` and returns when that call returns. That is, `mu` is
+   // guaranteed to be locked when this object is constructed.
+-  explicit MutexLock(Mutex& mu ABSL_INTERNAL_ATTRIBUTE_CAPTURED_BY(this))
++  explicit MutexLock(Mutex& mu ABSL_INTERNAL_ATTRIBUTE_CAPTURED_BY_THIS)
+       ABSL_EXCLUSIVE_LOCK_FUNCTION(mu)
+       : mu_(mu) {
+     this->mu_.lock();
+@@ -638,7 +638,7 @@
+   // Like above, but calls `mu.LockWhen(cond)` instead. That is, in addition to
+   // the above, the condition given by `cond` is also guaranteed to hold when
+   // this object is constructed.
+-  explicit MutexLock(Mutex& mu ABSL_INTERNAL_ATTRIBUTE_CAPTURED_BY(this),
++  explicit MutexLock(Mutex& mu ABSL_INTERNAL_ATTRIBUTE_CAPTURED_BY_THIS,
+                      const Condition& cond) ABSL_EXCLUSIVE_LOCK_FUNCTION(mu)
+       : mu_(mu) {
+     this->mu_.LockWhen(cond);
+@@ -667,7 +667,7 @@
+ // releases a shared lock on a `Mutex` via RAII.
+ class ABSL_SCOPED_LOCKABLE ReaderMutexLock {
+  public:
+-  explicit ReaderMutexLock(Mutex& mu ABSL_INTERNAL_ATTRIBUTE_CAPTURED_BY(this))
++  explicit ReaderMutexLock(Mutex& mu ABSL_INTERNAL_ATTRIBUTE_CAPTURED_BY_THIS)
+       ABSL_SHARED_LOCK_FUNCTION(mu)
+       : mu_(mu) {
+     mu.lock_shared();
+@@ -678,7 +678,7 @@
+   explicit ReaderMutexLock(Mutex* absl_nonnull mu) ABSL_SHARED_LOCK_FUNCTION(mu)
+       : ReaderMutexLock(*mu) {}
+ 
+-  explicit ReaderMutexLock(Mutex& mu ABSL_INTERNAL_ATTRIBUTE_CAPTURED_BY(this),
++  explicit ReaderMutexLock(Mutex& mu ABSL_INTERNAL_ATTRIBUTE_CAPTURED_BY_THIS,
+                            const Condition& cond) ABSL_SHARED_LOCK_FUNCTION(mu)
+       : mu_(mu) {
+     mu.ReaderLockWhen(cond);
+@@ -707,7 +707,7 @@
+ // releases a write (exclusive) lock on a `Mutex` via RAII.
+ class ABSL_SCOPED_LOCKABLE WriterMutexLock {
+  public:
+-  explicit WriterMutexLock(Mutex& mu ABSL_INTERNAL_ATTRIBUTE_CAPTURED_BY(this))
++  explicit WriterMutexLock(Mutex& mu ABSL_INTERNAL_ATTRIBUTE_CAPTURED_BY_THIS)
+       ABSL_EXCLUSIVE_LOCK_FUNCTION(mu)
+       : mu_(mu) {
+     mu.lock();
+@@ -719,7 +719,7 @@
+       ABSL_EXCLUSIVE_LOCK_FUNCTION(mu)
+       : WriterMutexLock(*mu) {}
+ 
+-  explicit WriterMutexLock(Mutex& mu ABSL_INTERNAL_ATTRIBUTE_CAPTURED_BY(this),
++  explicit WriterMutexLock(Mutex& mu ABSL_INTERNAL_ATTRIBUTE_CAPTURED_BY_THIS,
+                            const Condition& cond)
+       ABSL_EXCLUSIVE_LOCK_FUNCTION(mu)
+       : mu_(mu) {
+@@ -1142,8 +1142,9 @@
+ // mutex before destruction. `Release()` may be called at most once.
+ class ABSL_SCOPED_LOCKABLE ReleasableMutexLock {
+  public:
+-  explicit ReleasableMutexLock(Mutex& mu ABSL_INTERNAL_ATTRIBUTE_CAPTURED_BY(
+-      this)) ABSL_EXCLUSIVE_LOCK_FUNCTION(mu)
++  explicit ReleasableMutexLock(
++      Mutex& mu ABSL_INTERNAL_ATTRIBUTE_CAPTURED_BY_THIS)
++      ABSL_EXCLUSIVE_LOCK_FUNCTION(mu)
+       : mu_(&mu) {
+     this->mu_->lock();
+   }
+@@ -1155,7 +1156,7 @@
+       : ReleasableMutexLock(*mu) {}
+ 
+   explicit ReleasableMutexLock(
+-      Mutex& mu ABSL_INTERNAL_ATTRIBUTE_CAPTURED_BY(this),
++      Mutex& mu ABSL_INTERNAL_ATTRIBUTE_CAPTURED_BY_THIS,
+       const Condition& cond) ABSL_EXCLUSIVE_LOCK_FUNCTION(mu)
+       : mu_(&mu) {
+     this->mu_->LockWhen(cond);

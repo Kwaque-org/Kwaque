@@ -8,3 +8,8 @@ kwaque:
     port: 9644
   log_level: info
   developer_mode: true
+  # Cooperative workload budget for system-allocator diagnostic builds.
+  # Native-allocator builds use their observed shard capacity instead.
+  diagnostic_memory_per_shard_bytes: 134217728
+  # When enabled, .kwaque_data_dir must already exist in data_directory.
+  storage_strict_data_init: false

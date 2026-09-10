@@ -1,5 +1,6 @@
 load("@rules_python//python:defs.bzl", "py_test")
 load("//bazel:build.bzl", "kwaque_cc_binary", "kwaque_cc_library")
+load("//bazel:test.bzl", "kwaque_cc_seastar_gtest")
 
 package(default_visibility = ["//visibility:private"])
 
@@ -12,6 +13,11 @@ kwaque_cc_library(
         "@googletest//:gtest",
         "@seastar",
     ],
+)
+
+kwaque_cc_seastar_gtest(
+    name = "seastar_gtest_main_test",
+    srcs = ["seastar_gtest_main_test.cc"],
 )
 
 kwaque_cc_library(

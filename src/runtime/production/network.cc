@@ -61,8 +61,6 @@ operation_error network_error_from_exception(
   std::exception_ptr exception, bool aborted = false) {
     try {
         std::rethrow_exception(std::move(exception));
-    } catch (const std::bad_alloc&) {
-        throw;
     } catch (const seastar::abort_requested_exception&) {
         return network_error(errc::aborted);
     } catch (const std::system_error& error) {

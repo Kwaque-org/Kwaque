@@ -1,3 +1,4 @@
+#include "src/base/allocation.h"
 #include "src/base/error.h"
 #include "src/base/units.h"
 #include "src/resource/bounded_work_queue.h"
@@ -103,6 +104,33 @@ private:
     seastar::noncopyable_function<void() noexcept>* callback_;
 };
 
+struct large_inline_item final {
+    std::array<std::uint8_t, 8U * 1'024U> bytes{};
+};
+
+static_assert(
+  sizeof(large_inline_item)
+  == bounded_work_queue<large_inline_item>::maximum_inline_item_bytes);
+
+class counted_queue_item final {
+public:
+    explicit counted_queue_item(std::size_t& destroyed) noexcept
+      : destroyed_(&destroyed) {}
+    counted_queue_item(counted_queue_item&& other) noexcept
+      : destroyed_(std::exchange(other.destroyed_, nullptr)) {}
+    counted_queue_item(const counted_queue_item&) = delete;
+    counted_queue_item& operator=(const counted_queue_item&) = delete;
+    counted_queue_item& operator=(counted_queue_item&&) = delete;
+    ~counted_queue_item() {
+        if (destroyed_ != nullptr) {
+            ++*destroyed_;
+        }
+    }
+
+private:
+    std::size_t* destroyed_;
+};
+
 } // namespace
 
 SEASTAR_TEST_CASE(
@@ -144,6 +172,45 @@ SEASTAR_TEST_CASE(
     co_await queue.close(queue_close_mode::drain);
     BOOST_CHECK(queue.state() == bounded_work_queue_state::closed);
     BOOST_CHECK_EQUAL(queue.bytes().value(), 0U);
+}
+
+SEASTAR_TEST_CASE(
+  bounded_work_queue_ready_push_abort_waits_for_item_publication) {
+    bounded_work_queue<move_callback_item> queue{queue_config(1, 10, 0)};
+    seastar::abort_source abort_source;
+    bool armed = true;
+    bool called = false;
+    bool close_pending = false;
+    std::exception_ptr callback_failure;
+    std::optional<seastar::future<>> closing;
+    seastar::noncopyable_function<void() noexcept> callback = [&] noexcept {
+        called = true;
+        try {
+            closing.emplace(queue.close(queue_close_mode::abort));
+            close_pending = !closing->available();
+        } catch (...) {
+            callback_failure = std::current_exception();
+        }
+    };
+
+    auto pushed = queue.push(
+      move_callback_item{7, armed, callback}, byte_count{3}, abort_source);
+    BOOST_REQUIRE(pushed.available());
+    BOOST_REQUIRE(pushed.get().has_value());
+    BOOST_CHECK(called);
+    BOOST_CHECK(close_pending);
+    BOOST_CHECK(!callback_failure);
+    BOOST_CHECK(queue.state() == bounded_work_queue_state::aborting);
+    const auto popped = co_await queue.pop(abort_source);
+    BOOST_REQUIRE(!popped.has_value());
+    BOOST_CHECK(popped.error().kind == queue_failure_kind::closed);
+    if (closing) {
+        co_await std::move(*closing);
+    }
+    co_await queue.close(queue_close_mode::abort);
+    BOOST_CHECK_EQUAL(queue.size(), 0U);
+    BOOST_CHECK_EQUAL(queue.bytes().value(), 0U);
+    BOOST_CHECK(queue.state() == bounded_work_queue_state::closed);
 }
 
 SEASTAR_TEST_CASE(
@@ -267,6 +334,70 @@ SEASTAR_TEST_CASE(bounded_work_queue_ready_push_avoids_coroutine_allocation) {
     BOOST_CHECK_EQUAL(*popped, 7);
     BOOST_CHECK_EQUAL(queue.bytes().value(), 0U);
     co_await queue.close(queue_close_mode::drain);
+}
+
+SEASTAR_TEST_CASE(
+  bounded_work_queue_large_inline_items_keep_each_allocation_bounded) {
+    static constexpr std::size_t count = 512;
+    bounded_work_queue<large_inline_item> queue{
+      queue_config(count, count * sizeof(large_inline_item), 1)};
+    seastar::abort_source abort_source;
+#if !defined(SEASTAR_DEFAULT_ALLOCATOR)
+    seastar::memory::scoped_large_allocation_warning_threshold threshold{
+      maximum_contiguous_allocation_bytes + 1U};
+    const auto oversized_before = seastar::memory::stats().large_allocations();
+#endif
+    // An inline item at this boundary makes a sixteen-item block too large.
+    // Fill across many storage chunks, then verify FIFO and empty-chunk reuse.
+    for (std::size_t index = 0; index < count; ++index) {
+        large_inline_item item;
+        item.bytes.front() = static_cast<std::uint8_t>(index);
+        item.bytes.back() = static_cast<std::uint8_t>(index >> 8U);
+        auto pushed = queue.push(
+          std::move(item), byte_count{sizeof(large_inline_item)}, abort_source);
+        BOOST_REQUIRE(pushed.available());
+        BOOST_REQUIRE(pushed.get().has_value());
+        if (index % 64U == 0) {
+            co_await seastar::maybe_yield();
+        }
+    }
+    BOOST_CHECK_EQUAL(queue.size(), count);
+    large_inline_item waiting_item;
+    waiting_item.bytes.back() = static_cast<std::uint8_t>(count >> 8U);
+    auto waiting = queue.push(
+      std::move(waiting_item),
+      byte_count{sizeof(large_inline_item)},
+      abort_source);
+    BOOST_REQUIRE(!waiting.available());
+    const auto first = co_await queue.pop(abort_source);
+    BOOST_REQUIRE(first.has_value());
+    BOOST_CHECK_EQUAL(first->bytes.front(), 0U);
+    BOOST_CHECK_EQUAL(first->bytes.back(), 0U);
+    const bool waiting_succeeded = (co_await std::move(waiting)).has_value();
+    BOOST_REQUIRE(waiting_succeeded);
+    for (std::size_t index = 1; index <= count; ++index) {
+        const auto popped = co_await queue.pop(abort_source);
+        BOOST_REQUIRE(popped.has_value());
+        BOOST_CHECK_EQUAL(
+          popped->bytes.front(), static_cast<std::uint8_t>(index));
+        BOOST_CHECK_EQUAL(
+          popped->bytes.back(), static_cast<std::uint8_t>(index >> 8U));
+    }
+    auto waiting_pop = queue.pop(abort_source);
+    BOOST_REQUIRE(!waiting_pop.available());
+    auto pushed = queue.push(
+      large_inline_item{}, byte_count{sizeof(large_inline_item)}, abort_source);
+    BOOST_REQUIRE(pushed.available());
+    BOOST_REQUIRE(pushed.get().has_value());
+    const bool waiting_pop_succeeded
+      = (co_await std::move(waiting_pop)).has_value();
+    BOOST_REQUIRE(waiting_pop_succeeded);
+#if !defined(SEASTAR_DEFAULT_ALLOCATOR)
+    BOOST_CHECK_EQUAL(
+      seastar::memory::stats().large_allocations(), oversized_before);
+#endif
+    co_await queue.close(queue_close_mode::drain);
+    BOOST_CHECK_EQUAL(queue.bytes().value(), 0U);
 }
 
 SEASTAR_TEST_CASE(
@@ -729,8 +860,8 @@ SEASTAR_TEST_CASE(bounded_work_queue_close_modes_release_every_unit) {
         auto rejected = co_await std::move(waiting);
         BOOST_REQUIRE(!rejected.has_value());
         BOOST_CHECK(rejected.error().kind == queue_failure_kind::closed);
-        BOOST_CHECK(queue.state() == bounded_work_queue_state::closed);
         co_await std::move(closing);
+        BOOST_CHECK(queue.state() == bounded_work_queue_state::closed);
         BOOST_CHECK_EQUAL(queue.waiting_producers(), 0U);
         BOOST_CHECK_EQUAL(queue.size(), 0U);
         BOOST_CHECK_EQUAL(queue.bytes().value(), 0U);
@@ -761,6 +892,64 @@ SEASTAR_TEST_CASE(bounded_work_queue_close_modes_release_every_unit) {
         BOOST_REQUIRE(!closed.has_value());
         BOOST_CHECK(closed.error().kind == queue_failure_kind::closed);
         co_await std::move(closing);
+    }
+}
+
+SEASTAR_TEST_CASE(
+  bounded_work_queue_abort_yields_while_discarding_and_joins_every_close) {
+    static constexpr std::size_t count = 16'384;
+    for (const auto initial_mode :
+         {queue_close_mode::abort, queue_close_mode::drain}) {
+        bounded_work_queue<counted_queue_item> queue{
+          queue_config(count, count, 1)};
+        seastar::abort_source abort_source;
+        std::size_t destroyed = 0;
+        std::size_t rejected_destroyed = 0;
+        for (std::size_t index = 0; index < count; ++index) {
+            auto pushed = queue.push(
+              counted_queue_item{destroyed}, byte_count{1}, abort_source);
+            BOOST_REQUIRE(pushed.available());
+            BOOST_REQUIRE(pushed.get().has_value());
+            if (index % 256U == 0) {
+                co_await seastar::maybe_yield();
+            }
+        }
+        auto waiting = queue.push(
+          counted_queue_item{rejected_destroyed}, byte_count{1}, abort_source);
+        BOOST_REQUIRE(!waiting.available());
+        auto first_close = queue.close(initial_mode);
+        auto abort_close = queue.close(queue_close_mode::abort);
+        auto repeated_close = queue.close(queue_close_mode::abort);
+        BOOST_CHECK(queue.state() == bounded_work_queue_state::aborting);
+        BOOST_CHECK(!first_close.available());
+        BOOST_CHECK(!abort_close.available());
+        BOOST_CHECK_LT(destroyed, count);
+
+        const auto refused_pop = co_await queue.pop(abort_source);
+        BOOST_REQUIRE(!refused_pop.has_value());
+        BOOST_CHECK(refused_pop.error().kind == queue_failure_kind::closed);
+        const auto refused_push = co_await queue.push(
+          counted_queue_item{rejected_destroyed}, byte_count{1}, abort_source);
+        BOOST_REQUIRE(!refused_push.has_value());
+        BOOST_CHECK(refused_push.error().kind == queue_failure_kind::closed);
+
+        // Independent reactor work must run while the queued population is
+        // still owned by close, including when drain is upgraded to abort.
+        co_await seastar::yield();
+        BOOST_CHECK_LT(destroyed, count);
+        BOOST_CHECK(!abort_close.available());
+        const auto interrupted = co_await std::move(waiting);
+        BOOST_REQUIRE(!interrupted.has_value());
+        BOOST_CHECK(interrupted.error().kind == queue_failure_kind::closed);
+        co_await std::move(first_close);
+        co_await std::move(abort_close);
+        co_await std::move(repeated_close);
+        BOOST_CHECK_EQUAL(destroyed, count);
+        BOOST_CHECK_EQUAL(rejected_destroyed, 2U);
+        BOOST_CHECK_EQUAL(queue.size(), 0U);
+        BOOST_CHECK_EQUAL(queue.bytes().value(), 0U);
+        BOOST_CHECK_EQUAL(queue.waiting_producers(), 0U);
+        BOOST_CHECK(queue.state() == bounded_work_queue_state::closed);
     }
 }
 

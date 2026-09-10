@@ -18,9 +18,11 @@
 #include <boost/test/unit_test.hpp>
 
 #include <cstdint>
+#include <memory>
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <utility>
 
 namespace {
 
@@ -194,4 +196,80 @@ SEASTAR_TEST_CASE(runtime_metric_partial_registration_rolls_back) {
     blocker.reset();
     BOOST_CHECK(!registered(kwaque::metric_id::file_accepted_total));
     co_await registry.stop();
+}
+
+SEASTAR_TEST_CASE(
+  runtime_metric_type_conflict_preserves_existing_registration) {
+    namespace metrics = seastar::metrics;
+    constexpr auto id = kwaque::metric_id::file_accepted_total;
+    const auto& descriptor = metric_descriptor(id);
+    BOOST_REQUIRE(!registered(id));
+    const metrics::label owner_label{"owner"};
+    auto value = std::make_shared<std::uint64_t>(17);
+    const std::weak_ptr<std::uint64_t> original_lifetime{value};
+    std::optional<metrics::metric_groups> original{std::in_place};
+    original->add_group(
+      seastar::sstring{descriptor.group},
+      {metrics::make_counter(
+         seastar::sstring{descriptor.name},
+         [retained = value] { return *retained; },
+         metrics::description("Original counter description"),
+         {owner_label("original")})
+         .aggregate({metrics::shard_label})});
+    const auto original_metadata = family(id).info();
+    const auto* original_callback = family(id).begin()->second.get();
+
+    auto rejected_value = std::make_shared<std::uint64_t>(99);
+    const std::weak_ptr<std::uint64_t> rejected_lifetime{rejected_value};
+    std::optional<metrics::metric_groups> candidate{std::in_place};
+    bool wrong_type = false;
+    try {
+        candidate->add_group(
+          seastar::sstring{descriptor.group},
+          {metrics::make_gauge(
+            seastar::sstring{descriptor.name},
+            [retained = std::move(rejected_value)] { return *retained; },
+            metrics::description("Rejected gauge description"),
+            {owner_label("candidate")})});
+    } catch (const metrics::double_registration&) {
+        BOOST_FAIL("distinct labels must reach the type-conflict check");
+    } catch (const std::runtime_error&) {
+        wrong_type = true;
+    }
+    BOOST_REQUIRE(wrong_type);
+    candidate.reset();
+    BOOST_CHECK(rejected_lifetime.expired());
+    BOOST_REQUIRE_EQUAL(family(id).size(), 1U);
+    BOOST_CHECK(family(id).begin()->second.get() == original_callback);
+    const auto& retained_metadata = family(id).info();
+    BOOST_CHECK(retained_metadata.type == original_metadata.type);
+    BOOST_CHECK(
+      retained_metadata.inherit_type == original_metadata.inherit_type);
+    BOOST_CHECK(retained_metadata.d.str() == original_metadata.d.str());
+    BOOST_CHECK(retained_metadata.name == original_metadata.name);
+    BOOST_CHECK(
+      retained_metadata.aggregate_labels == original_metadata.aggregate_labels);
+    BOOST_CHECK_EQUAL(
+      family(id).begin()->first.labels().at("owner").value(), "original");
+    *value = 23;
+    BOOST_CHECK_EQUAL(metric_value(id), 23U);
+
+    candidate.emplace();
+    candidate->add_group(
+      seastar::sstring{descriptor.group},
+      {metrics::make_counter(
+        seastar::sstring{descriptor.name},
+        [] { return 31U; },
+        metrics::description("Compatible counter description"),
+        {owner_label("candidate")})});
+    BOOST_REQUIRE_EQUAL(family(id).size(), 2U);
+    candidate.reset();
+    BOOST_REQUIRE_EQUAL(family(id).size(), 1U);
+    BOOST_CHECK_EQUAL(metric_value(id), 23U);
+    value.reset();
+    BOOST_CHECK(!original_lifetime.expired());
+    original.reset();
+    BOOST_CHECK(original_lifetime.expired());
+    BOOST_CHECK(!registered(id));
+    co_return;
 }

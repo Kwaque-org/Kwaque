@@ -65,6 +65,9 @@ public:
     runtime_lifetime& operator=(runtime_lifetime&&) = delete;
 
     void activate();
+    // Reject new leases while existing capability owners remain usable for
+    // drain.
+    void close_admission() noexcept;
     [[nodiscard]] std::optional<seastar::gate::holder> acquire();
     [[nodiscard]] seastar::future<> close();
 
@@ -76,6 +79,7 @@ private:
     std::optional<seastar::shared_promise<>> close_done_;
     runtime_lifetime_state state_{runtime_lifetime_state::inactive};
     bool lease_acquired_{false};
+    bool admission_closed_{false};
 };
 
 template<typename Backend>

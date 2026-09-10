@@ -68,6 +68,7 @@ bool_flag(
 bool_flag(
     name = "system_allocator",
     build_setting_default = False,
+    visibility = ["//visibility:public"],
 )
 
 bool_flag(

@@ -4,6 +4,7 @@ load("//bazel:test.bzl", "kwaque_cc_test")
 
 exports_files(
     [
+        "benchmark_policy.cc",
         "fuzz_signal_canary_test.py",
         "fuzz_test_wrapper.py",
     ],
@@ -35,6 +36,12 @@ config_setting(
 config_setting(
     name = "optimized_build",
     values = {"compilation_mode": "opt"},
+    visibility = ["//visibility:public"],
+)
+
+config_setting(
+    name = "system_allocator",
+    flag_values = {"@seastar//:system_allocator": "true"},
     visibility = ["//visibility:public"],
 )
 

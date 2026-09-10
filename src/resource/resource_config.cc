@@ -16,10 +16,11 @@ constexpr std::uint64_t memory_weight_total = 100;
 
 resource_config::resource_config(
   byte_count total_memory,
-  byte_count reactor_headroom,
+  memory_reservations reservations,
   std::array<byte_count, workload_class_count> budgets) noexcept
   : total_memory_(total_memory)
-  , reactor_headroom_(reactor_headroom)
+  , reactor_headroom_(reservations.reactor_headroom)
+  , admin_memory_reservation_(reservations.admin_memory)
   , budgets_(budgets) {}
 
 result<resource_config>
@@ -29,14 +30,40 @@ resource_config::from_total_memory(byte_count total_memory) noexcept {
 
 result<resource_config> resource_config::from_total_memory(
   byte_count total_memory, byte_count reactor_headroom) noexcept {
+    return from_total_memory(
+      total_memory,
+      memory_reservations{
+        .reactor_headroom = reactor_headroom, .admin_memory = byte_count{}});
+}
+
+result<resource_config> resource_config::from_production_memory(
+  byte_count total_memory, memory_reservations reservations) noexcept {
+    const auto required = production_baseline_memory().checked_add(
+      reservations.admin_memory);
+    if (!required) {
+        return failure(errc::out_of_range);
+    }
+    if (total_memory < *required) {
+        return failure(errc::resource_exhausted);
+    }
+    return from_total_memory(total_memory, reservations);
+}
+
+result<resource_config> resource_config::from_total_memory(
+  byte_count total_memory, memory_reservations reservations) noexcept {
     if (total_memory < minimum_total_memory()) {
         return failure(errc::resource_exhausted);
     }
-    if (reactor_headroom.value() == 0) {
+    if (reservations.reactor_headroom.value() == 0) {
         return failure(errc::invalid_argument);
     }
 
-    const auto allocatable = total_memory.checked_sub(reactor_headroom);
+    const auto reserved = reservations.reactor_headroom.checked_add(
+      reservations.admin_memory);
+    if (!reserved) {
+        return failure(errc::out_of_range);
+    }
+    const auto allocatable = total_memory.checked_sub(*reserved);
     if (!allocatable || allocatable->value() < workload_class_count * 2) {
         return failure(errc::resource_exhausted);
     }
@@ -64,11 +91,11 @@ result<resource_config> resource_config::from_total_memory(
         budgets[index] = budget;
     }
 
-    const auto accounted = allocated.checked_add(reactor_headroom);
+    const auto accounted = allocated.checked_add(*reserved);
     if (!accounted || *accounted > total_memory) {
         return failure(errc::out_of_range);
     }
-    return resource_config{total_memory, reactor_headroom, budgets};
+    return resource_config{total_memory, reservations, budgets};
 }
 
 byte_count resource_config::budget(workload_class classification) const {

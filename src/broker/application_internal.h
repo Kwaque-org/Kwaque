@@ -1,6 +1,8 @@
 #pragma once
 
 #include "src/admin/admin_server.h"
+#include "src/broker/crash_limiter.h"
+#include "src/broker/crash_recorder.h"
 #include "src/broker/pid_file.h"
 #include "src/broker/service_lifecycle.h"
 #include "src/broker/startup_policy.h"
@@ -13,6 +15,7 @@
 #include <seastar/core/coroutine.hh>
 #include <seastar/core/future.hh>
 #include <seastar/core/iostream.hh>
+#include <seastar/core/shared_future.hh>
 
 #include <boost/program_options/variables_map.hpp>
 
@@ -48,7 +51,7 @@ reduce_minimum_shard_memory(byte_count current, byte_count observed) noexcept {
 }
 
 [[nodiscard]] resource::resource_config
-production_resource_config(byte_count minimum_shard_memory);
+broker_resource_config(byte_count minimum_shard_memory, bool developer_mode);
 
 class application_test_access;
 
@@ -88,10 +91,19 @@ private:
     [[nodiscard]] seastar::future<byte_count> observe_minimum_shard_memory();
     [[nodiscard]] seastar::future<> start_data_directory();
     [[nodiscard]] seastar::future<> start_pid_file();
+    [[nodiscard]] seastar::future<> start_crash_tracking();
+    [[nodiscard]] seastar::future<>
+    shutdown_with(service_lifecycle::action readiness_notification);
+    [[nodiscard]] seastar::future<>
+    shutdown_after_start(service_lifecycle::action readiness_notification);
+    [[nodiscard]] seastar::future<>
+    shutdown_once(service_lifecycle::action readiness_notification);
     [[nodiscard]] seastar::future<>
     start_resource_registry(resource::resource_config configuration);
     [[nodiscard]] seastar::future<> start_environments();
-    [[nodiscard]] seastar::future<> start_admin();
+    [[nodiscard]] seastar::future<> start_admin(byte_count memory_reservation);
+    [[nodiscard]] seastar::future<>
+    check_host(const seastar::app_template::seastar_options* runtime_options);
     template<typename Checkpoint>
     [[nodiscard]] seastar::future<> start_services_with(
       Checkpoint checkpoint,
@@ -107,11 +119,21 @@ private:
     std::unique_ptr<runtime::stop_signal> stop_signal_;
     std::unique_ptr<service_lifecycle> lifecycle_;
     std::unique_ptr<pid_file> pid_file_;
+    std::unique_ptr<crash_limiter> crash_limiter_;
+    std::unique_ptr<crash_recorder> crash_recorder_;
     std::unique_ptr<admin::admin_server> admin_server_;
     std::unique_ptr<resource::resource_registry> resource_registry_;
     std::unique_ptr<runtime::production::environment_owner> environments_;
     std::chrono::steady_clock::time_point startup_started_at_{};
     std::optional<runtime::owner_shard> owner_;
+    seastar::shared_promise<> start_finished_;
+    seastar::shared_promise<> shutdown_finished_;
+    bool install_signal_handlers_{true};
+    bool start_attempted_{false};
+    bool start_active_{false};
+    bool fully_started_{false};
+    bool shutdown_started_{false};
+    bool shutdown_failed_{false};
 };
 
 template<typename Checkpoint>
@@ -119,10 +141,14 @@ seastar::future<> application_state::start_services_with(
   Checkpoint checkpoint,
   const seastar::app_template::seastar_options* runtime_options) {
     assert_owner();
-    if (!configuration_ || !services_constructed()) {
+    if (
+      !configuration_ || !services_constructed() || start_attempted_
+      || shutdown_started_) {
         throw std::logic_error(
           "configuration and services must be ready before startup");
     }
+    start_attempted_ = true;
+    start_active_ = true;
 
     std::exception_ptr startup_failure;
     try {
@@ -130,7 +156,9 @@ seastar::future<> application_state::start_services_with(
         const auto minimum_shard_memory
           = co_await observe_minimum_shard_memory();
         stop_signal_->abort_source().check();
-        auto resources = production_resource_config(minimum_shard_memory);
+        auto resources = broker_resource_config(
+          minimum_shard_memory, configuration_->developer_mode);
+        const auto admin_memory = resources.admin_memory_reservation();
         if (runtime_options != nullptr) {
             // The caller keeps native options alive until this startup
             // finishes.
@@ -141,17 +169,33 @@ seastar::future<> application_state::start_services_with(
         checkpoint(1);
         co_await start_pid_file();
         checkpoint(2);
-        co_await start_resource_registry(std::move(resources));
+        co_await start_crash_tracking();
         checkpoint(3);
-        co_await start_environments();
+        co_await check_host(runtime_options);
         checkpoint(4);
-        co_await start_admin();
+        co_await start_resource_registry(std::move(resources));
         checkpoint(5);
+        co_await start_environments();
+        checkpoint(6);
+        co_await start_admin(admin_memory);
+        checkpoint(7);
+        stop_signal_->abort_source().check();
+        fully_started_ = true;
     } catch (...) {
         startup_failure = std::current_exception();
     }
+    start_active_ = false;
+    start_finished_.set_value();
 
     if (startup_failure) {
+        try {
+            std::rethrow_exception(startup_failure);
+        } catch (const seastar::abort_requested_exception&) {
+        } catch (...) {
+            if (crash_recorder_) {
+                crash_recorder_->record_startup_failure();
+            }
+        }
         try {
             co_await shutdown();
         } catch (...) {

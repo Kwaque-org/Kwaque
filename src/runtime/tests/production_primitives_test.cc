@@ -245,7 +245,7 @@ SEASTAR_TEST_CASE(production_random_preserves_unclassified_entropy_failures) {
       std::make_exception_ptr(std::logic_error("invalid entropy state")),
     };
     for (const auto& failure : failures) {
-        auto entropy = [&failure]() -> std::uint32_t {
+        auto entropy = [&failure] -> std::uint32_t {
             std::rethrow_exception(failure);
         };
         std::exception_ptr observed;

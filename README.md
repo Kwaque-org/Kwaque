@@ -49,10 +49,13 @@ configuration does not require root privileges, device access, or privileged
 ports. Hosts must provide enough unlocked memory for the selected Seastar
 `--memory` value; production CPU, memory-locking, and filesystem tuning is not
 yet automated. Native-allocator builds derive workload admission from the
-smallest shard-local allocator after Seastar applies `--memory`, with fixed
-internal reactor headroom. System-allocator/sanitizer builds currently derive
-diagnostic admission from synthetic allocator statistics, identified explicitly
-in startup output; `--memory` does not cap their process allocations.
+smallest shard-local allocator after Seastar applies `--memory`. The broker
+reserves 16 MiB of reactor headroom and a separate 4 MiB for admin state per
+shard before dividing the eight workload budgets. Production startup requires
+128 MiB plus that admin reservation per shard; 1 GiB per shard is recommended.
+Explicit development fixtures retain the 64 MiB floor. System-allocator builds
+use `diagnostic_memory_per_shard_bytes` as a cooperative workload budget;
+`--memory` does not cap their process allocations.
 
 ## Quick start
 
@@ -110,16 +113,49 @@ explicit `developer_mode: true` for diagnostic use and report native OOM abort a
 unavailable. The presence-only `--abort-on-seastar-bad-alloc` option cannot disable
 the broker default or enable native allocator behavior in a system-allocator build.
 
+System-allocator diagnostic runs also require an explicit
+`diagnostic_memory_per_shard_bytes`; the local example sets 128 MiB. Native builds
+use observed allocator capacity even when that diagnostic setting is present.
+With `storage_strict_data_init: true`, `.kwaque_data_dir` must already exist inside
+the data directory before startup. The broker never creates this marker.
+The operator must control the data directory and its parent paths; PID inode
+checks protect cleanup identity, not arbitrary external directory replacement.
+
+Production restart limiting defaults to `crash_loop_limit: 5`; developer mode
+bypasses it. Prepared crash reports and restart state are created only after PID
+ownership, which is held through shutdown bookkeeping. See the
+[broker lifecycle policy](src/broker/README.md) for reset boundaries, drain health,
+and the 15/120-second shutdown warning timers.
+
+Startup reports read-only host checks for filesystem, free space, cgroup limits,
+descriptors, swap, selected tuning state, and matching device I/O configuration.
+It does not tune the host or treat configured I/O rates as measured throughput.
+The admin listener uses bounded connections, headers, metrics work and absolute
+request lifetimes; see [admin limits](src/admin/README.md).
+
 ## Development
 
 Keep related commands in the same build configuration: switching configurations
 can invalidate Bazel's analysis cache and rebuild dependencies. Personal overrides
 belong in an untracked `user.bazelrc`.
 
-`ci-debug` enables first-party warnings as errors. `ci-release` selects optimized,
-hardened binaries. `ci-sanitizer` runs with ASan and UBSan, and `fuzz` combines
-libFuzzer with ASan and UBSan. The normal developer `dev` configuration uses light
-optimization and ASan. All configurations are defined in [`.bazelrc`](.bazelrc).
+The validation profiles enable first-party warnings as errors and select explicit
+allocator and injection settings:
+
+- `ci-debug`: native allocator with allocation-failure injection, without optimization.
+- `ci-native`: native allocator without injection or optimization.
+- `ci-release`: optimized, hardened native binaries with injection disabled.
+- `ci-sanitizer`: system allocator with ASan and UBSan; injection is disabled.
+
+Native reactor tests and benchmarks enable real-OOM abort. Synthetic injection
+remains independently recoverable, and required fault sweeps verify that injection
+actually occurred. Reactor and process-policy tests compare compiled capabilities
+and effective OOM behavior with independent expectations supplied by each profile.
+Unsupported process injection/OOM cases are reported as skipped.
+
+`fuzz` combines libFuzzer with ASan and UBSan. The normal developer `dev`
+configuration uses light optimization and ASan. All configurations are defined
+in [`.bazelrc`](.bazelrc).
 
 CI skips native builds, tests, formatting, and analysis for additions or edits
 limited to README files, contributor/security documents, and prose under
@@ -132,6 +168,8 @@ CI disk caches are separated by architecture and build configuration. One job
 per configuration writes a commit-specific snapshot; matching analysis and
 golden jobs restore it, falling back to an earlier snapshot for a new commit.
 Ordinary and fuzz clang-tidy jobs run independently of the release build.
+The native policy job uses its own configuration and cache. Release jobs execute
+focused runtime and process-policy tests after the ordinary build.
 
 ### Ordinary tests and builds
 
@@ -289,6 +327,10 @@ python3 tools/compare_benchmarks.py \
 ```
 
 The tool retains native JSON, logs, invocation order, and a comparison manifest.
+It requests OOM abort and records a native pre-run profile before accepting each
+result. Comparisons require optimized native allocation with injection and
+sanitizers disabled. The profile hook runs before timing and allocation snapshots;
+the caller still supplies release-build evidence for the measured binary.
 Equal work and fixture boundaries still require review; a passing time ratio
 alone does not establish an equivalent workload.
 

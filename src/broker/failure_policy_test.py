@@ -60,7 +60,27 @@ class FailurePolicyTest(unittest.TestCase):
         self.assertEqual(
             fields["abort"], "true" if fields["allocator"] == "native" else "false"
         )
-        self.assertIn(fields["injection"], ("true", "false"))
+        for field in ("injection", "optimized", "sanitized", "asan", "ubsan"):
+            self.assertIn(fields[field], ("true", "false"))
+        if fields["allocator"] == "system":
+            self.assertEqual(fields["injection"], "false")
+        expectations = {
+            "allocator": "KWAQUE_EXPECT_TEST_ALLOCATOR",
+            "injection": "KWAQUE_EXPECT_TEST_INJECTION",
+            "optimized": "KWAQUE_EXPECT_TEST_OPTIMIZED",
+            "sanitized": "KWAQUE_EXPECT_TEST_SANITIZED",
+        }
+        supplied = [name for name in expectations.values() if name in os.environ]
+        self.assertIn(
+            len(supplied), (0, len(expectations)),
+            "specify all four validation profile expectations",
+        )
+        for field, name in expectations.items():
+            if name in os.environ:
+                self.assertEqual(fields[field], os.environ[name], name)
+        if os.environ.get("KWAQUE_EXPECT_TEST_SANITIZED") == "true":
+            self.assertEqual(fields["asan"], "true", "ASan instrumentation is required")
+            self.assertEqual(fields["ubsan"], "true", "UBSan instrumentation is required")
         return fields
 
     def test_effective_default_and_presence_option(self) -> None:
@@ -84,19 +104,24 @@ class FailurePolicyTest(unittest.TestCase):
         self.assertEqual(
             result.returncode, -signal.SIGABRT if native else 77, result.stdout
         )
-        if native:
-            self.assertIn("Failed to allocate", result.stdout)
+        if not native:
+            self.skipTest(
+                "real native heap exhaustion is unavailable with the system allocator"
+            )
+        self.assertIn("Failed to allocate", result.stdout)
 
     def test_injected_failure_remains_an_exception(self) -> None:
         injection = self.capabilities()["injection"] == "true"
         result = self.run_probe("injection")
         self.assertEqual(result.returncode, 0 if injection else 77, result.stdout)
+        if not injection:
+            self.skipTest("allocation injection is disabled in this verified profile")
 
     def test_configured_admission_limits_remain_recoverable(self) -> None:
         result = self.run_probe("admission")
         self.assertEqual(result.returncode, 0, result.stdout)
 
-    def test_fatal_diagnostic_survives_armed_allocation_injection(self) -> None:
+    def test_fatal_diagnostic_preserves_invariant_message(self) -> None:
         result = self.run_probe("invariant")
         self.assertEqual(result.returncode, -signal.SIGABRT, result.stdout)
         self.assertIn("id=KQ-FAILURE-POLICY-PROBE", result.stdout)

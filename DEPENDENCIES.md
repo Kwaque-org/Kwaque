@@ -16,6 +16,11 @@ the build and lock files are dependency pins.
 | Seastar | `a6ac2ff6190a4a9dce5059991355703e1073d11f` | Compatibility pin |
 | `unordered_dense` | `f30ed41b58af8c79788e8581fe57a6faf856258e` | Compatibility pin with exception-safety corrections |
 
+The Abseil pin carries a Clang 23 compatibility patch that replaces deprecated
+`lifetime_capture_by(this)` annotations with `lifetime_capture_by_this` when
+available, retaining the existing fallback for older compilers. This preserves
+lifetime diagnostics without suppressing warnings or changing runtime behavior.
+
 The Seastar archive at this baseline has SHA-256
 `5918f72ec59c159a8d2fe36870e7d30c6e61426fde766d7dd6853fa7f9871f7f`.
 The archive is the Seastar fork maintained by Redpanda, selected as part of a
@@ -32,7 +37,23 @@ revision provides equivalent behavior. Non-release, non-sanitizer builds enable
 Seastar's native allocation-failure injection so the rollback boundary is
 executable; release and system-allocator sanitizer builds disable it.
 
-A second narrow Seastar patch makes its custom `chunked_vector` compatible with
+A scoped Seastar HTTP/metrics patch adds optional connection admission,
+header/body bounds, absolute exchange deadlines, and bounded metrics collection
+and formatting. The broker enables these controls for its administrative listener;
+other native HTTP and metrics users retain the default behavior. Dependency updates
+must preserve the early admission, parser-fragment and scrape-cleanup tests before
+removing or replacing this patch.
+Bounded snapshot accounting includes deque/map capacity and cached function storage;
+dirty bounded refreshes release old cache capacity before replacement. Its trusted
+callback-copy and temporary-allocation requirements are part of the native API
+contract. Filtered and empty output paths retain preemption checks.
+The Seastar patches use Bazel's native patch application so changes to patch
+contents invalidate the materialized repository.
+
+A header compatibility patch includes `<new>` at global scope in the native
+spinlock header, preserving its alignment and locking implementation with libc++.
+
+A separate Seastar patch makes its custom `chunked_vector` compatible with
 those failure guarantees: a new fragment is fully allocated before it is
 published into the outer fragment vector, capacity changes commit afterward,
 and the allocating copy surface is no longer declared `noexcept`. Together,
