@@ -2,6 +2,8 @@
 
 #include "src/base/error.h"
 
+#include <seastar/core/deleter.hh>
+
 #include <algorithm>
 #include <bit>
 #include <cstring>
@@ -16,6 +18,38 @@ namespace {
 [[nodiscard]] bool
 add_would_overflow(std::uint64_t left, std::uint64_t right) noexcept {
     return right > std::numeric_limits<std::uint64_t>::max() - left;
+}
+
+[[nodiscard]] result<void> add_allocation_charge(
+  buffer_allocation_cost& cost,
+  byte_count& category,
+  byte_count& total,
+  byte_count requested,
+  allocation_charge_fn charge) noexcept {
+    if (requested.value() == 0) {
+        return {};
+    }
+    const auto charged = charge(requested);
+    if (charged < requested) {
+        return failure(errc::invalid_argument);
+    }
+    const auto next_category = category.checked_add(charged);
+    const auto next_total = total.checked_add(charged);
+    if (!next_category || !next_total) {
+        return failure(errc::out_of_range);
+    }
+    category = *next_category;
+    total = *next_total;
+    cost.largest_allocation = std::max(cost.largest_allocation, charged);
+    return {};
+}
+
+[[nodiscard]] result<byte_count> descriptor_allocation_bytes(
+  std::uint64_t count, std::size_t descriptor_size) noexcept {
+    if (count > std::numeric_limits<std::uint64_t>::max() / descriptor_size) {
+        return failure(errc::out_of_range);
+    }
+    return byte_count{count * descriptor_size};
 }
 
 // Deep copies use exact small allocations, then lower-bound powers of two
@@ -168,6 +202,141 @@ result<fragment_view> fragmented_buffer::fragment_at(std::size_t index) const {
     return fragment_view{fragment.storage.get(), fragment.storage.size()};
 }
 
+result<buffer_allocation_cost>
+fragmented_buffer::allocation_cost(allocation_charge_fn charge) const noexcept {
+    return allocation_cost(0, fragments_.size(), charge);
+}
+
+result<buffer_allocation_cost> fragmented_buffer::allocation_cost(
+  std::size_t first,
+  std::size_t count,
+  allocation_charge_fn charge) const noexcept {
+    if (charge == nullptr) {
+        return failure(errc::invalid_argument);
+    }
+    if (first > fragments_.size() || count > fragments_.size() - first) {
+        return failure(errc::out_of_range);
+    }
+    buffer_allocation_cost cost;
+    byte_count total;
+    if (first == 0) {
+        const auto front = static_cast<std::uint64_t>(
+          fragments_.front_free_capacity());
+        const auto size = static_cast<std::uint64_t>(fragments_.size());
+        const auto back = static_cast<std::uint64_t>(
+          fragments_.back_free_capacity());
+        if (
+          add_would_overflow(front, size)
+          || add_would_overflow(front + size, back)) {
+            return failure(errc::out_of_range);
+        }
+        // devector::capacity() excludes relocation reserve, not allocated
+        // storage.
+        const auto descriptors = descriptor_allocation_bytes(
+          front + size + back, sizeof(owned_fragment));
+        if (!descriptors) {
+            return failure(descriptors.error());
+        }
+        if (
+          auto added = add_allocation_charge(
+            cost, cost.descriptors, total, *descriptors, charge);
+          !added) {
+            return failure(added.error());
+        }
+    }
+    for (std::size_t index = first; index < first + count; ++index) {
+        const auto& fragment = fragments_[index];
+        if (
+          auto added = add_allocation_charge(
+            cost, cost.backing, total, fragment.retained_bytes, charge);
+          !added) {
+            return failure(added.error());
+        }
+        if (
+          auto added = add_allocation_charge(
+            cost,
+            cost.share_controls,
+            total,
+            byte_count{sizeof(seastar::free_deleter_impl)},
+            charge);
+          !added) {
+            return failure(added.error());
+        }
+    }
+    cost.fragments = item_count{count};
+    return cost;
+}
+
+result<buffer_allocation_cost> fragmented_buffer::slice_allocation_cost(
+  byte_count offset,
+  byte_count length,
+  allocation_charge_fn charge) const noexcept {
+    if (charge == nullptr) {
+        return failure(errc::invalid_argument);
+    }
+    const auto end = offset.checked_add(length);
+    if (!end || *end > size_) {
+        return failure(errc::out_of_range);
+    }
+    buffer_allocation_cost cost;
+    if (length.value() == 0) {
+        return cost;
+    }
+    byte_count total;
+    std::uint64_t touched = 0;
+    auto skip = offset.value();
+    auto remaining = length.value();
+    for (const auto& fragment : fragments_) {
+        if (remaining == 0) {
+            break;
+        }
+        const auto fragment_size = static_cast<std::uint64_t>(
+          fragment.storage.size());
+        if (skip >= fragment_size) {
+            skip -= fragment_size;
+            continue;
+        }
+        if (
+          auto added = add_allocation_charge(
+            cost, cost.backing, total, fragment.retained_bytes, charge);
+          !added) {
+            return failure(added.error());
+        }
+        if (
+          auto added = add_allocation_charge(
+            cost,
+            cost.share_controls,
+            total,
+            byte_count{sizeof(seastar::free_deleter_impl)},
+            charge);
+          !added) {
+            return failure(added.error());
+        }
+        ++touched;
+        remaining -= std::min(fragment_size - skip, remaining);
+        skip = 0;
+    }
+    if (remaining != 0 || add_would_overflow(touched, touched)) {
+        return failure(errc::out_of_range);
+    }
+    const auto descriptors = descriptor_allocation_bytes(
+      touched + touched, sizeof(owned_fragment));
+    if (!descriptors) {
+        return failure(descriptors.error());
+    }
+    // Slice construction can grow its devector with old and new blocks live.
+    for (unsigned allocation = 0; allocation < 2; ++allocation) {
+        if (
+          auto added = add_allocation_charge(
+            cost, cost.descriptors, total, *descriptors, charge);
+          !added) {
+            return failure(added.error());
+        }
+    }
+    cost.fragments = item_count{touched};
+    return cost;
+}
+
 result<fragmented_buffer>
 fragmented_buffer::share(byte_count offset, byte_count length) {
     const auto end = offset.checked_add(length);
@@ -289,7 +458,9 @@ result<void> fragmented_buffer::trim_front(byte_count bytes) {
     size_ = *size_.checked_sub(bytes);
     retained_bytes_ = *retained_bytes_.checked_sub(released);
     invalidate_presentation();
-    drop_empty_fragments();
+    // Exhausted fragments were popped above and a partial trim remains
+    // nonempty. The untouched suffix is already canonical; rescanning it
+    // would make repeated bounded front consumption quadratic.
     return {};
 }
 

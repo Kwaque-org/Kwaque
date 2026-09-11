@@ -55,19 +55,19 @@ static_assert(
 
 } // namespace
 
-result<limits> limits::make(limits_config config) noexcept {
+kwaque::result<limits> limits::make(limits_config config) noexcept {
     for (const auto member : byte_limits) {
         if (
           (config.*member).value() == 0
           || config.*member > absolute_limits.*member) {
-            return failure(errc::invalid_argument);
+            return kwaque::failure(errc::invalid_argument);
         }
     }
     for (const auto member : count_limits) {
         if (
           (config.*member).value() == 0
           || config.*member > absolute_limits.*member) {
-            return failure(errc::invalid_argument);
+            return kwaque::failure(errc::invalid_argument);
         }
     }
     return limits{config};
@@ -84,7 +84,7 @@ limits limits::intersect(const limits& requested) const noexcept {
     return limits{narrowed};
 }
 
-result<void> limits::validate_buffer(
+kwaque::result<void> limits::validate_buffer(
   byte_count logical_bytes,
   byte_count retained_bytes,
   item_count fragments,
@@ -92,30 +92,30 @@ result<void> limits::validate_buffer(
     if (
       logical_bytes > retained_bytes
       || (retained_bytes.value() == 0) != (fragments.value() == 0)) {
-        return failure(errc::invalid_argument);
+        return kwaque::failure(errc::invalid_argument);
     }
     if (
       logical_bytes > logical_limit
       || retained_bytes > config_.max_retained_bytes
       || fragments > config_.max_buffer_fragments) {
-        return failure(errc::resource_exhausted);
+        return kwaque::failure(errc::resource_exhausted);
     }
     return {};
 }
 
-result<void> limits::validate_batch_counts(
+kwaque::result<void> limits::validate_batch_counts(
   item_count original_records,
   item_count retained_records,
   item_count headers) const noexcept {
     if (
       original_records.value() == 0 || retained_records.value() == 0
       || retained_records > original_records) {
-        return failure(errc::invalid_argument);
+        return kwaque::failure(errc::invalid_argument);
     }
     if (
       original_records > config_.max_original_records
       || headers > config_.max_batch_headers) {
-        return failure(errc::resource_exhausted);
+        return kwaque::failure(errc::resource_exhausted);
     }
     static_assert(
       absolute_max_original_records
@@ -125,12 +125,12 @@ result<void> limits::validate_batch_counts(
     const auto possible_headers = retained_records.value()
                                   * config_.max_record_headers.value();
     if (headers.value() > possible_headers) {
-        return failure(errc::resource_exhausted);
+        return kwaque::failure(errc::resource_exhausted);
     }
     return {};
 }
 
-result<byte_count> limits::remaining_operation_bytes(
+kwaque::result<byte_count> limits::remaining_operation_bytes(
   const operation_usage& usage, byte_count parent_remaining) const noexcept {
     byte_count accounted;
     for (const auto cost : std::array{
@@ -142,20 +142,20 @@ result<byte_count> limits::remaining_operation_bytes(
            usage.payload_migration}) {
         const auto next = accounted.checked_add(cost);
         if (!next) {
-            return failure(errc::out_of_range);
+            return kwaque::failure(errc::out_of_range);
         }
         accounted = *next;
     }
     if (
       usage.decoded_metadata > config_.max_metadata_bytes
       || usage.scratch > config_.max_scratch_bytes) {
-        return failure(errc::resource_exhausted);
+        return kwaque::failure(errc::resource_exhausted);
     }
     const auto available = std::min(
       config_.max_operation_bytes, parent_remaining);
     const auto remaining = available.checked_sub(accounted);
     if (!remaining) {
-        return failure(errc::resource_exhausted);
+        return kwaque::failure(errc::resource_exhausted);
     }
     return *remaining;
 }

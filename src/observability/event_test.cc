@@ -278,7 +278,7 @@ SEASTAR_TEST_CASE(event_descriptor_registries_are_stable_and_bounded) {
       long_field_name, event_field_name_bytes_max));
 
     const auto texts = kwaque::observability::event_text_descriptors();
-    BOOST_REQUIRE(texts.size() == 57U);
+    BOOST_REQUIRE(texts.size() == 60U);
     for (std::size_t index = 0; index < texts.size(); ++index) {
         BOOST_CHECK(static_cast<std::uint16_t>(texts[index].id) == index + 1U);
         BOOST_CHECK(
@@ -307,10 +307,47 @@ SEASTAR_TEST_CASE(event_descriptor_registries_are_stable_and_bounded) {
       == nullptr);
     BOOST_CHECK(
       !kwaque::observability::event_reason_for(kwaque::errc::success));
-    for (std::uint8_t value = 1; value <= 23U; ++value) {
+    for (std::uint8_t value = 1; value <= 26U; ++value) {
         BOOST_CHECK(
           kwaque::observability::event_reason_for(
             static_cast<kwaque::errc>(value)));
+    }
+
+    struct reason_case final {
+        kwaque::errc reason;
+        event_public_text text_id;
+        std::uint16_t id;
+        std::string_view value;
+    };
+    constexpr std::array new_reasons{
+      reason_case{
+        kwaque::errc::corrupt_data,
+        event_public_text::reason_corrupt_data,
+        58,
+        "corrupt_data"},
+      reason_case{
+        kwaque::errc::wrong_context,
+        event_public_text::reason_wrong_context,
+        59,
+        "wrong_context"},
+      reason_case{
+        kwaque::errc::unsupported_format,
+        event_public_text::reason_unsupported_format,
+        60,
+        "unsupported_format"}};
+    for (const auto& expected : new_reasons) {
+        const auto mapped = kwaque::observability::event_reason_for(
+          expected.reason);
+        BOOST_REQUIRE(mapped.has_value());
+        BOOST_CHECK(*mapped == expected.text_id);
+        BOOST_CHECK(static_cast<std::uint16_t>(*mapped) == expected.id);
+        const auto* descriptor = kwaque::observability::descriptor_for(*mapped);
+        BOOST_REQUIRE(descriptor != nullptr);
+        BOOST_CHECK(descriptor->role == event_field_key::reason);
+        BOOST_CHECK(descriptor->value == expected.value);
+        const auto made = event_text::make(*mapped);
+        BOOST_REQUIRE(made.has_value());
+        BOOST_CHECK(made->value() == expected.value);
     }
     co_return;
 }

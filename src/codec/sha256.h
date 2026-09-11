@@ -1,15 +1,13 @@
-#ifndef KWAQUE_SRC_SIMULATION_SHA256_H_
-#define KWAQUE_SRC_SIMULATION_SHA256_H_
+#ifndef KWAQUE_SRC_CODEC_SHA256_H_
+#define KWAQUE_SRC_CODEC_SHA256_H_
 
-#include <array>
+#include "src/codec/digest.h"
+
 #include <cstddef>
 
 struct evp_md_ctx_st;
 
-namespace kwaque::simulation {
-
-inline constexpr std::size_t sha256_digest_bytes{32};
-using sha256_digest = std::array<unsigned char, sha256_digest_bytes>;
+namespace kwaque::codec {
 
 class sha256_hasher final {
 public:
@@ -27,6 +25,6 @@ private:
     evp_md_ctx_st* context_;
 };
 
-} // namespace kwaque::simulation
+} // namespace kwaque::codec
 
-#endif // KWAQUE_SRC_SIMULATION_SHA256_H_
+#endif // KWAQUE_SRC_CODEC_SHA256_H_

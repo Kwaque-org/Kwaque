@@ -306,6 +306,8 @@ jobs:
           //src/config:bootstrap_config_fuzz
           //proto/kwaque/common/v1:build_info_fuzz
           //src/bytes:fragmented_buffer_fuzz
+          //src/codec/tests:codec_fuzz
+          //src/codec/tests:codec_cooperative_fuzz
           //src/simulation/tests:scheduler_fuzz
           //src/simulation/tests:fault_schedule_fuzz
           //src/simulation/tests:fake_file_fuzz

@@ -2,6 +2,7 @@
 #include "src/base/units.h"
 #include "src/bytes/fragmented_buffer.h"
 #include "src/bytes/fragmented_buffer_builder.h"
+#include "src/bytes/fragmented_buffer_test_support.h"
 
 #include <seastar/core/deleter.hh>
 #include <seastar/core/memory.hh>
@@ -27,13 +28,6 @@
 #include <vector>
 
 namespace kwaque::bytes {
-
-class fragmented_buffer_test_access final {
-public:
-    static void set_last_usable_generation(fragmented_buffer& buffer) noexcept {
-        buffer.generation_ = std::numeric_limits<std::uint64_t>::max() - 1;
-    }
-};
 
 namespace {
 
@@ -1288,6 +1282,75 @@ TEST(BufferBuilder, PublishedSlicesSurviveTheBuilderAndOriginal) {
     }
     EXPECT_EQ(contents(slice), expected);
     EXPECT_EQ(contents(slice), "defg");
+}
+
+TEST(FragmentedBuffer, BoundedCostQueriesPreserveWholeAndTrimmedAccounting) {
+    const auto charge = +[](byte_count requested) noexcept {
+        return byte_count{requested.value() + 16U};
+    };
+    auto input = fragmented({"a", "bc", "def"});
+    const auto whole = input.allocation_cost(charge).value();
+    buffer_allocation_cost total;
+    for (std::size_t index = 0; index < input.fragment_count(); ++index) {
+        const auto part = input.allocation_cost(index, 1, charge).value();
+        total.backing = total.backing.checked_add(part.backing).value();
+        total.descriptors
+          = total.descriptors.checked_add(part.descriptors).value();
+        total.share_controls
+          = total.share_controls.checked_add(part.share_controls).value();
+        total.fragments = total.fragments.checked_add(part.fragments).value();
+        total.largest_allocation = std::max(
+          total.largest_allocation, part.largest_allocation);
+        if (index != 0) {
+            EXPECT_EQ(part.descriptors, byte_count{});
+        }
+    }
+    EXPECT_EQ(total, whole);
+    EXPECT_TRUE(input.content_equals(std::string_view{"abcdef"}));
+    EXPECT_EQ(input.allocation_cost(3, 1, charge).error(), errc::out_of_range);
+    EXPECT_EQ(input.allocation_cost(4, 0, charge).error(), errc::out_of_range);
+    EXPECT_EQ(
+      input.allocation_cost(0, 1, nullptr).error(), errc::invalid_argument);
+    ASSERT_TRUE(input.trim_front(input.size()).has_value());
+    const auto empty = input.allocation_cost(0, 0, charge).value();
+    EXPECT_EQ(empty, input.allocation_cost(charge).value());
+    EXPECT_EQ(empty.descriptors, whole.descriptors);
+    EXPECT_EQ(empty.backing, byte_count{});
+}
+
+TEST(BufferBuilder, DescriptorReservationPreservesContentAndExistingCapacity) {
+    fragmented_buffer_builder_config config;
+    config.max_fragments = 4;
+    fragmented_buffer_builder builder{config};
+    ASSERT_TRUE(builder.reserve_fragments(item_count{4}).has_value());
+    EXPECT_TRUE(builder.empty());
+    EXPECT_EQ(builder.fragment_count(), 0U);
+    ASSERT_TRUE(builder.append(std::string_view{"abc"}).has_value());
+    EXPECT_EQ(
+      builder.reserve_fragments(item_count{5}).error(), errc::out_of_range);
+    ASSERT_TRUE(builder.reserve_fragments(item_count{1}).has_value());
+    EXPECT_EQ(builder.size(), byte_count{3});
+#if defined(SEASTAR_ENABLE_ALLOC_FAILURE_INJECTION)
+    auto& injector = seastar::memory::local_failure_injector();
+    const auto before = injector.alloc_count();
+    injector.fail_after(0);
+    bool succeeded = false;
+    try {
+        succeeded = builder.reserve_fragments(item_count{4}).has_value();
+    } catch (...) {
+        injector.cancel();
+        throw;
+    }
+    const bool injected = injector.failed();
+    const auto after = injector.alloc_count();
+    injector.cancel();
+    EXPECT_TRUE(succeeded);
+    EXPECT_FALSE(injected);
+    EXPECT_EQ(before, after);
+#endif
+    auto published = builder.finish().value();
+    EXPECT_TRUE(published.content_equals(std::string_view{"abc"}));
+    EXPECT_EQ(builder.reserve_fragments(item_count{1}).error(), errc::closed);
 }
 
 } // namespace kwaque::bytes

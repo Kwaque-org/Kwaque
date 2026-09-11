@@ -76,7 +76,8 @@ public:
         return limits{limits_config{}};
     }
 
-    [[nodiscard]] static result<limits> make(limits_config config) noexcept;
+    [[nodiscard]] static kwaque::result<limits>
+    make(limits_config config) noexcept;
 
     // An owning snapshot; editing it cannot mutate a validated limits value.
     [[nodiscard]] constexpr limits_config config() const noexcept {
@@ -88,10 +89,10 @@ public:
     [[nodiscard]] limits intersect(const limits& requested) const noexcept;
 
     // Supply the served/reserved allocation capacity, including rounding.
-    [[nodiscard]] result<void>
+    [[nodiscard]] kwaque::result<void>
     validate_allocation(byte_count charged_capacity) const noexcept {
         if (charged_capacity > config_.max_allocation_bytes) {
-            return failure(errc::resource_exhausted);
+            return kwaque::failure(errc::resource_exhausted);
         }
         return {};
     }
@@ -100,7 +101,7 @@ public:
     // Empty allocated staging is valid. The owner supplies the complete logical
     // cap for this buffer; a body cap alone omits envelope headers/padding.
     // Each actual allocation still needs its own capacity check.
-    [[nodiscard]] result<void> validate_buffer(
+    [[nodiscard]] kwaque::result<void> validate_buffer(
       byte_count logical_bytes,
       byte_count retained_bytes,
       item_count fragments,
@@ -109,7 +110,7 @@ public:
     // Data-bearing batches only. Zero retained data uses separate extent/retry
     // metadata. These bounds do not prove per-record counts or payload
     // contents.
-    [[nodiscard]] result<void> validate_batch_counts(
+    [[nodiscard]] kwaque::result<void> validate_batch_counts(
       item_count original_records,
       item_count retained_records,
       item_count headers) const noexcept;
@@ -119,7 +120,7 @@ public:
     // only with ownership/accounting evidence. parent_remaining is mandatory,
     // including zero; no child receives a fresh allowance. This check does not
     // reserve or mutate the supplied budget.
-    [[nodiscard]] result<byte_count> remaining_operation_bytes(
+    [[nodiscard]] kwaque::result<byte_count> remaining_operation_bytes(
       const operation_usage& usage, byte_count parent_remaining) const noexcept;
 
     bool operator==(const limits&) const noexcept = default;

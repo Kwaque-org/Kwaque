@@ -60,6 +60,12 @@ public:
             return "is a directory";
         case errc::not_a_directory:
             return "not a directory";
+        case errc::corrupt_data:
+            return "corrupt data";
+        case errc::wrong_context:
+            return "wrong context";
+        case errc::unsupported_format:
+            return "unsupported format";
         }
         return "unknown Kwaque error";
     }
@@ -103,6 +109,9 @@ public:
         case errc::replay_divergence:
         case errc::invariant_violation:
         case errc::truncated_data:
+        case errc::corrupt_data:
+        case errc::wrong_context:
+        case errc::unsupported_format:
             return {value, *this};
         case errc::success:
             return std::error_condition{};

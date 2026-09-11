@@ -1,7 +1,7 @@
+#include "src/codec/sha256.h"
 #include "src/simulation/deterministic_random.h"
 #include "src/simulation/event_trace.h"
 #include "src/simulation/scheduler.h"
-#include "src/simulation/sha256.h"
 #include "src/simulation/virtual_time.h"
 
 #include <seastar/core/coroutine.hh>
@@ -21,6 +21,8 @@
 
 namespace {
 
+using kwaque::codec::sha256_digest;
+using kwaque::codec::sha256_hasher;
 using kwaque::simulation::deterministic_random;
 using kwaque::simulation::event_priority;
 using kwaque::simulation::event_trace;
@@ -29,8 +31,6 @@ using kwaque::simulation::random_domain;
 using kwaque::simulation::scheduler;
 using kwaque::simulation::scheduler_limit_values;
 using kwaque::simulation::scheduler_limits;
-using kwaque::simulation::sha256_digest;
-using kwaque::simulation::sha256_hasher;
 using kwaque::simulation::trace_action;
 using kwaque::simulation::trace_artifact;
 using kwaque::simulation::trace_digest;

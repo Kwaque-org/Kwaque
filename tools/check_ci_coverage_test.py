@@ -35,6 +35,8 @@ SMOKE_FUZZERS = {f"//src/simulation/tests:{name}" for name in STATEFUL_FUZZERS} 
     "//src/config:bootstrap_config_fuzz",
     "//proto/kwaque/common/v1:build_info_fuzz",
     "//src/bytes:fragmented_buffer_fuzz",
+    "//src/codec/tests:codec_fuzz",
+    "//src/codec/tests:codec_cooperative_fuzz",
     "//src/simulation/tests:signal_canary_test",
 }
 

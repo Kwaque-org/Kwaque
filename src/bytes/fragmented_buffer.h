@@ -37,6 +37,26 @@ inline constexpr byte_count max_buffer_bytes{
 // the platform rather than assumed, so a full batch is always submittable.
 inline constexpr std::size_t max_scatter_vectors = 1024;
 
+// A stable, nonallocating, nondecreasing upper-bound function verified for the
+// caller's allocator profile. It charges served capacity for a requested
+// allocation, not shard RSS.
+using allocation_charge_fn = byte_count (*)(byte_count) noexcept;
+
+struct buffer_allocation_cost final {
+    byte_count backing;
+    byte_count descriptors;
+    byte_count share_controls;
+    // Largest individual charge among the reported components.
+    byte_count largest_allocation;
+    item_count fragments;
+
+    bool operator==(const buffer_allocation_cost&) const = default;
+};
+
+// Cost queries cover recorded backing, descriptor capacity and possible raw
+// deleter promotion. Any other resources retained by an opaque native deleter
+// remain the producer's accounting responsibility; they cannot be introspected.
+
 // A borrowed read-only window onto one fragment's bytes. Valid only while the
 // buffer that produced it is alive and untrimmed.
 class fragment_view final {
@@ -250,6 +270,36 @@ public:
     [[nodiscard]] std::size_t fragment_count() const noexcept {
         return fragments_.size();
     }
+    [[nodiscard]] static constexpr std::size_t
+    fragment_descriptor_size() noexcept {
+        return sizeof(owned_fragment);
+    }
+
+    // Conservative charges under a nonnull verified profile function, without
+    // allocating, sharing or changing the buffer. Includes descriptor capacity
+    // retained by earlier trims and one potential share control per fragment;
+    // aliases are not deduplicated. This is not allocator introspection or an
+    // admission decision. The function must never charge less than requested.
+    [[nodiscard]] result<buffer_allocation_cost>
+    allocation_cost(allocation_charge_fn charge) const noexcept;
+
+    // Bounded accounting for cooperative owners. The range beginning at zero
+    // includes the physical descriptor allocation (even for an empty buffer);
+    // other ranges include only their backing and possible share controls.
+    // Sum disjoint consecutive ranges to obtain the whole-buffer charge.
+    [[nodiscard]] result<buffer_allocation_cost> allocation_cost(
+      std::size_t first,
+      std::size_t count,
+      allocation_charge_fn charge) const noexcept;
+
+    // Charges the touched backing and potential share controls, plus both old
+    // and new child descriptor allocations during bounded slice construction.
+    // It excludes the parent's descriptors. A zero-length slice has zero cost
+    // and makes no charge-function calls, even if the parent retains capacity.
+    [[nodiscard]] result<buffer_allocation_cost> slice_allocation_cost(
+      byte_count offset,
+      byte_count length,
+      allocation_charge_fn charge) const noexcept;
 
     [[nodiscard]] result<fragment_view> fragment_at(std::size_t index) const;
     [[nodiscard]] const_iterator begin() const noexcept {

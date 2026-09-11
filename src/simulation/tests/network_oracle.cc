@@ -1,7 +1,7 @@
 #include "src/simulation/tests/network_oracle.h"
 
+#include "src/codec/sha256.h"
 #include "src/simulation/deterministic_random.h"
-#include "src/simulation/sha256.h"
 
 #include <boost/multiprecision/cpp_int/import_export.hpp>
 
@@ -279,7 +279,7 @@ solve_bandwidth_oracle(std::span<const oracle_flow> flows) {
           });
     }
 
-    sha256_hasher hasher;
+    codec::sha256_hasher hasher;
     auto update = [&](const void* data, std::size_t size) {
         hasher.update(data, size);
     };

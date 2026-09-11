@@ -1,7 +1,7 @@
 #include "src/base/allocation.h"
+#include "src/codec/sha256.h"
 #include "src/runtime/fault.h"
 #include "src/simulation/event_trace.h"
-#include "src/simulation/sha256.h"
 
 #include <gtest/gtest.h>
 
@@ -219,12 +219,12 @@ TEST(EventTraceTest, EncodingAndParsingMatchTheCanonicalGoldenFixture) {
     const auto encoded_text = encoded->to_string();
     ASSERT_TRUE(encoded_text.has_value());
     EXPECT_EQ(*encoded_text, golden_trace);
-    constexpr kwaque::simulation::sha256_digest expected_hash{
+    constexpr kwaque::codec::sha256_digest expected_hash{
       0xf1, 0xf0, 0x4f, 0x77, 0x25, 0xe5, 0xe4, 0x85, 0x85, 0x8a, 0x00,
       0x9c, 0x3c, 0x1a, 0x9f, 0x84, 0xd1, 0x50, 0x23, 0x4c, 0x21, 0xb5,
       0x64, 0xc6, 0x32, 0xfd, 0x9c, 0xab, 0x78, 0x7a, 0x9c, 0x91,
     };
-    kwaque::simulation::sha256_hasher hasher;
+    kwaque::codec::sha256_hasher hasher;
     for (const auto& chunk : encoded->chunks()) {
         hasher.update(chunk.data(), chunk.size());
     }

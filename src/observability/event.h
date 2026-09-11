@@ -243,6 +243,9 @@ enum class event_public_text : std::uint16_t {
     reason_directory_not_empty = 55,
     reason_is_a_directory = 56,
     reason_not_a_directory = 57,
+    reason_corrupt_data = 58,
+    reason_wrong_context = 59,
+    reason_unsupported_format = 60,
 };
 
 struct event_text_descriptor final {

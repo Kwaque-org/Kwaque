@@ -31,11 +31,11 @@ kwaque_cc_library(
     srcs = ["fuzz_reproduction.cc"],
     hdrs = ["fuzz_reproduction.h"],
     deps = [
+        "//src/codec:sha256",
         "//src/observability:event",
         "//src/observability:event_log",
         "//src/runtime:error",
         "//src/simulation:event_trace",
-        "//src/simulation:sha256",
         "@seastar",
     ],
 )
@@ -54,6 +54,7 @@ kwaque_cc_library(
         ":network_oracle",
         "//src/base",
         "//src/bytes:fragmented_buffer",
+        "//src/codec:sha256",
         "//src/observability:event",
         "//src/observability:event_log",
         "//src/resource:workload_class",
@@ -74,7 +75,6 @@ kwaque_cc_library(
         "//src/simulation:fault_schedule",
         "//src/simulation:scheduler",
         "//src/simulation:scheduler_driver",
-        "//src/simulation:sha256",
         "//src/simulation:structured_event_sink",
         "@openssl",
         "@seastar",
@@ -306,10 +306,10 @@ kwaque_cc_library(
     srcs = ["network_oracle.cc"],
     hdrs = ["network_oracle.h"],
     deps = [
+        "//src/codec:sha256",
         "//src/runtime:error",
         "//src/runtime:fault_api",
         "//src/simulation:deterministic_random",
-        "//src/simulation:sha256",
         "@boost//:multiprecision",
     ],
 )
@@ -416,6 +416,7 @@ kwaque_cc_seastar_test(
     memory = "256MiB",
     deps = [
         "//src/base",
+        "//src/codec:sha256",
         "//src/observability:event",
         "//src/observability:event_log",
         "//src/resource:resource_manager",
@@ -435,7 +436,6 @@ kwaque_cc_seastar_test(
         "//src/simulation:fault_schedule",
         "//src/simulation:scheduler",
         "//src/simulation:scheduler_driver",
-        "//src/simulation:sha256",
     ],
 )
 
@@ -447,6 +447,7 @@ kwaque_cc_seastar_test(
     deps = [
         "//src/base",
         "//src/base:error",
+        "//src/codec:sha256",
         "//src/observability:event",
         "//src/observability:event_codec",
         "//src/observability:event_log",
@@ -462,7 +463,6 @@ kwaque_cc_seastar_test(
         "//src/simulation:fake_dns",
         "//src/simulation:fake_file_test_support",
         "//src/simulation:scheduler_driver",
-        "//src/simulation:sha256",
     ],
 )
 
@@ -553,9 +553,9 @@ kwaque_cc_test(
     srcs = ["event_trace_test.cc"],
     deps = [
         "//src/base",
+        "//src/codec:sha256",
         "//src/runtime:fault_api",
         "//src/simulation:event_trace",
-        "//src/simulation:sha256",
     ],
 )
 
@@ -575,10 +575,10 @@ kwaque_cc_seastar_test(
     cpu = 1,
     memory = "256MiB",
     deps = [
+        "//src/codec:sha256",
         "//src/simulation:deterministic_random",
         "//src/simulation:event_trace",
         "//src/simulation:scheduler",
-        "//src/simulation:sha256",
         "//src/simulation:virtual_time",
     ],
 )

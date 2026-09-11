@@ -58,6 +58,19 @@ kwaque_cc_seastar_gtest(
     deps = [
         ":fragmented_buffer",
         ":fragmented_buffer_builder",
+        ":fragmented_buffer_test_support",
+        "//src/base",
+        "//src/base:error",
+    ],
+)
+
+kwaque_cc_library(
+    name = "fragmented_buffer_test_support",
+    testonly = True,
+    hdrs = ["fragmented_buffer_test_support.h"],
+    visibility = ["//src/codec/tests:__pkg__"],
+    deps = [
+        ":fragmented_buffer",
         "//src/base",
         "//src/base:error",
     ],
