@@ -30,7 +30,10 @@ archive_override(
     module_name = "rules_boost",
     integrity = "sha256-wQsxOxZh1tluc6AXj+ncsYhBSl03uC+hPhBrU6JkupI=",
     patch_strip = 1,
-    patches = ["//bazel/thirdparty:rules-boost-license.patch"],
+    patches = [
+        "//bazel/thirdparty:rules-boost-license.patch",
+        "//bazel/thirdparty:rules-boost-uuid-value.patch",
+    ],
     strip_prefix = "rules_boost-f5b0f8c904f2487d8f5a9a956d4388724e627210",
     urls = ["https://github.com/nelhage/rules_boost/archive/f5b0f8c904f2487d8f5a9a956d4388724e627210.tar.gz"],
 )

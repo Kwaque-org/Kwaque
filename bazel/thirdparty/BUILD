@@ -6,6 +6,7 @@ exports_files([
     "lksctp.BUILD",
     "lz4-namespace-xxhash.patch",
     "openssl.BUILD",
+    "rules-boost-uuid-value.patch",
     "seastar.BUILD",
     "seastar-chunked-vector-exception-safety.patch",
     "seastar-http-resource-limits.patch",

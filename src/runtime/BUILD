@@ -53,12 +53,28 @@ kwaque_cc_library(
 )
 
 kwaque_cc_library(
+    name = "file_position",
+    hdrs = ["file_position.h"],
+    visibility = [
+        "//src/model:__pkg__",
+        "//src/model/tests:__pkg__",
+        "//src/protocol:__pkg__",
+        "//src/protocol/tests:__pkg__",
+        "//src/runtime/tests:__pkg__",
+        "//src/storage:__pkg__",
+        "//src/storage/tests:__pkg__",
+    ],
+    deps = ["//src/base"],
+)
+
+kwaque_cc_library(
     name = "file",
     srcs = ["file.cc"],
     hdrs = ["file.h"],
     visibility = ["//visibility:public"],
     deps = [
         ":error",
+        ":file_position",
         ":fragmented_buffer_internal",
         ":operation_statistics",
         ":shard_affinity",

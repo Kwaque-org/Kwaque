@@ -1,4 +1,6 @@
+#include "src/base/units.h"
 #include "src/runtime/file.h"
+#include "src/runtime/file_position.h"
 
 #include <seastar/core/future.hh>
 
@@ -6,6 +8,8 @@
 
 #include <algorithm>
 #include <cstddef>
+#include <cstdint>
+#include <limits>
 #include <string>
 #include <type_traits>
 #include <utility>
@@ -43,6 +47,24 @@ static_assert(!kwaque::runtime::file_system_backend<invalid_file_system>);
 static_assert(std::is_move_constructible_v<kwaque::runtime::file>);
 static_assert(!std::is_move_assignable_v<kwaque::runtime::file>);
 static_assert(!std::is_copy_constructible_v<kwaque::runtime::file>);
+
+TEST(FileContractTest, FilePositionPreservesItsExistingInterface) {
+    using kwaque::runtime::file_position;
+    constexpr file_position zero;
+    constexpr file_position maximum{std::numeric_limits<std::uint64_t>::max()};
+    constexpr auto next = zero.checked_add(kwaque::byte_count{17});
+    constexpr auto terminal = maximum.checked_add(kwaque::byte_count{0});
+    constexpr auto overflow = maximum.checked_add(kwaque::byte_count{1});
+
+    static_assert(sizeof(file_position) == sizeof(std::uint64_t));
+    static_assert(std::is_trivially_copyable_v<file_position>);
+    static_assert(!std::is_convertible_v<std::uint64_t, file_position>);
+    static_assert(next.has_value() && next->value() == 17);
+    static_assert(terminal.has_value() && *terminal == maximum);
+    static_assert(!overflow.has_value());
+    EXPECT_LT(zero, *next);
+    EXPECT_LT(*next, maximum);
+}
 
 TEST(FileContractTest, ValidatesBoundedPathsAndDirectoryNames) {
     auto path = kwaque::runtime::file_path::make("data/segment.log");
