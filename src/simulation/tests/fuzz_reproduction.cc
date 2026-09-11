@@ -1,8 +1,8 @@
 #include "src/simulation/tests/fuzz_reproduction.h"
 
+#include "src/codec/sha256.h"
 #include "src/observability/event.h"
 #include "src/simulation/determinism_version.h"
-#include "src/simulation/sha256.h"
 
 #include <seastar/coroutine/maybe_yield.hh>
 
@@ -82,7 +82,7 @@ template<typename Integer>
   const fuzz_digest& terminal_digest,
   const fuzz_digest& trace_digest,
   const fuzz_digest& event_digest) {
-    sha256_hasher hasher;
+    codec::sha256_hasher hasher;
     constexpr std::string_view domain{"KQREPRO"};
     hasher.update(domain.data(), domain.size());
     const auto update_integer = [&hasher]<typename Integer>(Integer value) {
@@ -612,13 +612,13 @@ runtime::result<fuzz_reproduction> fuzz_reproduction::make(
 }
 
 fuzz_digest digest_bytes(std::span<const std::uint8_t> bytes) {
-    sha256_hasher hasher;
+    codec::sha256_hasher hasher;
     hasher.update(bytes.data(), bytes.size());
     return std::move(hasher).final();
 }
 
 fuzz_digest digest_trace(const trace_artifact& trace) {
-    sha256_hasher hasher;
+    codec::sha256_hasher hasher;
     for (const auto& chunk : trace.chunks()) {
         hasher.update(chunk.data(), chunk.size());
     }
@@ -626,7 +626,7 @@ fuzz_digest digest_trace(const trace_artifact& trace) {
 }
 
 fuzz_digest digest_events(const observability::event_log_artifact& events) {
-    sha256_hasher hasher;
+    codec::sha256_hasher hasher;
     for (const auto& chunk : events.chunks()) {
         hasher.update(chunk.data(), chunk.size());
     }

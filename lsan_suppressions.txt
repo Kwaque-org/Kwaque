@@ -1,1 +1,6 @@
 # Add narrowly scoped LeakSanitizer suppressions only when a test proves they are required.
+
+# Live alien queues retain cached nodes through Boost's compressed tagged
+# free-list head, which LSan cannot trace during libFuzzer's per-input checks.
+# These nodes remain owned until the queue destructor frees them.
+leak:boost::lockfree::detail::freelist_stack<boost::lockfree::queue<seastar::alien::message_queue::work_item*>

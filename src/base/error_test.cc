@@ -19,6 +19,9 @@ static_assert(static_cast<int>(kwaque::errc::not_found) == 18);
 static_assert(static_cast<int>(kwaque::errc::directory_not_empty) == 21);
 static_assert(static_cast<int>(kwaque::errc::is_a_directory) == 22);
 static_assert(static_cast<int>(kwaque::errc::not_a_directory) == 23);
+static_assert(static_cast<int>(kwaque::errc::corrupt_data) == 24);
+static_assert(static_cast<int>(kwaque::errc::wrong_context) == 25);
+static_assert(static_cast<int>(kwaque::errc::unsupported_format) == 26);
 
 struct error_case final {
     kwaque::errc code;
@@ -51,6 +54,9 @@ constexpr std::array cases{
   error_case{kwaque::errc::directory_not_empty, 21, "directory not empty"},
   error_case{kwaque::errc::is_a_directory, 22, "is a directory"},
   error_case{kwaque::errc::not_a_directory, 23, "not a directory"},
+  error_case{kwaque::errc::corrupt_data, 24, "corrupt data"},
+  error_case{kwaque::errc::wrong_context, 25, "wrong context"},
+  error_case{kwaque::errc::unsupported_format, 26, "unsupported format"},
 };
 
 TEST(ErrorTest, PreservesStableValuesAndRoundTripsEveryCode) {
@@ -115,6 +121,26 @@ TEST(ErrorTest, MapsOnlyPortableConditionsToStandardEquivalents) {
     EXPECT_NE(
       kwaque::make_error_code(kwaque::errc::wrong_shard),
       std::errc::invalid_argument);
+}
+
+TEST(ErrorTest, CodecFailureConditionsRemainDistinct) {
+    for (const auto reason :
+         {kwaque::errc::corrupt_data,
+          kwaque::errc::wrong_context,
+          kwaque::errc::unsupported_format}) {
+        const auto condition
+          = kwaque::make_error_code(reason).default_error_condition();
+        EXPECT_EQ(&condition.category(), &kwaque::error_category());
+        EXPECT_EQ(condition.value(), static_cast<int>(reason));
+        for (const auto& test_case : cases) {
+            if (test_case.code != reason) {
+                EXPECT_NE(
+                  condition,
+                  kwaque::make_error_code(test_case.code)
+                    .default_error_condition());
+            }
+        }
+    }
 }
 
 } // namespace

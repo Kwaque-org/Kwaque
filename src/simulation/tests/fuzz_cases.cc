@@ -2,6 +2,7 @@
 
 #include "src/base/units.h"
 #include "src/bytes/fragmented_buffer.h"
+#include "src/codec/sha256.h"
 #include "src/observability/event.h"
 #include "src/observability/event_log.h"
 #include "src/resource/workload_class.h"
@@ -18,7 +19,6 @@
 #include "src/simulation/fake_network.h"
 #include "src/simulation/fault_schedule.h"
 #include "src/simulation/scheduler.h"
-#include "src/simulation/sha256.h"
 #include "src/simulation/tests/fake_file_model.h"
 #include "src/simulation/tests/fuzz_network_cases.h"
 #include "src/simulation/tests/network_oracle.h"
@@ -196,7 +196,7 @@ public:
     [[nodiscard]] fuzz_digest finish() && { return std::move(hasher_).final(); }
 
 private:
-    sha256_hasher hasher_;
+    codec::sha256_hasher hasher_;
 };
 
 class fuzz_case_context final {

@@ -30,6 +30,9 @@ enum class errc {
     directory_not_empty = 21,
     is_a_directory = 22,
     not_a_directory = 23,
+    corrupt_data = 24,
+    wrong_context = 25,
+    unsupported_format = 26,
 };
 
 [[nodiscard]] const std::error_category& error_category() noexcept;

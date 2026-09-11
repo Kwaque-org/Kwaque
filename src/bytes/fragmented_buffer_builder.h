@@ -104,6 +104,11 @@ public:
     // max_fragment_bytes.
     [[nodiscard]] result<void> reserve(byte_count bytes);
 
+    // Reserve descriptor storage before bounded splices. This does not add
+    // bytes or fragments. The caller admits the allocation and any migration
+    // of existing descriptors; an empty builder has no migration work.
+    [[nodiscard]] result<void> reserve_fragments(item_count count);
+
     // Publishes the accumulated bytes. One-way: the builder holds nothing
     // afterwards and every later append, reserve, or finish reports closed. The
     // flag rather than a reference qualifier enforces this, so a caller can

@@ -8,14 +8,6 @@ filegroup(
 )
 
 kwaque_cc_library(
-    name = "sha256",
-    srcs = ["sha256.cc"],
-    hdrs = ["sha256.h"],
-    visibility = ["//src/simulation:__subpackages__"],
-    deps = ["@openssl"],
-)
-
-kwaque_cc_library(
     name = "event_trace",
     srcs = ["event_trace.cc"],
     hdrs = [
@@ -307,9 +299,9 @@ kwaque_cc_library(
     hdrs = ["bandwidth.h"],
     visibility = ["//src/simulation:__subpackages__"],
     deps = [
-        ":sha256",
         "//src/base",
         "//src/base:invariant",
+        "//src/codec:sha256",
         "//src/runtime:error",
         "//src/runtime:time",
         "@boost//:multiprecision",

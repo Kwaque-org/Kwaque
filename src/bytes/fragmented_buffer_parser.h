@@ -60,6 +60,15 @@ public:
         return checkpoint_depth_;
     }
 
+    [[nodiscard]] result<buffer_allocation_cost>
+    allocation_cost(allocation_charge_fn charge) const noexcept {
+        return buffer_.allocation_cost(charge);
+    }
+    [[nodiscard]] result<buffer_allocation_cost> next_buffer_allocation_cost(
+      byte_count length, allocation_charge_fn charge) const noexcept {
+        return buffer_.slice_allocation_cost(at_.consumed, length, charge);
+    }
+
     [[nodiscard]] result<void> skip(byte_count bytes);
 
     // Copies out without advancing.

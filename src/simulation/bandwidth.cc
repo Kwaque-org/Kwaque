@@ -1,7 +1,7 @@
 #include "src/simulation/bandwidth.h"
 
 #include "src/base/invariant.h"
-#include "src/simulation/sha256.h"
+#include "src/codec/sha256.h"
 
 #include <seastar/core/chunked_vector.hh>
 
@@ -495,7 +495,7 @@ std::uint32_t bandwidth_planner::maximum_flows() const noexcept {
 }
 
 bandwidth_allocation_digest bandwidth_planner::allocation_digest() const {
-    sha256_hasher hasher;
+    codec::sha256_hasher hasher;
     auto update = [&](const void* data, std::size_t size) {
         hasher.update(data, size);
     };

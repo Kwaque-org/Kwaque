@@ -352,6 +352,18 @@ constexpr std::array text_descriptors{
     .id = event_public_text::reason_not_a_directory,
     .role = event_field_key::reason,
     .value = "not_a_directory"},
+  event_text_descriptor{
+    .id = event_public_text::reason_corrupt_data,
+    .role = event_field_key::reason,
+    .value = "corrupt_data"},
+  event_text_descriptor{
+    .id = event_public_text::reason_wrong_context,
+    .role = event_field_key::reason,
+    .value = "wrong_context"},
+  event_text_descriptor{
+    .id = event_public_text::reason_unsupported_format,
+    .role = event_field_key::reason,
+    .value = "unsupported_format"},
 };
 
 constexpr std::array forbidden_text_fragments{
@@ -570,6 +582,12 @@ std::optional<event_public_text> event_reason_for(errc reason) noexcept {
         return event_public_text::reason_is_a_directory;
     case errc::not_a_directory:
         return event_public_text::reason_not_a_directory;
+    case errc::corrupt_data:
+        return event_public_text::reason_corrupt_data;
+    case errc::wrong_context:
+        return event_public_text::reason_wrong_context;
+    case errc::unsupported_format:
+        return event_public_text::reason_unsupported_format;
     }
     return std::nullopt;
 }

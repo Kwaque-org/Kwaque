@@ -1,4 +1,5 @@
 #include "src/base/units.h"
+#include "src/codec/sha256.h"
 #include "src/observability/event.h"
 #include "src/observability/event_log.h"
 #include "src/resource/workload_class.h"
@@ -10,7 +11,6 @@
 #include "src/simulation/environment.h"
 #include "src/simulation/environment_test_support.h"
 #include "src/simulation/scheduler_driver.h"
-#include "src/simulation/sha256.h"
 
 #include <seastar/core/coroutine.hh>
 #include <seastar/core/future.hh>
@@ -234,7 +234,7 @@ SEASTAR_TEST_CASE(
   simulation_environment_construction_is_allocation_transactional) {
     // Digest providers initialize process-global state lazily. Complete that
     // one-time work before injecting failures into owner-local construction.
-    kwaque::simulation::sha256_hasher digest_warmup;
+    kwaque::codec::sha256_hasher digest_warmup;
     static_cast<void>(std::move(digest_warmup).final());
 
     std::unique_ptr<environment> target;

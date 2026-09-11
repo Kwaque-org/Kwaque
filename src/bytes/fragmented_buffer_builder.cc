@@ -396,6 +396,17 @@ result<void> fragmented_buffer_builder::reserve(byte_count bytes) {
     return grow_tail(bytes.value());
 }
 
+result<void> fragmented_buffer_builder::reserve_fragments(item_count count) {
+    if (finished_) {
+        return failure(errc::closed);
+    }
+    if (count.value() > config_.max_fragments) {
+        return failure(errc::out_of_range);
+    }
+    fragments_.reserve(static_cast<std::size_t>(count.value()));
+    return {};
+}
+
 result<fragmented_buffer> fragmented_buffer_builder::finish() {
     if (finished_) {
         return failure(errc::closed);

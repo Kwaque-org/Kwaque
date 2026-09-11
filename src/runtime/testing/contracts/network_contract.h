@@ -664,7 +664,11 @@ multiple_clients_body(Backend& backend, scenario_owner<Backend>& owner) {
       network_listen_options{.backlog = 8}));
     require_value(co_await owner.listeners[0].finish(), "multi-client listen");
     auto& listener = owner.listeners[0].get();
-    for (std::size_t index = 0; index < owner.clients.size(); ++index) {
+    // Launch in reverse slot order so FIFO acceptance also exercises peers
+    // whose client and server indices differ. All connects remain concurrent.
+    for (std::size_t remaining = owner.clients.size(); remaining != 0;
+         --remaining) {
+        const auto index = remaining - 1U;
         owner.clients[index].start(backend.connect(
           listener.local_endpoint(),
           std::nullopt,
@@ -688,10 +692,28 @@ multiple_clients_body(Backend& backend, scenario_owner<Backend>& owner) {
             make_bytes(payloads[index]), owner.write_aborts[index]),
           "multi-client write");
     }
+    std::array<bool, network_contract_clients> matched{};
     for (std::size_t index = 0; index < owner.servers.size(); ++index) {
+        auto& server = owner.servers[index].get();
+        // Concurrent connects need not be accepted in client slot order.
+        const auto client = std::ranges::find_if(
+          owner.clients, [&server](auto& candidate) {
+              return candidate.get().local_endpoint()
+                       == server.remote_endpoint()
+                     && candidate.get().remote_endpoint()
+                          == server.local_endpoint();
+          });
+        require(
+          client != owner.clients.end(),
+          "accepted connection has no matching client endpoints");
+        const auto client_index = static_cast<std::size_t>(
+          client - owner.clients.begin());
+        require(
+          !matched[client_index], "accepted connection duplicated a client");
+        matched[client_index] = true;
         co_await echo_exact_bytes(
-          owner.servers[index].get(),
-          payloads[index],
+          server,
+          payloads[client_index],
           owner.read_aborts[index],
           owner.write_aborts[index]);
     }

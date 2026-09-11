@@ -1,5 +1,6 @@
 #include "src/base/error.h"
 #include "src/base/units.h"
+#include "src/codec/sha256.h"
 #include "src/observability/event.h"
 #include "src/observability/event_codec.h"
 #include "src/observability/event_log.h"
@@ -14,7 +15,6 @@
 #include "src/simulation/fake_dns.h"
 #include "src/simulation/fake_file_test_support.h"
 #include "src/simulation/scheduler_driver.h"
-#include "src/simulation/sha256.h"
 
 #include <seastar/core/coroutine.hh>
 #include <seastar/core/future.hh>
@@ -38,6 +38,8 @@
 
 namespace {
 
+using kwaque::codec::sha256_digest;
+using kwaque::codec::sha256_hasher;
 using kwaque::observability::event;
 using kwaque::observability::event_log;
 using kwaque::runtime::testing::environment_contract_observation;
@@ -47,8 +49,6 @@ using kwaque::simulation::environment_config;
 using kwaque::simulation::environment_config_values;
 using kwaque::simulation::environment_test_access;
 using kwaque::simulation::event_trace;
-using kwaque::simulation::sha256_digest;
-using kwaque::simulation::sha256_hasher;
 using kwaque::simulation::trace_artifact;
 using kwaque::simulation::trace_digest;
 using kwaque::simulation::testing::scheduler_driver;

@@ -1,10 +1,10 @@
-#include "src/simulation/sha256.h"
+#include "src/codec/sha256.h"
 
 #include <openssl/evp.h>
 
 #include <stdexcept>
 
-namespace kwaque::simulation {
+namespace kwaque::codec {
 
 sha256_hasher::sha256_hasher()
   : context_(EVP_MD_CTX_new()) {
@@ -38,4 +38,4 @@ sha256_digest sha256_hasher::final() && {
     return digest;
 }
 
-} // namespace kwaque::simulation
+} // namespace kwaque::codec

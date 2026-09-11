@@ -1,6 +1,12 @@
-#include "src/base/error.h"
-#include "src/base/units.h"
+// Include order is part of this regression; error_test.cc checks the reverse.
+// clang-format off
 #include "src/codec/limits.h"
+#include "src/codec/error.h"
+// clang-format on
+
+#include "src/base/error.h"
+#include "src/base/result.h"
+#include "src/base/units.h"
 
 #include <gtest/gtest.h>
 
@@ -20,6 +26,14 @@ using kwaque::codec::absolute_max_original_records;
 using kwaque::codec::limits;
 using kwaque::codec::limits_config;
 using kwaque::codec::operation_usage;
+
+// The error test checks the reverse header order. Limits keep base results.
+static_assert(std::same_as<
+              decltype(limits::make(limits_config{})),
+              kwaque::result<limits>>);
+static_assert(std::same_as<
+              decltype(limits::defaults().validate_allocation(byte_count{})),
+              kwaque::result<void>>);
 
 constexpr std::uint64_t kib = 1024;
 constexpr std::uint64_t mib = 1024 * kib;
