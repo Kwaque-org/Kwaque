@@ -363,7 +363,7 @@ strict analysis selects production sources using Bazel target ownership and
 package boundaries:
 
 ```bash
-bazel build --config=ci-debug --build_tag_filters=-fuzz,-manual //...
+bazel build --config=ci-debug --remote_download_outputs=all --build_tag_filters=-fuzz,-manual //...
 bazel run --config=ci-debug //tools:compile_commands -- --config=ci-debug
 bazel run --config=ci-debug //tools:clang_tidy
 bazel run --config=ci-debug //tools:clang_tidy_strict
@@ -373,10 +373,13 @@ Fuzz-only translation units need the fuzz configuration. CI runs this in a
 separate job, using ordinary checks for the fuzzers and their dependencies:
 
 ```bash
-bazel build --config=ci --config=fuzz --build_tag_filters=fuzz //...
+bazel build --config=ci --config=fuzz --remote_download_outputs=all --build_tag_filters=fuzz //...
 bazel run --config=ci --config=fuzz //tools:compile_commands -- --fuzz-only --config=ci --config=fuzz
 bazel run --config=ci --config=fuzz //tools:clang_tidy
 ```
+
+The preparation builds use `--remote_download_outputs=all` so cached generated
+headers and other intermediate inputs are present for standalone clang-tidy.
 
 The databases remain ignored. Ordinary analysis retains every distinct compile
 variant of a source file; strict analysis uses the production commands in

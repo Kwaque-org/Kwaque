@@ -23,7 +23,7 @@ embedded source file is authoritative.
 | `actions/upload-artifact` | 4.6.2 | https://github.com/actions/upload-artifact | MIT | CI only | Retain fuzz logs and failure inputs |
 | `bazel-contrib/setup-bazel` | 0.19.0 | https://github.com/bazel-contrib/setup-bazel | Apache-2.0 | CI only | Bazel installation and CI caches |
 | `rules_boost` | `f5b0f8c904f2487d8f5a9a956d4388724e627210` | https://github.com/nelhage/rules_boost | Apache-2.0 | Build only | Bazel rules for Boost |
-| Boost | 1.84.0 | https://github.com/boostorg/boost | BSL-1.0 | Static link input; license bundled | Seastar runtime and test dependencies |
+| Boost | 1.84.0 | https://github.com/boostorg/boost | BSL-1.0 | Static link input and headers; license bundled | Seastar runtime/test libraries and header-only UUID model values |
 | CRC32C | 1.1.0 | https://github.com/google/crc32c | BSD-3-Clause | Baseline dependency; not currently linked; license bundled | Checksums |
 | fmt | 12.1.0 | https://github.com/fmtlib/fmt | MIT | Static link input; license bundled | Type-safe formatting |
 | GoogleTest | 1.17.0.bcr.2 | https://github.com/google/googletest | BSD-3-Clause | Test only | C++ unit tests |

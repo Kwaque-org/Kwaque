@@ -132,7 +132,8 @@ def analysis_coverage_errors(workflow: str) -> list[str]:
     errors = []
     ordinary = run_commands(jobs.get("clang-tidy", ""))
     if not any(
-        "bazel build --config=ci-debug --build_tag_filters=-fuzz,-manual //..."
+        "bazel build --config=ci-debug --remote_download_outputs=all "
+        "--build_tag_filters=-fuzz,-manual //..."
         == command
         for command in ordinary
     ):
@@ -154,10 +155,18 @@ def analysis_coverage_errors(workflow: str) -> list[str]:
     ):
         errors.append("fuzz analysis needs its own compilation database")
     if not any(
-        "--build_tag_filters=fuzz" in command.split() and "//..." in command.split()
+        command.startswith("bazel build ")
+        and all(
+            flag in command.split()
+            for flag in (
+                "--remote_download_outputs=all",
+                "--build_tag_filters=fuzz",
+                "//...",
+            )
+        )
         for command in fuzz
     ):
-        errors.append("fuzz analysis must materialize all fuzz roots")
+        errors.append("fuzz analysis must materialize all fuzz roots and cached inputs")
     if not any("//tools:clang_tidy" in command.split() for command in fuzz):
         errors.append("fuzz analysis must execute ordinary clang-tidy")
     if any("//tools:clang_tidy_strict" in command.split() for command in fuzz):
@@ -453,6 +462,28 @@ class CiCoverageTest(unittest.TestCase):
             job, job.replace("//tools:clang_tidy", "//tools:clang_tidy_strict")
         )
         self.assertTrue(analysis_coverage_errors(changed))
+
+    def test_analysis_builds_materialize_cached_intermediate_inputs(self) -> None:
+        flag = "--remote_download_outputs=all"
+        jobs = job_blocks(self.workflow)
+        for name in ("clang-tidy", "clang-tidy-fuzz"):
+            job = jobs[name]
+            self.assertIn(flag, job)
+            for replacement in (
+                "",
+                "--remote_download_outputs=toplevel",
+                "--remote_download_outputs=minimal",
+            ):
+                with self.subTest(job=name, replacement=replacement):
+                    changed = self.workflow.replace(job, job.replace(flag, replacement))
+                    self.assertTrue(analysis_coverage_errors(changed))
+            with self.subTest(job=name, flag_only_on_database_generation=True):
+                misplaced = job.replace(flag, "").replace(
+                    "//tools:compile_commands", f"{flag} //tools:compile_commands"
+                )
+                self.assertTrue(
+                    analysis_coverage_errors(self.workflow.replace(job, misplaced))
+                )
 
     def test_fuzz_and_hermetic_coverage(self) -> None:
         self.assertEqual(

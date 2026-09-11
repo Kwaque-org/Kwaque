@@ -183,7 +183,7 @@ void reshape(script& input, fragmented_buffer& buffer, std::string& oracle) {
         require(buffer.size().value() == oracle.size());
         require(contents(buffer) == oracle);
         for (const auto fragment : buffer) {
-            require(fragment.size() > 0);
+            require(!fragment.empty());
         }
     }
 }
@@ -312,7 +312,7 @@ void parse(
 
         const auto fragment = parser.peek_current_fragment();
         if (consumed < oracle.size()) {
-            require(fragment.size() > 0);
+            require(!fragment.empty());
             require(
               oracle.compare(consumed, fragment.size(), fragment.bytes()) == 0);
         } else {

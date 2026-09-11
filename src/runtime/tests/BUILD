@@ -36,7 +36,9 @@ kwaque_cc_test(
     name = "file_contract_test",
     srcs = ["file_contract_test.cc"],
     deps = [
+        "//src/base",
         "//src/runtime:file",
+        "//src/runtime:file_position",
         "@seastar",
     ],
 )

@@ -5,6 +5,7 @@
 #include "src/base/units.h"
 #include "src/bytes/fragmented_buffer.h"
 #include "src/runtime/error.h"
+#include "src/runtime/file_position.h"
 #include "src/runtime/operation_statistics.h"
 #include "src/runtime/shard_affinity.h"
 
@@ -163,30 +164,6 @@ enum class file_state : std::uint8_t {
     open,
     closing,
     closed,
-};
-
-class file_position final {
-public:
-    using rep = std::uint64_t;
-
-    constexpr file_position() noexcept = default;
-    constexpr explicit file_position(rep value) noexcept
-      : value_(value) {}
-
-    [[nodiscard]] constexpr rep value() const noexcept { return value_; }
-
-    [[nodiscard]] constexpr std::optional<file_position>
-    checked_add(byte_count bytes) const noexcept {
-        if (bytes.value() > std::numeric_limits<rep>::max() - value_) {
-            return std::nullopt;
-        }
-        return file_position{value_ + bytes.value()};
-    }
-
-    auto operator<=>(const file_position&) const = default;
-
-private:
-    rep value_{0};
 };
 
 class file_read_result final {

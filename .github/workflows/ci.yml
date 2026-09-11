@@ -214,6 +214,7 @@ jobs:
       - name: Materialize generated analysis inputs
         run: >-
           bazel build --config=ci-debug
+          --remote_download_outputs=all
           --build_tag_filters=-fuzz,-manual //...
       - name: Generate compilation database
         run: >-
@@ -239,7 +240,9 @@ jobs:
         with:
           cache-scope: fuzz
       - name: Materialize fuzz analysis inputs
-        run: bazel build --config=ci --config=fuzz --build_tag_filters=fuzz //...
+        run: >-
+          bazel build --config=ci --config=fuzz
+          --remote_download_outputs=all --build_tag_filters=fuzz //...
       - name: Generate the fuzz compilation database
         run: >-
           bazel run --config=ci --config=fuzz --lockfile_mode=error //tools:compile_commands --

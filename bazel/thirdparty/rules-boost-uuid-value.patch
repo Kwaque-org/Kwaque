@@ -1,0 +1,28 @@
+Expose the Boost.UUID value API without generator or serialization link dependencies.
+
+--- a/boost.BUILD
++++ b/boost.BUILD
+@@ -2206,3 +2206,23 @@
++# The UUID value API is header-only; generators and serialization use :uuid.
++cc_library(
++    name = "uuid_value",
++    hdrs = [
++        "libs/uuid/include/boost/uuid/detail/config.hpp",
++        "libs/uuid/include/boost/uuid/detail/uuid_generic.ipp",
++        "libs/uuid/include/boost/uuid/detail/uuid_x86.ipp",
++        "libs/uuid/include/boost/uuid/uuid.hpp",
++    ],
++    copts = default_copts,
++    defines = default_defines,
++    includes = ["libs/uuid/include"],
++    licenses = ["notice"],
++    visibility = ["//visibility:public"],
++    deps = [
++        ":config",
++        ":type_traits",
++    ],
++)
++
+ boost_library(
+     name = "uuid",
+     deps = [
