@@ -47,6 +47,7 @@ def declare_native_dependencies():
         patches = [
             "//bazel/thirdparty:seastar-chunked-vector-exception-safety.patch",
             "//bazel/thirdparty:seastar-metrics-registration-exception-safety.patch",
+            "//bazel/thirdparty:seastar-scheduling-group-rollback.patch",
             "//bazel/thirdparty:seastar-http-resource-limits.patch",
             "//bazel/thirdparty:seastar-spinlock-include.patch",
         ],

@@ -227,6 +227,63 @@ PERF_TEST_F(
     return batches;
 }
 
+PERF_TEST_F(buffer_fixture, trim_back_262144_bytes_64_fragments) {
+    auto working = buffer.share();
+    std::size_t trimmed = 0;
+    perf_tests::start_measuring_time();
+    while (!working.empty()) {
+        const auto size
+          = working.fragment_at(working.fragment_count() - 1)->size();
+        if (!working.trim_back(byte_count{size}))
+            throw std::runtime_error("buffer benchmark back trim");
+        ++trimmed;
+    }
+    perf_tests::stop_measuring_time();
+    return trimmed;
+}
+
+PERF_TEST_F(buffer_fixture, absolute_owning_slices_64_fragments) {
+    auto working = buffer.share();
+    perf_tests::start_measuring_time();
+    for (std::size_t index = 0; index != fragment_total; ++index) {
+        auto slice = working.share(
+          byte_count{index * fragment_bytes}, byte_count{fragment_bytes});
+        if (!slice || slice->size().value() != fragment_bytes)
+            throw std::runtime_error("buffer benchmark slice");
+        perf_tests::do_not_optimize(slice->fragment_count());
+    }
+    perf_tests::stop_measuring_time();
+    return fragment_total;
+}
+
+PERF_TEST_F(buffer_fixture, cursor_owning_slices_64_fragments) {
+    fragmented_buffer_parser parser{buffer.share()};
+    perf_tests::start_measuring_time();
+    for (std::size_t index = 0; index != fragment_total; ++index) {
+        auto slice = parser.read_buffer(byte_count{fragment_bytes});
+        if (!slice || slice->size().value() != fragment_bytes)
+            throw std::runtime_error("buffer benchmark slice");
+        perf_tests::do_not_optimize(slice->fragment_count());
+    }
+    perf_tests::stop_measuring_time();
+    return fragment_total;
+}
+
+PERF_TEST_F(buffer_fixture, splice_262144_bytes_64_fragments) {
+    auto working = buffer.share();
+    fragmented_buffer_builder builder;
+    if (!builder.reserve_fragments(item_count{fragment_total}))
+        throw std::runtime_error("buffer benchmark reserve");
+    perf_tests::start_measuring_time();
+    if (!builder.append_buffer(std::move(working)))
+        throw std::runtime_error("buffer benchmark splice");
+    auto output = builder.finish();
+    perf_tests::stop_measuring_time();
+    if (!output || output->size() != byte_count{fixture_bytes})
+        throw std::runtime_error("buffer benchmark publication");
+    perf_tests::do_not_optimize(output->retained_bytes());
+}
+
 PERF_TEST_F(linear_buffer_fixture, linearize_131072_bytes_32_fragments) {
     auto linear = buffer.linearize(buffer.size());
     if (!linear || linear->size() != fixture_bytes / 2) [[unlikely]] {
@@ -287,6 +344,9 @@ PERF_TEST(builder, append_shared_buffers_1000_x_4_bytes) {
     fragmented_buffer_builder builder;
 
     perf_tests::start_measuring_time();
+    if (!builder.reserve_fragments(item_count{shared_append_total})) {
+        throw std::runtime_error("buffer benchmark shared reservation");
+    }
     for (auto& input : inputs) {
         if (!builder.append_buffer(std::move(input))) [[unlikely]] {
             throw std::runtime_error("buffer benchmark shared append");

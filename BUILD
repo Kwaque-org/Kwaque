@@ -17,6 +17,15 @@ filegroup(
 )
 
 filegroup(
+    name = "ci_retention",
+    srcs = [
+        ".github/actions/retain-logs/action.yml",
+        ".github/actions/retain-logs/collect.py",
+    ],
+    visibility = ["//tools:__pkg__"],
+)
+
+filegroup(
     name = "test_suppressions",
     testonly = True,
     srcs = [

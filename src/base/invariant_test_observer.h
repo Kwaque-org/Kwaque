@@ -4,6 +4,8 @@
 
 namespace kwaque::testing {
 
+// The diagnostic is borrowed only for the synchronous callback. The observer
+// scope is thread-local and must not span an asynchronous suspension.
 using invariant_observer = void (*)(std::string_view diagnostic);
 
 class scoped_invariant_observer final {

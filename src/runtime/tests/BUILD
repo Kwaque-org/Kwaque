@@ -1,12 +1,36 @@
+load("//bazel:build.bzl", "kwaque_cc_binary")
 load(
     "//bazel:test.bzl",
     "kwaque_cc_benchmark",
     "kwaque_cc_seastar_gtest",
     "kwaque_cc_seastar_test",
     "kwaque_cc_test",
+    "kwaque_py_native_test",
 )
 
 package(default_visibility = ["//visibility:private"])
+
+kwaque_cc_binary(
+    name = "lifecycle_invariant_probe",
+    testonly = True,
+    srcs = ["lifecycle_invariant_probe.cc"],
+    deps = [
+        "//src/base",
+        "//src/resource:resource_config",
+        "//src/resource:resource_manager",
+        "//src/resource:resource_registry",
+        "//src/runtime:sharded_service",
+        "//src/runtime:task_scope",
+        "@seastar",
+    ],
+)
+
+kwaque_py_native_test(
+    name = "lifecycle_invariant_test",
+    timeout = "moderate",
+    srcs = ["lifecycle_invariant_test.py"],
+    data = [":lifecycle_invariant_probe"],
+)
 
 kwaque_cc_test(
     name = "operation_error_test",
@@ -222,6 +246,14 @@ kwaque_cc_test(
 )
 
 kwaque_cc_benchmark(
+    name = "runtime_cross_shard_bench",
+    srcs = ["runtime_cross_shard_bench.cc"],
+    cpu = 2,
+    memory = "256MiB",
+    deps = ["//src/runtime:cross_shard"],
+)
+
+kwaque_cc_benchmark(
     name = "runtime_contract_bench",
     srcs = [
         "runtime_contract_bench.cc",
@@ -348,6 +380,17 @@ kwaque_cc_seastar_test(
 )
 
 kwaque_cc_seastar_test(
+    name = "sharded_service_failure_test",
+    srcs = ["sharded_service_failure_test.cc"],
+    cpu = 2,
+    memory = "128MiB",
+    deps = [
+        "//src/runtime:sharded_service",
+        "//src/runtime:task_scope",
+    ],
+)
+
+kwaque_cc_seastar_test(
     name = "reactor_smoke_test",
     srcs = ["reactor_smoke_test.cc"],
     cpu = 1,
@@ -386,6 +429,7 @@ test_suite(
         ":production_file_test",
         ":production_network_test",
         ":production_primitives_test",
+        ":sharded_service_failure_test",
         ":sharded_service_test",
         ":test_directory_test",
     ],

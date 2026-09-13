@@ -10,7 +10,6 @@
 #include <cstdint>
 #include <span>
 #include <string_view>
-#include <vector>
 
 namespace kwaque::bytes {
 
@@ -96,8 +95,10 @@ public:
     // the builder. Use append() to split a longer contiguous byte range.
     [[nodiscard]] result<void>
     append_fragment_copy(const fragment_type& fragment);
-    // Splices another published buffer's fragments in, applying the same
-    // packing rule to its leading fragments.
+    // Copy at most pack_copy_threshold bytes from complete leading fragments
+    // into existing mutable tail room, then splice the remaining owners.
+    // No new payload backing is allocated. Rejection or allocation failure
+    // leaves both byte sequences unchanged; success empties the source.
     [[nodiscard]] result<void> append_buffer(fragmented_buffer&& other);
 
     // Guarantees at least `bytes` of contiguous tail capacity, bounded by
@@ -111,8 +112,7 @@ public:
 
     // Publishes the accumulated bytes. One-way: the builder holds nothing
     // afterwards and every later append, reserve, or finish reports closed. The
-    // flag rather than a reference qualifier enforces this, so a caller can
-    // still inspect a builder whose finish failed.
+    // descriptor storage transfers directly, without allocating at publication.
     [[nodiscard]] result<fragmented_buffer> finish();
 
 private:
@@ -126,10 +126,10 @@ private:
     [[nodiscard]] result<void> ensure_appendable(byte_count incoming) noexcept;
     [[nodiscard]] result<void> grow_tail(std::uint64_t requested);
     void grow_tail_unchecked(std::uint64_t requested);
-    // Appends non-empty storage whose lifetime, total size, and worst-case link
-    // count have already been validated by the caller.
-    void
-    append_prevalidated_fragment(fragmented_buffer::owned_fragment fragment);
+    // Insert before sealing the old tail, so allocation failure changes no
+    // existing presentation. Callers have checked fragment/backing bounds.
+    void push_fragment(
+      fragmented_buffer::owned_fragment fragment, std::uint64_t used);
     // Trims the tail allocation to the bytes actually written so donated
     // fragments can follow it without exposing unwritten capacity.
     void seal_tail() noexcept;
@@ -139,12 +139,8 @@ private:
     void rewind(const rollback_point& mark) noexcept;
     [[nodiscard]] std::uint64_t
     next_allocation(std::uint64_t requested) const noexcept;
-    [[nodiscard]] std::uint64_t next_allocation(
-      std::uint64_t requested,
-      std::uint64_t previous_allocation) const noexcept;
-
     fragmented_buffer_builder_config config_;
-    std::vector<fragmented_buffer::owned_fragment> fragments_;
+    fragmented_buffer::fragment_storage fragments_;
     byte_count size_;
     byte_count retained_bytes_;
     std::uint64_t tail_used_{0};

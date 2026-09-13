@@ -24,6 +24,7 @@
 #include <limits>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <utility>
 
 namespace kwaque::runtime {
@@ -66,7 +67,7 @@ struct directory_listing_limits final {
 
 class file_path final {
 public:
-    [[nodiscard]] static result<file_path> make(std::string value) noexcept;
+    [[nodiscard]] static result<file_path> make(std::string_view value);
 
     [[nodiscard]] const std::string& value() const noexcept { return value_; }
 
@@ -81,7 +82,7 @@ private:
 
 class file_name final {
 public:
-    [[nodiscard]] static result<file_name> make(std::string value) noexcept;
+    [[nodiscard]] static result<file_name> make(std::string_view value);
 
     [[nodiscard]] const std::string& value() const noexcept { return value_; }
 
@@ -116,9 +117,11 @@ struct directory_entry final {
 
 class directory_listing final {
 public:
+    // Validate before allocating fresh descriptor storage. Incoming spare
+    // capacity is not retained; allocation failures remain exceptional.
     [[nodiscard]] static result<directory_listing> make(
       seastar::chunked_vector<directory_entry> entries,
-      directory_listing_limits limits) noexcept;
+      directory_listing_limits limits);
 
     directory_listing(directory_listing&&) noexcept = default;
     directory_listing& operator=(directory_listing&&) noexcept = default;

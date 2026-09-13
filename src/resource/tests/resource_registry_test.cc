@@ -4,15 +4,29 @@
 
 #include <seastar/core/coroutine.hh>
 #include <seastar/core/memory.hh>
+#include <seastar/core/metrics_api.hh>
+#include <seastar/core/scheduling_specific.hh>
+#include <seastar/core/smp.hh>
+#include <seastar/core/sstring.hh>
+#include <seastar/core/with_scheduling_group.hh>
 #include <seastar/testing/test_case.hh>
+#include <seastar/util/alloc_failure_injector.hh>
+#include <seastar/util/critical_alloc_section.hh>
 
 #include <boost/test/unit_test.hpp>
 
+#include <array>
+#include <atomic>
 #include <concepts>
 #include <cstddef>
 #include <cstdint>
+#include <exception>
+#include <limits>
+#include <new>
+#include <optional>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <type_traits>
 #include <utility>
 #include <vector>
@@ -180,6 +194,223 @@ SEASTAR_TEST_CASE(resource_manager_rolls_back_every_local_start_point) {
     }
 
     co_await registry.stop();
+}
+
+namespace {
+constexpr std::size_t probe_shards = 16;
+std::array<std::atomic<unsigned>, probe_shards> live_group_specifics{};
+std::atomic<unsigned> failed_group_shard{std::numeric_limits<unsigned>::max()};
+std::atomic<unsigned> group_constructor_failures{0};
+
+struct group_specific_lifetime {
+    group_specific_lifetime() {
+        ++live_group_specifics[seastar::this_shard_id()];
+    }
+    ~group_specific_lifetime() {
+        --live_group_specifics[seastar::this_shard_id()];
+    }
+};
+
+struct group_specific_failure {
+    group_specific_failure() {
+        if (seastar::this_shard_id() == failed_group_shard.load()) {
+            failed_group_shard.store(std::numeric_limits<unsigned>::max());
+            ++group_constructor_failures;
+            throw std::runtime_error(
+              "injected scheduling-specific construction");
+        }
+    }
+};
+} // namespace
+
+SEASTAR_TEST_CASE(resource_registry_rolls_back_inside_native_group_creation) {
+    const auto shards = seastar::this_smp_shard_count();
+    BOOST_REQUIRE_LE(shards, probe_shards);
+    // The first key must be constructed before the second throws, so rollback
+    // must destroy real initialized state as well as release the group slot.
+    co_await seastar::scheduling_group_key_create(
+      seastar::make_scheduling_group_key_config<group_specific_lifetime>());
+    co_await seastar::scheduling_group_key_create(
+      seastar::make_scheduling_group_key_config<group_specific_failure>());
+    std::array<unsigned, probe_shards> baseline{};
+    for (unsigned shard = 0; shard < shards; ++shard) {
+        baseline[shard] = live_group_specifics[shard].load();
+    }
+    for (unsigned failed_shard = 0; failed_shard < shards; ++failed_shard) {
+        resource_registry registry;
+        group_constructor_failures.store(0);
+        failed_group_shard.store(failed_shard);
+        bool failed = false;
+        try {
+            co_await registry.start(test_config());
+        } catch (const std::runtime_error& error) {
+            failed = std::string_view{error.what()}
+                     == "injected scheduling-specific construction";
+        }
+        failed_group_shard.store(std::numeric_limits<unsigned>::max());
+        BOOST_CHECK(failed);
+        BOOST_CHECK_EQUAL(group_constructor_failures.load(), 1U);
+        co_await registry.stop();
+        for (unsigned shard = 0; shard < shards; ++shard) {
+            BOOST_CHECK_EQUAL(
+              live_group_specifics[shard].load(), baseline[shard]);
+        }
+        // Reusing the same workload names also checks that failed construction
+        // left no scheduler metric registrations or occupied group slots.
+        resource_registry replacement;
+        co_await replacement.start(test_config());
+        co_await replacement.stop();
+        for (unsigned shard = 0; shard < shards; ++shard) {
+            BOOST_CHECK_EQUAL(
+              live_group_specifics[shard].load(), baseline[shard]);
+        }
+    }
+    // A second creation may wait behind failed construction. It must observe
+    // the fully restored shard set, not reuse a slot during remote teardown.
+    failed_group_shard.store(shards - 1U);
+    group_constructor_failures.store(0);
+    auto first = seastar::create_scheduling_group("failed_parallel_group", 100);
+    auto second = seastar::create_scheduling_group("next_parallel_group", 100);
+    bool failed = false;
+    std::optional<seastar::scheduling_group> unexpected;
+    try {
+        unexpected = co_await std::move(first);
+    } catch (const std::runtime_error&) {
+        failed = true;
+    }
+    failed_group_shard.store(std::numeric_limits<unsigned>::max());
+    const auto replacement = co_await std::move(second);
+    co_await seastar::destroy_scheduling_group(replacement);
+    if (unexpected) {
+        co_await seastar::destroy_scheduling_group(*unexpected);
+    }
+    BOOST_CHECK(failed);
+    BOOST_CHECK_EQUAL(group_constructor_failures.load(), 1U);
+    for (unsigned shard = 0; shard < shards; ++shard) {
+        BOOST_CHECK_EQUAL(live_group_specifics[shard].load(), baseline[shard]);
+    }
+}
+
+#if defined(SEASTAR_ENABLE_ALLOC_FAILURE_INJECTION)
+namespace {
+std::size_t registered_series() {
+    std::size_t count = 0;
+    for (const auto& [name, family] : seastar::metrics::impl::get_value_map()) {
+        static_cast<void>(name);
+        count += family.size();
+    }
+    return count;
+}
+} // namespace
+#endif
+
+SEASTAR_TEST_CASE(scheduling_group_dispatch_preserves_user_failure_injection) {
+#if defined(SEASTAR_ENABLE_ALLOC_FAILURE_INJECTION)
+    const auto group = co_await seastar::create_scheduling_group(
+      "dispatch_probe", 100);
+    const bool needs_dispatch = !group.active();
+    bool entered = false;
+    bool ran_in_group = false;
+    bool critical_in_callback = true;
+    std::exception_ptr failure;
+    auto& injector = seastar::memory::local_failure_injector();
+    injector.fail_after(0);
+    try {
+        co_await seastar::with_scheduling_group(group, [&] {
+            entered = true;
+            ran_in_group = seastar::current_scheduling_group() == group;
+            critical_in_callback = seastar::memory::is_critical_alloc_section();
+            // The pending fault must reach user work, after task allocation
+            // and enqueueing have completed under their fatal-OOM contract.
+            seastar::memory::on_alloc_point();
+        });
+    } catch (...) {
+        failure = std::current_exception();
+    }
+    const bool injected = injector.failed();
+    injector.cancel();
+    co_await seastar::destroy_scheduling_group(group);
+    BOOST_CHECK(needs_dispatch);
+    BOOST_CHECK(entered);
+    BOOST_CHECK(ran_in_group);
+    BOOST_CHECK(!critical_in_callback);
+    BOOST_CHECK(injected);
+    BOOST_REQUIRE(failure != nullptr);
+    try {
+        std::rethrow_exception(failure);
+    } catch (const std::bad_alloc&) {
+    }
+#endif
+    co_return;
+}
+
+SEASTAR_TEST_CASE(native_group_allocation_failure_restores_every_shard) {
+#if defined(SEASTAR_ENABLE_ALLOC_FAILURE_INJECTION)
+    std::array<std::size_t, probe_shards> baseline{};
+    const auto shards = seastar::this_smp_shard_count();
+    BOOST_REQUIRE_LE(shards, probe_shards);
+    for (unsigned shard = 0; shard < shards; ++shard) {
+        baseline[shard] = co_await seastar::smp::submit_to(
+          shard, &registered_series);
+    }
+    for (const bool with_short_name : {false, true}) {
+        unsigned failures = 0;
+        bool reached_success = false;
+        for (std::size_t point = 0; point < 512; ++point) {
+            std::optional<seastar::scheduling_group> group;
+            // Allocate the names before arming injection. Both are longer than
+            // the inline string capacity, so a copy in a noexcept forwarding
+            // overload would terminate instead of returning a failed future.
+            seastar::sstring name{"allocation_probe"};
+            seastar::sstring short_name{"allocation_short_probe"};
+            auto& injector = seastar::memory::local_failure_injector();
+            std::exception_ptr failure;
+            injector.fail_after(point);
+            try {
+                if (with_short_name) {
+                    group = co_await seastar::create_scheduling_group(
+                      std::move(name), std::move(short_name), 100);
+                } else {
+                    group = co_await seastar::create_scheduling_group(
+                      std::move(name), 100);
+                }
+            } catch (...) {
+                failure = std::current_exception();
+            }
+            const bool injected = injector.failed();
+            injector.cancel();
+            if (group) {
+                co_await seastar::destroy_scheduling_group(*group);
+            }
+            for (unsigned shard = 0; shard < shards; ++shard) {
+                const auto count = co_await seastar::smp::submit_to(
+                  shard, &registered_series);
+                BOOST_CHECK_EQUAL(count, baseline[shard]);
+            }
+            if (injected) {
+                ++failures;
+                BOOST_REQUIRE(failure != nullptr);
+                try {
+                    std::rethrow_exception(failure);
+                } catch (const std::bad_alloc&) {
+                } catch (const std::runtime_error& error) {
+                    // Native C aligned_alloc reports nullptr; the specific-data
+                    // owner translates that failure into this exception.
+                    BOOST_CHECK(
+                      std::string_view{error.what()}
+                      == "memory allocation failed");
+                }
+            } else {
+                BOOST_CHECK(failure == nullptr);
+                reached_success = true;
+                break;
+            }
+        }
+        BOOST_CHECK_GT(failures, 0U);
+        BOOST_CHECK(reached_success);
+    }
+#endif
+    co_return;
 }
 
 } // namespace kwaque::resource

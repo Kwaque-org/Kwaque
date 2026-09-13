@@ -50,7 +50,6 @@ private:
 
     [[nodiscard]] bool try_acquire_manager_lease() const noexcept;
     void release_manager_lease() const noexcept;
-    void assert_valid() const;
 
     resource_config config_;
     std::uint64_t generation_;

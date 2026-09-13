@@ -23,8 +23,10 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <exception>
 #include <memory>
 #include <optional>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -42,6 +44,23 @@ resource_config test_config() {
         throw std::runtime_error("test resource configuration was rejected");
     }
     return *config;
+}
+
+template<typename Func>
+seastar::future<> run_with_manager(resource_registry& registry, Func function) {
+    resource_manager manager{registry.handles()};
+    co_await seastar::futurize_invoke(function, registry, manager)
+      .finally([&manager] { return manager.stop(); });
+}
+
+template<typename Func>
+seastar::future<> with_manager_fixture(Func function) {
+    resource_registry registry;
+    co_await registry.start(test_config())
+      .then([&registry, &function] {
+          return run_with_manager(registry, std::move(function));
+      })
+      .finally([&registry] { return registry.stop(); });
 }
 
 seastar::future<> verify_local_manager(resource_manager& manager) {
@@ -131,19 +150,31 @@ seastar::future<> verify_dma_scheduling_group(
   bool& observed_group,
   seastar::tmp_file& temporary) {
     auto& file = temporary.get_file();
-    const auto transfer_size = file.memory_dma_alignment();
+    const auto memory_alignment = file.memory_dma_alignment();
+    // Address alignment can be smaller than the required direct-I/O length.
+    // All three alignments are powers of two, so their maximum satisfies each.
+    const auto transfer_size = std::max(
+      {memory_alignment,
+       file.disk_read_dma_alignment(),
+       file.disk_write_dma_alignment()});
     auto buffer = seastar::temporary_buffer<char>::aligned(
-      transfer_size, transfer_size);
+      memory_alignment, transfer_size);
     std::memset(buffer.get_write(), 0x5a, buffer.size());
     auto workload = manager.acquire_workload(workload_class::offload);
     const auto group = workload.scheduling_group();
     const auto written = co_await seastar::with_scheduling_group(
-      group,
-      [&file, &observed_group, group, buffer = std::move(buffer)] mutable {
+      group, [&file, &observed_group, group, &buffer] {
           observed_group = seastar::current_scheduling_group() == group;
           return file.dma_write(0, buffer.get(), buffer.size());
       });
     BOOST_CHECK_EQUAL(written, transfer_size);
+    auto readback = seastar::temporary_buffer<char>::aligned(
+      memory_alignment, transfer_size);
+    const auto read = co_await file.dma_read(
+      0, readback.get_write(), readback.size());
+    BOOST_REQUIRE_EQUAL(read, transfer_size);
+    BOOST_CHECK(
+      std::equal(buffer.get(), buffer.get() + buffer.size(), readback.get()));
 }
 
 seastar::future<> verify_nested_scheduling_groups(
@@ -169,13 +200,8 @@ seastar::future<> run_background_until_signal(
     }
 }
 
-} // namespace
-
-SEASTAR_TEST_CASE(resource_manager_preserves_context_results_and_failures) {
-    resource_registry registry;
-    co_await registry.start(test_config());
-    resource_manager manager{registry.handles()};
-
+seastar::future<> verify_manager_context_results_and_failures(
+  resource_registry& registry, resource_manager& manager) {
     BOOST_CHECK_THROW(
       static_cast<void>(manager.hard_budget(workload_class::metadata)),
       std::logic_error);
@@ -293,7 +319,45 @@ SEASTAR_TEST_CASE(resource_manager_preserves_context_results_and_failures) {
     BOOST_CHECK_THROW(
       static_cast<void>(manager.acquire_workload(workload_class::metadata)),
       std::logic_error);
-    co_await registry.stop();
+}
+
+} // namespace
+
+SEASTAR_TEST_CASE(resource_manager_preserves_context_results_and_failures) {
+    return with_manager_fixture(&verify_manager_context_results_and_failures);
+}
+
+SEASTAR_TEST_CASE(
+  resource_manager_fixture_preserves_failure_and_drains_owners) {
+    const auto expected = std::make_exception_ptr(
+      std::runtime_error{"unexpected test operation failure"});
+    std::exception_ptr observed;
+    try {
+        co_await with_manager_fixture(
+          [expected](
+            resource_registry&,
+            resource_manager& manager) -> seastar::future<> {
+              co_await manager.start();
+              auto workload = manager.acquire_workload(
+                workload_class::metadata);
+              auto units = co_await seastar::get_units(
+                workload.memory_admission(), 1);
+              BOOST_CHECK_EQUAL(units.count(), 1U);
+              co_await seastar::yield();
+              std::rethrow_exception(expected);
+          });
+    } catch (...) {
+        observed = std::current_exception();
+    }
+    BOOST_REQUIRE(observed == expected);
+    // A fresh registry and manager prove the failed operation released both
+    // local admission and the process-wide registry lease before returning.
+    co_await with_manager_fixture(
+      [](resource_registry&, resource_manager& manager) -> seastar::future<> {
+          co_await manager.start();
+          BOOST_CHECK_EQUAL(
+            manager.memory_used(workload_class::metadata).value(), 0U);
+      });
 }
 
 SEASTAR_TEST_CASE(
@@ -442,78 +506,231 @@ SEASTAR_TEST_CASE(workload_smp_group_releases_slots_after_staged_dispatch) {
     co_await registry.stop();
 }
 
-SEASTAR_TEST_CASE(consensus_critical_progresses_during_replication_load) {
+namespace {
+seastar::future<> verify_priority_progress(
+  resource_manager& manager,
+  workload_class foreground,
+  std::span<const workload_class> backgrounds) {
+    bool completed = false;
+    std::array<std::size_t, workload_class_count> iterations{};
+    std::array<seastar::promise<>, workload_class_count> started;
+    std::vector<seastar::future<>> started_waits;
+    std::vector<seastar::future<>> work;
+    std::vector<workload_handle> leases;
+    started_waits.reserve(backgrounds.size());
+    work.reserve(backgrounds.size());
+    leases.reserve(backgrounds.size());
+    for (std::size_t index = 0; index < backgrounds.size(); ++index) {
+        leases.emplace_back(manager.acquire_workload(backgrounds[index]));
+        started_waits.push_back(started[index].get_future());
+        work.push_back(
+          seastar::with_scheduling_group(
+            leases.back().scheduling_group(),
+            [&completed, &iterations, &started, index] {
+                return run_background_until_signal(
+                  completed, iterations[index], started[index]);
+            }));
+    }
+    for (auto& ready : started_waits) {
+        co_await std::move(ready);
+    }
+    auto foreground_lease = manager.acquire_workload(foreground);
+    co_await seastar::with_scheduling_group(
+      foreground_lease.scheduling_group(), [&completed] { completed = true; });
+    for (auto& pending : work) {
+        co_await std::move(pending);
+    }
+    for (std::size_t index = 0; index < backgrounds.size(); ++index) {
+        BOOST_CHECK_GT(iterations[index], 0U);
+    }
+}
+
+seastar::future<> hold_admitted_remote(
+  runtime::owner_shard target,
+  seastar::smp_service_group group,
+  seastar::semaphore_units<> pending,
+  seastar::semaphore_units<> memory) {
+    co_await runtime::invoke_on_owner(target, group, &hold_remote_request);
+    // Both reservations outlive the response, not merely remote dispatch.
+    memory.return_all();
+    pending.return_all();
+}
+} // namespace
+
+SEASTAR_TEST_CASE(
+  priority_progress_covers_every_lower_class_and_combined_load) {
     resource_registry registry;
     co_await registry.start(test_config());
     resource_manager manager{registry.handles()};
     co_await manager.start();
-
-    bool critical_completed = false;
-    std::size_t replication_iterations = 0;
-    seastar::promise<> replication_started;
-    auto replication_started_wait = replication_started.get_future();
-    {
-        auto replication = manager.acquire_workload(
-          workload_class::replication);
-        auto consensus = manager.acquire_workload(
-          workload_class::consensus_critical);
-        auto background = seastar::with_scheduling_group(
-          replication.scheduling_group(),
-          [&critical_completed, &replication_iterations, &replication_started] {
-              return run_background_until_signal(
-                critical_completed,
-                replication_iterations,
-                replication_started);
-          });
-
-        co_await std::move(replication_started_wait);
-        co_await seastar::with_scheduling_group(
-          consensus.scheduling_group(),
-          [&critical_completed] { critical_completed = true; });
-        co_await std::move(background);
+    for (const auto foreground :
+         {workload_class::consensus_critical,
+          workload_class::foreground_protocol}) {
+        std::array<workload_class, workload_class_count> lower{};
+        std::size_t count = 0;
+        for (const auto candidate : all_workload_classes) {
+            if (
+              descriptor_for(candidate).scheduling_shares
+              < descriptor_for(foreground).scheduling_shares) {
+                lower[count++] = candidate;
+                co_await verify_priority_progress(
+                  manager,
+                  foreground,
+                  std::span<const workload_class>{&candidate, 1});
+            }
+        }
+        co_await verify_priority_progress(
+          manager,
+          foreground,
+          std::span<const workload_class>{lower}.first(count));
     }
-
-    BOOST_CHECK(critical_completed);
-    BOOST_CHECK_GT(replication_iterations, 0U);
     co_await manager.stop();
     co_await registry.stop();
 }
 
-SEASTAR_TEST_CASE(foreground_progresses_while_background_remains_runnable) {
+SEASTAR_TEST_CASE(
+  source_admission_bounds_pending_smp_owners_and_drains_after_abort) {
+    BOOST_REQUIRE_GE(seastar::this_smp_shard_count(), 2U);
     resource_registry registry;
     co_await registry.start(test_config());
     resource_manager manager{registry.handles()};
     co_await manager.start();
-
-    bool foreground_completed = false;
-    std::size_t background_iterations = 0;
-    seastar::promise<> background_started;
-    auto background_started_wait = background_started.get_future();
+    co_await seastar::smp::submit_to(1, &reset_remote_saturation);
+    const auto target = co_await seastar::smp::submit_to(
+      1, [] { return runtime::owner_shard{}; });
     {
-        auto background_work = manager.acquire_workload(
-          workload_class::compaction);
-        auto foreground_work = manager.acquire_workload(
-          workload_class::foreground_protocol);
-        const auto background_group = background_work.scheduling_group();
-        const auto foreground_group = foreground_work.scheduling_group();
-        auto background = seastar::with_scheduling_group(
-          background_group,
-          [&foreground_completed, &background_iterations, &background_started] {
-              return run_background_until_signal(
-                foreground_completed,
-                background_iterations,
-                background_started);
-          });
-
-        co_await std::move(background_started_wait);
-        co_await seastar::with_scheduling_group(
-          foreground_group,
-          [&foreground_completed] { foreground_completed = true; });
-        co_await std::move(background);
+        auto workload = manager.acquire_workload(workload_class::maintenance);
+        seastar::semaphore pending_limit{2};
+        seastar::abort_source abort;
+        std::vector<seastar::future<>> admitted;
+        admitted.reserve(2);
+        constexpr std::size_t cost = 4096;
+        const auto submit = [&] -> runtime::result<void> {
+            if (abort.abort_requested()) {
+                return runtime::failure(
+                  runtime::operation_error{
+                    errc::aborted, runtime::operation_kind::resource});
+            }
+            auto pending = seastar::try_get_units(pending_limit, 1);
+            if (!pending) {
+                return runtime::failure(
+                  runtime::operation_error{
+                    errc::resource_exhausted,
+                    runtime::operation_kind::resource});
+            }
+            auto memory = seastar::try_get_units(
+              workload.memory_admission(), cost);
+            if (!memory) {
+                return runtime::failure(
+                  runtime::operation_error{
+                    errc::resource_exhausted,
+                    runtime::operation_kind::resource});
+            }
+            admitted.push_back(hold_admitted_remote(
+              target,
+              workload.smp_service_group(),
+              std::move(*pending),
+              std::move(*memory)));
+            return {};
+        };
+        unsigned rejected = 0;
+        for (unsigned request = 0; request < 102; ++request) {
+            const auto result = submit();
+            if (!result) {
+                BOOST_CHECK(result.error().code() == errc::resource_exhausted);
+                ++rejected;
+            }
+        }
+        BOOST_CHECK_EQUAL(rejected, 100U);
+        BOOST_CHECK_EQUAL(admitted.size(), 2U);
+        BOOST_CHECK_EQUAL(pending_limit.current(), 0U);
+        BOOST_CHECK_EQUAL(pending_limit.waiters(), 0U);
+        BOOST_CHECK_EQUAL(
+          manager.memory_used(workload_class::maintenance).value(), 2 * cost);
+        abort.request_abort();
+        // Cancellation closes source admission; accepted remote work is still
+        // owned until its native response completes and must be drained.
+        const auto after_abort = submit();
+        BOOST_REQUIRE(!after_abort);
+        BOOST_CHECK(after_abort.error().code() == errc::aborted);
+        co_await seastar::smp::submit_to(1, &release_remote_requests);
+        for (auto& request : admitted) {
+            co_await std::move(request);
+        }
+        BOOST_CHECK_EQUAL(pending_limit.current(), 2U);
+        const auto after_drain = submit();
+        BOOST_REQUIRE(!after_drain);
+        BOOST_CHECK(after_drain.error().code() == errc::aborted);
+        BOOST_CHECK_EQUAL(admitted.size(), 2U);
+        BOOST_CHECK_EQUAL(
+          manager.memory_used(workload_class::maintenance).value(), 0U);
+        const auto maximum = co_await seastar::smp::submit_to(
+          1, &remote_maximum_requests);
+        BOOST_CHECK_LE(maximum, 2U);
     }
+    co_await manager.stop();
+    co_await registry.stop();
+}
 
-    BOOST_CHECK(foreground_completed);
-    BOOST_CHECK_GT(background_iterations, 0U);
+namespace {
+struct observed_buffer {
+    explicit observed_buffer(bool& destroyed)
+      : destroyed(destroyed)
+      , bytes(16) {
+        std::memset(bytes.get_write(), 0x5a, bytes.size());
+    }
+    ~observed_buffer() { destroyed = true; }
+    bool& destroyed;
+    seastar::temporary_buffer<char> bytes;
+};
+
+seastar::future<unsigned>
+delayed_borrow(const char* bytes, seastar::future<> release) {
+    co_await std::move(release);
+    co_return static_cast<unsigned char>(bytes[0]);
+}
+
+seastar::future<unsigned> run_borrowed_scheduling_operation(
+  seastar::scheduling_group group,
+  bool& destroyed,
+  seastar::promise<>& entered,
+  seastar::future<> release) {
+    observed_buffer owner{destroyed};
+    co_return co_await seastar::with_scheduling_group(
+      group, [&owner, &entered, release = std::move(release)] mutable {
+          auto pending = delayed_borrow(owner.bytes.get(), std::move(release));
+          entered.set_value();
+          return pending;
+      });
+}
+} // namespace
+
+SEASTAR_TEST_CASE(
+  scheduled_borrow_keeps_its_coroutine_buffer_until_completion) {
+    resource_registry registry;
+    co_await registry.start(test_config());
+    resource_manager manager{registry.handles()};
+    co_await manager.start();
+    {
+        auto workload = manager.acquire_workload(workload_class::offload);
+        for (const auto group :
+             {seastar::current_scheduling_group(),
+              workload.scheduling_group()}) {
+            bool destroyed = false;
+            seastar::promise<> release;
+            seastar::promise<> entered;
+            auto started = entered.get_future();
+            auto result = run_borrowed_scheduling_operation(
+              group, destroyed, entered, release.get_future());
+            co_await std::move(started);
+            BOOST_CHECK(!destroyed);
+            BOOST_CHECK(!result.available());
+            release.set_value();
+            const auto byte = co_await std::move(result);
+            BOOST_CHECK_EQUAL(byte, 0x5aU);
+            BOOST_CHECK(destroyed);
+        }
+    }
     co_await manager.stop();
     co_await registry.stop();
 }

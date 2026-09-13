@@ -267,6 +267,18 @@ result<buffer_allocation_cost> fragmented_buffer::allocation_cost(
     return cost;
 }
 
+fragmented_buffer::fragment_position
+fragmented_buffer::locate(byte_count offset) const noexcept {
+    std::size_t index = 0;
+    auto skip = offset.value();
+    while (index < fragments_.size()
+           && skip >= fragments_[index].storage.size()) {
+        skip -= fragments_[index].storage.size();
+        ++index;
+    }
+    return {index, static_cast<std::size_t>(skip)};
+}
+
 result<buffer_allocation_cost> fragmented_buffer::slice_allocation_cost(
   byte_count offset,
   byte_count length,
@@ -278,24 +290,30 @@ result<buffer_allocation_cost> fragmented_buffer::slice_allocation_cost(
     if (!end || *end > size_) {
         return failure(errc::out_of_range);
     }
+    const auto at = length.value() == 0 ? fragment_position{} : locate(offset);
+    return slice_allocation_cost_from(at.index, at.offset, length, charge);
+}
+
+result<buffer_allocation_cost> fragmented_buffer::slice_allocation_cost_from(
+  std::size_t first,
+  std::size_t offset,
+  byte_count length,
+  allocation_charge_fn charge) const noexcept {
     buffer_allocation_cost cost;
     if (length.value() == 0) {
         return cost;
     }
     byte_count total;
     std::uint64_t touched = 0;
-    auto skip = offset.value();
+    auto skip = offset;
     auto remaining = length.value();
-    for (const auto& fragment : fragments_) {
+    for (auto index = first; index < fragments_.size(); ++index) {
+        const auto& fragment = fragments_[index];
         if (remaining == 0) {
             break;
         }
         const auto fragment_size = static_cast<std::uint64_t>(
           fragment.storage.size());
-        if (skip >= fragment_size) {
-            skip -= fragment_size;
-            continue;
-        }
         if (
           auto added = add_allocation_charge(
             cost, cost.backing, total, fragment.retained_bytes, charge);
@@ -347,20 +365,23 @@ fragmented_buffer::share(byte_count offset, byte_count length) {
         return fragmented_buffer{};
     }
 
+    const auto at = locate(offset);
+    return share_from(at.index, at.offset, length);
+}
+
+result<fragmented_buffer> fragmented_buffer::share_from(
+  std::size_t first, std::size_t offset, byte_count length) {
     fragment_storage shared;
     byte_count retained;
-    std::uint64_t skip = offset.value();
+    std::uint64_t skip = offset;
     std::uint64_t remaining = length.value();
-    for (auto& fragment : fragments_) {
+    for (auto index = first; index < fragments_.size(); ++index) {
+        auto& fragment = fragments_[index];
         if (remaining == 0) {
             break;
         }
         const auto fragment_size = static_cast<std::uint64_t>(
           fragment.storage.size());
-        if (skip >= fragment_size) {
-            skip -= fragment_size;
-            continue;
-        }
         const auto available = fragment_size - skip;
         const auto take = std::min(available, remaining);
         if (shared.size() == max_buffer_fragments) {
@@ -497,7 +518,6 @@ result<void> fragmented_buffer::trim_back(byte_count bytes) {
     size_ = *size_.checked_sub(bytes);
     retained_bytes_ = *retained_bytes_.checked_sub(released);
     invalidate_presentation();
-    drop_empty_fragments();
     return {};
 }
 

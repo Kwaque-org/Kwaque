@@ -4,8 +4,9 @@ Fragmented byte buffers and parsers for the record and network paths belong here
 
 A published `fragmented_buffer` is a move-only sequence of owning fragments whose
 bytes are immutable. External temporary buffers are copied into frozen backing,
-while shares, slices, and buffer-to-builder splices remain zero-copy between
-already-published Kwaque buffers. Logical and retained backing bytes are reported
+while shares and slices retain already-published backing. Buffer-to-builder
+splices copy at most 4 KiB of complete leading fragments into existing mutable
+tail room, then transfer all remaining backing without copying. Logical and retained backing bytes are reported
 separately, so a small slice cannot hide the larger backing it keeps alive.
 Explicit deep copy coalesces tiny source fragments into chunks no larger than
 128 KiB. External freeze preserves every accepted supplied boundary and rejects
@@ -21,7 +22,8 @@ allocation if the receiver cannot represent the total size.
 `fragmented_buffer_builder` is the only surface that mutates content. It fills
 spare tail capacity before allocating, grows allocations geometrically up to a
 fixed ceiling, packs small frozen fragments into that spare capacity instead of
-adding links, and publishes exactly once. Logical bytes, retained backing bytes,
+adding links, and publishes exactly once by transferring the same descriptor storage without a
+publication allocation. Reserve known descriptor counts before bulk assembly. Logical bytes, retained backing bytes,
 fragment count, and per-allocation size are independently bounded, and a
 rejected append leaves exactly the content that preceded it. The packing
 threshold is a fixed property of the builder rather than a setting, so
@@ -33,6 +35,12 @@ it returns are owning and outlive the parser. Fixed-width integer reads state
 their byte order explicitly, accept only 8-, 16-, 32-, and 64-bit unsigned
 types, and carry no record-format assumptions. Truncated input, an invalid
 requested range, and malformed internal state remain distinct typed errors.
-Speculative parsing uses a checkpoint stack with a fixed depth.
+Speculative parsing uses a checkpoint stack with a fixed depth. Owning parser
+slices start at its current fragment; failed construction preserves its cursor
+and marks. Both trim directions visit only the affected fragments.
+
+Whole-buffer copies, comparisons and external-fragment validation are synchronous.
+Callers bound their input spans and split large reactor work into cooperative
+batches; the published size/count ceilings alone are not a reactor time budget.
 
 Buffers belong to one shard and must not be transferred across shards.

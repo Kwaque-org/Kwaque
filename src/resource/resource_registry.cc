@@ -56,12 +56,6 @@ bool resource_handle_set::valid() const noexcept {
     return active_generation.load(std::memory_order_acquire) == generation_;
 }
 
-void resource_handle_set::assert_valid() const {
-    if (!valid()) {
-        throw std::logic_error("resource handles are no longer valid");
-    }
-}
-
 bool resource_handle_set::try_acquire_manager_lease() const noexcept {
     if (!valid()) {
         return false;
@@ -105,6 +99,7 @@ void resource_handle_set::release_manager_lease() const noexcept {
 }
 
 resource_registry::~resource_registry() {
+    assert_current();
     KWAQUE_INVARIANT(
       invariant_id{"KQ-RESOURCE-REGISTRY-STOPPED"},
       state_ == resource_registry_state::constructed
@@ -161,10 +156,7 @@ resource_registry::create_smp_service_group(workload_class classification) {
     const auto& descriptor = descriptor_for(classification);
     const auto name = group_name(descriptor);
     seastar::smp_service_group_config smp_config;
-    const auto minimum_limit = seastar::this_smp_shard_count() - 1;
-    const auto effective_limit = std::max(
-      descriptor.max_nonlocal_requests, minimum_limit);
-    smp_config.max_nonlocal_requests = effective_limit;
+    smp_config.max_nonlocal_requests = descriptor.max_nonlocal_requests;
     smp_config.group_name = seastar::sstring{name};
     smp_service_groups_[index] = co_await seastar::create_smp_service_group(
       std::move(smp_config));

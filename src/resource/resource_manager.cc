@@ -60,6 +60,7 @@ resource_manager::resource_manager(resource_handle_set handles)
   : handles_(std::move(handles)) {}
 
 resource_manager::~resource_manager() {
+    assert_current();
     KWAQUE_INVARIANT(
       invariant_id{"KQ-RESOURCE-MANAGER-STOPPED"},
       state_ == resource_manager_state::constructed
@@ -288,12 +289,12 @@ resource_manager::memory_available(workload_class classification) const {
       invariant_id{"KQ-RESOURCE-MEMORY-READY"},
       memory_admissions_[index].has_value(),
       "started manager has no class memory admission");
+    const auto available = memory_admissions_[index]->available_units();
     KWAQUE_INVARIANT(
       invariant_id{"KQ-RESOURCE-MEMORY-AVAILABLE"},
-      memory_admissions_[index]->current() >= 0,
+      available >= 0,
       "workload memory admission counter became negative");
-    return byte_count{
-      static_cast<std::uint64_t>(memory_admissions_[index]->current())};
+    return byte_count{static_cast<std::uint64_t>(available)};
 }
 
 workload_handle

@@ -204,6 +204,26 @@ TEST(DnsContractTest, PreservesNumericFastPathOrderAndTtl) {
     EXPECT_EQ(result->answers()[1].endpoint.address(), *second_address);
 }
 
+TEST(DnsContractTest, RejectsExcessResultCapacityAndCopiesBoundedNames) {
+    using namespace kwaque;
+    using namespace kwaque::runtime;
+    std::string text;
+    text.reserve(maximum_contiguous_allocation_bytes * 2);
+    text = "EXAMPLE.COM.";
+    const auto host = dns_name::make(text);
+    ASSERT_TRUE(host.has_value());
+    EXPECT_EQ(host->value(), "example.com");
+    EXPECT_LT(host->value().capacity(), text.capacity());
+    const auto address = network_address::try_parse_numeric("127.0.0.1");
+    ASSERT_TRUE(address.has_value());
+    std::vector<dns_answer> answers;
+    answers.reserve(maximum_dns_results + 1);
+    answers.push_back({network_endpoint{*address, 80}, maximum_dns_ttl});
+    const auto rejected = dns_result::make(std::move(answers), 1);
+    ASSERT_FALSE(rejected.has_value());
+    EXPECT_EQ(rejected.error().code(), errc::resource_exhausted);
+}
+
 TEST(DnsContractTest, ValidatesConfigurationAndFamily) {
     kwaque::runtime::dns_config config;
     EXPECT_TRUE(config.validate().has_value());

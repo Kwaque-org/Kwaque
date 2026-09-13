@@ -50,7 +50,7 @@ struct bounded_work_queue_config final {
         // Every admitted item costs at least one byte, so an item bound above
         // the byte bound could never be the binding constraint.
         if (
-          maximum_items.value() == 0 || maximum_bytes.value() < 2
+          maximum_items.value() == 0 || maximum_bytes.value() == 0
           || maximum_bytes.value() > seastar::semaphore::max_counter()
           || maximum_items.value() > maximum_bytes.value()
           || maximum_producer_waiters > maximum_supported_producer_waiters
@@ -628,9 +628,7 @@ private:
                     return queue_result<admitted_item>{std::unexpected(
                       failure(queue_failure_kind::aborted, byte_count{}))};
                 }
-                auto admitted = std::move(items_.front());
-                items_.pop_front();
-                return queue_result<admitted_item>{std::move(admitted)};
+                return queue_result<admitted_item>{take_admitted()};
             }
         }
         if (auto rejected = consumer_wait_rejection(abort_source)) {
@@ -681,9 +679,7 @@ private:
                   failure(queue_failure_kind::aborted, byte_count{}));
             }
             if (!items_.empty()) {
-                auto admitted = std::move(items_.front());
-                items_.pop_front();
-                co_return queue_result<admitted_item>{std::move(admitted)};
+                co_return queue_result<admitted_item>{take_admitted()};
             }
 
             if (!waiting.try_engage()) {
@@ -702,6 +698,17 @@ private:
                        || abort_source.abort_requested();
             });
         }
+    }
+
+    [[nodiscard]] admitted_item take_admitted() {
+        auto admitted = std::move(items_.front());
+        items_.pop_front();
+        // Removing an item frees its slot immediately. Its byte reservation
+        // remains with the consumer until transfer or handler completion.
+        if (admitting_producers_ != 0) {
+            producer_condition_.signal();
+        }
+        return admitted;
     }
 
 public:
@@ -1184,6 +1191,11 @@ private:
             }
             tasks_.reset();
         }
+        // Captures may own native units or workload leases. Destroy them
+        // after workers drain and before releasing their dependencies.
+        handler_ = handler_type{};
+        reporter_ = reporter_type{};
+        expected_failure_ = expected_failure_type{};
         workload_.reset();
         if (failure) {
             std::rethrow_exception(failure);

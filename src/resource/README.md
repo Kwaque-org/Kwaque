@@ -16,6 +16,12 @@ that remains exact while `signal()` hands units directly to a readied waiter.
 Components must bound their own pending waits rather than adding an unbounded
 generic admission layer.
 
+The same distinction applies to SMP groups: their execution slots do not cap
+waiting submissions. A submitting component admits pending items and bytes before
+calling the native operation, retains those reservations through completion, and
+drains accepted work before releasing its workload lease. Closing admission does
+not cancel a remote operation already executing.
+
 Future reclaimable components own Seastar's public asynchronous reclaimer
 directly and keep their pressure policy local. FIFO work queues provide the
 bounded component boundary: independent item, byte, and
@@ -25,6 +31,9 @@ managed queue draws native units from the same per-class semaphore as direct
 reservations and reserves one waiter slot for the producer holding its admission
 turn. Its optional worker set is owned by the queue, is started at most once,
 and retains each item's memory units until that item's handler completes.
+Dequeue immediately wakes producers for the freed item slot; byte admission
+remains independent. Close destroys handler, reporter and classifier captures
+after workers drain and before releasing its workload lease.
 Per-queue worker, producer-waiter, and manual-consumer ceilings also prevent task
 metadata from becoming an unaccounted memory multiplier. Manual consumers default
 to at most 64 pending waits, with a configurable limit from zero to 64. Saturation
@@ -50,3 +59,10 @@ preventing manager/registry teardown. The lease must outlive all units and
 pending waits obtained from those handles. Components drain their gates and
 queues, return memory units, and release the lease before the shard manager and
 process registry stop.
+
+A waiting push already owns its item. The queue byte limit covers admitted
+queued and active handler payloads; pending producers can additionally retain
+up to the waiter count times the maximum item cost. Producers account for those
+bytes before retaining work, using their existing native reservations. Queue
+metadata, callback captures and multiplication across queues/shards are separate
+from payload charges.

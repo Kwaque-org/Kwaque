@@ -7,7 +7,6 @@
 #include <algorithm>
 #include <bit>
 #include <cstring>
-#include <deque>
 #include <stdexcept>
 #include <utility>
 
@@ -115,11 +114,7 @@ byte_count fragmented_buffer_builder::tail_capacity() const noexcept {
 
 std::uint64_t fragmented_buffer_builder::next_allocation(
   std::uint64_t requested) const noexcept {
-    return next_allocation(requested, last_allocation_);
-}
-
-std::uint64_t fragmented_buffer_builder::next_allocation(
-  std::uint64_t requested, std::uint64_t previous_allocation) const noexcept {
+    const auto previous_allocation = last_allocation_;
     const auto ceiling = config_.max_fragment_bytes.value();
     std::uint64_t candidate = config_.initial_fragment_bytes.value();
     if (previous_allocation != 0) {
@@ -178,16 +173,26 @@ result<void> fragmented_buffer_builder::grow_tail(std::uint64_t requested) {
     return {};
 }
 
+void fragmented_buffer_builder::push_fragment(
+  fragmented_buffer::owned_fragment fragment, std::uint64_t used) {
+    const auto retained = fragment.retained_bytes;
+    fragments_.push_back(std::move(fragment));
+    if (fragments_.size() > 1) {
+        fragments_[fragments_.size() - 2].storage.trim(
+          static_cast<std::size_t>(tail_used_));
+    }
+    retained_bytes_ = *retained_bytes_.checked_add(retained);
+    tail_used_ = used;
+}
+
 void fragmented_buffer_builder::grow_tail_unchecked(std::uint64_t requested) {
-    seal_tail();
     const auto allocation = next_allocation(requested);
-    fragments_.push_back(
+    push_fragment(
       fragmented_buffer::owned_fragment{
         .storage = fragment_type{static_cast<std::size_t>(allocation)},
         .retained_bytes = byte_count{allocation},
-      });
-    retained_bytes_ = *retained_bytes_.checked_add(byte_count{allocation});
-    tail_used_ = 0;
+      },
+      0);
     last_allocation_ = allocation;
 }
 
@@ -285,42 +290,14 @@ fragmented_buffer_builder::append_fragment_copy(const fragment_type& fragment) {
     if (!retained || *retained > config_.max_retained_bytes) {
         return failure(errc::resource_exhausted);
     }
-    append_prevalidated_fragment(
+    push_fragment(
       fragmented_buffer::owned_fragment{
         .storage = fragment.clone(),
         .retained_bytes = byte_count{length},
-      });
-    return {};
-}
-
-void fragmented_buffer_builder::append_prevalidated_fragment(
-  fragmented_buffer::owned_fragment fragment) {
-    const auto length = static_cast<std::uint64_t>(fragment.storage.size());
-    if (
-      length <= pack_copy_threshold.value()
-      && length <= config_.max_fragment_bytes.value()) {
-        if (tail_capacity().value() < length) {
-            grow_tail_unchecked(length);
-        }
-        auto& tail = fragments_.back();
-        std::memcpy(
-          tail.storage.get_write() + tail_used_,
-          fragment.storage.get(),
-          static_cast<std::size_t>(length));
-        tail_used_ += length;
-    } else {
-        seal_tail();
-        const auto retained = *retained_bytes_.checked_add(
-          fragment.retained_bytes);
-        fragments_.push_back(std::move(fragment));
-        retained_bytes_ = retained;
-        tail_used_ = fragments_.back().storage.size();
-    }
-
-    // The caller has already checked the complete incoming byte count. Keep
-    // accounting in lockstep with each committed fragment so the builder stays
-    // internally consistent if a later allocation throws.
+      },
+      length);
     size_ = byte_count{size_.value() + length};
+    return {};
 }
 
 result<void>
@@ -328,52 +305,53 @@ fragmented_buffer_builder::append_buffer(fragmented_buffer&& other) {
     if (auto appendable = ensure_appendable(other.size()); !appendable) {
         return appendable;
     }
-    // Validated before anything is moved: without packing each donated fragment
-    // needs its own link, so this is the worst case. Passing it means no
-    // per-fragment append below can fail and leave a partial splice.
-    if (fragments_.size() + other.fragment_count() > config_.max_fragments) {
+    // Only complete leading fragments that fit the existing mutable tail are
+    // packed. Stop at the first non-fitting fragment; the suffix is
+    // transferred.
+    auto copy_remaining = std::min(
+      pack_copy_threshold.value(), tail_capacity().value());
+    std::size_t packed = 0;
+    byte_count donated_backing = other.retained_bytes();
+    for (const auto& fragment : other.fragments_) {
+        const auto length = fragment.storage.size();
+        if (length > copy_remaining) break;
+        copy_remaining -= length;
+        donated_backing = *donated_backing.checked_sub(fragment.retained_bytes);
+        ++packed;
+    }
+    const auto count = fragments_.size() + other.fragment_count() - packed;
+    const auto retained = retained_bytes_.checked_add(donated_backing);
+    if (
+      count > config_.max_fragments || !retained
+      || *retained > config_.max_retained_bytes) {
         return failure(errc::resource_exhausted);
     }
-    auto projected_retained = retained_bytes_;
-    auto projected_tail = tail_capacity().value();
-    auto projected_last_allocation = last_allocation_;
-    for (const auto& fragment : other.fragments_) {
-        const auto length = static_cast<std::uint64_t>(fragment.storage.size());
-        if (
-          length <= pack_copy_threshold.value()
-          && length <= config_.max_fragment_bytes.value()) {
-            if (projected_tail < length) {
-                const auto allocation = next_allocation(
-                  length, projected_last_allocation);
-                const auto next = projected_retained.checked_add(
-                  byte_count{allocation});
-                if (!next || *next > config_.max_retained_bytes) {
-                    return failure(errc::resource_exhausted);
-                }
-                projected_retained = *next;
-                projected_tail = allocation;
-                projected_last_allocation = allocation;
-            }
-            projected_tail -= length;
-        } else {
-            const auto next = projected_retained.checked_add(
-              fragment.retained_bytes);
-            if (!next || *next > config_.max_retained_bytes) {
-                return failure(errc::resource_exhausted);
-            }
-            projected_retained = *next;
-            projected_tail = 0;
-        }
+    // Every operation after this reservation is nonallocating. No source
+    // descriptor is moved until all bound checks and preparation have
+    // succeeded.
+    fragments_.reserve_back(count);
+    for (std::size_t index = 0; index < packed; ++index) {
+        const auto& fragment = other.fragments_[index].storage;
+        std::memcpy(
+          fragments_.back().storage.get_write() + tail_used_,
+          fragment.get(),
+          fragment.size());
+        tail_used_ += fragment.size();
     }
-    fragments_.reserve(fragments_.size() + other.fragment_count());
-    auto donated = std::move(other.fragments_);
+    if (packed != other.fragment_count()) {
+        seal_tail();
+        for (std::size_t index = packed; index < other.fragment_count();
+             ++index) {
+            fragments_.push_back(std::move(other.fragments_[index]));
+        }
+        tail_used_ = fragments_.back().storage.size();
+    }
+    size_ = *size_.checked_add(other.size());
+    retained_bytes_ = *retained;
     other.fragments_.clear();
     other.size_ = byte_count{};
     other.retained_bytes_ = byte_count{};
     other.invalidate_presentation();
-    for (auto& fragment : donated) {
-        append_prevalidated_fragment(std::move(fragment));
-    }
     return {};
 }
 
@@ -403,7 +381,7 @@ result<void> fragmented_buffer_builder::reserve_fragments(item_count count) {
     if (count.value() > config_.max_fragments) {
         return failure(errc::out_of_range);
     }
-    fragments_.reserve(static_cast<std::size_t>(count.value()));
+    fragments_.reserve_back(static_cast<std::size_t>(count.value()));
     return {};
 }
 
@@ -422,12 +400,7 @@ result<fragmented_buffer> fragmented_buffer_builder::finish() {
     tail_used_ = 0;
     last_allocation_ = 0;
 
-    fragmented_buffer::fragment_storage published_fragments;
-    published_fragments.reserve_back(fragments.size());
-    for (auto& fragment : fragments) {
-        published_fragments.push_back(std::move(fragment));
-    }
-    fragmented_buffer published{std::move(published_fragments), size, retained};
+    fragmented_buffer published{std::move(fragments), size, retained};
     published.drop_empty_fragments();
     if (
       auto actual = fragmented_buffer::total_size(published.fragments_);

@@ -120,7 +120,7 @@ fragment and individual allocation bounds as well as new descriptor costs.
 
 `staging.h` assembles an encoded prefix and an owning payload through a private
 builder. It checks supplied allocator charges, retained input, tail allocation,
-descriptor migration/publication overlap and synchronous copy/work bounds before
+the preallocated descriptor array transferred at publication and synchronous copy/work bounds before
 allocating. Only completed output is returned. The payload is consumed at entry
 and can be lost on failure; borrowed prefix storage stays immutable through the
 call. Other live usage includes prefix backing and opaque owner resources, while
@@ -150,21 +150,125 @@ header, while page and checkpoint caps cover complete encoded objects.
 `validate_batch_counts` bounds nonempty data-batch counts and aggregate headers;
 record contents, exact per-record totals and format grammar require their owner.
 
+## Binary envelopes and evolution
+
+`format_registry.h` contains a passive, constant family registry. It reserves
+codes 1 through 10 for submitted batches, assigned batches, segment headers,
+segment batch blocks, WAL prepares, durable-boundary footers, sealed extents,
+sparse indexes, range manifests and read checkpoints. Registration describes
+framing compatibility; the concrete body codec and its owning service supply
+payload validation and decide whether that payload may be written or advertised.
+An entry alone does not establish an implemented payload or an active service.
+
+Reader support, writer output and activation have separate responsibilities:
+
+- Each current descriptor has reader `current=1`, `oldest_readable=1`, writer
+  version 1, minimum reader version 1 and required-feature support zero.
+- After header integrity, readers reject `minimum_reader > writer` as malformed,
+  then reject zero versions as unsupported. They require
+  `minimum_reader <= current` and `writer >= oldest_readable`, a registered
+  nonzero family and support for every required feature bit. Unknown nonzero
+  families are unsupported; zero is malformed. There is no opaque-family
+  decode-as-success fallback.
+- A compatible newer writer can add optional header extensions while retaining
+  the exact known body grammar. For example `(writer=2, minimum_reader=1)` may
+  be readable, while `(2,2)` is unsupported by a v1 reader and `(1,2)` is
+  malformed. Numeric compatibility does not permit extra or missing body fields.
+- Production writers always emit `(1,1)`, a 32-byte header and zero feature bits.
+  No production extension tag is assigned. Optional-read tolerance grants no
+  permission to emit an unassigned tag or switch the writer's version. Synthetic
+  newer-writer and extension construction is confined to tests.
+- Activating a changed writer is an explicit decision by its payload/service
+  owner after the required readers are available. This library provides no
+  negotiation, cluster rollout or writer-activation service.
+
+The `KQBF` prefix uses explicit little-endian fields. Header CRC32C covers all
+declared header bytes, including the body CRC, with its own four-byte slot at
+offset 28 replaced by zeros. Body CRC32C covers the exact encoded body, including
+any counted padding owned by that body's grammar. Header extensions use ordered,
+unique, nonzero u16 tags, u16 flags and u32 lengths. Flag bit 0 means mandatory;
+other bits are unsupported. Unknown optional values are bounded, checksummed and
+skipped. Unknown mandatory tags reject, after their full value extent is checked.
+
+`envelope.h` exposes an unverified fixed-prefix inspection and a current-profile
+prefix encoder. `envelope_integrity.h` checks only the supplied raw header CRC.
+`envelope_decode.h` combines framing, integrity, compatibility and the independently
+requested family before invoking a statically supplied asynchronous body decoder
+on an exact complete child. One parent checkpoint covers the operation. The
+body must be fully consumed; errors, exceptions and observed cancellation restore
+the parent's cursor and existing marks. Temporary child and callback owners are
+released before the final abort poll and commit. An eighth owned mark remains
+usable, while acquiring a ninth fails without disturbing caller marks.
+
+Before decoding, reserve the parent's backing, descriptor history and possible
+share controls once through `reserve_decode_input`. Keep that reservation for
+the input's lifetime, including after rejected children. Supply the residual
+after verified native/frame/callback costs; each additional alias is admitted
+before creation. Sequential aliases release their reservations before the next
+one uses the same remaining allowance. Returned owners retain their own charges.
+
+`envelope_encode.h` consumes an already encoded body before its first suspension,
+including on later rejection. It completes body CRC before header CRC, freezes a
+private header, and uses cooperative staging for the final immutable output.
+Its `other_live` and `parent_remaining` convention matches the staging writer:
+exclude the body/header/alias/staging charges that the writer admits itself.
+All phases share work and cancellation state. Cleanup preserves the first failure;
+only completed output escapes after the final abort poll. Payload grammar,
+expected object/generation/position and storage-padding rules belong to body owners.
+
+Preserving known semantics is different from preserving an immutable object's
+encoded identity. A reader can skip an optional extension, but re-encoding the
+known value omits those bytes and emits the current writer profile. Exact-object
+digests must therefore cover the original encoded extent. Consumers that need
+opaque-byte preservation must retain that extent rather than reconstruct it
+from a decoded value.
+
+A new family or extension must name its payload owner, assign an unused stable
+code, specify complete field/length/integrity rules and bounds, implement its
+reader and writer, and provide independent compatibility/rejection fixtures.
+Incompatible body changes need an explicit decoder and minimum-reader change.
+Reader availability and the owner's activation decision must precede emission.
+Codes are never silently repurposed. Metadata, snapshots, remote manifests and
+transport negotiation gain no speculative payloads from this registry; transport
+version rules require their own owning protocol specification.
+
 Run the focused tests with:
 
 ```bash
-bazel test //src/codec/tests:all
+bazel test --config=ci-debug \
+  --build_tag_filters=-fuzz,-manual --test_tag_filters=-fuzz,-manual \
+  //src/codec/tests:all
 ```
 
 
 `codec_fuzz` exercises scalar, nullable, transaction and ordered-pair codecs
 against independent byte/error/cursor oracles, plus CRC backend and incremental
-equivalence. `codec_cooperative_fuzz` composes integrity, staging, collections
-and shared empty work with scripted cancellation. Both use the existing reactor
-bridge, own their input before crossing it, and join all work. Their fixed
-corpora are executed explicitly by CI. The 16-KiB input limit does not qualify
-maximum-size operation or actual suspension; `codec_qualification_test` supplies
-separate maximum-fragment, packing and merge progress cases.
+equivalence. Marker `0xe0` additionally exercises raw and structured envelopes;
+mutations can recompute body and header CRCs to reach deeper validation.
+`codec_cooperative_fuzz` composes integrity, staging, collections and shared empty
+work with scripted cancellation. Selector 4 additionally exercises envelopes
+with initial, queued, body-decoder and cleanup cancellation, narrowed work,
+exhausted residuals and existing checkpoints. Both retain their prior dispatch
+for every input and add envelope work after it. A shared test-only oracle checks
+exact errors, absolute offsets, callback admission, decoded values and unchanged
+suffixes independently of the production encoders and checksum engine.
+
+Both fuzzers use the existing reactor bridge, own input before crossing it and
+join all work and queued observers. Their fixed corpora are executed explicitly
+by CI. `envelope_fuzz_cases_test` also exercises the oracle's independent facts
+and mutation matrix as an ordinary native test. The 16-KiB input/generated-wire
+cap does not qualify maximum-size operation or actual suspension.
+`codec_qualification_test` supplies separate maximum-fragment, packing and merge
+progress cases, plus 0/1/64-extension envelope headers, the 4,096-byte header
+boundary and cancellation after body progress.
+
+Native-only envelope qualification additionally decodes a 16-MiB body built from
+64-KiB fragments under a 4,096-byte header. It observes reactor progress during
+body verification, records native allocation counts after fixture setup, and
+checks retained payload capacity at proven allocation bases. Its tighter native
+large-span charge profile is not used to qualify the system allocator; that
+profile-specific maximum-body case is skipped there. These observations do not
+measure transient peak memory, compiler-frame sizes or whole-process usage.
 
 The retained-payload qualification records usable sizes only for proven native
 allocation bases, then verifies that no-copy staging preserves those same
@@ -227,6 +331,70 @@ backend qualification also needs native architecture coverage, cold behavior,
 verified peak reservations and control progress; these results do not silently
 change the production backend.
 
+The envelope cases add 29 paired comparisons to the same `codec_bench` binary.
+Prefix and TLV cases isolate their declared leaves; full decode and encode cases
+include both the operation and caller-owned input/result disposal. The native
+harness accumulates time and allocation/task deltas across those two measured
+windows, with byte/value validation between them excluded on both sides. Setup,
+allocator-base probes, CRC warm-up and fixture construction are outside timing.
+
+The `checked_*` alternative retains the same validation, ownership, admission,
+cancellation and cleanup obligations using native scalar access and the configured
+Google CRC32C backend. The `codec_*` side calls the production implementation with
+its selected CRC backend. Both cross matching translation-unit boundaries; the
+same body grammar and primitive storage/work mechanisms are shared. These pairs
+compare checked mechanisms and CRC backends, not complete brokers or a cold-start
+path. The comparison backend retains its configured portable ARM behavior.
+
+The matrix covers contiguous and fragmented prefixes, 0/1/64 TLVs, 64-byte and
+32-KiB bodies, and fragmented 16-MiB bodies. The 64-TLV benchmark header is 1,056
+bytes with eight-byte values; the full 4,096-byte boundary is covered by the
+separate fuzz and qualification cases. Encode pairs always use the actual
+extension-free writer profile. Allocation/task counts and paired timings remain
+separate from peak-memory and control-progress qualification.
+
+After the release build above, run all envelope pairs into a fresh directory:
+
+```bash
+kwaque_envelope_pairs=(
+  --pair envelope_prefix_contiguous.checked_read=envelope_prefix_contiguous.codec_read
+  --pair envelope_prefix_contiguous.checked_write=envelope_prefix_contiguous.codec_write
+  --pair envelope_prefix_frag1.checked_read=envelope_prefix_frag1.codec_read
+)
+for count in 0 1 64; do
+  for layout in contiguous frag7; do
+    group="envelope_tlv${count}_${layout}"
+    kwaque_envelope_pairs+=(--pair "${group}.checked_scan=${group}.codec_scan")
+  done
+done
+for size in 64 32768; do
+  for count in 0 1 64; do
+    for layout in contiguous frag67; do
+      group="envelope_body${size}_ext${count}_${layout}"
+      kwaque_envelope_pairs+=(--pair "${group}.checked_decode=${group}.codec_decode")
+      if [ "$count" = 0 ]; then
+        kwaque_envelope_pairs+=(--pair "${group}.checked_encode=${group}.codec_encode")
+      fi
+    done
+  done
+done
+for count in 0 1 64; do
+  group="envelope_body16777216_ext${count}_frag32768"
+  kwaque_envelope_pairs+=(--pair "${group}.checked_decode=${group}.codec_decode")
+done
+kwaque_envelope_pairs+=(
+  --pair envelope_body16777216_ext0_frag65536.checked_encode=envelope_body16777216_ext0_frag65536.codec_encode
+)
+python3 tools/compare_benchmarks.py \
+  --binary=bazel-bin/src/codec/tests/codec_bench \
+  --output-dir=.cache/envelope-bench-pairs \
+  "${kwaque_envelope_pairs[@]}"
+```
+
+Use a different output directory for each rerun. The existing driver requires
+three rounds with at least seven samples, verifies the actual native production
+profile and binary identity, and retains raw results and its gate decisions.
+
 Collection construction and staging owner cases report operation costs without
 an independent comparison claim. Their returned owner's validation/disposal is
 outside construction timing:
@@ -247,3 +415,11 @@ bazel test --config=ci --config=fuzz \
   //src/codec/tests:codec_fuzz \
   //src/codec/tests:codec_cooperative_fuzz
 ```
+
+Cooperative buffer assembly transfers complete published fragments, including
+small fragments, without packing or splitting their backing. It reserves one
+output descriptor array and one temporary slice at a time. Input backing and
+its reservations remain with returned aliases until they are released;
+consuming a donor does not imply destroying its backing during the operation.
+Synchronous assembly copies the borrowed prefix, uses bounded existing-tail
+packing, and reserves its output descriptors before mutation.

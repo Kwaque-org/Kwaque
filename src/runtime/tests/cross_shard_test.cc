@@ -12,6 +12,7 @@
 
 #include <boost/test/unit_test.hpp>
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <cstddef>
@@ -210,24 +211,61 @@ SEASTAR_TEST_CASE(cross_shard_wrappers_return_owned_values_from_every_shard) {
     }
 
     const scalar_id expected{42};
-    const auto echoed = co_await kwaque::runtime::invoke_on_owner(
-      owners.back(), group, &echo_id, expected);
-    BOOST_CHECK(echoed == expected);
-    const auto delayed = co_await kwaque::runtime::invoke_on_owner(
-      owners.back(), group, &delayed_echo_id, expected);
-    BOOST_CHECK(delayed == expected);
-    const auto referenced = co_await kwaque::runtime::invoke_on_owner(
-      owners.back(), group, &delayed_echo_reference, expected);
-    BOOST_CHECK(referenced == expected);
-    const auto result = co_await kwaque::runtime::invoke_on_owner(
-      owners.back(), group, &delayed_result, expected);
-    BOOST_REQUIRE(result.has_value());
-    BOOST_CHECK(*result == expected);
-    const auto failure = co_await kwaque::runtime::invoke_on_owner(
-      owners.back(), group, &delayed_result_failure, expected);
-    BOOST_REQUIRE(!failure.has_value());
-    BOOST_CHECK(failure.error().code() == kwaque::errc::timed_out);
-    BOOST_CHECK_EQUAL(failure.error().context_size(), 1U);
+    for (const auto owner : owners) {
+        const auto echoed = co_await kwaque::runtime::invoke_on_owner(
+          owner, group, &echo_id, expected);
+        BOOST_CHECK(echoed == expected);
+        const auto delayed = co_await kwaque::runtime::invoke_on_owner(
+          owner, group, &delayed_echo_id, expected);
+        BOOST_CHECK(delayed == expected);
+        const auto referenced = co_await kwaque::runtime::invoke_on_owner(
+          owner, group, &delayed_echo_reference, expected);
+        BOOST_CHECK(referenced == expected);
+        const auto result = co_await kwaque::runtime::invoke_on_owner(
+          owner, group, &delayed_result, expected);
+        BOOST_REQUIRE(result.has_value());
+        BOOST_CHECK(*result == expected);
+        const auto failure = co_await kwaque::runtime::invoke_on_owner(
+          owner, group, &delayed_result_failure, expected);
+        BOOST_REQUIRE(!failure.has_value());
+        BOOST_CHECK(failure.error().code() == kwaque::errc::timed_out);
+        BOOST_CHECK_EQUAL(failure.error().context_size(), 1U);
+        const auto temporary = co_await kwaque::runtime::invoke_on_owner(
+          owner,
+          group,
+          [](const scalar_id& value) -> seastar::future<scalar_id> {
+              co_await seastar::yield();
+              co_return value;
+          },
+          expected);
+        BOOST_CHECK(temporary == expected);
+    }
+}
+
+SEASTAR_TEST_CASE(cross_shard_bytes_transfer_empty_and_exact_limit_owners) {
+    using kwaque::runtime::cross_shard_bytes;
+    const auto group = seastar::default_smp_service_group();
+    const auto owners = co_await kwaque::runtime::invoke_on_all(
+      group, [] { return kwaque::runtime::owner_shard{}; });
+    BOOST_REQUIRE_GE(owners.size(), 2U);
+    for (const auto size : {std::size_t{0}, cross_shard_bytes::max_size}) {
+        std::vector<std::byte> source(size, std::byte{0x5a});
+        auto copied = cross_shard_bytes::copy(source);
+        BOOST_REQUIRE(copied.has_value());
+        source.clear();
+        const auto returned = co_await kwaque::runtime::invoke_on_owner(
+          owners.back(),
+          group,
+          [](cross_shard_bytes bytes) -> seastar::future<cross_shard_bytes> {
+              co_await seastar::yield();
+              co_return std::move(bytes);
+          },
+          std::move(*copied));
+        BOOST_CHECK_EQUAL(returned.bytes().size(), size);
+        BOOST_CHECK(std::ranges::all_of(returned.bytes(), [](std::byte byte) {
+            return byte == std::byte{0x5a};
+        }));
+    }
 }
 
 SEASTAR_TEST_CASE(cross_shard_fanout_waits_for_all_shards_before_failing) {

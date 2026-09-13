@@ -5,6 +5,7 @@
 #include <seastar/core/temporary_buffer.hh>
 
 #include <algorithm>
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -43,10 +44,22 @@ public:
     }
 
     [[nodiscard]] std::size_t bounded(std::size_t limit) noexcept {
-        return limit == 0 ? 0 : static_cast<std::size_t>(byte()) % (limit + 1);
+        const auto raw = static_cast<std::size_t>(byte())
+                         | (static_cast<std::size_t>(byte()) << 8U);
+        if (limit == 0) return 0;
+        switch (raw % 8U) {
+        case 0:
+            return 0;
+        case 1:
+            return limit;
+        case 2:
+            return limit - 1;
+        default:
+            return raw % (limit + 1);
+        }
     }
 
-    [[nodiscard]] std::string bytes(std::size_t length) noexcept {
+    [[nodiscard]] std::string bytes(std::size_t length) {
         std::string out;
         out.reserve(length);
         for (std::size_t index = 0; index < length; ++index) {
@@ -80,7 +93,7 @@ fragmented_buffer build(script& input, std::string& oracle) {
       config.initial_fragment_bytes.value()
       + static_cast<std::uint64_t>(input.bounded(255))};
     config.max_total_bytes = byte_count{max_input_size * 4};
-    config.max_fragments = 1 + input.bounded(31);
+    config.max_fragments = 1 + input.bounded(max_buffer_fragments - 1);
     if (!config.validate()) {
         return fragmented_buffer{};
     }
@@ -214,6 +227,8 @@ void parse(
     auto shared = buffer.share();
     fragmented_buffer_parser parser{std::move(shared)};
     std::size_t consumed = 0;
+    std::array<std::size_t, max_parser_checkpoints> checkpoints{};
+    std::size_t depth = 0;
 
     for (std::size_t operation = 0;
          operation < max_operations && !input.exhausted();
@@ -222,7 +237,7 @@ void parse(
         require(parser.bytes_remaining().value() == remaining);
         require(parser.bytes_consumed().value() == consumed);
 
-        const auto choice = input.byte() % 8;
+        const auto choice = input.byte() % 9;
         const auto request = input.bounded(remaining + 1);
         if (choice == 0) {
             const auto skipped = parser.skip(
@@ -267,22 +282,17 @@ void parse(
                   == oracle.substr(consumed, request));
             }
         } else if (choice == 4) {
-            if (parser.push_checkpoint()) {
-                const auto before = parser.bytes_consumed();
-                static_cast<void>(
-                  parser.skip(byte_count{static_cast<std::uint64_t>(request)}));
-                require(parser.rollback().has_value());
-                require(parser.bytes_consumed() == before);
-            }
+            const auto marked = parser.push_checkpoint();
+            require(marked.has_value() == (depth < checkpoints.size()));
+            if (marked) checkpoints[depth++] = consumed;
         } else if (choice == 5) {
-            if (parser.push_checkpoint()) {
-                const auto skipped = parser.skip(
-                  byte_count{static_cast<std::uint64_t>(request)});
-                require(parser.commit().has_value());
-                if (skipped) {
-                    consumed += request;
-                }
-            }
+            const auto rolled = parser.rollback();
+            require(rolled.has_value() == (depth != 0));
+            if (rolled) consumed = checkpoints[--depth];
+        } else if (choice == 8) {
+            const auto committed = parser.commit();
+            require(committed.has_value() == (depth != 0));
+            if (committed) --depth;
         } else if (choice == 6) {
             const auto before = parser.bytes_consumed();
             const auto value = parser.read_be<std::uint16_t>();
@@ -310,6 +320,7 @@ void parse(
             }
         }
 
+        require(parser.checkpoint_depth() == depth);
         const auto fragment = parser.peek_current_fragment();
         if (consumed < oracle.size()) {
             require(!fragment.empty());
@@ -318,6 +329,10 @@ void parse(
         } else {
             require(fragment.empty());
         }
+    }
+    while (depth != 0) {
+        require(parser.commit().has_value());
+        --depth;
     }
 }
 

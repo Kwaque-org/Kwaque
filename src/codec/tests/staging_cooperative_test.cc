@@ -254,7 +254,7 @@ TEST(CooperativeStagingTest, AbortWithAnArbitraryExceptionIsATypedFailure) {
       errc::aborted);
 }
 
-TEST(CooperativeStagingTest, AbortFromConsumedInputReleasePreventsPublication) {
+TEST(CooperativeStagingTest, TransferredBackingOutlivesAssemblyAndLateAbort) {
     seastar::abort_source abort;
     bool released = false;
     auto memory = std::make_unique<char[]>(1);
@@ -274,10 +274,15 @@ TEST(CooperativeStagingTest, AbortFromConsumedInputReleasePreventsPublication) {
     ASSERT_FALSE(released);
     ASSERT_FALSE(abort.abort_requested());
     codec::cooperative_work work{codec::limits::defaults(), abort};
-    const auto result = assemble(
+    auto result = assemble(
       fragmented_buffer{}, std::move(input), work, byte_count{1});
+    ASSERT_TRUE(result.has_value());
+    EXPECT_FALSE(released);
+    EXPECT_FALSE(abort.abort_requested());
+    EXPECT_TRUE(result->content_equals("x"));
+    *result = fragmented_buffer{};
     EXPECT_TRUE(released);
-    expect_error(result, errc::aborted);
+    EXPECT_TRUE(abort.abort_requested());
 }
 
 TEST(CooperativeStagingTest, EveryObservedAllocationFailurePublishesNothing) {

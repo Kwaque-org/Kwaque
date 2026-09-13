@@ -12,6 +12,7 @@
 #include <cstddef>
 #include <functional>
 #include <limits>
+#include <optional>
 #include <stdexcept>
 #include <utility>
 #include <vector>
@@ -128,20 +129,30 @@ public:
 
     seastar::future<> start() {
         assert_current();
-        const auto spawned = tasks_.spawn(
-          delayed_completion{
-            counters_, owner().value(), release_.get_future()});
-        if (!spawned) {
-            throw std::logic_error("delayed task was rejected");
+        tasks_.emplace();
+        std::exception_ptr failure;
+        try {
+            const auto spawned = tasks_->spawn(
+              delayed_completion{
+                counters_, owner().value(), release_.get_future()});
+            if (!spawned) {
+                throw std::logic_error("delayed task was rejected");
+            }
+        } catch (...) {
+            failure = std::current_exception();
+        }
+        if (failure) {
+            co_await tasks_->close();
+            tasks_.reset();
+            std::rethrow_exception(failure);
         }
         counters_.starts[owner().value()].fetch_add(
           1, std::memory_order_relaxed);
-        return seastar::make_ready_future<>();
     }
 
     void request_abort() {
         assert_current();
-        tasks_.request_abort();
+        tasks_->request_abort();
         if (!released_) {
             released_ = true;
             release_.set_value();
@@ -150,14 +161,15 @@ public:
 
     seastar::future<> stop() {
         assert_current();
-        co_await tasks_.close();
+        co_await tasks_->close();
+        tasks_.reset();
         counters_.stops[owner().value()].fetch_add(
           1, std::memory_order_relaxed);
     }
 
 private:
     lifecycle_counters& counters_;
-    kwaque::runtime::task_scope tasks_;
+    std::optional<kwaque::runtime::task_scope> tasks_;
     seastar::promise<> release_;
     bool released_{false};
 };

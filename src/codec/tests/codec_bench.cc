@@ -8,7 +8,7 @@
 #include "src/codec/integer.h"
 #include "src/codec/limits.h"
 #include "src/codec/staging_cooperative.h"
-#include "src/codec/tests/codec_bench_fixture.h"
+#include "src/codec/tests/codec_bench_reference.h"
 #include "src/codec/transaction.h"
 
 #include <seastar/core/abort_source.hh>

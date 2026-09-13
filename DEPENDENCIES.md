@@ -53,6 +53,15 @@ contents invalidate the materialized repository.
 A header compatibility patch includes `<new>` at global scope in the native
 spinlock header, preserving its alignment and locking implementation with libc++.
 
+A scheduling-group patch rolls back local task queues and scheduling-specific
+state when construction fails, and cleans initialized shards when a remote
+initialization fails. Group creation and destruction share a native management
+semaphore so a released group slot cannot be reused during cross-shard cleanup.
+Cleanup also excludes concurrent scheduling-specific key registration using the
+native key mutex; local construction rollback already holds that mutex.
+Dependency updates must retain the throwing-constructor rollback tests and prove
+equivalent cleanup before removing this patch.
+
 A separate Seastar patch makes its custom `chunked_vector` compatible with
 those failure guarantees: a new fragment is fully allocated before it is
 published into the outer fragment vector, capacity changes commit afterward,

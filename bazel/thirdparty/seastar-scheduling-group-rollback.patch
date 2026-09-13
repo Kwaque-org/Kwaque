@@ -1,0 +1,178 @@
+diff --git a/src/core/reactor.cc b/src/core/reactor.cc
+--- a/src/core/reactor.cc
++++ b/src/core/reactor.cc
+@@ -5284,6 +5284,7 @@
+ }
+ 
+ static std::atomic<unsigned long> s_next_scheduling_group_specific_key{0};
++static thread_local semaphore scheduling_group_management_sem{1};
+ 
+ static
+ unsigned long
+@@ -5348,10 +5349,23 @@
+         }
+ 
+         auto sg = scheduling_group(id);
++        auto clear_flag = defer([this, sg] () noexcept {
++            get_sg_data(sg).queue_is_initialized = false;
++        });
+         get_sg_data(sg).queue_is_initialized = true;
+         _task_queues[sg._id] = std::make_unique<task_queue>(group, sg._id, name, shortname, shares);
+-
+-        return init_scheduling_group_specific_data(sg).then([sg] {
++        clear_flag.cancel();
++
++        return init_scheduling_group_specific_data(sg).handle_exception([this, sg] (std::exception_ptr e) {
++            return destroy_scheduling_group(sg).then_wrapped([e = std::move(e)] (future<> cleanup) {
++                try {
++                    cleanup.get();
++                } catch (...) {
++                    on_fatal_internal_error(seastar_logger, "Scheduling group rollback failed");
++                }
++                std::rethrow_exception(e);
++            });
++        }).then([sg] {
+             return make_ready_future<scheduling_group>(sg);
+         });
+     });
+@@ -5360,13 +5374,26 @@
+ future<>
+ reactor::init_scheduling_group(seastar::scheduling_group sg, sstring name, sstring shortname, float shares, scheduling_supergroup parent) {
+     return with_shared(_scheduling_group_keys_mutex, [this, sg, name = std::move(name), shortname = std::move(shortname), shares, parent] {
++        auto clear_flag = defer([this, sg] () noexcept {
++            get_sg_data(sg).queue_is_initialized = false;
++        });
+         get_sg_data(sg).queue_is_initialized = true;
+         auto* group = &_cpu_sched;
+         if (!parent.is_root()) {
+             group = _supergroups[parent.index()].get();
+         }
+         _task_queues[sg._id] = std::make_unique<task_queue>(group, sg._id, name, shortname, shares);
+-        return init_scheduling_group_specific_data(sg);
++        clear_flag.cancel();
++        return init_scheduling_group_specific_data(sg).handle_exception([this, sg] (std::exception_ptr e) {
++            return destroy_scheduling_group(sg).then_wrapped([e = std::move(e)] (future<> cleanup) {
++                try {
++                    cleanup.get();
++                } catch (...) {
++                    on_fatal_internal_error(seastar_logger, "Scheduling group rollback failed");
++                }
++                std::rethrow_exception(e);
++            });
++        });
+     });
+ }
+ 
+@@ -5579,26 +5606,58 @@
+ 
+ future<scheduling_group>
+ create_scheduling_group(sstring name, sstring shortname, float shares, scheduling_supergroup parent) noexcept {
+-    auto sg = co_await smp::submit_to(0, [name, shortname, shares, parent] {
+-        return engine().init_scheduling_group(name, shortname, shares, parent);
+-    });
+-    co_await smp::invoke_on_all([sg, name, shortname, shares, parent] {
+-        if (this_shard_id() == 0) {
+-            return make_ready_future<>();
+-        }
+-        return engine().init_scheduling_group(sg, name, shortname, shares, parent);
+-    });
+-    co_return sg;
++    return smp::submit_to(0, [name = std::move(name), shortname = std::move(shortname), shares, parent] () mutable {
++        return with_semaphore(scheduling_group_management_sem, 1, [name = std::move(name), shortname = std::move(shortname), shares, parent] () mutable {
++            // Prepare nonthrowing continuation ownership before initialization
++            // can publish a group. Include fan-out callback construction in the
++            // rollback boundary, not only its returned future.
++            auto initialize_others = [name, shortname, shares, parent] (scheduling_group sg) {
++                return futurize_invoke([&] {
++                    // Init-capture drops the enclosing const call operator's
++                    // qualification, keeping owned strings nothrow-movable.
++                    return smp::invoke_on_all([sg, name = name, shortname = shortname, shares, parent] {
++                        if (this_shard_id() == 0) {
++                            return make_ready_future<>();
++                        }
++                        return engine().init_scheduling_group(sg, name, shortname, shares, parent);
++                    });
++                }).handle_exception([sg] (std::exception_ptr e) {
++                    return smp::invoke_on_all([sg] {
++                        auto& r = engine();
++                        return with_shared(r._scheduling_group_keys_mutex, [&r, sg] {
++                            // A failed local initializer has already cleared its
++                            // flag and queue. Never dispatch into an absent group.
++                            if (!r._task_queues[internal::scheduling_group_index(sg)]) {
++                                return make_ready_future<>();
++                            }
++                            return r.destroy_scheduling_group(sg);
++                        });
++                    }).then_wrapped([e = std::move(e)] (future<> cleanup) {
++                        try {
++                            cleanup.get();
++                        } catch (...) {
++                            on_fatal_internal_error(seastar_logger, "Scheduling group rollback failed");
++                        }
++                        std::rethrow_exception(e);
++                    });
++                }).then([sg] {
++                    return sg;
++                });
++            };
++            return engine().init_scheduling_group(std::move(name), std::move(shortname), shares, parent)
++                    .then(std::move(initialize_others));
++        });
++    });
+ }
+ 
+ future<scheduling_group>
+ create_scheduling_group(sstring name, sstring shortname, float shares) noexcept {
+-    return create_scheduling_group(name, shortname, shares, scheduling_supergroup());
++    return create_scheduling_group(std::move(name), std::move(shortname), shares, scheduling_supergroup());
+ }
+ 
+ future<scheduling_group>
+ create_scheduling_group(sstring name, float shares) noexcept {
+-    return create_scheduling_group(name, {}, shares);
++    return create_scheduling_group(std::move(name), {}, shares);
+ }
+ 
+ future<scheduling_group_key>
+@@ -5619,8 +5678,17 @@
+     if (sg == current_scheduling_group()) {
+         return make_exception_future<>(make_backtraced_exception_ptr<std::runtime_error>("Attempt to destroy the current scheduling group"));
+     }
+-    return smp::invoke_on_all([sg] {
+-        return engine().destroy_scheduling_group(sg);
++    return smp::submit_to(0, [sg] {
++        // Do not reuse a released shard-zero slot until teardown has completed
++        // on every shard, including rollback of a partially created group.
++        return with_semaphore(scheduling_group_management_sem, 1, [sg] {
++            return smp::invoke_on_all([sg] {
++                auto& r = engine();
++                return with_shared(r._scheduling_group_keys_mutex, [&r, sg] {
++                    return r.destroy_scheduling_group(sg);
++                });
++            });
++        });
+     });
+ }
+ 
+diff --git a/include/seastar/core/with_scheduling_group.hh b/include/seastar/core/with_scheduling_group.hh
+--- a/include/seastar/core/with_scheduling_group.hh
++++ b/include/seastar/core/with_scheduling_group.hh
+@@ -24,6 +24,7 @@
+ 
+ #include <seastar/core/future.hh>
+ #include <seastar/core/make_task.hh>
++#include <seastar/util/critical_alloc_section.hh>
+ #include <tuple>
+ #include <utility>
+ 
+@@ -39,6 +40,10 @@
+ auto
+ schedule_in_group(scheduling_group sg, Func func) noexcept {
+     static_assert(std::is_nothrow_move_constructible_v<Func>);
++    // Task allocation and enqueueing are fatal on OOM, like scheduling a
++    // future continuation. The queued callable runs after this guard ends,
++    // so its recoverable allocations remain eligible for failure injection.
++    memory::scoped_critical_alloc_section critical;
+     auto tsk = make_task(sg, std::move(func));
+     schedule_checked(tsk);
+     return tsk->get_future();

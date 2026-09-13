@@ -54,14 +54,26 @@ class CrashRecorderTest(unittest.TestCase):
                 timeout=60,
                 check=False,
             )
-            reports = [path.read_bytes() for path in Path(directory).glob("crash_reports/*.crash")]
+            reports = [
+                path.read_bytes()
+                for path in Path(directory).glob("crash_reports/*.crash")
+            ]
         return result, reports
 
     def check_report(self, encoded: bytes, kind: int, signo: int) -> None:
         self.assertGreaterEqual(len(encoded), 48)
         self.assertLessEqual(len(encoded), 9216)
         self.assertEqual(encoded[:8], b"KQCRSH2\0")
-        timestamp, actual_signal, shard, actual_kind, message, stack, version, architecture = struct.unpack_from("<QIIIIIII", encoded, 8)
+        (
+            timestamp,
+            actual_signal,
+            shard,
+            actual_kind,
+            message,
+            stack,
+            version,
+            architecture,
+        ) = struct.unpack_from("<QIIIIIII", encoded, 8)
         self.assertGreater(timestamp, 0)
         self.assertEqual(actual_signal, signo)
         self.assertEqual(actual_kind, kind)
@@ -72,18 +84,28 @@ class CrashRecorderTest(unittest.TestCase):
         self.assertGreater(architecture, 0)
         self.assertLessEqual(architecture, 16)
         self.assertEqual(len(encoded), 48 + message + stack + version + architecture)
-        self.assertEqual(encoded[-4 - architecture:-4].decode(), os.uname().machine)
-        self.assertEqual(struct.unpack_from("<I", encoded, len(encoded) - 4)[0], crc32c(encoded[:-4]))
+        self.assertEqual(encoded[-4 - architecture : -4].decode(), os.uname().machine)
+        self.assertEqual(
+            struct.unpack_from("<I", encoded, len(encoded) - 4)[0], crc32c(encoded[:-4])
+        )
         self.assertNotIn(b"secret-token-never-record", encoded)
 
     def test_signal_profiles_and_native_termination(self) -> None:
-        for scenario, signo, kind in (("abrt", signal.SIGABRT, 2), ("ill", signal.SIGILL, 3), ("segv", signal.SIGSEGV, 4)):
+        for scenario, signo, kind in (
+            ("abrt", signal.SIGABRT, 2),
+            ("ill", signal.SIGILL, 3),
+            ("segv", signal.SIGSEGV, 4),
+        ):
             with self.subTest(signal=scenario):
                 result, reports = self.run_probe(scenario)
                 if scenario == "segv" and "asan=true" in result.stdout:
                     # The sanitizer retains SIGSEGV ownership and may terminate
                     # through SIGABRT, which the recorder still observes.
-                    self.assertIn(result.returncode, (-signal.SIGABRT, -signal.SIGSEGV), result.stdout)
+                    self.assertIn(
+                        result.returncode,
+                        (-signal.SIGABRT, -signal.SIGSEGV),
+                        result.stdout,
+                    )
                     completed = [report for report in reports if report]
                     if completed:
                         self.assertEqual(len(completed), 1)
@@ -103,7 +125,9 @@ class CrashRecorderTest(unittest.TestCase):
 
     def test_simultaneous_shard_signals_keep_one_complete_report(self) -> None:
         result, reports = self.run_probe("concurrent", shards=2)
-        self.assertIn(result.returncode, (-signal.SIGABRT, -signal.SIGILL), result.stdout)
+        self.assertIn(
+            result.returncode, (-signal.SIGABRT, -signal.SIGILL), result.stdout
+        )
         self.assertEqual(len(reports), 1, result.stdout)
         signo = struct.unpack_from("<I", reports[0], 16)[0]
         self.check_report(reports[0], 2 if signo == signal.SIGABRT else 3, signo)
@@ -121,9 +145,7 @@ class CrashRecorderTest(unittest.TestCase):
         result, reports = self.run_probe("allocation")
         if result.returncode == 77:
             self.assertIn("injection=false", result.stdout)
-            self.assertNotEqual(
-                os.environ.get("KWAQUE_EXPECT_TEST_INJECTION"), "true"
-            )
+            self.assertNotEqual(os.environ.get("KWAQUE_EXPECT_TEST_INJECTION"), "true")
             self.assertEqual(reports, [])
             self.skipTest("allocation injection is disabled in this verified profile")
         self.assertEqual(result.returncode, -signal.SIGABRT, result.stdout)

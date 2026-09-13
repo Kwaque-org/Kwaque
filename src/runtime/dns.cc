@@ -39,7 +39,8 @@ bool valid_hostname(std::string_view value) noexcept {
         }
         for (std::size_t index = label_start; index < label_end; ++index) {
             const char character = value[index];
-            const bool letter = character >= 'a' && character <= 'z';
+            const bool letter = (character >= 'a' && character <= 'z')
+                                || (character >= 'A' && character <= 'Z');
             const bool digit = character >= '0' && character <= '9';
             if (!letter && !digit && character != '-') {
                 return false;
@@ -55,18 +56,21 @@ bool valid_hostname(std::string_view value) noexcept {
 
 } // namespace
 
-result<dns_name> dns_name::make(std::string value) noexcept {
-    if (value.size() > 1 && value.back() == '.') {
-        value.pop_back();
-    }
+result<dns_name> dns_name::make(std::string_view input) {
+    if (input.size() > 1 && input.back() == '.') input.remove_suffix(1);
+    if (input.size() > maximum_dns_name_bytes)
+        return failure(dns_error(errc::out_of_range));
     if (
-      value.empty() || value == "."
-      || std::any_of(value.begin(), value.end(), invalid_dns_character)) {
+      input.empty() || input == "."
+      || std::any_of(input.begin(), input.end(), invalid_dns_character)) {
         return failure(dns_error(errc::invalid_argument));
     }
-    if (value.size() > maximum_dns_name_bytes) {
-        return failure(dns_error(errc::out_of_range));
+    if (
+      !network_address::try_parse_numeric(input).has_value()
+      && !valid_hostname(input)) {
+        return failure(dns_error(errc::invalid_argument));
     }
+    std::string value{input};
     std::transform(
       value.begin(), value.end(), value.begin(), [](char character) {
           if (character >= 'A' && character <= 'Z') {
@@ -74,11 +78,6 @@ result<dns_name> dns_name::make(std::string value) noexcept {
           }
           return character;
       });
-    if (
-      !network_address::try_parse_numeric(value).has_value()
-      && !valid_hostname(value)) {
-        return failure(dns_error(errc::invalid_argument));
-    }
     return dns_name{std::move(value)};
 }
 
@@ -93,7 +92,9 @@ result<dns_result> dns_result::make(
     if (answers.empty()) {
         return failure(dns_error(errc::dns_failure));
     }
-    if (answers.size() > maximum_answers) {
+    if (
+      answers.size() > maximum_answers
+      || answers.capacity() > maximum_dns_results) {
         return failure(dns_error(errc::resource_exhausted));
     }
     if (

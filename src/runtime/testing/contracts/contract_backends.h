@@ -4,8 +4,14 @@
 #include "src/runtime/environment.h"
 
 #include <seastar/core/abort_source.hh>
+#include <seastar/core/coroutine.hh>
 #include <seastar/core/future.hh>
+#include <seastar/core/gate.hh>
+#include <seastar/core/semaphore.hh>
+#include <seastar/core/shared_future.hh>
+#include <seastar/util/defer.hh>
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <deque>
@@ -176,9 +182,13 @@ public:
           .data = std::move(data),
           .reservation = std::move(*reservation),
         };
-        auto completion = pending.completion.get_future();
-        pending_writes_.push_back(std::move(pending));
-        return completion;
+        auto holder = write_operations_.hold();
+        auto serialization = seastar::try_get_units(write_serializer_, 1);
+        return write_controlled(
+          std::move(pending),
+          abort_source,
+          std::move(serialization),
+          std::move(holder));
     }
     network_endpoint local_endpoint() const noexcept { return local_; }
     network_endpoint remote_endpoint() const noexcept { return remote_; }
@@ -214,13 +224,22 @@ public:
         fail_pending_writes(errc::aborted);
     }
     seastar::future<result<void>> close() {
-        if (state_ == network_connection_state::closed) {
-            return detail::success();
-        }
+        if (close_done_) return close_done_->get_shared_future();
+        close_done_.emplace();
         state_ = network_connection_state::closing;
         request_abort();
-        state_ = network_connection_state::closed;
-        return detail::success();
+        auto completion = write_operations_.close().then_wrapped(
+          [this](seastar::future<> drained) {
+              state_ = network_connection_state::closed;
+              try {
+                  drained.get();
+                  close_done_->set_value(result<void>{});
+              } catch (...) {
+                  close_done_->set_exception(std::current_exception());
+              }
+          });
+        static_cast<void>(completion);
+        return close_done_->get_shared_future();
     }
 
     void enable_controlled_io() noexcept { controlled_io_ = true; }
@@ -236,7 +255,7 @@ public:
     [[nodiscard]] bool pending_write_content_equals(
       std::size_t index, std::string_view expected) const noexcept {
         return index < pending_writes_.size()
-               && pending_writes_[index].data.content_equals(expected);
+               && pending_writes_[index]->data.content_equals(expected);
     }
     [[nodiscard]] bool complete_read(bytes::fragmented_buffer data, bool eof) {
         if (!pending_read_) {
@@ -251,13 +270,14 @@ public:
         return true;
     }
     [[nodiscard]] bool complete_next_write() {
-        if (pending_writes_.empty()) {
-            return false;
+        for (auto* pending : pending_writes_) {
+            if (pending->dispatched && !pending->completed) {
+                pending->completed = true;
+                pending->completion.set_value(result<void>{});
+                return true;
+            }
         }
-        auto pending = std::move(pending_writes_.front());
-        pending_writes_.pop_front();
-        pending.completion.set_value(result<void>{});
-        return true;
+        return false;
     }
 
 private:
@@ -291,7 +311,50 @@ private:
         bytes::fragmented_buffer data;
         network_write_admission::reservation reservation;
         seastar::promise<result<void>> completion;
+        bool dispatched{false};
+        bool completed{false};
     };
+
+    seastar::future<result<void>> write_controlled(
+      pending_write pending,
+      seastar::abort_source& caller_abort,
+      std::optional<seastar::semaphore_units<>> serialization,
+      seastar::gate::holder holder) {
+        static_cast<void>(holder);
+        pending_writes_.push_back(&pending);
+        auto remove = seastar::defer([this, entry = &pending] noexcept {
+            pending_writes_.erase(
+              std::find(pending_writes_.begin(), pending_writes_.end(), entry));
+        });
+        try {
+            if (!serialization) {
+                serialization
+                  = co_await seastar::coroutine::without_preemption_check(
+                    seastar::get_units(write_serializer_, 1, caller_abort));
+                if (caller_abort.abort_requested()) {
+                    co_return failure(
+                      operation_error{errc::aborted, operation_kind::network});
+                }
+            }
+            if (abort_requested_)
+                co_return failure(
+                  operation_error{errc::aborted, operation_kind::network});
+            if (auto rejected = output_rejection())
+                co_return failure(std::move(*rejected));
+            // This promise represents native dispatch: only owner-direction
+            // cancellation applies after this point, as in the real adapter.
+            pending.dispatched = true;
+            co_return co_await pending.completion.get_future();
+        } catch (const seastar::abort_requested_exception&) {
+            co_return failure(
+              operation_error{errc::aborted, operation_kind::network});
+        } catch (const seastar::broken_semaphore&) {
+            co_return failure(
+              operation_error{
+                abort_requested_ ? errc::aborted : errc::closed,
+                operation_kind::network});
+        }
+    }
 
     void fail_pending_read(errc code) {
         if (!pending_read_) {
@@ -306,12 +369,12 @@ private:
     }
 
     void fail_pending_writes(errc code) {
-        while (!pending_writes_.empty()) {
-            auto pending = std::move(pending_writes_.front());
-            pending_writes_.pop_front();
-            result<void> outcome = failure(
-              operation_error{code, operation_kind::network});
-            pending.completion.set_value(std::move(outcome));
+        write_serializer_.broken();
+        for (auto* pending : pending_writes_) {
+            if (!pending->dispatched || pending->completed) continue;
+            pending->completed = true;
+            pending->completion.set_value(
+              failure(operation_error{code, operation_kind::network}));
         }
     }
 
@@ -321,7 +384,10 @@ private:
     network_connection_limits limits_;
     network_write_admission write_admission_;
     std::optional<seastar::promise<result<network_read_result>>> pending_read_;
-    std::deque<pending_write> pending_writes_;
+    std::deque<pending_write*> pending_writes_;
+    seastar::semaphore write_serializer_{1};
+    seastar::gate write_operations_;
+    std::optional<seastar::shared_promise<result<void>>> close_done_;
     byte_count pending_read_limit_{};
     network_connection_state state_{network_connection_state::open};
     network_half_state input_state_{network_half_state::open};

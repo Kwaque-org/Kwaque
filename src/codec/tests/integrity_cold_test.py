@@ -13,7 +13,6 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-
 ISOLATED_FAILURE_OBSERVED = 86
 MEMORY_FIELDS = {
     "mallocs",

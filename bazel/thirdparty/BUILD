@@ -11,6 +11,7 @@ exports_files([
     "seastar-chunked-vector-exception-safety.patch",
     "seastar-http-resource-limits.patch",
     "seastar-metrics-registration-exception-safety.patch",
+    "seastar-scheduling-group-rollback.patch",
     "seastar-spinlock-include.patch",
     "unordered-dense-exception-safety.patch",
     "unordered_dense.BUILD",

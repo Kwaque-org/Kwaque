@@ -252,6 +252,64 @@ kwaque_cc_library(
     ],
 )
 
+kwaque_cc_library(
+    name = "format_registry",
+    hdrs = ["format_registry.h"],
+    visibility = [
+        "//src/codec/tests:__pkg__",
+        "//src/model:__pkg__",
+        "//src/model/tests:__pkg__",
+        "//src/protocol:__pkg__",
+        "//src/protocol/tests:__pkg__",
+        "//src/storage:__pkg__",
+        "//src/storage/tests:__pkg__",
+    ],
+    deps = [":error"],
+)
+
+kwaque_cc_library(
+    name = "envelope",
+    srcs = [
+        "envelope.cc",
+        "envelope_decode.cc",
+        "envelope_encode.cc",
+        "envelope_integrity.cc",
+        "header_extensions.cc",
+    ],
+    hdrs = [
+        "envelope.h",
+        "envelope_decode.h",
+        "envelope_encode.h",
+        "envelope_integrity.h",
+        "header_extensions.h",
+    ],
+    visibility = [
+        "//src/codec/tests:__pkg__",
+        "//src/model:__pkg__",
+        "//src/model/tests:__pkg__",
+        "//src/protocol:__pkg__",
+        "//src/protocol/tests:__pkg__",
+        "//src/storage:__pkg__",
+        "//src/storage/tests:__pkg__",
+    ],
+    deps = [
+        ":cooperative",
+        ":crc32c",
+        ":crc32c_cooperative",
+        ":error",
+        ":format_registry",
+        ":integer",
+        ":limits",
+        ":staging_cooperative",
+        "//src/base",
+        "//src/base:error",
+        "//src/base:invariant",
+        "//src/bytes:fragmented_buffer",
+        "//src/bytes:fragmented_buffer_parser",
+        "@seastar",
+    ],
+)
+
 filegroup(
     name = "package_boundary",
     srcs = ["README.md"],
