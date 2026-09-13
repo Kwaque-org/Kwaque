@@ -17,6 +17,7 @@
 #include <limits>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -32,7 +33,7 @@ inline constexpr monotonic_duration maximum_dns_ttl{
 
 class dns_name final {
 public:
-    [[nodiscard]] static result<dns_name> make(std::string value) noexcept;
+    [[nodiscard]] static result<dns_name> make(std::string_view value);
 
     [[nodiscard]] const std::string& value() const noexcept { return value_; }
 

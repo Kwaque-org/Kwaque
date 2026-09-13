@@ -99,147 +99,61 @@ seastar::future<result<bytes::buffer_allocation_cost>> input_cost(
     co_return total;
 }
 
-struct assembly_shape {
-    std::uint64_t ceiling;
-    std::uint64_t nodes;
-};
-
-seastar::future<result<assembly_shape>> choose_shape(
-  const fragmented_buffer& prefix,
-  const fragmented_buffer& payload,
-  cooperative_work& work,
-  byte_count total,
-  byte_count input_backing,
+// Both sources are published owners, so assembly transfers whole fragments.
+// Only the preallocated output descriptors and one temporary slice are new.
+result<item_count> admit_assembly_descriptors(
+  std::uint64_t nodes,
+  const limits& policy,
   operation_usage live,
+  byte_count input_backing,
   byte_count parent_remaining,
   bytes::allocation_charge_fn charge,
   field_context context) {
-    const auto policy = work.policy();
     const auto config = policy.config();
-    const auto anchor = at(errc::success, context);
-    const auto available = policy.remaining_operation_bytes(
-      live, parent_remaining);
-    if (!available) {
-        co_return codec::failure(
-          detail::allocation_cost_error(
-            available.error(), context, context.origin));
+    if (
+      nodes > config.max_buffer_fragments.value()
+      || input_backing > config.max_retained_bytes) {
+        return codec::failure(at(errc::resource_exhausted, context));
     }
-    // One splice includes its preflight, transfer, trim and temporary cleanup.
-    if (work.item_quantum().value() < 8) {
-        co_return codec::failure(at(errc::resource_exhausted, context));
+    const byte_count descriptor_request{
+      nodes * fragmented_buffer::fragment_descriptor_size()};
+    const byte_count slice_request{
+      2U * fragmented_buffer::fragment_descriptor_size()};
+    const auto descriptors = charge(descriptor_request);
+    const auto slice = charge(slice_request);
+    if (descriptors < descriptor_request || slice < slice_request) {
+        return codec::failure(at(errc::invalid_argument, context));
     }
-    auto ceiling = std::min(
-      {total.value(), config.max_allocation_bytes.value(), available->value()});
-    while (ceiling != 0) {
-        std::uint64_t nodes = 0;
-        std::uint64_t copied_pieces = 0;
-        bool copy_fits = true;
-        for (const auto* source : {&prefix, &payload}) {
-            for (const auto fragment : *source) {
-                const auto admitted = co_await work.admit(
-                  byte_count{}, item_count{1}, anchor);
-                if (!admitted) {
-                    co_return codec::failure(admitted.error());
-                }
-                if (auto ready = work.poll(anchor); !ready) {
-                    co_return codec::failure(ready.error());
-                }
-                const auto length = static_cast<std::uint64_t>(fragment.size());
-                const bool copied
-                  = length
-                      <= fragmented_buffer_builder::pack_copy_threshold.value()
-                    && length <= ceiling;
-                if (copied) {
-                    const auto slice = work.byte_quantum().value() / 2U;
-                    if (slice == 0) {
-                        copy_fits = false;
-                        continue;
-                    }
-                    const auto pieces = 1U + (length - 1U) / slice;
-                    nodes += pieces;
-                    copied_pieces += pieces;
-                } else {
-                    ++nodes;
-                }
-            }
+    const auto slice_peak = multiply(slice, 2, context);
+    if (!slice_peak) return codec::failure(slice_peak.error());
+    for (const auto cost : {descriptors, *slice_peak}) {
+        if (auto added = add(live.payload_bookkeeping, cost, context); !added) {
+            return codec::failure(added.error());
         }
-        if (!copy_fits || nodes > config.max_buffer_fragments.value()) {
-            // A narrower tail ceiling can turn packing into a no-copy splice.
-            ceiling /= 2U;
-            continue;
-        }
-        const byte_count descriptor_request{
-          nodes * fragmented_buffer::fragment_descriptor_size()};
-        const byte_count slice_request{
-          2U * fragmented_buffer::fragment_descriptor_size()};
-        const auto descriptors = charge(descriptor_request);
-        const auto slice_descriptors = charge(slice_request);
-        const auto tail = copied_pieces == 0 ? byte_count{}
-                                             : charge(byte_count{ceiling});
-        if (
-          descriptors < descriptor_request || slice_descriptors < slice_request
-          || (copied_pieces != 0 && tail < byte_count{ceiling})) {
-            co_return codec::failure(at(errc::invalid_argument, context));
-        }
-        const auto backing = multiply(tail, copied_pieces, context);
-        const auto descriptor_peak = multiply(descriptors, 2, context);
-        const auto slice_peak = multiply(slice_descriptors, 2, context);
-        if (!backing || !descriptor_peak || !slice_peak) {
-            co_return codec::failure(at(errc::out_of_range, context));
-        }
-        auto projected = live;
-        for (const auto cost : {*descriptor_peak, *slice_peak}) {
-            if (
-              auto added = add(projected.payload_bookkeeping, cost, context);
-              !added) {
-                co_return codec::failure(added.error());
-            }
-        }
-        if (
-          auto added = add(projected.staged_output, *backing, context);
-          !added) {
-            co_return codec::failure(added.error());
-        }
-        auto retained = input_backing;
-        if (auto added = add(retained, *backing, context); !added) {
-            co_return codec::failure(added.error());
-        }
-        const auto fits = policy.remaining_operation_bytes(
-          projected, parent_remaining);
-        if (!fits && fits.error() != errc::resource_exhausted) {
-            co_return codec::failure(
-              detail::allocation_cost_error(
-                fits.error(), context, context.origin));
-        }
-        if (
-          descriptors <= config.max_allocation_bytes
-          && slice_descriptors <= config.max_allocation_bytes
-          && tail <= config.max_allocation_bytes
-          && retained <= config.max_retained_bytes && fits) {
-            co_return assembly_shape{ceiling, nodes};
-        }
-        ceiling /= 2U;
     }
-    co_return codec::failure(at(errc::resource_exhausted, context));
+    const auto fits = policy.remaining_operation_bytes(live, parent_remaining);
+    if (!fits) {
+        return codec::failure(
+          detail::allocation_cost_error(fits.error(), context, context.origin));
+    }
+    if (
+      descriptors > config.max_allocation_bytes
+      || slice > config.max_allocation_bytes) {
+        return codec::failure(at(errc::resource_exhausted, context));
+    }
+    return item_count{nodes};
 }
 
 seastar::future<result<void>> splice_input(
   fragmented_buffer& source,
   fragmented_buffer_builder& output,
-  const assembly_shape shape,
   cooperative_work& work,
   field_context context) {
     const auto anchor = at(errc::success, context);
     while (!source.empty()) {
         const auto fragment = source.fragment_at(0).value();
         const auto length = static_cast<std::uint64_t>(fragment.size());
-        const bool copied
-          = length <= fragmented_buffer_builder::pack_copy_threshold.value()
-            && length <= shape.ceiling;
-        const auto slice_size = copied
-                                  ? std::min(
-                                      length, work.byte_quantum().value() / 2U)
-                                  : length;
+        const auto slice_size = length;
         auto before_share = co_await work.checkpoint(anchor);
         if (!before_share) {
             co_return codec::failure(before_share.error());
@@ -258,7 +172,7 @@ seastar::future<result<void>> splice_input(
             co_return codec::failure(after_share.error());
         }
         const auto admitted = co_await work.admit(
-          byte_count{copied ? 2U * slice_size : 0U}, item_count{8}, anchor);
+          byte_count{}, item_count{8}, anchor);
         if (!admitted) {
             co_return codec::failure(admitted.error());
         }
@@ -355,19 +269,18 @@ seastar::future<result<fragmented_buffer>> assemble_owned(
     if (total->value() == 0) {
         co_return fragmented_buffer{};
     }
-    const auto shape = co_await choose_shape(
-      prefix,
-      payload,
-      work,
-      *total,
-      input_backing,
+    if (work.item_quantum().value() < 8) {
+        co_return codec::failure(at(errc::resource_exhausted, context));
+    }
+    const auto nodes = admit_assembly_descriptors(
+      prefix.fragment_count() + payload.fragment_count(),
+      policy,
       live,
+      input_backing,
       parent_remaining,
       charge,
       context);
-    if (!shape) {
-        co_return codec::failure(shape.error());
-    }
+    if (!nodes) co_return codec::failure(nodes.error());
     const auto setup = co_await work.admit(byte_count{}, item_count{1}, anchor);
     if (!setup) {
         co_return codec::failure(setup.error());
@@ -376,21 +289,20 @@ seastar::future<result<fragmented_buffer>> assemble_owned(
         co_return codec::failure(ready.error());
     }
     bytes::fragmented_buffer_builder_config config;
-    config.initial_fragment_bytes = byte_count{
-      std::min(shape->ceiling, std::uint64_t{512})};
-    config.max_fragment_bytes = byte_count{shape->ceiling};
+    config.initial_fragment_bytes = byte_count{1};
+    config.max_fragment_bytes = byte_count{1};
     config.max_total_bytes = *total;
     config.max_retained_bytes = policy.config().max_retained_bytes;
-    config.max_fragments = static_cast<std::size_t>(shape->nodes);
+    config.max_fragments = static_cast<std::size_t>(nodes->value());
     output.emplace(config);
-    const auto reserved = output->reserve_fragments(item_count{shape->nodes});
+    const auto reserved = output->reserve_fragments(*nodes);
     KWAQUE_INVARIANT(
       invariant_id{"KQ-CODEC-STAGING-RESERVE"},
       reserved.has_value(),
       "admitted descriptor reservation failed");
     for (auto* source : {&prefix, &payload}) {
         const auto appended = co_await splice_input(
-          *source, *output, *shape, work, context);
+          *source, *output, work, context);
         if (!appended) {
             co_return codec::failure(appended.error());
         }

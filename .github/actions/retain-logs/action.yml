@@ -1,0 +1,24 @@
+name: Retain failed test diagnostics
+description: Preserve reports, outputs and available executables for failed Bazel tests
+
+inputs:
+  name:
+    description: Artifact name, unique across the job matrix and run attempt
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - name: Find failed tests
+      id: collect
+      if: always()
+      shell: bash
+      run: python3 "${{ github.action_path }}/collect.py"
+    - name: Upload diagnostics
+      if: always() && steps.collect.outputs.has_failures == 'true'
+      uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # 4.6.2
+      with:
+        name: ${{ inputs.name }}
+        path: ${{ steps.collect.outputs.paths }}
+        retention-days: 30
+        if-no-files-found: warn

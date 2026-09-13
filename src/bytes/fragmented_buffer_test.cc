@@ -936,9 +936,8 @@ TEST(BufferBuilder, TinyAppendsReuseTheTailInsteadOfGrowingLinks) {
       fragment_sizes(*donated), (std::vector<std::size_t>{16, 32, 48, 64, 40}));
     EXPECT_EQ(contents(*donated), std::string(200, 'x'));
 
-    // Published buffers already carry the fragment ownership invariant. Their
-    // tiny fragments take the same packing path after one whole-buffer bounds
-    // check, and each moved-from source is emptied.
+    // Published donations preserve ownership when there is no mutable tail.
+    // Tiny copied appends above still use bounded growth and packing.
     fragmented_buffer_builder buffered_builder{config};
     for (std::size_t index = 0; index < 200; ++index) {
         auto source = fragmented({"x"});
@@ -951,9 +950,7 @@ TEST(BufferBuilder, TinyAppendsReuseTheTailInsteadOfGrowingLinks) {
     auto buffered = buffered_builder.finish();
     ASSERT_TRUE(buffered.has_value());
     EXPECT_EQ(buffered->size().value(), 200U);
-    EXPECT_EQ(
-      fragment_sizes(*buffered),
-      (std::vector<std::size_t>{16, 32, 48, 64, 40}));
+    EXPECT_EQ(fragment_sizes(*buffered), std::vector<std::size_t>(200, 1));
     EXPECT_EQ(contents(*buffered), std::string(200, 'x'));
 }
 
@@ -1210,6 +1207,124 @@ TEST(BufferBuilder, AppendBufferSplicesAndEmptiesTheSource) {
     auto zero_copy = zero_copy_builder.finish();
     ASSERT_TRUE(zero_copy.has_value());
     EXPECT_EQ(zero_copy->fragment_at(0)->data(), backing);
+}
+
+TEST(BufferBuilder, SplicePacksOnlyOneBoundedPrefixIntoExistingTail) {
+    fragmented_buffer_builder_config config;
+    config.initial_fragment_bytes = byte_count{8192};
+    config.max_fragment_bytes = byte_count{8192};
+    config.max_fragments = 3;
+    fragmented_buffer_builder builder{config};
+    ASSERT_TRUE(builder.append(std::string_view{"head"}));
+    ASSERT_TRUE(builder.reserve_fragments(item_count{3}));
+    const std::string part(2048, 'x');
+    auto input = fragmented({part, part, part, part});
+    auto alias = input.share();
+    const auto* third = input.fragment_at(2)->data();
+    const auto* fourth = input.fragment_at(3)->data();
+    ASSERT_TRUE(builder.append_buffer(std::move(input)));
+    // Successful splicing guarantees an empty donor.
+    // NOLINTNEXTLINE(bugprone-use-after-move)
+    EXPECT_TRUE(input.empty());
+    auto output = builder.finish();
+    ASSERT_TRUE(output.has_value());
+    EXPECT_EQ(
+      fragment_sizes(*output), (std::vector<std::size_t>{4100, 2048, 2048}));
+    EXPECT_EQ(output->fragment_at(1)->data(), third);
+    EXPECT_EQ(output->fragment_at(2)->data(), fourth);
+    EXPECT_EQ(output->retained_bytes(), byte_count{12288});
+    EXPECT_TRUE(output->content_equals("head" + std::string(8192, 'x')));
+    EXPECT_TRUE(alias.content_equals(std::string(8192, 'x')));
+
+    fragmented_buffer_builder full{config};
+    ASSERT_TRUE(full.append(std::string_view{part}));
+    auto donor = fragmented({std::string(4097, 'z'), "tail"});
+    const auto* first = donor.fragment_at(0)->data();
+    const auto* last = donor.fragment_at(1)->data();
+    ASSERT_TRUE(full.append_buffer(std::move(donor)));
+    auto linked = full.finish();
+    ASSERT_TRUE(linked.has_value());
+    // An unpackable prefix stops packing; a later small fragment is linked.
+    EXPECT_EQ(linked->fragment_at(1)->data(), first);
+    EXPECT_EQ(linked->fragment_at(2)->data(), last);
+}
+
+TEST(BufferBuilder, SplicePreparationFailurePreservesBothOwners) {
+#if !defined(SEASTAR_ENABLE_ALLOC_FAILURE_INJECTION)
+    GTEST_SKIP() << "allocation failure injection is not enabled";
+#else
+    bool succeeded = false;
+    std::size_t failures = 0;
+    for (std::size_t point = 0; point != 32; ++point) {
+        fragmented_buffer_builder_config config;
+        config.initial_fragment_bytes = byte_count{8};
+        config.max_fragment_bytes = byte_count{8};
+        fragmented_buffer_builder builder{config};
+        ASSERT_TRUE(builder.reserve_fragments(item_count{1}));
+        ASSERT_TRUE(builder.append(std::string_view{"12345678"}));
+        auto donor = fragmented({"a", "b", "c", "d"});
+        auto& injector = seastar::memory::local_failure_injector();
+        std::optional<result<void>> appended;
+        bool failed = false;
+        injector.fail_after(point);
+        try {
+            appended.emplace(builder.append_buffer(std::move(donor)));
+        } catch (const std::bad_alloc&) {
+            failed = true;
+        } catch (...) {
+            injector.cancel();
+            throw;
+        }
+        const bool injected = injector.failed();
+        injector.cancel();
+        if (injected) {
+            ++failures;
+            EXPECT_TRUE(failed);
+            EXPECT_EQ(builder.size(), byte_count{8});
+            EXPECT_EQ(builder.retained_bytes(), byte_count{8});
+            EXPECT_EQ(builder.fragment_count(), 1U);
+            EXPECT_EQ(builder.tail_capacity(), byte_count{});
+            // Preparation failure preserves the donor's complete byte sequence.
+            // NOLINTNEXTLINE(bugprone-use-after-move)
+            EXPECT_TRUE(donor.content_equals("abcd"));
+            ASSERT_TRUE(builder.append(std::string_view{"ok"}));
+            EXPECT_TRUE(builder.finish()->content_equals("12345678ok"));
+        } else {
+            EXPECT_FALSE(failed);
+            ASSERT_TRUE(appended.has_value() && appended->has_value());
+            // Successful splicing guarantees an empty donor.
+            // NOLINTNEXTLINE(bugprone-use-after-move)
+            EXPECT_TRUE(donor.empty());
+            EXPECT_TRUE(builder.finish()->content_equals("12345678abcd"));
+            succeeded = true;
+            break;
+        }
+    }
+    EXPECT_GT(failures, 0U);
+    EXPECT_TRUE(succeeded);
+#endif
+}
+
+TEST(BufferBuilder, PublicationTransfersReservedDescriptorsWithoutAllocation) {
+    for (const bool empty : {false, true}) {
+        fragmented_buffer_builder builder;
+        ASSERT_TRUE(builder.reserve_fragments(item_count{64}));
+        if (!empty) ASSERT_TRUE(builder.append(std::string_view{"payload"}));
+        const auto before = seastar::memory::stats().mallocs();
+        auto output = builder.finish();
+        const auto after = seastar::memory::stats().mallocs();
+        ASSERT_TRUE(output.has_value());
+        EXPECT_EQ(before, after);
+        EXPECT_TRUE(builder.finished());
+        EXPECT_TRUE(builder.empty());
+        EXPECT_TRUE(output->content_equals(empty ? "" : "payload"));
+        const auto cost = output->allocation_cost(
+          [](byte_count value) noexcept { return value; });
+        ASSERT_TRUE(cost.has_value());
+        EXPECT_EQ(
+          cost->descriptors,
+          byte_count{64 * fragmented_buffer::fragment_descriptor_size()});
+    }
 }
 
 TEST(BufferBuilder, EnforcesTotalBytesFragmentCountAndReserveBounds) {

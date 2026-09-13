@@ -170,7 +170,11 @@ def kwaque_cc_seastar_test(
         size = "small",
         timeout = None,
         tags = []):
-    """Defines a Seastar asynchronous test using Seastar's test runner."""
+    """Defines a Seastar asynchronous test using Seastar's test runner.
+
+    SEASTAR_TESTING_MAIN applies to every source. Only one translation unit
+    may include the Seastar test registration headers that define main.
+    """
     cc_test(
         name = name,
         srcs = srcs,

@@ -165,6 +165,34 @@ TEST(FileContractTest, DirectoryListingBoundsEntriesAndAggregateNameBytes) {
     EXPECT_EQ(rejected.error().code(), kwaque::errc::resource_exhausted);
 }
 
+TEST(FileContractTest, BoundedValuesDoNotRetainCallerCapacity) {
+    using namespace kwaque;
+    using namespace kwaque::runtime;
+    std::string oversized;
+    oversized.reserve(maximum_contiguous_allocation_bytes * 2);
+    oversized = "entry";
+    const auto name = file_name::make(oversized);
+    const auto path = file_path::make(oversized);
+    ASSERT_TRUE(name.has_value());
+    ASSERT_TRUE(path.has_value());
+    EXPECT_EQ(name->value(), "entry");
+    EXPECT_LT(name->value().capacity(), oversized.capacity());
+    EXPECT_LT(path->value().capacity(), oversized.capacity());
+
+    seastar::chunked_vector<directory_entry> entries;
+    entries.reserve(decltype(entries)::elements_per_fragment());
+    entries.push_back({*name, file_kind::regular});
+    auto listing = directory_listing::make(
+      std::move(entries),
+      {.maximum_entries = item_count{1}, .maximum_name_bytes = byte_count{5}});
+    ASSERT_TRUE(listing.has_value());
+    EXPECT_EQ(listing->entries().size(), 1U);
+    EXPECT_EQ(listing->entries().capacity(), 1U);
+    seastar::chunked_vector<directory_entry> invalid;
+    invalid.push_back({*name, static_cast<file_kind>(255)});
+    EXPECT_FALSE(directory_listing::make(std::move(invalid), {}).has_value());
+}
+
 TEST(FileContractTest, DirectoryListingCrossesChunkBoundaries) {
     const auto entry_count = std::min<std::size_t>(
       seastar::chunked_vector<

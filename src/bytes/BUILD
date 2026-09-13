@@ -68,7 +68,10 @@ kwaque_cc_library(
     name = "fragmented_buffer_test_support",
     testonly = True,
     hdrs = ["fragmented_buffer_test_support.h"],
-    visibility = ["//src/codec/tests:__pkg__"],
+    visibility = [
+        "//src/codec/tests:__pkg__",
+        "//src/model/tests:__pkg__",
+    ],
     deps = [
         ":fragmented_buffer",
         "//src/base",
@@ -98,6 +101,7 @@ kwaque_cc_fuzz_test(
     corpus = [
         "testdata/fragmented_buffer_fuzz_corpus/append_parse.bin",
         "testdata/fragmented_buffer_fuzz_corpus/empty.bin",
+        "testdata/fragmented_buffer_fuzz_corpus/deep_marks_high_offsets.bin",
         "testdata/fragmented_buffer_fuzz_corpus/trim_share.bin",
     ],
     deps = [

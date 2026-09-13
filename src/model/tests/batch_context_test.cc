@@ -513,6 +513,68 @@ TEST_F(BatchContextTest, EqualityIncludesOriginalMetadataSpanAndRetainedCount) {
     EXPECT_EQ(*original, assigned_batch_context{*original});
 }
 
+TEST_F(
+  BatchContextTest, PersistedContextRestoresSparseCountsAndOriginalCoverage) {
+    const auto original = make_submitted().value();
+    for (const auto count : {item_count{1}, item_count{2}, item_count{5}}) {
+        const auto restored = assigned_batch_context::restore(
+          original, count, range_logical_end{100}, range_logical_end{105});
+        ASSERT_TRUE(restored.has_value());
+        EXPECT_EQ(restored->submitted(), original);
+        EXPECT_EQ(restored->retained_count(), count);
+        EXPECT_EQ(restored->logical_span().count(), range_logical_count{5});
+    }
+    const auto dense = assigned_batch_context::assign(
+                         original, range_logical_end{100}, *binding_)
+                         .value();
+    EXPECT_EQ(
+      assigned_batch_context::restore(
+        original, item_count{5}, range_logical_end{100}, range_logical_end{105})
+        .value(),
+      dense);
+    EXPECT_EQ(
+      assigned_batch_context::restore(
+        original, item_count{2}, range_logical_end{100}, range_logical_end{105})
+        .value(),
+      dense.with_retained_count(item_count{2}).value());
+}
+
+TEST_F(
+  BatchContextTest, PersistedContextRejectsImpossibleCountsAndSpanArithmetic) {
+    const auto original = make_submitted().value();
+    for (const auto count :
+         {item_count{}, item_count{6}, item_count{maximum}}) {
+        const auto restored = assigned_batch_context::restore(
+          original, count, range_logical_end{100}, range_logical_end{105});
+        ASSERT_FALSE(restored.has_value());
+        EXPECT_EQ(restored.error(), kwaque::errc::invalid_argument);
+    }
+    for (const auto end :
+         {range_logical_end{99},
+          range_logical_end{100},
+          range_logical_end{104},
+          range_logical_end{106}}) {
+        const auto restored = assigned_batch_context::restore(
+          original, item_count{2}, range_logical_end{100}, end);
+        ASSERT_FALSE(restored.has_value());
+        EXPECT_EQ(restored.error(), kwaque::errc::invalid_argument);
+    }
+    const auto overflow = assigned_batch_context::restore(
+      original,
+      item_count{2},
+      range_logical_end{maximum - 4U},
+      range_logical_end{maximum});
+    ASSERT_FALSE(overflow.has_value());
+    EXPECT_EQ(overflow.error(), kwaque::errc::out_of_range);
+    const auto maximum_end = assigned_batch_context::restore(
+      original,
+      item_count{2},
+      range_logical_end{maximum - 5U},
+      range_logical_end{maximum});
+    ASSERT_TRUE(maximum_end.has_value());
+    EXPECT_EQ(maximum_end->logical_span().end().value(), maximum);
+}
+
 TEST_F(BatchContextTest, GettersOwnValuesAcrossTemporaryContextsAndResults) {
     const auto submitted = make_submitted();
     ASSERT_TRUE(submitted.has_value());

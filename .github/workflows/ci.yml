@@ -62,6 +62,7 @@ jobs:
           //...
 
       - name: Verify optimized runtime and process policy
+        id: tests
         run: >-
           bazel test --config=ci-release
           //bazel/tests:seastar_gtest
@@ -69,6 +70,12 @@ jobs:
           //src/runtime/tests:runtime_metrics_test
           //src/broker:failure_policy_test
           //src/broker:crash_recorder_process_test
+
+      - name: Retain failed test diagnostics
+        if: failure() && steps.tests.outcome == 'failure'
+        uses: ./.github/actions/retain-logs
+        with:
+          name: ci-${{ github.job }}-${{ runner.arch }}-${{ github.run_attempt }}
 
   native-policy:
     name: Native policy without allocation injection
@@ -86,6 +93,7 @@ jobs:
           cache-scope: ci-native
           cache-write: 'true'
       - name: Verify native runtime and process policy
+        id: tests
         run: >-
           bazel test --config=ci-native
           //bazel/tests:seastar_gtest
@@ -93,6 +101,12 @@ jobs:
           //src/runtime/tests:runtime_metrics_test
           //src/broker:failure_policy_test
           //src/broker:crash_recorder_process_test
+
+      - name: Retain failed test diagnostics
+        if: failure() && steps.tests.outcome == 'failure'
+        uses: ./.github/actions/retain-logs
+        with:
+          name: ci-${{ github.job }}-${{ runner.arch }}-${{ github.run_attempt }}
 
   test:
     name: Native allocation injection, unit and smoke tests
@@ -110,6 +124,7 @@ jobs:
           cache-scope: ci-debug
           cache-write: 'true'
       - name: Run unit and smoke tests
+        id: unit_tests
         run: >-
           bazel test --config=ci-debug
           --build_tag_filters=-fuzz,-manual
@@ -117,10 +132,17 @@ jobs:
           //...
 
       - name: Repeat the real adapter and environment contracts in sandboxes
+        id: hermetic_tests
         run: >-
           bazel test --config=ci-debug --spawn_strategy=sandboxed
           --runs_per_test=10 --cache_test_results=no
           //src/runtime/tests:hermetic_contracts
+
+      - name: Retain failed test diagnostics
+        if: failure() && (steps.unit_tests.outcome == 'failure' || steps.hermetic_tests.outcome == 'failure')
+        uses: ./.github/actions/retain-logs
+        with:
+          name: ci-${{ github.job }}-${{ runner.arch }}-${{ github.run_attempt }}
 
   sanitizer:
     name: ASan and UBSan
@@ -138,11 +160,18 @@ jobs:
           cache-scope: ci-sanitizer
           cache-write: 'true'
       - name: Execute tests with sanitizers
+        id: tests
         run: >-
           bazel test --config=ci-sanitizer
           --build_tag_filters=-fuzz,-manual
           --test_tag_filters=-fuzz,-manual
           //...
+
+      - name: Retain failed test diagnostics
+        if: failure() && steps.tests.outcome == 'failure'
+        uses: ./.github/actions/retain-logs
+        with:
+          name: ci-${{ github.job }}-${{ runner.arch }}-${{ github.run_attempt }}
 
   goldens:
     name: Determinism goldens (${{ matrix.runner }}, ${{ matrix.config }})
@@ -172,11 +201,18 @@ jobs:
           cache-write: ${{ matrix.runner == 'ubuntu-24.04-arm' && matrix.config == 'ci-debug' }}
         if: needs.workflow-lint.outputs.run_checks != 'false'
       - name: Execute the canonical golden suite
+        id: tests
         if: needs.workflow-lint.outputs.run_checks != 'false'
         run: >-
           bazel test --config="${{ matrix.config }}"
           --cache_test_results=no
           //src/simulation/tests:determinism_goldens
+
+      - name: Retain failed test diagnostics
+        if: failure() && steps.tests.outcome == 'failure'
+        uses: ./.github/actions/retain-logs
+        with:
+          name: ci-${{ github.job }}-${{ runner.arch }}-${{ matrix.config }}-${{ github.run_attempt }}
 
   cpp-format:
     name: C++ and Bazel formatting
@@ -298,6 +334,7 @@ jobs:
           cache-scope: fuzz
           cache-write: 'true'
       - name: Run every fixed-corpus fuzz smoke and the signal artifact canary
+        id: tests
         run: >-
           bazel test --config=ci --config=fuzz
           --keep_going --test_output=all --test_arg=-seed=1
@@ -308,21 +345,18 @@ jobs:
           //src/bytes:fragmented_buffer_fuzz
           //src/codec/tests:codec_fuzz
           //src/codec/tests:codec_cooperative_fuzz
+          //src/model/tests:record_fuzz
           //src/simulation/tests:scheduler_fuzz
           //src/simulation/tests:fault_schedule_fuzz
           //src/simulation/tests:fake_file_fuzz
           //src/simulation/tests:fake_network_fuzz
           //src/simulation/tests:signal_canary_test
-      - name: Retain fuzz logs and failure inputs
-        if: always()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # 4.6.2
+
+      - name: Retain failed test diagnostics
+        if: failure() && steps.tests.outcome == 'failure'
+        uses: ./.github/actions/retain-logs
         with:
           name: fuzz-smoke-${{ github.run_attempt }}
-          path: |
-            bazel-testlogs/**/test.log
-            bazel-testlogs/**/test.outputs/**
-          retention-days: 30
-          if-no-files-found: warn
 
   arm-build:
     name: Linux aarch64 release build and runtime tests
@@ -345,6 +379,7 @@ jobs:
           --build_tag_filters=-fuzz,-manual
           //...
       - name: Test deterministic runtime on aarch64 release
+        id: tests
         run: >-
           bazel test --config=ci-release
           //bazel/tests:seastar_gtest
@@ -382,3 +417,9 @@ jobs:
           //src/simulation/tests:fake_file_test
           //src/simulation/tests:fake_file_runtime_test
           //src/simulation/tests:fake_file_replay_test
+
+      - name: Retain failed test diagnostics
+        if: failure() && steps.tests.outcome == 'failure'
+        uses: ./.github/actions/retain-logs
+        with:
+          name: ci-${{ github.job }}-${{ runner.arch }}-${{ github.run_attempt }}

@@ -5,7 +5,7 @@
 #include "src/codec/crc32c_cooperative.h"
 #include "src/codec/error.h"
 #include "src/codec/limits.h"
-#include "src/codec/tests/codec_bench_fixture.h"
+#include "src/codec/tests/codec_bench_reference.h"
 
 #include <seastar/core/abort_source.hh>
 #include <seastar/core/byteorder.hh>

@@ -148,17 +148,6 @@ inline constexpr bool is_cross_shard_callable
      && std::is_function_v<std::remove_pointer_t<std::decay_t<Func>>>)
     || (std::is_empty_v<std::decay_t<Func>> && std::is_trivially_copyable_v<std::decay_t<Func>>);
 
-template<typename Func>
-struct function_pointer_takes_owned_arguments : std::false_type {};
-
-template<typename Result, typename... Args>
-struct function_pointer_takes_owned_arguments<Result (*)(Args...)>
-  : std::bool_constant<(!std::is_reference_v<Args> && ...)> {};
-
-template<typename Result, typename... Args>
-struct function_pointer_takes_owned_arguments<Result (*)(Args...) noexcept>
-  : std::bool_constant<(!std::is_reference_v<Args> && ...)> {};
-
 template<typename Future>
 struct future_result;
 
@@ -176,16 +165,6 @@ concept cross_shard_result_value = std::same_as<Result, void>
                                    || is_cross_shard_value<Result>;
 
 template<typename Result, typename Func, typename... Args>
-seastar::future<Result> invoke_owned(Func function, Args... args) {
-    if constexpr (std::same_as<Result, void>) {
-        co_await seastar::futurize_invoke(function, std::move(args)...);
-    } else {
-        co_return co_await seastar::futurize_invoke(
-          function, std::move(args)...);
-    }
-}
-
-template<typename Result, typename Func, typename... Args>
 seastar::future<Result> invoke_on_shard(
   seastar::shard_id target,
   seastar::smp_service_group service_group,
@@ -198,14 +177,10 @@ seastar::future<Result> invoke_on_shard(
        arguments = std::tuple<Args...>{std::move(args)...}] mutable {
           return std::apply(
             [&function](Args&... values) {
-                if constexpr (
-                  function_pointer_takes_owned_arguments<
-                    std::decay_t<Func>>::value) {
-                    return std::invoke(function, std::move(values)...);
-                } else {
-                    return invoke_owned<Result>(
-                      std::move(function), std::move(values)...);
-                }
+                // Native submission retains this rvalue callback through
+                // asynchronous completion on both local and remote targets.
+                // Reference parameters borrow its retained tuple members.
+                return std::invoke(function, std::move(values)...);
             },
             arguments);
       });
@@ -229,6 +204,8 @@ using cross_shard_result_t = detail::cross_shard_result<Func, Args...>;
 // The callable cannot carry mutable shard-local captures. Pass all state as
 // explicitly opted-in value arguments and keep the supplied service group alive
 // until the returned future resolves.
+// A service group limits remote execution, not pending submissions. The
+// submitting component bounds tasks, items and retained bytes before this call.
 template<typename Func, typename... Args>
 requires cross_shard_invocation<Func, Args...>
 auto invoke_on_owner(

@@ -9,6 +9,7 @@
 #include "src/codec/error.h"
 #include "src/codec/integer.h"
 #include "src/codec/limits.h"
+#include "src/codec/tests/envelope_fuzz_cases.h"
 #include "src/codec/transaction.h"
 #include "src/runtime/testing/seastar_fuzz.h"
 
@@ -940,7 +941,14 @@ LLVMFuzzerTestOneInput(const std::uint8_t* data, std::size_t size) {
     if (size != 0) {
         owned.assign(data, data + size);
     }
-    kwaque::runtime::testing::run_fuzz_input(
-      [owned = std::move(owned)] { exercise(owned); });
+    kwaque::runtime::testing::run_fuzz_input([owned = std::move(owned)] {
+        exercise(owned);
+        // Existing modulo selectors still execute unchanged. This marker adds
+        // an envelope case without reinterpreting any existing corpus entry.
+        if (!owned.empty() && owned.front() == 0xe0U) {
+            codec::testing::exercise_envelope_case(
+              std::span<const std::uint8_t>{owned}.subspan(1));
+        }
+    });
     return 0;
 }

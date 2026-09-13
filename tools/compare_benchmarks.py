@@ -65,10 +65,15 @@ def read_runtime_profile(path: Path) -> dict[str, str]:
         raise ComparisonError("cannot read benchmark profile log") from error
     if len(data) > MAXIMUM_PROFILE_LOG_BYTES:
         raise ComparisonError("benchmark profile log exceeds size limit")
-    lines = [line[len(PROFILE_PREFIX):] for line in data.splitlines()
-             if line.startswith(PROFILE_PREFIX)]
+    lines = [
+        line[len(PROFILE_PREFIX) :]
+        for line in data.splitlines()
+        if line.startswith(PROFILE_PREFIX)
+    ]
     if len(lines) != 1:
-        raise ComparisonError("native benchmark must report exactly one runtime profile")
+        raise ComparisonError(
+            "native benchmark must report exactly one runtime profile"
+        )
     fields = {}
     try:
         for field in lines[0].decode("ascii").split():
@@ -77,9 +82,13 @@ def read_runtime_profile(path: Path) -> dict[str, str]:
                 raise ValueError("duplicate profile field")
             fields[key] = value
     except (UnicodeError, ValueError) as error:
-        raise ComparisonError("native benchmark reported a malformed runtime profile") from error
+        raise ComparisonError(
+            "native benchmark reported a malformed runtime profile"
+        ) from error
     if fields != PRODUCTION_PROFILE:
-        raise ComparisonError("native benchmark does not match the production runtime profile")
+        raise ComparisonError(
+            "native benchmark does not match the production runtime profile"
+        )
     return fields
 
 
@@ -437,7 +446,10 @@ def run_comparison(
                         timeout=timeout,
                         check=False,
                         shell=False,
-                        env={**os.environ, "KWAQUE_REQUIRE_BENCHMARK_PROFILE": "production"},
+                        env={
+                            **os.environ,
+                            "KWAQUE_REQUIRE_BENCHMARK_PROFILE": "production",
+                        },
                     )
             except subprocess.TimeoutExpired as error:
                 raise ComparisonError(

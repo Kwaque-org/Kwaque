@@ -260,3 +260,52 @@ SEASTAR_TEST_CASE(queue_metrics_sum_one_compile_time_queue_set) {
     }
     co_return;
 }
+
+SEASTAR_TEST_CASE(
+  resource_manager_registration_failure_preserves_existing_metrics) {
+    using namespace kwaque::resource;
+    kwaque::resource::resource_registry registry;
+    co_await registry.start(config());
+    {
+        const auto& descriptor = metric_descriptor(
+          kwaque::metric_id::memory_waiters);
+        seastar::metrics::metric_groups conflicting;
+        conflicting.add_group(
+          seastar::sstring{descriptor.group},
+          {seastar::metrics::make_gauge(
+             seastar::sstring{descriptor.name},
+             [] { return std::uint64_t{123}; },
+             seastar::metrics::description{seastar::sstring{descriptor.help}},
+             {seastar::metrics::label_instance{
+               seastar::sstring{kwaque::metric_workload_label},
+               seastar::sstring{kwaque::metric_workload_label_values.back()}}})
+             .aggregate({seastar::metrics::shard_label})});
+        resource_manager manager{registry.handles()};
+        bool failed = false;
+        try {
+            co_await manager.start();
+        } catch (const std::exception&) {
+            failed = true;
+        }
+        if (!failed) {
+            co_await manager.stop();
+        }
+        BOOST_CHECK(failed);
+        BOOST_CHECK(manager.state() == resource_manager_state::stopped);
+        BOOST_CHECK_EQUAL(family(kwaque::metric_id::memory_waiters).size(), 1U);
+        BOOST_CHECK_EQUAL(
+          metric_value(kwaque::metric_id::memory_waiters), 123U);
+        for (const auto id :
+             {kwaque::metric_id::memory_configured_bytes,
+              kwaque::metric_id::memory_used_bytes,
+              kwaque::metric_id::memory_available_bytes}) {
+            BOOST_CHECK(
+              !seastar::metrics::impl::get_value_map().contains(full_name(id)));
+        }
+        co_await manager.stop();
+    }
+    resource_manager replacement{registry.handles()};
+    co_await replacement.start();
+    co_await replacement.stop();
+    co_await registry.stop();
+}

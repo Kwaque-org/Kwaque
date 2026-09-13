@@ -178,7 +178,16 @@ fragmented_buffer_parser::peek_buffer(byte_count bytes) {
     if (bytes.value() == 0) {
         return fragmented_buffer{};
     }
-    return buffer_.share(at_.consumed, bytes);
+    return buffer_.share_from(at_.fragment, at_.offset, bytes);
+}
+
+result<buffer_allocation_cost>
+fragmented_buffer_parser::next_buffer_allocation_cost(
+  byte_count length, allocation_charge_fn charge) const noexcept {
+    if (charge == nullptr) return failure(errc::invalid_argument);
+    if (length > bytes_remaining()) return failure(errc::out_of_range);
+    return buffer_.slice_allocation_cost_from(
+      at_.fragment, at_.offset, length, charge);
 }
 
 result<fragmented_buffer>

@@ -20,19 +20,11 @@ constexpr invariant_id network_admission_invariant{
 constexpr invariant_id network_admission_move_invariant{
   "KQ-NETWORK-WRITE-ADMISSION-MOVE-BEFORE-USE"};
 
-std::size_t
-validated_pending_write_operations(network_connection_limits limits) {
-    if (!limits.validate()) {
+network_connection_limits
+validated_write_limits(network_connection_limits limits) {
+    if (!limits.validate())
         throw std::invalid_argument("invalid network write admission limits");
-    }
-    return limits.pending_writes;
-}
-
-std::size_t validated_pending_write_bytes(network_connection_limits limits) {
-    if (!limits.validate()) {
-        throw std::invalid_argument("invalid network write admission limits");
-    }
-    return limits.pending_write_bytes.value();
+    return limits;
 }
 
 } // namespace
@@ -53,9 +45,9 @@ result<void> network_connection_limits::validate() const noexcept {
 
 network_write_admission::network_write_admission(
   network_connection_limits limits)
-  : limits_(limits)
-  , operation_units_(validated_pending_write_operations(limits))
-  , byte_units_(validated_pending_write_bytes(limits)) {}
+  : limits_(validated_write_limits(limits))
+  , operation_units_(limits_.pending_writes)
+  , byte_units_(limits_.pending_write_bytes.value()) {}
 
 network_connection_limits
 network_write_admission::prepare_move(network_write_admission& other) noexcept {

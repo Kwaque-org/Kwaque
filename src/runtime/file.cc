@@ -32,7 +32,7 @@ operation_error file_error(errc code) noexcept {
     return operation_error{code, operation_kind::file};
 }
 
-bool contains_nul(const std::string& value) noexcept {
+bool contains_nul(std::string_view value) noexcept {
     return std::find(value.begin(), value.end(), '\0') != value.end();
 }
 
@@ -515,26 +515,23 @@ private:
     bool size_known_{false};
 };
 
-result<file_path> file_path::make(std::string value) noexcept {
-    if (value.empty() || contains_nul(value)) {
-        return failure(file_error(errc::invalid_argument));
-    }
-    if (value.size() > maximum_file_path_bytes) {
+result<file_path> file_path::make(std::string_view value) {
+    if (value.size() > maximum_file_path_bytes)
         return failure(file_error(errc::out_of_range));
-    }
-    return file_path{std::move(value)};
+    if (value.empty() || contains_nul(value))
+        return failure(file_error(errc::invalid_argument));
+    return file_path{std::string{value}};
 }
 
-result<file_name> file_name::make(std::string value) noexcept {
+result<file_name> file_name::make(std::string_view value) {
+    if (value.size() > maximum_file_name_bytes)
+        return failure(file_error(errc::out_of_range));
     if (
       value.empty() || value == "." || value == ".."
-      || value.find('/') != std::string::npos || contains_nul(value)) {
+      || value.find('/') != std::string_view::npos || contains_nul(value)) {
         return failure(file_error(errc::invalid_argument));
     }
-    if (value.size() > maximum_file_name_bytes) {
-        return failure(file_error(errc::out_of_range));
-    }
-    return file_name{std::move(value)};
+    return file_name{std::string{value}};
 }
 
 result<void> directory_listing_limits::validate() const noexcept {
@@ -551,7 +548,7 @@ result<void> directory_listing_limits::validate() const noexcept {
 
 result<directory_listing> directory_listing::make(
   seastar::chunked_vector<directory_entry> entries,
-  directory_listing_limits limits) noexcept {
+  directory_listing_limits limits) {
     if (auto valid = limits.validate(); !valid) {
         return failure(valid.error());
     }
@@ -560,13 +557,25 @@ result<directory_listing> directory_listing::make(
     }
     std::uint64_t name_bytes = 0;
     for (const auto& entry : entries) {
+        if (
+          static_cast<std::uint8_t>(entry.kind)
+          > static_cast<std::uint8_t>(file_kind::other)) {
+            return failure(file_error(errc::invalid_argument));
+        }
         const auto size = static_cast<std::uint64_t>(entry.name.value().size());
         if (size > limits.maximum_name_bytes.value() - name_bytes) {
             return failure(file_error(errc::resource_exhausted));
         }
         name_bytes += size;
     }
-    return directory_listing{std::move(entries)};
+    // Repeated pops can retain native outer descriptor capacity even
+    // when capacity() is zero. Transfer values into fresh bounded storage so
+    // caller allocation history cannot escape inside this validated result.
+    seastar::chunked_vector<directory_entry> bounded;
+    bounded.reserve(entries.size());
+    for (auto& entry : entries)
+        bounded.push_back(std::move(entry));
+    return directory_listing{std::move(bounded)};
 }
 
 result<void> file_open_options::validate() const noexcept {

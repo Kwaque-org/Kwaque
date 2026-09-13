@@ -33,8 +33,8 @@ class fragmented_buffer_parser;
 inline constexpr std::size_t max_buffer_fragments = 1024;
 inline constexpr byte_count max_buffer_bytes{
   max_buffer_fragments * maximum_contiguous_allocation_bytes};
-// A scatter batch never exceeds what one vectored write can accept, taken from
-// the platform rather than assumed, so a full batch is always submittable.
+// Matches the supported Linux vectored-I/O limit. Export also applies the
+// caller's independent vector and byte limits.
 inline constexpr std::size_t max_scatter_vectors = 1024;
 
 // A stable, nonallocating, nondecreasing upper-bound function verified for the
@@ -376,6 +376,19 @@ private:
 
     [[nodiscard]] static result<byte_count>
     total_size(const fragment_storage& fragments) noexcept;
+    struct fragment_position {
+        std::size_t index;
+        std::size_t offset;
+    };
+    [[nodiscard]] fragment_position locate(byte_count offset) const noexcept;
+    // Caller has checked the logical extent and supplies a normalized position.
+    [[nodiscard]] result<fragmented_buffer>
+    share_from(std::size_t first, std::size_t offset, byte_count length);
+    [[nodiscard]] result<buffer_allocation_cost> slice_allocation_cost_from(
+      std::size_t first,
+      std::size_t offset,
+      byte_count length,
+      allocation_charge_fn charge) const noexcept;
     void drop_empty_fragments();
     void invalidate_presentation() noexcept {
         // Never reuse a presentation number. At exhaustion the buffer remains

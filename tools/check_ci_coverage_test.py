@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import re
+import runpy
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -25,6 +27,7 @@ SETUP_BUILD = (
     if WORKFLOW_ARGUMENTS
     else WORKFLOW.parents[1] / "actions/setup-build/action.yml"
 )
+RETAIN_LOGS = SETUP_BUILD.parents[1] / "retain-logs/action.yml"
 STATEFUL_FUZZERS = {
     "scheduler_fuzz",
     "fault_schedule_fuzz",
@@ -37,6 +40,7 @@ SMOKE_FUZZERS = {f"//src/simulation/tests:{name}" for name in STATEFUL_FUZZERS} 
     "//src/bytes:fragmented_buffer_fuzz",
     "//src/codec/tests:codec_fuzz",
     "//src/codec/tests:codec_cooperative_fuzz",
+    "//src/model/tests:record_fuzz",
     "//src/simulation/tests:signal_canary_test",
 }
 
@@ -102,11 +106,8 @@ def fuzz_coverage_errors(workflow: str, scheduled: str, config: str) -> list[str
     for name, job in (("smoke", smoke), ("scheduled", campaign)):
         for required in (
             "--test_env=KWAQUE_FUZZ_MINIMIZE_SECONDS=30",
-            "if: always()",
-            "actions/upload-artifact@",
-            "bazel-testlogs/**/test.log",
-            "bazel-testlogs/**/test.outputs/**",
-            "retention-days: 30",
+            "if: failure()",
+            "uses: ./.github/actions/retain-logs",
         ):
             if required not in job:
                 errors.append(
@@ -135,8 +136,7 @@ def analysis_coverage_errors(workflow: str) -> list[str]:
     ordinary = run_commands(jobs.get("clang-tidy", ""))
     if not any(
         "bazel build --config=ci-debug --remote_download_outputs=all "
-        "--build_tag_filters=-fuzz,-manual //..."
-        == command
+        "--build_tag_filters=-fuzz,-manual //..." == command
         for command in ordinary
     ):
         errors.append(
@@ -254,12 +254,15 @@ def validation_profile_errors(workflow: str, config: str) -> list[str]:
     }.items():
         commands = run_commands(jobs.get(name, ""))
         selected = [
-            command for command in commands
+            command
+            for command in commands
             if command.startswith(f"bazel test --config={profile} ")
         ]
         if not any("//..." in command.split() for command in selected):
             targets = {
-                word for command in selected for word in command.split()
+                word
+                for command in selected
+                for word in command.split()
                 if word.startswith("//")
             }
             if not PROFILE_TARGETS <= targets:
@@ -343,6 +346,7 @@ class CiCoverageTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
         cls.workflow = WORKFLOW.read_text(encoding="utf-8")
+        cls.retention = runpy.run_path(str(RETAIN_LOGS.with_name("collect.py")))
 
     def test_documentation_selection_preserves_jobs_and_build_order(self) -> None:
         jobs = job_blocks(self.workflow)
@@ -380,9 +384,132 @@ class CiCoverageTest(unittest.TestCase):
         goldens = jobs["goldens"]
         self.assertNotRegex(goldens, r"(?m)^    if:")
         steps = re.split(r"(?m)^      - ", goldens)[1:]
-        self.assertEqual(len(steps), 3)
-        for step in steps:
+        checks = [
+            step for step in steps if "uses: ./.github/actions/retain-logs" not in step
+        ]
+        self.assertEqual(len(checks), 3)
+        for step in checks:
             self.assertIn("if: needs.workflow-lint.outputs.run_checks != 'false'", step)
+
+    def test_only_failed_test_steps_can_trigger_retention(self) -> None:
+        for workflow in (self.workflow, FUZZ_WORKFLOW.read_text()):
+            for name, job in job_blocks(workflow).items():
+                with self.subTest(job=name):
+                    steps = re.split(r"(?m)^      - ", job)[1:]
+                    tests = [
+                        step
+                        for step in steps
+                        if any(
+                            command.startswith("bazel test ")
+                            for command in run_commands(step)
+                        )
+                    ]
+                    retention = [
+                        step
+                        for step in steps
+                        if "uses: ./.github/actions/retain-logs" in step
+                    ]
+                    if not tests:
+                        self.assertEqual(retention, [])
+                        continue
+                    self.assertEqual(len(retention), 1)
+                    self.assertEqual(retention[0], steps[-1])
+                    ids = []
+                    for step in tests:
+                        match = re.search(r"(?m)^        id: (\w+)$", step)
+                        self.assertIsNotNone(match)
+                        ids.append(match.group(1))
+                    self.assertEqual(len(ids), len(set(ids)))
+                    failed = " || ".join(
+                        f"steps.{step}.outcome == 'failure'" for step in ids
+                    )
+                    if len(ids) > 1:
+                        failed = f"({failed})"
+                    self.assertIn(f"if: failure() && {failed}", retention[0])
+                    self.assertIn("${{ github.run_attempt }}", retention[0])
+                    if name == "goldens":
+                        self.assertIn("${{ runner.arch }}", retention[0])
+                        self.assertIn("${{ matrix.config }}", retention[0])
+                    elif name == "stateful-fuzz":
+                        self.assertIn("${{ matrix.target }}", retention[0])
+                    elif name != "fuzz-smoke":
+                        self.assertIn("${{ github.job }}", retention[0])
+
+    def test_retention_upload_requires_failed_reports(self) -> None:
+        action = RETAIN_LOGS.read_text()
+        for required in (
+            'python3 "${{ github.action_path }}/collect.py"',
+            "path: ${{ steps.collect.outputs.paths }}",
+            "retention-days: 30",
+            "if-no-files-found: warn",
+            "actions/upload-artifact@",
+        ):
+            with self.subTest(setting=required):
+                self.assertIn(required, action)
+        upload = action.split("- name: Upload diagnostics", 1)[1]
+        self.assertIn(
+            "if: always() && steps.collect.outputs.has_failures == 'true'", upload
+        )
+
+    def test_retention_skips_successful_and_unexecuted_tests(self) -> None:
+        collect = self.retention["failure_paths"]
+        with tempfile.TemporaryDirectory() as directory:
+            logs, binaries = Path(directory) / "logs", Path(directory) / "bin"
+            self.assertEqual(collect(logs, binaries), [])
+            for name, xml in (
+                ("passed", '<testsuite tests="1" failures="0" errors="0"/>'),
+                ("skipped", "<testsuite><testcase><skipped/></testcase></testsuite>"),
+                ("passed/test.outputs/example", '<testsuite failures="1"/>'),
+            ):
+                report = logs / name / "test.xml"
+                report.parent.mkdir(parents=True, exist_ok=True)
+                report.write_text(xml)
+            build_log = logs / "not_executed" / "test.log"
+            build_log.parent.mkdir()
+            build_log.write_text("build failed before test execution")
+            self.assertEqual(collect(logs, binaries), [])
+
+    def test_retention_collects_failed_nested_runs_and_their_binary(self) -> None:
+        collect = self.retention["failure_paths"]
+        with tempfile.TemporaryDirectory() as directory:
+            logs, binaries = Path(directory) / "logs", Path(directory) / "bin"
+            failed = logs / "pkg/test/run_2_of_3"
+            failed.mkdir(parents=True)
+            (failed / "test.xml").write_text(
+                '<testsuite><testcase><error message="aborted"/>'
+                "</testcase></testsuite>"
+            )
+            passed = logs / "pkg/test/run_1_of_3"
+            passed.mkdir(parents=True)
+            (passed / "test.xml").write_text('<testsuite errors="0"/>')
+            binary = binaries / "pkg/test"
+            binary.parent.mkdir(parents=True)
+            binary.write_bytes(b"test executable")
+            expected = [
+                str(failed / pattern)
+                for pattern in (
+                    "test.log",
+                    "test.xml",
+                    "test.outputs/**",
+                    "test_attempts/**",
+                )
+            ] + [str(binary)]
+            self.assertEqual(collect(logs, binaries), sorted(expected))
+
+    def test_retention_recognizes_counts_and_malformed_reports(self) -> None:
+        failed_report = self.retention["failed_report"]
+        with tempfile.TemporaryDirectory() as directory:
+            report = Path(directory) / "test.xml"
+            for xml in (
+                '<testsuite failures="1"/>',
+                '<testsuite errors="1"/>',
+                '<testsuites xmlns="urn:junit"><testsuite><testcase><failure/>'
+                "</testcase></testsuite></testsuites>",
+                "<testsuite",
+            ):
+                with self.subTest(report=xml):
+                    report.write_text(xml)
+                    self.assertTrue(failed_report(report))
 
     def test_analysis_is_independent_and_parallel_without_reducing_scope(self) -> None:
         jobs = job_blocks(self.workflow)
@@ -514,7 +641,7 @@ class CiCoverageTest(unittest.TestCase):
         scheduled = FUZZ_WORKFLOW.read_text()
         for value in STATEFUL_FUZZERS | {
             "--test_arg=-max_total_time=600",
-            "if: always()",
+            "if: failure()",
             "--test_timeout=720",
             "fail-fast: false",
             "  schedule:",
@@ -563,9 +690,13 @@ class CiCoverageTest(unittest.TestCase):
         for profile, expected in PROFILE_EXPECTATIONS.items():
             for field, value in zip(PROFILE_FIELDS, expected):
                 with self.subTest(profile=profile, field=field):
-                    flag = f"test:{profile} --test_env=KWAQUE_EXPECT_TEST_{field}={value}"
+                    flag = (
+                        f"test:{profile} --test_env=KWAQUE_EXPECT_TEST_{field}={value}"
+                    )
                     self.assertTrue(
-                        validation_profile_errors(self.workflow, config.replace(flag, ""))
+                        validation_profile_errors(
+                            self.workflow, config.replace(flag, "")
+                        )
                     )
         for job_name in ("build", "arm-build", "native-policy"):
             job = job_blocks(self.workflow)[job_name]

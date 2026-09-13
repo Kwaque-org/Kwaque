@@ -4,6 +4,7 @@
 #include "src/bytes/fragmented_buffer_parser.h"
 
 #include <seastar/core/temporary_buffer.hh>
+#include <seastar/util/alloc_failure_injector.hh>
 
 #include <gtest/gtest.h>
 
@@ -11,6 +12,8 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <new>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <type_traits>
@@ -400,6 +403,84 @@ TEST(BufferParser, ExhaustiveFragmentationMatchesContiguousOracle) {
     }
     // 2^(length+1) compositions, so the matrix really is exhaustive.
     EXPECT_EQ(compositions, std::size_t{1} << (length + 1));
+}
+
+TEST(BufferParser, SequentialOwningSlicesKeepPositionCostsAndCheckpoints) {
+    const std::string text(max_buffer_fragments, 'q');
+    std::vector<std::size_t> cuts;
+    for (std::size_t cut = 1; cut < text.size(); ++cut)
+        cuts.push_back(cut);
+    auto source = split_at(text, cuts);
+    fragmented_buffer_parser parser{source.share()};
+    ASSERT_TRUE(parser.push_checkpoint());
+    for (std::size_t index = 0; index < text.size(); ++index) {
+        const auto charge = [](byte_count value) noexcept { return value; };
+        const auto expected = source.slice_allocation_cost(
+          byte_count{index}, byte_count{1}, charge);
+        const auto cost = parser.next_buffer_allocation_cost(
+          byte_count{1}, charge);
+        ASSERT_TRUE(expected.has_value() && cost.has_value());
+        EXPECT_EQ(*cost, *expected);
+        auto peek = parser.peek_buffer(byte_count{1});
+        ASSERT_TRUE(peek.has_value());
+        EXPECT_EQ(parser.bytes_consumed(), byte_count{index});
+        auto read = parser.read_buffer(byte_count{1});
+        ASSERT_TRUE(read.has_value());
+        EXPECT_EQ(
+          read->fragment_at(0)->data(), source.fragment_at(index)->data());
+        EXPECT_EQ(peek->fragment_at(0)->data(), read->fragment_at(0)->data());
+        EXPECT_EQ(parser.bytes_consumed(), byte_count{index + 1});
+    }
+    EXPECT_TRUE(parser.at_end());
+    ASSERT_TRUE(parser.rollback());
+    EXPECT_EQ(parser.bytes_consumed(), byte_count{});
+    EXPECT_TRUE(parser.read_buffer(byte_count{1})->content_equals("q"));
+}
+
+TEST(BufferParser, OwningSliceAllocationFailureDoesNotAdvanceOrLoseMarks) {
+#if !defined(SEASTAR_ENABLE_ALLOC_FAILURE_INJECTION)
+    GTEST_SKIP() << "allocation failure injection is not enabled";
+#else
+    bool succeeded = false;
+    std::size_t failures = 0;
+    for (std::size_t point = 0; point < 64; ++point) {
+        fragmented_buffer_parser parser{split_at("abbccc", {1, 3})};
+        ASSERT_TRUE(parser.skip(byte_count{1}));
+        ASSERT_TRUE(parser.push_checkpoint());
+        auto& injector = seastar::memory::local_failure_injector();
+        std::optional<result<fragmented_buffer>> slice;
+        bool failed = false;
+        injector.fail_after(point);
+        try {
+            slice.emplace(parser.read_buffer(byte_count{3}));
+        } catch (const std::bad_alloc&) {
+            failed = true;
+        } catch (...) {
+            injector.cancel();
+            throw;
+        }
+        const bool injected = injector.failed();
+        injector.cancel();
+        EXPECT_EQ(parser.checkpoint_depth(), 1U);
+        if (injected) {
+            ++failures;
+            EXPECT_TRUE(failed);
+            EXPECT_EQ(parser.bytes_consumed(), byte_count{1});
+            EXPECT_TRUE(
+              parser.read_buffer(byte_count{3})->content_equals("bbc"));
+        } else {
+            EXPECT_FALSE(failed);
+            ASSERT_TRUE(slice.has_value() && slice->has_value());
+            EXPECT_TRUE((**slice).content_equals("bbc"));
+            succeeded = true;
+        }
+        ASSERT_TRUE(parser.rollback());
+        EXPECT_EQ(parser.bytes_consumed(), byte_count{1});
+        if (succeeded) break;
+    }
+    EXPECT_TRUE(succeeded);
+    EXPECT_GT(failures, 0U);
+#endif
 }
 
 TEST(BufferParser, EmptyAndExhaustedInputsBehaveConsistently) {

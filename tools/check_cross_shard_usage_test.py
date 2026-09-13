@@ -11,6 +11,27 @@ except ModuleNotFoundError:
 
 
 class CrossShardUsageTest(unittest.TestCase):
+    def test_fanout_has_explicit_counted_allowances(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = "src/component/fanout.cc"
+            self.write(
+                root,
+                path,
+                "seastar::smp::invoke_on_all([] {});\n"
+                "seastar::smp /* gap */ ::invoke_on_others([] {});\n"
+                'const char* text = "smp::invoke_on_all(";\n',
+            )
+            self.assertEqual(len(scan_paths(root, [Path("src")], allowed_rules={})), 2)
+            self.assertEqual(
+                scan_paths(
+                    root,
+                    [Path("src")],
+                    allowed_rules={path: {"direct cross-shard fan-out": 1}},
+                ),
+                [f"{path}:2: direct cross-shard fan-out"],
+            )
+
     def write(self, root: Path, relative: str, content: str) -> None:
         destination = root / relative
         destination.parent.mkdir(parents=True, exist_ok=True)

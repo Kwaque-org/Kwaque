@@ -113,7 +113,9 @@ class BenchmarkComparisonTest(unittest.TestCase):
             )
         return result, child
 
-    def test_runtime_profile_requires_native_optimized_oom_abort_without_instrumentation(self) -> None:
+    def test_runtime_profile_requires_native_optimized_oom_abort_without_instrumentation(
+        self,
+    ) -> None:
         path = self.root / "profile.log"
         path.write_bytes(b"startup diagnostics\n" + PROFILE_LINE)
         self.assertEqual(driver.read_runtime_profile(path), driver.PRODUCTION_PROFILE)

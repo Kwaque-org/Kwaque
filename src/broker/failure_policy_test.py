@@ -72,7 +72,8 @@ class FailurePolicyTest(unittest.TestCase):
         }
         supplied = [name for name in expectations.values() if name in os.environ]
         self.assertIn(
-            len(supplied), (0, len(expectations)),
+            len(supplied),
+            (0, len(expectations)),
             "specify all four validation profile expectations",
         )
         for field, name in expectations.items():
@@ -80,7 +81,9 @@ class FailurePolicyTest(unittest.TestCase):
                 self.assertEqual(fields[field], os.environ[name], name)
         if os.environ.get("KWAQUE_EXPECT_TEST_SANITIZED") == "true":
             self.assertEqual(fields["asan"], "true", "ASan instrumentation is required")
-            self.assertEqual(fields["ubsan"], "true", "UBSan instrumentation is required")
+            self.assertEqual(
+                fields["ubsan"], "true", "UBSan instrumentation is required"
+            )
         return fields
 
     def test_effective_default_and_presence_option(self) -> None:

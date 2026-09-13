@@ -47,6 +47,9 @@ inline constexpr std::size_t max_invariant_expression_size = 128;
 inline constexpr std::size_t max_invariant_context_size = 160;
 inline constexpr std::size_t max_invariant_diagnostic_size = 2048;
 
+// Formats without allocating, then emits to inherited stderr and aborts.
+// Emission is best effort and may block according to the descriptor's kernel
+// semantics; bounded diagnostic storage does not imply a termination deadline.
 [[gnu::cold]] [[noreturn]] void invariant_failed(
   const invariant_id& id,
   std::string_view expression,

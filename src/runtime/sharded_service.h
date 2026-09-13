@@ -40,8 +40,12 @@ concept sharded_service_lifecycle = requires(Service& service) {
 // Process-scoped owner for one mutable Service instance per shard. Public
 // lifecycle methods run on the constructing shard, and the supplied service
 // group must outlive all calls. Service::request_abort() must be idempotent,
-// and Service::stop() must drain its local task scope. Destruction is valid
-// only before start or after stop has completed.
+// and Service::stop() must drain its local work even if abort reports a
+// failure. A failed Service::start() must clean its own partial state; a
+// constructed Service must be destructible without stop(). Only successfully
+// started local services are stopped. Destruction is valid only before a start
+// attempt or after the lifecycle operation has completed, on the constructing
+// shard.
 template<sharded_service_lifecycle Service>
 class sharded_service final : public shard_affine {
 private:
@@ -52,6 +56,7 @@ private:
           : service_(std::forward<Args>(args)...) {}
 
         ~local_service() {
+            assert_current();
             KWAQUE_INVARIANT(
               invariant_id{"KQ-SHARDED-LOCAL-STOPPED"},
               !started_,
@@ -79,12 +84,18 @@ private:
             if (!started_) {
                 co_return;
             }
-            service_.request_abort();
             std::exception_ptr failure;
+            try {
+                service_.request_abort();
+            } catch (...) {
+                failure = std::current_exception();
+            }
             try {
                 co_await service_.stop();
             } catch (...) {
-                failure = std::current_exception();
+                if (!failure) {
+                    failure = std::current_exception();
+                }
             }
             started_ = false;
             if (failure) {
@@ -128,17 +139,23 @@ public:
       : service_group_(service_group) {}
 
     ~sharded_service() {
+        assert_current();
         KWAQUE_INVARIANT(
           invariant_id{"KQ-SHARDED-OWNER-STOPPED"},
-          state_ == sharded_service_state::constructed
+          (state_ == sharded_service_state::constructed && !operation_active_)
             || (state_ == sharded_service_state::stopped && !container_started_),
           "sharded service owner destroyed while active");
     }
 
     // Constructor arguments are copied by the underlying shard container. Keep
-    // them immutable and independently valid on every shard.
+    // them immutable and independently valid on every shard. Native remote
+    // submission moves its callback inside a noexcept boundary, so argument
+    // moves must not throw. Copy/allocation failures remain recoverable.
     template<typename... Args>
-    requires(std::copy_constructible<Args> && ...)
+    requires(
+      (std::copy_constructible<Args>
+       && std::is_nothrow_move_constructible_v<Args>)
+      && ...)
     [[nodiscard]] seastar::future<> start(Args... args) {
         assert_current();
         if (state_ != sharded_service_state::constructed || operation_active_) {
@@ -166,12 +183,15 @@ public:
                     co_await request_abort_all();
                 } catch (...) {
                 }
-                try {
-                    co_await services_.stop();
-                } catch (...) {
-                }
-                container_started_ = false;
             }
+            // Native construction can reserve its instance array before an
+            // argument or callback constructor fails. Stop also handles empty
+            // and partially constructed containers.
+            try {
+                co_await services_.stop();
+            } catch (...) {
+            }
+            container_started_ = false;
             state_ = sharded_service_state::stopped;
             operation_active_ = false;
             std::rethrow_exception(startup_failure);
@@ -227,19 +247,6 @@ public:
     [[nodiscard]] sharded_service_state state() const {
         assert_current();
         return state_;
-    }
-
-    template<typename Selector>
-    requires std::copy_constructible<Selector>
-             && std::invocable<const Selector&, Service&>
-    [[nodiscard]] auto local_parameter(Selector selector) {
-        assert_parameter_source();
-        return seastar::sharded_parameter(
-          [selector = std::move(selector)](
-            local_service& local) -> decltype(auto) {
-              return std::invoke(selector, local.service());
-          },
-          std::ref(services_));
     }
 
     template<typename Func, typename... Args>
@@ -302,31 +309,10 @@ public:
     }
 
 private:
-    void assert_parameter_source() const {
-        assert_current();
-        if (state_ != sharded_service_state::started || operation_active_) {
-            throw std::logic_error(
-              "sharded service cannot provide local constructor parameters");
-        }
-    }
-
     void assert_invocable() const {
         assert_current();
         if (state_ != sharded_service_state::started || operation_active_) {
             throw std::logic_error("sharded service is not available");
-        }
-    }
-
-    template<typename Func, typename... Args>
-    static auto
-    invoke_local_owned(local_service& local, Func function, Args... args)
-      -> seastar::future<invocation_result<Func, Args...>> {
-        if constexpr (std::same_as<invocation_result<Func, Args...>, void>) {
-            co_await seastar::futurize_invoke(
-              function, local.service(), std::move(args)...);
-        } else {
-            co_return co_await seastar::futurize_invoke(
-              function, local.service(), std::move(args)...);
         }
     }
 
@@ -341,8 +327,10 @@ private:
             local_service& local) mutable {
               return std::apply(
                 [&local, &function](Args&... values) {
-                    return invoke_local_owned(
-                      local, std::move(function), std::move(values)...);
+                    // Native invocation retains the callback and its tuple;
+                    // the invocation gate keeps the local service alive.
+                    return std::invoke(
+                      function, local.service(), std::move(values)...);
                 },
                 arguments);
           });

@@ -1,6 +1,7 @@
+#include "src/codec/tests/codec_bench_reference.h"
+
 #include "src/base/invariant.h"
 #include "src/base/units.h"
-#include "src/codec/tests/codec_bench_fixture.h"
 
 #include <seastar/core/byteorder.hh>
 #include <seastar/core/coroutine.hh>

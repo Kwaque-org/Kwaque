@@ -44,6 +44,10 @@ public:
     // must form an acyclic dependency graph. Long workflows should return an
     // owned dispatch result promptly and continue under a component gate after
     // releasing the limited slot.
+    // This bounds executing remote work, not submission-side waiters. Before
+    // submission, the component must admit task/item and retained-byte costs
+    // against its own bounded capacity, and drain them before releasing this
+    // lease.
     [[nodiscard]] seastar::smp_service_group smp_service_group() const;
     [[nodiscard]] byte_count hard_budget() const {
         assert_live();

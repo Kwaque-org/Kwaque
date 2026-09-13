@@ -3,12 +3,14 @@
 #include <seastar/core/abort_source.hh>
 #include <seastar/core/coroutine.hh>
 #include <seastar/core/future.hh>
+#include <seastar/core/sleep.hh>
 #include <seastar/testing/test_case.hh>
 #include <seastar/util/alloc_failure_injector.hh>
 #include <seastar/util/later.hh>
 
 #include <boost/test/unit_test.hpp>
 
+#include <chrono>
 #include <exception>
 #include <memory>
 #include <new>
@@ -190,6 +192,36 @@ SEASTAR_TEST_CASE(
     third_child.reset();
 }
 
+SEASTAR_TEST_CASE(task_scope_parent_abort_wakes_a_suspended_native_wait) {
+    seastar::abort_source parent;
+    kwaque::runtime::task_scope child{parent};
+    seastar::promise<> waiting;
+    auto started = waiting.get_future();
+    bool canceled = false;
+    const auto accepted = child.spawn(
+      [&child, &waiting, &canceled] -> seastar::future<> {
+          auto sleep = seastar::sleep_abortable(
+            std::chrono::hours{1}, child.abort_source());
+          BOOST_REQUIRE(!sleep.available());
+          waiting.set_value();
+          try {
+              co_await std::move(sleep);
+          } catch (const seastar::sleep_aborted&) {
+              canceled = true;
+          }
+      },
+      kwaque::runtime::task_lifetime::until_abort);
+    BOOST_REQUIRE(accepted.has_value());
+    co_await std::move(started);
+    BOOST_CHECK_EQUAL(child.task_count(), 1U);
+    BOOST_CHECK(!canceled);
+    parent.request_abort();
+    co_await child.close();
+    BOOST_CHECK(canceled);
+    BOOST_CHECK_EQUAL(child.task_count(), 0U);
+    BOOST_CHECK_EQUAL(child.statistics().failed, 0U);
+}
+
 SEASTAR_TEST_CASE(task_scope_reports_the_first_background_failure_once_closed) {
     kwaque::runtime::task_scope scope;
     const auto accepted = scope.spawn([] {
@@ -230,7 +262,7 @@ SEASTAR_TEST_CASE(task_scope_notifies_first_failure_before_close) {
         notified.set_value();
     }};
     BOOST_REQUIRE(scope
-                    .spawn([expected]() -> seastar::future<> {
+                    .spawn([expected] -> seastar::future<> {
                         std::rethrow_exception(expected);
                     })
                     .has_value());
@@ -267,7 +299,7 @@ SEASTAR_TEST_CASE(task_scope_stop_does_not_hide_a_suspended_failure) {
     BOOST_REQUIRE(scope
                     .spawn(
                       [pending = release.get_future(),
-                       expected]() mutable -> seastar::future<> {
+                       expected] mutable -> seastar::future<> {
                           co_await std::move(pending);
                           std::rethrow_exception(expected);
                       },
@@ -294,7 +326,7 @@ SEASTAR_TEST_CASE(
     BOOST_REQUIRE(
       scope
         .spawn(
-          [pending = release.get_future()]() mutable -> seastar::future<> {
+          [pending = release.get_future()] mutable -> seastar::future<> {
               co_await std::move(pending);
               throw seastar::abort_requested_exception{};
           },

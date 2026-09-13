@@ -6,11 +6,13 @@
 #include <seastar/core/future.hh>
 #include <seastar/core/gate.hh>
 #include <seastar/testing/test_case.hh>
+#include <seastar/util/later.hh>
 
 #include <boost/test/unit_test.hpp>
 
 #include <optional>
 #include <span>
+#include <string_view>
 #include <type_traits>
 #include <utility>
 #include <vector>
@@ -246,6 +248,54 @@ SEASTAR_TEST_CASE(
 
     const auto closed_again = co_await connected->close();
     BOOST_REQUIRE(closed_again.has_value());
+}
+
+template<typename Backend>
+seastar::future<> check_queued_write_cancellation() {
+    using namespace kwaque;
+    using namespace kwaque::runtime;
+    Backend backend;
+    seastar::abort_source first_abort, queued_abort, surviving_abort;
+    auto connected = co_await backend.network().connect(
+      kwaque::runtime::testing::detail::loopback(33150),
+      std::nullopt,
+      network_connection_limits{
+        .pending_write_bytes = byte_count{8}, .pending_writes = 3},
+      first_abort);
+    BOOST_REQUIRE(connected.has_value());
+    connected->enable_controlled_io();
+    auto first = connected->write(
+      *bytes::fragmented_buffer::copy_of(std::string_view{"a"}), first_abort);
+    auto canceled = connected->write(
+      *bytes::fragmented_buffer::copy_of(std::string_view{"bb"}), queued_abort);
+    auto surviving = connected->write(
+      *bytes::fragmented_buffer::copy_of(std::string_view{"ccc"}),
+      surviving_abort);
+    queued_abort.request_abort();
+    const auto rejected = co_await std::move(canceled);
+    BOOST_REQUIRE(!rejected.has_value());
+    BOOST_CHECK(rejected.error().code() == errc::aborted);
+    BOOST_CHECK_EQUAL(connected->pending_write_count(), 2U);
+    BOOST_CHECK_EQUAL(connected->pending_write_bytes().value(), 4U);
+    BOOST_CHECK(!first.available());
+    BOOST_CHECK(!surviving.available());
+    // This caller abort happens after native dispatch and cannot cancel A.
+    first_abort.request_abort();
+    BOOST_CHECK(!first.available());
+    BOOST_REQUIRE(connected->complete_next_write());
+    const auto first_result = co_await std::move(first);
+    BOOST_CHECK(first_result.has_value());
+    while (!connected->complete_next_write())
+        co_await seastar::yield();
+    const auto surviving_result = co_await std::move(surviving);
+    BOOST_CHECK(surviving_result.has_value());
+    BOOST_CHECK_EQUAL(connected->pending_write_bytes().value(), 0U);
+    BOOST_CHECK((co_await connected->close()).has_value());
+}
+
+SEASTAR_TEST_CASE(network_contract_cancels_only_the_queued_caller) {
+    co_await check_queued_write_cancellation<production_backend>();
+    co_await check_queued_write_cancellation<deterministic_backend>();
 }
 
 SEASTAR_TEST_CASE(network_contract_reserves_retained_backing) {

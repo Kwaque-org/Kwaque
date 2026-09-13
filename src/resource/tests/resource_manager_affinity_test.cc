@@ -85,4 +85,34 @@ SEASTAR_TEST_CASE(resource_manager_rejects_foreign_shard_access) {
     co_await registry.stop();
 }
 
+SEASTAR_TEST_CASE(
+  resource_manager_observes_negative_native_counter_before_conversion) {
+    resource_registry registry;
+    co_await registry.start(local_memory_config());
+    resource_manager manager{registry.handles()};
+    co_await manager.start();
+    {
+        auto workload = manager.acquire_workload(workload_class::metadata);
+        auto& memory = workload.memory_admission();
+        const auto amount = memory.current() + 1U;
+        memory.consume(amount);
+        bool observed = false;
+        {
+            testing::scoped_invariant_observer observer{observe_and_throw};
+            try {
+                static_cast<void>(
+                  manager.memory_available(workload_class::metadata));
+            } catch (const observed_invariant&) {
+                observed = observed_diagnostic.find(
+                             "id=KQ-RESOURCE-MEMORY-AVAILABLE ")
+                           != std::string::npos;
+            }
+        }
+        memory.signal(amount);
+        BOOST_CHECK(observed);
+    }
+    co_await manager.stop();
+    co_await registry.stop();
+}
+
 } // namespace kwaque::resource

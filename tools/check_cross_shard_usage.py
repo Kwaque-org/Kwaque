@@ -25,6 +25,10 @@ RULES = (
         re.compile(r"\bsmp\s*::\s*submit_to\s*\("),
     ),
     Rule(
+        "direct cross-shard fan-out",
+        re.compile(r"\bsmp\s*::\s*invoke_on_(?:all|others)\s*\("),
+    ),
+    Rule(
         "direct sharded-service ownership",
         re.compile(r"\bsharded\s*<"),
     ),
@@ -39,6 +43,8 @@ ALLOWED_RULE_COUNTS = {
     "src/runtime/cross_shard.h": {"direct cross-shard submission": 1},
     "src/runtime/sharded_service.h": {"direct sharded-service ownership": 1},
     "src/broker/application_start.cc": {"direct cross-shard submission": 1},
+    "src/broker/crash_recorder.cc": {"direct cross-shard fan-out": 2},
+    "src/broker/crash_recorder_probe.cc": {"direct cross-shard fan-out": 1},
 }
 
 

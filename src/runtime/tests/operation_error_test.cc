@@ -3,6 +3,7 @@
 #include <gtest/gtest.h>
 
 #include <cstdint>
+#include <limits>
 #include <optional>
 #include <string>
 #include <type_traits>
@@ -63,6 +64,39 @@ TEST(OperationErrorTest, RendersOnlyBoundedAllowlistedFields) {
     EXPECT_EQ(rendered.find('\r'), std::string::npos);
     EXPECT_EQ(rendered.find('/'), std::string::npos);
     EXPECT_EQ(rendered.find('\\'), std::string::npos);
+}
+
+TEST(OperationErrorTest, MaximumContextAndRejectedInsertionPreserveEveryField) {
+    operation_error error{
+      kwaque::errc::invariant_violation, operation_kind::observability};
+    constexpr auto maximum = std::numeric_limits<std::uint64_t>::max();
+    for (const auto key :
+         {operation_context_key::deadline_ns,
+          operation_context_key::occurrence,
+          operation_context_key::stable_id,
+          operation_context_key::sequence}) {
+        ASSERT_TRUE(error.add_context(key, maximum));
+        const auto snapshot = error;
+        EXPECT_FALSE(error.add_context(key, 0));
+        EXPECT_EQ(error, snapshot);
+        EXPECT_FALSE(
+          error.add_context(static_cast<operation_context_key>(255), 0));
+        EXPECT_EQ(error, snapshot);
+    }
+    const auto before = error;
+    for (const auto key :
+         {operation_context_key::stable_id,
+          operation_context_key::peer,
+          static_cast<operation_context_key>(255)}) {
+        EXPECT_FALSE(error.add_context(key, 0));
+        EXPECT_EQ(error, before);
+    }
+    EXPECT_EQ(
+      error.render(),
+      "operation=observability error=kwaque:16"
+      " deadline_ns=18446744073709551615 occurrence=18446744073709551615"
+      " stable_id=18446744073709551615 sequence=18446744073709551615");
+    EXPECT_LE(error.render().size(), operation_error::max_rendered_size);
 }
 
 TEST(OperationErrorTest, RuntimeResultSeparatesExpectedFailureFromExceptions) {

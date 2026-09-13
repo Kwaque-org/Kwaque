@@ -12,6 +12,7 @@
 #include "src/codec/sha256.h"
 #include "src/codec/sha256_cooperative.h"
 #include "src/codec/staging_cooperative.h"
+#include "src/codec/tests/envelope_fuzz_cases.h"
 #include "src/codec/transaction.h"
 #include "src/runtime/testing/seastar_fuzz.h"
 
@@ -412,6 +413,25 @@ void empty_children(const script& input) {
     }
 }
 
+void envelopes(const script& input) {
+    codec::testing::envelope_fuzz_options options;
+    options.initially_aborted = input.initially_aborted();
+    options.queued_abort = input.queued_abort();
+    options.body_abort = (input.control[3] & 4U) != 0;
+    options.cleanup_abort = (input.control[3] & 8U) != 0;
+    options.exhaust_operation = (input.control[3] & 16U) != 0;
+    options.exhaust_metadata = (input.control[3] & 32U) != 0;
+    options.work_bytes = std::uint64_t{128} << (input.control[1] % 6U);
+    options.work_items = std::uint64_t{64} << (input.control[2] % 3U);
+    options.checkpoint_depth = static_cast<std::uint8_t>(input.control[4] % 9U);
+    options.layout = input.control[5];
+    codec::testing::exercise_envelope_case(
+      std::span<const std::uint8_t>{
+        reinterpret_cast<const std::uint8_t*>(input.payload.data()),
+        input.payload.size()},
+      options);
+}
+
 void exercise(const std::vector<char>& bytes) {
     const script input{bytes};
     switch (input.control[0] % 4U) {
@@ -427,6 +447,11 @@ void exercise(const std::vector<char>& bytes) {
     case 3:
         empty_children(input);
         break;
+    }
+    // Keep the original dispatch for every byte, including older reproductions
+    // using this marker. The envelope exercise adds separately joined work.
+    if (input.control[0] == 4U) {
+        envelopes(input);
     }
 }
 

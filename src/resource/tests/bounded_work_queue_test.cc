@@ -13,8 +13,10 @@
 #include <seastar/core/lowres_clock.hh>
 #include <seastar/core/memory.hh>
 #include <seastar/core/shared_future.hh>
+#include <seastar/core/with_timeout.hh>
 #include <seastar/testing/test_case.hh>
 #include <seastar/util/alloc_failure_injector.hh>
+#include <seastar/util/defer.hh>
 #include <seastar/util/later.hh>
 #include <seastar/util/noncopyable_function.hh>
 
@@ -644,7 +646,8 @@ SEASTAR_TEST_CASE(
 
 SEASTAR_TEST_CASE(bounded_work_queue_saturates_each_admission_dimension) {
     BOOST_CHECK(!queue_config(0, 10, 1).validate().has_value());
-    BOOST_CHECK(!queue_config(1, 1, 1).validate().has_value());
+    BOOST_CHECK(queue_config(1, 1, 1).validate().has_value());
+    BOOST_CHECK(!queue_config(1, 0, 1).validate().has_value());
     BOOST_CHECK(!queue_config(1, std::numeric_limits<std::uint64_t>::max(), 1)
                    .validate()
                    .has_value());
@@ -1169,6 +1172,133 @@ SEASTAR_TEST_CASE(bounded_work_queue_integrates_and_isolates_workers) {
 
     co_await queue.close(queue_close_mode::drain);
     observed_workload.reset();
+    co_await manager.stop();
+    co_await registry.stop();
+}
+
+SEASTAR_TEST_CASE(managed_queue_reuses_item_slots_while_handlers_hold_bytes) {
+    resource_registry registry;
+    co_await registry.start(manager_config());
+    resource_manager manager{registry.handles()};
+    co_await manager.start();
+    for (const std::uint64_t capacity : {10U, 30U}) {
+        bounded_work_queue<int> queue{
+          queue_config(1, capacity, 1), manager, workload_class::maintenance};
+        seastar::abort_source abort;
+        seastar::shared_promise<> release;
+        std::array<seastar::promise<>, 2> entered;
+        auto first_entered = entered[0].get_future();
+        auto second_entered = entered[1].get_future();
+        BOOST_REQUIRE(
+          (co_await queue.push(0, byte_count{10}, abort)).has_value());
+        auto second = queue.push(1, byte_count{10}, abort);
+        BOOST_REQUIRE(!second.available());
+        queue.start_workers(
+          {.workers = 2, .maximum_error_reports = 0},
+          [&entered, &release](int value) -> seastar::future<> {
+              entered[static_cast<std::size_t>(value)].set_value();
+              co_await release.get_shared_future();
+          },
+          [](std::exception_ptr) noexcept {});
+        co_await std::move(first_entered);
+        std::exception_ptr progress_failure;
+        std::optional<seastar::future<>> entered_after_release;
+        if (capacity == 30) {
+            try {
+                co_await seastar::with_timeout(
+                  seastar::lowres_clock::now() + std::chrono::seconds{5},
+                  std::move(second_entered));
+            } catch (...) {
+                progress_failure = std::current_exception();
+            }
+            BOOST_CHECK_EQUAL(queue.bytes().value(), 20U);
+            BOOST_CHECK_EQUAL(queue.active_handlers(), 2U);
+        } else {
+            BOOST_CHECK(!second.available());
+            BOOST_CHECK(!second_entered.available());
+            BOOST_CHECK_EQUAL(queue.bytes().value(), 10U);
+            entered_after_release.emplace(std::move(second_entered));
+        }
+        release.set_value();
+        const auto accepted = co_await std::move(second);
+        co_await queue.close(queue_close_mode::drain);
+        if (entered_after_release) co_await std::move(*entered_after_release);
+        BOOST_CHECK(accepted.has_value());
+        BOOST_CHECK(!progress_failure);
+        BOOST_CHECK_EQUAL(queue.bytes().value(), 0U);
+    }
+    co_await manager.stop();
+    co_await registry.stop();
+}
+
+SEASTAR_TEST_CASE(
+  managed_queue_close_releases_callback_owners_before_dependencies) {
+    resource_registry registry;
+    co_await registry.start(manager_config());
+    resource_manager manager{registry.handles()};
+    co_await manager.start();
+    for (const auto mode : {queue_close_mode::drain, queue_close_mode::abort}) {
+        seastar::abort_source abort;
+        seastar::promise<> entered;
+        auto started = entered.get_future();
+        seastar::promise<> release;
+        std::array<std::size_t, 3> destroyed{};
+        std::size_t reports = 0;
+        std::optional<seastar::future<>> reentered;
+        bounded_work_queue<int> queue{
+          queue_config(1, 10, 0), manager, workload_class::maintenance};
+        auto reenter = seastar::defer(
+          [&] noexcept { reentered.emplace(queue.close(mode)); });
+        auto lease = manager.acquire_workload(workload_class::maintenance);
+        auto units = seastar::get_units(lease.memory_admission(), 3).get();
+        queue.start_workers(
+          {.workers = 1, .maximum_error_reports = 1},
+          [owner = counted_queue_item{destroyed[0]},
+           lease = std::move(lease),
+           units = std::move(units),
+           &entered,
+           &release](int) -> seastar::future<> {
+              static_cast<void>(owner);
+              static_cast<void>(lease);
+              static_cast<void>(units);
+              entered.set_value();
+              co_await release.get_future();
+              throw optional_item_failure{};
+          },
+          [owner = counted_queue_item{destroyed[1]},
+           reenter = std::move(reenter),
+           &reports](std::exception_ptr) noexcept {
+              static_cast<void>(owner);
+              static_cast<void>(reenter);
+              ++reports;
+          },
+          [owner = counted_queue_item{destroyed[2]}](
+            const std::exception_ptr& error) noexcept {
+              static_cast<void>(owner);
+              try {
+                  std::rethrow_exception(error);
+              } catch (const optional_item_failure&) {
+                  return true;
+              } catch (...) {
+                  return false;
+              }
+          });
+        BOOST_REQUIRE(
+          (co_await queue.push(0, byte_count{1}, abort)).has_value());
+        co_await std::move(started);
+        auto closing = queue.close(mode);
+        BOOST_CHECK(!closing.available());
+        release.set_value();
+        co_await std::move(closing);
+        for (const auto count : destroyed)
+            BOOST_CHECK_EQUAL(count, 1U);
+        BOOST_CHECK_EQUAL(reports, 1U);
+        BOOST_CHECK(reentered.has_value());
+        if (reentered) co_await std::move(*reentered);
+        BOOST_CHECK_EQUAL(
+          manager.memory_used(workload_class::maintenance).value(), 0U);
+        co_await queue.close(mode);
+    }
     co_await manager.stop();
     co_await registry.stop();
 }

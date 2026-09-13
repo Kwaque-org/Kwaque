@@ -83,7 +83,7 @@ result<bytes::fragmented_buffer> assemble_buffer(
       config.max_work_items.value(), std::uint64_t{256});
     const auto fragments = static_cast<std::uint64_t>(payload.fragment_count());
     // Covers our cost/packing scans, the builder's preflight and transfer, and
-    // descriptor migration. Final publication is its separate bounded leaf.
+    // the single prepared descriptor array. Publication only transfers it.
     if (
       *total > logical_cap || prefix.size() > work_bytes
       || fragments > work_items / 8U) {
@@ -159,34 +159,34 @@ result<bytes::fragmented_buffer> assemble_buffer(
             return codec::failure(
               staging_error(errc::resource_exhausted, context));
         }
-        std::uint64_t packing_fragments = 0;
         std::uint64_t copied = prefix.size();
+        auto copy_remaining
+          = prefix.empty()
+              ? 0U
+              : std::min<std::uint64_t>(
+                  bytes::fragmented_buffer_builder::pack_copy_threshold.value(),
+                  ceiling);
         for (const auto fragment : payload) {
-            if (
-              fragment.size()
-                <= bytes::fragmented_buffer_builder::pack_copy_threshold.value()
-              && fragment.size() <= ceiling) {
-                ++packing_fragments;
-                copied += fragment.size();
-            }
+            if (fragment.size() > copy_remaining) break;
+            copied += fragment.size();
+            copy_remaining -= fragment.size();
         }
         if (copied > work_bytes) {
-            // Smaller ceilings can convert a small donation into a no-copy
-            // splice, so continue searching within the same finite bound.
+            // A smaller tail ceiling reduces the possible bounded prefix copy;
+            // remaining published fragments are transferred without copying.
             ceiling /= 2U;
             continue;
         }
-        const auto new_tails = prefix_fragments + packing_fragments;
+        const auto new_tails = prefix_fragments;
         const auto backing = multiply_charge(served_tail, new_tails, context);
         const byte_count descriptor_request{
-          2U * nodes * bytes::fragmented_buffer::fragment_descriptor_size()};
+          nodes * bytes::fragmented_buffer::fragment_descriptor_size()};
         const auto descriptor = charge(descriptor_request);
         if (descriptor < descriptor_request) {
             return codec::failure(
               staging_error(errc::invalid_argument, context));
         }
-        const auto descriptor_peak = multiply_charge(descriptor, 2, context);
-        if (!backing || !descriptor_peak) {
+        if (!backing) {
             return codec::failure(staging_error(errc::out_of_range, context));
         }
         const auto output_backing = input_cost->backing.checked_add(*backing);
@@ -201,7 +201,7 @@ result<bytes::fragmented_buffer> assemble_buffer(
         }
         if (
           auto added = add_charge(
-            projected.payload_bookkeeping, *descriptor_peak, context);
+            projected.payload_bookkeeping, descriptor, context);
           !added) {
             return codec::failure(added.error());
         }
@@ -224,6 +224,11 @@ result<bytes::fragmented_buffer> assemble_buffer(
             builder_config.max_fragments = static_cast<std::size_t>(
               config.max_buffer_fragments.value());
             bytes::fragmented_buffer_builder output{builder_config};
+            const auto reserved = output.reserve_fragments(item_count{nodes});
+            KWAQUE_INVARIANT(
+              invariant_id{"KQ-CODEC-STAGING-RESERVE"},
+              reserved.has_value(),
+              "admitted descriptor reservation failed");
             const auto copied_prefix = output.append(prefix);
             KWAQUE_INVARIANT(
               invariant_id{"KQ-CODEC-STAGING-PREFIX"},

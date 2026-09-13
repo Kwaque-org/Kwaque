@@ -82,6 +82,7 @@ kwaque_cc_seastar_test(
     name = "resource_manager_test",
     srcs = ["resource_manager_test.cc"],
     cpu = 4,
+    env = {"BOOST_TEST_LOG_LEVEL": "test_suite"},
     memory = "512MiB",
     deps = [
         "//src/base",

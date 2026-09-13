@@ -323,13 +323,13 @@ TEST(CodecStagingTest, WorkAndFragmentLimitsBoundSynchronousAssembly) {
       errc::resource_exhausted);
     config = codec::limits_config{};
     config.max_work_bytes = byte_count{3};
-    expect_error(
-      assemble(
-        "h"sv,
-        fragments({"a"sv, "b"sv, "c"sv}),
-        policy_with(config),
-        byte_count{4}),
-      errc::resource_exhausted);
+    const auto bounded_copy = assemble(
+      "h"sv,
+      fragments({"a"sv, "b"sv, "c"sv}),
+      policy_with(config),
+      byte_count{4});
+    ASSERT_TRUE(bounded_copy.has_value());
+    EXPECT_TRUE(bounded_copy->content_equals("habc"));
     config = codec::limits_config{};
     config.max_work_items = item_count{8};
     expect_error(

@@ -69,6 +69,7 @@ void task_scope::complete_task(
 }
 
 task_scope::~task_scope() {
+    assert_current();
     KWAQUE_INVARIANT(
       invariant_id{"KQ-TASK-SCOPE-CLOSED"},
       close_done_.available() && gate_.is_closed() && gate_.get_count() == 0,

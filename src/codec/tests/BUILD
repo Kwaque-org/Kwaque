@@ -1,18 +1,204 @@
-load("//bazel:build.bzl", "kwaque_cc_binary")
+load("//bazel:build.bzl", "kwaque_cc_binary", "kwaque_cc_library")
 load("//bazel:test.bzl", "kwaque_cc_benchmark", "kwaque_cc_fuzz_test", "kwaque_cc_seastar_gtest", "kwaque_cc_test", "kwaque_py_native_test")
 
 package(default_visibility = ["//visibility:private"])
+
+kwaque_cc_library(
+    name = "envelope_test_fixture",
+    testonly = True,
+    hdrs = ["envelope_decode_test_support.h"],
+    deps = [
+        "//src/bytes:fragmented_buffer",
+        "@seastar",
+    ],
+)
+
+kwaque_cc_library(
+    name = "envelope_fuzz_cases",
+    testonly = True,
+    srcs = ["envelope_fuzz_cases.cc"],
+    hdrs = ["envelope_fuzz_cases.h"],
+    deps = [
+        ":envelope_test_fixture",
+        "//src/base",
+        "//src/base:error",
+        "//src/bytes:fragmented_buffer",
+        "//src/bytes:fragmented_buffer_parser",
+        "//src/codec:cooperative",
+        "//src/codec:envelope",
+        "//src/codec:error",
+        "//src/codec:format_registry",
+        "//src/codec:integer",
+        "//src/codec:limits",
+        "@seastar",
+    ],
+)
+
+kwaque_cc_seastar_gtest(
+    name = "envelope_fuzz_cases_test",
+    srcs = ["envelope_fuzz_cases_test.cc"],
+    memory = "256MiB",
+    deps = [
+        ":envelope_fuzz_cases",
+        ":envelope_test_fixture",
+        "//src/bytes:fragmented_buffer",
+    ],
+)
+
+kwaque_cc_test(
+    name = "format_registry_test",
+    srcs = ["format_registry_test.cc"],
+    deps = [
+        "//src/base:error",
+        "//src/codec:error",
+        "//src/codec:format_registry",
+    ],
+)
+
+kwaque_cc_seastar_gtest(
+    name = "envelope_prefix_test",
+    srcs = ["envelope_prefix_test.cc"],
+    memory = "192MiB",
+    deps = [
+        "//src/base",
+        "//src/base:error",
+        "//src/bytes:fragmented_buffer",
+        "//src/bytes:fragmented_buffer_parser",
+        "//src/codec:envelope",
+        "//src/codec:error",
+        "//src/codec:format_registry",
+        "//src/codec:integer",
+        "//src/codec:limits",
+    ],
+)
+
+kwaque_cc_seastar_gtest(
+    name = "header_extensions_test",
+    srcs = [
+        "header_extensions_test.cc",
+        "header_extensions_test_support.cc",
+        "header_extensions_test_support.h",
+    ],
+    memory = "192MiB",
+    deps = [
+        "//src/base",
+        "//src/base:error",
+        "//src/bytes:fragmented_buffer",
+        "//src/bytes:fragmented_buffer_builder",
+        "//src/bytes:fragmented_buffer_parser",
+        "//src/codec:cooperative",
+        "//src/codec:envelope",
+        "//src/codec:error",
+        "//src/codec:integer",
+        "//src/codec:limits",
+    ],
+)
+
+kwaque_cc_seastar_gtest(
+    name = "envelope_integrity_test",
+    srcs = ["envelope_integrity_test.cc"],
+    memory = "192MiB",
+    deps = [
+        ":envelope_test_fixture",
+        "//src/base",
+        "//src/base:error",
+        "//src/bytes:fragmented_buffer",
+        "//src/codec:cooperative",
+        "//src/codec:crc32c",
+        "//src/codec:envelope",
+        "//src/codec:error",
+        "//src/codec:integer",
+        "//src/codec:limits",
+    ],
+)
+
+kwaque_cc_seastar_gtest(
+    name = "envelope_decode_test",
+    srcs = ["envelope_decode_test.cc"],
+    memory = "256MiB",
+    deps = [
+        ":envelope_test_fixture",
+        "//src/base",
+        "//src/base:error",
+        "//src/bytes:fragmented_buffer",
+        "//src/bytes:fragmented_buffer_parser",
+        "//src/codec:cooperative",
+        "//src/codec:crc32c",
+        "//src/codec:envelope",
+        "//src/codec:error",
+        "//src/codec:format_registry",
+        "//src/codec:integer",
+        "//src/codec:limits",
+    ],
+)
+
+kwaque_cc_seastar_gtest(
+    name = "envelope_encode_test",
+    srcs = ["envelope_encode_test.cc"],
+    memory = "256MiB",
+    deps = [
+        ":envelope_test_fixture",
+        "//src/base",
+        "//src/base:error",
+        "//src/bytes:fragmented_buffer",
+        "//src/bytes:fragmented_buffer_parser",
+        "//src/bytes:fragmented_buffer_test_support",
+        "//src/codec:cooperative",
+        "//src/codec:crc32c",
+        "//src/codec:envelope",
+        "//src/codec:error",
+        "//src/codec:format_registry",
+        "//src/codec:integer",
+        "//src/codec:limits",
+    ],
+)
+
+kwaque_cc_library(
+    name = "codec_bench_reference",
+    testonly = True,
+    srcs = [
+        "codec_bench_reference.cc",
+        "envelope_bench_decode.cc",
+        "envelope_bench_encode.cc",
+        "envelope_bench_extensions.cc",
+        "envelope_bench_integrity.cc",
+        "envelope_bench_prefix.cc",
+    ],
+    hdrs = [
+        "codec_bench_reference.h",
+        "envelope_bench_native.h",
+    ],
+    visibility = ["//src/model/tests:__pkg__"],
+    deps = [
+        "//src/base",
+        "//src/base:error",
+        "//src/base:invariant",
+        "//src/bytes:fragmented_buffer",
+        "//src/bytes:fragmented_buffer_builder",
+        "//src/bytes:fragmented_buffer_parser",
+        "//src/codec:cooperative",
+        "//src/codec:envelope",
+        "//src/codec:error",
+        "//src/codec:integer",
+        "//src/codec:limits",
+        "//src/codec:staging_cooperative",
+        "@crc32c",
+        "@seastar",
+    ],
+)
 
 kwaque_cc_benchmark(
     name = "codec_bench",
     srcs = [
         "codec_bench.cc",
-        "codec_bench_fixture.h",
-        "codec_bench_reference.cc",
         "crc32c_bench.cc",
+        "envelope_bench.cc",
+        "envelope_bench_fixture.h",
+        "envelope_bench_reference.cc",
     ],
     memory = "512MiB",
     deps = [
+        ":codec_bench_reference",
         "//src/base",
         "//src/base:error",
         "//src/base:invariant",
@@ -23,7 +209,9 @@ kwaque_cc_benchmark(
         "//src/codec:cooperative",
         "//src/codec:crc32c",
         "//src/codec:crc32c_cooperative",
+        "//src/codec:envelope",
         "//src/codec:error",
+        "//src/codec:format_registry",
         "//src/codec:integer",
         "//src/codec:limits",
         "//src/codec:staging_cooperative",
@@ -45,6 +233,7 @@ kwaque_cc_fuzz_test(
         "resources:memory:1024",
     ],
     deps = [
+        ":envelope_fuzz_cases",
         "//src/base",
         "//src/base:error",
         "//src/bytes:fragmented_buffer",
@@ -75,6 +264,7 @@ kwaque_cc_fuzz_test(
         "resources:memory:1024",
     ],
     deps = [
+        ":envelope_fuzz_cases",
         "//src/base",
         "//src/base:error",
         "//src/bytes:fragmented_buffer",
@@ -100,15 +290,18 @@ kwaque_cc_seastar_gtest(
     srcs = ["codec_qualification_test.cc"],
     memory = "256MiB",
     deps = [
+        ":envelope_test_fixture",
         "//src/base",
         "//src/base:error",
         "//src/bytes:fragmented_buffer",
         "//src/bytes:fragmented_buffer_builder",
+        "//src/bytes:fragmented_buffer_parser",
         "//src/bytes:fragmented_buffer_test_support",
         "//src/codec:collection",
         "//src/codec:cooperative",
         "//src/codec:crc32c_cooperative",
         "//src/codec:digest",
+        "//src/codec:envelope",
         "//src/codec:error",
         "//src/codec:integer",
         "//src/codec:limits",
