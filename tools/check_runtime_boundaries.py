@@ -61,13 +61,16 @@ BOOTSTRAP_SCOPE_FILES = (
     "conf/kwaque.yaml",
 )
 ALLOWED_PRODUCTION_INCLUDE_LINES = {
+    "src/broker/application_start.cc": frozenset(
+        {'#include "src/runtime/production/random.h"'}
+    ),
     "src/broker/application_internal.h": frozenset(
         {'#include "src/runtime/production/environment.h"'}
     ),
 }
 ALLOWED_CONCRETE_LIBRARY_DEPENDENCIES = {
     ("src/broker/BUILD", "application_internal"): frozenset(
-        {"//src/runtime/production:environment"}
+        {"//src/runtime/production:environment", "//src/runtime/production:random"}
     ),
 }
 DECLARATION_OWNER_HEADERS = frozenset({"src/runtime/environment.h"})

@@ -1,5 +1,6 @@
 #include "src/simulation/fake_network.h"
 
+#include "src/base/allocation.h"
 #include "src/base/invariant.h"
 #include "src/bytes/fragmented_buffer_builder.h"
 #include "src/runtime/random.h"
@@ -16,17 +17,21 @@
 #include <absl/container/btree_set.h>
 #include <boost/intrusive/list.hpp>
 #include <boost/intrusive/list_hook.hpp>
+#include <boost/intrusive/set.hpp>
+#include <boost/intrusive/set_hook.hpp>
 
 #include <algorithm>
 #include <array>
+#include <concepts>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
-#include <deque>
 #include <exception>
 #include <limits>
 #include <memory>
 #include <optional>
+#include <tuple>
+#include <type_traits>
 #include <utility>
 #include <variant>
 #include <vector>
@@ -131,16 +136,21 @@ network_object_key(std::uint64_t owner, std::uint8_t side) noexcept {
         const auto begin = offset;
         const auto end = begin + fragment.size();
         if (selected_byte >= begin && selected_byte < end) {
-            seastar::temporary_buffer<char> mutated(fragment.size());
-            std::memcpy(mutated.get_write(), fragment.data(), fragment.size());
-            mutated.get_write()[selected_byte - begin] ^= static_cast<char>(
-              std::uint8_t{1} << selected_bit);
-            auto appended = builder.append(
-              std::span<const char>{mutated.get(), mutated.size()});
-            KWAQUE_INVARIANT(
-              fake_network_state_invariant,
-              appended.has_value(),
-              "bounded corrupt packet copy was rejected");
+            const auto bytes = std::span<const char>{
+              fragment.data(), fragment.size()};
+            const auto index = static_cast<std::size_t>(selected_byte - begin);
+            const char mutated = static_cast<char>(
+              bytes[index] ^ (std::uint8_t{1} << selected_bit));
+            for (const auto part :
+                 {bytes.first(index),
+                  std::span{&mutated, 1U},
+                  bytes.subspan(index + 1U)}) {
+                auto appended = builder.append(part);
+                KWAQUE_INVARIANT(
+                  fake_network_state_invariant,
+                  appended.has_value(),
+                  "bounded corrupt packet copy was rejected");
+            }
         } else {
             auto appended = builder.append(
               std::span<const char>{fragment.data(), fragment.size()});
@@ -228,6 +238,27 @@ public:
         ingress,
     };
 
+    static network_control_trace_phase
+    control_phase(control_kind kind) noexcept {
+        switch (kind) {
+        case control_kind::partition:
+            return network_control_trace_phase::partition;
+        case control_kind::heal:
+            return network_control_trace_phase::heal;
+        case control_kind::clog:
+            return network_control_trace_phase::clog;
+        case control_kind::unclog:
+            return network_control_trace_phase::unclog;
+        case control_kind::egress:
+            return network_control_trace_phase::egress_limit;
+        case control_kind::link:
+            return network_control_trace_phase::link_limit;
+        case control_kind::ingress:
+            return network_control_trace_phase::ingress_limit;
+        }
+        return network_control_trace_phase::partition;
+    }
+
     enum class sequence_status : std::uint8_t {
         empty,
         live,
@@ -240,11 +271,6 @@ public:
         std::uint32_t slot{0};
 
         [[nodiscard]] bool valid() const noexcept { return id != 0; }
-    };
-
-    struct fin_token final {
-        std::uint64_t pair{0};
-        std::uint8_t side{0};
     };
 
     struct staged_flow_start final {
@@ -308,13 +334,12 @@ public:
         runtime::network_endpoint remote;
         runtime::network_connection_limits limits;
         std::optional<std::uint64_t> read_operation;
+        std::optional<std::uint64_t> parked_close_operation;
         std::optional<seastar::shared_promise<runtime::result<void>>>
           close_done;
         scheduler::event_slot_reservation fin_event_reservation;
         event_trace::reservation fin_trace;
         event_trace::reservation fin_effect_trace;
-        scheduler::event_slot_reservation fin_ready_event_reservation;
-        event_trace::reservation fin_ready_trace;
         scheduler::event_slot_reservation close_event_reservation;
         event_trace::reservation close_trace;
         event_trace::reservation close_parked_trace;
@@ -351,11 +376,16 @@ public:
         std::vector<sequence_status> sequence_statuses;
         std::vector<event_trace::reservation> sequence_traces;
         byte_count logical_bytes;
+        std::uint64_t pending_transfer_bytes{0};
+        std::uint64_t pending_tail_ns{0};
+        runtime::monotonic_time deferred_ready_at;
         std::optional<std::uint16_t> transmitter_slot;
         std::optional<std::uint32_t> current_packet;
         std::optional<packet_token> deferred_clone;
+        std::optional<packet_token> fin_packet;
         std::optional<std::uint64_t> fin_sequence;
         event_id gap_event;
+        runtime::monotonic_time gap_deadline;
         std::uint64_t next_sequence{0};
         std::uint64_t expected_sequence{0};
         std::uint32_t packet_count{0};
@@ -429,6 +459,7 @@ public:
         event_trace::reservation parked_trace;
         event_id event;
         runtime::fault_decision fault;
+        std::optional<runtime::operation_error> completion_error;
         bool scheduled{false};
         bool parked{false};
     };
@@ -439,11 +470,14 @@ public:
         seastar::promise<runtime::result<runtime::network_read_result>> done;
         scheduler::event_slot_reservation event_reservation;
         event_trace::reservation trace;
+        scheduler::event_slot_reservation retry_event;
+        event_trace::reservation retry_trace;
         scheduler::event_slot_reservation terminal_event;
         event_trace::reservation terminal_trace;
         event_trace::reservation parked_trace;
         event_id event;
         runtime::fault_decision fault;
+        std::optional<runtime::operation_error> completion_error;
         std::optional<runtime::network_read_result> parked_result;
         std::uint64_t fault_a{0};
         std::uint64_t fault_b{0};
@@ -471,6 +505,53 @@ public:
         bool parked{false};
     };
 
+    struct address_capacity final {
+        bandwidth_capacity value;
+        std::uint32_t pending_controls{0};
+    };
+
+    class capacity_lease final {
+    public:
+        capacity_lease() noexcept = default;
+        capacity_lease(
+          impl& owner, runtime::network_address address, bool ingress) noexcept;
+        capacity_lease(const capacity_lease&) = delete;
+        capacity_lease& operator=(const capacity_lease&) = delete;
+        capacity_lease(capacity_lease&& other) noexcept
+          : owner_(std::exchange(other.owner_, nullptr))
+          , address_(other.address_)
+          , ingress_(other.ingress_) {}
+        capacity_lease& operator=(capacity_lease&& other) noexcept {
+            if (this != &other) {
+                release();
+                owner_ = std::exchange(other.owner_, nullptr);
+                address_ = other.address_;
+                ingress_ = other.ingress_;
+            }
+            return *this;
+        }
+        ~capacity_lease();
+        void release() noexcept;
+
+    private:
+        impl* owner_{nullptr};
+        runtime::network_address address_{runtime::network_address::ipv4({})};
+        bool ingress_{false};
+    };
+
+    struct ready_budget final {
+        scheduler::event_slot_reservation event;
+        scheduler::event_id_reservation ids;
+        scheduler::event_id_reservation selected_id;
+        event_trace::reservation trace;
+        std::uint32_t attempts{0};
+    };
+
+    struct bandwidth_wake final {
+        scheduler::event_id_reservation id;
+        event_trace::reservation trace;
+    };
+
     struct control_operation final {
         control_kind kind{control_kind::partition};
         runtime::network_address source{runtime::network_address::ipv4(
@@ -478,9 +559,12 @@ public:
         runtime::network_address target{runtime::network_address::ipv4(
           {std::byte{}, std::byte{}, std::byte{}, std::byte{}})};
         bandwidth_capacity capacity;
+        capacity_lease address;
+        std::optional<ready_budget> ready;
         seastar::promise<runtime::result<void>> done;
         event_trace::reservation rebalance_trace;
-        event_trace::reservation wake_trace;
+        event_trace::reservation effect_trace;
+        bandwidth_wake wake;
         event_id event;
     };
 
@@ -518,20 +602,15 @@ public:
         event_trace::reservation sequence;
         event_trace::reservation start_rebalance;
         event_trace::reservation finish_rebalance;
-        event_trace::reservation start_wake;
-        event_trace::reservation finish_wake;
-    };
-
-    struct stop_batch_reservation final {
-        scheduler::event_slot_reservation event;
-        event_trace::reservation trace;
-        std::uint64_t id{0};
+        bandwidth_wake start_wake;
+        bandwidth_wake finish_wake;
     };
 
     using order_hook = boost::intrusive::list_member_hook<>;
 
     struct packet_state final {
         order_hook order;
+        boost::intrusive::set_member_hook<> ready_hook;
         std::uint64_t id{0};
         std::uint32_t slot{0};
         std::uint64_t pair{0};
@@ -545,19 +624,18 @@ public:
         event_trace::reservation delivery_trace;
         scheduler::event_slot_reservation gap_event_reservation;
         event_trace::reservation gap_trace;
-        scheduler::event_slot_reservation ready_event_reservation;
-        event_trace::reservation ready_trace;
         event_trace::reservation flow_start_trace;
         event_trace::reservation transfer_trace;
         event_trace::reservation packet_effect_trace;
         event_trace::reservation sequence_trace;
         event_trace::reservation start_rebalance_trace;
         event_trace::reservation finish_rebalance_trace;
-        event_trace::reservation start_wake_trace;
-        event_trace::reservation finish_wake_trace;
+        bandwidth_wake start_wake;
+        bandwidth_wake finish_wake;
         event_id delivery_event;
         runtime::monotonic_time ready_at;
         runtime::monotonic_duration delivery_delay;
+        std::uint64_t transfer_tail_ns{0};
         std::uint64_t sequence{0};
         std::uint8_t side{0};
         packet_phase phase{packet_phase::free};
@@ -565,9 +643,31 @@ public:
         bool drop_delivery{false};
         bool reorder_delivery{false};
         bool packet_effect_observed{false};
+        bool fin{false};
+        bool disconnect{false};
+        bool pending_transfer{false};
     };
 
+    // The intrusive tree stores its comparator as a base class.
+    struct ready_less {
+        bool operator()(
+          const packet_state& left, const packet_state& right) const noexcept {
+            return std::tie(left.ready_at, left.id)
+                   < std::tie(right.ready_at, right.id);
+        }
+    };
+    using ready_order = boost::intrusive::set<
+      packet_state,
+      boost::intrusive::member_hook<
+        packet_state,
+        boost::intrusive::set_member_hook<>,
+        &packet_state::ready_hook>,
+      boost::intrusive::compare<ready_less>,
+      boost::intrusive::constant_time_size<false>>;
+
     struct flow_state final {
+        std::uint64_t pair{0};
+        std::uint8_t side{0};
         std::uint32_t packet_slot{0};
         bandwidth_fraction remaining;
         bandwidth_rate rate;
@@ -594,8 +694,8 @@ public:
         bandwidth_capacity capacity;
         runtime::monotonic_duration latency_min;
         runtime::monotonic_duration latency_mean_parameter;
-        seastar::chunked_fifo<packet_token, 128, 1> ready;
-        seastar::chunked_fifo<fin_token, 128, 1> ready_fins;
+        ready_order ready;
+        std::optional<ready_budget> delivery_budget;
         event_id ready_chain_event;
         std::uint32_t packets{0};
         bool partitioned{false};
@@ -613,13 +713,18 @@ public:
       boost::intrusive::member_hook<link_state, order_hook, &link_state::order>,
       boost::intrusive::constant_time_size<false>>;
 
+    struct close_operation final {
+        std::optional<seastar::shared_promise<runtime::result<void>>> done;
+    };
+
     using operation_payload = std::variant<
       bind_operation,
       connect_operation,
       accept_operation,
       read_operation,
       write_operation,
-      control_operation>;
+      control_operation,
+      close_operation>;
 
     struct operation_state final {
         operation_state(
@@ -630,12 +735,134 @@ public:
           , payload(std::move(value))
           , parked(std::move(parked_reservation)) {}
 
+        operation_state(const operation_state&) = delete;
+        operation_state& operator=(const operation_state&) = delete;
+        operation_state(operation_state&&) = delete;
+        operation_state& operator=(operation_state&&) = delete;
+
+        boost::intrusive::set_member_hook<> index_hook;
+        std::uint32_t slot{0};
         std::uint64_t id;
         operation_payload payload;
         parked_credit parked;
         scheduler::event_slot_reservation stop_event;
         event_trace::reservation stop_trace;
         bool stop_needs_completion{true};
+    };
+
+    class operation_pool final {
+        struct key_of_operation final {
+            using type = std::uint64_t;
+            type operator()(const operation_state& value) const noexcept {
+                return value.id;
+            }
+        };
+        using index_type = boost::intrusive::set<
+          operation_state,
+          boost::intrusive::member_hook<
+            operation_state,
+            boost::intrusive::set_member_hook<>,
+            &operation_state::index_hook>,
+          boost::intrusive::key_of_value<key_of_operation>>;
+        struct slot final {
+            std::optional<operation_state> value;
+            std::uint32_t next{0};
+        };
+        static constexpr std::size_t slots_per_block
+          = maximum_contiguous_allocation_bytes / sizeof(slot);
+        static_assert(slots_per_block != 0);
+        using block = std::vector<slot>;
+        static_assert(std::is_nothrow_move_constructible_v<block>);
+        struct releaser final {
+            operation_pool* owner;
+            void operator()(operation_state* value) const noexcept {
+                owner->release(*value);
+            }
+        };
+
+    public:
+        using iterator = index_type::iterator;
+        using handle = std::unique_ptr<operation_state, releaser>;
+
+        explicit operation_pool(std::uint32_t capacity)
+          : capacity_(capacity) {
+            const auto count = (capacity + slots_per_block - 1U)
+                               / slots_per_block;
+            for (std::size_t i = 0; i < count; ++i) {
+                // Each block reaches its final size before publishing a node.
+                blocks_.emplace_back(
+                  std::min<std::size_t>(
+                    slots_per_block, capacity - i * slots_per_block));
+            }
+            for (std::uint32_t i = 0; i < capacity; ++i) {
+                at(i).next = i + 1U;
+            }
+        }
+        handle make(
+          std::uint64_t id,
+          operation_payload payload,
+          parked_credit parked = {}) {
+            KWAQUE_INVARIANT(
+              fake_network_state_invariant,
+              free_ < capacity_,
+              "admitted operation exhausted its fixed pool");
+            auto& selected = at(free_);
+            auto& value = selected.value.emplace(
+              id, std::move(payload), std::move(parked));
+            value.slot = free_;
+            free_ = selected.next;
+            return handle{&value, releaser{this}};
+        }
+        auto emplace(std::uint64_t id, handle value) noexcept {
+            KWAQUE_INVARIANT(
+              fake_network_state_invariant,
+              value->id == id,
+              "operation index key disagrees with its owner");
+            auto inserted = index_.insert(*value);
+            if (inserted.second) {
+                static_cast<void>(value.release());
+            }
+            return inserted;
+        }
+        auto begin() noexcept { return index_.begin(); }
+        auto end() noexcept { return index_.end(); }
+        auto begin() const noexcept { return index_.begin(); }
+        auto end() const noexcept { return index_.end(); }
+        auto find(std::uint64_t id) noexcept { return index_.find(id); }
+        auto upper_bound(std::uint64_t id) noexcept {
+            return index_.upper_bound(id);
+        }
+        auto upper_bound(std::uint64_t id) const noexcept {
+            return index_.upper_bound(id);
+        }
+        auto size() const noexcept { return index_.size(); }
+        bool empty() const noexcept { return index_.empty(); }
+        handle extract(iterator position) noexcept {
+            auto* value = &*position;
+            index_.erase(position);
+            return handle{value, releaser{this}};
+        }
+        void erase(std::uint64_t id) noexcept {
+            auto found = find(id);
+            if (found != end()) {
+                auto retired = extract(found);
+            }
+        }
+
+    private:
+        slot& at(std::uint32_t index) noexcept {
+            return blocks_[index / slots_per_block][index % slots_per_block];
+        }
+        void release(operation_state& value) noexcept {
+            const auto index = value.slot;
+            at(index).value.reset();
+            at(index).next = free_;
+            free_ = index;
+        }
+        seastar::chunked_vector<block> blocks_;
+        std::uint32_t capacity_;
+        index_type index_;
+        std::uint32_t free_{0};
     };
 
     struct port_selection final {
@@ -650,19 +877,22 @@ public:
       std::unique_ptr<bandwidth_planner> bandwidth,
       std::unique_ptr<bandwidth_planner> staged_bandwidth,
       scheduler::event_slot_reservation bandwidth_reservation,
-      seastar::chunked_fifo<scheduler::event_slot_reservation, 32, 2>
-        stop_capacity,
+      scheduler::event_slot_reservation stop_event,
+      scheduler::event_id_reservation stop_ids,
+      event_trace::reservation stop_trace,
       fault_schedule* faults)
       : owner_(&owner)
       , config_(std::move(config))
       , scheduler_(&events)
+      , operations(config_.maximum_operations)
       , random_(config_.latency_seed)
       , bandwidth_(std::move(bandwidth))
       , staged_bandwidth_(std::move(staged_bandwidth))
       , bandwidth_event_reservation_(std::move(bandwidth_reservation))
-      , stop_event_capacity_(std::move(stop_capacity))
+      , stop_event_reservation_(std::move(stop_event))
+      , stop_id_capacity_(std::move(stop_ids))
+      , stop_trace_capacity_(std::move(stop_trace))
       , faults_(faults) {
-        work_ids.reserve(config_.maximum_operations);
         packets.reserve(config_.maximum_packets);
         for (std::uint32_t slot = 0; slot < config_.maximum_packets; ++slot) {
             packets.emplace_back();
@@ -694,15 +924,13 @@ public:
     absl::btree_map<std::uint64_t, std::unique_ptr<listener_state>> listeners;
     absl::btree_map<runtime::network_endpoint, std::uint64_t> listener_registry;
     absl::btree_map<std::uint64_t, std::unique_ptr<pair_state>> pairs;
-    absl::btree_map<std::uint64_t, std::unique_ptr<operation_state>> operations;
+    operation_pool operations;
     absl::btree_map<directed_link_key, std::unique_ptr<link_state>> links;
     link_order ordered_links;
-    absl::btree_map<runtime::network_address, bandwidth_capacity> egress_limits;
-    absl::btree_map<runtime::network_address, bandwidth_capacity>
-      ingress_limits;
+    absl::btree_map<runtime::network_address, address_capacity> egress_limits;
+    absl::btree_map<runtime::network_address, address_capacity> ingress_limits;
     absl::btree_set<runtime::network_endpoint> connection_locals;
     absl::btree_map<runtime::network_address, std::uint16_t> port_cursors;
-    std::vector<std::uint64_t> work_ids;
     seastar::chunked_vector<packet_state> packets;
     packet_order ordered_packets;
     seastar::chunked_fifo<std::uint32_t, 128, 512> free_packets;
@@ -713,15 +941,17 @@ public:
     std::unique_ptr<bandwidth_planner> bandwidth_;
     std::unique_ptr<bandwidth_planner> staged_bandwidth_;
     scheduler::event_slot_reservation bandwidth_event_reservation_;
-    seastar::chunked_fifo<scheduler::event_slot_reservation, 32, 2>
-      stop_event_capacity_;
+    scheduler::event_id_reservation bandwidth_replacement_id_;
+    scheduler::event_slot_reservation stop_event_reservation_;
+    scheduler::event_id_reservation stop_id_capacity_;
+    event_trace::reservation stop_trace_capacity_;
+    scheduler::event_id_reservation active_stop_id_;
     event_id bandwidth_event_;
     runtime::monotonic_time bandwidth_deadline_;
     std::uint64_t bandwidth_flow_id_{0};
     bandwidth_allocation_digest allocation_digest_{};
     fault_schedule* faults_{nullptr};
     absl::btree_map<network_fault_key, std::uint64_t> fault_occurrences_;
-    seastar::chunked_fifo<stop_batch_reservation, 32, 2> stop_batches_;
     std::optional<seastar::shared_promise<runtime::result<void>>> stop_done_;
     std::optional<runtime::operation_error> stop_failure_;
     std::uint64_t next_listener_id{1};
@@ -807,7 +1037,7 @@ public:
     }
     [[nodiscard]] operation_state* find_operation(std::uint64_t id) noexcept {
         const auto found = operations.find(id);
-        return found == operations.end() ? nullptr : found->second.get();
+        return found == operations.end() ? nullptr : &*found;
     }
     [[nodiscard]] packet_state* find_packet(packet_token token) noexcept {
         if (token.slot >= packets.size()) {
@@ -830,6 +1060,15 @@ public:
     egress_capacity(const runtime::network_address& address) const noexcept;
     [[nodiscard]] bandwidth_capacity
     ingress_capacity(const runtime::network_address& address) const noexcept;
+    [[nodiscard]] bool direction_fits_deadline(
+      const pair_state& pair,
+      std::uint8_t side,
+      std::uint64_t extra_bytes = 0,
+      std::uint64_t extra_tail = 0,
+      const control_operation* control = nullptr) const noexcept;
+    [[nodiscard]] bool
+    control_fits_deadline(const control_operation& control) const noexcept;
+    void release_transfer_charge(packet_state& packet) noexcept;
     [[nodiscard]] runtime::result<prepared_network_fault> prepare_fault(
       runtime::builtin_fault_point point, runtime::fault_object_key object);
     [[nodiscard]] runtime::result<void>
@@ -883,12 +1122,15 @@ public:
       std::uint64_t coordinate_b = 0,
       std::uint64_t value = 0,
       std::uint32_t result = 0);
+    [[nodiscard]] runtime::result<bandwidth_wake>
+    reserve_bandwidth_wake(std::uint64_t stable_id);
     [[nodiscard]] runtime::result<packet_trace_reservations>
     reserve_packet_traces(
       std::uint64_t packet,
       std::uint64_t pair,
       std::uint8_t side,
-      byte_count bytes);
+      byte_count bytes,
+      bool transmits = true);
     [[nodiscard]] runtime::result<parked_credit>
     reserve_parked(bool required) noexcept;
 
@@ -907,6 +1149,8 @@ public:
     [[nodiscard]] runtime::result<void>
     schedule_read(std::uint64_t operation, runtime::monotonic_time deadline);
     void complete_read(std::uint64_t operation) noexcept;
+    void publish_read(
+      std::uint64_t operation, runtime::network_read_result result) noexcept;
     void complete_read_terminal(std::uint64_t operation) noexcept;
 
     [[nodiscard]] bandwidth_resource_key resource_key(
@@ -920,7 +1164,7 @@ public:
     void start_next_packet(std::uint64_t pair, std::uint8_t direction) noexcept;
     [[nodiscard]] bool rebalance_bandwidth(
       event_trace::reservation trace = {},
-      event_trace::reservation wake_trace = {},
+      bandwidth_wake wake = {},
       std::uint64_t stable_id = 0,
       const control_operation* staged_control = nullptr,
       const staged_flow_start* staged_start = nullptr) noexcept;
@@ -932,8 +1176,7 @@ public:
     void retire_packet(std::uint32_t slot, errc write_code) noexcept;
     void destroy_packet(std::uint32_t slot) noexcept;
     void abort_write(std::uint64_t operation) noexcept;
-    void complete_immediate_write(
-      std::uint64_t operation, errc code, bool disconnect) noexcept;
+    void complete_immediate_write(std::uint64_t operation) noexcept;
     void complete_write_terminal(std::uint64_t operation) noexcept;
     void complete_parked_connection_operation(
       std::uint64_t operation, errc code) noexcept;
@@ -949,7 +1192,6 @@ public:
       directed_link_key link,
       std::uint32_t slot,
       std::uint64_t packet) noexcept;
-    void complete_ready_fin(directed_link_key link, fin_token fin) noexcept;
     void apply_delivery(std::uint32_t slot, std::uint64_t packet) noexcept;
 
     void deliver_fin(std::uint64_t pair, std::uint8_t side) noexcept;
@@ -962,7 +1204,6 @@ public:
     void complete_listener_close(std::uint64_t listener) noexcept;
     void collect_pair(std::uint64_t pair) noexcept;
     void collect_listener(std::uint64_t listener) noexcept;
-    [[nodiscard]] runtime::result<void> prepare_stop_batches();
     void schedule_stop_batch() noexcept;
     void run_stop_batch() noexcept;
     [[nodiscard]] bool has_stop_preparation_work() const noexcept;
@@ -982,6 +1223,44 @@ public:
     void maybe_finish_stop() noexcept;
     void force_discard_all(const runtime::operation_error& failure) noexcept;
 };
+
+fake_network::impl::capacity_lease::capacity_lease(
+  impl& owner, runtime::network_address address, bool ingress) noexcept
+  : owner_(&owner)
+  , address_(address)
+  , ingress_(ingress) {
+    auto& records = ingress_ ? owner_->ingress_limits : owner_->egress_limits;
+    ++records.at(address_).pending_controls;
+}
+
+fake_network::impl::capacity_lease::~capacity_lease() { release(); }
+
+void fake_network::impl::capacity_lease::release() noexcept {
+    if (owner_ == nullptr) {
+        return;
+    }
+    auto* owner = std::exchange(owner_, nullptr);
+    auto& records = ingress_ ? owner->ingress_limits : owner->egress_limits;
+    const auto found = records.find(address_);
+    if (found == records.end()) {
+        KWAQUE_INVARIANT(
+          fake_network_state_invariant,
+          owner->state_ != fake_network_state::open || owner->forcing_discard_,
+          "pending capacity control lost its address record");
+        return;
+    }
+    auto& record = found->second;
+    KWAQUE_INVARIANT(
+      fake_network_state_invariant,
+      record.pending_controls != 0,
+      "pending capacity control count underflow");
+    --record.pending_controls;
+    const auto default_capacity = ingress_ ? owner->config_.ingress_capacity
+                                           : owner->config_.egress_capacity;
+    if (record.pending_controls == 0 && record.value == default_capacity) {
+        records.erase(found);
+    }
+}
 
 fake_network::impl::prepared_network_fault::prepared_network_fault(
   prepared_network_fault&& other) noexcept
@@ -1256,33 +1535,60 @@ fake_network::impl::reserve_terminal(
     return std::pair{std::move(*event), std::move(*trace)};
 }
 
+runtime::result<fake_network::impl::bandwidth_wake>
+fake_network::impl::reserve_bandwidth_wake(std::uint64_t stable_id) {
+    auto id = scheduler_->reserve_event_id();
+    if (!id) {
+        return runtime::failure(id.error());
+    }
+    auto trace = scheduler_->reserve_trace(
+      trace_event_descriptor{
+        .kind = trace_event_kind::bandwidth,
+        .domain = static_cast<std::uint32_t>(
+          bandwidth_trace_phase::transfer_done),
+        .stable_id = stable_id,
+      });
+    if (!trace) {
+        return runtime::failure(trace.error());
+    }
+    return bandwidth_wake{.id = std::move(*id), .trace = std::move(*trace)};
+}
+
 runtime::result<fake_network::impl::packet_trace_reservations>
 fake_network::impl::reserve_packet_traces(
   std::uint64_t packet,
   std::uint64_t pair,
   std::uint8_t side,
-  byte_count bytes) {
-    auto flow_start = scheduler_->reserve_effect(
-      trace_event_descriptor{
-        .kind = trace_event_kind::bandwidth,
-        .domain = static_cast<std::uint32_t>(bandwidth_trace_phase::flow_start),
-        .stable_id = packet,
-        .coordinate_a = pair,
-        .coordinate_b = side,
-        .value = bytes.value(),
-        .effect = trace_action::flow_started,
-      });
-    auto transfer = scheduler_->reserve_effect(
-      trace_event_descriptor{
-        .kind = trace_event_kind::bandwidth,
-        .domain = static_cast<std::uint32_t>(
-          bandwidth_trace_phase::transfer_done),
-        .stable_id = packet,
-        .coordinate_a = pair,
-        .coordinate_b = side,
-        .value = bytes.value(),
-        .effect = trace_action::transfer_completed,
-      });
+  byte_count bytes,
+  bool transmits) {
+    runtime::result<event_trace::reservation> flow_start{
+      event_trace::reservation{}};
+    runtime::result<event_trace::reservation> transfer{
+      event_trace::reservation{}};
+    if (transmits) {
+        flow_start = scheduler_->reserve_effect(
+          trace_event_descriptor{
+            .kind = trace_event_kind::bandwidth,
+            .domain = static_cast<std::uint32_t>(
+              bandwidth_trace_phase::flow_start),
+            .stable_id = packet,
+            .coordinate_a = pair,
+            .coordinate_b = side,
+            .value = bytes.value(),
+            .effect = trace_action::flow_started,
+          });
+        transfer = scheduler_->reserve_effect(
+          trace_event_descriptor{
+            .kind = trace_event_kind::bandwidth,
+            .domain = static_cast<std::uint32_t>(
+              bandwidth_trace_phase::transfer_done),
+            .stable_id = packet,
+            .coordinate_a = pair,
+            .coordinate_b = side,
+            .value = bytes.value(),
+            .effect = trace_action::transfer_completed,
+          });
+    }
     auto packet_effect = scheduler_->reserve_effect(
       trace_event_descriptor{
         .kind = trace_event_kind::network,
@@ -1303,6 +1609,15 @@ fake_network::impl::reserve_packet_traces(
         .coordinate_b = side,
         .effect = trace_action::network_operation_applied,
       });
+    if (!packet_effect || !sequence) {
+        return runtime::failure(
+          !packet_effect ? packet_effect.error() : sequence.error());
+    }
+    if (!transmits) {
+        return packet_trace_reservations{
+          .packet_effect = std::move(*packet_effect),
+          .sequence = std::move(*sequence)};
+    }
     const auto empty_context = allocation_context(
       bandwidth_allocation_digest{});
     auto start_rebalance = scheduler_->reserve_effect(
@@ -1321,20 +1636,8 @@ fake_network::impl::reserve_packet_traces(
         .effect = trace_action::bandwidth_rebalanced,
       },
       empty_context);
-    auto start_wake = scheduler_->reserve_trace(
-      trace_event_descriptor{
-        .kind = trace_event_kind::bandwidth,
-        .domain = static_cast<std::uint32_t>(
-          bandwidth_trace_phase::transfer_done),
-        .stable_id = packet,
-      });
-    auto finish_wake = scheduler_->reserve_trace(
-      trace_event_descriptor{
-        .kind = trace_event_kind::bandwidth,
-        .domain = static_cast<std::uint32_t>(
-          bandwidth_trace_phase::transfer_done),
-        .stable_id = packet,
-      });
+    auto start_wake = reserve_bandwidth_wake(packet);
+    auto finish_wake = reserve_bandwidth_wake(packet);
     if (
       !flow_start || !transfer || !packet_effect || !sequence
       || !start_rebalance || !finish_rebalance || !start_wake || !finish_wake) {
@@ -1371,10 +1674,11 @@ fake_network::impl::reserve_parked(bool required) noexcept {
     return parked_credit{parked_operations};
 }
 
-namespace {
+namespace {} // namespace
 
-[[nodiscard]] runtime::result<void> validate_config(
-  const fake_network_config& config, const scheduler& events) noexcept {
+runtime::result<void>
+fake_network_config::validate(const scheduler_limits& limits) const noexcept {
+    const auto& config = *this;
     if (
       config.ephemeral_first == 0
       || config.ephemeral_first > config.ephemeral_last
@@ -1448,7 +1752,7 @@ namespace {
     };
     if (std::ranges::any_of(latencies, [&](runtime::monotonic_duration value) {
             return value.nanoseconds()
-                   > events.limits().maximum_deadline().nanoseconds();
+                   > limits.maximum_deadline().nanoseconds();
         })) {
         return runtime::failure(network_error(errc::out_of_range));
     }
@@ -1460,7 +1764,7 @@ namespace {
     const auto maximum_sample = std::max(
       config.latency_min.nanoseconds(),
       config.latency_mean_parameter.nanoseconds() * 2U);
-    if (maximum_sample > events.limits().maximum_deadline().nanoseconds()) {
+    if (maximum_sample > limits.maximum_deadline().nanoseconds()) {
         return runtime::failure(network_error(errc::out_of_range));
     }
     const std::array capacities{
@@ -1498,29 +1802,32 @@ namespace {
           maximum_sample, config.interframe_gap.nanoseconds());
         if (
           (*maximum_duration)->nanoseconds()
-          > events.limits().maximum_deadline().nanoseconds() - maximum_tail) {
+          > limits.maximum_deadline().nanoseconds() - maximum_tail) {
             return runtime::failure(network_error(errc::out_of_range));
         }
     }
-    const auto owners = static_cast<std::uint64_t>(config.maximum_operations)
-                        + config.maximum_packets
-                        + config.maximum_connection_pairs
-                        + config.maximum_listeners + config.maximum_links + 1U;
-    const auto stop_batches = (owners + config.stop_batch - 1U)
-                              / config.stop_batch;
-    const auto required_events
-      = static_cast<std::uint64_t>(config.maximum_listeners) * 3U
-        + static_cast<std::uint64_t>(config.maximum_connection_pairs) * 8U
-        + static_cast<std::uint64_t>(config.maximum_operations) * 4U
-        + static_cast<std::uint64_t>(config.maximum_packets) * 3U + stop_batches
-        + 1U;
-    if (required_events > events.limits().pending_events()) {
+    if (required_events() > limits.pending_events()) {
         return runtime::failure(network_error(errc::out_of_range));
     }
     return {};
 }
 
-} // namespace
+std::uint32_t fake_network_config::cleanup_batches() const noexcept {
+    if (stop_batch == 0) {
+        return 0;
+    }
+    const auto owners = static_cast<std::uint64_t>(maximum_operations)
+                        + maximum_packets + maximum_connection_pairs
+                        + maximum_listeners + maximum_links + 1U;
+    return static_cast<std::uint32_t>((owners + stop_batch - 1U) / stop_batch);
+}
+
+std::uint64_t fake_network_config::required_events() const noexcept {
+    return static_cast<std::uint64_t>(maximum_listeners) * 3U
+           + static_cast<std::uint64_t>(maximum_connection_pairs) * 6U
+           + static_cast<std::uint64_t>(maximum_operations) * 4U
+           + static_cast<std::uint64_t>(maximum_packets) * 2U + 2U;
+}
 
 fake_network::fake_network(
   fake_network_config config,
@@ -1534,7 +1841,8 @@ runtime::result<std::unique_ptr<fake_network>> fake_network::make(
   fake_network_config config,
   scheduler& event_scheduler,
   fault_schedule* faults) {
-    if (auto valid = validate_config(config, event_scheduler); !valid) {
+    event_scheduler.assert_current();
+    if (auto valid = config.validate(event_scheduler.limits()); !valid) {
         return runtime::failure(valid.error());
     }
     auto planner = bandwidth_planner::make(config.maximum_active_flows);
@@ -1549,21 +1857,20 @@ runtime::result<std::unique_ptr<fake_network>> fake_network::make(
     if (!bandwidth_event) {
         return runtime::failure(bandwidth_event.error());
     }
-    const auto stop_owners
-      = static_cast<std::uint64_t>(config.maximum_operations)
-        + config.maximum_packets + config.maximum_connection_pairs
-        + config.maximum_listeners + config.maximum_links + 1U;
-    const auto maximum_stop_batches = (stop_owners + config.stop_batch - 1U)
-                                      / config.stop_batch;
-    seastar::chunked_fifo<scheduler::event_slot_reservation, 32, 2>
-      stop_capacity;
-    stop_capacity.reserve(maximum_stop_batches);
-    for (std::uint64_t index = 0; index < maximum_stop_batches; ++index) {
-        auto reserved = event_scheduler.reserve_event_slot();
-        if (!reserved) {
-            return runtime::failure(reserved.error());
-        }
-        stop_capacity.push_back(std::move(*reserved));
+    auto stop_event = event_scheduler.reserve_event_slot();
+    auto stop_ids = event_scheduler.reserve_event_id(config.cleanup_batches());
+    auto stop_trace = event_scheduler.reserve_trace(
+      trace_event_descriptor{
+        .kind = trace_event_kind::network,
+        .domain = static_cast<std::uint32_t>(network_trace_phase::stop),
+        .stable_id = 1,
+      },
+      config.cleanup_batches());
+    if (!stop_event || !stop_ids || !stop_trace) {
+        return runtime::failure(
+          !stop_event ? stop_event.error()
+          : !stop_ids ? stop_ids.error()
+                      : stop_trace.error());
     }
     auto owner = std::unique_ptr<fake_network>{
       new fake_network(config, event_scheduler, nullptr)};
@@ -1574,7 +1881,9 @@ runtime::result<std::unique_ptr<fake_network>> fake_network::make(
       std::move(*planner),
       std::move(*staged_planner),
       std::move(*bandwidth_event),
-      std::move(stop_capacity),
+      std::move(*stop_event),
+      std::move(*stop_ids),
+      std::move(*stop_trace),
       faults);
     return owner;
 }
@@ -1678,16 +1987,6 @@ seastar::future<runtime::result<void>> fake_network::stop() {
         impl_->force_discard_all(*failure);
         return impl_->stop_done_->get_shared_future();
     }
-    try {
-        if (auto prepared = impl_->prepare_stop_batches(); !prepared) {
-            impl_->stop_done_.reset();
-            return seastar::make_ready_future<runtime::result<void>>(
-              runtime::failure(prepared.error()));
-        }
-    } catch (...) {
-        impl_->stop_done_.reset();
-        return seastar::current_exception_as_future<runtime::result<void>>();
-    }
     impl_->state_ = fake_network_state::stopping;
     impl_->abort_requested_ = true;
     impl_->schedule_stop_batch();
@@ -1732,23 +2031,10 @@ seastar::future<runtime::result<void>> fake_network::impl::submit_control(
       || operation_ids_exhausted) {
         return ready_failure<void>(errc::queue_full);
     }
-    if (!capacity.is_unlimited() && capacity.bytes_per_second() != 0) {
-        auto minimum_rate = bandwidth_fraction::ratio(
-          capacity.bytes_per_second(), config_.maximum_active_flows);
-        KWAQUE_INVARIANT(
-          fake_network_state_invariant,
-          minimum_rate.has_value(),
-          "validated control flow count produced an invalid rate");
-        auto maximum_duration = bandwidth_duration(
-          bandwidth_rate::finite(std::move(*minimum_rate)),
-          bandwidth_fraction::whole(config_.maximum_direction_bytes.value()));
-        if (!maximum_duration || !*maximum_duration) {
-            return ready_failure<void>(errc::out_of_range);
-        }
-        auto deadline = scheduler_->now().checked_add(**maximum_duration);
-        if (!deadline || *deadline > scheduler_->limits().maximum_deadline()) {
-            return ready_failure<void>(errc::out_of_range);
-        }
+    control_operation control{
+      .kind = kind, .source = source, .target = target, .capacity = capacity};
+    if (!control_fits_deadline(control)) {
+        return ready_failure<void>(errc::out_of_range);
     }
 
     const bool link_control = kind == control_kind::partition
@@ -1764,11 +2050,10 @@ seastar::future<runtime::result<void>> fake_network::impl::submit_control(
         return ready_failure<void>(errc::queue_full);
     }
     if (
-      (kind == control_kind::egress && capacity != config_.egress_capacity
+      (kind == control_kind::egress
        && !egress_limits.contains(source)
        && persistent_address_entries() >= config_.maximum_address_entries)
       || (kind == control_kind::ingress
-          && capacity != config_.ingress_capacity
           && !ingress_limits.contains(source)
           && persistent_address_entries()
                >= config_.maximum_address_entries)) {
@@ -1776,30 +2061,12 @@ seastar::future<runtime::result<void>> fake_network::impl::submit_control(
     }
 
     const auto operation_id = next_operation_id;
-    const auto phase = [&] {
-        switch (kind) {
-        case control_kind::partition:
-            return network_control_trace_phase::partition;
-        case control_kind::heal:
-            return network_control_trace_phase::heal;
-        case control_kind::clog:
-            return network_control_trace_phase::clog;
-        case control_kind::unclog:
-            return network_control_trace_phase::unclog;
-        case control_kind::egress:
-            return network_control_trace_phase::egress_limit;
-        case control_kind::link:
-            return network_control_trace_phase::link_limit;
-        case control_kind::ingress:
-            return network_control_trace_phase::ingress_limit;
-        }
-        return network_control_trace_phase::partition;
-    }();
+    const auto phase = control_phase(kind);
     auto main = reserve_terminal(
       trace_event_kind::network_control,
       static_cast<std::uint32_t>(phase),
       operation_id,
-      trace_action::network_control_applied,
+      trace_action::none,
       static_cast<std::uint64_t>(kind),
       0,
       capacity.is_unlimited() ? 0U : capacity.bytes_per_second(),
@@ -1807,6 +2074,20 @@ seastar::future<runtime::result<void>> fake_network::impl::submit_control(
     if (!main) {
         return seastar::make_ready_future<runtime::result<void>>(
           runtime::failure(main.error()));
+    }
+    auto effect_trace = scheduler_->reserve_effect(
+      trace_event_descriptor{
+        .kind = trace_event_kind::network_control,
+        .domain = static_cast<std::uint32_t>(phase),
+        .stable_id = operation_id,
+        .coordinate_a = static_cast<std::uint64_t>(kind),
+        .value = capacity.is_unlimited() ? 0U : capacity.bytes_per_second(),
+        .result = capacity.is_unlimited() ? 1U : 0U,
+        .effect = trace_action::network_control_applied,
+      });
+    if (!effect_trace) {
+        return seastar::make_ready_future<runtime::result<void>>(
+          runtime::failure(effect_trace.error()));
     }
     auto stop_terminal = reserve_terminal(
       trace_event_kind::network,
@@ -1823,8 +2104,7 @@ seastar::future<runtime::result<void>> fake_network::impl::submit_control(
     }
     runtime::result<event_trace::reservation> rebalance_trace{
       event_trace::reservation{}};
-    runtime::result<event_trace::reservation> wake_trace{
-      event_trace::reservation{}};
+    runtime::result<bandwidth_wake> wake{bandwidth_wake{}};
     if (
       kind == control_kind::egress || kind == control_kind::link
       || kind == control_kind::ingress) {
@@ -1843,21 +2123,40 @@ seastar::future<runtime::result<void>> fake_network::impl::submit_control(
             return seastar::make_ready_future<runtime::result<void>>(
               runtime::failure(rebalance_trace.error()));
         }
-        wake_trace = scheduler_->reserve_trace(
-          trace_event_descriptor{
-            .kind = trace_event_kind::bandwidth,
-            .domain = static_cast<std::uint32_t>(
-              bandwidth_trace_phase::transfer_done),
-            .stable_id = operation_id,
-          });
-        if (!wake_trace) {
+        wake = reserve_bandwidth_wake(operation_id);
+        if (!wake) {
             return seastar::make_ready_future<runtime::result<void>>(
-              runtime::failure(wake_trace.error()));
+              runtime::failure(wake.error()));
         }
     }
     bool inserted_link = false;
     bool inserted_address = false;
     try {
+        if (kind == control_kind::unclog) {
+            auto& ready = control.ready.emplace();
+            auto slot = scheduler_->reserve_event_slot();
+            if (!slot) {
+                return seastar::make_ready_future<runtime::result<void>>(
+                  runtime::failure(slot.error()));
+            }
+            ready.event = std::move(*slot);
+            auto ids = scheduler_->reserve_event_id(config_.maximum_packets);
+            auto trace = scheduler_->reserve_trace(
+              trace_event_descriptor{
+                .kind = trace_event_kind::network,
+                .domain = static_cast<std::uint32_t>(
+                  network_trace_phase::delivery),
+                .stable_id = operation_id,
+              },
+              config_.maximum_packets);
+            if (!ids || !trace) {
+                return seastar::make_ready_future<runtime::result<void>>(
+                  runtime::failure(!ids ? ids.error() : trace.error()));
+            }
+            ready.ids = std::move(*ids);
+            ready.trace = std::move(*trace);
+            ready.attempts = config_.maximum_packets;
+        }
         if (link_control && existing_link == nullptr) {
             auto prepared = std::make_unique<link_state>(
               next_link_id,
@@ -1873,27 +2172,27 @@ seastar::future<runtime::result<void>> fake_network::impl::submit_control(
             track_link(*inserted.first->second);
             inserted_link = true;
         }
-        if (
-          kind == control_kind::egress && capacity != config_.egress_capacity) {
-            inserted_address = egress_limits
-                                 .try_emplace(source, config_.egress_capacity)
-                                 .second;
-        } else if (
-          kind == control_kind::ingress
-          && capacity != config_.ingress_capacity) {
-            inserted_address = ingress_limits
-                                 .try_emplace(source, config_.ingress_capacity)
-                                 .second;
+        if (kind == control_kind::egress) {
+            inserted_address
+              = egress_limits
+                  .try_emplace(
+                    source, address_capacity{.value = config_.egress_capacity})
+                  .second;
+        } else if (kind == control_kind::ingress) {
+            inserted_address
+              = ingress_limits
+                  .try_emplace(
+                    source, address_capacity{.value = config_.ingress_capacity})
+                  .second;
         }
-        control_operation control{
-          .kind = kind,
-          .source = source,
-          .target = target,
-          .capacity = capacity,
-          .rebalance_trace = std::move(*rebalance_trace),
-          .wake_trace = std::move(*wake_trace),
-        };
-        auto operation = std::make_unique<operation_state>(
+        if (kind == control_kind::egress || kind == control_kind::ingress) {
+            control.address = capacity_lease{
+              *this, source, kind == control_kind::ingress};
+        }
+        control.rebalance_trace = std::move(*rebalance_trace);
+        control.wake = std::move(*wake);
+        control.effect_trace = std::move(*effect_trace);
+        auto operation = operations.make(
           operation_id,
           operation_payload{
             std::in_place_type<control_operation>, std::move(control)});
@@ -1912,7 +2211,7 @@ seastar::future<runtime::result<void>> fake_network::impl::submit_control(
             .coordinate_a = static_cast<std::uint64_t>(kind),
             .value = capacity.is_unlimited() ? 0U : capacity.bytes_per_second(),
             .result = capacity.is_unlimited() ? 1U : 0U,
-            .effect = trace_action::network_control_applied,
+            .effect = trace_action::none,
           },
           event_cleanup_policy::invoke,
           std::move(main->second));
@@ -1974,6 +2273,33 @@ void fake_network::impl::complete_control(std::uint64_t operation_id) noexcept {
                                : network_error(errc::replay_divergence)));
         return;
     }
+    if (!control_fits_deadline(control)) {
+        operations.erase(operation_id);
+        --active_controls;
+        done.set_value(runtime::failure(network_error(errc::out_of_range)));
+        return;
+    }
+    const auto phase = control_phase(control.kind);
+    auto observed = scheduler_->observe_effect(
+      trace_event_descriptor{
+        .kind = trace_event_kind::network_control,
+        .domain = static_cast<std::uint32_t>(phase),
+        .stable_id = operation_id,
+        .coordinate_a = static_cast<std::uint64_t>(control.kind),
+        .value = control.capacity.is_unlimited()
+                   ? 0U
+                   : control.capacity.bytes_per_second(),
+        .result = control.capacity.is_unlimited() ? 1U : 0U,
+        .effect = trace_action::network_control_applied,
+      },
+      {},
+      control.effect_trace);
+    if (!observed) {
+        operations.erase(operation_id);
+        --active_controls;
+        done.set_value(runtime::failure(observed.error()));
+        return;
+    }
     const directed_link_key key{
       .source = control.source, .target = control.target};
     bool applied = true;
@@ -1984,33 +2310,47 @@ void fake_network::impl::complete_control(std::uint64_t operation_id) noexcept {
     case control_kind::heal:
         find_link(key)->partitioned = false;
         break;
-    case control_kind::clog:
-        find_link(key)->clogged = true;
+    case control_kind::clog: {
+        auto* link = find_link(key);
+        link->clogged = true;
+        if (link->ready_chain_scheduled) {
+            const auto canceled = scheduler_->cancel(link->ready_chain_event);
+            if (!canceled) {
+                applied = false;
+                break;
+            }
+            link->ready_chain_scheduled = false;
+        }
+        link->delivery_budget.reset();
         break;
+    }
     case control_kind::unclog: {
         auto* link = find_link(key);
         link->clogged = false;
+        if (!link->ready_chain_scheduled) {
+            link->delivery_budget = std::move(control.ready);
+        }
         applied = schedule_ready_delivery(*link);
         break;
     }
     case control_kind::egress:
         applied = rebalance_bandwidth(
           std::move(control.rebalance_trace),
-          std::move(control.wake_trace),
+          std::move(control.wake),
           operation_id,
           &control);
         break;
     case control_kind::link:
         applied = rebalance_bandwidth(
           std::move(control.rebalance_trace),
-          std::move(control.wake_trace),
+          std::move(control.wake),
           operation_id,
           &control);
         break;
     case control_kind::ingress:
         applied = rebalance_bandwidth(
           std::move(control.rebalance_trace),
-          std::move(control.wake_trace),
+          std::move(control.wake),
           operation_id,
           &control);
         break;
@@ -2065,9 +2405,11 @@ fake_network::~fake_network() {
         && impl_->free_packets.size() == config_.maximum_packets
         && impl_->ordered_packets.empty()
         && impl_->free_flows.size() == config_.maximum_active_flows
-        && !impl_->bandwidth_scheduled_ && impl_->stop_batches_.empty()
+        && !impl_->bandwidth_scheduled_
         && !impl_->stop_batch_scheduled_
-        && (!impl_->activated_ || impl_->stop_event_capacity_.empty())
+        && (!impl_->activated_ || (!impl_->stop_event_reservation_.active()
+            && !impl_->stop_id_capacity_.active() && !impl_->stop_trace_capacity_.active()
+            && !impl_->active_stop_id_.active()))
         && impl_->bandwidth_->allocation_count() == 0
         && impl_->bandwidth_->resource_count() == 0
         && impl_->bandwidth_->membership_count() == 0
@@ -2346,7 +2688,7 @@ seastar::future<runtime::result<fake_listener>> fake_network::listen(
         listener->stop_event = std::move(stop_terminal->first);
         listener->stop_trace = std::move(stop_terminal->second);
         impl::bind_operation binding{.listener = listener_id};
-        auto operation = std::make_unique<impl::operation_state>(
+        auto operation = impl_->operations.make(
           operation_id,
           impl::operation_payload{
             std::in_place_type<impl::bind_operation>, std::move(binding)});
@@ -2572,23 +2914,8 @@ seastar::future<runtime::result<fake_connection>> fake_network::connect(
     std::array<
       std::pair<scheduler::event_slot_reservation, event_trace::reservation>,
       2>
-      fin_ready_terminals;
-    std::array<
-      std::pair<scheduler::event_slot_reservation, event_trace::reservation>,
-      2>
       endpoint_stop_terminals;
-    for (std::size_t side = 0; side < fin_ready_terminals.size(); ++side) {
-        auto ready = impl_->reserve_terminal(
-          trace_event_kind::network,
-          static_cast<std::uint32_t>(network_trace_phase::fin),
-          pair_id,
-          trace_action::none,
-          side);
-        if (!ready) {
-            return seastar::make_ready_future<runtime::result<fake_connection>>(
-              runtime::failure(ready.error()));
-        }
-        fin_ready_terminals[side] = std::move(*ready);
+    for (std::size_t side = 0; side < endpoint_stop_terminals.size(); ++side) {
         auto stop_terminal = impl_->reserve_terminal(
           trace_event_kind::network,
           static_cast<std::uint32_t>(network_trace_phase::stop),
@@ -2724,10 +3051,6 @@ seastar::future<runtime::result<fake_connection>> fake_network::connect(
               endpoint_terminals[side].second);
             pair->endpoints[side].fin_effect_trace = std::move(
               fin_effects[side]);
-            pair->endpoints[side].fin_ready_event_reservation = std::move(
-              fin_ready_terminals[side].first);
-            pair->endpoints[side].fin_ready_trace = std::move(
-              fin_ready_terminals[side].second);
             pair->endpoints[side].close_event_reservation = std::move(
               endpoint_terminals[side + 2U].first);
             pair->endpoints[side].close_trace = std::move(
@@ -2750,7 +3073,7 @@ seastar::future<runtime::result<fake_connection>> fake_network::connect(
           .parked_trace = std::move(*connect_parked_trace),
           .fault = prepared_fault->decision,
         };
-        auto operation = std::make_unique<impl::operation_state>(
+        auto operation = impl_->operations.make(
           operation_id,
           impl::operation_payload{
             std::in_place_type<impl::connect_operation>, std::move(connecting)},
@@ -2898,6 +3221,19 @@ void fake_network::impl::complete_connect_client(
     connect.abort_subscription = std::nullopt;
     --pending_connects;
     connect.client_done = true;
+    if (scheduler_->discarding_failed_event()) {
+        const auto* failure = scheduler_->trace_failure();
+        connect.done.set_value(
+          runtime::failure(
+            failure != nullptr ? *failure
+                               : network_error(errc::replay_divergence)));
+        pair->endpoints[0].state = runtime::network_connection_state::closed;
+        pair->endpoints[0].input = runtime::network_half_state::shut_down;
+        pair->endpoints[0].output = runtime::network_half_state::shut_down;
+        maybe_erase_connect(operation_id);
+        collect_pair(pair->id);
+        return;
+    }
     if (
       connect.fault.action() == runtime::fault_action::error
       || connect.fault.action() == runtime::fault_action::disconnect) {
@@ -2923,19 +3259,6 @@ void fake_network::impl::complete_connect_client(
         maybe_erase_connect(operation_id);
         done.set_value(runtime::failure(network_error(code)));
         collect_pair(pair_id);
-        return;
-    }
-    if (scheduler_->discarding_failed_event()) {
-        const auto* failure = scheduler_->trace_failure();
-        connect.done.set_value(
-          runtime::failure(
-            failure != nullptr ? *failure
-                               : network_error(errc::replay_divergence)));
-        pair->endpoints[0].state = runtime::network_connection_state::closed;
-        pair->endpoints[0].input = runtime::network_half_state::shut_down;
-        pair->endpoints[0].output = runtime::network_half_state::shut_down;
-        maybe_erase_connect(operation_id);
-        collect_pair(pair->id);
         return;
     }
     if (pair->endpoints[0].peer_reset) {
@@ -3044,19 +3367,21 @@ void fake_network::impl::complete_incoming(
                 auto combined = accept_latency.checked_add(
                   *accept.fault.delay());
                 if (!combined) {
-                    accept.done.set_value(
-                      runtime::failure(network_error(errc::out_of_range)));
-                    listener->accept_operation.reset();
-                    operations.erase(accept_id);
-                    reset_pair(selected_pair_id, 1);
-                    return;
+                    accept.completion_error = network_error(errc::out_of_range);
+                } else {
+                    accept_latency = *combined;
                 }
-                accept_latency = *combined;
             }
-            const auto deadline = add_deadline(
+            auto deadline = add_deadline(
               scheduler_->now(),
               accept_latency,
               scheduler_->limits().maximum_deadline());
+            if (!deadline) {
+                accept.completion_error = deadline.error();
+            }
+            if (accept.completion_error) {
+                deadline = scheduler_->now();
+            }
             if (!deadline || !schedule_accept(accept_id, *deadline)) {
                 accept.done.set_value(
                   runtime::failure(
@@ -3201,6 +3526,26 @@ seastar::future<runtime::result<fake_connection>> fake_network::accept(
         return seastar::make_ready_future<runtime::result<fake_connection>>(
           runtime::failure(prepared_fault.error()));
     }
+    std::optional<runtime::monotonic_time> ready_deadline;
+    if (
+      !listener->backlog.empty()
+      && prepared_fault->decision.action() != runtime::fault_action::error) {
+        auto latency = config_.accept_latency;
+        if (prepared_fault->decision.action() == runtime::fault_action::delay) {
+            auto combined = latency.checked_add(
+              *prepared_fault->decision.delay());
+            if (!combined) {
+                return ready_failure<fake_connection>(errc::out_of_range);
+            }
+            latency = *combined;
+        }
+        auto deadline = add_deadline(
+          scheduler_->now(), latency, scheduler_->limits().maximum_deadline());
+        if (!deadline) {
+            return ready_failure<fake_connection>(errc::out_of_range);
+        }
+        ready_deadline = *deadline;
+    }
     const auto operation_id = impl_->next_operation_id;
     auto main = impl_->reserve_terminal(
       trace_event_kind::network,
@@ -3270,7 +3615,7 @@ seastar::future<runtime::result<fake_connection>> fake_network::accept(
           .parked_trace = std::move(*accept_parked_trace),
           .fault = prepared_fault->decision,
         };
-        auto operation = std::make_unique<impl::operation_state>(
+        auto operation = impl_->operations.make(
           operation_id,
           impl::operation_payload{
             std::in_place_type<impl::accept_operation>, std::move(accepting)},
@@ -3319,32 +3664,9 @@ seastar::future<runtime::result<fake_connection>> fake_network::accept(
             auto& inserted = std::get<impl::accept_operation>(
               impl_->find_operation(operation_id)->payload);
             inserted.pair = pair;
-            auto accept_latency = config_.accept_latency;
-            if (inserted.fault.action() == runtime::fault_action::delay) {
-                auto combined = accept_latency.checked_add(
-                  *inserted.fault.delay());
-                if (!combined) {
-                    listener->accept_operation.reset();
-                    impl_->operations.erase(operation_id);
-                    impl_->reset_pair(pair, 1);
-                    return ready_failure<fake_connection>(errc::out_of_range);
-                }
-                accept_latency = *combined;
-            }
-            const auto deadline = add_deadline(
-              scheduler_->now(),
-              accept_latency,
-              scheduler_->limits().maximum_deadline());
-            if (!deadline) {
-                listener->accept_operation.reset();
-                impl_->operations.erase(operation_id);
-                impl_->reset_pair(pair, 1);
-                return seastar::make_ready_future<
-                  runtime::result<fake_connection>>(
-                  runtime::failure(deadline.error()));
-            }
             if (
-              auto scheduled = impl_->schedule_accept(operation_id, *deadline);
+              auto scheduled = impl_->schedule_accept(
+                operation_id, *ready_deadline);
               !scheduled) {
                 listener->accept_operation.reset();
                 impl_->operations.erase(operation_id);
@@ -3407,6 +3729,40 @@ void fake_network::impl::complete_accept(std::uint64_t operation_id) noexcept {
     if (listener != nullptr && listener->accept_operation == operation_id) {
         listener->accept_operation.reset();
     }
+    const bool rejected
+      = scheduler_->discarding_failed_event() || listener == nullptr
+        || listener->aborted || listener->closing || listener->closed
+        || accept.caller_abort == nullptr
+        || accept.caller_abort->abort_requested()
+        || (pair == nullptr && accept.fault.action() != runtime::fault_action::error)
+        || (pair != nullptr && pair->endpoints[1].peer_reset);
+    if (rejected) {
+        auto done = std::move(accept.done);
+        const auto pair_id = accept.pair;
+        operations.erase(operation_id);
+        if (pair_id) {
+            reset_pair(*pair_id, 1);
+        }
+        const auto* failure = scheduler_->trace_failure();
+        done.set_value(
+          runtime::failure(
+            failure != nullptr ? *failure : network_error(errc::aborted)));
+        if (listener != nullptr) {
+            collect_listener(listener->id);
+        }
+        return;
+    }
+    if (accept.completion_error) {
+        auto done = std::move(accept.done);
+        const auto error = *accept.completion_error;
+        const auto pair_id = accept.pair;
+        operations.erase(operation_id);
+        if (pair_id) {
+            reset_pair(*pair_id, 1);
+        }
+        done.set_value(runtime::failure(error));
+        return;
+    }
     if (accept.fault.action() == runtime::fault_action::error) {
         auto done = std::move(accept.done);
         operations.erase(operation_id);
@@ -3442,30 +3798,11 @@ void fake_network::impl::complete_accept(std::uint64_t operation_id) noexcept {
         return;
     }
     auto done = std::move(accept.done);
-    const bool rejected = scheduler_->discarding_failed_event()
-                          || listener == nullptr || listener->aborted
-                          || listener->closing || listener->closed
-                          || accept.caller_abort == nullptr
-                          || accept.caller_abort->abort_requested()
-                          || pair == nullptr || pair->endpoints[1].peer_reset;
-    const auto pair_id = accept.pair;
     operations.erase(operation_id);
-    if (rejected) {
-        if (pair_id) {
-            reset_pair(*pair_id, 1);
-        }
-        const auto* failure = scheduler_->discarding_failed_event()
-                                ? scheduler_->trace_failure()
-                                : nullptr;
-        done.set_value(
-          runtime::failure(
-            failure != nullptr ? *failure : network_error(errc::aborted)));
-    } else {
-        pair->endpoints[1].exposed = true;
-        pair->endpoints[1].handle_owned = true;
-        done.set_value(
-          fake_connection{*owner_, pair->id, 1, pair->endpoints[1].limits});
-    }
+    pair->endpoints[1].exposed = true;
+    pair->endpoints[1].handle_owned = true;
+    done.set_value(
+      fake_connection{*owner_, pair->id, 1, pair->endpoints[1].limits});
     if (listener != nullptr) {
         collect_listener(listener->id);
     }
@@ -3638,21 +3975,17 @@ void fake_network::impl::complete_listener_close(
         }
         reset_pair(pair, 1);
     }
-    work_ids.clear();
-    for (const auto& [operation_id, operation] : operations) {
-        static_cast<void>(operation_id);
+    for (auto next = operations.begin(); next != operations.end();) {
+        const auto id = next->id;
+        const auto* connect = std::get_if<connect_operation>(&next->payload);
+        ++next;
         if (
-          const auto* connect = std::get_if<connect_operation>(
-            &operation->payload);
           connect != nullptr && connect->listener == listener_id
           && !connect->incoming_done) {
-            work_ids.push_back(connect->pair);
+            reset_pair(connect->pair, 1);
+            next = operations.upper_bound(id);
         }
     }
-    for (const auto pair : work_ids) {
-        reset_pair(pair, 1);
-    }
-    work_ids.clear();
     listener->closed = true;
     listener->closing = false;
     const auto* failure = scheduler_->discarding_failed_event()
@@ -3840,6 +4173,21 @@ fake_network::read(
         fault_a = *selected;
         fault_b = *bit;
     }
+    const auto& incoming = pair->directions[other_side(side)];
+    const bool readable = incoming.fin_delivered || !incoming.delivered.empty();
+    const bool immediate = decision.action() == runtime::fault_action::error
+                           || decision.action()
+                                == runtime::fault_action::disconnect;
+    auto deadline = scheduler_->now();
+    if (readable && decision.action() == runtime::fault_action::delay) {
+        auto delayed = add_deadline(
+          deadline, *decision.delay(), scheduler_->limits().maximum_deadline());
+        if (!delayed) {
+            return ready_failure<runtime::network_read_result>(
+              errc::out_of_range);
+        }
+        deadline = *delayed;
+    }
     const auto operation_id = impl_->next_operation_id;
     auto main = impl_->reserve_terminal(
       trace_event_kind::network,
@@ -3850,6 +4198,23 @@ fake_network::read(
       side,
       maximum_bytes.value(),
       static_cast<std::uint32_t>(decision.action()));
+    decltype(main) retry;
+    if (decision.action() == runtime::fault_action::drop) {
+        retry = impl_->reserve_terminal(
+          trace_event_kind::network,
+          static_cast<std::uint32_t>(network_trace_phase::read),
+          operation_id,
+          trace_action::network_operation_applied,
+          pair_id,
+          side,
+          maximum_bytes.value(),
+          static_cast<std::uint32_t>(runtime::fault_action::none));
+        if (!retry) {
+            return seastar::make_ready_future<
+              runtime::result<runtime::network_read_result>>(
+              runtime::failure(retry.error()));
+        }
+    }
     auto terminal = impl_->reserve_terminal(
       trace_event_kind::network,
       static_cast<std::uint32_t>(network_trace_phase::read),
@@ -3905,6 +4270,8 @@ fake_network::read(
           .maximum_bytes = maximum_bytes,
           .event_reservation = std::move(main->first),
           .trace = std::move(main->second),
+          .retry_event = std::move(retry->first),
+          .retry_trace = std::move(retry->second),
           .terminal_event = std::move(terminal->first),
           .terminal_trace = std::move(terminal->second),
           .parked_trace = std::move(*read_parked_trace),
@@ -3913,7 +4280,7 @@ fake_network::read(
           .fault_b = fault_b,
           .side = side,
         };
-        auto operation = std::make_unique<impl::operation_state>(
+        auto operation = impl_->operations.make(
           operation_id,
           impl::operation_payload{
             std::in_place_type<impl::read_operation>, std::move(reading)},
@@ -3932,24 +4299,7 @@ fake_network::read(
         }
         impl_->issue_operation_id();
         impl_->activated_ = true;
-        const auto& incoming = pair->directions[other_side(side)];
-        const bool readable = incoming.fin_delivered
-                              || !incoming.delivered.empty();
-        const bool immediate = decision.action() == runtime::fault_action::error
-                               || decision.action()
-                                    == runtime::fault_action::disconnect;
         if (readable || immediate) {
-            auto deadline = scheduler_->now();
-            if (decision.action() == runtime::fault_action::delay) {
-                auto delayed = deadline.checked_add(*decision.delay());
-                if (!delayed) {
-                    endpoint.read_operation.reset();
-                    impl_->operations.erase(operation_id);
-                    return ready_failure<runtime::network_read_result>(
-                      errc::out_of_range);
-                }
-                deadline = *delayed;
-            }
             if (
               auto scheduled = impl_->schedule_read(operation_id, deadline);
               !scheduled) {
@@ -4034,6 +4384,14 @@ void fake_network::impl::complete_read(std::uint64_t operation_id) noexcept {
             failure != nullptr ? *failure : network_error(code)));
         return;
     }
+    if (read.completion_error) {
+        auto done = std::move(read.done);
+        const auto error = *read.completion_error;
+        endpoint.read_operation.reset();
+        operations.erase(operation_id);
+        done.set_value(runtime::failure(error));
+        return;
+    }
     if (read.fault.action() == runtime::fault_action::error) {
         auto done = std::move(read.done);
         endpoint.read_operation.reset();
@@ -4055,14 +4413,18 @@ void fake_network::impl::complete_read(std::uint64_t operation_id) noexcept {
     const auto direction_index = other_side(read.side);
     auto& direction = pair->directions[direction_index];
     if (direction.delivered.empty()) {
-        auto done = std::move(read.done);
-        endpoint.read_operation.reset();
-        operations.erase(operation_id);
         if (direction.fin_delivered) {
             auto result = runtime::network_read_result::make(
               bytes::fragmented_buffer{}, true, maximum_bytes);
-            done.set_value(std::move(result));
+            KWAQUE_INVARIANT(
+              fake_network_state_invariant,
+              result.has_value(),
+              "empty EOF result failed validation");
+            publish_read(operation_id, std::move(*result));
         } else {
+            auto done = std::move(read.done);
+            endpoint.read_operation.reset();
+            operations.erase(operation_id);
             done.set_value(runtime::failure(network_error(errc::unavailable)));
         }
         return;
@@ -4102,6 +4464,8 @@ void fake_network::impl::complete_read(std::uint64_t operation_id) noexcept {
         if (read.fault.action() == runtime::fault_action::drop) {
             read.scheduled = false;
             read.fault = runtime::fault_decision{};
+            read.event_reservation = std::move(read.retry_event);
+            read.trace = std::move(read.retry_trace);
             const bool readable = direction.fin_delivered
                                   || !direction.delivered.empty();
             if (readable) {
@@ -4135,38 +4499,46 @@ void fake_network::impl::complete_read(std::uint64_t operation_id) noexcept {
           fake_network_state_invariant,
           result.has_value(),
           "validated fake read produced an invalid bounded result");
-        if (read.fault.action() == runtime::fault_action::drop_completion) {
-            auto observed = scheduler_->observe_effect(
-              trace_event_descriptor{
-                .kind = trace_event_kind::network,
-                .domain = static_cast<std::uint32_t>(
-                  network_trace_phase::parked),
-                .stable_id = operation_id,
-                .effect = trace_action::operation_parked,
-              },
-              {},
-              read.parked_trace);
-            if (!observed) {
-                return;
-            }
-            read.parked_result.emplace(std::move(*result));
-            read.parked = true;
-            read.scheduled = false;
-            endpoint.read_operation.reset();
-            collect_pair(pair->id);
-            return;
-        }
-        auto done = std::move(read.done);
-        endpoint.read_operation.reset();
-        operations.erase(operation_id);
-        done.set_value(std::move(result));
-        collect_pair(pair->id);
+        publish_read(operation_id, std::move(*result));
     } catch (...) {
         auto done = std::move(read.done);
         endpoint.read_operation.reset();
         operations.erase(operation_id);
         done.set_exception(std::current_exception());
     }
+}
+
+void fake_network::impl::publish_read(
+  std::uint64_t operation_id, runtime::network_read_result result) noexcept {
+    auto* operation = find_operation(operation_id);
+    auto& read = std::get<read_operation>(operation->payload);
+    auto* pair = find_pair(read.pair);
+    auto& endpoint = pair->endpoints[read.side];
+    if (read.fault.action() == runtime::fault_action::drop_completion) {
+        auto observed = scheduler_->observe_effect(
+          trace_event_descriptor{
+            .kind = trace_event_kind::network,
+            .domain = static_cast<std::uint32_t>(network_trace_phase::parked),
+            .stable_id = operation_id,
+            .effect = trace_action::operation_parked,
+          },
+          {},
+          read.parked_trace);
+        if (!observed) {
+            return;
+        }
+        read.parked_result.emplace(std::move(result));
+        read.parked = true;
+        read.scheduled = false;
+        endpoint.read_operation.reset();
+        collect_pair(pair->id);
+        return;
+    }
+    auto done = std::move(read.done);
+    endpoint.read_operation.reset();
+    operations.erase(operation_id);
+    done.set_value(std::move(result));
+    collect_pair(pair->id);
 }
 
 void fake_network::impl::complete_read_terminal(
@@ -4266,9 +4638,7 @@ seastar::future<runtime::result<void>> fake_network::write(
           data, *selected_byte, static_cast<std::uint8_t>(*selected_bit));
     }
     const bool immediate_fault = decision.action()
-                                   == runtime::fault_action::error
-                                 || decision.action()
-                                      == runtime::fault_action::disconnect;
+                                 == runtime::fault_action::error;
     if (immediate_fault) {
         if (
           impl_->operations.size() == config_.maximum_operations
@@ -4314,7 +4684,7 @@ seastar::future<runtime::result<void>> fake_network::write(
               .terminal_trace = std::move(terminal->second),
               .side = side,
             };
-            auto operation = std::make_unique<impl::operation_state>(
+            auto operation = impl_->operations.make(
               operation_id,
               impl::operation_payload{
                 std::in_place_type<impl::write_operation>, std::move(writing)});
@@ -4331,19 +4701,11 @@ seastar::future<runtime::result<void>> fake_network::write(
               impl_->find_operation(operation_id)->payload);
             auto waiting = stored.done.get_future();
             stored.terminal_event.release();
-            const auto code = decision.action() == runtime::fault_action::error
-                                ? errc::fault_injected
-                                : errc::network_failure;
             auto scheduled = scheduler_->schedule(
               scheduler_->now(),
               event_priority::normal(),
-              [this,
-               operation_id,
-               code,
-               disconnect = decision.action()
-                            == runtime::fault_action::disconnect] noexcept {
-                  impl_->complete_immediate_write(
-                    operation_id, code, disconnect);
+              [this, operation_id] noexcept {
+                  impl_->complete_immediate_write(operation_id);
               },
               trace_event_descriptor{
                 .kind = trace_event_kind::network,
@@ -4375,13 +4737,18 @@ seastar::future<runtime::result<void>> fake_network::write(
               runtime::result<void>>();
         }
     }
+    const bool disconnect = decision.action()
+                            == runtime::fault_action::disconnect;
     const std::uint32_t packet_copies = decision.action()
                                             == runtime::fault_action::duplicate
                                           ? 2U
                                           : 1U;
-    const auto logical_required = data.size().value() * packet_copies;
-    const auto retained_required = data.retained_bytes().value()
-                                   * packet_copies;
+    const auto logical_required = disconnect
+                                    ? 0U
+                                    : data.size().value() * packet_copies;
+    const auto retained_required = disconnect ? 0U
+                                              : data.retained_bytes().value()
+                                                  * packet_copies;
     auto& direction = pair->directions[side];
     if (
       logical_required > config_.maximum_direction_bytes.value()
@@ -4421,15 +4788,17 @@ seastar::future<runtime::result<void>> fake_network::write(
       .source = endpoint.local.address(), .target = endpoint.remote.address()};
     auto* link = impl_->find_link(link_key);
     if (
-      link == nullptr
+      !disconnect && link == nullptr
       && (impl_->links.size() == config_.maximum_links || impl_->link_ids_exhausted)) {
         return ready_failure<void>(errc::queue_full);
     }
-    const bool needs_transmitter_slot = !direction.transmitter_slot;
+    const bool needs_transmitter_slot = !disconnect
+                                        && !direction.transmitter_slot;
     if (needs_transmitter_slot && impl_->free_flows.empty()) {
         return ready_failure<void>(errc::queue_full);
     }
-    auto admitted = admission.try_acquire(data.retained_bytes());
+    auto admitted = admission.try_acquire(
+      disconnect ? byte_count{} : data.retained_bytes());
     if (!admitted) {
         return ready_failure<void>(errc::queue_full);
     }
@@ -4450,94 +4819,44 @@ seastar::future<runtime::result<void>> fake_network::write(
         return ready_failure<void>(errc::out_of_range);
     }
     const auto maximum_delivery_latency = maximum_latency + injected_delay;
-    const auto delivery_limit = add_deadline(
-      scheduler_->now(),
-      runtime::monotonic_duration{maximum_delivery_latency},
-      scheduler_->limits().maximum_deadline());
-    const auto gap_limit = add_deadline(
-      scheduler_->now(),
-      config_.interframe_gap,
-      scheduler_->limits().maximum_deadline());
-    if (!delivery_limit || !gap_limit) {
-        return seastar::make_ready_future<runtime::result<void>>(
-          runtime::failure(
-            !delivery_limit ? delivery_limit.error() : gap_limit.error()));
-    }
-    const std::array capacities{
-      impl_->egress_capacity(endpoint.local.address()),
-      link == nullptr ? config_.link_capacity : link->capacity,
-      decision.action() == runtime::fault_action::drop
-        ? bandwidth_capacity::unlimited()
-        : impl_->ingress_capacity(endpoint.remote.address())};
-    const bool parked = std::ranges::any_of(
-      capacities, [](bandwidth_capacity capacity) {
-          return !capacity.is_unlimited() && capacity.bytes_per_second() == 0;
-      });
-    std::optional<std::uint64_t> minimum_capacity;
-    for (const auto capacity : capacities) {
-        if (
-          !capacity.is_unlimited() && capacity.bytes_per_second() != 0
-          && (!minimum_capacity || capacity.bytes_per_second() < *minimum_capacity)) {
-            minimum_capacity = capacity.bytes_per_second();
-        }
-    }
-    if (!parked && minimum_capacity) {
-        auto minimum_rate = bandwidth_fraction::ratio(
-          *minimum_capacity, config_.maximum_active_flows);
-        KWAQUE_INVARIANT(
-          fake_network_state_invariant,
-          minimum_rate.has_value(),
-          "validated bandwidth flow count produced an invalid write rate");
-        auto duration = bandwidth_duration(
-          bandwidth_rate::finite(std::move(*minimum_rate)),
-          bandwidth_fraction::whole(data.size().value()));
-        if (!duration || !*duration) {
-            return seastar::make_ready_future<runtime::result<void>>(
-              runtime::failure(
-                duration ? network_error(errc::out_of_range)
-                         : duration.error()));
-        }
-        auto transmit_limit = add_deadline(
-          scheduler_->now(),
-          **duration,
-          scheduler_->limits().maximum_deadline());
-        if (!transmit_limit) {
-            return seastar::make_ready_future<runtime::result<void>>(
-              runtime::failure(transmit_limit.error()));
-        }
-        const auto tail = std::max(
-          maximum_delivery_latency, config_.interframe_gap.nanoseconds());
-        if (
-          tail > scheduler_->limits().maximum_deadline().nanoseconds()
-                   - transmit_limit->nanoseconds()) {
-            return ready_failure<void>(errc::out_of_range);
-        }
+    const auto transfer_tail = disconnect
+                                 ? 0U
+                                 : std::max(
+                                     maximum_delivery_latency,
+                                     config_.interframe_gap.nanoseconds());
+    if (!disconnect && (
+      transfer_tail > scheduler_->limits().maximum_deadline().nanoseconds() / packet_copies
+      || !impl_->direction_fits_deadline(*pair, side, logical_required, transfer_tail * packet_copies))) {
+        return ready_failure<void>(errc::out_of_range);
     }
     const auto operation_id = impl_->next_operation_id;
     const auto packet_id = impl_->next_packet_id;
-    auto delivery = impl_->reserve_terminal(
-      trace_event_kind::network,
-      static_cast<std::uint32_t>(network_trace_phase::delivery),
-      packet_id);
-    auto gap = impl_->reserve_terminal(
-      trace_event_kind::bandwidth,
-      static_cast<std::uint32_t>(bandwidth_trace_phase::transfer_done),
-      packet_id);
-    auto ready_delivery = impl_->reserve_terminal(
-      trace_event_kind::network,
-      static_cast<std::uint32_t>(network_trace_phase::delivery),
-      packet_id);
+    runtime::result<
+      std::pair<scheduler::event_slot_reservation, event_trace::reservation>>
+      delivery;
+    decltype(delivery) gap;
+    if (!disconnect) {
+        delivery = impl_->reserve_terminal(
+          trace_event_kind::network,
+          static_cast<std::uint32_t>(network_trace_phase::delivery),
+          packet_id);
+        gap = impl_->reserve_terminal(
+          trace_event_kind::bandwidth,
+          static_cast<std::uint32_t>(bandwidth_trace_phase::transfer_done),
+          packet_id);
+    }
     auto packet_traces = impl_->reserve_packet_traces(
-      packet_id, pair_id, side, data.size());
+      packet_id,
+      pair_id,
+      side,
+      disconnect ? byte_count{} : data.size(),
+      !disconnect);
     std::optional<
       std::pair<scheduler::event_slot_reservation, event_trace::reservation>>
       clone_delivery;
     std::optional<
       std::pair<scheduler::event_slot_reservation, event_trace::reservation>>
       clone_gap;
-    std::optional<
-      std::pair<scheduler::event_slot_reservation, event_trace::reservation>>
-      clone_ready_delivery;
     std::optional<impl::packet_trace_reservations> clone_packet_traces;
     if (packet_copies == 2U) {
         auto reserved_delivery = impl_->reserve_terminal(
@@ -4548,20 +4867,14 @@ seastar::future<runtime::result<void>> fake_network::write(
           trace_event_kind::bandwidth,
           static_cast<std::uint32_t>(bandwidth_trace_phase::transfer_done),
           packet_id + 1U);
-        auto reserved_ready = impl_->reserve_terminal(
-          trace_event_kind::network,
-          static_cast<std::uint32_t>(network_trace_phase::delivery),
-          packet_id + 1U);
-        if (!reserved_delivery || !reserved_gap || !reserved_ready) {
+        if (!reserved_delivery || !reserved_gap) {
             return seastar::make_ready_future<runtime::result<void>>(
               runtime::failure(
                 !reserved_delivery ? reserved_delivery.error()
-                : !reserved_gap    ? reserved_gap.error()
-                                   : reserved_ready.error()));
+                                   : reserved_gap.error()));
         }
         clone_delivery.emplace(std::move(*reserved_delivery));
         clone_gap.emplace(std::move(*reserved_gap));
-        clone_ready_delivery.emplace(std::move(*reserved_ready));
         auto reserved_traces = impl_->reserve_packet_traces(
           packet_id + 1U, pair_id, side, data.size());
         if (!reserved_traces) {
@@ -4588,17 +4901,21 @@ seastar::future<runtime::result<void>> fake_network::write(
       0,
       0,
       static_cast<std::uint32_t>(errc::aborted));
-    auto write_effect = scheduler_->reserve_effect(
-      trace_event_descriptor{
-        .kind = trace_event_kind::network,
-        .domain = static_cast<std::uint32_t>(network_trace_phase::write),
-        .stable_id = operation_id,
-        .coordinate_a = pair_id,
-        .coordinate_b = side,
-        .value = data.size().value(),
-        .result = static_cast<std::uint32_t>(decision.action()),
-        .effect = trace_action::network_operation_applied,
-      });
+    runtime::result<event_trace::reservation> write_effect{
+      event_trace::reservation{}};
+    if (!disconnect) {
+        write_effect = scheduler_->reserve_effect(
+          trace_event_descriptor{
+            .kind = trace_event_kind::network,
+            .domain = static_cast<std::uint32_t>(network_trace_phase::write),
+            .stable_id = operation_id,
+            .coordinate_a = pair_id,
+            .coordinate_b = side,
+            .value = data.size().value(),
+            .result = static_cast<std::uint32_t>(decision.action()),
+            .effect = trace_action::network_operation_applied,
+          });
+    }
     runtime::result<event_trace::reservation> parked_trace{
       event_trace::reservation{}};
     if (decision.action() == runtime::fault_action::drop_completion) {
@@ -4611,11 +4928,10 @@ seastar::future<runtime::result<void>> fake_network::write(
           });
     }
     if (
-      !delivery || !gap || !ready_delivery || !packet_traces || !terminal
-      || !write_stop_terminal || !write_effect || !parked_trace) {
+      !delivery || !gap || !packet_traces || !terminal || !write_stop_terminal
+      || !write_effect || !parked_trace) {
         const auto error = !delivery              ? delivery.error()
                            : !gap                 ? gap.error()
-                           : !ready_delivery      ? ready_delivery.error()
                            : !packet_traces       ? packet_traces.error()
                            : !terminal            ? terminal.error()
                            : !write_stop_terminal ? write_stop_terminal.error()
@@ -4633,7 +4949,7 @@ seastar::future<runtime::result<void>> fake_network::write(
     bool inserted_link = false;
     try {
         std::unique_ptr<impl::link_state> prepared_link;
-        if (link == nullptr) {
+        if (!disconnect && link == nullptr) {
             prepared_link = std::make_unique<impl::link_state>(
               impl_->next_link_id,
               link_key,
@@ -4667,7 +4983,7 @@ seastar::future<runtime::result<void>> fake_network::write(
           .drop_completion = decision.action()
                              == runtime::fault_action::drop_completion,
         };
-        auto operation = std::make_unique<impl::operation_state>(
+        auto operation = impl_->operations.make(
           operation_id,
           impl::operation_payload{
             std::in_place_type<impl::write_operation>, std::move(writing)},
@@ -4716,30 +5032,38 @@ seastar::future<runtime::result<void>> fake_network::write(
         if (needs_transmitter_slot) {
             direction.transmitter_slot = impl_->free_flows.front();
             impl_->free_flows.pop_front();
+            auto& flow = impl_->flows[*direction.transmitter_slot];
+            flow.pair = pair_id;
+            flow.side = side;
         }
         auto& packet = impl_->packets[packet_slot];
         KWAQUE_INVARIANT(
           fake_network_state_invariant,
           packet.phase == impl::packet_phase::free,
           "fake packet free list returned an occupied slot");
-        const auto logical_charge = data.size();
-        const auto retained_charge = data.retained_bytes();
+        const auto logical_charge = disconnect ? byte_count{} : data.size();
+        const auto retained_charge = disconnect ? byte_count{}
+                                                : data.retained_bytes();
         packet.id = packet_id;
+        packet.pending_transfer = !disconnect;
+        packet.transfer_tail_ns = transfer_tail;
+        packet.disconnect = decision.action()
+                            == runtime::fault_action::disconnect;
         packet.pair = pair_id;
         packet.write_operation = operation_id;
         if (clone_slot) {
             packet.clone = clone_token;
         }
         packet.link = link_key;
-        packet.data = std::move(data);
+        if (!disconnect) {
+            packet.data = std::move(data);
+        }
         packet.logical_charge = logical_charge;
         packet.retained_charge = retained_charge;
         packet.delivery_event_reservation = std::move(delivery->first);
         packet.delivery_trace = std::move(delivery->second);
         packet.gap_event_reservation = std::move(gap->first);
         packet.gap_trace = std::move(gap->second);
-        packet.ready_event_reservation = std::move(ready_delivery->first);
-        packet.ready_trace = std::move(ready_delivery->second);
         packet.flow_start_trace = std::move(packet_traces->flow_start);
         packet.transfer_trace = std::move(packet_traces->transfer);
         packet.packet_effect_trace = std::move(packet_traces->packet_effect);
@@ -4747,8 +5071,8 @@ seastar::future<runtime::result<void>> fake_network::write(
           packet_traces->start_rebalance);
         packet.finish_rebalance_trace = std::move(
           packet_traces->finish_rebalance);
-        packet.start_wake_trace = std::move(packet_traces->start_wake);
-        packet.finish_wake_trace = std::move(packet_traces->finish_wake);
+        packet.start_wake = std::move(packet_traces->start_wake);
+        packet.finish_wake = std::move(packet_traces->finish_wake);
         packet.delivery_delay = runtime::monotonic_duration{injected_delay};
         packet.sequence = direction.next_sequence;
         packet.side = side;
@@ -4783,6 +5107,8 @@ seastar::future<runtime::result<void>> fake_network::write(
               clone.phase == impl::packet_phase::free,
               "fake packet free list returned an occupied clone slot");
             clone.id = packet_id + 1U;
+            clone.pending_transfer = true;
+            clone.transfer_tail_ns = transfer_tail;
             clone.pair = pair_id;
             clone.link = link_key;
             clone.data = std::move(*clone_data);
@@ -4792,9 +5118,6 @@ seastar::future<runtime::result<void>> fake_network::write(
             clone.delivery_trace = std::move(clone_delivery->second);
             clone.gap_event_reservation = std::move(clone_gap->first);
             clone.gap_trace = std::move(clone_gap->second);
-            clone.ready_event_reservation = std::move(
-              clone_ready_delivery->first);
-            clone.ready_trace = std::move(clone_ready_delivery->second);
             clone.flow_start_trace = std::move(clone_packet_traces->flow_start);
             clone.transfer_trace = std::move(clone_packet_traces->transfer);
             clone.packet_effect_trace = std::move(
@@ -4803,9 +5126,8 @@ seastar::future<runtime::result<void>> fake_network::write(
               clone_packet_traces->start_rebalance);
             clone.finish_rebalance_trace = std::move(
               clone_packet_traces->finish_rebalance);
-            clone.start_wake_trace = std::move(clone_packet_traces->start_wake);
-            clone.finish_wake_trace = std::move(
-              clone_packet_traces->finish_wake);
+            clone.start_wake = std::move(clone_packet_traces->start_wake);
+            clone.finish_wake = std::move(clone_packet_traces->finish_wake);
             clone.sequence = direction.next_sequence;
             clone.side = side;
             clone.phase = impl::packet_phase::deferred_clone;
@@ -4829,11 +5151,15 @@ seastar::future<runtime::result<void>> fake_network::write(
                 ++direction.next_sequence;
             }
         }
+        direction.pending_transfer_bytes += logical_required;
+        direction.pending_tail_ns += transfer_tail * packet_copies;
         direction.transmit_queue.push_back(token);
         direction.packet_count += packet_copies;
         direction.logical_bytes = *direction.logical_bytes.checked_add(
           byte_count{logical_required});
-        link->packets += packet_copies;
+        if (!disconnect) {
+            link->packets += packet_copies;
+        }
         impl_->live_packets += packet_copies;
         impl_->packet_logical_bytes = *impl_->packet_logical_bytes.checked_add(
           byte_count{logical_required});
@@ -4900,14 +5226,154 @@ bandwidth_capacity fake_network::impl::egress_capacity(
   const runtime::network_address& address) const noexcept {
     const auto found = egress_limits.find(address);
     return found == egress_limits.end() ? config_.egress_capacity
-                                        : found->second;
+                                        : found->second.value;
 }
 
 bandwidth_capacity fake_network::impl::ingress_capacity(
   const runtime::network_address& address) const noexcept {
     const auto found = ingress_limits.find(address);
     return found == ingress_limits.end() ? config_.ingress_capacity
-                                         : found->second;
+                                         : found->second.value;
+}
+
+void fake_network::impl::release_transfer_charge(
+  packet_state& packet) noexcept {
+    if (!packet.pending_transfer) {
+        return;
+    }
+    auto& direction = find_pair(packet.pair)->directions[packet.side];
+    KWAQUE_INVARIANT(
+      fake_network_state_invariant,
+      direction.pending_transfer_bytes >= packet.logical_charge.value()
+        && direction.pending_tail_ns >= packet.transfer_tail_ns,
+      "queued transfer accounting underflow");
+    direction.pending_transfer_bytes -= packet.logical_charge.value();
+    direction.pending_tail_ns -= packet.transfer_tail_ns;
+    packet.pending_transfer = false;
+}
+
+bool fake_network::impl::direction_fits_deadline(
+  const pair_state& pair,
+  std::uint8_t side,
+  std::uint64_t extra_bytes,
+  std::uint64_t extra_tail,
+  const control_operation* control) const noexcept {
+    const auto& direction = pair.directions[side];
+    if (
+      extra_tail
+      > std::numeric_limits<std::uint64_t>::max() - direction.pending_tail_ns) {
+        return false;
+    }
+    if (direction.pending_transfer_bytes == 0 && extra_bytes == 0) {
+        return true;
+    }
+    const auto& endpoint = pair.endpoints[side];
+    const directed_link_key key{
+      .source = endpoint.local.address(), .target = endpoint.remote.address()};
+    const auto linked = links.find(key);
+    std::array capacities{
+      egress_capacity(key.source),
+      linked == links.end() ? config_.link_capacity : linked->second->capacity,
+      ingress_capacity(key.target)};
+    if (control != nullptr) {
+        if (
+          control->kind == control_kind::egress
+          && control->source == key.source) {
+            capacities[0] = control->capacity;
+        } else if (
+          control->kind == control_kind::link && control->source == key.source
+          && control->target == key.target) {
+            capacities[1] = control->capacity;
+        } else if (
+          control->kind == control_kind::ingress
+          && control->source == key.target) {
+            capacities[2] = control->capacity;
+        }
+    }
+    // Zero egress/link pauses every transfer. A later enabling control must
+    // re-prove its deadline. Dropped packets don't consume receiver ingress.
+    for (std::size_t index = 0; index < 2; ++index) {
+        if (
+          !capacities[index].is_unlimited()
+          && capacities[index].bytes_per_second() == 0) {
+            return true;
+        }
+    }
+    std::optional<std::uint64_t> minimum;
+    for (const auto capacity : capacities) {
+        if (
+          !capacity.is_unlimited() && capacity.bytes_per_second() != 0
+          && (!minimum || capacity.bytes_per_second() < *minimum)) {
+            minimum = capacity.bytes_per_second();
+        }
+    }
+    auto remaining = bandwidth_fraction::whole(direction.pending_transfer_bytes)
+                       .add(bandwidth_fraction::whole(extra_bytes));
+    if (direction.transmitter_slot) {
+        const auto& flow = flows[*direction.transmitter_slot];
+        if (flow.active) {
+            const auto& packet = packets[flow.packet_slot];
+            const auto progress = bandwidth_transfer(
+              flow.rate,
+              runtime::monotonic_duration{
+                scheduler_->now().nanoseconds()
+                - flow.last_update.nanoseconds()},
+              flow.remaining);
+            remaining = remaining
+                          .subtract(
+                            bandwidth_fraction::whole(
+                              packet.logical_charge.value()))
+                          .add(progress);
+        }
+    }
+    const auto maximum = scheduler_->limits().maximum_deadline().nanoseconds();
+    auto start = scheduler_->now().nanoseconds();
+    if (direction.gap_scheduled) {
+        start = std::max(start, direction.gap_deadline.nanoseconds());
+    }
+    if (direction.deferred_clone) {
+        start = std::max(start, direction.deferred_ready_at.nanoseconds());
+    }
+    if (
+      start > maximum || direction.pending_tail_ns > maximum - start
+      || extra_tail > maximum - start - direction.pending_tail_ns) {
+        return false;
+    }
+    const auto available = maximum - start - direction.pending_tail_ns
+                           - extra_tail;
+    if (!minimum) {
+        return true;
+    }
+    auto rate = bandwidth_fraction::ratio(
+      *minimum, config_.maximum_active_flows);
+    if (!rate) {
+        return false;
+    }
+    auto duration = bandwidth_duration(
+      bandwidth_rate::finite(std::move(*rate)), remaining);
+    return duration && *duration && (**duration).nanoseconds() <= available;
+}
+
+bool fake_network::impl::control_fits_deadline(
+  const control_operation& control) const noexcept {
+    if (
+      control.kind != control_kind::egress && control.kind != control_kind::link
+      && control.kind != control_kind::ingress
+      && control.kind != control_kind::unclog) {
+        return true;
+    }
+    for (const auto& flow : flows) {
+        if (flow.pair == 0) {
+            continue;
+        }
+        const auto* pair = find_pair(flow.pair);
+        if (
+          pair != nullptr
+          && !direction_fits_deadline(*pair, flow.side, 0, 0, &control)) {
+            return false;
+        }
+    }
+    return true;
 }
 
 runtime::result<fake_network::impl::prepared_network_fault>
@@ -5035,9 +5501,7 @@ void fake_network::impl::start_next_packet(
         return;
     }
     auto& direction = pair->directions[direction_index];
-    if (
-      direction.transmitter != transmitter_state::ready
-      || !direction.transmitter_slot) {
+    if (direction.transmitter != transmitter_state::ready) {
         return;
     }
     while (direction.deferred_clone || !direction.transmit_queue.empty()) {
@@ -5068,6 +5532,15 @@ void fake_network::impl::start_next_packet(
           fake_network_state_invariant,
           packet->phase == packet_phase::queued,
           "fake transmitter dequeued a non-queued packet");
+        if (packet->disconnect) {
+            retire_packet(token.slot, errc::network_failure);
+            reset_pair(pair_id, direction_index);
+            return;
+        }
+        KWAQUE_INVARIANT(
+          fake_network_state_invariant,
+          direction.transmitter_slot.has_value(),
+          "queued data packet has no reserved transmitter slot");
         const auto flow_slot = *direction.transmitter_slot;
         auto& flow = flows[flow_slot];
         KWAQUE_INVARIANT(
@@ -5091,12 +5564,12 @@ void fake_network::impl::start_next_packet(
             return;
         }
         auto rebalance_trace = std::move(packet->start_rebalance_trace);
-        auto wake_trace = std::move(packet->start_wake_trace);
+        auto wake = std::move(packet->start_wake);
         const auto packet_id = packet->id;
         const staged_flow_start staged{.packet = token, .flow_slot = flow_slot};
         if (!rebalance_bandwidth(
               std::move(rebalance_trace),
-              std::move(wake_trace),
+              std::move(wake),
               packet_id,
               nullptr,
               &staged)) {
@@ -5117,15 +5590,17 @@ void fake_network::impl::start_next_packet(
         }
         return;
     }
-    const auto flow_slot = *direction.transmitter_slot;
-    flows[flow_slot] = flow_state{};
-    free_flows.push_back(flow_slot);
-    direction.transmitter_slot.reset();
+    if (direction.transmitter_slot) {
+        const auto flow_slot = *direction.transmitter_slot;
+        flows[flow_slot] = flow_state{};
+        free_flows.push_back(flow_slot);
+        direction.transmitter_slot.reset();
+    }
 }
 
 bool fake_network::impl::rebalance_bandwidth(
   event_trace::reservation trace,
-  event_trace::reservation wake_trace,
+  bandwidth_wake wake,
   std::uint64_t stable_id,
   const control_operation* staged_control,
   const staged_flow_start* staged_start) noexcept {
@@ -5392,6 +5867,7 @@ bool fake_network::impl::rebalance_bandwidth(
           "fake bandwidth replacement lost its scheduled wake-up");
         bandwidth_scheduled_ = false;
         bandwidth_flow_id_ = 0;
+        bandwidth_replacement_id_.release();
         auto replacement = scheduler_->reserve_event_slot();
         KWAQUE_INVARIANT(
           fake_network_state_invariant,
@@ -5404,23 +5880,15 @@ bool fake_network::impl::rebalance_bandwidth(
           .source = staged_control->source, .target = staged_control->target};
         switch (staged_control->kind) {
         case control_kind::egress:
-            if (staged_control->capacity == config_.egress_capacity) {
-                egress_limits.erase(staged_control->source);
-            } else {
-                egress_limits.at(
-                  staged_control->source) = staged_control->capacity;
-            }
+            egress_limits.at(staged_control->source).value
+              = staged_control->capacity;
             break;
         case control_kind::link:
             find_link(staged_key)->capacity = staged_control->capacity;
             break;
         case control_kind::ingress:
-            if (staged_control->capacity == config_.ingress_capacity) {
-                ingress_limits.erase(staged_control->source);
-            } else {
-                ingress_limits.at(
-                  staged_control->source) = staged_control->capacity;
-            }
+            ingress_limits.at(staged_control->source).value
+              = staged_control->capacity;
             break;
         case control_kind::partition:
         case control_kind::heal:
@@ -5484,6 +5952,11 @@ bool fake_network::impl::rebalance_bandwidth(
     if (!earliest) {
         return true;
     }
+    KWAQUE_INVARIANT(
+      fake_network_state_invariant,
+      wake.id.active(),
+      "bandwidth wake has no reserved replacement ID");
+    bandwidth_replacement_id_ = std::move(wake.id);
     bandwidth_event_reservation_.release();
     auto scheduled = scheduler_->schedule(
       *deadline,
@@ -5496,7 +5969,7 @@ bool fake_network::impl::rebalance_bandwidth(
         .stable_id = earliest_flow,
       },
       event_cleanup_policy::invoke,
-      std::move(wake_trace));
+      std::move(wake.trace));
     if (!scheduled && scheduler_->trace_failed()) {
         terminal_schedule_failed_ = true;
         return false;
@@ -5518,6 +5991,7 @@ void fake_network::impl::complete_bandwidth() noexcept {
         force_discard_all(*scheduler_->trace_failure());
         return;
     }
+    bandwidth_replacement_id_.release();
     auto replacement = scheduler_->reserve_event_slot();
     KWAQUE_INVARIANT(
       fake_network_state_invariant,
@@ -5526,11 +6000,11 @@ void fake_network::impl::complete_bandwidth() noexcept {
     bandwidth_event_reservation_ = std::move(*replacement);
     const auto stable_id = std::exchange(bandwidth_flow_id_, 0U);
     event_trace::reservation trace;
-    event_trace::reservation wake_trace;
+    bandwidth_wake wake;
     for (auto& flow : flows) {
         if (flow.active && packets[flow.packet_slot].id == stable_id) {
             trace = std::move(packets[flow.packet_slot].finish_rebalance_trace);
-            wake_trace = std::move(packets[flow.packet_slot].finish_wake_trace);
+            wake = std::move(packets[flow.packet_slot].finish_wake);
             break;
         }
     }
@@ -5539,7 +6013,7 @@ void fake_network::impl::complete_bandwidth() noexcept {
       stable_id != 0,
       "fake bandwidth wake lost its stable flow ID");
     static_cast<void>(
-      rebalance_bandwidth(std::move(trace), std::move(wake_trace), stable_id));
+      rebalance_bandwidth(std::move(trace), std::move(wake), stable_id));
     if (terminal_schedule_failed_) {
         force_discard_all(*scheduler_->trace_failure());
     }
@@ -5569,6 +6043,7 @@ bool fake_network::impl::finish_flow(std::uint16_t flow_slot) noexcept {
     flow.active = false;
     flow.remaining = bandwidth_fraction{};
     flow.rate = bandwidth_rate::unlimited();
+    release_transfer_charge(packet);
     packet.phase = packet_phase::propagating;
     direction.current_packet.reset();
     direction.transmitter = transmitter_state::interframe;
@@ -5617,6 +6092,10 @@ bool fake_network::impl::finish_flow(std::uint16_t flow_slot) noexcept {
       gap.has_value(),
       "fake transmitter could not schedule reserved interframe completion");
     direction.gap_event = *gap;
+    direction.gap_deadline = *gap_deadline;
+    if (packet.clone) {
+        direction.deferred_ready_at = *delivery_deadline;
+    }
     direction.gap_scheduled = true;
 
     packet.delivery_event_reservation.release();
@@ -5709,7 +6188,7 @@ void fake_network::impl::complete_delivery(
       "fake delivery lost its directed link");
     if (link->clogged) {
         packet->phase = packet_phase::ready_clogged;
-        link->ready.push_back(packet_token{.id = packet_id, .slot = slot});
+        link->ready.insert(*packet);
         return;
     }
     apply_delivery(slot, packet_id);
@@ -5794,73 +6273,55 @@ bool fake_network::impl::schedule_ready_delivery(link_state& link) noexcept {
     if (link.clogged || link.ready_chain_scheduled) {
         return true;
     }
-    while (!link.ready.empty()) {
-        const auto token = link.ready.front();
-        auto* packet = find_packet(token);
-        if (packet == nullptr || packet->phase != packet_phase::ready_clogged) {
-            link.ready.pop_front();
-            continue;
-        }
-        packet->ready_event_reservation.release();
-        auto scheduled = scheduler_->schedule(
-          scheduler_->now(),
-          event_priority::normal(),
-          [this, key = link.key, token] noexcept {
-              complete_ready_delivery(key, token.slot, token.id);
-          },
-          trace_event_descriptor{
-            .kind = trace_event_kind::network,
-            .domain = static_cast<std::uint32_t>(network_trace_phase::delivery),
-            .stable_id = token.id,
-          },
-          event_cleanup_policy::invoke,
-          std::move(packet->ready_trace));
-        if (!scheduled && scheduler_->trace_failed()) {
-            terminal_schedule_failed_ = true;
-            return false;
-        }
-        KWAQUE_INVARIANT(
-          fake_network_state_invariant,
-          scheduled.has_value(),
-          "fake unclog could not schedule bounded ready delivery");
-        link.ready_chain_event = *scheduled;
-        link.ready_chain_scheduled = true;
+    if (link.ready.empty()) {
+        link.delivery_budget.reset();
         return true;
     }
-    if (!link.ready_fins.empty()) {
-        const auto fin = link.ready_fins.front();
-        auto* pair = find_pair(fin.pair);
-        KWAQUE_INVARIANT(
-          fake_network_state_invariant,
-          pair != nullptr,
-          "fake ready FIN lost its connection pair");
-        auto& endpoint = pair->endpoints[fin.side];
-        endpoint.fin_ready_event_reservation.release();
-        auto scheduled = scheduler_->schedule(
-          scheduler_->now(),
-          event_priority::normal(),
-          [this, key = link.key, fin] noexcept {
-              complete_ready_fin(key, fin);
-          },
-          trace_event_descriptor{
-            .kind = trace_event_kind::network,
-            .domain = static_cast<std::uint32_t>(network_trace_phase::fin),
-            .stable_id = fin.pair,
-            .coordinate_a = fin.side,
-          },
-          event_cleanup_policy::invoke,
-          std::move(endpoint.fin_ready_trace));
-        if (!scheduled && scheduler_->trace_failed()) {
-            terminal_schedule_failed_ = true;
-            return false;
-        }
-        KWAQUE_INVARIANT(
-          fake_network_state_invariant,
-          scheduled.has_value(),
-          "fake unclog could not schedule bounded ready FIN");
-        link.ready_chain_event = *scheduled;
-        link.ready_chain_scheduled = true;
+    KWAQUE_INVARIANT(
+      fake_network_state_invariant,
+      link.delivery_budget && link.delivery_budget->attempts != 0,
+      "ready delivery exhausted its admitted attempt inventory");
+    auto& budget = *link.delivery_budget;
+    auto& packet = *link.ready.begin();
+    const packet_token token{.id = packet.id, .slot = packet.slot};
+    auto id = budget.ids.split(1);
+    runtime::result<event_trace::reservation> trace{event_trace::reservation{}};
+    if (budget.trace.active()) {
+        trace = budget.trace.split(2);
     }
+    KWAQUE_INVARIANT(
+      fake_network_state_invariant,
+      id.has_value() && trace.has_value(),
+      "ready delivery lost its counted reservation");
+    --budget.attempts;
+    budget.selected_id = std::move(*id);
+    budget.event.release();
+    auto scheduled = scheduler_->schedule(
+      scheduler_->now(),
+      event_priority::normal(),
+      [this, key = link.key, token] noexcept {
+          complete_ready_delivery(key, token.slot, token.id);
+      },
+      trace_event_descriptor{
+        .kind = trace_event_kind::network,
+        .domain = static_cast<std::uint32_t>(
+          packet.fin ? network_trace_phase::fin
+                     : network_trace_phase::delivery),
+        .stable_id = packet.fin ? packet.pair : packet.id,
+        .coordinate_a = packet.fin ? packet.side : 0U,
+      },
+      event_cleanup_policy::invoke,
+      std::move(*trace));
+    if (!scheduled && scheduler_->trace_failed()) {
+        terminal_schedule_failed_ = true;
+        return false;
+    }
+    KWAQUE_INVARIANT(
+      fake_network_state_invariant,
+      scheduled.has_value(),
+      "ready delivery lost its reserved scheduler capacity");
+    link.ready_chain_event = *scheduled;
+    link.ready_chain_scheduled = true;
     return true;
 }
 
@@ -5871,41 +6332,31 @@ void fake_network::impl::complete_ready_delivery(
         return;
     }
     link->ready_chain_scheduled = false;
-    if (link->clogged || link->ready.empty()) {
+    if (scheduler_->discarding_failed_event()) {
+        link->delivery_budget.reset();
         return;
     }
-    const auto token = link->ready.front();
+    auto& budget = *link->delivery_budget;
+    budget.selected_id.release();
+    auto replacement = scheduler_->reserve_event_slot();
     KWAQUE_INVARIANT(
       fake_network_state_invariant,
-      token.slot == slot && token.id == packet_id,
-      "fake ready-delivery chain changed order");
-    link->ready.pop_front();
-    apply_delivery(slot, packet_id);
-    if (!scheduler_->trace_failed()) {
-        static_cast<void>(schedule_ready_delivery(*link));
-    }
-    if (terminal_schedule_failed_) {
-        force_discard_all(*scheduler_->trace_failure());
-    }
-}
-
-void fake_network::impl::complete_ready_fin(
-  directed_link_key key, fin_token fin) noexcept {
-    auto* link = find_link(key);
-    if (link == nullptr) {
+      replacement.has_value(),
+      "ready delivery lost its reserved successor slot");
+    budget.event = std::move(*replacement);
+    if (link->clogged) {
+        link->delivery_budget.reset();
         return;
     }
-    link->ready_chain_scheduled = false;
-    if (link->clogged || link->ready_fins.empty()) {
-        return;
+    auto* packet = find_packet(slot, packet_id);
+    if (packet != nullptr && packet->ready_hook.is_linked()) {
+        link->ready.erase(link->ready.iterator_to(*packet));
+        if (packet->fin) {
+            deliver_fin(packet->pair, packet->side);
+        } else {
+            apply_delivery(slot, packet_id);
+        }
     }
-    const auto front = link->ready_fins.front();
-    KWAQUE_INVARIANT(
-      fake_network_state_invariant,
-      front.pair == fin.pair && front.side == fin.side,
-      "fake ready FIN chain changed order");
-    link->ready_fins.pop_front();
-    deliver_fin(fin.pair, fin.side);
     if (!scheduler_->trace_failed()) {
         static_cast<void>(schedule_ready_delivery(*link));
     }
@@ -5934,6 +6385,9 @@ void fake_network::impl::release_sequences(
                 delivered_any = true;
             }
             direction.fin_sequence.reset();
+            if (direction.fin_packet) {
+                destroy_packet(direction.fin_packet->slot);
+            }
             direction.fin_arrived = false;
             direction.fin_retired = false;
             if (
@@ -6016,6 +6470,7 @@ void fake_network::impl::destroy_packet(std::uint32_t slot) noexcept {
       pair != nullptr,
       "fake packet outlived its connection pair");
     auto& direction = pair->directions[packet.side];
+    release_transfer_charge(packet);
     direction.logical_bytes = *direction.logical_bytes.checked_sub(
       packet.data.size());
     KWAQUE_INVARIANT(
@@ -6029,26 +6484,32 @@ void fake_network::impl::destroy_packet(std::uint32_t slot) noexcept {
       packet.logical_charge);
     packet_retained_bytes = *packet_retained_bytes.checked_sub(
       packet.retained_charge);
-    auto* link = find_link(packet.link);
-    KWAQUE_INVARIANT(
-      fake_network_state_invariant,
-      link != nullptr && link->packets != 0,
-      "fake packet lost its directed-link ownership");
-    --link->packets;
+    if (!packet.disconnect) {
+        auto* link = find_link(packet.link);
+        KWAQUE_INVARIANT(
+          fake_network_state_invariant,
+          link != nullptr && link->packets != 0,
+          "fake packet lost its directed-link ownership");
+        --link->packets;
+        if (packet.ready_hook.is_linked()) {
+            link->ready.erase(link->ready.iterator_to(packet));
+        }
+    }
+    if (packet.fin) {
+        direction.fin_packet.reset();
+    }
     packet.delivery_event_reservation.release();
     packet.delivery_trace.release();
     packet.gap_event_reservation.release();
     packet.gap_trace.release();
-    packet.ready_event_reservation.release();
-    packet.ready_trace.release();
     packet.flow_start_trace.release();
     packet.transfer_trace.release();
     packet.packet_effect_trace.release();
     packet.sequence_trace.release();
     packet.start_rebalance_trace.release();
     packet.finish_rebalance_trace.release();
-    packet.start_wake_trace.release();
-    packet.finish_wake_trace.release();
+    packet.start_wake = bandwidth_wake{};
+    packet.finish_wake = bandwidth_wake{};
     packet.data = bytes::fragmented_buffer{};
     const auto stable_slot = packet.slot;
     packet = packet_state{};
@@ -6062,6 +6523,22 @@ void fake_network::impl::retire_packet(
     if (
       packet.phase == packet_phase::free
       || packet.phase == packet_phase::retired) {
+        return;
+    }
+    if (packet.fin) {
+        auto* pair = find_pair(packet.pair);
+        auto& direction = pair->directions[packet.side];
+        if (packet.delivery_scheduled) {
+            static_cast<void>(scheduler_->cancel(packet.delivery_event));
+            packet.delivery_scheduled = false;
+            pair->endpoints[packet.side].fin_scheduled = false;
+        }
+        if (packet.ready_hook.is_linked()) {
+            auto* link = find_link(packet.link);
+            link->ready.erase(link->ready.iterator_to(packet));
+        }
+        direction.fin_retired = true;
+        release_sequences(packet.pair, packet.side);
         return;
     }
     if (
@@ -6136,10 +6613,18 @@ void fake_network::impl::retire_packet(
       fake_network_state_invariant,
       direction.sequence_statuses[sequence_index] == sequence_status::live,
       "fake retired packet lost its sequence reservation");
+    const bool releases_deferred = direction.deferred_clone
+                                   && direction.deferred_clone->id == packet.id;
+    if (releases_deferred) {
+        direction.deferred_clone.reset();
+    }
     direction.sequence_statuses[sequence_index] = sequence_status::retired;
     packet.phase = packet_phase::retired;
     destroy_packet(slot);
     release_sequences(pair_id, side);
+    if (releases_deferred) {
+        start_next_packet(pair_id, side);
+    }
 }
 
 void fake_network::impl::abort_write(std::uint64_t operation_id) noexcept {
@@ -6156,21 +6641,21 @@ void fake_network::impl::abort_write(std::uint64_t operation_id) noexcept {
 }
 
 void fake_network::impl::complete_immediate_write(
-  std::uint64_t operation_id, errc code, bool disconnect) noexcept {
+  std::uint64_t operation_id) noexcept {
     auto* operation = find_operation(operation_id);
     if (operation == nullptr) {
         return;
     }
     auto& write = std::get<write_operation>(operation->payload);
-    const auto pair_id = write.pair;
-    const auto side = write.side;
     auto done = std::move(write.done);
     write.admission.reset();
     operations.erase(operation_id);
-    if (disconnect && find_pair(pair_id) != nullptr) {
-        reset_pair(pair_id, side);
-    }
-    done.set_value(runtime::failure(network_error(code)));
+    const auto* failure = scheduler_->discarding_failed_event()
+                            ? scheduler_->trace_failure()
+                            : nullptr;
+    done.set_value(
+      runtime::failure(
+        failure != nullptr ? *failure : network_error(errc::fault_injected)));
 }
 
 void fake_network::impl::complete_parked_connection_operation(
@@ -6237,15 +6722,18 @@ void fake_network::impl::maybe_wake_read(
       fake_network_state_invariant,
       state != nullptr,
       "fake read wake lost operation state");
-    const auto& read = std::get<read_operation>(state->payload);
+    auto& read = std::get<read_operation>(state->payload);
     auto deadline = scheduler_->now();
     if (read.fault.action() == runtime::fault_action::delay) {
-        auto delayed = deadline.checked_add(*read.fault.delay());
+        auto delayed = add_deadline(
+          deadline,
+          *read.fault.delay(),
+          scheduler_->limits().maximum_deadline());
         if (!delayed) {
-            complete_read_terminal(operation);
-            return;
+            read.completion_error = delayed.error();
+        } else {
+            deadline = *delayed;
         }
-        deadline = *delayed;
     }
     if (auto scheduled = schedule_read(operation, deadline); !scheduled) {
         complete_read_terminal(operation);
@@ -6329,15 +6817,43 @@ fake_network::shutdown_output(std::uint64_t pair_id, std::uint8_t side) {
         return runtime::failure(network_error(errc::closed));
     }
     auto& direction = pair->directions[side];
-    if (direction.sequence_exhausted) {
+    if (direction.sequence_exhausted || impl_->packet_ids_exhausted) {
         return runtime::failure(network_error(errc::out_of_range));
     }
+    if (
+      impl_->free_packets.empty()
+      || direction.packet_count == config_.maximum_direction_packets
+      || direction.sequence_entries == direction.sequence_slots.size()) {
+        return runtime::failure(network_error(errc::queue_full));
+    }
+    // Unflushed work is retired by shutdown. Only an existing interframe
+    // gap can delay this zero-byte control's transmitter readiness.
+    const auto ready_at = direction.gap_scheduled ? direction.gap_deadline
+                                                  : scheduler_->now();
     const auto deadline = add_deadline(
-      scheduler_->now(),
-      config_.fin_latency,
-      scheduler_->limits().maximum_deadline());
+      ready_at, config_.fin_latency, scheduler_->limits().maximum_deadline());
     if (!deadline) {
         return runtime::failure(deadline.error());
+    }
+    const impl::directed_link_key key{
+      .source = endpoint.local.address(), .target = endpoint.remote.address()};
+    auto* link = impl_->find_link(key);
+    const bool inserted_link = link == nullptr;
+    if (inserted_link) {
+        if (
+          impl_->links.size() == config_.maximum_links
+          || impl_->link_ids_exhausted) {
+            return runtime::failure(network_error(errc::queue_full));
+        }
+        auto prepared = std::make_unique<impl::link_state>(
+          impl_->next_link_id,
+          key,
+          config_.link_capacity,
+          config_.latency_min,
+          config_.latency_mean_parameter);
+        link = prepared.get();
+        impl_->links.emplace(key, std::move(prepared));
+        impl_->track_link(*link);
     }
     endpoint.fin_event_reservation.release();
     auto fin = scheduler_->schedule(
@@ -6353,7 +6869,31 @@ fake_network::shutdown_output(std::uint64_t pair_id, std::uint8_t side) {
       event_cleanup_policy::invoke,
       std::move(endpoint.fin_trace));
     if (!fin) {
+        if (inserted_link) {
+            impl_->erase_link(key);
+        }
         return runtime::failure(fin.error());
+    }
+    const auto slot = impl_->free_packets.front();
+    impl_->free_packets.pop_front();
+    auto& packet = impl_->packets[slot];
+    packet.id = impl_->next_packet_id;
+    packet.pair = pair_id;
+    packet.side = side;
+    packet.link = key;
+    packet.sequence = direction.next_sequence;
+    packet.fin = true;
+    packet.phase = impl::packet_phase::propagating;
+    packet.delivery_event = *fin;
+    packet.delivery_scheduled = true;
+    direction.fin_packet = impl::packet_token{.id = packet.id, .slot = slot};
+    ++direction.packet_count;
+    ++impl_->live_packets;
+    ++link->packets;
+    impl_->track_packet(packet);
+    impl_->issue_packet_id();
+    if (inserted_link) {
+        impl_->issue_link_id();
     }
     endpoint.fin_event = *fin;
     endpoint.fin_scheduled = true;
@@ -6368,7 +6908,7 @@ fake_network::shutdown_output(std::uint64_t pair_id, std::uint8_t side) {
     }
     bool removed_active = false;
     event_trace::reservation rebalance_trace;
-    event_trace::reservation wake_trace;
+    impl::bandwidth_wake wake;
     std::uint64_t rebalance_id = 0;
     for (const auto token : direction.sequence_slots) {
         auto* packet = impl_->find_packet(token);
@@ -6382,7 +6922,7 @@ fake_network::shutdown_output(std::uint64_t pair_id, std::uint8_t side) {
         if (active) {
             rebalance_id = packet->id;
             rebalance_trace = std::move(packet->finish_rebalance_trace);
-            wake_trace = std::move(packet->finish_wake_trace);
+            wake = std::move(packet->finish_wake);
         }
         impl_->retire_packet(
           token.slot, active ? errc::network_failure : errc::closed);
@@ -6391,7 +6931,7 @@ fake_network::shutdown_output(std::uint64_t pair_id, std::uint8_t side) {
     direction.deferred_clone.reset();
     if (removed_active) {
         static_cast<void>(impl_->rebalance_bandwidth(
-          std::move(rebalance_trace), std::move(wake_trace), rebalance_id));
+          std::move(rebalance_trace), std::move(wake), rebalance_id));
     }
     if (!direction.gap_scheduled && direction.transmitter_slot) {
         const auto slot = *direction.transmitter_slot;
@@ -6412,6 +6952,15 @@ void fake_network::impl::deliver_fin(
     auto& source = pair->endpoints[side];
     source.fin_scheduled = false;
     auto& direction = pair->directions[side];
+    auto* packet = direction.fin_packet ? find_packet(*direction.fin_packet)
+                                        : nullptr;
+    if (packet == nullptr) {
+        return;
+    }
+    packet->delivery_scheduled = false;
+    if (packet->phase == packet_phase::propagating) {
+        packet->ready_at = scheduler_->now();
+    }
     if (
       scheduler_->discarding_failed_event() || source.abort_requested
       || source.peer_reset) {
@@ -6423,7 +6972,8 @@ void fake_network::impl::deliver_fin(
       .source = source.local.address(), .target = source.remote.address()};
     auto* link = find_link(key);
     if (link != nullptr && link->clogged) {
-        link->ready_fins.push_back(fin_token{.pair = pair_id, .side = side});
+        packet->phase = packet_phase::ready_clogged;
+        link->ready.insert(*packet);
         return;
     }
     if (link != nullptr && link->partitioned) {
@@ -6523,7 +7073,7 @@ void fake_network::impl::fail_endpoint_operations(
     auto& outgoing = pair->directions[side];
     bool removed_active = false;
     event_trace::reservation rebalance_trace;
-    event_trace::reservation wake_trace;
+    bandwidth_wake wake;
     std::uint64_t rebalance_id = 0;
     for (const auto token : outgoing.sequence_slots) {
         auto* packet = find_packet(token);
@@ -6535,27 +7085,26 @@ void fake_network::impl::fail_endpoint_operations(
         if (active) {
             rebalance_id = packet->id;
             rebalance_trace = std::move(packet->finish_rebalance_trace);
-            wake_trace = std::move(packet->finish_wake_trace);
+            wake = std::move(packet->finish_wake);
         }
         retire_packet(token.slot, code);
     }
-    work_ids.clear();
-    for (const auto& [operation_id, operation] : operations) {
-        const auto* write = std::get_if<write_operation>(&operation->payload);
-        const auto* read = std::get_if<read_operation>(&operation->payload);
-        if (
+    for (auto next = operations.begin(); next != operations.end();) {
+        auto* operation = &*next++;
+        const auto operation_id = operation->id;
+        {
+            const auto* write = std::get_if<write_operation>(
+              &operation->payload);
+            const auto* read = std::get_if<read_operation>(&operation->payload);
+            if (!(
           (write != nullptr && write->pair == pair_id && write->side == side
            && write->parked)
           || (read != nullptr && read->pair == pair_id && read->side == side
-              && read->parked)) {
-            work_ids.push_back(operation_id);
+              && read->parked))) {
+                continue;
+            }
         }
-    }
-    for (const auto operation_id : work_ids) {
-        auto* operation = find_operation(operation_id);
-        if (operation == nullptr) {
-            continue;
-        }
+
         if (auto* read = std::get_if<read_operation>(&operation->payload)) {
             read->terminal_event.release();
             auto terminal = scheduler_->schedule(
@@ -6614,7 +7163,7 @@ void fake_network::impl::fail_endpoint_operations(
     outgoing.transmitter = transmitter_state::ready;
     if (removed_active) {
         static_cast<void>(rebalance_bandwidth(
-          std::move(rebalance_trace), std::move(wake_trace), rebalance_id));
+          std::move(rebalance_trace), std::move(wake), rebalance_id));
     }
 }
 
@@ -6655,6 +7204,16 @@ void fake_network::impl::reset_pair(
             endpoint.fin_scheduled = false;
         }
         auto& direction = pair->directions[side];
+        if (direction.fin_packet) {
+            auto* packet = find_packet(*direction.fin_packet);
+            if (packet != nullptr) {
+                packet->delivery_scheduled = false;
+                auto* link = find_link(packet->link);
+                if (packet->ready_hook.is_linked()) {
+                    link->ready.erase(link->ready.iterator_to(*packet));
+                }
+            }
+        }
         if (direction.fin_sequence) {
             direction.fin_retired = true;
         }
@@ -6664,23 +7223,22 @@ void fake_network::impl::reset_pair(
     fail_endpoint_operations(pair_id, initiator, errc::aborted);
     fail_endpoint_operations(
       pair_id, other_side(initiator), errc::network_failure);
-    work_ids.clear();
-    for (const auto& [operation_id, operation] : operations) {
-        const auto* connect = std::get_if<connect_operation>(
-          &operation->payload);
-        const auto* accept = std::get_if<accept_operation>(&operation->payload);
-        if (
+    for (auto next = operations.begin(); next != operations.end();) {
+        auto* operation = &*next++;
+        const auto operation_id = operation->id;
+        {
+            const auto* connect = std::get_if<connect_operation>(
+              &operation->payload);
+            const auto* accept = std::get_if<accept_operation>(
+              &operation->payload);
+            if (!(
           (connect != nullptr && connect->pair == pair_id && connect->parked)
           || (accept != nullptr && accept->pair && *accept->pair == pair_id
-              && accept->parked)) {
-            work_ids.push_back(operation_id);
+              && accept->parked))) {
+                continue;
+            }
         }
-    }
-    for (const auto operation_id : work_ids) {
-        auto* operation = find_operation(operation_id);
-        if (operation == nullptr) {
-            continue;
-        }
+
         auto* connect = std::get_if<connect_operation>(&operation->payload);
         auto* accept = std::get_if<accept_operation>(&operation->payload);
         const auto owner_side = connect != nullptr ? std::uint8_t{0}
@@ -6753,8 +7311,18 @@ fake_network::close_connection(std::uint64_t pair_id, std::uint8_t side) {
           runtime::result<void>{});
     }
     auto& endpoint = pair->endpoints[side];
+    if (endpoint.parked_close_operation) {
+        auto* operation = impl_->find_operation(
+          *endpoint.parked_close_operation);
+        if (operation != nullptr) {
+            auto& closing = std::get<impl::close_operation>(operation->payload);
+            if (closing.done) {
+                return closing.done->get_shared_future();
+            }
+        }
+    }
     if (endpoint.state == runtime::network_connection_state::closed) {
-        return endpoint.close_done && endpoint.close_done->available()
+        return endpoint.close_done
                  ? endpoint.close_done->get_shared_future()
                  : seastar::make_ready_future<runtime::result<void>>(
                      runtime::result<void>{});
@@ -6799,11 +7367,49 @@ fake_network::close_connection(std::uint64_t pair_id, std::uint8_t side) {
         return seastar::make_ready_future<runtime::result<void>>(
           runtime::failure(parked_credit.error()));
     }
+    impl::operation_pool::handle parked_operation;
+    if (
+      prepared_fault->decision.action()
+      == runtime::fault_action::drop_completion) {
+        if (
+          impl_->operations.size() == config_.maximum_operations
+          || impl_->operation_ids_exhausted) {
+            endpoint.close_done.reset();
+            return ready_failure<void>(errc::queue_full);
+        }
+        const auto id = impl_->next_operation_id;
+        auto terminal = impl_->reserve_terminal(
+          trace_event_kind::network,
+          static_cast<std::uint32_t>(network_trace_phase::stop),
+          id,
+          trace_action::stop_terminal,
+          0,
+          0,
+          0,
+          static_cast<std::uint32_t>(errc::aborted));
+        if (!terminal) {
+            endpoint.close_done.reset();
+            return seastar::make_ready_future<runtime::result<void>>(
+              runtime::failure(terminal.error()));
+        }
+        parked_operation = impl_->operations.make(
+          id,
+          impl::operation_payload{std::in_place_type<impl::close_operation>},
+          std::move(*parked_credit));
+        parked_operation->stop_event = std::move(terminal->first);
+        parked_operation->stop_trace = std::move(terminal->second);
+    }
     auto committed = impl_->commit_fault(*prepared_fault);
     if (!committed) {
         endpoint.close_done.reset();
         return seastar::make_ready_future<runtime::result<void>>(
           runtime::failure(committed.error()));
+    }
+    if (parked_operation) {
+        endpoint.parked_close_operation = parked_operation->id;
+        const auto id = parked_operation->id;
+        impl_->operations.emplace(id, std::move(parked_operation));
+        impl_->issue_operation_id();
     }
     endpoint.close_fault = prepared_fault->decision;
     endpoint.close_drop_completion = endpoint.close_fault.action()
@@ -6831,6 +7437,10 @@ fake_network::close_connection(std::uint64_t pair_id, std::uint8_t side) {
         endpoint.state = runtime::network_connection_state::closed;
         endpoint.close_parked_credit.release();
         endpoint.close_done->set_value(runtime::failure(closed.error()));
+        if (endpoint.parked_close_operation) {
+            impl_->operations.erase(*endpoint.parked_close_operation);
+            endpoint.parked_close_operation.reset();
+        }
     } else {
         endpoint.close_event = *closed;
     }
@@ -6853,6 +7463,10 @@ void fake_network::impl::complete_connection_close(
     if (failure != nullptr) {
         endpoint.close_parked_credit.release();
         endpoint.close_done->set_value(runtime::failure(*failure));
+        if (endpoint.parked_close_operation) {
+            operations.erase(*endpoint.parked_close_operation);
+            endpoint.parked_close_operation.reset();
+        }
     } else if (endpoint.close_drop_completion) {
         auto observed = scheduler_->observe_effect(
           trace_event_descriptor{
@@ -6867,6 +7481,11 @@ void fake_network::impl::complete_connection_close(
         if (!observed) {
             return;
         }
+        auto* operation = find_operation(*endpoint.parked_close_operation);
+        auto& closing = std::get<close_operation>(operation->payload);
+        closing.done.emplace(std::move(*endpoint.close_done));
+        endpoint.close_done.reset();
+        collect_pair(pair_id);
         return;
     } else if (endpoint.close_fault.action() == runtime::fault_action::error) {
         endpoint.close_parked_credit.release();
@@ -6916,7 +7535,16 @@ void fake_network::impl::collect_pair(std::uint64_t pair_id) noexcept {
       || pair->directions[0].fin_sequence || pair->directions[1].fin_sequence) {
         return;
     }
-    for (const auto& [operation_id, operation] : operations) {
+    KWAQUE_INVARIANT(
+      fake_network_drained_invariant,
+      pair->directions[0].pending_transfer_bytes == 0
+        && pair->directions[1].pending_transfer_bytes == 0
+        && pair->directions[0].pending_tail_ns == 0
+        && pair->directions[1].pending_tail_ns == 0,
+      "collected connection retained queued transfer credits");
+    for (const auto& entry : operations) {
+        const auto operation_id = entry.id;
+        const auto* operation = &entry;
         static_cast<void>(operation_id);
         bool references = false;
         std::visit(
@@ -6957,83 +7585,39 @@ void fake_network::impl::collect_pair(std::uint64_t pair_id) noexcept {
     pairs.erase(pair_id);
 }
 
-runtime::result<void> fake_network::impl::prepare_stop_batches() {
-    KWAQUE_INVARIANT(
-      fake_network_state_invariant,
-      stop_batches_.empty(),
-      "fake network retained stop-batch reservations while open");
-    const auto owners = operations.size() + live_packets + pairs.size()
-                        + listeners.size() + links.size() + 1U;
-    const auto batches = std::max<std::size_t>(
-      1U, (owners + config_.stop_batch - 1U) / config_.stop_batch);
-    if (
-      batches
-      > std::numeric_limits<std::uint64_t>::max() - next_stop_batch_id + 1U) {
-        return runtime::failure(network_error(errc::out_of_range));
-    }
-    if (batches > stop_event_capacity_.size()) {
-        return runtime::failure(network_error(errc::queue_full));
-    }
-    seastar::chunked_fifo<stop_batch_reservation, 32, 2> prepared;
-    prepared.reserve(batches);
-    for (std::size_t index = 0; index < batches; ++index) {
-        const auto id = next_stop_batch_id + index;
-        const trace_event_descriptor descriptor{
-          .kind = trace_event_kind::network,
-          .domain = static_cast<std::uint32_t>(network_trace_phase::stop),
-          .stable_id = id,
-        };
-        auto trace = scheduler_->reserve_trace(descriptor);
-        if (!trace) {
-            return runtime::failure(trace.error());
-        }
-        prepared.push_back(
-          stop_batch_reservation{
-            .trace = std::move(*trace),
-            .id = id,
-          });
-    }
-    for (auto& batch : prepared) {
-        batch.event = std::move(stop_event_capacity_.front());
-        stop_event_capacity_.pop_front();
-    }
-    stop_event_capacity_.clear();
-    next_stop_batch_id += batches;
-    stop_batches_ = std::move(prepared);
-    return {};
-}
-
 void fake_network::impl::schedule_stop_batch() noexcept {
     if (stop_batch_scheduled_) {
         return;
     }
-    if (stop_batches_.empty()) {
-        KWAQUE_INVARIANT(
-          fake_network_state_invariant,
-          !has_stop_preparation_work(),
-          "fake network exhausted stop batches before preparation drained");
-        maybe_finish_stop();
-        return;
+    auto id_credit = stop_id_capacity_.split(1);
+    runtime::result<event_trace::reservation> trace{event_trace::reservation{}};
+    if (stop_trace_capacity_.active()) {
+        trace = stop_trace_capacity_.split(2);
     }
-    auto batch = std::move(stop_batches_.front());
-    stop_batches_.pop_front();
-    batch.event.release();
-    const auto id = batch.id;
+    KWAQUE_INVARIANT(
+      fake_network_state_invariant,
+      id_credit.has_value() && trace.has_value(),
+      "network stop exhausted its admitted cleanup inventory");
+    active_stop_id_ = std::move(*id_credit);
+    stop_event_reservation_.release();
+    const auto id = next_stop_batch_id++;
     auto scheduled = scheduler_->schedule(
       scheduler_->now(),
       event_priority::highest(),
       [this] noexcept {
           stop_batch_scheduled_ = false;
-          if (scheduler_->discarding_failed_event()) [[unlikely]] {
-              const auto* failure = scheduler_->trace_failure();
-              KWAQUE_INVARIANT(
-                fake_network_state_invariant,
-                failure != nullptr,
-                "discarded network stop batch has no trace failure");
-              force_discard_all(*failure);
-          } else {
-              run_stop_batch();
+          if (scheduler_->discarding_failed_event()) {
+              force_discard_all(*scheduler_->trace_failure());
+              return;
           }
+          active_stop_id_.release();
+          auto replacement = scheduler_->reserve_event_slot();
+          KWAQUE_INVARIANT(
+            fake_network_state_invariant,
+            replacement.has_value(),
+            "network stop lost its reserved successor slot");
+          stop_event_reservation_ = std::move(*replacement);
+          run_stop_batch();
       },
       trace_event_descriptor{
         .kind = trace_event_kind::network,
@@ -7041,7 +7625,7 @@ void fake_network::impl::schedule_stop_batch() noexcept {
         .stable_id = id,
       },
       event_cleanup_policy::invoke,
-      std::move(batch.trace));
+      std::move(*trace));
     if (!scheduled) {
         force_discard_all(scheduled.error());
         return;
@@ -7055,8 +7639,8 @@ fake_network::impl::next_stop_operation() noexcept {
     if (found == operations.end()) {
         return nullptr;
     }
-    stop_operation_after = found->first;
-    return found->second.get();
+    stop_operation_after = found->id;
+    return &*found;
 }
 
 fake_network::impl::packet_state*
@@ -7119,6 +7703,7 @@ void fake_network::impl::run_stop_batch() noexcept {
                 bandwidth_flow_id_ = 0;
             }
             bandwidth_event_reservation_.release();
+            bandwidth_replacement_id_.release();
             free_flows.clear();
             for (std::uint16_t slot = 0; slot < flows.size(); ++slot) {
                 flows[slot] = flow_state{};
@@ -7146,7 +7731,9 @@ void fake_network::impl::run_stop_batch() noexcept {
     if (has_stop_preparation_work()) {
         schedule_stop_batch();
     } else {
-        stop_batches_.clear();
+        stop_event_reservation_.release();
+        stop_id_capacity_.release();
+        stop_trace_capacity_.release();
         maybe_finish_stop();
     }
 }
@@ -7271,6 +7858,14 @@ void fake_network::impl::discard_stop_packet(packet_state& packet) noexcept {
       pair != nullptr,
       "network stop packet lost its pair");
     auto& direction = pair->directions[packet.side];
+    if (packet.fin) {
+        pair->endpoints[packet.side].fin_scheduled = false;
+        direction.fin_sequence.reset();
+        direction.fin_arrived = false;
+        direction.fin_retired = false;
+        destroy_packet(packet.slot);
+        return;
+    }
     if (direction.gap_scheduled && packet.phase == packet_phase::propagating) {
         static_cast<void>(scheduler_->cancel(direction.gap_event));
         direction.gap_scheduled = false;
@@ -7448,7 +8043,7 @@ void fake_network::impl::discard_stop_link(link_state& link) noexcept {
       link.packets == 0,
       "network stop discarded link before packets drained");
     link.ready.clear();
-    link.ready_fins.clear();
+    link.delivery_budget.reset();
     const auto key = link.key;
     erase_link(key);
 }
@@ -7459,8 +8054,7 @@ void fake_network::impl::complete_stop_operation(
     if (found == operations.end()) {
         return;
     }
-    auto operation = std::move(found->second);
-    operations.erase(found);
+    auto operation = operations.extract(found);
     const auto* trace_failure = scheduler_->discarding_failed_event()
                                   ? scheduler_->trace_failure()
                                   : nullptr;
@@ -7470,16 +8064,24 @@ void fake_network::impl::complete_stop_operation(
     std::visit(
       [&](auto& value) {
           using type = std::decay_t<decltype(value)>;
-          auto done = std::move(value.done);
-          if constexpr (std::same_as<type, connect_operation>) {
-              if (needs_completion) {
-                  done.set_value(runtime::failure(error));
+          if constexpr (std::same_as<type, close_operation>) {
+              if (value.done) {
+                  value.done->set_value(runtime::failure(error));
               }
           } else {
-              done.set_value(runtime::failure(error));
+              auto done = std::move(value.done);
+              if constexpr (std::same_as<type, connect_operation>) {
+                  if (needs_completion) {
+                      done.set_value(runtime::failure(error));
+                  }
+              } else {
+                  done.set_value(runtime::failure(error));
+              }
           }
       },
       operation->payload);
+    // Return the pooled cell and its credits before publishing drained state.
+    operation.reset();
     maybe_finish_stop();
 }
 
@@ -7543,6 +8145,7 @@ void fake_network::impl::maybe_finish_stop() noexcept {
         && parked_operations == 0 && egress_limits.empty()
         && ingress_limits.empty() && port_cursors.empty()
         && fault_occurrences_.empty() && links.empty() && !bandwidth_scheduled_
+        && !bandwidth_replacement_id_.active()
         && free_packets.size() == config_.maximum_packets
         && ordered_packets.empty() && ordered_links.empty()
         && free_flows.size() == config_.maximum_active_flows
@@ -7572,8 +8175,7 @@ void fake_network::impl::force_discard_all(
         static_cast<void>(scheduler_->discard_failed());
     }
     while (!operations.empty()) {
-        auto operation = std::move(operations.begin()->second);
-        operations.erase(operations.begin());
+        auto operation = operations.extract(operations.begin());
         std::visit(
           [&](auto& value) {
               using type = std::decay_t<decltype(value)>;
@@ -7583,9 +8185,15 @@ void fake_network::impl::force_discard_all(
                   }
                   return true;
               }();
-              auto done = std::move(value.done);
-              if (needs_completion) {
-                  done.set_value(runtime::failure(*stop_failure_));
+              if constexpr (std::same_as<type, close_operation>) {
+                  if (value.done) {
+                      value.done->set_value(runtime::failure(*stop_failure_));
+                  }
+              } else {
+                  auto done = std::move(value.done);
+                  if (needs_completion) {
+                      done.set_value(runtime::failure(*stop_failure_));
+                  }
               }
           },
           operation->payload);
@@ -7621,8 +8229,10 @@ void fake_network::impl::force_discard_all(
     ingress_limits.clear();
     port_cursors.clear();
     fault_occurrences_.clear();
-    stop_batches_.clear();
-    stop_event_capacity_.clear();
+    stop_event_reservation_.release();
+    active_stop_id_.release();
+    stop_id_capacity_.release();
+    stop_trace_capacity_.release();
     free_flows.clear();
     for (std::uint16_t slot = 0; slot < flows.size(); ++slot) {
         flows[slot] = flow_state{};
@@ -7639,6 +8249,7 @@ void fake_network::impl::force_discard_all(
     bandwidth_scheduled_ = false;
     bandwidth_flow_id_ = 0;
     bandwidth_event_reservation_.release();
+    bandwidth_replacement_id_.release();
     stop_resources_released_ = true;
     stop_batch_scheduled_ = false;
     state_ = fake_network_state::stopped;

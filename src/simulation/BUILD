@@ -346,6 +346,7 @@ kwaque_cc_library(
         ":deterministic_random",
         ":fault_schedule",
         ":scheduler",
+        "//src/base",
         "//src/base:invariant",
         "//src/bytes:fragmented_buffer",
         "//src/bytes:fragmented_buffer_builder",

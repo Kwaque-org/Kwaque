@@ -1,6 +1,223 @@
+load("//bazel:build.bzl", "kwaque_cc_library")
+
 package(default_visibility = ["//visibility:private"])
 
 filegroup(
     name = "package_boundary",
     srcs = ["README.md"],
+)
+
+kwaque_cc_library(
+    name = "encoded_batch",
+    srcs = ["encoded_batch.cc"],
+    hdrs = ["encoded_batch.h"],
+    visibility = ["//src/storage/tests:__pkg__"],
+    deps = [
+        "//src/base",
+        "//src/base:error",
+        "//src/base:invariant",
+        "//src/bytes:fragmented_buffer",
+        "//src/bytes:fragmented_buffer_parser",
+        "//src/codec:cooperative",
+        "//src/codec:digest",
+        "//src/codec:envelope",
+        "//src/codec:error",
+        "//src/codec:integer",
+        "//src/codec:limits",
+        "//src/model:batch",
+        "//src/model:batch_codec",
+        "//src/model:batch_context",
+        "//src/model:batch_identity",
+        "@seastar",
+    ],
+)
+
+kwaque_cc_library(
+    name = "format_internal",
+    srcs = ["format_internal.cc"],
+    hdrs = ["format_internal.h"],
+    deps = [
+        ":format_size",
+        "//src/base",
+        "//src/base:error",
+        "//src/base:invariant",
+        "//src/bytes:fragmented_buffer",
+        "//src/bytes:fragmented_buffer_builder",
+        "//src/bytes:fragmented_buffer_parser",
+        "//src/codec:cooperative",
+        "//src/codec:envelope",
+        "//src/codec:error",
+        "//src/codec:integer",
+        "//src/codec:limits",
+        "//src/codec:staging_cooperative",
+        "@seastar",
+    ],
+)
+
+kwaque_cc_library(
+    name = "segment_format",
+    srcs = ["segment_format.cc"],
+    hdrs = ["segment_format.h"],
+    visibility = ["//src/storage/tests:__pkg__"],
+    deps = [
+        ":encoded_batch",
+        ":format_context",
+        ":format_internal",
+        ":format_size",
+        "//src/base",
+        "//src/base:error",
+        "//src/base:invariant",
+        "//src/bytes:fragmented_buffer",
+        "//src/bytes:fragmented_buffer_parser",
+        "//src/codec:cooperative",
+        "//src/codec:envelope",
+        "//src/codec:error",
+        "//src/codec:integer",
+        "//src/codec:limits",
+        "//src/model:batch_codec",
+        "//src/model:batch_context",
+        "//src/model:epoch",
+        "//src/model:identity",
+        "//src/model:position",
+        "//src/runtime:file_position",
+        "@seastar",
+    ],
+)
+
+kwaque_cc_library(
+    name = "wal_format",
+    srcs = ["wal_format.cc"],
+    hdrs = ["wal_format.h"],
+    visibility = ["//src/storage/tests:__pkg__"],
+    deps = [
+        ":encoded_batch",
+        ":format_context",
+        ":format_internal",
+        ":format_size",
+        "//src/base",
+        "//src/base:error",
+        "//src/base:invariant",
+        "//src/bytes:fragmented_buffer",
+        "//src/bytes:fragmented_buffer_parser",
+        "//src/codec:cooperative",
+        "//src/codec:envelope",
+        "//src/codec:error",
+        "//src/codec:integer",
+        "//src/codec:limits",
+        "//src/model:batch_codec",
+        "//src/model:batch_context",
+        "//src/model:batch_identity",
+        "//src/model:epoch",
+        "//src/model:identity",
+        "//src/model:position",
+        "//src/runtime:file_position",
+        "@seastar",
+    ],
+)
+
+kwaque_cc_library(
+    name = "footer_format",
+    srcs = [
+        "extent_verifier.cc",
+        "footer_format.cc",
+        "footer_internal.h",
+        "page_internal.cc",
+        "page_internal.h",
+        "retry_format.cc",
+        "sealed_format.cc",
+    ],
+    hdrs = [
+        "extent_verifier.h",
+        "footer_format.h",
+        "retry_format.h",
+        "sealed_format.h",
+    ],
+    visibility = ["//src/storage/tests:__pkg__"],
+    deps = [
+        ":completed_retry",
+        ":format_context",
+        ":format_internal",
+        ":format_size",
+        ":page_ref",
+        ":segment_format",
+        "//src/base",
+        "//src/base:error",
+        "//src/base:invariant",
+        "//src/bytes:fragmented_buffer",
+        "//src/bytes:fragmented_buffer_builder",
+        "//src/bytes:fragmented_buffer_parser",
+        "//src/codec:cooperative",
+        "//src/codec:crc32c",
+        "//src/codec:digest",
+        "//src/codec:envelope",
+        "//src/codec:error",
+        "//src/codec:integer",
+        "//src/codec:limits",
+        "//src/codec:sha256",
+        "//src/model:batch_codec",
+        "//src/model:batch_context",
+        "//src/model:batch_identity",
+        "//src/model:epoch",
+        "//src/model:identity",
+        "//src/model:position",
+        "//src/runtime:file_position",
+        "@seastar",
+    ],
+)
+
+kwaque_cc_library(
+    name = "format_context",
+    srcs = ["format_context.cc"],
+    hdrs = ["format_context.h"],
+    visibility = ["//src/storage/tests:__pkg__"],
+    deps = [
+        "//src/base",
+        "//src/base:error",
+        "//src/model:epoch",
+        "//src/model:identity",
+        "//src/model:position",
+        "//src/runtime:file_position",
+    ],
+)
+
+kwaque_cc_library(
+    name = "format_size",
+    srcs = ["format_size.cc"],
+    hdrs = ["format_size.h"],
+    visibility = ["//src/storage/tests:__pkg__"],
+    deps = [
+        ":format_context",
+        "//src/base",
+        "//src/base:error",
+        "//src/codec:envelope",
+        "//src/codec:limits",
+        "//src/model:position",
+        "//src/runtime:file_position",
+    ],
+)
+
+kwaque_cc_library(
+    name = "completed_retry",
+    hdrs = ["completed_retry.h"],
+    visibility = ["//src/storage/tests:__pkg__"],
+    deps = [
+        "//src/base",
+        "//src/base:error",
+        "//src/codec:digest",
+        "//src/codec:limits",
+        "//src/model:batch_identity",
+        "//src/model:epoch",
+        "//src/model:position",
+    ],
+)
+
+kwaque_cc_library(
+    name = "page_ref",
+    hdrs = ["page_ref.h"],
+    visibility = ["//src/storage/tests:__pkg__"],
+    deps = [
+        "//src/base",
+        "//src/base:error",
+        "//src/codec:digest",
+    ],
 )

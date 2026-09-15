@@ -1021,3 +1021,29 @@ TEST(EventTraceTest, ReplayRejectsEveryHeaderMismatchBeforeObservation) {
     changed.input_digest[0] ^= 1U;
     expect_rejected(changed);
 }
+
+TEST(EventTraceTest, SplitReservationsRetainCountAndEncodedByteOwnership) {
+    const auto limits = test_limits(
+      4, canonical_header_encoded_size + 4U * canonical_entry_encoded_size);
+    event_trace trace{test_header(limits), limits};
+    auto parent = trace.reserve(4, 4U * canonical_entry_encoded_size);
+    ASSERT_TRUE(parent.has_value());
+    EXPECT_FALSE(parent->split(5).has_value());
+    EXPECT_EQ(parent->entries(), 4U);
+    auto first = parent->split(2);
+    ASSERT_TRUE(first.has_value());
+    EXPECT_EQ(parent->entries(), 2U);
+    EXPECT_FALSE(trace.reserve(1, canonical_entry_encoded_size).has_value());
+    ASSERT_TRUE(first->observe(keyed_entry(1)).has_value());
+    ASSERT_TRUE(first->observe(keyed_entry(2)).has_value());
+    EXPECT_FALSE(first->active());
+    auto last = parent->split(2);
+    ASSERT_TRUE(last.has_value());
+    EXPECT_FALSE(parent->active());
+    EXPECT_FALSE(trace.reserve(1, canonical_entry_encoded_size).has_value());
+    ASSERT_TRUE(last->observe(keyed_entry(3)).has_value());
+    ASSERT_TRUE(last->observe(keyed_entry(4)).has_value());
+    EXPECT_EQ(trace.entries().size(), 4U);
+    EXPECT_EQ(trace.encoded_bytes(), limits.encoded_bytes());
+    EXPECT_FALSE(last->active());
+}

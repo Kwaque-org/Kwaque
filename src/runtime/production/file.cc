@@ -1,5 +1,7 @@
 #include "src/runtime/production/file.h"
 
+#include "src/runtime/file_error_internal.h"
+
 #include <seastar/core/coroutine.hh>
 #include <seastar/core/file-types.hh>
 #include <seastar/core/file.hh>
@@ -20,56 +22,14 @@ operation_error file_system_error(errc code) noexcept {
     return operation_error{code, operation_kind::file};
 }
 
-errc map_file_system_error(const std::error_code& error) noexcept {
-    if (error == std::errc::no_such_file_or_directory) {
-        return errc::not_found;
-    }
-    if (error == std::errc::file_exists) {
-        return errc::already_exists;
-    }
-    if (
-      error == std::errc::permission_denied
-      || error == std::errc::operation_not_permitted
-      || error == std::errc::read_only_file_system) {
-        return errc::permission_denied;
-    }
-    if (error == std::errc::directory_not_empty) {
-        return errc::directory_not_empty;
-    }
-    if (error == std::errc::operation_canceled) {
-        return errc::aborted;
-    }
-    if (error == std::errc::timed_out) {
-        return errc::timed_out;
-    }
-    if (
-      error == std::errc::no_space_on_device
-      || error == std::errc::too_many_files_open
-      || error == std::errc::too_many_files_open_in_system) {
-        return errc::resource_exhausted;
-    }
-    if (error == std::errc::file_too_large) {
-        return errc::out_of_range;
-    }
-    if (error == std::errc::invalid_argument) {
-        return errc::invalid_argument;
-    }
-    if (error == std::errc::is_a_directory) {
-        return errc::is_a_directory;
-    }
-    if (error == std::errc::not_a_directory) {
-        return errc::not_a_directory;
-    }
-    return errc::io_failure;
-}
-
 operation_error file_system_error_from_exception(std::exception_ptr exception) {
     try {
         std::rethrow_exception(std::move(exception));
     } catch (const seastar::cancelled_error&) {
         return file_system_error(errc::aborted);
     } catch (const std::system_error& error) {
-        return file_system_error(map_file_system_error(error.code()));
+        return file_system_error(
+          kwaque::runtime::detail::map_file_system_error(error.code()));
     }
 }
 
@@ -225,7 +185,7 @@ file_system::list(file_path path, directory_listing_limits limits) {
                 }
 
                 auto name = file_name::make(
-                  std::string{native->name.data(), native->name.size()});
+                  std::string_view{native->name.data(), native->name.size()});
                 if (!name) {
                     rejected = name.error();
                     break;
@@ -292,7 +252,7 @@ seastar::future<result<void>> file_system::remove_file(file_path path) {
     assert_current();
     [[maybe_unused]] auto metric = statistics_->accept();
     try {
-        co_await seastar::remove_file(path.value());
+        co_await seastar::unlink_file(path.value());
         co_return result<void>{};
     } catch (const std::bad_alloc&) {
         throw;
@@ -303,7 +263,15 @@ seastar::future<result<void>> file_system::remove_file(file_path path) {
 }
 
 seastar::future<result<void>> file_system::remove_directory(file_path path) {
-    return remove_file(std::move(path));
+    assert_current();
+    [[maybe_unused]] auto metric = statistics_->accept();
+    try {
+        co_await seastar::remove_directory(path.value());
+        co_return result<void>{};
+    } catch (...) {
+        co_return failure(
+          file_system_error_from_exception(std::current_exception()));
+    }
 }
 
 seastar::future<result<void>>

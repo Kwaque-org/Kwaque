@@ -377,9 +377,15 @@ SEASTAR_TEST_CASE(fault_schedule_accepts_its_absolute_rule_limit) {
         rules.push_back(make_rule(
           index,
           builtin_fault_point::file_read,
-          fault_object_key::from_u64(index),
-          1,
-          1,
+          index <= kwaque::simulation::maximum_fault_schedule_rules / 2U
+            ? std::optional<fault_object_key>{}
+            : std::optional{fault_object_key::from_u64(index)},
+          index <= kwaque::simulation::maximum_fault_schedule_rules / 2U
+            ? 2U * index - 1U
+            : kwaque::simulation::maximum_fault_schedule_rules,
+          index <= kwaque::simulation::maximum_fault_schedule_rules / 2U
+            ? 2U * index - 1U
+            : kwaque::simulation::maximum_fault_schedule_rules,
           fault_selector::once()));
     }
     auto schedule = fault_schedule::make(

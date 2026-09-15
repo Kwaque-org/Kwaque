@@ -52,7 +52,6 @@ public:
     [[nodiscard]] bool empty() const noexcept { return size_ == 0; }
     [[nodiscard]] std::uint64_t size() const noexcept { return size_; }
     [[nodiscard]] char back() const noexcept { return chunks_.back().back(); }
-    [[nodiscard]] bool contains(char byte) const noexcept;
     [[nodiscard]] bool
     copy_to(std::uint64_t offset, std::span<char> destination) const noexcept;
     [[nodiscard]] runtime::result<std::string> to_string() const;
@@ -304,6 +303,11 @@ struct trace_event_descriptor final {
     bool operator==(const trace_event_descriptor&) const = default;
 };
 
+// Validate the complete scheduled descriptor using the canonical trace rules,
+// before its callback, ID, or trace reservation is committed.
+[[nodiscard]] bool
+trace_descriptor_is_valid(trace_event_descriptor descriptor) noexcept;
+
 struct trace_entry final {
     std::uint64_t sequence{0};
     runtime::monotonic_time time{};
@@ -422,6 +426,9 @@ public:
             return entries_;
         }
         [[nodiscard]] runtime::result<void> observe(trace_entry entry) noexcept;
+        // Splitting transfers reserved count and bytes without releasing them.
+        [[nodiscard]] runtime::result<reservation>
+        split(std::uint32_t entries) noexcept;
         void release() noexcept;
 
     private:

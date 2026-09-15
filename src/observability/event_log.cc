@@ -10,6 +10,7 @@
 #include <cstdint>
 #include <cstring>
 #include <limits>
+#include <new>
 #include <span>
 #include <type_traits>
 #include <utility>
@@ -108,20 +109,27 @@ public:
         }
         std::size_t copied = 0;
         while (copied < destination.size()) {
-            const auto& chunk = artifact_->chunks()[chunk_index_];
+            const auto source = chunk();
             const auto count = std::min(
-              chunk.size() - chunk_offset_, destination.size() - copied);
-            std::memcpy(
-              destination.data() + copied, chunk.data() + chunk_offset_, count);
+              source.size(), destination.size() - copied);
+            std::memcpy(destination.data() + copied, source.data(), count);
             copied += count;
-            consumed_ += count;
-            chunk_offset_ += count;
-            if (chunk_offset_ == chunk.size()) {
-                ++chunk_index_;
-                chunk_offset_ = 0;
-            }
+            skip(count);
         }
         return true;
+    }
+
+    [[nodiscard]] std::span<const std::uint8_t> chunk() const noexcept {
+        return std::span{artifact_->chunks()[chunk_index_]}.subspan(
+          chunk_offset_);
+    }
+    void skip(std::size_t count) noexcept {
+        consumed_ += count;
+        chunk_offset_ += count;
+        if (chunk_offset_ == artifact_->chunks()[chunk_index_].size()) {
+            ++chunk_index_;
+            chunk_offset_ = 0;
+        }
     }
 
     template<typename Integer>
@@ -149,6 +157,28 @@ private:
     std::size_t chunk_index_{0};
     std::size_t chunk_offset_{0};
 };
+
+bool equal_batch(
+  event_log_artifact_reader& left,
+  event_log_artifact_reader& right,
+  std::uint64_t bytes) noexcept {
+    while (bytes != 0) {
+        const auto l = left.chunk();
+        const auto r = right.chunk();
+        const auto count = static_cast<std::size_t>(
+          std::min<std::uint64_t>({bytes, l.size(), r.size()}));
+        if (!std::equal(
+              l.begin(),
+              l.begin() + static_cast<std::ptrdiff_t>(count),
+              r.begin())) {
+            return false;
+        }
+        left.skip(count);
+        right.skip(count);
+        bytes -= count;
+    }
+    return true;
+}
 
 struct decoded_header final {
     event_sink_identity identity;
@@ -185,8 +215,10 @@ struct decoded_header final {
         return runtime::failure(log_error(errc::out_of_range));
     }
     if (
-      payload_bytes
-      != encoded.size() - canonical_event_log_header_encoded_size) {
+      payload_bytes != encoded.size() - canonical_event_log_header_encoded_size
+      || entries
+           > payload_bytes
+               / (canonical_event_log_record_prefix_size + canonical_event_fixed_encoded_size)) {
         return runtime::failure(log_error(errc::malformed_data));
     }
     return decoded_header{
@@ -230,13 +262,22 @@ append_decoded(event_log& output, runtime::result<event> decoded) noexcept {
 } // namespace
 
 event_entry_log::event_entry_log(std::size_t capacity)
+  : event_entry_log(capacity, true) {}
+
+event_entry_log::event_entry_log(std::size_t capacity, bool preallocate)
   : capacity_(capacity) {
-    auto remaining = capacity;
-    while (remaining != 0) {
-        const auto count = std::min(remaining, entries_per_chunk);
-        chunks_.emplace_back();
-        chunks_.back().reserve(count);
-        remaining -= count;
+    if (preallocate) {
+        prepare(capacity);
+    }
+}
+
+void event_entry_log::prepare(std::size_t count) {
+    while (prepared_ < count) {
+        const auto size = std::min(capacity_ - prepared_, entries_per_chunk);
+        std::vector<event> chunk;
+        chunk.reserve(size);
+        chunks_.push_back(std::move(chunk));
+        prepared_ += size;
     }
 }
 
@@ -330,35 +371,28 @@ bool event_log_artifact::operator==(
     if (size_ != other.size_) {
         return false;
     }
-    auto left_chunk = chunks_.begin();
-    auto right_chunk = other.chunks_.begin();
-    std::size_t left_offset = 0;
-    std::size_t right_offset = 0;
-    std::uint64_t compared = 0;
-    while (compared < size_) {
-        const auto count = std::min(
-          left_chunk->size() - left_offset, right_chunk->size() - right_offset);
-        if (!std::equal(
-              left_chunk->begin() + static_cast<std::ptrdiff_t>(left_offset),
-              left_chunk->begin()
-                + static_cast<std::ptrdiff_t>(left_offset + count),
-              right_chunk->begin()
-                + static_cast<std::ptrdiff_t>(right_offset))) {
-            return false;
-        }
-        compared += count;
-        left_offset += count;
-        right_offset += count;
-        if (left_offset == left_chunk->size()) {
-            ++left_chunk;
-            left_offset = 0;
-        }
-        if (right_offset == right_chunk->size()) {
-            ++right_chunk;
-            right_offset = 0;
-        }
+    event_log_artifact_reader left{*this};
+    event_log_artifact_reader right{other};
+    return equal_batch(left, right, size_);
+}
+
+seastar::future<bool> event_log_artifact::equals_cooperatively(
+  const event_log_artifact& other) const {
+    if (size_ != other.size_) {
+        co_return false;
     }
-    return true;
+    event_log_artifact_reader left{*this};
+    event_log_artifact_reader right{other};
+    while (left.remaining() != 0) {
+        if (!equal_batch(
+              left,
+              right,
+              std::min<std::uint64_t>(left.remaining(), 64U * 1024U))) {
+            co_return false;
+        }
+        co_await seastar::coroutine::maybe_yield{};
+    }
+    co_return true;
 }
 
 runtime::result<event_log_limits>
@@ -403,9 +437,22 @@ void event_log::reservation::release() noexcept {
 }
 
 event_log::event_log(event_sink_identity identity, event_log_limits limits)
+  : event_log(identity, limits, true) {}
+
+event_log::event_log(
+  event_sink_identity identity, event_log_limits limits, bool preallocate)
   : identity_(identity)
   , limits_(limits)
-  , entries_(limits.entries()) {}
+  , entries_(limits.entries(), preallocate) {}
+
+runtime::result<void> event_log::prepare(std::size_t count) noexcept {
+    try {
+        entries_.prepare(count);
+        return {};
+    } catch (const std::bad_alloc&) {
+        return runtime::failure(log_error(errc::resource_exhausted));
+    }
+}
 
 event_log::~event_log() {
     KWAQUE_INVARIANT(
@@ -429,6 +476,11 @@ runtime::result<event_log::reservation> event_log::reserve(
       || reserved_bytes_
            > limits_.encoded_bytes() - encoded_bytes_ - encoded_bytes) {
         return runtime::failure(log_error(errc::resource_exhausted));
+    }
+    if (
+      auto prepared = prepare(entries_.size() + reserved_entries_ + entries);
+      !prepared) {
+        return runtime::failure(prepared.error());
     }
     reserved_entries_ += entries;
     reserved_bytes_ += encoded_bytes;
@@ -474,6 +526,13 @@ event_log::append_with(const event& value, reservation* reserved) noexcept {
           entries_.size() + reserved_entries_ == limits_.entries()
             ? limits_.entries()
             : limits_.encoded_bytes()));
+    }
+    if (reserved == nullptr) {
+        if (
+          auto prepared = prepare(entries_.size() + reserved_entries_ + 1U);
+          !prepared) {
+            return runtime::failure(prepared.error());
+        }
     }
     entries_.append(value);
     encoded_bytes_ += record_bytes;
@@ -541,18 +600,21 @@ event_log::encode_cooperatively(std::uint32_t entries_per_yield) const {
       || entries_per_yield > cooperative_event_log_entries_per_yield_max) {
         co_return runtime::failure(log_error(errc::invalid_argument));
     }
-    event_log_artifact output{encoded_bytes_};
+    const auto entry_count = static_cast<std::uint32_t>(entries_.size());
+    const auto encoded_bytes = encoded_bytes_;
+    event_log_artifact output{encoded_bytes};
     if (
       auto appended = append_header(
         output,
         identity_,
-        static_cast<std::uint32_t>(entries_.size()),
-        encoded_bytes_ - canonical_event_log_header_encoded_size);
+        entry_count,
+        encoded_bytes - canonical_event_log_header_encoded_size);
       !appended) {
         co_return runtime::failure(appended.error());
     }
     std::uint32_t batch_entries = 0;
-    for (const auto& value : entries_) {
+    for (std::uint32_t index = 0; index < entry_count; ++index) {
+        const auto& value = entries_[index];
         auto encoded = encode_event(value);
         if (!encoded) {
             co_return runtime::failure(encoded.error());
@@ -565,7 +627,7 @@ event_log::encode_cooperatively(std::uint32_t entries_per_yield) const {
             co_await seastar::coroutine::maybe_yield{};
         }
     }
-    if (output.size() != encoded_bytes_) {
+    if (output.size() != encoded_bytes) {
         co_return runtime::failure(log_error(errc::invariant_violation));
     }
     co_return std::move(output);
@@ -589,7 +651,8 @@ runtime::result<std::unique_ptr<event_log>> event_log::decode(
       || encoded.size() > synchronous_event_log_encoded_bytes_max) {
         return runtime::failure(log_error(errc::resource_exhausted));
     }
-    auto output = std::make_unique<event_log>(header->identity, parser_limits);
+    auto output = std::unique_ptr<event_log>{
+      new event_log{header->identity, parser_limits, false}};
     for (std::uint32_t index = 0; index < header->entries; ++index) {
         if (
           auto appended = append_decoded(*output, read_event(reader));
@@ -624,7 +687,8 @@ event_log::decode_cooperatively(
     if (!header) {
         co_return runtime::failure(header.error());
     }
-    auto output = std::make_unique<event_log>(header->identity, parser_limits);
+    auto output = std::unique_ptr<event_log>{
+      new event_log{header->identity, parser_limits, false}};
     std::uint32_t batch_entries = 0;
     for (std::uint32_t index = 0; index < header->entries; ++index) {
         if (

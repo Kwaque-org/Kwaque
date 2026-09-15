@@ -13,6 +13,7 @@
 #include <seastar/testing/perf_tests.hh>
 
 #include <algorithm>
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <exception>
@@ -332,12 +333,78 @@ private:
     std::uint64_t generation_{1};
 };
 
+// Isolate the atomic page transition from scheduler admission. Each iteration
+// starts with the same durable image and 512 volatile overrides; preparation,
+// mutation, and node reclamation are measured as one complete truncate.
+class dirty_truncate_fixture {
+public:
+    dirty_truncate_fixture()
+      : files_(
+          fake_file_system::make(
+            fake_file_system_config{.logical_capacity = byte_count{16U << 20U}})
+            .value())
+      , path_(fake_file_test_access::resolve(*files_, "value").value()) {
+        const auto created = fake_file_test_access::create_file(*files_, path_);
+        const auto named = fake_file_test_access::lookup(*files_, path_);
+        if (!created || !named || *created != *named)
+            throw std::runtime_error("truncate benchmark file creation");
+        page_.fill(std::byte{'a'});
+        for (std::uint64_t i = 0; i < page_count; ++i)
+            write_page(i);
+        fake_file_test_access::flush(*files_, path_).value();
+        auto root = fake_file_test_access::resolve(*files_, ".").value();
+        fake_file_test_access::sync_directory(*files_, root).value();
+    }
+
+    std::size_t execute() {
+        fake_file_test_access::crash(*files_);
+        for (std::uint64_t i = 0; i < page_count; i += 2)
+            write_page(i);
+        constexpr auto size = (page_count - 1U) * fake_file_page_bytes + 1U;
+        perf_tests::start_measuring_time();
+        auto result = fake_file_test_access::truncate(*files_, path_, size);
+        perf_tests::stop_measuring_time();
+        if (
+          !result
+          || fake_file_test_access::visible_size(*files_, path_).value()
+               != size)
+            throw std::runtime_error("truncate benchmark result");
+        // Regrowth must expose zeros after the retained byte, not the old tail.
+        fake_file_test_access::truncate(*files_, path_, size + 1U).value();
+        std::array<std::byte, 2> tail{};
+        auto read = fake_file_test_access::read(
+          *files_, path_, size - 1U, tail);
+        if (
+          !read || read->value() != tail.size() || tail[0] != std::byte{'a'}
+          || tail[1] != std::byte{})
+            throw std::runtime_error("truncate benchmark tail bytes");
+        return 1;
+    }
+
+private:
+    void write_page(std::uint64_t index) {
+        const auto written = fake_file_test_access::write(
+          *files_, path_, index * page_.size(), page_);
+        if (!written || written->value() != page_.size())
+            throw std::runtime_error("truncate benchmark page write mismatch");
+    }
+
+    static constexpr std::uint64_t page_count = 1'024;
+    std::unique_ptr<fake_file_system> files_;
+    canonical_fake_path path_;
+    std::array<std::byte, fake_file_page_bytes> page_{};
+};
+
 using fake_file_read_fixture = fake_file_fixture<file_case::read>;
 using fake_file_write_fixture = fake_file_fixture<file_case::write>;
 using fake_file_flush_fixture = fake_file_fixture<file_case::flush>;
 using fake_file_crash_fixture = fake_file_fixture<file_case::crash>;
 
 } // namespace
+
+PERF_TEST_F(dirty_truncate_fixture, truncate_with_512_dirty_pages) {
+    return execute();
+}
 
 PERF_TEST_F(fake_file_read_fixture, read4096) { return execute(); }
 PERF_TEST_F(fake_file_write_fixture, overwrite4096) { return execute(); }

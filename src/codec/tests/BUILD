@@ -157,6 +157,7 @@ kwaque_cc_library(
     name = "codec_bench_reference",
     testonly = True,
     srcs = [
+        "benchmark_buffer.cc",
         "codec_bench_reference.cc",
         "envelope_bench_decode.cc",
         "envelope_bench_encode.cc",
@@ -165,14 +166,20 @@ kwaque_cc_library(
         "envelope_bench_prefix.cc",
     ],
     hdrs = [
+        "benchmark_buffer.h",
         "codec_bench_reference.h",
         "envelope_bench_native.h",
     ],
-    visibility = ["//src/model/tests:__pkg__"],
+    visibility = [
+        "//src/compression/tests:__pkg__",
+        "//src/model/tests:__pkg__",
+        "//src/storage/tests:__pkg__",
+    ],
     deps = [
         "//src/base",
         "//src/base:error",
         "//src/base:invariant",
+        "//src/bytes:allocation_test_profile",
         "//src/bytes:fragmented_buffer",
         "//src/bytes:fragmented_buffer_builder",
         "//src/bytes:fragmented_buffer_parser",

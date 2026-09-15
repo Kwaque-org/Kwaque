@@ -11,8 +11,10 @@
 #include <seastar/core/coroutine.hh>
 #include <seastar/core/future.hh>
 #include <seastar/core/loop.hh>
+#include <seastar/core/memory.hh>
 #include <seastar/core/smp.hh>
 #include <seastar/testing/test_case.hh>
+#include <seastar/util/alloc_failure_injector.hh>
 #include <seastar/util/later.hh>
 
 #include <boost/test/unit_test.hpp>
@@ -2314,4 +2316,307 @@ SEASTAR_TEST_CASE(fake_filesystem_has_one_nontransportable_shard_owner) {
     co_await pump_until(environment.events, closing);
     co_await require_ready_success(closing);
     co_return;
+}
+
+SEASTAR_TEST_CASE(fake_dropped_open_retains_native_owner_until_stop_or_crash) {
+    for (const bool crash : {false, true}) {
+        for (unsigned mode = 0; mode < 3; ++mode) {
+            seastar::chunked_vector<fault_rule> rules;
+            rules.push_back(rule(
+              1,
+              builtin_fault_point::file_open,
+              1,
+              1,
+              fault_decision::make_drop_completion()));
+            fake_file_system_config config;
+            config.maximum_open_handles = 1;
+            fixture environment{std::move(rules), config};
+            auto root = fake_file_test_access::resolve(
+                          *environment.files, "/kwaque")
+                          .value();
+            auto target = fake_file_test_access::resolve(
+                            *environment.files, "/kwaque/value")
+                            .value();
+            if (mode != 1) {
+                BOOST_REQUIRE(
+                  fake_file_test_access::create_file(*environment.files, target)
+                    .has_value());
+                const std::array original{
+                  std::byte{'o'}, std::byte{'l'}, std::byte{'d'}};
+                BOOST_REQUIRE(
+                  fake_file_test_access::write(
+                    *environment.files, target, 0, original)
+                    .has_value());
+                BOOST_REQUIRE(
+                  fake_file_test_access::flush(*environment.files, target)
+                    .has_value());
+                BOOST_REQUIRE(
+                  fake_file_test_access::sync_directory(
+                    *environment.files, root)
+                    .has_value());
+            }
+            auto opening = environment.files->open(
+              path("/kwaque/value"),
+              {.access = kwaque::runtime::file_access::read_write,
+               .create = mode == 1,
+               .truncate = mode == 2});
+            BOOST_REQUIRE(environment.events.advance_to_next().has_value());
+            BOOST_REQUIRE(environment.events.run_ready().has_value());
+            co_await seastar::yield();
+            BOOST_CHECK(!opening.available());
+            BOOST_CHECK_EQUAL(
+              fake_file_test_access::open_handles(*environment.files), 1U);
+            BOOST_CHECK_EQUAL(environment.files->pending_operations(), 1U);
+            BOOST_CHECK_EQUAL(
+              *fake_file_test_access::visible_size(*environment.files, target),
+              mode == 0 ? 3U : 0U);
+            auto denied = co_await environment.files->open(
+              path("/kwaque/other"),
+              {.access = kwaque::runtime::file_access::read_write,
+               .create = true});
+            BOOST_REQUIRE(!denied.has_value());
+            BOOST_CHECK(denied.error().code() == kwaque::errc::queue_full);
+            auto terminal = crash ? environment.files->crash()
+                                  : environment.files->stop();
+            co_await pump_until(environment.events, terminal);
+            const auto terminal_result = co_await std::move(terminal);
+            BOOST_REQUIRE(terminal_result.has_value());
+            co_await pump_until(environment.events, opening);
+            const auto outcome = co_await std::move(opening);
+            BOOST_REQUIRE(!outcome.has_value());
+            BOOST_CHECK(outcome.error().code() == kwaque::errc::aborted);
+            BOOST_CHECK_EQUAL(
+              fake_file_test_access::open_handles(*environment.files), 0U);
+            BOOST_CHECK_EQUAL(environment.files->pending_operations(), 0U);
+            BOOST_CHECK_EQUAL(environment.files->pending_bytes().value(), 0U);
+            if (crash) {
+                const auto restored = fake_file_test_access::visible_size(
+                  *environment.files, target);
+                if (mode == 1)
+                    BOOST_CHECK(!restored.has_value());
+                else {
+                    BOOST_REQUIRE(restored.has_value());
+                    BOOST_CHECK_EQUAL(*restored, 3U);
+                }
+                auto stopped = environment.files->stop();
+                co_await pump_until(environment.events, stopped);
+                const auto stop_result = co_await std::move(stopped);
+                BOOST_REQUIRE(stop_result.has_value());
+            }
+        }
+    }
+}
+
+SEASTAR_TEST_CASE(fake_old_handle_close_cannot_release_reopened_generation) {
+    fixture environment;
+    auto opening = environment.files->open(
+      path("/kwaque/value"),
+      {.access = kwaque::runtime::file_access::read_write, .create = true});
+    co_await pump_until(environment.events, opening);
+    auto old = (co_await std::move(opening)).value();
+    auto synced = environment.files->sync_directory(path("/kwaque"));
+    co_await pump_until(environment.events, synced);
+    const auto sync_result = co_await std::move(synced);
+    BOOST_REQUIRE(sync_result.has_value());
+    auto crashed = environment.files->crash();
+    co_await pump_until(environment.events, crashed);
+    const auto crash_result = co_await std::move(crashed);
+    BOOST_REQUIRE(crash_result.has_value());
+    auto reopening = environment.files->open(path("/kwaque/value"), {});
+    co_await pump_until(environment.events, reopening);
+    auto current = (co_await std::move(reopening)).value();
+    const auto old_close_result = co_await old.close();
+    BOOST_REQUIRE(old_close_result.has_value());
+    BOOST_CHECK_EQUAL(
+      fake_file_test_access::open_handles(*environment.files), 1U);
+    auto closing = current.close();
+    co_await pump_until(environment.events, closing);
+    const auto close_result = co_await std::move(closing);
+    BOOST_REQUIRE(close_result.has_value());
+    BOOST_CHECK_EQUAL(
+      fake_file_test_access::open_handles(*environment.files), 0U);
+    auto stopped = environment.files->stop();
+    co_await pump_until(environment.events, stopped);
+    const auto stop_result = co_await std::move(stopped);
+    BOOST_REQUIRE(stop_result.has_value());
+}
+
+SEASTAR_TEST_CASE(
+  fake_bounded_listing_does_not_materialize_the_whole_directory) {
+    fixture environment;
+    for (unsigned index = 0; index < 512; ++index) {
+        auto target = fake_file_test_access::resolve(
+                        *environment.files,
+                        "/kwaque/long-directory-entry-name-"
+                          + std::to_string(index))
+                        .value();
+        BOOST_REQUIRE(
+          fake_file_test_access::create_file(*environment.files, target)
+            .has_value());
+    }
+    const auto before = seastar::memory::stats().mallocs();
+    auto listing = environment.files->list(
+      path("/kwaque"),
+      {.maximum_entries = kwaque::item_count{1},
+       .maximum_name_bytes = kwaque::byte_count{255}});
+    co_await pump_until(environment.events, listing);
+    auto result = co_await std::move(listing);
+    const auto allocations = seastar::memory::stats().mallocs() - before;
+    BOOST_REQUIRE(!result.has_value());
+    BOOST_CHECK(result.error().code() == kwaque::errc::resource_exhausted);
+#ifndef SEASTAR_DEFAULT_ALLOCATOR
+    // A full copy would allocate at least once for every long name.
+    BOOST_CHECK_LT(allocations, 256U);
+#else
+    static_cast<void>(allocations);
+#endif
+    auto stopped = environment.files->stop();
+    co_await pump_until(environment.events, stopped);
+    const auto stop_result = co_await std::move(stopped);
+    BOOST_REQUIRE(stop_result.has_value());
+}
+
+namespace {
+seastar::future<> exercise_dropped_open_cleanup(
+  scheduler& events, event_trace& trace, bool diverges) {
+    seastar::chunked_vector<fault_rule> rules;
+    rules.push_back(rule(
+      1,
+      builtin_fault_point::file_open,
+      1,
+      1,
+      fault_decision::make_drop_completion()));
+    auto faults
+      = fault_schedule::make(events, trace, seed, std::move(rules)).value();
+    auto files = fake_file_system::make({}, events, *faults).value();
+    auto opening = files->open(
+      path("/kwaque/value"),
+      {.access = kwaque::runtime::file_access::read_write, .create = true});
+    BOOST_REQUIRE(events.advance_to_next().has_value());
+    BOOST_REQUIRE(events.run_ready().has_value());
+    BOOST_CHECK(!opening.available());
+    BOOST_CHECK_EQUAL(fake_file_test_access::open_handles(*files), 1U);
+    auto stopping = files->stop();
+    if (!diverges) co_await pump_until(events, stopping);
+    auto stopped = co_await std::move(stopping);
+    auto opened = co_await std::move(opening);
+    BOOST_REQUIRE(!opened.has_value());
+    if (diverges) {
+        BOOST_REQUIRE(!stopped.has_value());
+        BOOST_CHECK(stopped.error().code() == kwaque::errc::replay_divergence);
+        BOOST_CHECK(opened.error().code() == kwaque::errc::replay_divergence);
+    } else {
+        BOOST_CHECK(stopped.has_value());
+        BOOST_CHECK(opened.error().code() == kwaque::errc::aborted);
+    }
+    BOOST_CHECK_EQUAL(fake_file_test_access::open_handles(*files), 0U);
+    BOOST_CHECK_EQUAL(files->pending_operations(), 0U);
+    BOOST_CHECK_EQUAL(events.pending_events(), 0U);
+}
+} // namespace
+
+SEASTAR_TEST_CASE(fake_dropped_open_replay_divergence_releases_parked_handle) {
+    const auto limits = make_scheduler_limits();
+    const auto budget = make_trace_limits();
+    const auto header = trace_header::current(
+      seed,
+      kwaque::simulation::deterministic_random_algorithm_version,
+      kwaque::simulation::deterministic_random_coordinate_version,
+      kwaque::simulation::trace_budget(limits),
+      budget,
+      {},
+      {});
+    event_trace captured{header, budget};
+    {
+        scheduler events{limits, &captured};
+        co_await exercise_dropped_open_cleanup(events, captured, false);
+    }
+    auto encoded = captured.encode().value();
+    auto expected = event_trace::decode(encoded, budget).value();
+    bool mutated = false;
+    for (auto& entry : expected.entries) {
+        if (
+          entry.action == kwaque::simulation::trace_action::scheduled
+          && entry.result
+               == static_cast<std::uint32_t>(kwaque::errc::aborted)) {
+            ++entry.stable_id;
+            mutated = true;
+            break;
+        }
+    }
+    BOOST_REQUIRE(mutated);
+    auto replay
+      = event_trace::replay(header, budget, std::move(expected)).value();
+    {
+        scheduler events{limits, replay.get()};
+        co_await exercise_dropped_open_cleanup(events, *replay, true);
+    }
+    BOOST_CHECK(!replay->finish_replay().has_value());
+}
+
+SEASTAR_TEST_CASE(fake_partial_resize_apply_uses_only_prepared_storage) {
+    seastar::chunked_vector<fault_rule> rules;
+    rules.push_back(rule(
+      123,
+      builtin_fault_point::file_truncate,
+      1,
+      1,
+      fault_decision::make_partial_resize()));
+    fixture environment{std::move(rules)};
+    auto creating = environment.files->create_directories(path("/kwaque/data"));
+    co_await pump_until(environment.events, creating);
+    co_await require_ready_success(creating);
+    auto opening = environment.files->open(
+      path("/kwaque/data/file"),
+      {.access = kwaque::runtime::file_access::read_write, .create = true});
+    co_await pump_until(environment.events, opening);
+    auto opened = co_await std::move(opening);
+    BOOST_REQUIRE(opened.has_value());
+    auto file = std::move(*opened);
+    auto writing = file.write(
+      kwaque::runtime::file_position{0}, payload(std::string(4'096, 'p')));
+    co_await pump_until(environment.events, writing);
+    const auto written = co_await std::move(writing);
+    BOOST_REQUIRE(written.has_value());
+    auto truncating = file.truncate(1'000);
+    BOOST_REQUIRE(environment.events.advance_to_next().has_value());
+    const auto prepared = environment.events.step();
+    BOOST_REQUIRE(prepared.has_value());
+    BOOST_REQUIRE(*prepared);
+    BOOST_CHECK(!truncating.available());
+#if defined(SEASTAR_ENABLE_ALLOC_FAILURE_INJECTION)
+    auto& injector = seastar::memory::local_failure_injector();
+    injector.fail_after(0);
+#endif
+    const auto applied = environment.events.step();
+#if defined(SEASTAR_ENABLE_ALLOC_FAILURE_INJECTION)
+    const bool allocated = injector.failed();
+    injector.cancel();
+    BOOST_CHECK(!allocated);
+#endif
+    BOOST_REQUIRE(applied.has_value());
+    BOOST_REQUIRE(*applied);
+    const auto result = co_await std::move(truncating);
+    BOOST_REQUIRE(!result.has_value());
+    BOOST_CHECK(result.error().code() == kwaque::errc::io_failure);
+    const auto file_path = fake_file_test_access::resolve(
+      *environment.files, "/kwaque/data/file");
+    BOOST_REQUIRE(file_path.has_value());
+    const auto size = fake_file_test_access::visible_size(
+      *environment.files, *file_path);
+    BOOST_REQUIRE(size.has_value());
+    BOOST_CHECK_GT(*size, 1'000U);
+    BOOST_CHECK_LT(*size, 4'096U);
+    auto reading = file.read(
+      kwaque::runtime::file_position{0}, kwaque::byte_count{*size});
+    co_await pump_until(environment.events, reading);
+    const auto contents = co_await std::move(reading);
+    BOOST_REQUIRE(contents.has_value());
+    BOOST_CHECK(contents->data().content_equals(std::string(*size, 'p')));
+    auto closing = file.close();
+    co_await pump_until(environment.events, closing);
+    co_await require_ready_success(closing);
+    auto stopping = environment.files->stop();
+    co_await pump_until(environment.events, stopping);
+    co_await require_ready_success(stopping);
 }

@@ -6,6 +6,7 @@
 #include <seastar/core/coroutine.hh>
 #include <seastar/core/future.hh>
 
+#include <optional>
 #include <stdexcept>
 #include <utility>
 
@@ -35,12 +36,41 @@ run_environment_lifecycle_contract(Environment& environment, Driver driver) {
         throw std::runtime_error("environment did not become started");
     }
 
+    std::optional<basic_runtime<Environment>> retained{
+      std::in_place, environment};
     environment.request_abort();
     if (!environment.abort_requested()) {
         throw std::runtime_error("environment did not retain abort");
     }
 
+    const auto require_closed_admission = [&] {
+        bool rejected = false;
+        try {
+            [[maybe_unused]] basic_runtime<Environment> fresh{environment};
+        } catch (const std::logic_error&) {
+            rejected = true;
+        }
+        if (!rejected) {
+            throw std::runtime_error(
+              "aborted environment admitted a new runtime lease");
+        }
+        bool invoked = false;
+        auto task = environment.tasks().spawn([&invoked] {
+            invoked = true;
+            return seastar::make_ready_future<>();
+        });
+        if (task || invoked || task.error().code() != errc::closed) {
+            throw std::runtime_error("aborted environment admitted a new task");
+        }
+    };
+    require_closed_admission();
     auto first_stop = environment.stop();
+    require_closed_admission();
+    if (first_stop.available()) {
+        throw std::runtime_error(
+          "stop failed to retain an existing runtime lease");
+    }
+    retained.reset();
     auto second_stop = environment.stop();
     co_await driver.lifecycle(std::move(first_stop));
     co_await std::move(second_stop);

@@ -70,13 +70,27 @@ kwaque_cc_library(
     hdrs = ["fragmented_buffer_test_support.h"],
     visibility = [
         "//src/codec/tests:__pkg__",
+        "//src/compression/tests:__pkg__",
         "//src/model/tests:__pkg__",
+        "//src/storage/tests:__pkg__",
     ],
     deps = [
         ":fragmented_buffer",
         "//src/base",
         "//src/base:error",
     ],
+)
+
+kwaque_cc_library(
+    name = "allocation_test_profile",
+    testonly = True,
+    hdrs = ["test_allocation_profile.h"],
+    visibility = [
+        "//src/codec/tests:__pkg__",
+        "//src/compression/tests:__pkg__",
+        "//src/storage/tests:__pkg__",
+    ],
+    deps = ["//src/base"],
 )
 
 kwaque_cc_seastar_gtest(

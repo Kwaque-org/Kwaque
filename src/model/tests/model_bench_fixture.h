@@ -1,5 +1,6 @@
 #pragma once
 
+#include "src/codec/tests/benchmark_buffer.h"
 #include "src/model/batch_builder.h"
 #include "src/model/batch_codec.h"
 #include "src/model/record_codec.h"
@@ -8,29 +9,26 @@
 #include <vector>
 
 namespace kwaque::model::bench {
-byte_count capacity_bound(byte_count request) noexcept;
-void require(bool condition, const char* message);
-void qualify_allocator();
+using codec::bench::capacity_bound;
+using codec::bench::copy_layout;
+using codec::bench::qualify_allocator;
+using codec::bench::require;
 batch_decode_expectation expected_context();
 batch_id fixture_id();
 producer_stream_binding fixture_binding();
 
-// Freshly copied layouts have known allocation bases; ownership is transferred
-// at entry and every payload copy is split through cumulative work accounting.
-seastar::future<bytes::fragmented_buffer> copy_layout(
-  bytes::fragmented_buffer input,
-  std::size_t width,
-  codec::cooperative_work& work,
-  byte_count remaining,
-  std::size_t fragment_limit = 512);
-
 class model_fixture {
 public:
     model_fixture(
-      std::size_t count, std::size_t payload, std::size_t width) noexcept
+      std::size_t count,
+      std::size_t payload,
+      std::size_t width,
+      codec::bench::payload_pattern pattern
+      = codec::bench::payload_pattern::compressible) noexcept
       : count(count)
       , payload_size(payload)
-      , width(width) {}
+      , width(width)
+      , pattern(pattern) {}
     seastar::future<> initialize(bool report = false);
     seastar::future<submitted_batch> build(codec::cooperative_work& work);
     seastar::future<submitted_batch> submitted(codec::cooperative_work& work);
@@ -45,6 +43,7 @@ public:
     std::size_t count;
     std::size_t payload_size;
     std::size_t width;
+    codec::bench::payload_pattern pattern;
     std::optional<record> value;
     bytes::fragmented_buffer record_wire;
     bytes::fragmented_buffer submitted_wire;

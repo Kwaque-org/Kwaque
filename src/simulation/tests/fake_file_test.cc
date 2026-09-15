@@ -2,6 +2,8 @@
 #include "src/simulation/fake_file_test_support.h"
 
 #include <seastar/core/coroutine.hh>
+#include <seastar/core/memory.hh>
+#include <seastar/coroutine/maybe_yield.hh>
 #include <seastar/testing/test_case.hh>
 #include <seastar/util/alloc_failure_injector.hh>
 
@@ -931,5 +933,103 @@ SEASTAR_TEST_CASE(fake_sparse_state_matches_an_independent_dense_image) {
     fake_file_test_access::crash(*filesystem);
     oracle.crash();
     compare();
+    co_return;
+}
+
+SEASTAR_TEST_CASE(fake_truncate_prepares_node_before_nonallocating_commit) {
+    // Cross the former dirty-index chunk boundary with distinct live pages.
+    constexpr std::size_t pages = 16'384;
+    auto filesystem = make_filesystem("/disk", 128U << 20U);
+    const auto root = path(*filesystem, ".");
+    const auto file = path(*filesystem, "file");
+    static_cast<void>(make_durable_file(*filesystem, root, file));
+    for (std::size_t index = 1; index <= pages; ++index) {
+        BOOST_REQUIRE(
+          fake_file_test_access::write(
+            *filesystem, file, index * 4'096, bytes("x"))
+            .has_value());
+        if (index % 128 == 0) co_await seastar::coroutine::maybe_yield{};
+    }
+    const auto size = fake_file_test_access::visible_size(*filesystem, file);
+    BOOST_REQUIRE(size.has_value());
+    const auto retained = filesystem->retained_capacity();
+    bool pristine = true;
+    // Each preparation is discarded: no tail override or size becomes visible.
+    verify_allocation_failures([&] {
+        pristine = pristine
+                   && *fake_file_test_access::visible_size(*filesystem, file)
+                        == *size
+                   && filesystem->retained_capacity() == retained
+                   && *fake_file_test_access::volatile_page_count(
+                        *filesystem, file)
+                        == pages;
+        auto prepared = fake_file_test_access::prepare_truncate(
+          *filesystem, file, 1);
+        pristine = pristine && prepared.has_value();
+    });
+    BOOST_CHECK(pristine);
+    auto prepared = fake_file_test_access::prepare_truncate(
+      *filesystem, file, 1);
+    BOOST_REQUIRE(prepared.has_value());
+    const auto before = seastar::memory::stats().mallocs();
+    auto& injector = seastar::memory::local_failure_injector();
+    injector.fail_after(0);
+    fake_file_test_access::commit_truncate(*filesystem, std::move(*prepared));
+    injector.cancel();
+    BOOST_CHECK_EQUAL(seastar::memory::stats().mallocs(), before);
+    BOOST_CHECK_EQUAL(
+      *fake_file_test_access::visible_size(*filesystem, file), 1U);
+    BOOST_CHECK_EQUAL(
+      *fake_file_test_access::volatile_page_count(*filesystem, file), 1U);
+    BOOST_CHECK(read(*filesystem, file, 0, 1) == std::string(1, '\0'));
+    BOOST_REQUIRE(fake_file_test_access::flush(*filesystem, file).has_value());
+    fake_file_test_access::crash(*filesystem);
+    BOOST_CHECK(read(*filesystem, file, 0, 1) == std::string(1, '\0'));
+    co_return;
+}
+
+SEASTAR_TEST_CASE(fake_truncate_rewrite_keeps_only_live_dirty_pages) {
+    auto filesystem = make_filesystem("/disk", 65'536);
+    const auto root = path(*filesystem, ".");
+    const auto file = path(*filesystem, "file");
+    static_cast<void>(make_durable_file(*filesystem, root, file));
+    for (unsigned cycle = 0; cycle < 1'024; ++cycle) {
+        BOOST_REQUIRE(
+          fake_file_test_access::write(*filesystem, file, 4'096, bytes("x"))
+            .has_value());
+        BOOST_CHECK_EQUAL(
+          *fake_file_test_access::volatile_page_count(*filesystem, file), 1U);
+        BOOST_REQUIRE(
+          fake_file_test_access::truncate(*filesystem, file, 0).has_value());
+        BOOST_CHECK_EQUAL(
+          *fake_file_test_access::volatile_page_count(*filesystem, file), 0U);
+        BOOST_CHECK_EQUAL(filesystem->retained_capacity().value(), 0U);
+    }
+    BOOST_REQUIRE(
+      fake_file_test_access::write(*filesystem, file, 0, bytes("last"))
+        .has_value());
+    BOOST_REQUIRE(fake_file_test_access::flush(*filesystem, file).has_value());
+    fake_file_test_access::crash(*filesystem);
+    BOOST_CHECK(read(*filesystem, file, 0, 4) == "last");
+    co_return;
+}
+
+SEASTAR_TEST_CASE(fake_same_path_rename_checks_source_and_root) {
+    auto filesystem = make_filesystem();
+    const auto missing = path(*filesystem, "missing");
+    const auto rejected = fake_file_test_access::rename(
+      *filesystem, missing, missing);
+    BOOST_REQUIRE(!rejected.has_value());
+    BOOST_CHECK(rejected.error().code() == kwaque::errc::not_found);
+    const auto root = path(*filesystem, ".");
+    BOOST_CHECK(
+      !fake_file_test_access::rename(*filesystem, root, root).has_value());
+    const auto id = fake_file_test_access::create_file(*filesystem, missing);
+    BOOST_REQUIRE(id.has_value());
+    const auto equivalent = path(*filesystem, "./missing");
+    BOOST_REQUIRE(
+      fake_file_test_access::rename(*filesystem, missing, equivalent)
+        .has_value());
+    BOOST_CHECK(filesystem->object_count() == 2U);
     co_return;
 }

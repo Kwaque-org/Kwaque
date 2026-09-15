@@ -256,7 +256,8 @@ class FuzzReproductionTest(unittest.TestCase):
         )
         self.assertIn("operation=observability", divergent.stderr)
         self.assertIn("sequence=1", divergent.stderr)
-        self.assertIn("detail=3", divergent.stderr)
+        # event_replay_difference::monotonic identifies the mutated timestamp.
+        self.assertIn("detail=6", divergent.stderr)
         self.assert_replay_exit(block, 0)
 
         bad_header = block.replace("KQREPRO 01", "KQREPRO 02", 1)

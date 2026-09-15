@@ -439,44 +439,25 @@ seastar::future<result<void>> connection::write_general(
   network_write_admission::reservation reservation,
   seastar::gate::holder holder,
   operation_statistics::reservation metric) {
-    static_cast<void>(reservation);
-    static_cast<void>(holder);
+    std::optional<seastar::semaphore_units<>> serialization;
     try {
-        auto serialization
-          = co_await seastar::coroutine::without_preemption_check(
-            seastar::get_units(write_serializer_, 1, caller_abort));
-        if (caller_abort.abort_requested()) {
-            co_return co_await flush_preceding_batch_after_cancellation();
-        }
-        if (auto rejected = output_rejection()) {
-            co_return failure(std::move(*rejected));
-        }
-
-        const auto bytes = data.size().value();
-        auto consumer
-          = kwaque::runtime::detail::fragmented_buffer_io_access::consume(data);
-        while (auto fragment = consumer.take_front()) {
-            co_await output_.write(std::move(fragment));
-        }
-        unflushed_bytes_ += bytes;
-        if (
-          write_serializer_.waiters() == 0
-          || unflushed_bytes_ >= maximum_unflushed_bytes) {
-            co_await output_.flush();
-            unflushed_bytes_ = 0;
-        }
-        if (abort_requested_) {
-            co_return failure(network_error(errc::aborted));
-        }
-        metric.add_completed_bytes(bytes);
-        co_return result<void>{};
-    } catch (const std::bad_alloc&) {
-        throw;
+        serialization.emplace(
+          co_await seastar::coroutine::without_preemption_check(
+            seastar::get_units(write_serializer_, 1, caller_abort)));
     } catch (...) {
         co_return failure(network_error_from_exception(
           std::current_exception(),
           abort_requested_ || caller_abort.abort_requested()));
     }
+    if (caller_abort.abort_requested()) {
+        co_return co_await flush_preceding_batch_after_cancellation();
+    }
+    co_return co_await write_acquired(
+      std::move(data),
+      std::move(reservation),
+      std::move(holder),
+      std::move(*serialization),
+      std::move(metric));
 }
 
 seastar::future<result<void>>

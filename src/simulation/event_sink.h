@@ -19,6 +19,18 @@ enum class event_replay_difference : std::uint8_t {
     expected_missing = 1,
     actual_missing = 2,
     value = 3,
+    kind = 4,
+    severity = 5,
+    monotonic = 6,
+    wall = 7,
+    shard = 8,
+    workload = 9,
+    sequence = 10,
+    field_count = 11,
+    // Each field occupies three adjacent codes: key, type, value.
+    field_key_0 = 32,
+    field_type_0 = 33,
+    field_value_0 = 34,
 };
 
 class event_log_sink final : public runtime::shard_affine {

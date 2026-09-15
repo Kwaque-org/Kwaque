@@ -365,6 +365,7 @@ kwaque_cc_library(
         "//src/codec:envelope",
         "//src/codec:error",
         "//src/codec:integer",
+        "//src/compression",
         "@seastar",
     ],
 )

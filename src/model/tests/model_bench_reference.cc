@@ -59,10 +59,7 @@ seastar::future<codec::result<decoded<Assigned>>> checked_decode(
             anchor.family(),
             anchor.field(),
             anchor.byte_offset()});
-    const byte_count body{
-      (Assigned ? assigned_batch_fixed_bytes : submitted_batch_fixed_bytes)
-        .value()
-      + work.policy().config().max_expanded_batch_bytes.value()};
+    const auto body = work.policy().config().max_encoded_body_bytes;
     return codec::bench::checked::native_decode<decoded<Assigned>>(
       input,
       family,

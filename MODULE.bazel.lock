@@ -260,7 +260,7 @@
   "moduleExtensions": {
     "//bazel:extensions.bzl%native_dependencies": {
       "general": {
-        "bzlTransitiveDigest": "Xyc4n9AwUgx1T9VdvBDzolH5/qKeVbRR7Vl3/h+sSOg=",
+        "bzlTransitiveDigest": "AbDV+fxKlV2zLTDX70cGIlHpubSTgovUDBl972PeCc0=",
         "usagesDigest": "9YDPLZWwbcujbIwOBv6LCUVfCkkytgvLeWbAXhHLa3Y=",
         "recordedInputs": [
           "REPO_MAPPING:,bazel_tools bazel_tools",
@@ -323,7 +323,8 @@
                 "@@//bazel/thirdparty:seastar-metrics-registration-exception-safety.patch",
                 "@@//bazel/thirdparty:seastar-scheduling-group-rollback.patch",
                 "@@//bazel/thirdparty:seastar-http-resource-limits.patch",
-                "@@//bazel/thirdparty:seastar-spinlock-include.patch"
+                "@@//bazel/thirdparty:seastar-spinlock-include.patch",
+                "@@//bazel/thirdparty:seastar-file-removal-kind.patch"
               ],
               "sha256": "5918f72ec59c159a8d2fe36870e7d30c6e61426fde766d7dd6853fa7f9871f7f",
               "strip_prefix": "seastar-a6ac2ff6190a4a9dce5059991355703e1073d11f",

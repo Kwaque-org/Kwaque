@@ -1,9 +1,11 @@
 #include "src/bytes/fragmented_buffer.h"
+#include "src/runtime/fault.h"
 #include "src/runtime/testing/contracts/network_contract.h"
 #include "src/simulation/bandwidth.h"
 #include "src/simulation/determinism_version.h"
 #include "src/simulation/event_trace.h"
 #include "src/simulation/fake_network.h"
+#include "src/simulation/fault_schedule.h"
 #include "src/simulation/scheduler.h"
 #include "src/simulation/scheduler_driver.h"
 #include "src/simulation/tests/network_oracle.h"
@@ -216,6 +218,123 @@ public:
         perf_tests::stop_measuring_time();
         return benchmark_batch;
     }
+};
+
+class fault_construction_fixture {
+public:
+    fault_construction_fixture()
+      : budget_(
+          trace_limits::make(
+            {.entries = 16, .encoded_bytes = 16384, .line_bytes = 1024})
+            .value())
+      , trace_(
+          trace_header::current(
+            1,
+            deterministic_random_algorithm_version,
+            deterministic_random_coordinate_version,
+            trace_budget(benchmark_scheduler_limits()),
+            budget_,
+            {},
+            {}),
+          budget_)
+      , events_(benchmark_scheduler_limits(), &trace_) {
+        for (std::uint64_t i = 1; i <= count; ++i) {
+            const auto occurrence = i <= count / 2 ? 2U * i - 1U : count;
+            rules_.push_back(
+              fault_rule::make(
+                fault_rule_id::make(i).value(),
+                runtime::builtin_fault_point::file_read,
+                i <= count / 2
+                  ? std::optional<runtime::fault_object_key>{}
+                  : std::optional{runtime::fault_object_key::from_u64(i)},
+                runtime::fault_occurrence::make(occurrence).value(),
+                runtime::fault_occurrence::make(occurrence).value(),
+                fault_selector::once(),
+                runtime::fault_decision::make_error())
+                .value());
+        }
+    }
+    std::size_t execute() {
+        auto rules = rules_.copy();
+        const auto limits = fault_schedule_limits::make(count).value();
+        std::size_t accepted = 0;
+        perf_tests::start_measuring_time();
+        {
+            auto schedule = fault_schedule::make(
+              events_, trace_, 1, std::move(rules), limits);
+            if (!schedule)
+                throw std::runtime_error(
+                  "fault construction benchmark admission");
+            accepted = (*schedule)->rules().size();
+        }
+        perf_tests::stop_measuring_time();
+        if (accepted != count)
+            throw std::runtime_error("fault construction benchmark count");
+        return 1;
+    }
+
+private:
+    static constexpr std::uint32_t count = 8'192;
+    trace_limits budget_;
+    event_trace trace_;
+    scheduler events_;
+    seastar::chunked_vector<fault_rule> rules_;
+};
+
+class trace_decode_fixture {
+public:
+    trace_decode_fixture()
+      : budget_(
+          trace_limits::make(
+            {.entries = count,
+             .encoded_bytes = canonical_header_encoded_size
+                              + count * canonical_entry_encoded_size,
+             .line_bytes = 1024})
+            .value()) {
+        event_trace trace{
+          trace_header::current(
+            1,
+            deterministic_random_algorithm_version,
+            deterministic_random_coordinate_version,
+            trace_budget(benchmark_scheduler_limits()),
+            budget_,
+            {},
+            {}),
+          budget_};
+        for (std::uint32_t i = 0; i < count; ++i)
+            trace
+              .observe(
+                trace_entry{
+                  .action = trace_action::keyed_decision,
+                  .kind = trace_event_kind::keyed_random,
+                  .domain = 1,
+                  .value = i})
+              .value();
+        encoded_ = trace.encode_cooperatively().get().value();
+    }
+    seastar::future<std::size_t> execute() {
+        trace_artifact input{encoded_.size()};
+        for (const auto& chunk : encoded_.chunks())
+            input.append({chunk.data(), chunk.size()});
+        std::size_t decoded_count = 0;
+        perf_tests::start_measuring_time();
+        {
+            auto decoded = co_await event_trace::decode_cooperatively(
+              std::move(input), budget_);
+            if (!decoded)
+                throw std::runtime_error("trace decode benchmark failed");
+            decoded_count = decoded->entries.size();
+        }
+        perf_tests::stop_measuring_time();
+        if (decoded_count != count)
+            throw std::runtime_error("trace decode benchmark count");
+        co_return 1;
+    }
+
+private:
+    static constexpr std::uint32_t count = 4'096;
+    trace_limits budget_;
+    trace_artifact encoded_;
 };
 
 struct bandwidth_fixture {
@@ -546,6 +665,114 @@ public:
         perf_tests::stop_measuring_time();
         co_await finish_transition();
         co_return 1U;
+    }
+
+    seastar::future<std::size_t> endpoint_admission(unsigned selected) {
+        co_await stop_environment();
+        create_environment();
+        if (selected == 0) {
+            perf_tests::start_measuring_time();
+        }
+        auto bound = co_await wait_asynchronously(
+          network_->listen(runtime::network_endpoint{benchmark_target, 0}, {}));
+        if (!bound) {
+            throw std::runtime_error("endpoint benchmark bind");
+        }
+        if (selected == 0) {
+            perf_tests::stop_measuring_time();
+        }
+        listeners_.push_back(std::move(*bound));
+        if (selected == 0) {
+            co_return 1U;
+        }
+        if (selected == 1) {
+            perf_tests::start_measuring_time();
+        }
+        auto connected = co_await wait_asynchronously(network_->connect(
+          listeners_.back().local_endpoint(),
+          std::nullopt,
+          runtime::network_connection_limits{},
+          connect_abort_));
+        if (!connected) {
+            throw std::runtime_error("endpoint benchmark connect");
+        }
+        if (selected == 1) {
+            perf_tests::stop_measuring_time();
+        }
+        clients_.push_back(std::move(*connected));
+        if (selected == 2) {
+            perf_tests::start_measuring_time();
+        }
+        auto accepted = co_await wait_asynchronously(
+          listeners_.back().accept(accept_abort_));
+        if (!accepted) {
+            throw std::runtime_error("endpoint benchmark accept");
+        }
+        if (selected == 2) {
+            perf_tests::stop_measuring_time();
+        }
+        servers_.push_back(std::move(*accepted));
+        if (
+          clients_.front().remote_endpoint()
+            != listeners_.front().local_endpoint()
+          || servers_.front().remote_endpoint()
+               != clients_.front().local_endpoint()) {
+            throw std::runtime_error("endpoint benchmark address mismatch");
+        }
+        co_return 1U;
+    }
+
+    seastar::future<std::size_t> pressure_rejection() {
+        if (
+          network_->state() != fake_network_state::open
+          || requires_fresh_environment()) {
+            co_await restart_environment();
+        }
+        co_await prepare_transition(true);
+        writes_.push_back(
+          clients_.front().write(source_.share(), write_abort_));
+        writes_.push_back(
+          clients_.front().write(source_.share(), write_abort_));
+        auto payload = source_.share();
+        perf_tests::start_measuring_time();
+        auto rejected = clients_.front().write(
+          std::move(payload), write_abort_);
+        const auto was_ready = rejected.available();
+        const auto result = co_await std::move(rejected);
+        perf_tests::stop_measuring_time();
+        if (!was_ready || result || result.error().code() != errc::queue_full) {
+            throw std::runtime_error(
+              "network pressure benchmark admitted excess work");
+        }
+        require(co_await wait_asynchronously(network_->stop()));
+        for (auto& writing : writes_) {
+            const auto stopped = co_await std::move(writing);
+            if (stopped || stopped.error().code() != errc::aborted) {
+                throw std::runtime_error("network pressure benchmark terminal");
+            }
+        }
+        writes_.clear();
+        prepared_payloads_.clear();
+        co_return 1U;
+    }
+
+    seastar::future<std::size_t> topology_controls() {
+        if (requires_fresh_environment()) {
+            co_await restart_environment();
+        }
+        const auto source = clients_.front().local_endpoint().address();
+        const auto target = clients_.front().remote_endpoint().address();
+        perf_tests::start_measuring_time();
+        require(
+          co_await wait_asynchronously(network_->partition(source, target)));
+        require(co_await wait_asynchronously(network_->heal(source, target)));
+        require(co_await wait_asynchronously(network_->clog(source, target)));
+        require(co_await wait_asynchronously(network_->unclog(source, target)));
+        perf_tests::stop_measuring_time();
+        if (network_->active_operations() != 0) {
+            throw std::runtime_error("topology benchmark retained a control");
+        }
+        co_return 4U;
     }
 
 private:
@@ -885,6 +1112,11 @@ using rebalance_96_fixture = integrated_rebalance_fixture<96>;
 
 } // namespace
 
+PERF_TEST_F(fault_construction_fixture, construct8192_disjoint_scopes) {
+    return execute();
+}
+PERF_TEST_F(trace_decode_fixture, decode4096_entries) { return execute(); }
+
 PERF_TEST_F(scheduler_fixture, enqueue_64) { return enqueue(); }
 
 PERF_TEST_F(scheduler_fixture, step_64) { return step(); }
@@ -937,6 +1169,22 @@ PERF_TEST_CN(integrated_many_to_one_fixture, transmit_read_8x4096) {
 
 PERF_TEST_CN(integrated_one_to_many_fixture, transmit_read_8x4096) {
     return execute();
+}
+
+PERF_TEST_CN(rebalance_1_fixture, bind_endpoint) {
+    return endpoint_admission(0);
+}
+PERF_TEST_CN(rebalance_1_fixture, connect_endpoint) {
+    return endpoint_admission(1);
+}
+PERF_TEST_CN(rebalance_1_fixture, accept_endpoint) {
+    return endpoint_admission(2);
+}
+PERF_TEST_CN(rebalance_1_fixture, pressure_rejection) {
+    return pressure_rejection();
+}
+PERF_TEST_CN(rebalance_1_fixture, topology_controls) {
+    return topology_controls();
 }
 
 PERF_TEST_CN(rebalance_1_fixture, stop_active) { return stop_active(); }

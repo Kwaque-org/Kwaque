@@ -113,6 +113,63 @@ class BenchmarkComparisonTest(unittest.TestCase):
             )
         return result, child
 
+    def test_same_case_across_saved_binaries_records_both_identities(self):
+        baseline = self.root / "saved baseline"
+        baseline.write_bytes(b"saved-release-fixture")
+        baseline.chmod(0o755)
+        case = "maximum_noise.cold_decompress"
+        invoked = []
+
+        def run(arguments, **kwargs):
+            invoked.append(Path(arguments[0]))
+            with mock.patch.object(self, "binary", Path(arguments[0])):
+                return self.fake_native(arguments, **kwargs)
+
+        with mock.patch.object(driver.subprocess, "run", side_effect=run):
+            result = driver.run_comparison(
+                self.binary,
+                [driver.Pair(case, case)],
+                self.output,
+                baseline_binary=baseline,
+            )
+        self.assertEqual(invoked.count(baseline), 3)
+        self.assertEqual(invoked.count(self.binary), 3)
+        self.assertEqual(
+            result["baseline_binary"]["sha256"], driver.binary_digest(baseline)
+        )
+        self.assertEqual(result["binary"]["sha256"], driver.binary_digest(self.binary))
+        self.assertEqual(result["comparisons"][0]["status"], "parity")
+
+    def test_saved_binary_must_be_distinct_and_immutable(self):
+        with self.assertRaisesRegex(driver.ComparisonError, "separate binaries"):
+            driver.run_comparison(
+                self.binary, [PAIR], self.output, baseline_binary=self.binary
+            )
+        self.assertFalse(self.output.exists())
+        baseline = self.root / "saved baseline"
+        baseline.write_bytes(b"saved-release-fixture")
+        baseline.chmod(0o755)
+
+        def mutate(arguments, **kwargs):
+            with mock.patch.object(self, "binary", Path(arguments[0])):
+                result = self.fake_native(arguments, **kwargs)
+            if Path(arguments[0]) == baseline:
+                baseline.write_bytes(b"changed during measurement")
+            return result
+
+        with mock.patch.object(driver.subprocess, "run", side_effect=mutate):
+            with self.assertRaisesRegex(driver.ComparisonError, "changed during"):
+                driver.run_comparison(
+                    self.binary, [PAIR], self.output, baseline_binary=baseline
+                )
+
+    def test_same_case_requires_saved_binary(self):
+        with self.assertRaises(driver.ComparisonError):
+            driver.run_comparison(
+                self.binary, [driver.Pair("group.case", "group.case")], self.output
+            )
+        self.assertFalse(self.output.exists())
+
     def test_runtime_profile_requires_native_optimized_oom_abort_without_instrumentation(
         self,
     ) -> None:

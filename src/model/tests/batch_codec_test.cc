@@ -397,7 +397,7 @@ TEST(BatchCodecTest, WrongExpectedFamilyAndIntegrityPrecedeBodyInterpretation) {
     rejected(unhex(dense_envelope), false, errc::wrong_context);
     rejected(unhex(submitted_envelope), true, errc::wrong_context);
     auto raw = unhex(submitted_envelope);
-    raw[32 + 156] = 1;
+    raw[32 + 156] = 2;
     rejected(raw, false, errc::corrupt_data); // body CRC is not repaired
     raw[28] ^= 1;
     rejected(raw, false, errc::corrupt_data); // header is earlier
@@ -543,7 +543,7 @@ TEST(BatchCodecTest, UnsupportedCodecAndProfileAndNonzeroReservedBytesReject) {
     for (const bool assigned : {false, true}) {
         for (int mode = 0; mode < 4; ++mode) {
             auto raw = unhex(assigned ? sparse_envelope : submitted_envelope);
-            if (mode == 0) raw[32 + 156] = 1;
+            if (mode == 0) raw[32 + 156] = 2;
             if (mode == 1) raw[32 + 157] = 1;
             if (mode == 2) store(raw, 32 + 158, 0, 2);
             if (mode == 3) store(raw, 32 + 158, 2, 2);

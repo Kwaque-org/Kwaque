@@ -1,6 +1,7 @@
 #include "src/runtime/file.h"
 
 #include "src/base/invariant.h"
+#include "src/runtime/file_error_internal.h"
 #include "src/runtime/fragmented_buffer_internal.h"
 
 #include <seastar/core/coroutine.hh>
@@ -43,56 +44,13 @@ file_io_limits validated_file_io_limits(file_io_limits limits) {
     return limits;
 }
 
-errc map_system_error(const std::error_code& error) noexcept {
-    if (error == std::errc::no_such_file_or_directory) {
-        return errc::not_found;
-    }
-    if (error == std::errc::file_exists) {
-        return errc::already_exists;
-    }
-    if (
-      error == std::errc::permission_denied
-      || error == std::errc::operation_not_permitted
-      || error == std::errc::read_only_file_system) {
-        return errc::permission_denied;
-    }
-    if (error == std::errc::directory_not_empty) {
-        return errc::directory_not_empty;
-    }
-    if (error == std::errc::operation_canceled) {
-        return errc::aborted;
-    }
-    if (error == std::errc::timed_out) {
-        return errc::timed_out;
-    }
-    if (
-      error == std::errc::no_space_on_device
-      || error == std::errc::too_many_files_open
-      || error == std::errc::too_many_files_open_in_system) {
-        return errc::resource_exhausted;
-    }
-    if (error == std::errc::file_too_large) {
-        return errc::out_of_range;
-    }
-    if (error == std::errc::invalid_argument) {
-        return errc::invalid_argument;
-    }
-    if (error == std::errc::is_a_directory) {
-        return errc::is_a_directory;
-    }
-    if (error == std::errc::not_a_directory) {
-        return errc::not_a_directory;
-    }
-    return errc::io_failure;
-}
-
 operation_error file_error_from_exception(std::exception_ptr exception) {
     try {
         std::rethrow_exception(std::move(exception));
     } catch (const seastar::cancelled_error&) {
         return file_error(errc::aborted);
     } catch (const std::system_error& error) {
-        return file_error(map_system_error(error.code()));
+        return file_error(detail::map_file_system_error(error.code()));
     }
 }
 

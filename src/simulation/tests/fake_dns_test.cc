@@ -47,9 +47,9 @@ kwaque::simulation::scheduler_limits dns_scheduler_limits() {
 kwaque::simulation::trace_limits dns_trace_limits() {
     auto limits = kwaque::simulation::trace_limits::make(
       kwaque::simulation::trace_limit_values{
-        .entries = 1'024,
+        .entries = 16'384,
         .encoded_bytes = kwaque::simulation::canonical_header_encoded_size
-                         + 1'024U
+                         + 16'384U
                              * kwaque::simulation::canonical_entry_encoded_size,
         .line_bytes = 1'024,
       });
@@ -167,7 +167,11 @@ seastar::future<> capture_dns_vocabulary(
             const auto advanced = events.advance_to_next();
             BOOST_REQUIRE(advanced.has_value() && advanced->has_value());
         }
-        BOOST_REQUIRE(events.run_ready().has_value());
+        BOOST_REQUIRE(
+          events
+            .run_ready_batch(
+              std::min<std::uint64_t>(64U, events.limits().events_per_pump()))
+            .has_value());
         co_await seastar::yield();
     }
     BOOST_CHECK(!parked.available());
@@ -685,7 +689,8 @@ SEASTAR_TEST_CASE(
     auto made = kwaque::simulation::fake_dns::make({}, events);
     BOOST_REQUIRE(made.has_value());
     auto resolver = std::move(*made);
-    std::vector<kwaque::simulation::event_trace::reservation> blockers;
+    seastar::chunked_vector<kwaque::simulation::event_trace::reservation>
+      blockers;
     while (true) {
         auto reserved = trace.reserve(
           1, kwaque::simulation::canonical_entry_encoded_size);
@@ -1308,4 +1313,35 @@ SEASTAR_TEST_CASE(fake_dns_shared_runtime_contract) {
     auto contract = kwaque::runtime::testing::run_dns_contract(*resolver);
     co_await pump_until(events, contract);
     co_await std::move(contract);
+}
+
+SEASTAR_TEST_CASE(fake_dns_stop_does_not_need_unreserved_trace_capacity) {
+    const auto scheduler_budget = dns_scheduler_limits();
+    const auto trace_budget = dns_trace_limits();
+    kwaque::simulation::event_trace trace{
+      dns_trace_header(scheduler_budget, trace_budget), trace_budget};
+    kwaque::simulation::scheduler events{scheduler_budget, &trace};
+    auto made = kwaque::simulation::fake_dns::make({}, events);
+    BOOST_REQUIRE(made.has_value());
+    auto dns = std::move(*made);
+    seastar::chunked_vector<kwaque::simulation::event_trace::reservation> held;
+    while (true) {
+        auto reserved = trace.reserve(
+          1, kwaque::simulation::canonical_entry_encoded_size);
+        if (!reserved) {
+            break;
+        }
+        held.push_back(std::move(*reserved));
+        if (held.size() % 64U == 0) {
+            co_await seastar::yield();
+        }
+    }
+    auto stopping = dns->stop();
+    BOOST_CHECK(!stopping.available());
+    co_await pump_until(events, stopping);
+    const auto stopped = co_await std::move(stopping);
+    BOOST_REQUIRE(stopped.has_value());
+    BOOST_CHECK(dns->state() == kwaque::simulation::fake_dns_state::stopped);
+    BOOST_CHECK_EQUAL(events.pending_events(), 0U);
+    BOOST_CHECK(!events.trace_failed());
 }

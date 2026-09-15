@@ -65,6 +65,11 @@ enum class fake_network_state : std::uint8_t {
 };
 
 struct fake_network_config final {
+    [[nodiscard]] runtime::result<void>
+    validate(const scheduler_limits& limits) const noexcept;
+    [[nodiscard]] std::uint64_t required_events() const noexcept;
+    [[nodiscard]] std::uint32_t cleanup_batches() const noexcept;
+
     std::optional<runtime::network_address> ipv4_source{
       runtime::network_address::ipv4(
         {std::byte{127}, std::byte{0}, std::byte{0}, std::byte{1}})};

@@ -2280,6 +2280,8 @@ open_network(fuzz_case_context& context, network_fixture& fixture) {
     }
     fixture.faults = std::move(*faults);
     const auto count = static_cast<std::uint32_t>(fixture.flow_count);
+    // Retain both fault payloads and admit FIN before reading through EOF.
+    constexpr std::uint32_t packet_slots_per_flow{3};
     fake_network_config config;
     config.maximum_listeners = count;
     config.maximum_connection_pairs = count;
@@ -2288,10 +2290,10 @@ open_network(fuzz_case_context& context, network_fixture& fixture) {
     config.maximum_operations = 2U * count + 8U;
     config.maximum_parked_operations = count;
     config.maximum_direction_bytes = byte_count{4'096};
-    config.maximum_packets = 2U * count;
+    config.maximum_packets = packet_slots_per_flow * count;
     config.maximum_packet_logical_bytes = byte_count{4'096U * count};
     config.maximum_packet_retained_bytes = byte_count{4'096U * count};
-    config.maximum_direction_packets = 2;
+    config.maximum_direction_packets = packet_slots_per_flow;
     config.maximum_links = count + 1U;
     config.maximum_address_entries = 2U * count + 4U;
     config.maximum_active_flows = count;

@@ -131,6 +131,7 @@ kwaque_cc_library(
         "//src/resource:resource_registry",
         "//src/runtime:stop_signal",
         "//src/runtime/production:environment",
+        "//src/runtime/production:random",
         "@boost//:program_options",
         "@seastar",
     ],

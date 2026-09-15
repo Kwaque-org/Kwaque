@@ -79,7 +79,9 @@ struct fixed_fields final {
     context_type<Assigned> context;
     codec::semantic_batch_digest digest;
     item_count headers;
-    byte_count records;
+    byte_count encoded_records;
+    byte_count expanded_records;
+    compression::codec_id encoding;
 };
 
 template<bool Assigned, std::size_t N>
@@ -90,9 +92,12 @@ codec::result<fixed_fields<Assigned>> parse_fixed(
   codec::field_context context) {
     using detail::batch_load;
     // Profile is checked before interpreting its identity/count/record grammar.
-    if (batch_load<156, std::uint8_t>(fixed) != 0)
-        return codec::failure(
-          at(errc::unsupported_format, context, batch_field::codec, 156));
+    const auto encoding = compression::parse_codec_id(
+      batch_load<156, std::uint8_t>(fixed),
+      {context.origin + 156U,
+       context.family,
+       static_cast<std::uint16_t>(batch_field::codec)});
+    if (!encoding) return codec::failure(encoding.error());
     if (batch_load<157, std::uint8_t>(fixed) != 0)
         return codec::failure(
           at(errc::malformed_data, context, batch_field::reserved, 157));
@@ -212,7 +217,10 @@ codec::result<fixed_fields<Assigned>> parse_fixed(
           errc::resource_exhausted, context, batch_field::header_count, 152));
     const auto encoded = batch_load<160, std::uint32_t>(fixed);
     const auto expanded = batch_load<164, std::uint32_t>(fixed);
-    if (encoded > config.max_expanded_batch_bytes.value())
+    const auto encoded_limit = config.max_encoded_body_bytes.checked_sub(
+      byte_count{N});
+    if (!encoded_limit || encoded > encoded_limit->value()
+        || (*encoding == compression::codec_id::none && encoded > config.max_expanded_batch_bytes.value()))
         return codec::failure(at(
           errc::resource_exhausted,
           context,
@@ -224,7 +232,7 @@ codec::result<fixed_fields<Assigned>> parse_fixed(
           context,
           batch_field::expanded_record_bytes,
           164));
-    if (encoded != expanded)
+    if (*encoding == compression::codec_id::none && encoded != expanded)
         return codec::failure(at(
           errc::malformed_data,
           context,
@@ -252,10 +260,20 @@ codec::result<fixed_fields<Assigned>> parse_fixed(
                 : batch_field::logical_end,
               assigned.error() == errc::out_of_range ? 168 : 176));
         return fixed_fields<Assigned>{
-          *assigned, digest, item_count{headers}, byte_count{encoded}};
+          *assigned,
+          digest,
+          item_count{headers},
+          byte_count{encoded},
+          byte_count{expanded},
+          *encoding};
     } else {
         return fixed_fields<Assigned>{
-          *submitted, digest, item_count{headers}, byte_count{encoded}};
+          *submitted,
+          digest,
+          item_count{headers},
+          byte_count{encoded},
+          byte_count{expanded},
+          *encoding};
     }
 }
 
@@ -263,6 +281,8 @@ template<bool Assigned>
 seastar::future<codec::result<fixed_fields<Assigned>>> read_body(
   fragmented_buffer_parser& input,
   fragmented_buffer& records,
+  std::optional<fragmented_buffer_parser>& expanded_input,
+  byte_count& backing,
   byte_count& metadata,
   batch_decode_expectation expected,
   codec::decode_budget memory,
@@ -332,33 +352,40 @@ seastar::future<codec::result<fixed_fields<Assigned>>> read_body(
         else
             return item_count{submitted.original_count().value()};
     }();
-    if (
-      fields->records != input.bytes_remaining()
-      || retained.value() > fields->records.value() / 7U)
+    if (fields->encoded_records != input.bytes_remaining())
         co_return codec::failure(at(
           errc::malformed_data,
           context,
           batch_field::encoded_record_bytes,
           160));
+    if (retained.value() > fields->expanded_records.value() / 7U) {
+        const bool raw = fields->encoding == compression::codec_id::none;
+        co_return codec::failure(at(
+          errc::malformed_data,
+          context,
+          raw ? batch_field::encoded_record_bytes
+              : batch_field::expanded_record_bytes,
+          raw ? 160U : 164U));
+    }
     if (auto ready = co_await work.checkpoint(anchor); !ready)
         co_return codec::failure(ready.error());
     if (auto ready = work.poll(anchor); !ready)
         co_return codec::failure(ready.error());
     const auto cost = input.next_buffer_allocation_cost(
-      fields->records, memory.charge);
+      fields->encoded_records, memory.charge);
     if (!cost)
         co_return codec::failure(
           codec::detail::allocation_cost_error(
             cost.error(), context, context.origin + fixed.size()));
     const auto valid = codec::detail::validate_decode_cost(
-      fields->records,
-      work.policy().config().max_expanded_batch_bytes,
+      fields->encoded_records,
+      work.policy().config().max_encoded_body_bytes,
       *cost,
       work.policy(),
       context,
       context.origin + fixed.size());
     if (!valid) co_return codec::failure(valid.error());
-    const auto remaining = codec::detail::consume_decode_budget(
+    auto remaining = codec::detail::consume_decode_budget(
       work.policy(),
       memory,
       byte_count{},
@@ -368,13 +395,82 @@ seastar::future<codec::result<fixed_fields<Assigned>>> read_body(
     if (!remaining) co_return codec::failure(remaining.error());
     if (auto ready = work.poll(anchor); !ready)
         co_return codec::failure(ready.error());
-    auto shared = input.peek_buffer(fields->records);
+    auto shared = input.peek_buffer(fields->encoded_records);
     if (!shared)
         co_return codec::failure(
           codec::detail::allocation_cost_error(
             shared.error(), context, context.origin + fixed.size()));
     records = std::move(*shared);
     metadata = cost->descriptors;
+    const bool compressed = fields->encoding == compression::codec_id::lz4;
+    const codec::field_context region_context{
+      context.origin + fixed.size(),
+      context.family,
+      static_cast<std::uint16_t>(batch_field::records)};
+    if (compressed) {
+        auto expanded = co_await compression::decompress_lz4(
+          std::move(records),
+          fields->expanded_records,
+          work,
+          *remaining,
+          region_context);
+        if (!expanded) co_return codec::failure(expanded.error());
+        backing = expanded->retained.backing;
+        metadata = *expanded->retained.descriptors.checked_add(
+          expanded->retained.share_controls);
+        records = std::move(expanded->value);
+        // The consumed encoded alias is gone, but its parent backing is still
+        // reserved. Reconcile that temporary alias, then reserve the raw owner
+        // and its separate validation parser before creating the share.
+        remaining = codec::detail::consume_decode_budget(
+          work.policy(),
+          memory,
+          backing,
+          metadata,
+          region_context,
+          region_context.origin);
+        if (!remaining) co_return codec::failure(remaining.error());
+        if (auto ready = co_await work.checkpoint(anchor); !ready)
+            co_return codec::failure(ready.error());
+        if (auto ready = work.poll(anchor); !ready)
+            co_return codec::failure(ready.error());
+        const auto alias = records.slice_allocation_cost(
+          byte_count{}, records.size(), memory.charge);
+        if (!alias)
+            co_return codec::failure(
+              codec::detail::allocation_cost_error(
+                alias.error(), region_context, region_context.origin));
+        const auto valid_alias = codec::detail::validate_decode_cost(
+          records.size(),
+          work.policy().config().max_expanded_batch_bytes,
+          *alias,
+          work.policy(),
+          region_context,
+          region_context.origin);
+        if (!valid_alias) co_return codec::failure(valid_alias.error());
+        remaining = codec::detail::consume_decode_budget(
+          work.policy(),
+          *remaining,
+          byte_count{},
+          alias->descriptors,
+          region_context,
+          region_context.origin);
+        if (!remaining) co_return codec::failure(remaining.error());
+        auto shared_raw = records.share(byte_count{}, records.size());
+        if (!shared_raw)
+            co_return codec::failure(
+              codec::detail::allocation_cost_error(
+                shared_raw.error(), region_context, region_context.origin));
+        expanded_input.emplace(std::move(*shared_raw));
+    }
+    auto& scan = compressed ? *expanded_input : input;
+    // Expanded positions never enter wire-origin arithmetic, even when the
+    // encoded input's last byte is near UINT64_MAX.
+    const auto scan_context
+      = compressed
+          ? codec::
+              field_context{0, context.family, static_cast<std::uint16_t>(batch_field::records)}
+          : context;
     std::uint64_t headers = 0;
     std::optional<range_logical_count> previous;
     const bool dense = retained.value() == submitted.original_count().value();
@@ -387,15 +483,22 @@ seastar::future<codec::result<fixed_fields<Assigned>>> read_body(
         if (auto ready = work.poll(anchor); !ready)
             co_return codec::failure(ready.error());
         const auto record = co_await detail::scan_record(
-          input,
+          scan,
           {submitted.original_timestamp_base(),
            submitted.original_count(),
            item_count{
              work.policy().config().max_batch_headers.value() - headers}},
           *remaining,
           work,
-          context);
-        if (!record) co_return codec::failure(record.error());
+          scan_context);
+        if (!record)
+            co_return codec::failure(
+              compressed ? at(
+                             record.error().code(),
+                             context,
+                             batch_field::records,
+                             fixed.size())
+                         : record.error());
         if (auto ready = work.poll(anchor); !ready)
             co_return codec::failure(ready.error());
         const auto delta = record->fields.logical_delta;
@@ -406,19 +509,19 @@ seastar::future<codec::result<fixed_fields<Assigned>>> read_body(
               errc::malformed_data,
               context,
               batch_field::records,
-              record->encoded.offset.value()));
+              compressed ? fixed.size() : record->encoded.offset.value()));
         previous = delta;
         headers += record->headers().size();
         if (headers > fields->headers.value())
             co_return codec::failure(at(
               errc::malformed_data, context, batch_field::header_count, 152));
     }
-    if (!input.at_end())
+    if (!scan.at_end())
         co_return codec::failure(at(
           errc::malformed_data,
           context,
           batch_field::records,
-          input.bytes_consumed().value()));
+          compressed ? fixed.size() : scan.bytes_consumed().value()));
     if (headers != fields->headers.value())
         co_return codec::failure(
           at(errc::malformed_data, context, batch_field::header_count, 152));
@@ -433,6 +536,13 @@ seastar::future<codec::result<fixed_fields<Assigned>>> read_body(
         if (*computed != fields->digest)
             co_return codec::failure(
               at(errc::corrupt_data, context, batch_field::fingerprint, 104));
+    }
+    if (compressed) {
+        const auto consumed = input.skip(fields->encoded_records);
+        KWAQUE_INVARIANT(
+          invariant_id{"KQ-BATCH-COMPRESSED-EXTENT"},
+          consumed.has_value(),
+          "complete encoded record region could not advance its body parser");
     }
     co_return *fields;
 }
@@ -464,15 +574,30 @@ public:
       codec::cooperative_work& work,
       codec::field_context context) {
         fragmented_buffer records;
+        std::optional<fragmented_buffer_parser> expanded_input;
+        byte_count backing;
         byte_count metadata;
         std::optional<codec::result<fixed_fields<Assigned>>> outcome;
         std::exception_ptr exception;
         try {
             outcome.emplace(
               co_await read_body<Assigned>(
-                input, records, metadata, expected, memory, work, context));
+                input,
+                records,
+                expanded_input,
+                backing,
+                metadata,
+                expected,
+                memory,
+                work,
+                context));
         } catch (...) {
             exception = std::current_exception();
+        }
+        if (expanded_input) {
+            co_await work.drain_inline(
+              work.byte_quantum(), work.item_quantum());
+            expanded_input.reset();
         }
         if (!exception && outcome->has_value()) {
             if (
@@ -492,12 +617,7 @@ public:
         // its temporary body alias and commits. Nothing escapes this callback
         // early; the returned record region is the only new persistent owner.
         const auto remaining = codec::detail::consume_decode_budget(
-          work.policy(),
-          original,
-          byte_count{},
-          metadata,
-          context,
-          context.origin);
+          work.policy(), original, backing, metadata, context, context.origin);
         KWAQUE_INVARIANT(
           invariant_id{"KQ-BATCH-DECODE-RESIDUAL"},
           remaining.has_value(),
@@ -588,10 +708,7 @@ seastar::future<codec::result<decoded_type<Assigned>>> decode_batch(
           context,
           batch_field::fixed_body,
           input.bytes_consumed().value()));
-    constexpr auto fixed = Assigned ? assigned_batch_fixed_bytes
-                                    : submitted_batch_fixed_bytes;
-    const byte_count body_cap{
-      fixed.value() + work.policy().config().max_expanded_batch_bytes.value()};
+    const auto body_cap = work.policy().config().max_encoded_body_bytes;
     const byte_count total_cap{
       body_cap.value() + work.policy().config().max_header_bytes.value()};
     return codec::decode_envelope<decoded_type<Assigned>>(

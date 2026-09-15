@@ -215,3 +215,43 @@ SEASTAR_TEST_CASE(
         }
     });
 }
+
+SEASTAR_TEST_CASE(
+  fuzz_network_retains_duplicate_and_reordered_data_while_admitting_fin) {
+    co_await seastar::async([] {
+        using namespace kwaque::simulation;
+        using namespace kwaque::simulation::testing;
+        constexpr std::array counts{1U, 8U, 32U, 96U};
+        constexpr std::array<std::uint8_t, 2> actions{5, 6};
+        for (std::uint8_t selector = 0; selector < counts.size(); ++selector) {
+            for (std::uint8_t topology = 0; topology < 2; ++topology) {
+                for (const auto action : actions) {
+                    auto script = network_script(selector, topology, action);
+                    script[0] = 17;
+                    const auto captured = execute_fuzz_case(
+                      fuzz_harness::fake_network, script);
+                    BOOST_REQUIRE(captured.has_value());
+                    BOOST_REQUIRE(
+                      captured->outcome().code == kwaque::errc::success);
+                    auto decoded = decode_fuzz_trace(
+                                     captured->trace(),
+                                     fuzz_harness::fake_network)
+                                     .get();
+                    BOOST_REQUIRE(decoded.has_value());
+                    const auto fins = std::count_if(
+                      decoded->entries.begin(),
+                      decoded->entries.end(),
+                      [](const trace_entry& entry) {
+                          return entry.action == trace_action::scheduled
+                                 && entry.kind == trace_event_kind::network
+                                 && entry.domain
+                                      == static_cast<std::uint32_t>(
+                                        network_trace_phase::fin);
+                      });
+                    BOOST_CHECK_EQUAL(fins, counts[selector]);
+                    BOOST_REQUIRE(replay_fuzz_case(*captured).has_value());
+                }
+            }
+        }
+    });
+}

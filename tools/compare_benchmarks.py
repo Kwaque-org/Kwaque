@@ -329,6 +329,7 @@ def run_comparison(
     timeout: float | None = None,
     cpu: int | None = None,
     task_quota_ms: float | None = None,
+    baseline_binary: Path | None = None,
 ) -> dict[str, Any]:
     if isinstance(runs, bool) or not isinstance(runs, int) or runs < MINIMUM_RUNS:
         raise ComparisonError("runs must be an integer of at least seven")
@@ -344,7 +345,12 @@ def run_comparison(
     if task_quota_ms is not None:
         task_quota_ms = finite_number(task_quota_ms, "task_quota_ms", positive=True)
     if not pairs or any(
-        parse_pair(f"{pair.baseline}={pair.candidate}") != pair for pair in pairs
+        not all(
+            len(name) <= 200 and CASE_NAME.fullmatch(name)
+            for name in (pair.baseline, pair.candidate)
+        )
+        or (pair.baseline == pair.candidate and baseline_binary is None)
+        for pair in pairs
     ):
         raise ComparisonError("at least one valid comparison pair is required")
     if len(set(pairs)) != len(pairs):
@@ -365,8 +371,20 @@ def run_comparison(
         ) from error
     if not binary.is_file() or not os.access(binary, os.X_OK):
         raise ComparisonError("benchmark binary must be an executable regular file")
+    if baseline_binary is not None:
+        try:
+            baseline_binary = baseline_binary.expanduser().resolve(strict=True)
+        except OSError as error:
+            raise ComparisonError(
+                f"baseline binary is unavailable ({error.strerror})"
+            ) from error
+        if not baseline_binary.is_file() or not os.access(baseline_binary, os.X_OK):
+            raise ComparisonError("baseline binary must be an executable regular file")
+        if baseline_binary == binary or os.path.samefile(baseline_binary, binary):
+            raise ComparisonError("before/after comparison requires separate binaries")
     output_dir = output_dir.expanduser().resolve()
     digest = binary_digest(binary)
+    baseline_digest = binary_digest(baseline_binary) if baseline_binary else digest
     try:
         output_dir.mkdir(parents=True, exist_ok=False)
     except OSError as error:
@@ -403,9 +421,24 @@ def run_comparison(
         "comparisons": [],
     }
     measurements: dict[tuple[int, int, str], Measurement] = {}
+    if baseline_binary:
+        manifest["baseline_binary"] = {
+            "name": baseline_binary.name,
+            "sha256": baseline_digest,
+        }
     write_manifest(output_dir, manifest)
     try:
         for sequence, invocation in enumerate(order, 1):
+            selected_binary = (
+                baseline_binary
+                if baseline_binary and invocation.role == "baseline"
+                else binary
+            )
+            selected_digest = (
+                baseline_digest
+                if baseline_binary and invocation.role == "baseline"
+                else digest
+            )
             stem = f"{sequence:04d}-round-{invocation.round}-pair-{invocation.pair + 1}-{invocation.role}"
             json_name = stem + ".json"
             log_name = stem + ".log"
@@ -431,14 +464,14 @@ def run_comparison(
             }
             manifest["invocations"].append(record)
             write_manifest(output_dir, manifest)
-            if binary_digest(binary) != digest:
+            if binary_digest(selected_binary) != selected_digest:
                 raise ComparisonError(
                     "benchmark binary changed before a native invocation"
                 )
             try:
                 with (output_dir / log_name).open("xb") as log:
                     result = subprocess.run(
-                        [str(binary), *arguments],
+                        [str(selected_binary), *arguments],
                         cwd=output_dir,
                         stdin=subprocess.DEVNULL,
                         stdout=log,
@@ -464,7 +497,7 @@ def run_comparison(
                 raise ComparisonError(
                     f"native case {invocation.case} exited with status {result.returncode}"
                 )
-            if binary_digest(binary) != digest:
+            if binary_digest(selected_binary) != selected_digest:
                 raise ComparisonError(
                     "benchmark binary changed during a native invocation"
                 )
@@ -515,11 +548,21 @@ def main() -> int:
         "--binary", required=True, type=Path, help="prebuilt release benchmark binary"
     )
     parser.add_argument(
+        "--baseline-binary",
+        type=Path,
+        help="optional saved release binary for an equivalent before/after comparison",
+    )
+    selection = parser.add_mutually_exclusive_group(required=True)
+    selection.add_argument(
         "--pair",
-        required=True,
         action="append",
         type=parse_pair,
         help="exact group.baseline=group.candidate names; repeat for additional pairs",
+    )
+    selection.add_argument(
+        "--case",
+        action="append",
+        help="same exact group.case in both binaries; requires --baseline-binary",
     )
     parser.add_argument(
         "--output-dir",
@@ -553,10 +596,14 @@ def main() -> int:
     )
     arguments = parser.parse_args()
     try:
+        if arguments.case and not arguments.baseline_binary:
+            raise ComparisonError("--case requires --baseline-binary")
+        pairs = arguments.pair or [Pair(name, name) for name in arguments.case]
         manifest = run_comparison(
             arguments.binary,
-            arguments.pair,
+            pairs,
             arguments.output_dir,
+            baseline_binary=arguments.baseline_binary,
             runs=arguments.runs,
             duration=arguments.duration,
             seed=arguments.seed,

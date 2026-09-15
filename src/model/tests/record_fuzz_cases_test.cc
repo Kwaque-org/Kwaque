@@ -60,3 +60,19 @@ TEST(RecordFuzzCasesTest, BudgetsBoundariesAbortAndMaximumEngineInput) {
     maximum[4] = 1;
     kwaque::model::testing::exercise_record_case(maximum);
 }
+
+TEST(
+  RecordFuzzCasesTest,
+  CompressedGrammarUsesIndependentExpansionAndRawSemantics) {
+    for (const std::uint8_t mode : std::array<std::uint8_t, 2>{4, 5}) {
+        for (std::uint8_t mutation = 0; mutation < 32; ++mutation) {
+            for (const std::uint8_t work :
+                 std::array<std::uint8_t, 4>{16, 17, 18, 20}) {
+                std::array<std::uint8_t, 12> input{
+                  mode, mutation, 4, 1, 1, 0, 0x55, work, 1, 2, 3, 4};
+                kwaque::model::testing::exercise_record_case(input);
+                seastar::thread::maybe_yield();
+            }
+        }
+    }
+}

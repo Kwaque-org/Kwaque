@@ -136,15 +136,21 @@ public:
         event_id_reservation& operator=(event_id_reservation&& other) noexcept;
 
         [[nodiscard]] bool active() const noexcept { return owner_ != nullptr; }
+        [[nodiscard]] std::uint64_t count() const noexcept { return count_; }
+        [[nodiscard]] runtime::result<event_id_reservation>
+        split(std::uint64_t count) noexcept;
         void release() noexcept;
 
     private:
         friend class scheduler;
 
-        explicit event_id_reservation(scheduler& owner) noexcept
-          : owner_(&owner) {}
+        explicit event_id_reservation(
+          scheduler& owner, std::uint64_t count) noexcept
+          : owner_(&owner)
+          , count_(count) {}
 
         scheduler* owner_{nullptr};
+        std::uint64_t count_{0};
     };
 
     // Reserves both one future event ID and one physical pending-event slot.
@@ -187,14 +193,15 @@ public:
       trace_event_descriptor descriptor = {},
       event_cleanup_policy cleanup = event_cleanup_policy::drop,
       event_trace::reservation trace_reservation = {});
-    [[nodiscard]] runtime::result<event_id_reservation> reserve_event_id();
+    [[nodiscard]] runtime::result<event_id_reservation>
+    reserve_event_id(std::uint64_t count = 1);
     [[nodiscard]] runtime::result<event_slot_reservation> reserve_event_slot();
     [[nodiscard]] runtime::result<void> can_schedule(
       runtime::monotonic_time deadline,
       trace_event_descriptor descriptor = {},
       event_cleanup_policy cleanup = event_cleanup_policy::drop) const noexcept;
-    [[nodiscard]] runtime::result<event_trace::reservation>
-    reserve_trace(trace_event_descriptor descriptor = {});
+    [[nodiscard]] runtime::result<event_trace::reservation> reserve_trace(
+      trace_event_descriptor descriptor = {}, std::uint32_t count = 1);
     [[nodiscard]] runtime::result<event_trace::reservation> reserve_effect(
       trace_event_descriptor descriptor,
       std::span<const trace_context_field> context = {});
@@ -370,9 +377,10 @@ private:
     [[nodiscard]] runtime::result<void> validate_effect(
       trace_event_descriptor descriptor,
       std::span<const trace_context_field> context) const noexcept;
-    [[nodiscard]] bool event_id_available() const noexcept;
+    [[nodiscard]] bool
+    event_id_available(std::uint64_t count = 1) const noexcept;
     [[nodiscard]] std::size_t claimed_event_slots() const noexcept;
-    void release_reserved_event_id() noexcept;
+    void release_reserved_event_id(std::uint64_t count) noexcept;
     void release_reserved_event_slot() noexcept;
     [[nodiscard]] runtime::result<void> observe_event(
       trace_action action,

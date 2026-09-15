@@ -50,6 +50,7 @@ def declare_native_dependencies():
             "//bazel/thirdparty:seastar-scheduling-group-rollback.patch",
             "//bazel/thirdparty:seastar-http-resource-limits.patch",
             "//bazel/thirdparty:seastar-spinlock-include.patch",
+            "//bazel/thirdparty:seastar-file-removal-kind.patch",
         ],
         sha256 = "5918f72ec59c159a8d2fe36870e7d30c6e61426fde766d7dd6853fa7f9871f7f",
         strip_prefix = "seastar-{}".format(SEASTAR_REVISION),

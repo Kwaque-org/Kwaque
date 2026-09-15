@@ -327,6 +327,7 @@ kwaque_cc_test(
 kwaque_cc_benchmark(
     name = "simulation_bench",
     srcs = [
+        "fake_dns_bench.cc",
         "fake_file_bench.cc",
         "simulation_bench.cc",
     ],
@@ -335,11 +336,14 @@ kwaque_cc_benchmark(
         ":network_oracle",
         "//src/base",
         "//src/bytes:fragmented_buffer",
+        "//src/runtime:dns",
+        "//src/runtime:fault_api",
         "//src/runtime:file",
         "//src/runtime:network",
         "//src/runtime/testing/contracts:network_contract",
         "//src/simulation:bandwidth",
         "//src/simulation:event_trace",
+        "//src/simulation:fake_dns",
         "//src/simulation:fake_file",
         "//src/simulation:fake_file_test_support",
         "//src/simulation:fake_network",
@@ -654,6 +658,7 @@ kwaque_cc_seastar_test(
     cpu = 1,
     memory = "256MiB",
     deps = [
+        "//src/base",
         "//src/runtime:network",
         "//src/runtime:random",
         "//src/runtime/testing/contracts:network_contract",

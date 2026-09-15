@@ -7,6 +7,7 @@
 #include "src/broker/service_lifecycle.h"
 #include "src/broker/startup_policy.h"
 #include "src/config/bootstrap_config.h"
+#include "src/observability/event_identity.h"
 #include "src/resource/resource_config.h"
 #include "src/resource/resource_registry.h"
 #include "src/runtime/production/environment.h"
@@ -52,6 +53,9 @@ reduce_minimum_shard_memory(byte_count current, byte_count observed) noexcept {
 
 [[nodiscard]] resource::resource_config
 broker_resource_config(byte_count minimum_shard_memory, bool developer_mode);
+
+[[nodiscard]] runtime::result<observability::event_sink_identity>
+production_event_identity(std::uint64_t run_nonce) noexcept;
 
 class application_test_access;
 
