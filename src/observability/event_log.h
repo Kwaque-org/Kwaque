@@ -59,6 +59,9 @@ public:
 
     [[nodiscard]] bool
     operator==(const event_log_artifact& other) const noexcept;
+    // Both artifacts must remain alive and unchanged until comparison finishes.
+    [[nodiscard]] seastar::future<bool>
+    equals_cooperatively(const event_log_artifact& other) const;
 
 private:
     std::deque<std::vector<std::uint8_t>> chunks_;
@@ -162,14 +165,18 @@ public:
 private:
     friend class event_log;
 
+    event_entry_log(std::size_t capacity, bool preallocate);
+
     static constexpr std::size_t entries_per_chunk = std::max<std::size_t>(
       1, maximum_contiguous_allocation_bytes / sizeof(event));
 
     void append(const event& value) noexcept;
+    void prepare(std::size_t count);
 
     std::deque<std::vector<event>> chunks_;
     std::size_t size_{0};
     std::size_t capacity_{0};
+    std::size_t prepared_{0};
 };
 
 class event_log final {
@@ -227,6 +234,9 @@ public:
     encode_cooperatively(
       std::uint32_t entries_per_yield
       = cooperative_event_log_entries_per_yield_max) const;
+    // Decoded histories retain parser limits but allocate storage as populated.
+    // Further unreserved appends and reservations may allocate. Reserved append
+    // remains nonallocating, as does every append to a construction-sized log.
     [[nodiscard]] static runtime::result<std::unique_ptr<event_log>>
     decode(const event_log_artifact& encoded, event_log_limits parser_limits);
     [[nodiscard]] static seastar::future<
@@ -253,6 +263,9 @@ public:
     }
 
 private:
+    event_log(
+      event_sink_identity identity, event_log_limits limits, bool preallocate);
+    [[nodiscard]] runtime::result<void> prepare(std::size_t count) noexcept;
     [[nodiscard]] runtime::result<void>
     append_with(const event& value, reservation* reserved) noexcept;
     void consume(reservation& reserved, std::uint64_t encoded_bytes) noexcept;

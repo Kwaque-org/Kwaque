@@ -5,6 +5,7 @@
 #include "src/observability/event_sink.h"
 #include "src/observability/testing/capture_event_sink.h"
 #include "src/resource/workload_class.h"
+#include "src/runtime/operation_statistics.h"
 #include "src/runtime/time.h"
 
 #include <seastar/testing/perf_tests.hh>
@@ -119,6 +120,72 @@ PERF_TEST(structured_event, disabled_native_log) {
     }
     if (!sink.stop()) {
         throw std::logic_error("event benchmark disabled log cleanup");
+    }
+    return inner_iterations;
+}
+
+PERF_TEST(structured_event, disabled_literal_native_log) {
+    seastar::logger logger{"kwaque-event-benchmark"};
+    logger.set_level(seastar::log_level::error);
+    std::uint64_t sequence = 0;
+    perf_tests::start_measuring_time();
+    for (std::size_t index = 0; index < inner_iterations; ++index) {
+        logger.info(
+          "runtime_state_changed schema={} epoch={} monotonic_ns={} wall_ns={} "
+          "shard={} workload={} sequence={} state={} operation={}",
+          1,
+          1,
+          17,
+          23,
+          seastar::this_shard_id(),
+          "metadata",
+          ++sequence,
+          "ready",
+          "environment_start");
+    }
+    perf_tests::stop_measuring_time();
+    if (sequence != inner_iterations) {
+        throw std::logic_error("literal native log count");
+    }
+    return inner_iterations;
+}
+
+PERF_TEST(operation_counters, owned_terminal_and_gauge) {
+    runtime::operation_statistics statistics;
+    perf_tests::start_measuring_time();
+    for (std::size_t index = 0; index < inner_iterations; ++index) {
+        auto accepted = statistics.accept();
+        accepted.add_completed_bytes(4'096);
+        perf_tests::do_not_optimize(statistics.active());
+    }
+    perf_tests::stop_measuring_time();
+    if (
+      statistics.active() != 0 || statistics.accepted() != inner_iterations
+      || statistics.rejected() != 0
+      || statistics.completed() != inner_iterations
+      || statistics.completed_bytes() != inner_iterations * 4'096U) {
+        throw std::logic_error("owned operation counter totals");
+    }
+    return inner_iterations;
+}
+
+PERF_TEST(operation_counters, direct_counter_and_gauge) {
+    runtime::operation_statistics_snapshot statistics;
+    perf_tests::start_measuring_time();
+    for (std::size_t index = 0; index < inner_iterations; ++index) {
+        ++statistics.active;
+        ++statistics.accepted;
+        statistics.completed_bytes += 4'096;
+        perf_tests::do_not_optimize(statistics.active);
+        --statistics.active;
+        ++statistics.completed;
+    }
+    perf_tests::stop_measuring_time();
+    if (
+      statistics.active != 0 || statistics.accepted != inner_iterations
+      || statistics.rejected != 0 || statistics.completed != inner_iterations
+      || statistics.completed_bytes != inner_iterations * 4'096U) {
+        throw std::logic_error("direct operation counter totals");
     }
     return inner_iterations;
 }

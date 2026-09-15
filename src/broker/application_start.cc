@@ -8,6 +8,7 @@
 #include "src/broker/host_checks.h"
 #include "src/observability/event_identity.h"
 #include "src/resource/resource_config.h"
+#include "src/runtime/production/random.h"
 
 #include <seastar/core/abort_source.hh>
 #include <seastar/core/coroutine.hh>
@@ -49,20 +50,17 @@ broker_resource_config(byte_count minimum_shard_memory, bool developer_mode) {
     return *configured;
 }
 
-namespace {
-
-observability::event_sink_identity production_event_identity() {
-    auto epoch = observability::event_sink_epoch::make(1);
+runtime::result<observability::event_sink_identity>
+production_event_identity(std::uint64_t run_nonce) noexcept {
+    auto epoch = observability::event_sink_epoch::make(run_nonce);
     if (!epoch) {
-        throw std::system_error(make_error_code(epoch.error().code()));
+        return runtime::failure(epoch.error());
     }
     return observability::event_sink_identity{
       .epoch = *epoch,
       .configuration_digest = {},
     };
 }
-
-} // namespace
 
 seastar::future<byte_count> application_state::observe_minimum_shard_memory() {
     log::broker().info("build {}", build_info::version_line());
@@ -191,14 +189,20 @@ seastar::future<> application_state::start_resource_registry(
 }
 
 seastar::future<> application_state::start_environments() {
+    auto random = runtime::production::random_source::make();
+    if (!random) {
+        throw std::system_error(make_error_code(random.error().code()));
+    }
+    auto identity = production_event_identity(random->next_u64());
+    if (!identity) {
+        throw std::system_error(make_error_code(identity.error().code()));
+    }
     co_await lifecycle_->start_step(
       "runtime_environment",
-      [this] {
+      [this, identity = *identity] {
           return environments_->start(
             runtime::production::environment_dependencies{
-              resource_registry_->handles(),
-              log::broker(),
-              production_event_identity()});
+              resource_registry_->handles(), log::broker(), identity});
       },
       [this] { return environments_->stop(); });
     co_await environments_->invoke_on_all(

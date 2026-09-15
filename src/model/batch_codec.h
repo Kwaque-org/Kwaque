@@ -2,6 +2,7 @@
 
 #include "src/codec/envelope_encode.h"
 #include "src/codec/transaction.h"
+#include "src/compression/compression.h"
 #include "src/model/batch.h"
 
 #include <cstdint>
@@ -99,6 +100,29 @@ encode_assigned_batch(
   bytes::allocation_charge_fn charge,
   codec::field_context context = {});
 
+// Explicit compression selection; the overloads above preserve codec none.
+// Owners remain canonical raw records. Only the wire record region changes;
+// identity, binding, span and semantic digest are preserved. LZ4 reserves its
+// input and output overlap before native work and keeps the original input
+// reservation excluded through final assembly (aliases may still retain it).
+[[nodiscard]] seastar::future<codec::result<bytes::fragmented_buffer>>
+encode_submitted_batch(
+  submitted_batch&& batch,
+  compression::codec_id encoding,
+  codec::cooperative_work& work,
+  byte_count parent_remaining,
+  bytes::allocation_charge_fn charge,
+  codec::field_context context = {});
+
+[[nodiscard]] seastar::future<codec::result<bytes::fragmented_buffer>>
+encode_assigned_batch(
+  assigned_batch&& batch,
+  compression::codec_id encoding,
+  codec::cooperative_work& work,
+  byte_count parent_remaining,
+  bytes::allocation_charge_fn charge,
+  codec::field_context context = {});
+
 // Decode exactly one envelope. Integrity and family precede body parsing; all
 // fixed fields, counts, records, timestamps and final bytes are checked before
 // publication. Submitted and dense assigned data recompute the original SHA.
@@ -112,9 +136,11 @@ encode_assigned_batch(
 // reserve_decode_input. memory is the residual after that reservation and
 // verified SHA/CRC/native/frame/callback/opaque and other live costs. Each
 // alias is admitted before allocation. remaining reserves only the returned
-// record-region metadata; temporary body/record aliases are gone before the
-// envelope commits. Keep the parent backing reservation until ALL resulting
-// aliases are freed, even after the parser is destroyed. Pass remaining while
+// record-region metadata and any newly expanded backing; temporary body/record
+// and expanded-parser aliases are gone before the envelope commits. LZ4 output
+// is canonical raw records with its own persistent reservation. Keep the parent
+// backing reservation until ALL resulting aliases are freed, even after the
+// parser is destroyed. Pass remaining while
 // retaining another result; there is no automatic reservation/refund service.
 //
 // Expected values and input coordinates are checked before entering framing.

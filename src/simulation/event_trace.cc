@@ -712,6 +712,38 @@ private:
 
 } // namespace
 
+bool trace_descriptor_is_valid(trace_event_descriptor descriptor) noexcept {
+    // Timing and sequencing are validated by the scheduler. Equal zero times
+    // represent a selected event solely to check its immutable field shape.
+    const trace_header header{};
+    trace_entry entry{
+      .sequence = 1,
+      .action = trace_action::selected,
+      .kind = descriptor.kind,
+      .event_id = 1,
+      .domain = descriptor.domain,
+      .stable_id = descriptor.stable_id,
+      .coordinate_a = descriptor.coordinate_a,
+      .coordinate_b = descriptor.coordinate_b,
+      .value = descriptor.value,
+      .result = descriptor.result,
+    };
+    if (!validate_entry_shape(entry, header)) return false;
+    if (descriptor.effect != trace_action::none) {
+        if (
+          descriptor.effect == trace_action::scheduled
+          || descriptor.effect == trace_action::canceled
+          || descriptor.effect == trace_action::selected
+          || descriptor.effect == trace_action::time_advanced
+          || descriptor.effect == trace_action::keyed_decision
+          || descriptor.effect == trace_action::fault_evaluated)
+            return false;
+        entry.action = descriptor.effect;
+        return validate_entry_shape(entry, header).has_value();
+    }
+    return true;
+}
+
 trace_entry_log::trace_entry_log(std::size_t capacity)
   : capacity_(capacity) {
     auto remaining = capacity;
@@ -760,12 +792,6 @@ void trace_artifact::append(std::string_view bytes) {
 
 void trace_artifact::push_back(char byte) {
     append(std::string_view{&byte, 1});
-}
-
-bool trace_artifact::contains(char byte) const noexcept {
-    return std::ranges::any_of(chunks_, [byte](const std::vector<char>& chunk) {
-        return std::ranges::find(chunk, byte) != chunk.end();
-    });
 }
 
 bool trace_artifact::copy_to(
@@ -941,6 +967,26 @@ void event_trace::reservation::release() noexcept {
     owner->release(entries_, encoded_bytes_);
     entries_ = 0;
     encoded_bytes_ = 0;
+}
+
+runtime::result<event_trace::reservation>
+event_trace::reservation::split(std::uint32_t entries) noexcept {
+    const auto bytes = static_cast<std::uint64_t>(entries)
+                       * canonical_entry_encoded_size;
+    if (
+      owner_ == nullptr || entries == 0 || entries > entries_
+      || bytes > encoded_bytes_) {
+        return runtime::failure(trace_error(errc::invalid_argument));
+    }
+    auto* owner = owner_;
+    entries_ -= entries;
+    encoded_bytes_ -= bytes;
+    if (entries_ == 0) {
+        owner->release(0, encoded_bytes_);
+        owner_ = nullptr;
+        encoded_bytes_ = 0;
+    }
+    return reservation{*owner, entries, bytes};
 }
 
 runtime::result<void>
@@ -1150,7 +1196,7 @@ runtime::result<decoded_event_trace>
 event_trace::decode(const trace_artifact& encoded, trace_limits parser_limits) {
     if (
       encoded.empty() || encoded.size() > parser_limits.encoded_bytes()
-      || encoded.back() != '\n' || encoded.contains('\r')) {
+      || encoded.back() != '\n') {
         return runtime::failure(trace_error(errc::malformed_data));
     }
 
@@ -1229,7 +1275,7 @@ event_trace::decode_cooperatively(
     }
     if (
       encoded.empty() || encoded.size() > parser_limits.encoded_bytes()
-      || encoded.back() != '\n' || encoded.contains('\r')
+      || encoded.back() != '\n'
       || canonical_header_encoded_size - 1U > parser_limits.line_bytes()) {
         co_return runtime::failure(trace_error(errc::malformed_data));
     }

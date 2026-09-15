@@ -286,37 +286,24 @@ environment_config::make(environment_config_values values) {
     if (!fault_budget) {
         return runtime::failure(fault_budget.error());
     }
-    if (auto valid = values.dns.query_limits.validate(); !valid) {
+    if (auto valid = values.network.validate(*scheduler_budget); !valid) {
         return runtime::failure(valid.error());
     }
-    if (values.network.stop_batch == 0) {
-        return runtime::failure(environment_error(errc::invalid_argument));
+    if (auto valid = values.dns.validate(*scheduler_budget); !valid) {
+        return runtime::failure(valid.error());
     }
-    const auto network_stop_owners = static_cast<std::uint64_t>(
-                                       values.network.maximum_operations)
-                                     + values.network.maximum_packets
-                                     + values.network.maximum_connection_pairs
-                                     + values.network.maximum_listeners
-                                     + values.network.maximum_links + 1U;
-    const auto network_stop_batches = (network_stop_owners
-                                       + values.network.stop_batch - 1U)
-                                      / values.network.stop_batch;
-    const auto network_events
-      = static_cast<std::uint64_t>(values.network.maximum_listeners) * 3U
-        + static_cast<std::uint64_t>(values.network.maximum_connection_pairs)
-            * 8U
-        + static_cast<std::uint64_t>(values.network.maximum_operations) * 4U
-        + static_cast<std::uint64_t>(values.network.maximum_packets) * 3U
-        + network_stop_batches + 1U;
-    const auto file_events
-      = static_cast<std::uint64_t>(values.file.maximum_pending_operations) * 3U;
-    const auto dns_events = (static_cast<std::uint64_t>(
-                               values.dns.query_limits.maximum_waiters)
-                             + 1U)
-                              * 2U
-                            + 1U;
+    if (auto valid = fake_file_system::validate_config(values.file); !valid) {
+        return runtime::failure(valid.error());
+    }
     if (
-      network_events + file_events + dns_events + 2U
+      auto valid = values.file.validate_scheduling(
+        *scheduler_budget, runtime::monotonic_time{});
+      !valid) {
+        return runtime::failure(valid.error());
+    }
+    if (
+      values.network.required_events() + values.file.required_events()
+        + values.dns.required_events() + 2U
       > scheduler_budget->pending_events()) {
         return runtime::failure(environment_error(errc::out_of_range));
     }
@@ -324,6 +311,21 @@ environment_config::make(environment_config_values values) {
       values.runtime_stream_stable_id == 0
       || values.fault_rules.size() > fault_budget->rules()) {
         return runtime::failure(environment_error(errc::out_of_range));
+    }
+    const auto cleanup_entries
+      = std::uint64_t{2}
+        * (values.network.cleanup_batches() + values.dns.cleanup_batches());
+    if (
+      cleanup_entries > trace_budget->entries()
+      || cleanup_entries * canonical_entry_encoded_size
+           > trace_budget->encoded_bytes() - canonical_header_encoded_size) {
+        return runtime::failure(environment_error(errc::resource_exhausted));
+    }
+    if (
+      auto valid = fault_schedule::validate_rules(
+        values.fault_rules, *fault_budget);
+      !valid) {
+        return runtime::failure(valid.error());
     }
     auto epoch = observability::event_sink_epoch::make(values.event_epoch);
     if (!epoch) {
@@ -592,6 +594,13 @@ runtime::result<void> environment::emit_lifecycle(
 }
 
 void environment::request_abort_unchecked() noexcept {
+    if (abort_requested_) {
+        return;
+    }
+    lifetime_.close_admission();
+    if (tasks_) {
+        tasks_->close_admission();
+    }
     abort_requested_ = true;
     if (tasks_) {
         tasks_->request_abort();

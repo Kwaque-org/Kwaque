@@ -247,6 +247,16 @@ class Writer:
 # and handle invalidation are commutative. No hash traversal assigns event IDs.
 ALLOWANCES = (
     Allowance(
+        "src/observability/event_codec_test.cc", "host-clock",
+        "const auto preemption_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);",
+        1, "External quota-wait watchdog; it never supplies encoded event time.",
+    ),
+    Allowance(
+        "src/observability/event_codec_test.cc", "host-clock",
+        "while (!seastar::need_preempt() && std::chrono::steady_clock::now() < preemption_deadline) {}",
+        1, "Bounded wait for native preemption before the live-append regression.",
+    ),
+    Allowance(
         "src/simulation/fake_file.h",
         "unordered-state",
         "using page_map = seastar::chunked_hash_map<std::uint64_t, page_state>;",
@@ -383,7 +393,7 @@ BYTE_COPIES = {
         "std::memcpy(destination.data() + copied, chunk.data() + chunk_offset, count);",
     ),
     "src/observability/event_log.cc": (
-        "std::memcpy(destination.data() + copied, chunk.data() + chunk_offset_, count);",
+        "std::memcpy(destination.data() + copied, source.data(), count);",
         "std::memcpy(destination.data() + copied, chunk.data() + chunk_offset, count);",
     ),
     "src/simulation/fake_file.cc": (
@@ -393,9 +403,6 @@ BYTE_COPIES = {
         "std::as_writable_bytes(std::span{io->destination, static_cast<std::size_t>(length)})",
         "std::as_bytes(std::span{source, static_cast<std::size_t>(length)})",
         "reinterpret_cast<std::uint8_t*>(io->snapshot.get_write())",
-    ),
-    "src/simulation/fake_network.cc": (
-        "std::memcpy(mutated.get_write(), fragment.data(), fragment.size());",
     ),
     "src/simulation/fake_file_test_support.h": (
         "std::memcpy(destination.data() + offset, state.bytes->data(), count);",
@@ -450,25 +457,15 @@ ALLOWANCES += (
     Allowance(
         "src/simulation/fake_file.cc",
         "unordered-iteration",
-        """for (auto current = file.visible_pages.begin(); current != file.visible_pages.end();) {
-                  if (current->first >= prepared.kept_pages) { current = file.visible_pages.erase(current); }
-                  else { ++current; }
-              }""",
-        1,
-        "Truncate erases pages above a stable numeric boundary; no ordered output.",
-    ),
-    Allowance(
-        "src/simulation/fake_file.cc",
-        "unordered-iteration",
         """for (auto current = file.durable_pages.begin(); current != file.durable_pages.end();) {
                   const auto visible = file.visible_pages.find(current->first);
                   if (current->first >= *file.cleared_from_page
-                      && (visible == file.visible_pages.end() || !visible->second.dirty)) {
+                      && visible == file.visible_pages.end()) {
                       current = file.durable_pages.erase(current);
                   } else { ++current; }
               }""",
         1,
-        "Flush deletes cleared pages; dirty-page IDs determine publishing order.",
+        "Flush deletes cleared pages commutatively; the ordered volatile map determines publishing order.",
     ),
     Allowance(
         "src/simulation/fake_file.cc",
@@ -608,6 +605,11 @@ for _path, _size, _version in (
 # Signed integer bit patterns are independent of pointer identities. Keep each
 # conversion explicit so a new bit_cast from an address cannot slip through.
 INTEGER_BIT_CASTS = {
+    "src/simulation/event_sink.cc": (
+        "std::bit_cast<std::uint64_t>(*value.as_signed())",
+        "std::bit_cast<std::uint64_t>(expected.wall().unix_nanoseconds())",
+        "std::bit_cast<std::uint64_t>(actual.wall().unix_nanoseconds())",
+    ),
     "src/observability/event.h": (
         "from_signed(std::int64_t value) noexcept { return event_field_value{event_field_type::signed_integer, std::bit_cast<std::uint64_t>(value)}; }",
         "std::bit_cast<std::int64_t>(numeric_)",
@@ -720,6 +722,44 @@ WRITERS = (
         "src/simulation/bandwidth.cc",
         "big-endian multiprecision digest",
         "boost::multiprecision::export_bits(value, bytes.begin(), 8U, true);",
+    ),
+)
+
+
+# Exact traversals of the ordered volatile override map.
+ALLOWANCES += (
+    Allowance(
+        "src/simulation/fake_file.cc",
+        "unordered-iteration",
+        """for (const auto& [page_index, visible] : file.visible_pages) {
+            if (file.durable_pages.contains(page_index)) {
+                continue;
+            }
+            const auto [position, inserted] = file.durable_pages.try_emplace(
+              page_index, page_state{.bytes = visible.bytes});
+            static_cast<void>(position);
+            KWAQUE_INVARIANT(
+              fake_storage_transaction_invariant,
+              inserted,
+              "new durable page was already present");
+            try {
+                inserted_pages.push_back(page_index);
+            } catch (...) {
+                file.durable_pages.erase(page_index);
+                throw;
+            }
+        }""",
+        1,
+        "Volatile overrides are std::map nodes traversed in ascending page order.",
+    ),
+    Allowance(
+        "src/simulation/fake_file.cc",
+        "unordered-iteration",
+        """for (const auto& [page_index, visible] : file.visible_pages) {
+        file.durable_pages.find(page_index)->second.bytes = visible.bytes;
+    }""",
+        1,
+        "Volatile overrides are std::map nodes traversed in ascending page order.",
     ),
 )
 
@@ -876,6 +916,7 @@ def main() -> int:
         "Determinism source tripwires passed; executable goldens and noise tests are still required"
     )
     return 0
+
 
 
 if __name__ == "__main__":

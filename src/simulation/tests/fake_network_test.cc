@@ -1,3 +1,4 @@
+#include "src/base/allocation.h"
 #include "src/runtime/random.h"
 #include "src/runtime/testing/contracts/network_contract.h"
 #include "src/runtime/testing/contracts/network_contract_failure_cases.h"
@@ -14,6 +15,7 @@
 #include <seastar/core/chunked_vector.hh>
 #include <seastar/core/coroutine.hh>
 #include <seastar/core/future.hh>
+#include <seastar/core/memory.hh>
 #include <seastar/core/reactor.hh>
 #include <seastar/testing/test_case.hh>
 #include <seastar/util/alloc_failure_injector.hh>
@@ -27,6 +29,7 @@
 #include <cstdint>
 #include <exception>
 #include <iterator>
+#include <limits>
 #include <memory>
 #include <new>
 #include <optional>
@@ -80,9 +83,9 @@ kwaque::simulation::scheduler_limits bandwidth_scheduler_limits() {
 kwaque::simulation::trace_limits network_trace_limits() {
     auto limits = kwaque::simulation::trace_limits::make(
       kwaque::simulation::trace_limit_values{
-        .entries = 8'192,
+        .entries = 65'536,
         .encoded_bytes = kwaque::simulation::canonical_header_encoded_size
-                         + 8'192U
+                         + 65'536U
                              * kwaque::simulation::canonical_entry_encoded_size,
         .line_bytes = 1'024,
       });
@@ -160,7 +163,11 @@ seastar::future<> pump_all(kwaque::simulation::scheduler& events) {
             const auto advanced = events.advance_to_next();
             BOOST_REQUIRE(advanced.has_value() && advanced->has_value());
         }
-        BOOST_REQUIRE(events.run_ready().has_value());
+        BOOST_REQUIRE(
+          events
+            .run_ready_batch(
+              std::min<std::uint64_t>(64U, events.limits().events_per_pump()))
+            .has_value());
         co_await seastar::yield();
     }
 }
@@ -913,7 +920,8 @@ SEASTAR_TEST_CASE(
     auto bound = co_await std::move(binding);
     BOOST_REQUIRE(bound.has_value());
     auto listener = std::move(*bound);
-    std::vector<kwaque::simulation::event_trace::reservation> blockers;
+    seastar::chunked_vector<kwaque::simulation::event_trace::reservation>
+      blockers;
     while (true) {
         auto reserved = trace.reserve(
           1, kwaque::simulation::canonical_entry_encoded_size);
@@ -4291,4 +4299,933 @@ SEASTAR_TEST_CASE(fake_network_watchdog_aborts_and_joins_parked_read) {
       network->state() == kwaque::simulation::fake_network_state::stopped);
     BOOST_CHECK_EQUAL(network->active_operations(), 0U);
     BOOST_CHECK_EQUAL(events.pending_events(), 0U);
+}
+
+SEASTAR_TEST_CASE(fake_network_dropped_eof_remains_pending_until_stop) {
+    fault_environment fixture{
+      kwaque::runtime::builtin_fault_point::network_read,
+      kwaque::runtime::fault_decision::make_drop_completion()};
+    auto connection = co_await open_connection(fixture);
+    BOOST_REQUIRE(connection.client.shutdown_output().has_value());
+    co_await pump_all(fixture.events);
+    seastar::abort_source abort;
+    auto reading = connection.server.read(kwaque::byte_count{1}, abort);
+    co_await pump_all(fixture.events);
+    BOOST_CHECK(!reading.available());
+    co_await stop_network(fixture.events, fixture.network);
+    const auto terminal = co_await std::move(reading);
+    BOOST_REQUIRE(!terminal.has_value());
+    BOOST_CHECK(terminal.error().code() == kwaque::errc::aborted);
+}
+
+SEASTAR_TEST_CASE(fake_network_repeated_dropped_close_outlives_closed_handles) {
+    fault_environment fixture{
+      kwaque::runtime::builtin_fault_point::close,
+      kwaque::runtime::fault_decision::make_drop_completion()};
+    std::optional<connection_fixture> connection{
+      co_await open_connection(fixture)};
+    auto first = connection->client.close();
+    co_await pump_all(fixture.events);
+    auto second = connection->client.close();
+    BOOST_CHECK(!first.available());
+    BOOST_CHECK(!second.available());
+    auto server = connection->server.close();
+    auto listener = connection->listener.close();
+    co_await pump_all(fixture.events);
+    co_await pump_until(fixture.events, listener);
+    BOOST_CHECK(!server.available());
+    co_await require_ready_success(listener);
+    connection.reset();
+    BOOST_CHECK(!first.available());
+    BOOST_CHECK(!second.available());
+    BOOST_REQUIRE_EQUAL(fixture.network->active_operations(), 2U);
+    BOOST_REQUIRE_EQUAL(fixture.events.pending_events(), 0U);
+    co_await stop_network(fixture.events, fixture.network);
+    BOOST_CHECK(
+      fixture.network->state()
+      == kwaque::simulation::fake_network_state::stopped);
+    BOOST_CHECK_EQUAL(fixture.events.pending_events(), 0U);
+    BOOST_REQUIRE(first.available());
+    BOOST_REQUIRE(second.available());
+    BOOST_REQUIRE(server.available());
+    const auto server_result = co_await std::move(server);
+    BOOST_REQUIRE(!server_result.has_value());
+    BOOST_CHECK(server_result.error().code() == kwaque::errc::aborted);
+    const auto first_result = co_await std::move(first);
+    const auto second_result = co_await std::move(second);
+    BOOST_REQUIRE(!first_result.has_value());
+    BOOST_REQUIRE(!second_result.has_value());
+    BOOST_CHECK(first_result.error().code() == kwaque::errc::aborted);
+    BOOST_CHECK(first_result.error() == second_result.error());
+    BOOST_CHECK_EQUAL(fixture.network->active_operations(), 0U);
+}
+
+SEASTAR_TEST_CASE(fake_network_fin_waits_for_the_existing_interframe_gap) {
+    kwaque::simulation::scheduler events{bandwidth_scheduler_limits()};
+    kwaque::simulation::fake_network_config config;
+    config.latency_min = kwaque::runtime::monotonic_duration{};
+    config.latency_mean_parameter = kwaque::runtime::monotonic_duration{};
+    config.interframe_gap = kwaque::runtime::monotonic_duration{10};
+    config.fin_latency = kwaque::runtime::monotonic_duration{1};
+    auto made = kwaque::simulation::fake_network::make(config, events);
+    BOOST_REQUIRE(made.has_value());
+    auto network = std::move(*made);
+    auto connection = co_await open_connection(events, *network);
+    seastar::abort_source abort;
+    auto writing = connection.client.write(
+      kwaque::runtime::testing::network_contract_detail::make_bytes("x"),
+      abort);
+    while (!writing.available()) {
+        if (!events.has_ready_events()) {
+            BOOST_REQUIRE(events.advance_to_next().has_value());
+        }
+        BOOST_REQUIRE(events.run_ready_batch(1).has_value());
+        co_await seastar::yield();
+    }
+    co_await require_ready_success(writing);
+    const auto transfer_done = events.now().nanoseconds();
+    BOOST_REQUIRE(connection.client.shutdown_output().has_value());
+    auto reading = connection.server.read(kwaque::byte_count{1}, abort);
+    co_await pump_until(events, reading);
+    auto data = co_await std::move(reading);
+    BOOST_REQUIRE(data.has_value());
+    BOOST_CHECK(data->data().content_equals("x"));
+    auto eof = connection.server.read(kwaque::byte_count{1}, abort);
+    co_await pump_until(events, eof);
+    const auto end = co_await std::move(eof);
+    BOOST_REQUIRE(end.has_value());
+    BOOST_CHECK(end->eof());
+    BOOST_CHECK_EQUAL(events.now().nanoseconds(), transfer_done + 11U);
+    co_await stop_network(events, network);
+}
+
+SEASTAR_TEST_CASE(
+  fake_network_queued_capacity_controls_retain_prepared_addresses) {
+    kwaque::simulation::scheduler events{bandwidth_scheduler_limits()};
+    auto made = kwaque::simulation::fake_network::make({}, events);
+    BOOST_REQUIRE(made.has_value());
+    auto network = std::move(*made);
+    for (bool ingress : {false, true}) {
+        auto update = [&](kwaque::simulation::bandwidth_capacity capacity) {
+            return ingress ? network->set_ingress_capacity(alternate, capacity)
+                           : network->set_egress_capacity(loopback, capacity);
+        };
+        auto reset = update(
+          kwaque::simulation::bandwidth_capacity::unlimited());
+        auto finite = update(
+          kwaque::simulation::bandwidth_capacity::finite(1'000'000'000));
+        auto again = update(
+          kwaque::simulation::bandwidth_capacity::unlimited());
+        auto final = update(
+          kwaque::simulation::bandwidth_capacity::finite(2'000'000'000));
+        co_await pump_all(events);
+        co_await require_ready_success(reset);
+        co_await require_ready_success(finite);
+        co_await require_ready_success(again);
+        co_await require_ready_success(final);
+    }
+    co_await stop_network(events, network);
+}
+
+SEASTAR_TEST_CASE(fake_network_dropped_read_retry_and_stop_own_trace_capacity) {
+    kwaque::simulation::fake_network_config config;
+    config.fin_latency = kwaque::runtime::monotonic_duration{10};
+    fault_environment fixture{
+      kwaque::runtime::builtin_fault_point::network_read,
+      kwaque::runtime::fault_decision::make_drop(),
+      config};
+    auto connection = co_await open_connection(fixture);
+    seastar::abort_source abort;
+    auto writing = connection.client.write(
+      kwaque::runtime::testing::network_contract_detail::make_bytes("x"),
+      abort);
+    co_await pump_until(fixture.events, writing);
+    co_await require_ready_success(writing);
+    co_await pump_all(fixture.events);
+    auto reading = connection.server.read(kwaque::byte_count{1}, abort);
+    seastar::chunked_vector<kwaque::simulation::event_trace::reservation> held;
+    auto fill_trace = [&] -> seastar::future<> {
+        while (true) {
+            auto reserved = fixture.trace.reserve(
+              1, kwaque::simulation::canonical_entry_encoded_size);
+            if (!reserved) {
+                BOOST_CHECK(
+                  reserved.error().code() == kwaque::errc::resource_exhausted);
+                co_return;
+            }
+            held.push_back(std::move(*reserved));
+            if (held.size() % 64U == 0) {
+                co_await seastar::yield();
+            }
+        }
+    };
+    std::exception_ptr failure;
+    try {
+        BOOST_REQUIRE(connection.client.shutdown_output().has_value());
+        // The fixture owns the clock-advance entry separately from network
+        // work.
+        auto clock_advance = fixture.trace.reserve(
+          1, kwaque::simulation::canonical_entry_encoded_size);
+        BOOST_REQUIRE(clock_advance.has_value());
+        co_await fill_trace();
+        const auto dropped = fixture.events.run_ready_batch(1);
+        BOOST_REQUIRE(dropped.has_value());
+        BOOST_REQUIRE_EQUAL(*dropped, 1U);
+        BOOST_CHECK(!reading.available());
+        const auto now = fixture.events.now();
+        const auto entries = fixture.trace.entries().size();
+        const auto blocked = fixture.events.advance_to_next();
+        BOOST_REQUIRE(!blocked.has_value());
+        BOOST_CHECK(blocked.error().code() == kwaque::errc::resource_exhausted);
+        BOOST_CHECK(fixture.events.now() == now);
+        BOOST_CHECK_EQUAL(fixture.trace.entries().size(), entries);
+        BOOST_CHECK(!fixture.events.trace_failed());
+
+        clock_advance->release();
+        const auto advanced = fixture.events.advance_to_next();
+        BOOST_REQUIRE(advanced.has_value());
+        BOOST_REQUIRE(advanced->has_value());
+        BOOST_CHECK_EQUAL(
+          (**advanced).nanoseconds(),
+          now.nanoseconds() + config.fin_latency.nanoseconds());
+        BOOST_CHECK(
+          !fixture.trace
+             .reserve(1, kwaque::simulation::canonical_entry_encoded_size)
+             .has_value());
+        co_await pump_until(fixture.events, reading);
+        const auto eof = co_await std::move(reading);
+        BOOST_REQUIRE(eof.has_value());
+        BOOST_CHECK(eof->eof());
+        co_await fill_trace();
+    } catch (...) {
+        failure = std::current_exception();
+    }
+    try {
+        co_await stop_network(fixture.events, fixture.network);
+    } catch (...) {
+        kwaque::runtime::testing::retain_cleanup_failure(failure);
+    }
+    if (failure) {
+        std::rethrow_exception(failure);
+    }
+    BOOST_CHECK_EQUAL(fixture.events.pending_events(), 0U);
+    BOOST_CHECK_EQUAL(fixture.network->active_operations(), 0U);
+    BOOST_CHECK(!fixture.events.trace_failed());
+}
+
+SEASTAR_TEST_CASE(fake_network_queued_transfers_include_all_gap_deadlines) {
+    auto limits = kwaque::simulation::scheduler_limits::make(
+      {.pending_events = 65'536,
+       .events_per_pump = 64,
+       .total_events = 1'024,
+       .maximum_deadline = kwaque::runtime::monotonic_time{30}});
+    BOOST_REQUIRE(limits.has_value());
+    kwaque::simulation::scheduler events{*limits};
+    kwaque::simulation::fake_network_config config;
+    config.maximum_active_flows = 1;
+    config.maximum_direction_bytes = kwaque::byte_count{2};
+    config.link_capacity = kwaque::simulation::bandwidth_capacity::finite(
+      100'000'000);
+    config.latency_min = kwaque::runtime::monotonic_duration{};
+    config.latency_mean_parameter = kwaque::runtime::monotonic_duration{};
+    config.fin_latency = kwaque::runtime::monotonic_duration{};
+    config.interframe_gap = kwaque::runtime::monotonic_duration{1};
+    auto made = kwaque::simulation::fake_network::make(config, events);
+    BOOST_REQUIRE(made.has_value());
+    auto network = std::move(*made);
+    auto connection = co_await open_connection(events, *network);
+    BOOST_REQUIRE(
+      events.run_until(kwaque::runtime::monotonic_time{9}).has_value());
+    seastar::abort_source abort;
+    auto first = connection.client.write(
+      kwaque::runtime::testing::network_contract_detail::make_bytes("a"),
+      abort);
+    const auto active = network->active_operations();
+    const auto digest = network->allocation_digest();
+    auto second = connection.client.write(
+      kwaque::runtime::testing::network_contract_detail::make_bytes("b"),
+      abort);
+    BOOST_REQUIRE(second.available());
+    const auto rejected = co_await std::move(second);
+    BOOST_REQUIRE(!rejected.has_value());
+    BOOST_CHECK(rejected.error().code() == kwaque::errc::out_of_range);
+    BOOST_CHECK_EQUAL(network->active_operations(), active);
+    BOOST_CHECK(network->allocation_digest() == digest);
+    co_await pump_until(events, first);
+    co_await require_ready_success(first);
+    co_await stop_network(events, network);
+}
+
+SEASTAR_TEST_CASE(
+  fake_network_rate_resume_checks_propagation_through_exact_horizon) {
+    auto limits = kwaque::simulation::scheduler_limits::make(
+      {.pending_events = 65'536,
+       .events_per_pump = 64,
+       .total_events = 1'024,
+       .maximum_deadline = kwaque::runtime::monotonic_time{100}});
+    BOOST_REQUIRE(limits.has_value());
+    kwaque::simulation::scheduler events{*limits};
+    kwaque::simulation::fake_network_config config;
+    config.maximum_active_flows = 1;
+    config.maximum_direction_bytes = kwaque::byte_count{1};
+    config.link_capacity = kwaque::simulation::bandwidth_capacity::finite(0);
+    config.latency_min = kwaque::runtime::monotonic_duration{10};
+    config.latency_mean_parameter = kwaque::runtime::monotonic_duration{};
+    config.fin_latency = kwaque::runtime::monotonic_duration{};
+    auto made = kwaque::simulation::fake_network::make(config, events);
+    BOOST_REQUIRE(made.has_value());
+    auto network = std::move(*made);
+    auto connection = co_await open_connection(events, *network);
+    seastar::abort_source abort;
+    auto writing = connection.client.write(
+      kwaque::runtime::testing::network_contract_detail::make_bytes("x"),
+      abort);
+    BOOST_REQUIRE(
+      events.run_until(kwaque::runtime::monotonic_time{85}).has_value());
+    const auto digest = network->allocation_digest();
+    auto slow = network->set_link_capacity(
+      loopback,
+      alternate,
+      kwaque::simulation::bandwidth_capacity::finite(100'000'000));
+    BOOST_REQUIRE(slow.available());
+    const auto rejected = co_await std::move(slow);
+    BOOST_REQUIRE(!rejected.has_value());
+    BOOST_CHECK(rejected.error().code() == kwaque::errc::out_of_range);
+    BOOST_CHECK(network->allocation_digest() == digest);
+    BOOST_CHECK(!writing.available());
+    auto exact = network->set_link_capacity(
+      loopback,
+      alternate,
+      kwaque::simulation::bandwidth_capacity::finite(200'000'000));
+    co_await pump_until(events, exact);
+    co_await require_ready_success(exact);
+    co_await pump_until(events, writing);
+    co_await require_ready_success(writing);
+    auto reading = connection.server.read(kwaque::byte_count{1}, abort);
+    co_await pump_until(events, reading);
+    const auto received = co_await std::move(reading);
+    BOOST_REQUIRE(received.has_value());
+    BOOST_CHECK_EQUAL(events.now().nanoseconds(), 100U);
+    co_await stop_network(events, network);
+}
+
+SEASTAR_TEST_CASE(
+  fake_network_reclogged_delivery_uses_the_next_controls_reserved_attempt) {
+    const auto scheduler_budget = bandwidth_scheduler_limits();
+    const auto trace_budget = network_trace_limits();
+    kwaque::simulation::event_trace trace{
+      network_trace_header(scheduler_budget, trace_budget), trace_budget};
+    kwaque::simulation::scheduler events{scheduler_budget, &trace};
+    kwaque::simulation::fake_network_config config;
+    config.maximum_packets = 4;
+    config.maximum_direction_packets = 4;
+    config.maximum_active_flows = 1;
+    config.latency_min = kwaque::runtime::monotonic_duration{1};
+    config.latency_mean_parameter = kwaque::runtime::monotonic_duration{};
+    auto made = kwaque::simulation::fake_network::make(config, events);
+    BOOST_REQUIRE(made.has_value());
+    auto network = std::move(*made);
+    auto connection = co_await open_connection(events, *network);
+    auto clogged = network->clog(loopback, alternate);
+    co_await pump_until(events, clogged);
+    co_await require_ready_success(clogged);
+    seastar::abort_source abort;
+    auto writing = connection.client.write(
+      kwaque::runtime::testing::network_contract_detail::make_bytes("abc"),
+      abort);
+    co_await pump_until(events, writing);
+    co_await require_ready_success(writing);
+    BOOST_REQUIRE(events.advance_to_next().has_value());
+#if defined(SEASTAR_ENABLE_ALLOC_FAILURE_INJECTION)
+    auto& injector = seastar::memory::local_failure_injector();
+    injector.fail_after(0);
+#endif
+    const auto arrival = events.run_ready_batch(1);
+#if defined(SEASTAR_ENABLE_ALLOC_FAILURE_INJECTION)
+    const bool allocated = injector.failed();
+    injector.cancel();
+    BOOST_CHECK(!allocated);
+#endif
+    BOOST_REQUIRE(arrival.has_value());
+    auto first = network->unclog(loopback, alternate);
+    auto again = network->clog(loopback, alternate);
+    co_await pump_all(events);
+    co_await require_ready_success(first);
+    co_await require_ready_success(again);
+    auto reading = connection.server.read(kwaque::byte_count{3}, abort);
+    BOOST_CHECK(!reading.available());
+    auto final = network->unclog(loopback, alternate);
+    seastar::chunked_vector<kwaque::simulation::event_trace::reservation> held;
+    while (true) {
+        auto reserved = trace.reserve(
+          1, kwaque::simulation::canonical_entry_encoded_size);
+        if (!reserved) {
+            break;
+        }
+        held.push_back(std::move(*reserved));
+        if (held.size() % 64U == 0) {
+            co_await seastar::yield();
+        }
+    }
+    co_await pump_until(events, final);
+    co_await require_ready_success(final);
+    co_await pump_until(events, reading);
+    const auto received = co_await std::move(reading);
+    BOOST_REQUIRE(received.has_value());
+    BOOST_CHECK(received->data().content_equals("abc"));
+    co_await stop_network(events, network);
+    BOOST_CHECK_EQUAL(events.pending_events(), 0U);
+    BOOST_CHECK(!events.trace_failed());
+}
+
+SEASTAR_TEST_CASE(
+  fake_network_clogged_fin_and_packet_retirement_unlinks_reused_slots) {
+    kwaque::simulation::scheduler events{bandwidth_scheduler_limits()};
+    kwaque::simulation::fake_network_config config;
+    config.maximum_packets = 2;
+    config.maximum_direction_packets = 2;
+    config.maximum_active_flows = 1;
+    auto made = kwaque::simulation::fake_network::make(config, events);
+    BOOST_REQUIRE(made.has_value());
+    auto network = std::move(*made);
+    auto clogged = network->clog(loopback, alternate);
+    co_await pump_until(events, clogged);
+    co_await require_ready_success(clogged);
+    for (std::size_t cycle = 0; cycle < 8; ++cycle) {
+        auto connection = co_await open_connection(events, *network);
+        seastar::abort_source abort;
+        auto writing = connection.client.write(
+          kwaque::runtime::testing::network_contract_detail::make_bytes("x"),
+          abort);
+        co_await pump_until(events, writing);
+        co_await require_ready_success(writing);
+        BOOST_REQUIRE(connection.client.shutdown_output().has_value());
+        co_await pump_all(events);
+        auto client = connection.client.close();
+        auto server = connection.server.close();
+        auto listener = connection.listener.close();
+        co_await pump_all(events);
+        co_await require_ready_success(client);
+        co_await require_ready_success(server);
+        co_await require_ready_success(listener);
+    }
+    auto unclogged = network->unclog(loopback, alternate);
+    co_await pump_until(events, unclogged);
+    co_await require_ready_success(unclogged);
+    co_await stop_network(events, network);
+    BOOST_CHECK_EQUAL(events.pending_events(), 0U);
+}
+
+SEASTAR_TEST_CASE(
+  fake_network_operation_pool_avoids_large_contiguous_allocations) {
+#if !defined(SEASTAR_DEFAULT_ALLOCATOR)
+    auto limits = kwaque::simulation::scheduler_limits::make(
+      {.pending_events = 400'000,
+       .events_per_pump = 64,
+       .total_events = 1'000'000});
+    BOOST_REQUIRE(limits.has_value());
+    kwaque::simulation::scheduler events{*limits};
+    kwaque::simulation::fake_network_config config;
+    config.maximum_operations
+      = kwaque::simulation::maximum_fake_network_operations;
+    std::unique_ptr<kwaque::simulation::fake_network> network;
+    std::uint64_t large_allocations = 0;
+    {
+        seastar::memory::scoped_large_allocation_warning_threshold threshold{
+          kwaque::maximum_contiguous_allocation_bytes + 1U};
+        const auto before = seastar::memory::stats().large_allocations();
+        auto made = kwaque::simulation::fake_network::make(config, events);
+        large_allocations = seastar::memory::stats().large_allocations()
+                            - before;
+        BOOST_REQUIRE(made.has_value());
+        network = std::move(*made);
+    }
+    BOOST_CHECK_EQUAL(large_allocations, 0U);
+    co_await stop_network(events, network);
+#else
+    BOOST_TEST_MESSAGE(
+      "Native allocator statistics are required for the allocation-size "
+      "observation");
+    co_return;
+#endif
+}
+
+SEASTAR_TEST_CASE(
+  fake_network_disconnect_waits_behind_earlier_writes_and_can_be_canceled) {
+    for (const bool cancel_second : {false, true}) {
+        const auto scheduler_budget = bandwidth_scheduler_limits();
+        const auto trace_budget = network_trace_limits();
+        kwaque::simulation::event_trace trace{
+          network_trace_header(scheduler_budget, trace_budget), trace_budget};
+        kwaque::simulation::scheduler events{scheduler_budget, &trace};
+        seastar::chunked_vector<kwaque::simulation::fault_rule> rules;
+        rules.push_back(network_rule(
+          1,
+          kwaque::runtime::builtin_fault_point::network_write,
+          2,
+          kwaque::runtime::fault_decision::make_disconnect()));
+        auto selected = kwaque::simulation::fault_schedule::make(
+          events, trace, 17, std::move(rules));
+        BOOST_REQUIRE(selected.has_value());
+        auto faults = std::move(*selected);
+        kwaque::simulation::fake_network_config config;
+        config.maximum_active_flows = 1;
+        config.link_capacity = kwaque::simulation::bandwidth_capacity::finite(
+          1'000'000'000);
+        config.latency_min = kwaque::runtime::monotonic_duration{};
+        config.latency_mean_parameter = kwaque::runtime::monotonic_duration{};
+        auto made = kwaque::simulation::fake_network::make(
+          config, events, faults.get());
+        BOOST_REQUIRE(made.has_value());
+        auto network = std::move(*made);
+        auto connection = co_await open_connection(events, *network);
+        seastar::abort_source first_abort;
+        seastar::abort_source second_abort;
+        auto first = connection.client.write(
+          kwaque::runtime::testing::network_contract_detail::make_bytes("a"),
+          first_abort);
+        auto second = connection.client.write(
+          kwaque::runtime::testing::network_contract_detail::make_bytes("b"),
+          second_abort);
+        if (cancel_second) {
+            second_abort.request_abort();
+        }
+        co_await pump_until(events, first);
+        co_await require_ready_success(first);
+        co_await pump_until(events, second);
+        const auto rejected = co_await std::move(second);
+        BOOST_REQUIRE(!rejected.has_value());
+        BOOST_CHECK(
+          rejected.error().code()
+          == (cancel_second ? kwaque::errc::aborted : kwaque::errc::network_failure));
+        if (cancel_second) {
+            auto reading = connection.server.read(
+              kwaque::byte_count{1}, first_abort);
+            co_await pump_until(events, reading);
+            const auto received = co_await std::move(reading);
+            BOOST_REQUIRE(received.has_value());
+            BOOST_CHECK(received->data().content_equals("a"));
+        }
+        co_await stop_network(events, network);
+    }
+}
+
+SEASTAR_TEST_CASE(fake_network_accept_abort_precedes_fault_errors_and_parking) {
+    for (const auto action :
+         {kwaque::runtime::fault_action::error,
+          kwaque::runtime::fault_action::disconnect,
+          kwaque::runtime::fault_action::drop_completion}) {
+        fault_environment fixture{
+          kwaque::runtime::builtin_fault_point::accept, decision_for(action)};
+        auto binding = fixture.network->listen(
+          kwaque::runtime::network_endpoint{alternate, 0}, {});
+        co_await pump_until(fixture.events, binding);
+        auto bound = co_await std::move(binding);
+        BOOST_REQUIRE(bound.has_value());
+        auto listener = std::move(*bound);
+        seastar::abort_source accept_abort;
+        seastar::abort_source connect_abort;
+        auto accepting = listener.accept(accept_abort);
+        accept_abort.request_abort();
+        auto connecting = fixture.network->connect(
+          listener.local_endpoint(), std::nullopt, {}, connect_abort);
+        co_await pump_all(fixture.events);
+        const bool available_before_stop = accepting.available();
+        auto connected = co_await std::move(connecting);
+        co_await stop_network(fixture.events, fixture.network);
+        const auto rejected = co_await std::move(accepting);
+        BOOST_CHECK(available_before_stop);
+        BOOST_REQUIRE(!rejected.has_value());
+        BOOST_CHECK(rejected.error().code() == kwaque::errc::aborted);
+        static_cast<void>(connected);
+    }
+}
+
+SEASTAR_TEST_CASE(
+  fake_network_known_read_delay_rejection_does_not_commit_fault_or_trace) {
+    fault_environment fixture{
+      kwaque::runtime::builtin_fault_point::network_read,
+      kwaque::runtime::fault_decision::make_delay(
+        kwaque::runtime::monotonic_duration{2})};
+    auto connection = co_await open_connection(fixture);
+    seastar::abort_source abort;
+    auto writing = connection.client.write(
+      kwaque::runtime::testing::network_contract_detail::make_bytes("x"),
+      abort);
+    co_await pump_until(fixture.events, writing);
+    co_await require_ready_success(writing);
+    co_await pump_all(fixture.events);
+    BOOST_REQUIRE(
+      fixture.events
+        .run_until(
+          kwaque::runtime::monotonic_time{
+            fixture.scheduler_budget.maximum_deadline().nanoseconds() - 1U})
+        .has_value());
+    const auto entries = fixture.trace.entries().size();
+    const auto evaluations = fixture.faults->evaluations();
+    auto reading = connection.server.read(kwaque::byte_count{1}, abort);
+    BOOST_REQUIRE(reading.available());
+    const auto rejected = co_await std::move(reading);
+    BOOST_REQUIRE(!rejected.has_value());
+    BOOST_CHECK(rejected.error().code() == kwaque::errc::out_of_range);
+    BOOST_CHECK_EQUAL(fixture.trace.entries().size(), entries);
+    BOOST_CHECK_EQUAL(fixture.faults->evaluations(), evaluations);
+    BOOST_CHECK_EQUAL(fixture.network->active_operations(), 0U);
+    co_await stop_network(fixture.events, fixture.network);
+}
+
+SEASTAR_TEST_CASE(
+  fake_network_equal_ready_times_use_packet_ids_not_callback_order) {
+    const auto scheduler_budget = bandwidth_scheduler_limits();
+    const auto trace_budget = network_trace_limits();
+    kwaque::simulation::event_trace trace{
+      network_trace_header(scheduler_budget, trace_budget), trace_budget};
+    kwaque::simulation::scheduler events{scheduler_budget, &trace};
+    std::array<std::byte, 9> second_client_key{};
+    second_client_key[0] = std::byte{2};
+    auto object = kwaque::runtime::fault_object_key::from_bytes(
+      second_client_key);
+    auto id = kwaque::simulation::fault_rule_id::make(1);
+    auto occurrence = kwaque::runtime::fault_occurrence::make(1);
+    BOOST_REQUIRE(
+      object.has_value() && id.has_value() && occurrence.has_value());
+    auto delayed = kwaque::simulation::fault_rule::make(
+      *id,
+      kwaque::runtime::builtin_fault_point::network_write,
+      *object,
+      *occurrence,
+      *occurrence,
+      kwaque::simulation::fault_selector::once(),
+      kwaque::runtime::fault_decision::make_delay(
+        kwaque::runtime::monotonic_duration{1}));
+    BOOST_REQUIRE(delayed.has_value());
+    seastar::chunked_vector<kwaque::simulation::fault_rule> rules;
+    rules.push_back(std::move(*delayed));
+    auto selected = kwaque::simulation::fault_schedule::make(
+      events, trace, 17, std::move(rules));
+    BOOST_REQUIRE(selected.has_value());
+    auto faults = std::move(*selected);
+    kwaque::simulation::fake_network_config config;
+    config.maximum_active_flows = 2;
+    config.maximum_packets = 8;
+    config.maximum_direction_packets = 4;
+    config.link_capacity = kwaque::simulation::bandwidth_capacity::finite(
+      1'000'000'000);
+    config.latency_min = kwaque::runtime::monotonic_duration{};
+    config.latency_mean_parameter = kwaque::runtime::monotonic_duration{};
+    auto made = kwaque::simulation::fake_network::make(
+      config, events, faults.get());
+    BOOST_REQUIRE(made.has_value());
+    auto network = std::move(*made);
+    auto first = co_await open_connection(events, *network);
+    auto second = co_await open_connection(events, *network);
+    auto clogged = network->clog(loopback, alternate);
+    co_await pump_until(events, clogged);
+    co_await require_ready_success(clogged);
+    seastar::abort_source abort;
+    const auto transmission_started = events.now();
+    auto earlier_packet = first.client.write(
+      kwaque::runtime::testing::network_contract_detail::make_bytes("aa"),
+      abort);
+    auto later_packet = second.client.write(
+      kwaque::runtime::testing::network_contract_detail::make_bytes("b"),
+      abort);
+    co_await pump_all(events);
+    co_await require_ready_success(earlier_packet);
+    co_await require_ready_success(later_packet);
+    std::vector<std::uint64_t> arrivals;
+    for (const auto& entry : trace.entries()) {
+        if (
+          entry.action == kwaque::simulation::trace_action::selected
+          && entry.kind == kwaque::simulation::trace_event_kind::network
+          && entry.domain
+               == static_cast<std::uint32_t>(
+                 kwaque::simulation::network_trace_phase::delivery)) {
+            arrivals.push_back(entry.stable_id);
+            BOOST_CHECK_EQUAL(
+              entry.time.nanoseconds(),
+              transmission_started.nanoseconds() + 3U);
+        }
+    }
+    BOOST_REQUIRE_EQUAL(arrivals.size(), 2U);
+    BOOST_CHECK_EQUAL(arrivals[0], 2U);
+    BOOST_CHECK_EQUAL(arrivals[1], 1U);
+    auto unclogged = network->unclog(loopback, alternate);
+    co_await pump_until(events, unclogged);
+    co_await require_ready_success(unclogged);
+    co_await pump_all(events);
+    std::vector<std::uint64_t> deliveries;
+    for (const auto& entry : trace.entries()) {
+        if (
+          entry.action == kwaque::simulation::trace_action::packet_delivered) {
+            deliveries.push_back(entry.stable_id);
+        }
+    }
+    BOOST_REQUIRE_EQUAL(deliveries.size(), 2U);
+    BOOST_CHECK_EQUAL(deliveries[0], 1U);
+    BOOST_CHECK_EQUAL(deliveries[1], 2U);
+    co_await stop_network(events, network);
+}
+
+SEASTAR_TEST_CASE(fake_network_fin_admission_obeys_the_shared_packet_limit) {
+    kwaque::simulation::scheduler events{bandwidth_scheduler_limits()};
+    kwaque::simulation::fake_network_config config;
+    config.maximum_packets = 1;
+    config.maximum_direction_packets = 1;
+    config.maximum_active_flows = 1;
+    auto made = kwaque::simulation::fake_network::make(config, events);
+    BOOST_REQUIRE(made.has_value());
+    auto network = std::move(*made);
+    auto connection = co_await open_connection(events, *network);
+    auto clogged = network->clog(loopback, alternate);
+    co_await pump_until(events, clogged);
+    co_await require_ready_success(clogged);
+    seastar::abort_source abort;
+    auto writing = connection.client.write(
+      kwaque::runtime::testing::network_contract_detail::make_bytes("x"),
+      abort);
+    co_await pump_until(events, writing);
+    co_await require_ready_success(writing);
+    co_await pump_all(events);
+    const auto rejected = connection.client.shutdown_output();
+    BOOST_REQUIRE(!rejected.has_value());
+    BOOST_CHECK(rejected.error().code() == kwaque::errc::queue_full);
+    BOOST_CHECK(
+      connection.client.output_state()
+      == kwaque::runtime::network_half_state::open);
+    auto unclogged = network->unclog(loopback, alternate);
+    co_await pump_until(events, unclogged);
+    co_await require_ready_success(unclogged);
+    auto reading = connection.server.read(kwaque::byte_count{1}, abort);
+    co_await pump_until(events, reading);
+    const auto data = co_await std::move(reading);
+    BOOST_REQUIRE(data.has_value());
+    BOOST_REQUIRE(connection.client.shutdown_output().has_value());
+    co_await stop_network(events, network);
+}
+
+namespace {
+
+seastar::future<kwaque::errc> run_error_fault_history(
+  kwaque::runtime::builtin_fault_point point,
+  kwaque::simulation::event_trace& trace) {
+    kwaque::simulation::scheduler events{bandwidth_scheduler_limits(), &trace};
+    seastar::chunked_vector<kwaque::simulation::fault_rule> rules;
+    rules.push_back(
+      network_rule(1, point, 1, kwaque::runtime::fault_decision::make_error()));
+    auto selected = kwaque::simulation::fault_schedule::make(
+      events, trace, 17, std::move(rules));
+    BOOST_REQUIRE(selected.has_value());
+    auto faults = std::move(*selected);
+    auto made = kwaque::simulation::fake_network::make(
+      {}, events, faults.get());
+    BOOST_REQUIRE(made.has_value());
+    auto network = std::move(*made);
+    seastar::abort_source abort;
+    auto complete =
+      [&]<typename T>(seastar::future<kwaque::runtime::result<T>> pending)
+      -> seastar::future<kwaque::errc> {
+        while (!pending.available() && !events.trace_failed()
+               && events.pending_events() != 0) {
+            if (!events.has_ready_events()) {
+                BOOST_REQUIRE(events.advance_to_next().has_value());
+            }
+            const auto ran = events.run_ready_batch(64);
+            if (!ran) {
+                BOOST_REQUIRE(events.trace_failed());
+            }
+            co_await seastar::yield();
+        }
+        if (events.trace_failed()) {
+            BOOST_REQUIRE(events.discard_failed());
+        }
+        co_await pump_until(events, pending);
+        auto result = co_await std::move(pending);
+        const auto code = result ? kwaque::errc::success
+                                 : result.error().code();
+        auto stopping = network->stop();
+        if (!stopping.available()) {
+            co_await pump_until(events, stopping);
+        }
+        const auto stopped = co_await std::move(stopping);
+        if (events.trace_failed()) {
+            BOOST_REQUIRE(!stopped.has_value());
+            BOOST_CHECK(
+              stopped.error().code() == kwaque::errc::replay_divergence);
+        } else {
+            BOOST_REQUIRE(stopped.has_value());
+        }
+        BOOST_CHECK_EQUAL(network->active_operations(), 0U);
+        BOOST_CHECK_EQUAL(events.pending_events(), 0U);
+        co_return code;
+    };
+    if (point == kwaque::runtime::builtin_fault_point::network_write) {
+        auto connection = co_await open_connection(events, *network);
+        co_return co_await complete(connection.client.write(
+          kwaque::runtime::testing::network_contract_detail::make_bytes("x"),
+          abort));
+    }
+    auto binding = network->listen(
+      kwaque::runtime::network_endpoint{alternate, 0}, {});
+    co_await pump_until(events, binding);
+    auto bound = co_await std::move(binding);
+    BOOST_REQUIRE(bound.has_value());
+    auto listener = std::move(*bound);
+    auto connecting = network->connect(
+      listener.local_endpoint(), std::nullopt, {}, abort);
+    if (point == kwaque::runtime::builtin_fault_point::connect) {
+        co_return co_await complete(std::move(connecting));
+    }
+    co_await pump_until(events, connecting);
+    auto connected = co_await std::move(connecting);
+    BOOST_REQUIRE(connected.has_value());
+    auto client = std::move(*connected);
+    co_return co_await complete(listener.accept(abort));
+}
+
+} // namespace
+
+SEASTAR_TEST_CASE(fake_network_poison_precedes_injected_error_terminals) {
+    for (const auto point :
+         {kwaque::runtime::builtin_fault_point::connect,
+          kwaque::runtime::builtin_fault_point::accept,
+          kwaque::runtime::builtin_fault_point::network_write}) {
+        const auto budget = network_trace_limits();
+        const auto header = network_trace_header(
+          bandwidth_scheduler_limits(), budget);
+        kwaque::simulation::event_trace captured{header, budget};
+        const auto ordinary = co_await run_error_fault_history(point, captured);
+        BOOST_CHECK(ordinary == kwaque::errc::fault_injected);
+        auto encoded = captured.encode();
+        BOOST_REQUIRE(encoded.has_value());
+        auto decoded = kwaque::simulation::event_trace::decode(
+          std::move(*encoded), budget);
+        BOOST_REQUIRE(decoded.has_value());
+        const auto phase
+          = point == kwaque::runtime::builtin_fault_point::connect
+              ? kwaque::simulation::network_trace_phase::connect_client
+            : point == kwaque::runtime::builtin_fault_point::accept
+              ? kwaque::simulation::network_trace_phase::accept
+              : kwaque::simulation::network_trace_phase::write;
+        auto selected = std::ranges::find_if(
+          decoded->entries, [&](const auto& entry) {
+              return entry.action == kwaque::simulation::trace_action::selected
+                     && entry.kind
+                          == kwaque::simulation::trace_event_kind::network
+                     && entry.domain == static_cast<std::uint32_t>(phase);
+          });
+        BOOST_REQUIRE(selected != decoded->entries.end());
+        selected->result ^= 1U;
+        auto replay = kwaque::simulation::event_trace::replay(
+          header, budget, std::move(*decoded));
+        BOOST_REQUIRE(replay.has_value());
+        const auto poisoned = co_await run_error_fault_history(point, **replay);
+        BOOST_CHECK(poisoned == kwaque::errc::replay_divergence);
+    }
+}
+
+SEASTAR_TEST_CASE(
+  fake_network_bandwidth_and_stop_rearm_from_owned_id_capacity) {
+    for (const bool replace_wake : {false, true}) {
+        kwaque::simulation::scheduler events{bandwidth_scheduler_limits()};
+        kwaque::simulation::fake_network_config config;
+        config.maximum_active_flows = 1;
+        config.link_capacity = kwaque::simulation::bandwidth_capacity::finite(
+          1'000'000'000);
+        auto made = kwaque::simulation::fake_network::make(config, events);
+        BOOST_REQUIRE(made.has_value());
+        auto network = std::move(*made);
+        auto connection = co_await open_connection(events, *network);
+        seastar::abort_source abort;
+        auto writing = connection.client.write(
+          kwaque::runtime::testing::network_contract_detail::make_bytes("x"),
+          abort);
+        std::optional<seastar::future<kwaque::runtime::result<void>>> control;
+        if (replace_wake) {
+            control.emplace(network->set_link_capacity(
+              loopback,
+              alternate,
+              kwaque::simulation::bandwidth_capacity::finite(2'000'000'000)));
+        }
+        std::uint64_t lower = 0;
+        std::uint64_t upper = std::numeric_limits<std::uint64_t>::max();
+        while (lower < upper) {
+            const auto candidate = lower + (upper - lower) / 2U + 1U;
+            auto probe = events.reserve_event_id(candidate);
+            if (probe) {
+                lower = candidate;
+            } else {
+                upper = candidate - 1U;
+            }
+        }
+        auto held = events.reserve_event_id(lower);
+        BOOST_REQUIRE(held.has_value());
+        BOOST_CHECK(!events.reserve_event_id().has_value());
+        if (control) {
+            co_await pump_until(events, *control);
+            co_await require_ready_success(*control);
+        }
+        co_await pump_until(events, writing);
+        co_await require_ready_success(writing);
+        co_await stop_network(events, network);
+        BOOST_CHECK_EQUAL(events.pending_events(), 0U);
+    }
+}
+
+SEASTAR_TEST_CASE(
+  fake_network_disconnect_metadata_needs_no_payload_or_flow_capacity) {
+    const auto scheduler_budget = bandwidth_scheduler_limits();
+    const auto trace_budget = network_trace_limits();
+    kwaque::simulation::event_trace trace{
+      network_trace_header(scheduler_budget, trace_budget), trace_budget};
+    kwaque::simulation::scheduler events{scheduler_budget, &trace};
+    std::array<std::byte, 9> key{};
+    key[0] = std::byte{2};
+    auto object = kwaque::runtime::fault_object_key::from_bytes(key);
+    auto id = kwaque::simulation::fault_rule_id::make(1);
+    auto occurrence = kwaque::runtime::fault_occurrence::make(1);
+    BOOST_REQUIRE(
+      object.has_value() && id.has_value() && occurrence.has_value());
+    auto rule = kwaque::simulation::fault_rule::make(
+      *id,
+      kwaque::runtime::builtin_fault_point::network_write,
+      *object,
+      *occurrence,
+      *occurrence,
+      kwaque::simulation::fault_selector::once(),
+      kwaque::runtime::fault_decision::make_disconnect());
+    BOOST_REQUIRE(rule.has_value());
+    seastar::chunked_vector<kwaque::simulation::fault_rule> rules;
+    rules.push_back(std::move(*rule));
+    auto selected = kwaque::simulation::fault_schedule::make(
+      events, trace, 17, std::move(rules));
+    BOOST_REQUIRE(selected.has_value());
+    auto faults = std::move(*selected);
+    kwaque::simulation::fake_network_config config;
+    config.maximum_active_flows = 1;
+    config.maximum_links = 1;
+    config.maximum_packet_logical_bytes = kwaque::byte_count{1};
+    config.link_capacity = kwaque::simulation::bandwidth_capacity::finite(0);
+    auto made = kwaque::simulation::fake_network::make(
+      config, events, faults.get());
+    BOOST_REQUIRE(made.has_value());
+    auto network = std::move(*made);
+    auto occupied = co_await open_connection(events, *network);
+    auto closing = co_await open_connection(events, *network, third);
+    seastar::abort_source abort;
+    auto blocked = occupied.client.write(
+      kwaque::runtime::testing::network_contract_detail::make_bytes("a"),
+      abort);
+    auto disconnect = closing.client.write(
+      kwaque::runtime::testing::network_contract_detail::make_bytes("metadata"),
+      abort);
+    co_await pump_until(events, disconnect);
+    const auto failed = co_await std::move(disconnect);
+    BOOST_REQUIRE(!failed.has_value());
+    BOOST_CHECK(failed.error().code() == kwaque::errc::network_failure);
+    BOOST_CHECK(!blocked.available());
+    co_await stop_network(events, network);
+    const auto stopped = co_await std::move(blocked);
+    BOOST_REQUIRE(!stopped.has_value());
+    BOOST_CHECK(stopped.error().code() == kwaque::errc::aborted);
 }

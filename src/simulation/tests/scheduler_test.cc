@@ -6,6 +6,8 @@
 #include <seastar/core/future.hh>
 #include <seastar/core/memory.hh>
 #include <seastar/testing/test_case.hh>
+#include <seastar/util/alloc_failure_injector.hh>
+#include <seastar/util/defer.hh>
 #include <seastar/util/later.hh>
 
 #include <boost/test/unit_test.hpp>
@@ -15,7 +17,9 @@
 #include <cstddef>
 #include <cstdint>
 #include <limits>
+#include <new>
 #include <optional>
+#include <string_view>
 #include <type_traits>
 #include <utility>
 #include <vector>
@@ -1084,4 +1088,216 @@ SEASTAR_TEST_CASE(scheduler_acceptance_is_asynchronous_but_rejection_is_ready) {
     BOOST_REQUIRE(!rejected_outcome.has_value());
     BOOST_CHECK(rejected_outcome.error().code() == kwaque::errc::queue_full);
     BOOST_TEST(cancel_event(rejecting_scheduler, *blocker));
+}
+
+SEASTAR_TEST_CASE(
+  scheduler_rejects_malformed_effect_before_admission_with_or_without_trace) {
+    using namespace kwaque::simulation;
+    const auto limits = scheduler_limits::make(
+                          {.pending_events = 8,
+                           .events_per_pump = 8,
+                           .total_events = 32,
+                           .maximum_deadline = monotonic_time{100}})
+                          .value();
+    const auto budget = trace_limits::make({.entries = 32,
+                                            .encoded_bytes = 16384,
+                                            .line_bytes = 1024})
+                          .value();
+    for (const bool traced : {false, true}) {
+        event_trace trace{
+          trace_header::current(
+            1,
+            deterministic_random_algorithm_version,
+            deterministic_random_coordinate_version,
+            trace_budget(limits),
+            budget,
+            {},
+            {}),
+          budget};
+        scheduler target{limits, traced ? &trace : nullptr};
+        const std::uint32_t valid_result
+          = static_cast<std::uint8_t>(
+              kwaque::runtime::fault_action::partial_resize)
+            | 0x100U;
+        trace_event_descriptor descriptor{
+          .kind = trace_event_kind::file,
+          .domain = kwaque::runtime::descriptor_for(
+                      kwaque::runtime::builtin_fault_point::file_truncate)
+                      ->id.value(),
+          .stable_id = 1,
+          .coordinate_a = 1,
+          .coordinate_b = 0,
+          .value = 2,
+          .result = valid_result,
+          .effect = trace_action::partial_resize_applied};
+        for (const auto invalid :
+             {0U, valid_result | 0x10000U, valid_result ^ 0x300U}) {
+            descriptor.result = invalid;
+            scheduler::callback callback{[] noexcept {}};
+            auto rejected = target.schedule(
+              target.now(),
+              event_priority::normal(),
+              std::move(callback),
+              descriptor,
+              event_cleanup_policy::invoke);
+            BOOST_REQUIRE(!rejected.has_value());
+            BOOST_CHECK(
+              rejected.error().code() == kwaque::errc::invalid_argument);
+            // Invalid descriptors reject before taking callback ownership.
+            // NOLINTNEXTLINE(bugprone-use-after-move)
+            BOOST_CHECK(static_cast<bool>(callback));
+            BOOST_CHECK_EQUAL(target.pending_events(), 0U);
+            BOOST_CHECK(trace.entries().empty());
+        }
+        descriptor.result = valid_result;
+        auto admitted = target.schedule(
+          target.now(),
+          event_priority::normal(),
+          [] noexcept {},
+          descriptor,
+          event_cleanup_policy::invoke);
+        BOOST_REQUIRE(admitted.has_value());
+        BOOST_CHECK_EQUAL(admitted->value(), 1U);
+        BOOST_REQUIRE(target.step().has_value());
+        BOOST_CHECK_EQUAL(target.pending_events(), 0U);
+        BOOST_CHECK(!trace.failed());
+    }
+    co_return;
+}
+
+SEASTAR_TEST_CASE(
+  cooperative_trace_decode_rejects_cr_across_chunks_and_preserves_valid_bytes) {
+    using namespace kwaque::simulation;
+    constexpr std::uint32_t count = 2048;
+    const auto limits = scheduler_limits::make(
+                          {.pending_events = 8,
+                           .events_per_pump = 8,
+                           .total_events = 32,
+                           .maximum_deadline = monotonic_time{100}})
+                          .value();
+    const auto budget = trace_limits::make(
+                          {.entries = count,
+                           .encoded_bytes = canonical_header_encoded_size
+                                            + count
+                                                * canonical_entry_encoded_size,
+                           .line_bytes = 1024})
+                          .value();
+    event_trace trace{
+      trace_header::current(
+        1,
+        deterministic_random_algorithm_version,
+        deterministic_random_coordinate_version,
+        trace_budget(limits),
+        budget,
+        {},
+        {}),
+      budget};
+    for (std::uint32_t index = 0; index < count; ++index) {
+        BOOST_REQUIRE(trace
+                        .observe(
+                          trace_entry{
+                            .action = trace_action::keyed_decision,
+                            .kind = trace_event_kind::keyed_random,
+                            .domain = 1,
+                            .stable_id = 1,
+                            .value = index})
+                        .has_value());
+    }
+    auto encoded = co_await trace.encode_cooperatively(32);
+    BOOST_REQUIRE(encoded.has_value());
+    for (const std::uint64_t corrupt_at :
+         {std::uint64_t{5},
+          std::uint64_t{kwaque::maximum_contiguous_allocation_bytes - 1},
+          std::uint64_t{kwaque::maximum_contiguous_allocation_bytes},
+          encoded->size() - 2}) {
+        trace_artifact corrupted{encoded->size()};
+        std::uint64_t offset = 0;
+        for (const auto& chunk : encoded->chunks()) {
+            const std::string_view bytes{chunk.data(), chunk.size()};
+            if (corrupt_at >= offset && corrupt_at - offset < bytes.size()) {
+                const auto at = static_cast<std::size_t>(corrupt_at - offset);
+                corrupted.append(bytes.substr(0, at));
+                corrupted.push_back('\r');
+                corrupted.append(bytes.substr(at + 1));
+            } else
+                corrupted.append(bytes);
+            offset += chunk.size();
+        }
+#if defined(SEASTAR_ENABLE_ALLOC_FAILURE_INJECTION)                            \
+  && !defined(SEASTAR_DEFAULT_ALLOCATOR)
+        if (corrupt_at == encoded->size() - 2) {
+            trace_artifact probe{corrupted.size()};
+            for (const auto& chunk : corrupted.chunks())
+                probe.append({chunk.data(), chunk.size()});
+            bool reached = false;
+            auto attempted = [&] {
+                auto& injector = seastar::memory::local_failure_injector();
+                auto reset = seastar::defer([&] { injector.cancel(); });
+                injector.fail_after(0);
+                auto future = event_trace::decode_cooperatively(
+                  std::move(probe), budget, 32);
+                reached = injector.failed();
+                return future;
+            }();
+            bool allocation_failed = false;
+            try {
+                static_cast<void>(co_await std::move(attempted));
+            } catch (const std::bad_alloc&) {
+                allocation_failed = true;
+            }
+            // Parsing reaches its first output allocation before examining a
+            // malformed final byte. A whole-artifact CR prepass fails this.
+            BOOST_CHECK(reached);
+            BOOST_CHECK(allocation_failed);
+        }
+#endif
+        auto decoded = co_await event_trace::decode_cooperatively(
+          std::move(corrupted), budget, 32);
+        BOOST_REQUIRE(!decoded.has_value());
+        BOOST_CHECK(decoded.error().code() == kwaque::errc::malformed_data);
+    }
+    bool decoding = true;
+    bool observed_during_decode = false;
+    auto observer = seastar::yield().then(
+      [&] { observed_during_decode = decoding; });
+    auto decoded = co_await event_trace::decode_cooperatively(
+      std::move(*encoded), budget, 32);
+    decoding = false;
+    co_await std::move(observer);
+#ifdef SEASTAR_DEBUG
+    // This profile requests preemption at every cooperative boundary.
+    BOOST_CHECK(observed_during_decode);
+#else
+    static_cast<void>(observed_during_decode);
+#endif
+    BOOST_REQUIRE(decoded.has_value());
+    BOOST_CHECK(std::ranges::equal(decoded->entries, trace.entries()));
+}
+
+SEASTAR_TEST_CASE(
+  scheduler_counted_id_reservations_split_without_releasing_capacity) {
+    scheduler target{scheduler_limits::defaults()};
+    scheduler_test_access::use_final_event_id(target);
+    BOOST_CHECK(!target.reserve_event_id(2).has_value());
+    BOOST_CHECK(!target.reserve_event_id(0).has_value());
+    auto parent = target.reserve_event_id(1);
+    BOOST_REQUIRE(parent.has_value());
+    BOOST_CHECK(!parent->split(2).has_value());
+    BOOST_CHECK_EQUAL(parent->count(), 1U);
+    auto child = parent->split(1);
+    BOOST_REQUIRE(child.has_value());
+    BOOST_CHECK(!parent->active());
+    BOOST_CHECK(
+      !target
+         .schedule(monotonic_time{}, event_priority::normal(), [] noexcept {})
+         .has_value());
+    child->release();
+    auto event = target.schedule(
+      monotonic_time{}, event_priority::normal(), [] noexcept {});
+    BOOST_REQUIRE(event.has_value());
+    BOOST_CHECK_EQUAL(
+      event->value(), std::numeric_limits<std::uint64_t>::max());
+    BOOST_CHECK(cancel_event(target, *event));
+    BOOST_CHECK(!target.reserve_event_id().has_value());
+    co_return;
 }

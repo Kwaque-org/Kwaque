@@ -157,9 +157,11 @@ kwaque_cc_library(
     srcs = [
         "record_fuzz_cases.cc",
         "record_fuzz_oracle.cc",
+    ],
+    hdrs = [
+        "record_fuzz_cases.h",
         "record_fuzz_oracle.h",
     ],
-    hdrs = ["record_fuzz_cases.h"],
     deps = [
         "//src/base",
         "//src/base:error",
@@ -181,6 +183,7 @@ kwaque_cc_library(
         "//src/model:record_codec",
         "//src/runtime:time",
         "@crc32c",
+        "@lz4//:lz4_frame",
         "@seastar",
     ],
 )
@@ -190,6 +193,28 @@ kwaque_cc_seastar_gtest(
     srcs = ["record_fuzz_cases_test.cc"],
     memory = "256MiB",
     deps = [":record_fuzz_cases"],
+)
+
+kwaque_cc_seastar_gtest(
+    name = "batch_compression_test",
+    srcs = ["batch_compression_test.cc"],
+    memory = "256MiB",
+    deps = [
+        ":record_fuzz_cases",
+        "//src/base",
+        "//src/base:error",
+        "//src/bytes:fragmented_buffer",
+        "//src/bytes:fragmented_buffer_builder",
+        "//src/bytes:fragmented_buffer_parser",
+        "//src/codec:cooperative",
+        "//src/codec:error",
+        "//src/codec:integer",
+        "//src/codec:limits",
+        "//src/compression",
+        "//src/model:batch_builder",
+        "//src/model:batch_codec",
+        "//src/model:record_codec",
+    ],
 )
 
 kwaque_cc_fuzz_test(
@@ -280,7 +305,10 @@ kwaque_cc_seastar_gtest(
 
 kwaque_cc_benchmark(
     name = "model_bench",
-    srcs = ["model_bench.cc"],
+    srcs = [
+        "batch_compression_bench.cc",
+        "model_bench.cc",
+    ],
     memory = "512MiB",
     deps = [
         ":model_bench_support",
@@ -292,6 +320,9 @@ kwaque_cc_benchmark(
         "//src/codec:error",
         "//src/codec:integer",
         "//src/codec:limits",
+        "//src/codec:sha256",
+        "//src/codec/tests:codec_bench_reference",
+        "//src/compression",
         "//src/model:batch",
         "//src/model:batch_builder",
         "//src/model:batch_codec",
@@ -299,6 +330,7 @@ kwaque_cc_benchmark(
         "//src/model:fingerprint",
         "//src/model:record",
         "//src/model:record_codec",
+        "@fmt",
     ],
 )
 

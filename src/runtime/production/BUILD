@@ -33,7 +33,10 @@ kwaque_cc_library(
     name = "random",
     srcs = ["random.cc"],
     hdrs = ["random.h"],
-    visibility = ["//src/runtime/tests:__pkg__"],
+    visibility = [
+        "//src/broker:__pkg__",
+        "//src/runtime/tests:__pkg__",
+    ],
     deps = [
         "//src/runtime:error",
         "//src/runtime:random",
@@ -48,6 +51,7 @@ kwaque_cc_library(
     deps = [
         "//src/runtime:error",
         "//src/runtime:file",
+        "//src/runtime:file_error_internal",
         "//src/runtime:operation_statistics",
         "//src/runtime:shard_affinity",
         "@seastar",

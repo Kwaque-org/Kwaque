@@ -64,17 +64,11 @@ void reconcile(std::span<const oracle_flow> flows) {
         if (oracle.rate.unlimited) {
             continue;
         }
-        ASSERT_LE(
-          oracle.rate.finite.numerator(),
-          kwaque::simulation::testing::oracle_fraction::integer{
-            std::numeric_limits<std::uint64_t>::max()});
-        ASSERT_LE(
-          oracle.rate.finite.denominator(),
-          kwaque::simulation::testing::oracle_fraction::integer{
-            std::numeric_limits<std::uint64_t>::max()});
         EXPECT_TRUE(actual.rate.finite_value().equals(
-          oracle.rate.finite.numerator().convert_to<std::uint64_t>(),
-          oracle.rate.finite.denominator().convert_to<std::uint64_t>()));
+          oracle.rate.finite.numerator()
+            .convert_to<kwaque::simulation::bandwidth_integer>(),
+          oracle.rate.finite.denominator()
+            .convert_to<kwaque::simulation::bandwidth_integer>()));
     }
 }
 
@@ -377,4 +371,52 @@ TEST(NetworkOracleTest, DenseModelCoversDnsAndReleasesPacketPressure) {
         .has_value());
     EXPECT_EQ(oracle.snapshot().live_packets, 0U);
     EXPECT_TRUE(oracle.apply(write).has_value());
+}
+
+TEST(NetworkOracleTest, ReconcilesNormalizedNumeratorsBeyondUint64) {
+    const auto maximum = std::numeric_limits<std::uint64_t>::max();
+    std::array<oracle_flow, 4> flows{};
+    for (std::size_t index = 0; index < flows.size(); ++index) {
+        flows[index].id = index + 1U;
+        if (index < 3) {
+            flows[index].constraints[flows[index].constraint_count++]
+              = oracle_constraint{
+                .resource = 1, .capacity = oracle_capacity::finite(5)};
+        }
+        if (index == 0 || index == 3) {
+            flows[index].constraints[flows[index].constraint_count++]
+              = oracle_constraint{
+                .resource = 2, .capacity = oracle_capacity::finite(maximum)};
+        }
+    }
+    const auto oracle = solve_bandwidth_oracle(flows);
+    ASSERT_TRUE(oracle.has_value());
+    ASSERT_GT(oracle->allocations.back().rate.finite.numerator(), maximum);
+    reconcile(flows);
+}
+
+TEST(NetworkOracleTest, FullWidthRatesReconcileMixedResourcesAtTheFlowLimit) {
+    for (std::uint64_t seed = 1; seed <= 32; ++seed) {
+        auto random = kwaque::simulation::deterministic_random{seed}.stream(
+          kwaque::simulation::random_domain::network_decision, 0x5749445448);
+        ASSERT_TRUE(random.has_value());
+        std::array<oracle_capacity, 19> capacities{};
+        for (auto& capacity : capacities) {
+            capacity = oracle_capacity::finite(
+              random->next_u64() | (UINT64_C(1) << 63U));
+        }
+        std::array<oracle_flow, 96> flows{};
+        for (std::size_t index = 0; index < flows.size(); ++index) {
+            auto& flow = flows[index];
+            flow.id = index + 1U;
+            const std::array resources{
+              std::size_t{0}, 1U + index % 7U, 8U + (index * 5U + seed) % 11U};
+            for (const auto resource : resources) {
+                flow.constraints[flow.constraint_count++] = oracle_constraint{
+                  .resource = resource + 1U, .capacity = capacities[resource]};
+            }
+        }
+        SCOPED_TRACE(seed);
+        reconcile(flows);
+    }
 }

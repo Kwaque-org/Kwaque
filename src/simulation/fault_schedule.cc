@@ -216,22 +216,12 @@ fault_schedule::fault_schedule(
   , groups_(std::move(groups))
   , ranges_(ranges) {}
 
-runtime::result<std::unique_ptr<fault_schedule>> fault_schedule::make(
-  scheduler& event_scheduler,
-  event_trace& trace,
-  std::uint64_t master_seed,
-  seastar::chunked_vector<fault_rule> rules,
-  fault_schedule_limits limits) {
-    event_scheduler.assert_current();
+runtime::result<fault_schedule::rule_index> fault_schedule::index_rules(
+  seastar::chunked_vector<fault_rule>& rules, fault_schedule_limits limits) {
     if (
       rules.size() > limits.rules()
       || rules.size() > maximum_fault_schedule_rules) {
         return runtime::failure(fault_error(errc::out_of_range));
-    }
-    if (
-      trace.header().master_seed != master_seed
-      || !event_scheduler.uses_trace(trace)) {
-        return runtime::failure(fault_error(errc::invalid_argument));
     }
 
     seastar::chunked_vector<std::uint64_t> ids;
@@ -288,30 +278,66 @@ runtime::result<std::unique_ptr<fault_schedule>> fault_schedule::make(
         for (std::size_t exact_index = begin + 1U; exact_index < group_index;
              ++exact_index) {
             const auto& exact = groups[exact_index];
-            std::size_t wildcard_rule = wildcard.begin;
-            std::size_t exact_rule = exact.begin;
-            while (wildcard_rule < wildcard.end && exact_rule < exact.end) {
+            const auto first = rules.begin()
+                               + static_cast<std::ptrdiff_t>(wildcard.begin);
+            const auto last = rules.begin()
+                              + static_cast<std::ptrdiff_t>(wildcard.end);
+            for (auto index = exact.begin; index < exact.end; ++index) {
+                // Disjoint wildcard intervals have increasing last endpoints.
+                // Skip the irrelevant prefix instead of rescanning it per
+                // object.
+                const auto candidate = std::lower_bound(
+                  first,
+                  last,
+                  rules[index].first(),
+                  [](const fault_rule& rule, runtime::fault_occurrence first) {
+                      return rule.last() < first;
+                  });
                 if (
-                  intervals_overlap(rules[wildcard_rule], rules[exact_rule])) {
+                  candidate != last
+                  && intervals_overlap(*candidate, rules[index])) {
                     return runtime::failure(
                       fault_error(errc::invalid_argument));
-                }
-                if (rules[wildcard_rule].last() < rules[exact_rule].first()) {
-                    ++wildcard_rule;
-                } else {
-                    ++exact_rule;
                 }
             }
         }
     }
 
+    return rule_index{.groups = std::move(groups), .ranges = ranges};
+}
+
+runtime::result<void> fault_schedule::validate_rules(
+  seastar::chunked_vector<fault_rule>& rules, fault_schedule_limits limits) {
+    auto index = index_rules(rules, limits);
+    if (!index) {
+        return runtime::failure(index.error());
+    }
+    return {};
+}
+
+runtime::result<std::unique_ptr<fault_schedule>> fault_schedule::make(
+  scheduler& event_scheduler,
+  event_trace& trace,
+  std::uint64_t master_seed,
+  seastar::chunked_vector<fault_rule> rules,
+  fault_schedule_limits limits) {
+    event_scheduler.assert_current();
+    if (
+      trace.header().master_seed != master_seed
+      || !event_scheduler.uses_trace(trace)) {
+        return runtime::failure(fault_error(errc::invalid_argument));
+    }
+    auto index = index_rules(rules, limits);
+    if (!index) {
+        return runtime::failure(index.error());
+    }
     return std::unique_ptr<fault_schedule>{new fault_schedule{
       event_scheduler,
       trace,
       master_seed,
       std::move(rules),
-      std::move(groups),
-      ranges}};
+      std::move(index->groups),
+      index->ranges}};
 }
 
 const fault_schedule::rule_group* fault_schedule::find_group(

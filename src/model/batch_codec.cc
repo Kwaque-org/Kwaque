@@ -30,6 +30,7 @@ seastar::future<codec::result<fragmented_buffer>> encode_body(
     metadata,
   codec::semantic_batch_digest fingerprint,
   item_count headers,
+  compression::codec_id encoding,
   fragmented_buffer& records,
   fragmented_buffer& prefix,
   fragmented_buffer& body,
@@ -70,6 +71,65 @@ seastar::future<codec::result<fragmented_buffer>> encode_body(
         co_return codec::failure(at(errc::resource_exhausted, context));
     if (records.empty() || retained.value() > records.size().value() / 7U)
         co_return codec::failure(at(errc::invalid_argument, context));
+    constexpr auto overhead = fixed_bytes.value()
+                              + codec::envelope_prefix_bytes;
+    if (context.origin > std::numeric_limits<std::uint64_t>::max() - overhead)
+        co_return codec::failure(at(errc::invalid_argument, context));
+    const auto selected = compression::parse_codec_id(
+      static_cast<std::uint8_t>(encoding),
+      {context.origin + codec::envelope_prefix_bytes + 156U,
+       context.family,
+       static_cast<std::uint16_t>(batch_field::codec)});
+    if (!selected) co_return codec::failure(selected.error());
+    const auto expanded_bytes = records.size();
+    if (encoding == compression::codec_id::lz4) {
+        const auto encoded_cap = config.max_encoded_body_bytes.checked_sub(
+          fixed_bytes);
+        if (!encoded_cap)
+            co_return codec::failure(at(errc::resource_exhausted, context));
+        if (auto ready = co_await work.checkpoint(anchor); !ready)
+            co_return codec::failure(ready.error());
+        if (auto ready = work.poll(anchor); !ready)
+            co_return codec::failure(ready.error());
+        const auto input = records.allocation_cost(charge);
+        if (!input)
+            co_return codec::failure(
+              codec::detail::allocation_cost_error(
+                input.error(), context, context.origin));
+        const auto metadata_cost = input->descriptors.checked_add(
+          input->share_controls);
+        if (!metadata_cost)
+            co_return codec::failure(at(errc::out_of_range, context));
+        const auto admitted = codec::detail::consume_decode_budget(
+          policy,
+          {remaining, config.max_metadata_bytes, charge},
+          input->backing,
+          *metadata_cost,
+          context,
+          context.origin);
+        if (!admitted) co_return codec::failure(admitted.error());
+        // Raw source coordinates are internal; only the actual encoded extent
+        // must fit the caller's wire origin. No raw offset is a wire offset.
+        auto encoded = co_await compression::compress_lz4(
+          std::move(records),
+          *encoded_cap,
+          work,
+          *admitted,
+          {0,
+           context.family,
+           static_cast<std::uint16_t>(batch_field::records)});
+        if (!encoded)
+            co_return codec::failure(
+              codec::error{
+                encoded.error().code(),
+                context.family,
+                static_cast<std::uint16_t>(batch_field::records),
+                context.origin + overhead});
+        records = std::move(encoded->value);
+        // Assembly charges the new owner itself. The old reservation is kept
+        // separate until return, including when external aliases retain it.
+        remaining = admitted->operation_remaining;
+    }
     const auto total = records.size().checked_add(fixed_bytes);
     if (
       !total
@@ -95,7 +155,8 @@ seastar::future<codec::result<fragmented_buffer>> encode_body(
       records.size(),
       input->backing,
       input->fragments,
-      config.max_expanded_batch_bytes);
+      encoding == compression::codec_id::none ? config.max_expanded_batch_bytes
+                                              : config.max_encoded_body_bytes);
     if (!payload)
         co_return codec::failure(
           codec::detail::allocation_cost_error(
@@ -143,12 +204,13 @@ seastar::future<codec::result<fragmented_buffer>> encode_body(
       fixed, static_cast<std::uint32_t>(retained.value()));
     detail::batch_store<152>(
       fixed, static_cast<std::uint32_t>(headers.value()));
-    // codec/reserved remain zero; record profile is exactly one.
+    detail::batch_store<156>(fixed, static_cast<std::uint8_t>(encoding));
+    // Reserved stays zero; record profile is exactly one.
     detail::batch_store<158>(fixed, std::uint16_t{1});
     detail::batch_store<160>(
       fixed, static_cast<std::uint32_t>(records.size().value()));
     detail::batch_store<164>(
-      fixed, static_cast<std::uint32_t>(records.size().value()));
+      fixed, static_cast<std::uint32_t>(expanded_bytes.value()));
     if constexpr (Assigned) {
         detail::batch_store<168>(
           fixed, metadata.logical_span().begin().value());
@@ -197,6 +259,7 @@ seastar::future<codec::result<fragmented_buffer>> encode_body(
 template<bool Assigned>
 seastar::future<codec::result<bytes::fragmented_buffer>> encode_batch(
   std::conditional_t<Assigned, assigned_batch, submitted_batch>&& batch,
+  compression::codec_id encoding,
   codec::cooperative_work& work,
   byte_count parent_remaining,
   bytes::allocation_charge_fn charge,
@@ -218,6 +281,7 @@ seastar::future<codec::result<bytes::fragmented_buffer>> encode_batch(
             submitted,
             fingerprint,
             headers,
+            encoding,
             records,
             prefix,
             body,
@@ -255,7 +319,12 @@ seastar::future<codec::result<bytes::fragmented_buffer>> encode_submitted_batch(
   bytes::allocation_charge_fn charge,
   codec::field_context context) {
     return encode_batch<false>(
-      std::move(batch), work, parent_remaining, charge, context);
+      std::move(batch),
+      compression::codec_id::none,
+      work,
+      parent_remaining,
+      charge,
+      context);
 }
 
 seastar::future<codec::result<bytes::fragmented_buffer>> encode_assigned_batch(
@@ -265,7 +334,34 @@ seastar::future<codec::result<bytes::fragmented_buffer>> encode_assigned_batch(
   bytes::allocation_charge_fn charge,
   codec::field_context context) {
     return encode_batch<true>(
-      std::move(batch), work, parent_remaining, charge, context);
+      std::move(batch),
+      compression::codec_id::none,
+      work,
+      parent_remaining,
+      charge,
+      context);
+}
+
+seastar::future<codec::result<bytes::fragmented_buffer>> encode_submitted_batch(
+  submitted_batch&& batch,
+  compression::codec_id encoding,
+  codec::cooperative_work& work,
+  byte_count parent_remaining,
+  bytes::allocation_charge_fn charge,
+  codec::field_context context) {
+    return encode_batch<false>(
+      std::move(batch), encoding, work, parent_remaining, charge, context);
+}
+
+seastar::future<codec::result<bytes::fragmented_buffer>> encode_assigned_batch(
+  assigned_batch&& batch,
+  compression::codec_id encoding,
+  codec::cooperative_work& work,
+  byte_count parent_remaining,
+  bytes::allocation_charge_fn charge,
+  codec::field_context context) {
+    return encode_batch<true>(
+      std::move(batch), encoding, work, parent_remaining, charge, context);
 }
 
 } // namespace kwaque::model

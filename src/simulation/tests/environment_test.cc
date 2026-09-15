@@ -187,6 +187,19 @@ SEASTAR_TEST_CASE(simulation_environment_validates_aggregate_configuration) {
     BOOST_REQUIRE(!rejected_stream.has_value());
     BOOST_CHECK(rejected_stream.error().code() == kwaque::errc::out_of_range);
 
+    environment_config_values invalid_file;
+    invalid_file.file.logical_capacity = kwaque::byte_count{};
+    auto rejected_file = environment_config::make(std::move(invalid_file));
+    BOOST_REQUIRE(!rejected_file.has_value());
+    environment_config_values invalid_dns;
+    invalid_dns.dns.maximum_records = 0;
+    auto rejected_dns = environment_config::make(std::move(invalid_dns));
+    BOOST_REQUIRE(!rejected_dns.has_value());
+    environment_config_values invalid_network;
+    invalid_network.network.maximum_packets = 0;
+    auto rejected_network = environment_config::make(
+      std::move(invalid_network));
+    BOOST_REQUIRE(!rejected_network.has_value());
     environment_config_values invalid_epoch;
     invalid_epoch.event_epoch = 0;
     auto rejected_epoch = environment_config::make(std::move(invalid_epoch));
@@ -799,4 +812,20 @@ SEASTAR_TEST_CASE(simulation_environment_stop_delay_uses_virtual_control_time) {
     BOOST_CHECK_EQUAL(target->time().offset().nanoseconds(), 0);
     BOOST_CHECK(!contains_trace_action(
       *target, kwaque::simulation::trace_action::wall_adjusted));
+}
+
+SEASTAR_TEST_CASE(
+  simulation_environment_rejects_invalid_rule_sets_before_binding) {
+    environment_config_values values;
+    auto duplicate = rule(
+      91,
+      kwaque::runtime::builtin_fault_point::environment_start,
+      1,
+      kwaque::runtime::fault_decision::make_error());
+    values.fault_rules.push_back(duplicate);
+    values.fault_rules.push_back(duplicate);
+    const auto rejected = environment_config::make(std::move(values));
+    BOOST_REQUIRE(!rejected.has_value());
+    BOOST_CHECK(rejected.error().code() == kwaque::errc::invalid_argument);
+    co_return;
 }

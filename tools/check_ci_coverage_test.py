@@ -40,7 +40,9 @@ SMOKE_FUZZERS = {f"//src/simulation/tests:{name}" for name in STATEFUL_FUZZERS} 
     "//src/bytes:fragmented_buffer_fuzz",
     "//src/codec/tests:codec_fuzz",
     "//src/codec/tests:codec_cooperative_fuzz",
+    "//src/compression/tests:compression_fuzz",
     "//src/model/tests:record_fuzz",
+    "//src/storage/tests:storage_format_fuzz",
     "//src/simulation/tests:signal_canary_test",
 }
 
@@ -328,7 +330,7 @@ def coverage_errors(workflow: str) -> list[str]:
                 f"goldens: requires both {field} values for all four native jobs"
             )
     commands = run_commands(goldens)
-    expected = f'bazel test --config="${{{{ matrix.config }}}}" --cache_test_results=no {GOLDENS}'
+    expected = f'bazel test --config="${{{{ matrix.config }}}}" --cache_test_results=no {GOLDENS} //src/storage/tests:format_tests'
     if commands != [expected]:
         errors.append(
             "goldens: all four jobs must execute the identical explicit uncached suite"
@@ -339,6 +341,19 @@ def coverage_errors(workflow: str) -> list[str]:
         errors.append("arm-build: use a native aarch64 runner")
     if "//src/simulation/tests:fake_file_replay_test" not in arm:
         errors.append("arm-build: retain the wider release runtime coverage")
+    for target in (
+        "//src/compression/tests:format_tests",
+        "//src/model/tests:batch_compression_test",
+        "//src/storage/tests:format_tests",
+    ):
+        if not any(
+            target in command.split()
+            for command in run_commands(arm)
+            if command.startswith("bazel test ")
+        ):
+            errors.append(
+                f"arm-build: execute format allocation and integration coverage: {target}"
+            )
     return errors
 
 

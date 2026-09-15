@@ -1,0 +1,84 @@
+diff --git a/include/seastar/core/reactor.hh b/include/seastar/core/reactor.hh
+--- a/include/seastar/core/reactor.hh
++++ b/include/seastar/core/reactor.hh
+@@ -559,6 +559,8 @@
+     future<std::filesystem::space_info> file_system_space(std::string_view pathname) noexcept;
+     future<struct statvfs> statvfs(std::string_view pathname) noexcept;
+     future<> remove_file(std::string_view pathname) noexcept;
++    future<> unlink_file(std::string_view pathname) noexcept;
++    future<> remove_directory(std::string_view pathname) noexcept;
+     future<> rename_file(std::string_view old_pathname, std::string_view new_pathname, rename_flags flags = rename_flags::none) noexcept;
+     future<> link_file(std::string_view oldpath, std::string_view newpath) noexcept;
+     future<> chmod(std::string_view name, file_permissions permissions) noexcept;
+diff --git a/include/seastar/core/seastar.hh b/include/seastar/core/seastar.hh
+--- a/include/seastar/core/seastar.hh
++++ b/include/seastar/core/seastar.hh
+@@ -312,6 +312,14 @@
+ /// containing directory is sync'ed.
+ future<> remove_file(std::string_view name) noexcept;
+ 
++/// Unlinks a non-directory entry; a directory is rejected by the syscall.
++/// Sync the containing directory separately to make removal durable.
++future<> unlink_file(std::string_view name) noexcept;
++
++/// Removes an empty directory; non-directory entries are rejected.
++/// Sync the containing directory separately to make removal durable.
++future<> remove_directory(std::string_view name) noexcept;
++
+ /// Renames (moves) a file.
+ ///
+ /// \param old_name existing file name
+diff --git a/src/core/reactor.cc b/src/core/reactor.cc
+--- a/src/core/reactor.cc
++++ b/src/core/reactor.cc
+@@ -2069,6 +2069,32 @@
+ }
+ 
+ future<>
++reactor::unlink_file(std::string_view pathname_view) noexcept {
++    auto pathname = sstring(pathname_view);
++    syscall_result<int> sr = co_await _thread_pool->submit<syscall_result<int>>(
++            internal::thread_pool_submit_reason::file_operation, [pathname] {
++        return wrap_syscall<int>(::unlink(pathname.c_str()));
++    });
++    if (sr.failed()) {
++        co_await coroutine::return_exception_ptr(
++          sr.make_fs_exception_ptr("unlink failed", fs::path(pathname)));
++    }
++}
++
++future<>
++reactor::remove_directory(std::string_view pathname_view) noexcept {
++    auto pathname = sstring(pathname_view);
++    syscall_result<int> sr = co_await _thread_pool->submit<syscall_result<int>>(
++            internal::thread_pool_submit_reason::file_operation, [pathname] {
++        return wrap_syscall<int>(::rmdir(pathname.c_str()));
++    });
++    if (sr.failed()) {
++        co_await coroutine::return_exception_ptr(
++          sr.make_fs_exception_ptr("rmdir failed", fs::path(pathname)));
++    }
++}
++
++future<>
+ reactor::rename_file(std::string_view old_pathname_view, std::string_view new_pathname_view, rename_flags flags) noexcept {
+     auto old_pathname = sstring(old_pathname_view);
+     auto new_pathname = sstring(new_pathname_view);
+diff --git a/src/util/file.cc b/src/util/file.cc
+--- a/src/util/file.cc
++++ b/src/util/file.cc
+@@ -102,6 +102,14 @@
+ 
+ future<> remove_file(std::string_view pathname) noexcept {
+     return engine().remove_file(pathname);
++}
++
++future<> unlink_file(std::string_view pathname) noexcept {
++    return engine().unlink_file(pathname);
++}
++
++future<> remove_directory(std::string_view pathname) noexcept {
++    return engine().remove_directory(pathname);
+ }
+ 
+ future<> rename_file(std::string_view old_pathname, std::string_view new_pathname, rename_flags flags) noexcept {

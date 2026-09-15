@@ -1,5 +1,8 @@
 #include "src/simulation/event_sink.h"
 
+#include <array>
+#include <bit>
+
 namespace kwaque::simulation {
 
 namespace {
@@ -12,6 +15,110 @@ namespace {
 [[nodiscard]] std::uint64_t
 event_kind_value(const observability::event* value) noexcept {
     return value == nullptr ? 0U : static_cast<std::uint16_t>(value->kind());
+}
+
+struct event_difference final {
+    event_replay_difference field;
+    std::uint64_t expected;
+    std::uint64_t actual;
+};
+
+std::uint64_t
+field_value(const observability::event_field_value& value) noexcept {
+    using observability::event_field_type;
+    switch (value.type()) {
+    case event_field_type::signed_integer:
+        return std::bit_cast<std::uint64_t>(*value.as_signed());
+    case event_field_type::unsigned_integer:
+        return *value.as_unsigned();
+    case event_field_type::boolean:
+        return *value.as_boolean();
+    case event_field_type::stable_id:
+        return value.as_stable_id()->value();
+    case event_field_type::bounded_string:
+        for (const auto& text : observability::event_text_descriptors()) {
+            if (
+              text.role == *value.text_role()
+              && text.value == *value.as_text()) {
+                return static_cast<std::uint16_t>(text.id);
+            }
+        }
+        return 0;
+    }
+    return 0;
+}
+
+event_difference first_difference(
+  const observability::event& expected,
+  const observability::event& actual) noexcept {
+    const std::array differences{
+      event_difference{
+        event_replay_difference::kind,
+        event_kind_value(&expected),
+        event_kind_value(&actual)},
+      event_difference{
+        event_replay_difference::severity,
+        static_cast<std::uint8_t>(expected.severity()),
+        static_cast<std::uint8_t>(actual.severity())},
+      event_difference{
+        event_replay_difference::monotonic,
+        expected.monotonic().nanoseconds(),
+        actual.monotonic().nanoseconds()},
+      event_difference{
+        event_replay_difference::wall,
+        std::bit_cast<std::uint64_t>(expected.wall().unix_nanoseconds()),
+        std::bit_cast<std::uint64_t>(actual.wall().unix_nanoseconds())},
+      event_difference{
+        event_replay_difference::shard,
+        expected.shard().value(),
+        actual.shard().value()},
+      event_difference{
+        event_replay_difference::workload,
+        static_cast<std::uint8_t>(expected.workload()),
+        static_cast<std::uint8_t>(actual.workload())},
+      event_difference{
+        event_replay_difference::sequence,
+        expected.sequence(),
+        actual.sequence()},
+      event_difference{
+        event_replay_difference::field_count,
+        expected.fields().size(),
+        actual.fields().size()},
+    };
+    for (const auto& candidate : differences) {
+        if (candidate.expected != candidate.actual) {
+            return candidate;
+        }
+    }
+    for (std::size_t index = 0; index < expected.fields().size(); ++index) {
+        const auto& left = expected.fields()[index];
+        const auto& right = actual.fields()[index];
+        const std::array fields{
+          event_difference{
+            event_replay_difference::field_key_0,
+            static_cast<std::uint16_t>(left.key),
+            static_cast<std::uint16_t>(right.key)},
+          event_difference{
+            event_replay_difference::field_type_0,
+            static_cast<std::uint8_t>(left.value.type()),
+            static_cast<std::uint8_t>(right.value.type())},
+          event_difference{
+            event_replay_difference::field_value_0,
+            field_value(left.value),
+            field_value(right.value)},
+        };
+        for (auto candidate : fields) {
+            if (candidate.expected != candidate.actual) {
+                candidate.field = static_cast<event_replay_difference>(
+                  static_cast<std::uint8_t>(candidate.field) + index * 3U);
+                return candidate;
+            }
+        }
+    }
+    return {
+      event_replay_difference::value,
+      event_kind_value(&expected),
+      event_kind_value(&actual)};
 }
 
 } // namespace
@@ -102,17 +209,22 @@ runtime::result<void> event_log_sink::remember_failure(
   event_replay_difference difference) noexcept {
     assert_current();
     if (!failure_) {
+        const auto context = expected != nullptr && actual != nullptr
+                               ? first_difference(*expected, *actual)
+                               : event_difference{
+                                   difference,
+                                   event_kind_value(expected),
+                                   event_kind_value(actual)};
         auto error = sink_error(errc::replay_divergence);
         static_cast<void>(error.add_context(
           runtime::operation_context_key::sequence, replay_index_ + 1U));
         static_cast<void>(error.add_context(
           runtime::operation_context_key::detail,
-          static_cast<std::uint8_t>(difference)));
+          static_cast<std::uint8_t>(context.field)));
         static_cast<void>(error.add_context(
-          runtime::operation_context_key::expected,
-          event_kind_value(expected)));
+          runtime::operation_context_key::expected, context.expected));
         static_cast<void>(error.add_context(
-          runtime::operation_context_key::actual, event_kind_value(actual)));
+          runtime::operation_context_key::actual, context.actual));
         failure_.emplace(std::move(error));
     }
     return runtime::failure(*failure_);

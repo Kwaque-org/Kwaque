@@ -419,7 +419,9 @@ public:
         metadata.path = path;
         metadata.open_options = options;
         bool open_slot = false;
-        return filesystem.apply_open(metadata, open_slot);
+        auto opened = filesystem.apply_open(metadata, open_slot);
+        if (!opened) return runtime::failure(opened.error());
+        return std::move(*opened).publish();
     }
     [[nodiscard]] static runtime::result<fake_object_id> create_directory(
       fake_file_system& filesystem, const canonical_fake_path& path) {
@@ -483,6 +485,29 @@ public:
       std::span<std::byte> destination) noexcept {
         return filesystem.read(path, position, destination);
     }
+    [[nodiscard]] static runtime::result<std::size_t> volatile_page_count(
+      const fake_file_system& filesystem, const canonical_fake_path& path) {
+        auto file = filesystem.regular_file(path);
+        if (!file) return runtime::failure(file.error());
+        return (*file)->visible_pages.size();
+    }
+
+    [[nodiscard]] static runtime::result<fake_file_system::prepared_truncate>
+    prepare_truncate(
+      fake_file_system& filesystem,
+      const canonical_fake_path& path,
+      std::uint64_t size) {
+        auto id = filesystem.lookup(path);
+        if (!id) return runtime::failure(id.error());
+        return filesystem.prepare_truncate(*id, size);
+    }
+
+    static void commit_truncate(
+      fake_file_system& filesystem,
+      fake_file_system::prepared_truncate prepared) noexcept {
+        filesystem.commit_truncate(std::move(prepared));
+    }
+
     [[nodiscard]] static runtime::result<void> truncate(
       fake_file_system& filesystem,
       const canonical_fake_path& path,
@@ -632,10 +657,9 @@ private:
         }
     }
 
+    template<typename Pages>
     static void append_pages(
-      fake_file_state_digest& state,
-      const fake_file_system::page_map& pages,
-      std::uint64_t tag) {
+      fake_file_state_digest& state, const Pages& pages, std::uint64_t tag) {
         mix(state, tag);
         mix(state, pages.size());
         seastar::chunked_vector<std::uint64_t> indices;
@@ -693,9 +717,9 @@ private:
         }
     }
 
-    static void copy_pages(
-      const fake_file_system::page_map& pages,
-      std::vector<std::byte>& destination) {
+    template<typename Pages>
+    static void
+    copy_pages(const Pages& pages, std::vector<std::byte>& destination) {
         for (const auto& [index, state] : pages) {
             const auto offset = index * fake_file_page_bytes;
             if (offset >= destination.size()) {

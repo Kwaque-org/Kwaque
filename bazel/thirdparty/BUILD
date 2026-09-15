@@ -10,6 +10,7 @@ exports_files([
     "seastar.BUILD",
     "seastar-chunked-vector-exception-safety.patch",
     "seastar-http-resource-limits.patch",
+    "seastar-file-removal-kind.patch",
     "seastar-metrics-registration-exception-safety.patch",
     "seastar-scheduling-group-rollback.patch",
     "seastar-spinlock-include.patch",

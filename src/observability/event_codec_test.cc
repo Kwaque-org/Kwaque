@@ -6,14 +6,17 @@
 #include "src/observability/testing/event_sequence_test_access.h"
 
 #include <seastar/core/coroutine.hh>
+#include <seastar/core/preempt.hh>
 #include <seastar/testing/test_case.hh>
 #include <seastar/util/alloc_failure_injector.hh>
+#include <seastar/util/later.hh>
 
 #include <boost/test/unit_test.hpp>
 
 #include <algorithm>
 #include <array>
 #include <bit>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <limits>
@@ -50,6 +53,15 @@ using kwaque::observability::event_sink_epoch;
 using kwaque::observability::event_sink_identity;
 using kwaque::observability::event_stable_id;
 using kwaque::observability::event_text;
+
+void require_pending_preemption() {
+    const auto preemption_deadline = std::chrono::steady_clock::now()
+                                     + std::chrono::seconds(2);
+    while (!seastar::need_preempt()
+           && std::chrono::steady_clock::now() < preemption_deadline) {
+    }
+    BOOST_REQUIRE(seastar::need_preempt());
+}
 
 event_text text(event_public_text value) {
     auto made = event_text::make(value);
@@ -723,4 +735,123 @@ SEASTAR_TEST_CASE(large_event_logs_require_cooperative_codec_paths) {
     BOOST_REQUIRE(decoded.has_value());
     BOOST_CHECK((*decoded)->entries().size() == entries);
     co_return;
+}
+
+SEASTAR_TEST_CASE(
+  decoded_event_history_allocates_for_content_and_preserves_limits) {
+    const auto parser = limits(
+      event_log_limits::entries_absolute,
+      event_log_limits::encoded_bytes_absolute);
+    event_log empty{identity(), limits(1, 4'096)};
+    auto artifact = empty.encode();
+    BOOST_REQUIRE(artifact.has_value());
+    auto decoded = event_log::decode(*artifact, parser);
+    BOOST_REQUIRE(decoded.has_value());
+    BOOST_CHECK((*decoded)->entries().empty());
+    BOOST_CHECK((*decoded)->limits() == parser);
+    auto sequence = event_sequence_test_access::make(identity());
+    auto value = stamp(*sequence, make_file_request());
+    const auto bytes = canonical_event_log_record_prefix_size
+                       + value.encoded_size();
+    auto reserved = (*decoded)->reserve(1, bytes);
+    BOOST_REQUIRE(reserved.has_value());
+    BOOST_REQUIRE((*decoded)->append(value, *reserved).has_value());
+    auto extended = (*decoded)->encode();
+    BOOST_REQUIRE(extended.has_value());
+    auto cooperative = co_await event_log::decode_cooperatively(
+      std::move(*extended), parser, 1);
+    BOOST_REQUIRE(cooperative.has_value());
+    BOOST_CHECK_EQUAL((*cooperative)->entries().size(), 1U);
+    BOOST_CHECK((*cooperative)->entries()[0] == value);
+    auto malformed = artifact->to_vector();
+    BOOST_REQUIRE(malformed.has_value());
+    // The count prefix cannot claim an entry without any record bytes.
+    (*malformed)[48] = 1;
+    auto rejected = event_log::decode(*malformed, parser);
+    BOOST_REQUIRE(!rejected.has_value());
+    BOOST_CHECK(rejected.error().code() == kwaque::errc::malformed_data);
+}
+
+SEASTAR_TEST_CASE(
+  cooperative_event_artifact_comparison_handles_chunk_boundaries) {
+    kwaque::observability::event_log_artifact left;
+    kwaque::observability::event_log_artifact equal;
+    kwaque::observability::event_log_artifact different;
+    std::array<std::uint8_t, 4'096> bytes{};
+    for (std::size_t index = 0; index < 65; ++index) {
+        bytes.fill(static_cast<std::uint8_t>(index));
+        BOOST_REQUIRE(left.append(bytes).has_value());
+        BOOST_REQUIRE(equal.append(bytes).has_value());
+        if (index == 64) {
+            bytes.back() ^= 1U;
+        }
+        BOOST_REQUIRE(different.append(bytes).has_value());
+    }
+    const auto same = co_await left.equals_cooperatively(equal);
+    const auto changed = co_await left.equals_cooperatively(different);
+    BOOST_CHECK(same);
+    BOOST_CHECK(!changed);
+    BOOST_REQUIRE(equal.push_back(0).has_value());
+    const auto longer = co_await left.equals_cooperatively(equal);
+    BOOST_CHECK(!longer);
+}
+
+SEASTAR_TEST_CASE(
+  cooperative_event_encoding_keeps_a_prefix_during_live_append) {
+    constexpr std::uint32_t count = 1'025;
+    event_log log{identity(), limits(count + 1U, 1'048'576)};
+    auto sequence = event_sequence_test_access::make(identity());
+    const auto request = make_file_request();
+    for (std::uint32_t index = 0; index < count; ++index) {
+        BOOST_REQUIRE(log.append(stamp(*sequence, request)).has_value());
+    }
+    const auto prefix_bytes = log.encoded_bytes();
+    require_pending_preemption();
+    bool appended = false;
+    auto observer = seastar::yield().then([&] {
+        BOOST_REQUIRE(log.append(stamp(*sequence, request)).has_value());
+        appended = true;
+    });
+    auto encoding = log.encode_cooperatively(1);
+    co_await std::move(observer);
+    BOOST_REQUIRE(appended);
+    auto encoded = co_await std::move(encoding);
+    BOOST_REQUIRE(encoded.has_value());
+    BOOST_CHECK_EQUAL(encoded->size(), prefix_bytes);
+    auto decoded = co_await event_log::decode_cooperatively(
+      std::move(*encoded), log.limits());
+    BOOST_REQUIRE(decoded.has_value());
+    BOOST_CHECK_EQUAL((*decoded)->entries().size(), count);
+    BOOST_CHECK_EQUAL(log.entries().size(), count + 1U);
+    auto final = co_await log.encode_cooperatively();
+    BOOST_REQUIRE(final.has_value());
+    BOOST_CHECK_EQUAL(final->size(), log.encoded_bytes());
+}
+
+SEASTAR_TEST_CASE(
+  cooperative_event_decoding_yields_while_growing_validated_history) {
+    constexpr std::uint32_t count = 1'025;
+    event_log log{identity(), limits(count, 1'048'576)};
+    auto sequence = event_sequence_test_access::make(identity());
+    for (std::uint32_t index = 0; index < count; ++index) {
+        BOOST_REQUIRE(
+          log.append(stamp(*sequence, make_file_request())).has_value());
+    }
+    auto encoded = co_await log.encode_cooperatively();
+    BOOST_REQUIRE(encoded.has_value());
+    const auto parser = limits(
+      event_log_limits::entries_absolute,
+      event_log_limits::encoded_bytes_absolute);
+    require_pending_preemption();
+    bool observed = false;
+    auto observer = seastar::yield().then([&] { observed = true; });
+    auto decoding = event_log::decode_cooperatively(
+      std::move(*encoded), parser, 128);
+    BOOST_CHECK(!decoding.available());
+    co_await std::move(observer);
+    BOOST_CHECK(observed);
+    auto decoded = co_await std::move(decoding);
+    BOOST_REQUIRE(decoded.has_value());
+    BOOST_CHECK_EQUAL((*decoded)->entries().size(), count);
+    BOOST_CHECK((*decoded)->entries()[count - 1U] == log.entries()[count - 1U]);
 }

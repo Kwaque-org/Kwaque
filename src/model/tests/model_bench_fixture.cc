@@ -1,40 +1,20 @@
 #include "src/model/tests/model_bench_fixture.h"
 
-#include "src/bytes/fragmented_buffer_builder.h"
 #include "src/model/batch_rewrite.h"
 
 #include <seastar/core/abort_source.hh>
 #include <seastar/core/coroutine.hh>
-#include <seastar/core/deleter.hh>
 #include <seastar/core/temporary_buffer.hh>
 
 #include <fmt/format.h>
 
-#include <algorithm>
 #include <array>
-#include <bit>
 #include <cstdint>
 #include <malloc.h>
-#include <stdexcept>
 #include <utility>
 
 namespace kwaque::model::bench {
 using bytes::fragmented_buffer;
-void require(bool condition, const char* message) {
-    if (!condition) throw std::runtime_error(message);
-}
-byte_count capacity_bound(byte_count request) noexcept {
-    if (request.value() == 0) return {};
-    if (request.value() > (std::uint64_t{1} << 62U))
-        return byte_count{UINT64_MAX};
-    const auto rounded = std::bit_ceil(
-      std::max(request.value(), std::uint64_t{16}));
-#if defined(SEASTAR_DEFAULT_ALLOCATOR)
-    return byte_count{2U * rounded};
-#else
-    return byte_count{request.value() <= 16384 ? 2U * rounded : rounded};
-#endif
-}
 namespace {
 template<typename Id>
 Id object(std::uint8_t first) {
@@ -42,13 +22,6 @@ Id object(std::uint8_t first) {
     for (std::size_t i = 0; i < value.size(); ++i)
         value[i] = static_cast<std::uint8_t>(first + i);
     return Id::make(value).value();
-}
-void native_allocation(void* base, std::size_t requested) {
-    const auto served = ::malloc_usable_size(base);
-    require(
-      served >= requested
-        && served <= capacity_bound(byte_count{requested}).value(),
-      "fixture allocation exceeds verified profile");
 }
 } // namespace
 batch_decode_expectation expected_context() {
@@ -75,92 +48,6 @@ producer_stream_binding fixture_binding() {
              segment_generation::make(9).value())
       .value();
 }
-void qualify_allocator() {
-    for (const auto size : std::array<std::size_t, 13>{
-           16,
-           32,
-           fragmented_buffer::fragment_descriptor_size(),
-           sizeof(seastar::free_deleter_impl),
-           sizeof(record_header),
-           sizeof(record_header) * 64,
-           128,
-           1024,
-           8192,
-           16384,
-           16385,
-           32768,
-           65536}) {
-        seastar::temporary_buffer<char> allocation{size};
-        native_allocation(allocation.get_write(), size);
-    }
-}
-
-seastar::future<fragmented_buffer> copy_layout(
-  fragmented_buffer input,
-  std::size_t requested_width,
-  codec::cooperative_work& work,
-  byte_count remaining,
-  std::size_t fragment_limit) {
-    const auto size = input.size().value();
-    if (size == 0) co_return fragmented_buffer{};
-    require(
-      fragment_limit != 0 && fragment_limit <= bytes::max_buffer_fragments,
-      "invalid fixture fragment limit");
-    const auto width = std::min<std::uint64_t>(
-      size,
-      std::max<std::uint64_t>(
-        requested_width == 0 ? 65536 : requested_width,
-        (size + fragment_limit - 1U) / fragment_limit));
-    const auto count = 1U + (size - 1U) / width;
-    require(
-      width <= 65536 && count <= fragment_limit,
-      "fixture layout exceeds allocation/fragment bound");
-    if (auto ready = co_await work.checkpoint(); !ready)
-        throw std::runtime_error("fixture aborted");
-    const auto source = input.allocation_cost(capacity_bound).value();
-    const auto descriptor = capacity_bound(
-      byte_count{count * fragmented_buffer::fragment_descriptor_size()});
-    const auto backing = byte_count{
-      count * capacity_bound(byte_count{width}).value()};
-    require(work.policy().remaining_operation_bytes({.retained_input=source.backing,.staged_output=backing,
-      .payload_bookkeeping=byte_count{source.descriptors.value()+source.share_controls.value()+descriptor.value()}},remaining).has_value(),"fixture copy exceeds remaining operation budget");
-    bytes::fragmented_buffer_builder builder{
-      {.initial_fragment_bytes = byte_count{width},
-       .max_fragment_bytes = byte_count{width},
-       .max_total_bytes = byte_count{size},
-       .max_retained_bytes = byte_count{count * width},
-       .max_fragments = static_cast<std::size_t>(count)}};
-    builder.reserve_fragments(item_count{count}).value();
-    for (const auto fragment : input) {
-        for (std::size_t offset = 0; offset < fragment.size();) {
-            const auto n = std::min<std::size_t>(
-              {fragment.size() - offset,
-               static_cast<std::size_t>(work.byte_quantum().value() / 2U),
-               static_cast<std::size_t>(width)});
-            const auto ready = co_await work.admit(
-              byte_count{2U * n}, item_count{8});
-            require(ready.has_value(), "fixture copy aborted");
-            builder.append(std::span<const char>{fragment.data() + offset, n})
-              .value();
-            offset += n;
-        }
-    }
-    const auto ready = co_await work.checkpoint();
-    require(ready.has_value(), "fixture publication aborted");
-    auto result = builder.finish().value();
-    // All fragment pointers are allocation bases: this builder only copied,
-    // never sliced/spliced or trimmed a prefix. Verify every actual backing.
-    for (const auto fragment : result) {
-        native_allocation(
-          const_cast<char*>(fragment.data()), static_cast<std::size_t>(width));
-        const auto ready = co_await work.admit(byte_count{}, item_count{1});
-        require(ready.has_value(), "fixture allocation check aborted");
-    }
-    co_await work.drain_inline(work.byte_quantum(), work.item_quantum());
-    input = fragmented_buffer{};
-    co_return result;
-}
-
 seastar::future<> model_fixture::account(codec::cooperative_work& work) {
     byte_count total;
     if (value) {
@@ -230,25 +117,20 @@ seastar::future<> model_fixture::initialize(bool report) {
     qualify_allocator();
     seastar::abort_source abort;
     codec::cooperative_work work{codec::limits::defaults(), abort};
-    bytes::fragmented_buffer_builder payload{
-      {.initial_fragment_bytes = byte_count{32768},
-       .max_fragment_bytes = byte_count{65536},
-       .max_total_bytes = byte_count{1048576},
-       .max_retained_bytes = byte_count{2U << 20U},
-       .max_fragments = 1024}};
-    (co_await work.admit(byte_count{65536}, item_count{1})).value();
-    std::array<char, 32768> block{};
-    std::fill(block.begin(), block.end(), 'x');
-    for (std::size_t at = 0; at < payload_size;) {
-        const auto size = std::min(block.size(), payload_size - at);
-        const auto ready = co_await work.admit(
-          byte_count{2U * size}, item_count{8});
-        require(ready.has_value(), "fixture payload aborted");
-        payload.append(std::span<const char>{block}.first(size)).value();
-        at += size;
+    for (const auto requested :
+         {sizeof(record_header),
+          sizeof(record_header) * 64U,
+          std::size_t{128},
+          std::size_t{8192}}) {
+        seastar::temporary_buffer<char> allocation{requested};
+        const auto served = ::malloc_usable_size(allocation.get_write());
+        require(
+          served >= requested
+            && served <= capacity_bound(byte_count{requested}).value(),
+          "model fixture allocation exceeds verified profile");
     }
-    auto bytes = co_await copy_layout(
-      payload.finish().value(), width, work, remaining);
+    auto bytes = co_await codec::bench::patterned_buffer(
+      payload_size, width == 0 ? 65536 : width, pattern, work, remaining);
     std::vector<record_header> headers;
     if (payload_size < 1048565)
         headers.push_back(

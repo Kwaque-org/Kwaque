@@ -27,8 +27,10 @@ kwaque_cc_library(
     hdrs = ["seastar_fuzz.h"],
     visibility = [
         "//src/codec/tests:__pkg__",
+        "//src/compression/tests:__pkg__",
         "//src/model/tests:__pkg__",
         "//src/simulation/tests:__pkg__",
+        "//src/storage/tests:__pkg__",
     ],
     deps = [
         "@seastar",

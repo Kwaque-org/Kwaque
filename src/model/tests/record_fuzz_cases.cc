@@ -1,5 +1,6 @@
 #include "src/model/tests/record_fuzz_cases.h"
 
+#include "src/codec/sha256.h"
 #include "src/model/batch_codec.h"
 #include "src/model/batch_rewrite.h"
 #include "src/model/record_codec.h"
@@ -34,11 +35,25 @@ byte_count charge(byte_count request) noexcept {
     if (request.value() == 0) return {};
     if (request.value() > (std::uint64_t{1} << 62U))
         return byte_count{UINT64_MAX};
+#if defined(SEASTAR_DEFAULT_ALLOCATOR)
     return byte_count{
-      2U * std::bit_ceil(std::max(request.value(), std::uint64_t{16}))};
+      std::bit_ceil(std::max(request.value() + 32U, std::uint64_t{32}))};
+#else
+    const auto rounded = std::bit_ceil(
+      std::max(request.value(), std::uint64_t{16}));
+    return byte_count{request.value() <= 16384 ? 2U * rounded : rounded};
+#endif
 }
 codec::decode_budget memory() {
     return {byte_count{32U << 20U}, byte_count{1U << 20U}, charge};
+}
+codec::sha256_digest record_digest(const fragmented_buffer& value) {
+    codec::sha256_hasher hash;
+    for (const auto fragment : value) {
+        hash.update(fragment.data(), fragment.size());
+        seastar::thread::maybe_yield();
+    }
+    return std::move(hash).final();
 }
 template<typename Id>
 Id object(std::uint8_t first) {
@@ -124,7 +139,11 @@ record_bytes(std::string_view data, std::uint64_t delta, bool dense_first) {
     return varuint(body.size()) + body;
 }
 std::string batch_bytes(
-  std::string_view data, bool assigned, bool extension, std::uint8_t count) {
+  std::string_view data,
+  bool assigned,
+  bool extension,
+  std::uint8_t count,
+  bool compressed = false) {
     const auto original = 1U + count % 8U;
     std::string records;
     std::uint64_t headers = 0;
@@ -149,7 +168,13 @@ std::string batch_bytes(
     const auto digest = fingerprint(body, records);
     for (std::size_t i = 0; i < digest.size(); ++i)
         body[104 + i] = static_cast<char>(digest[i]);
-    body += records;
+    if (compressed) {
+        auto encoded = lz4_records(records);
+        put(body, 156, 1, 1);
+        put(body, 160, encoded.size(), 4);
+        body += encoded;
+    } else
+        body += records;
     return frame(std::move(body), assigned, extension);
 }
 void mutate(
@@ -359,11 +384,15 @@ void exercise_batch(
     const bool invalid_origin = (origin_flags & 8U) != 0;
     if ((origin_flags & 12U) != 0)
         context.origin = UINT64_MAX - raw.size() - (invalid_origin ? 0U : 1U);
-    const auto oracle
-      = invalid_origin
-          ? batch_probe{.error = errc::invalid_argument}
-          : probe_batch(
-              raw, Assigned, complete, wrong, UINT64_MAX - context.origin - 1U);
+    const auto oracle = invalid_origin
+                          ? batch_probe{.error = errc::invalid_argument}
+                          : probe_batch(
+                              raw,
+                              Assigned,
+                              complete,
+                              wrong,
+                              UINT64_MAX - context.origin - 1U,
+                              narrow);
     auto input = parser(raw, layout, depth);
     codec::limits_config config;
     if (narrow) {
@@ -417,9 +446,14 @@ void exercise_batch(
     if (actual) {
         require(actual->value.fingerprint().bytes() == oracle.digest);
         require(actual->value.header_count().value() == oracle.headers);
-        require(
-          flatten(actual->value.records())
-          == raw.substr(oracle.records_at, oracle.record_bytes));
+        require(actual->value.records().size().value() == oracle.record_bytes);
+        if (oracle.compressed)
+            require(
+              record_digest(actual->value.records()) == oracle.record_digest);
+        else
+            require(
+              flatten(actual->value.records())
+              == raw.substr(oracle.records_at, oracle.record_bytes));
         if constexpr (Assigned) {
             require(
               actual->value.context().logical_span().begin().value()
@@ -449,6 +483,40 @@ void exercise_batch(
                   .get();
         }();
         require(encoded.has_value());
+        if (oracle.compressed) {
+            // Re-encoding is canonical none, not byte-identical LZ4. Keep large
+            // expansion fragmented while checking the independently established
+            // raw digest and metadata through the complete model round trip.
+            fragmented_buffer_parser rebuilt_input{std::move(*encoded)};
+            const auto budget = codec::reserve_decode_input(
+                                  rebuilt_input, next.policy(), memory())
+                                  .value();
+            auto rebuilt = [&] {
+                if constexpr (Assigned)
+                    return decode_assigned_batch(
+                             rebuilt_input, expected(wrong), budget, next)
+                      .get();
+                else
+                    return decode_submitted_batch(
+                             rebuilt_input, expected(wrong), budget, next)
+                      .get();
+            }();
+            require(rebuilt.has_value() && rebuilt_input.at_end());
+            require(rebuilt->value.fingerprint().bytes() == oracle.digest);
+            require(rebuilt->value.header_count().value() == oracle.headers);
+            require(
+              record_digest(rebuilt->value.records()) == oracle.record_digest);
+            if constexpr (Assigned) {
+                require(
+                  rebuilt->value.context().logical_span().begin().value()
+                  == oracle.begin);
+                require(
+                  rebuilt->value.context().logical_span().end().value()
+                  == oracle.end);
+            }
+            next.drain(next.byte_quantum(), next.item_quantum()).get();
+            return;
+        }
         const auto rebuilt = flatten(*encoded);
         require(
           probe_batch(rebuilt, Assigned, true, wrong).error == errc::success);
@@ -563,11 +631,14 @@ void exercise_record_case(std::span<const std::uint8_t> input) {
         return;
     }
     const bool batch = mode >= 2, assigned = mode == 3 || mode == 5;
-    std::string wire
-      = mode == 1 ? record_bytes(data, controls[2] % 64U, false)
-        : mode >= 4
-          ? batch_bytes(data, assigned, (controls[4] & 4U) != 0, controls[2])
-          : data;
+    std::string wire = mode == 1 ? record_bytes(data, controls[2] % 64U, false)
+                       : mode >= 4 ? batch_bytes(
+                                       data,
+                                       assigned,
+                                       (controls[4] & 4U) != 0,
+                                       controls[2],
+                                       (controls[7] & 16U) != 0)
+                                   : data;
     mutate(wire, controls[1], controls[2], batch);
     if (batch && wire.size() >= 32 && (controls[4] & 2U) != 0) {
         const auto header = little(wire, 10, 2);

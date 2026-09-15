@@ -489,8 +489,9 @@ std::vector<std::uint8_t> fuzz_configuration(fuzz_harness harness) {
                "fault-history=1";
         break;
     case fuzz_harness::fake_network:
-        text = "network:v2;flows=1,8,32,96;commands=512;pending=4096;total="
-               "32768;deadline=1000000000000;trace=16384;trace-bytes=4194304";
+        text = "network:v3;flows=1,8,32,96;commands=512;pending=4096;total="
+               "32768;deadline=1000000000000;trace=16384;trace-bytes=4194304;"
+               "packets-per-flow=3";
         break;
     case fuzz_harness::semantic_canary:
         text = "canary:v2";

@@ -236,6 +236,10 @@ private:
 
 class fault_schedule final : public runtime::shard_affine {
 public:
+    // Canonicalizes the caller-owned rule list before validating overlaps.
+    [[nodiscard]] static runtime::result<void> validate_rules(
+      seastar::chunked_vector<fault_rule>& rules, fault_schedule_limits limits);
+
     [[nodiscard]] static runtime::result<std::unique_ptr<fault_schedule>> make(
       scheduler& event_scheduler,
       event_trace& trace,
@@ -289,6 +293,13 @@ private:
         std::size_t begin{0};
         std::size_t end{0};
     };
+
+    struct rule_index final {
+        seastar::chunked_vector<rule_group> groups;
+        std::array<group_range, runtime::builtin_fault_points.size()> ranges;
+    };
+    [[nodiscard]] static runtime::result<rule_index> index_rules(
+      seastar::chunked_vector<fault_rule>& rules, fault_schedule_limits limits);
 
     struct selector_result final {
         std::uint64_t sample{fault_trace_no_sample};

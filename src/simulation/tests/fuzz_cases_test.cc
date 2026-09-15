@@ -422,14 +422,14 @@ SEASTAR_TEST_CASE(fuzz_replay_reports_event_values_and_missing_entries) {
         const auto encoded = encode_event((*decoded)->entries()[0]);
         BOOST_REQUIRE(encoded.has_value());
         for (const auto difference :
-             {event_replay_difference::value,
+             {event_replay_difference::monotonic,
               event_replay_difference::expected_missing,
               event_replay_difference::actual_missing}) {
             event_log changed_log{
               (*decoded)->identity(), replay_event_limits()};
             auto value = std::vector<std::uint8_t>{
               encoded->bytes().begin(), encoded->bytes().end()};
-            if (difference == event_replay_difference::value) {
+            if (difference == event_replay_difference::monotonic) {
                 value[8U + value[6]] ^= 1U;
             }
             if (difference != event_replay_difference::expected_missing) {
@@ -460,6 +460,18 @@ SEASTAR_TEST_CASE(fuzz_replay_reports_event_values_and_missing_entries) {
             BOOST_CHECK_EQUAL(
               error_context(replayed.error(), operation_context_key::detail),
               static_cast<std::uint8_t>(difference));
+            if (difference == event_replay_difference::monotonic) {
+                const auto original_time
+                  = (*decoded)->entries()[0].monotonic().nanoseconds();
+                BOOST_CHECK_EQUAL(
+                  error_context(
+                    replayed.error(), operation_context_key::expected),
+                  original_time ^ std::uint64_t{1});
+                BOOST_CHECK_EQUAL(
+                  error_context(
+                    replayed.error(), operation_context_key::actual),
+                  original_time);
+            }
             BOOST_REQUIRE(replay_fuzz_case(*captured).has_value());
         }
     });

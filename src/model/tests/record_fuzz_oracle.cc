@@ -10,7 +10,14 @@
 #include <array>
 #include <bit>
 #include <limits>
+#include <memory>
+#include <new>
+#include <stdexcept>
 #include <utility>
+#include <vector>
+
+#define LZ4F_STATIC_LINKING_ONLY
+#include <lz4frame.h>
 
 namespace kwaque::model::testing {
 namespace {
@@ -20,8 +27,144 @@ std::uint32_t checksum(std::string_view input) {
     return ::crc32c::Extend(
       0, reinterpret_cast<const std::uint8_t*>(input.data()), input.size());
 }
+// Constant-width slabs keep both random scalar access and payload skipping
+// independent of production parsers, without flattening expanded records.
+struct expanded_bytes {
+    static constexpr std::size_t width = 32768;
+    std::vector<std::unique_ptr<std::array<char, width>>> slabs;
+    std::size_t size{0};
+    void append(const char* bytes, std::size_t count) {
+        while (count != 0) {
+            const auto offset = size % width;
+            if (offset == 0)
+                slabs.push_back(std::make_unique<std::array<char, width>>());
+            const auto part = std::min(count, width - offset);
+            std::copy_n(bytes, part, slabs.back()->data() + offset);
+            bytes += part;
+            count -= part;
+            size += part;
+        }
+    }
+};
+struct oracle_view {
+    std::string_view flat;
+    const expanded_bytes* expanded{nullptr};
+    std::size_t offset{0}, length{0};
+    oracle_view(std::string_view value)
+      : flat(value)
+      , length(value.size()) {}
+    oracle_view(const expanded_bytes& value)
+      : expanded(&value)
+      , length(value.size) {}
+    std::size_t size() const { return length; }
+    char operator[](std::size_t at) const {
+        if (at >= length) __builtin_trap();
+        if (!expanded) return flat[offset + at];
+        const auto position = offset + at;
+        return (*expanded->slabs[position / expanded_bytes::width])
+          [position % expanded_bytes::width];
+    }
+    oracle_view substr(std::size_t at, std::size_t count = SIZE_MAX) const {
+        if (at > length) __builtin_trap();
+        auto result = *this;
+        result.offset += at;
+        result.length = std::min(count, length - at);
+        return result;
+    }
+    void hash_into(codec::sha256_hasher& hash) const {
+        for (std::size_t at = 0; at < length;) {
+            const auto position = offset + at;
+            const auto count = std::min(
+              length - at,
+              expanded_bytes::width - position % expanded_bytes::width);
+            const char* source
+              = expanded
+                  ? expanded->slabs[position / expanded_bytes::width]->data()
+                      + position % expanded_bytes::width
+                  : flat.data() + position;
+            hash.update(source, count);
+            at += count;
+            seastar::thread::maybe_yield();
+        }
+    }
+};
+errc native_error(std::size_t code) {
+    if (!LZ4F_isError(code)) return errc::success;
+    switch (LZ4F_getErrorCode(code)) {
+    case LZ4F_ERROR_headerChecksum_invalid:
+    case LZ4F_ERROR_blockChecksum_invalid:
+    case LZ4F_ERROR_contentChecksum_invalid:
+        return errc::corrupt_data;
+    case LZ4F_ERROR_allocation_failed:
+        throw std::bad_alloc{};
+    default:
+        return errc::malformed_data;
+    }
+}
+errc expand_records(
+  std::string_view frame, std::size_t expected, expanded_bytes& output) {
+    if (frame.size() < 5) return errc::malformed_data;
+    const auto header_size = LZ4F_headerSize(frame.data(), frame.size());
+    if (const auto error = native_error(header_size); error != errc::success)
+        return error;
+    if (frame.size() < header_size) return errc::malformed_data;
+    LZ4F_dctx* pointer = nullptr;
+    const auto made = LZ4F_createDecompressionContext(&pointer, LZ4F_VERSION);
+    if (const auto error = native_error(made); error != errc::success)
+        return error;
+    const auto free = [](LZ4F_dctx* p) {
+        (void)LZ4F_freeDecompressionContext(p);
+    };
+    std::unique_ptr<LZ4F_dctx, decltype(free)> native{pointer, free};
+    LZ4F_frameInfo_t info{};
+    auto consumed = header_size;
+    const auto read = LZ4F_getFrameInfo(
+      native.get(), &info, frame.data(), &consumed);
+    if (const auto error = native_error(read); error != errc::success)
+        return error;
+    const auto flags = static_cast<unsigned char>(frame[4]);
+    if (
+      info.frameType != LZ4F_frame || info.blockSizeID != LZ4F_max64KB
+      || info.blockMode != LZ4F_blockIndependent || !info.blockChecksumFlag
+      || !info.contentChecksumFlag || (flags & 1U) || info.dictID)
+        return errc::unsupported_format;
+    if (!(flags & 8U) && expected != 0) return errc::unsupported_format;
+    if (info.contentSize != expected) return errc::malformed_data;
+    frame.remove_prefix(consumed);
+    auto bounce = std::make_unique<std::array<char, expanded_bytes::width>>();
+    const char sentinel = 0;
+    for (;;) {
+        const auto offered = std::min(frame.size(), expanded_bytes::width);
+        consumed = offered;
+        const auto capacity = std::min(
+          expanded_bytes::width,
+          std::max(expected - output.size, std::size_t{1}));
+        auto produced = capacity;
+        const auto code = LZ4F_decompress(
+          native.get(),
+          bounce->data(),
+          &produced,
+          frame.empty() ? &sentinel : frame.data(),
+          &consumed,
+          nullptr);
+        if (const auto error = native_error(code); error != errc::success)
+            return error;
+        if (
+          consumed > offered || produced > capacity
+          || produced > expected - output.size)
+            return errc::malformed_data;
+        frame.remove_prefix(consumed);
+        output.append(bounce->data(), produced);
+        seastar::thread::maybe_yield();
+        if (code == 0)
+            return frame.empty() && output.size == expected
+                     ? errc::success
+                     : errc::malformed_data;
+        if (consumed == 0 && produced == 0) return errc::malformed_data;
+    }
+}
 struct cursor {
-    std::string_view bytes;
+    oracle_view bytes;
     std::size_t at{0};
     errc error{errc::success};
     bool complete{true};
@@ -113,6 +256,30 @@ std::string varuint(std::uint64_t value) {
     } while (value != 0);
     return result;
 }
+std::string lz4_records(std::string_view records) {
+    if (records.size() > 65536)
+        throw std::invalid_argument("native fixture input is bounded");
+    LZ4F_preferences_t prefs{};
+    prefs.frameInfo.blockSizeID = LZ4F_max64KB;
+    prefs.frameInfo.blockMode = LZ4F_blockIndependent;
+    prefs.frameInfo.contentChecksumFlag = LZ4F_contentChecksumEnabled;
+    prefs.frameInfo.blockChecksumFlag = LZ4F_blockChecksumEnabled;
+    prefs.frameInfo.contentSize = records.size();
+    const auto bound = LZ4F_compressFrameBound(records.size(), &prefs);
+    if (LZ4F_isError(bound) || bound > 100000)
+        throw std::runtime_error("invalid fixture frame bound");
+    std::string result(bound, '\0');
+    const char empty = 0;
+    const auto size = LZ4F_compressFrame(
+      result.data(),
+      result.size(),
+      records.empty() ? &empty : records.data(),
+      records.size(),
+      &prefs);
+    if (LZ4F_isError(size)) throw std::runtime_error{LZ4F_getErrorName(size)};
+    result.resize(size);
+    return result;
+}
 codec::sha256_digest
 fingerprint(std::string_view fixed, std::string_view records) {
     codec::sha256_hasher hash;
@@ -161,8 +328,9 @@ std::string frame(std::string body, bool assigned, bool extension) {
     return wire;
 }
 
-record_probe probe_record(
-  std::string_view wire,
+namespace {
+record_probe probe_record_bytes(
+  oracle_view wire,
   std::int64_t base,
   std::uint64_t original,
   std::uint64_t headers,
@@ -221,12 +389,25 @@ record_probe probe_record(
       .headers = count};
 }
 
+} // namespace
+record_probe probe_record(
+  std::string_view wire,
+  std::int64_t base,
+  std::uint64_t original,
+  std::uint64_t headers,
+  bool complete,
+  std::uint64_t extent_limit) {
+    return probe_record_bytes(
+      oracle_view{wire}, base, original, headers, complete, extent_limit);
+}
+
 batch_probe probe_batch(
   std::string_view wire,
   bool assigned,
   bool complete,
   bool wrong_context,
-  std::uint64_t extent_limit) {
+  std::uint64_t extent_limit,
+  bool narrow_compression_work) {
     const auto short_error = complete ? errc::malformed_data
                                       : errc::truncated_data;
     const auto fixed = assigned ? 184U : 168U;
@@ -234,7 +415,7 @@ batch_probe probe_batch(
     if (wire.substr(0, 4) != "KQBF") return {.error = errc::malformed_data};
     const auto header = little(wire, 10, 2), body_size = little(wire, 12, 4);
     if (header < 32) return {.error = errc::malformed_data};
-    if (header > 4096 || body_size > (8U << 20U) + fixed)
+    if (header > 4096 || body_size > (16U << 20U))
         return {.error = errc::resource_exhausted};
     if (header + body_size > extent_limit)
         return {.error = errc::malformed_data};
@@ -273,7 +454,8 @@ batch_probe probe_batch(
         return {.error = errc::corrupt_data};
     if (family != (assigned ? 2U : 1U)) return {.error = errc::wrong_context};
     if (body.size() < fixed) return {.error = errc::malformed_data};
-    if (little(body, 156, 1) != 0) return {.error = errc::unsupported_format};
+    const auto encoding = little(body, 156, 1);
+    if (encoding > 1) return {.error = errc::unsupported_format};
     if (little(body, 157, 1) != 0) return {.error = errc::malformed_data};
     if (little(body, 158, 2) != 1) return {.error = errc::unsupported_format};
     if (nil(body, 0) || little(body, 16, 8) == 0 || little(body, 24, 8) == 0)
@@ -303,9 +485,12 @@ batch_probe probe_batch(
     if (result.headers > 4096 || result.headers > 64U * result.retained)
         return {.error = errc::resource_exhausted};
     const auto encoded = little(body, 160, 4), expanded = little(body, 164, 4);
-    if (encoded > (8U << 20U) || expanded > (8U << 20U))
+    if (
+      encoded > (16U << 20U) - fixed || expanded > (8U << 20U)
+      || (encoding == 0 && encoded > (8U << 20U)))
         return {.error = errc::resource_exhausted};
-    if (encoded != expanded) return {.error = errc::malformed_data};
+    if (encoding == 0 && encoded != expanded)
+        return {.error = errc::malformed_data};
     if (assigned) {
         result.begin = little(body, 168, 8);
         result.end = little(body, 176, 8);
@@ -314,18 +499,29 @@ batch_probe probe_batch(
           || result.begin + result.original != result.end)
             return {.error = errc::malformed_data};
     }
-    if (encoded != body.size() - fixed || result.retained > encoded / 7U)
+    if (encoded != body.size() - fixed || result.retained > expanded / 7U)
         return {.error = errc::malformed_data};
-    std::size_t offset = fixed;
+    expanded_bytes expanded_records;
+    if (encoding == 1) {
+        if (narrow_compression_work) return {.error = errc::resource_exhausted};
+        const auto error = expand_records(
+          body.substr(fixed),
+          static_cast<std::size_t>(expanded),
+          expanded_records);
+        if (error != errc::success) return {.error = error};
+    }
+    const auto records = encoding == 1 ? oracle_view{expanded_records}
+                                       : oracle_view{body.substr(fixed)};
+    std::size_t offset = 0;
     std::uint64_t headers = 0, previous = 0;
     for (std::uint64_t i = 0; i < result.retained; ++i) {
-        auto record = probe_record(
-          body.substr(offset),
+        auto record = probe_record_bytes(
+          records.substr(offset),
           result.timestamp,
           result.original,
           4096 - headers,
           true,
-          extent_limit - header - offset);
+          encoding == 1 ? max64 : extent_limit - header - fixed - offset);
         if (record.error != errc::success) return {.error = record.error};
         if ((i != 0 && record.delta <= previous) || (result.retained==result.original && (record.delta!=i || (i==0 && record.timestamp!=0))))
             return {.error = errc::malformed_data};
@@ -335,18 +531,31 @@ batch_probe probe_batch(
         if (headers > result.headers) return {.error = errc::malformed_data};
         seastar::thread::maybe_yield();
     }
-    if (offset != body.size() || headers != result.headers)
+    if (offset != records.size() || headers != result.headers)
         return {.error = errc::malformed_data};
     for (std::size_t i = 0; i < result.digest.size(); ++i)
         result.digest[i] = static_cast<unsigned char>(body[104 + i]);
-    if (
-      result.retained == result.original
-      && fingerprint(body, body.substr(fixed)) != result.digest)
-        return {.error = errc::corrupt_data};
+    if (encoding == 1) {
+        codec::sha256_hasher raw_hash;
+        records.hash_into(raw_hash);
+        result.record_digest = std::move(raw_hash).final();
+    }
+    if (result.retained == result.original) {
+        codec::sha256_hasher semantic;
+        semantic.update(
+          codec::semantic_batch_domain.data(),
+          codec::semantic_batch_domain.size());
+        semantic.update(body.data(), 104);
+        semantic.update(body.data() + 136, 12);
+        records.hash_into(semantic);
+        if (std::move(semantic).final() != result.digest)
+            return {.error = errc::corrupt_data};
+    }
     result.used = static_cast<std::size_t>(header + body_size);
     result.records_at = static_cast<std::size_t>(header) + fixed;
-    result.record_bytes = static_cast<std::size_t>(encoded);
-    result.canonical = writer == 1 && header == 32;
+    result.record_bytes = static_cast<std::size_t>(expanded);
+    result.compressed = encoding == 1;
+    result.canonical = encoding == 0 && writer == 1 && header == 32;
     return result;
 }
 } // namespace kwaque::model::testing

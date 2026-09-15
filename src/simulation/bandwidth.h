@@ -44,6 +44,9 @@ public:
     [[nodiscard]] bool zero() const noexcept { return numerator_ == 0; }
     [[nodiscard]] bool
     equals(std::uint64_t numerator, std::uint64_t denominator) const;
+    [[nodiscard]] bool equals(
+      const bandwidth_integer& numerator,
+      const bandwidth_integer& denominator) const;
     [[nodiscard]] std::optional<std::uint64_t> numerator_u64() const;
     [[nodiscard]] std::optional<std::uint64_t> denominator_u64() const;
 

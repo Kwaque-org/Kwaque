@@ -93,6 +93,7 @@ public:
       , access_(access)
       , generation_(generation)
       , handle_(std::move(handle)) {
+        handle_->generation = generation;
         _memory_dma_alignment = owner.config_.memory_dma_alignment;
         _disk_read_dma_alignment = owner.config_.disk_read_dma_alignment;
         _disk_write_dma_alignment = owner.config_.disk_write_dma_alignment;
@@ -629,8 +630,8 @@ fake_file_system::canonicalize_root(std::string_view root) {
     return canonicalize(root, {}, 0, true);
 }
 
-runtime::result<std::unique_ptr<fake_file_system>>
-fake_file_system::make(fake_file_system_config config) {
+runtime::result<canonical_fake_path>
+fake_file_system::validate_config(const fake_file_system_config& config) {
     if (
       config.logical_capacity.value() == 0
       || config.logical_capacity > maximum_fake_disk_capacity
@@ -677,35 +678,50 @@ fake_file_system::make(fake_file_system_config config) {
       retained_path_size(*root) > config.maximum_retained_path_bytes.value()) {
         return runtime::failure(file_error(errc::resource_exhausted));
     }
+    return root;
+}
+
+runtime::result<std::unique_ptr<fake_file_system>>
+fake_file_system::make(fake_file_system_config config) {
+    auto root = validate_config(config);
+    if (!root) {
+        return runtime::failure(root.error());
+    }
     std::string{}.swap(config.virtual_root);
     return std::unique_ptr<fake_file_system>{new fake_file_system{
       std::move(config), std::move(*root), nullptr, nullptr}};
+}
+
+runtime::result<void> fake_file_system_config::validate_scheduling(
+  const scheduler_limits& limits, runtime::monotonic_time now) const noexcept {
+    const auto deadline = now.checked_add(base_latency);
+    if (
+      required_events() > limits.pending_events() || !deadline
+      || *deadline > limits.maximum_deadline()) {
+        return runtime::failure(file_error(errc::invalid_argument));
+    }
+    return {};
 }
 
 runtime::result<std::unique_ptr<fake_file_system>> fake_file_system::make(
   fake_file_system_config config,
   scheduler& event_scheduler,
   fault_schedule& faults) {
-    auto state = make(std::move(config));
-    if (!state) {
-        return runtime::failure(state.error());
-    }
     event_scheduler.assert_current();
     faults.assert_current();
-    const auto first_deadline = event_scheduler.now().checked_add(
-      (*state)->config_.base_latency);
-    if (
-      event_scheduler.limits().pending_events()
-        < static_cast<std::uint64_t>(
-            (*state)->config_.maximum_pending_operations)
-            * 3U
-      || !first_deadline
-      || *first_deadline > event_scheduler.limits().maximum_deadline()) {
-        return runtime::failure(file_error(errc::invalid_argument));
+    auto root = validate_config(config);
+    if (!root) {
+        return runtime::failure(root.error());
     }
-    (*state)->scheduler_ = &event_scheduler;
-    (*state)->faults_ = &faults;
-    return state;
+    if (
+      auto valid = config.validate_scheduling(
+        event_scheduler.limits(), event_scheduler.now());
+      !valid) {
+        return runtime::failure(valid.error());
+    }
+    std::string{}.swap(config.virtual_root);
+    return std::unique_ptr<fake_file_system>{new fake_file_system{
+      std::move(config), std::move(*root), &event_scheduler, &faults}};
 }
 
 fake_file_system::fake_file_system(
@@ -794,7 +810,8 @@ seastar::future<runtime::result<runtime::file>> fake_file_system::open(
             if (!outcome) {
                 return runtime::failure(outcome.error());
             }
-            return std::get<runtime::file>(std::move(*outcome));
+            auto opened = std::get<pending_open>(std::move(*outcome));
+            return std::move(opened).publish();
         });
 }
 
@@ -1533,9 +1550,6 @@ fake_file_system::remove(const canonical_fake_path& path, fake_file_kind kind) {
 runtime::result<void> fake_file_system::rename(
   const canonical_fake_path& from, const canonical_fake_path& to) {
     assert_current();
-    if (from == to) {
-        return {};
-    }
     auto from_parent_id = lookup_parent(from);
     auto to_parent_id = lookup_parent(to);
     if (!from_parent_id) {
@@ -1555,6 +1569,9 @@ runtime::result<void> fake_file_system::rename(
         return runtime::failure(file_error(errc::not_found));
     }
     const auto source_id = *source_position;
+    if (from == to) {
+        return {};
+    }
     auto* source = find_inode(source_id);
     if (
       source->kind == fake_file_kind::directory
@@ -1701,15 +1718,12 @@ fake_file_system::sync_directory(const canonical_fake_path& path) {
     return {};
 }
 
-runtime::result<seastar::chunked_vector<fake_directory_entry>>
-fake_file_system::list(const canonical_fake_path& path) const {
+template<typename Visitor>
+runtime::result<void> fake_file_system::visit_directory(
+  const canonical_fake_path& path, Visitor visitor) const {
     assert_current();
     auto selected = directory(path);
-    if (!selected) {
-        return runtime::failure(selected.error());
-    }
-    seastar::chunked_vector<fake_directory_entry> entries;
-    entries.reserve((*selected)->durable.size() + (*selected)->unsynced.size());
+    if (!selected) return runtime::failure(selected.error());
     auto durable = (*selected)->durable.begin();
     auto changed = (*selected)->unsynced.begin();
     while (durable != (*selected)->durable.end()
@@ -1739,16 +1753,25 @@ fake_file_system::list(const canonical_fake_path& path) const {
             ++changed;
         }
         if (id) {
-            entries.push_back(
-              fake_directory_entry{
-                .name = std::string{name},
-                .id = *id,
-                .kind = find_inode(*id)->kind,
-              });
+            auto visited = visitor(name, *id, find_inode(*id)->kind);
+            if (!visited) return runtime::failure(visited.error());
         }
     }
-    return runtime::result<seastar::chunked_vector<fake_directory_entry>>{
-      std::move(entries)};
+    return {};
+}
+
+runtime::result<seastar::chunked_vector<fake_directory_entry>>
+fake_file_system::list(const canonical_fake_path& path) const {
+    seastar::chunked_vector<fake_directory_entry> entries;
+    auto visited = visit_directory(
+      path,
+      [&](std::string_view name, fake_object_id id, fake_file_kind kind)
+        -> runtime::result<void> {
+          entries.push_back(fake_directory_entry{std::string{name}, id, kind});
+          return {};
+      });
+    if (!visited) return runtime::failure(visited.error());
+    return entries;
 }
 
 runtime::result<fake_file_system::regular_file_state*>
@@ -1898,7 +1921,6 @@ runtime::result<byte_count> fake_file_system::write(
         std::uint64_t index;
         page_pointer replacement;
         bool existed;
-        bool needs_dirty_entry;
         bool inserted{false};
     };
     seastar::chunked_vector<page_update> updates;
@@ -1913,7 +1935,6 @@ runtime::result<byte_count> fake_file_system::write(
         page initial{};
         const auto existing = file.visible_pages.find(page_index);
         const bool existed = existing != file.visible_pages.end();
-        const bool needs_dirty_entry = !existed;
         if (existed) {
             initial = *existing->second.bytes;
         } else if (
@@ -1939,30 +1960,16 @@ runtime::result<byte_count> fake_file_system::write(
             .index = page_index,
             .replacement = std::move(immutable),
             .existed = existed,
-            .needs_dirty_entry = needs_dirty_entry,
           });
     }
 
-    const auto previous_dirty_count = file.dirty_page_count;
     try {
-        for (const auto& update : updates) {
-            if (!update.needs_dirty_entry) {
-                continue;
-            }
-            if (file.dirty_page_count < file.dirty_pages.size()) {
-                file.dirty_pages[file.dirty_page_count] = update.index;
-            } else {
-                file.dirty_pages.push_back(update.index);
-            }
-            ++file.dirty_page_count;
-        }
         for (auto& update : updates) {
             if (update.existed) {
                 continue;
             }
             const auto [position, inserted] = file.visible_pages.try_emplace(
-              update.index,
-              page_state{.bytes = update.replacement, .dirty = true});
+              update.index, page_state{.bytes = update.replacement});
             static_cast<void>(position);
             KWAQUE_INVARIANT(
               fake_storage_transaction_invariant,
@@ -1976,7 +1983,6 @@ runtime::result<byte_count> fake_file_system::write(
                 file.visible_pages.erase(update.index);
             }
         }
-        file.dirty_page_count = previous_dirty_count;
         throw;
     }
 
@@ -1985,7 +1991,6 @@ runtime::result<byte_count> fake_file_system::write(
         if (!update.inserted) {
             auto& page = file.visible_pages.find(update.index)->second;
             page.bytes = std::move(update.replacement);
-            page.dirty = true;
         }
     }
     file.visible_size = new_size;
@@ -2127,13 +2132,15 @@ fake_file_system::prepare_truncate(fake_object_id id, std::uint64_t size) {
           std::move(replacement));
         page_pointer immutable_tail = mutable_tail;
         prepared.tail = std::move(immutable_tail);
-        prepared.insert_tail = visible == file.visible_pages.end();
+        if (visible == file.visible_pages.end()) {
+            visible_page_map staged;
+            staged.try_emplace(
+              tail_index, page_state{.bytes = std::move(*prepared.tail)});
+            prepared.tail.reset();
+            prepared.tail_node = staged.extract(staged.begin());
+        }
     }
 
-    if (prepared.tail && prepared.insert_tail) {
-        file.visible_pages.reserve(file.visible_pages.size() + 1U);
-        file.dirty_pages.reserve(file.dirty_page_count + 1U);
-    }
     return prepared;
 }
 
@@ -2151,21 +2158,13 @@ void fake_file_system::commit_truncate(prepared_truncate prepared) noexcept {
         && retained_size(file) == prepared.retained_before,
       "prepared truncate observed intervening file state");
 
-    if (prepared.tail && prepared.insert_tail) {
-        const auto tail_index = prepared.kept_pages - 1U;
-        const auto [position, inserted] = file.visible_pages.try_emplace(
-          tail_index, page_state{.bytes = *prepared.tail, .dirty = true});
-        static_cast<void>(position);
+    if (!prepared.tail_node.empty()) {
+        auto inserted = file.visible_pages.insert(
+          std::move(prepared.tail_node));
         KWAQUE_INVARIANT(
           fake_storage_transaction_invariant,
-          inserted,
+          inserted.inserted,
           "truncate tail override was already present");
-        if (file.dirty_page_count < file.dirty_pages.size()) {
-            file.dirty_pages[file.dirty_page_count] = tail_index;
-        } else {
-            file.dirty_pages.push_back(tail_index);
-        }
-        ++file.dirty_page_count;
     }
 
     const auto retained = update_retained_capacity(
@@ -2175,14 +2174,9 @@ void fake_file_system::commit_truncate(prepared_truncate prepared) noexcept {
       retained.has_value(),
       "prepared truncate lost retained-capacity admission");
     if (prepared.size < file.visible_size) {
-        for (auto current = file.visible_pages.begin();
-             current != file.visible_pages.end();) {
-            if (current->first >= prepared.kept_pages) {
-                current = file.visible_pages.erase(current);
-            } else {
-                ++current;
-            }
-        }
+        file.visible_pages.erase(
+          file.visible_pages.lower_bound(prepared.kept_pages),
+          file.visible_pages.end());
         file.cleared_from_page = std::min(
           file.cleared_from_page.value_or(prepared.kept_pages),
           prepared.kept_pages);
@@ -2194,7 +2188,6 @@ void fake_file_system::commit_truncate(prepared_truncate prepared) noexcept {
               found != file.visible_pages.end(),
               "truncate tail override disappeared before commit");
             found->second.bytes = std::move(*prepared.tail);
-            found->second.dirty = true;
         }
     }
     file.visible_size = prepared.size;
@@ -2224,19 +2217,14 @@ runtime::result<void> fake_file_system::flush(fake_object_id id) {
     auto& file = std::get<regular_file_state>(object->state);
     const auto before = retained_size(file);
     seastar::chunked_vector<std::uint64_t> inserted_pages;
-    inserted_pages.reserve(file.dirty_page_count);
+    inserted_pages.reserve(file.visible_pages.size());
     try {
-        for (std::size_t index = 0; index < file.dirty_page_count; ++index) {
-            const auto page_index = file.dirty_pages[index];
-            const auto visible = file.visible_pages.find(page_index);
-            if (
-              visible == file.visible_pages.end()
-              || file.durable_pages.contains(page_index)) {
+        for (const auto& [page_index, visible] : file.visible_pages) {
+            if (file.durable_pages.contains(page_index)) {
                 continue;
             }
             const auto [position, inserted] = file.durable_pages.try_emplace(
-              page_index,
-              page_state{.bytes = visible->second.bytes, .dirty = false});
+              page_index, page_state{.bytes = visible.bytes});
             static_cast<void>(position);
             KWAQUE_INVARIANT(
               fake_storage_transaction_invariant,
@@ -2262,27 +2250,18 @@ runtime::result<void> fake_file_system::flush(fake_object_id id) {
             const auto visible = file.visible_pages.find(current->first);
             if (
               current->first >= *file.cleared_from_page
-              && (visible == file.visible_pages.end() || !visible->second.dirty)) {
+              && visible == file.visible_pages.end()) {
                 current = file.durable_pages.erase(current);
             } else {
                 ++current;
             }
         }
     }
-    for (std::size_t index = 0; index < file.dirty_page_count; ++index) {
-        const auto page_index = file.dirty_pages[index];
-        const auto visible = file.visible_pages.find(page_index);
-        if (visible == file.visible_pages.end()) {
-            file.durable_pages.erase(page_index);
-            continue;
-        }
-        auto& durable = file.durable_pages.find(page_index)->second;
-        durable.bytes = visible->second.bytes;
-        durable.dirty = false;
+    for (const auto& [page_index, visible] : file.visible_pages) {
+        file.durable_pages.find(page_index)->second.bytes = visible.bytes;
     }
     file.durable_size = file.visible_size;
     file.visible_pages.clear();
-    file.dirty_page_count = 0;
     file.cleared_from_page.reset();
     clear_dirty(*object);
     static_cast<void>(update_retained_capacity(before, retained_size(file)));
@@ -2303,7 +2282,6 @@ void fake_file_system::restore_durable_state() noexcept {
             const auto before = retained_size(file);
             file.visible_pages.clear();
             file.visible_size = file.durable_size;
-            file.dirty_page_count = 0;
             file.cleared_from_page.reset();
             static_cast<void>(
               update_retained_capacity(before, file.durable_size));
@@ -2701,6 +2679,11 @@ void fake_file_system::release_handle_reference(
     }
     handle->reference_owned = false;
     handle->lifecycle = handle_lifecycle::closed;
+    // A crash already released every reference in the older generation.
+    // Its late handle cleanup must not debit a newly reopened handle.
+    if (handle->generation != generation_) {
+        return;
+    }
     release_open_reference(id);
     if (open_handles_ != 0) {
         --open_handles_;
@@ -3278,7 +3261,7 @@ void fake_file_system::complete(fake_operation_id id) noexcept {
     }
 }
 
-runtime::result<runtime::file>
+runtime::result<fake_file_system::pending_open>
 fake_file_system::apply_open(metadata_operation& metadata, bool& open_slot) {
     assert_current();
     KWAQUE_INVARIANT(
@@ -3390,8 +3373,7 @@ fake_file_system::apply_open(metadata_operation& metadata, bool& open_slot) {
         --pending_opens_;
         open_slot = false;
     }
-    return runtime::file{
-      std::move(native), runtime::file_io_limits{}, std::move(statistics)};
+    return pending_open{std::move(native), std::move(statistics)};
 }
 
 runtime::result<fake_file_system::pending_value>
@@ -3482,34 +3464,32 @@ fake_file_system::apply(pending_operation& operation) {
         }};
     }
     case pending_kind::list: {
-        auto listed = list(*metadata->path);
-        if (!listed) {
-            return runtime::failure(listed.error());
-        }
         seastar::chunked_vector<runtime::directory_entry> entries;
         std::uint64_t name_bytes = 0;
-        entries.reserve(listed->size());
-        for (auto& entry : *listed) {
-            if (
-              entries.size() == metadata->listing_limits.maximum_entries.value()
-              || entry.name.size()
-                   > metadata->listing_limits.maximum_name_bytes.value()
-                       - name_bytes) {
-                return runtime::failure(file_error(errc::resource_exhausted));
-            }
-            auto name = runtime::file_name::make(std::move(entry.name));
-            if (!name) {
-                return runtime::failure(name.error());
-            }
-            name_bytes += name->value().size();
-            entries.push_back(
-              runtime::directory_entry{
-                .name = std::move(*name),
-                .kind = entry.kind == fake_file_kind::regular
-                          ? runtime::file_kind::regular
-                          : runtime::file_kind::directory,
-              });
-        }
+        auto visited = visit_directory(
+          *metadata->path,
+          [&](std::string_view value, fake_object_id, fake_file_kind kind)
+            -> runtime::result<void> {
+              if (
+                entries.size()
+                  == metadata->listing_limits.maximum_entries.value()
+                || value.size()
+                     > metadata->listing_limits.maximum_name_bytes.value()
+                         - name_bytes) {
+                  return runtime::failure(file_error(errc::resource_exhausted));
+              }
+              auto name = runtime::file_name::make(value);
+              if (!name) return runtime::failure(name.error());
+              name_bytes += value.size();
+              entries.push_back(
+                runtime::directory_entry{
+                  .name = std::move(*name),
+                  .kind = kind == fake_file_kind::regular
+                            ? runtime::file_kind::regular
+                            : runtime::file_kind::directory});
+              return {};
+          });
+        if (!visited) return runtime::failure(visited.error());
         auto listing = runtime::directory_listing::make(
           std::move(entries), metadata->listing_limits);
         if (!listing) {
@@ -3790,6 +3770,12 @@ void fake_file_system::finish(
           fake_storage_transaction_invariant,
           operation.phase == pending_phase::queued,
           "fake operation reached the parked state from an invalid phase");
+        if (result) {
+            if (auto* opened = std::get_if<pending_open>(&*result)) {
+                std::get<metadata_operation>(operation.payload)
+                  .parked_open.emplace(std::move(*opened));
+            }
+        }
         operation.phase = pending_phase::parked;
         ++parked_operations_;
         ++parked_by_kind_[static_cast<std::size_t>(operation.kind)];

@@ -270,6 +270,30 @@ SEASTAR_TEST_CASE(production_file_system_maps_object_kind_mismatches) {
           BOOST_CHECK(
             opened_directory.error().code() == kwaque::errc::is_a_directory);
 
+          const auto wrong_directory = co_await file_system.remove_directory(
+            path_of(regular_path));
+          BOOST_REQUIRE(!wrong_directory.has_value());
+          BOOST_CHECK(
+            wrong_directory.error().code() == kwaque::errc::not_a_directory);
+          BOOST_CHECK(std::filesystem::exists(regular_path));
+          const auto wrong_file = co_await file_system.remove_file(
+            path_of(directory_path));
+          BOOST_REQUIRE(!wrong_file.has_value());
+          BOOST_CHECK(
+            wrong_file.error().code() == kwaque::errc::is_a_directory);
+          BOOST_CHECK(std::filesystem::exists(directory_path));
+          const auto absent = directory.get_path() / "missing";
+          const auto same_missing = co_await file_system.rename(
+            path_of(absent), path_of(absent));
+          BOOST_REQUIRE(!same_missing.has_value());
+          BOOST_CHECK(same_missing.error().code() == kwaque::errc::not_found);
+          const auto symlink = directory.get_path() / "link";
+          std::filesystem::create_symlink(regular_path, symlink);
+          const auto unlinked = co_await file_system.remove_file(
+            path_of(symlink));
+          BOOST_REQUIRE(unlinked.has_value());
+          BOOST_CHECK(std::filesystem::exists(regular_path));
+
           const auto listed_file = co_await file_system.list(
             path_of(regular_path), {});
           BOOST_REQUIRE(!listed_file.has_value());

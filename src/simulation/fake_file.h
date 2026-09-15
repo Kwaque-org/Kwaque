@@ -27,6 +27,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <deque>
+#include <map>
 #include <memory>
 #include <optional>
 #include <span>
@@ -128,6 +129,13 @@ struct fake_directory_entry final {
 };
 
 struct fake_file_system_config final {
+    [[nodiscard]] std::uint64_t required_events() const noexcept {
+        return static_cast<std::uint64_t>(maximum_pending_operations) * 3U;
+    }
+    [[nodiscard]] runtime::result<void> validate_scheduling(
+      const scheduler_limits& limits,
+      runtime::monotonic_time now) const noexcept;
+
     std::string virtual_root{"/kwaque"};
     byte_count logical_capacity{default_fake_disk_capacity};
     std::uint32_t maximum_objects{default_fake_file_objects};
@@ -160,6 +168,9 @@ enum class fake_file_system_state : std::uint8_t {
 
 class fake_file_system final : public runtime::shard_affine {
 public:
+    [[nodiscard]] static runtime::result<canonical_fake_path>
+    validate_config(const fake_file_system_config& config);
+
     [[nodiscard]] static runtime::result<std::unique_ptr<fake_file_system>>
     make(fake_file_system_config config);
     [[nodiscard]] static runtime::result<std::unique_ptr<fake_file_system>>
@@ -253,18 +264,19 @@ private:
 
     struct page_state final {
         page_pointer bytes;
-        bool dirty{false};
     };
 
     using page_map = seastar::chunked_hash_map<std::uint64_t, page_state>;
+    // Ordered, individually allocated nodes allow a truncate tail to be
+    // prepared off to the side and inserted without allocation at commit.
+    using visible_page_map = std::map<std::uint64_t, page_state>;
 
     struct regular_file_state final {
         // Visible pages contains only volatile overrides. Reads fall through to
-        // durable pages when an override is absent.
-        page_map visible_pages;
+        // durable pages when an override is absent. This ordered map is also
+        // the unique dirty-page set; truncation removes obsolete nodes.
+        visible_page_map visible_pages;
         page_map durable_pages;
-        seastar::chunked_vector<std::uint64_t> dirty_pages;
-        std::size_t dirty_page_count{0};
         std::optional<std::uint64_t> cleared_from_page;
         std::uint64_t visible_size{0};
         std::uint64_t durable_size{0};
@@ -278,7 +290,7 @@ private:
         std::uint64_t retained_after{0};
         std::uint64_t kept_pages{0};
         std::optional<page_pointer> tail;
-        bool insert_tail{false};
+        visible_page_map::node_type tail_node;
     };
 
     struct inode final : runtime::shard_affine {
@@ -355,12 +367,25 @@ private:
     struct open_handle_state final : runtime::shard_affine {
         handle_lifecycle lifecycle{handle_lifecycle::open};
         bool reference_owned{false};
+        std::uint64_t generation{0};
+    };
+
+    struct pending_open final {
+        seastar::file native;
+        runtime::operation_statistics_owner statistics;
+
+        [[nodiscard]] runtime::file publish() && {
+            return runtime::file{
+              std::move(native),
+              runtime::file_io_limits{},
+              std::move(statistics)};
+        }
     };
 
     using pending_value = std::variant<
       std::monostate,
       bool,
-      runtime::file,
+      pending_open,
       runtime::file_status,
       runtime::directory_listing,
       byte_count,
@@ -372,6 +397,7 @@ private:
         std::optional<canonical_fake_path> destination_path;
         runtime::file_open_options open_options{};
         runtime::directory_listing_limits listing_limits{};
+        std::optional<pending_open> parked_open;
     };
 
     struct native_io_operation final {
@@ -542,7 +568,7 @@ private:
     lookup_parent(const canonical_fake_path& path) const noexcept;
     [[nodiscard]] runtime::result<fake_object_id>
     create(const canonical_fake_path& path, fake_file_kind kind);
-    [[nodiscard]] runtime::result<runtime::file>
+    [[nodiscard]] runtime::result<pending_open>
     apply_open(metadata_operation& metadata, bool& open_slot);
     [[nodiscard]] runtime::result<void>
     remove(const canonical_fake_path& path, fake_file_kind kind);
@@ -552,6 +578,9 @@ private:
     sync_directory(const canonical_fake_path& path);
     [[nodiscard]] runtime::result<seastar::chunked_vector<fake_directory_entry>>
     list(const canonical_fake_path& path) const;
+    template<typename Visitor>
+    [[nodiscard]] runtime::result<void>
+    visit_directory(const canonical_fake_path& path, Visitor visitor) const;
 
     [[nodiscard]] runtime::result<byte_count> write(
       const canonical_fake_path& path,

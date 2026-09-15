@@ -8,6 +8,7 @@
 #include <seastar/core/abort_source.hh>
 #include <seastar/core/coroutine.hh>
 #include <seastar/core/lowres_clock.hh>
+#include <seastar/core/semaphore.hh>
 #include <seastar/net/stack.hh>
 #include <seastar/testing/test_case.hh>
 #include <seastar/util/later.hh>
@@ -23,9 +24,11 @@
 #include <optional>
 #include <span>
 #include <stdexcept>
+#include <string>
 #include <string_view>
 #include <system_error>
 #include <utility>
+#include <vector>
 
 namespace {
 
@@ -90,6 +93,9 @@ struct transport_failure_probe final {
     std::exception_ptr output_close_failure;
     std::optional<seastar::promise<seastar::temporary_buffer<char>>>
       pending_read;
+    std::optional<seastar::promise<>> pending_write;
+    seastar::promise<> write_started;
+    std::vector<seastar::temporary_buffer<char>> pending_buffers;
     unsigned input_closes{0};
     unsigned output_closes{0};
     bool socket_destroyed{false};
@@ -128,6 +134,13 @@ public:
 
     seastar::future<>
     put(std::span<seastar::temporary_buffer<char>> buffers) final {
+        if (probe_.pending_write) {
+            for (auto& buffer : buffers)
+                probe_.pending_buffers.push_back(std::move(buffer));
+            probe_.write_started.set_value();
+            return probe_.pending_write->get_future().finally(
+              [this] { probe_.pending_buffers.clear(); });
+        }
         for (auto& buffer : buffers) {
             buffer = {};
         }
@@ -588,4 +601,35 @@ SEASTAR_TEST_CASE(
     BOOST_REQUIRE(client_closed.has_value());
     BOOST_REQUIRE(server_closed.has_value());
     BOOST_REQUIRE(listener_closed.has_value());
+}
+
+SEASTAR_TEST_CASE(
+  production_queued_write_preserves_native_error_after_late_caller_abort) {
+    for (const bool queued : {false, true}) {
+        transport_failure_probe probe;
+        probe.pending_write.emplace();
+        auto connection = make_failing_connection(probe);
+        auto serialization = queued
+                               ? kwaque::runtime::production::
+                                   network_test_access::hold_write_serializer(
+                                     connection)
+                               : std::optional<seastar::semaphore_units<>>{};
+        seastar::abort_source caller_abort;
+        const std::string payload(8192, 'x');
+        auto writing = connection.write(bytes(payload), caller_abort);
+        serialization.reset();
+        co_await probe.write_started.get_future();
+        caller_abort.request_abort();
+        auto completion = std::move(*probe.pending_write);
+        probe.pending_write.reset();
+        completion.set_exception(
+          std::system_error(std::make_error_code(std::errc::connection_reset)));
+        const auto result = co_await std::move(writing);
+        const auto closed = co_await connection.close();
+        BOOST_REQUIRE(!result.has_value());
+        BOOST_CHECK(result.error().code() == kwaque::errc::network_failure);
+        BOOST_REQUIRE(closed.has_value());
+        BOOST_CHECK(probe.pending_buffers.empty());
+        BOOST_CHECK_EQUAL(connection.statistics().active, 0U);
+    }
 }

@@ -88,6 +88,13 @@ bool bandwidth_fraction::equals(
     return expected && *this == *expected;
 }
 
+bool bandwidth_fraction::equals(
+  const bandwidth_integer& numerator,
+  const bandwidth_integer& denominator) const {
+    return denominator != 0
+           && *this == bandwidth_fraction{numerator, denominator};
+}
+
 std::optional<std::uint64_t> bandwidth_fraction::numerator_u64() const {
     return to_u64(numerator_);
 }

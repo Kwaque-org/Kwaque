@@ -373,3 +373,18 @@ SEASTAR_TEST_CASE(application_constructs_services_without_starting_them) {
     co_await state.shutdown();
     co_await state.shutdown();
 }
+
+SEASTAR_TEST_CASE(broker_event_identity_uses_the_supplied_run_nonce) {
+    using kwaque::broker::detail::production_event_identity;
+    const auto first = production_event_identity(17);
+    const auto second = production_event_identity(29);
+    BOOST_REQUIRE(first.has_value());
+    BOOST_REQUIRE(second.has_value());
+    BOOST_CHECK_EQUAL(first->epoch.value(), 17U);
+    BOOST_CHECK_EQUAL(second->epoch.value(), 29U);
+    BOOST_CHECK(first->epoch != second->epoch);
+    const auto invalid = production_event_identity(0);
+    BOOST_REQUIRE(!invalid.has_value());
+    BOOST_CHECK(invalid.error().code() == kwaque::errc::invalid_argument);
+    co_return;
+}

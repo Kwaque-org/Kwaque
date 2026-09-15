@@ -68,12 +68,20 @@ kwaque_cc_library(
 )
 
 kwaque_cc_library(
+    name = "file_error_internal",
+    hdrs = ["file_error_internal.h"],
+    visibility = ["//src/runtime/production:__pkg__"],
+    deps = ["//src/base:error"],
+)
+
+kwaque_cc_library(
     name = "file",
     srcs = ["file.cc"],
     hdrs = ["file.h"],
     visibility = ["//visibility:public"],
     deps = [
         ":error",
+        ":file_error_internal",
         ":file_position",
         ":fragmented_buffer_internal",
         ":operation_statistics",

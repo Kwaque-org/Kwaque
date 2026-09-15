@@ -21,6 +21,7 @@ namespace kwaque::simulation {
 
 class fault_schedule;
 class scheduler;
+class scheduler_limits;
 
 inline constexpr std::uint32_t default_fake_dns_records{4'096};
 inline constexpr std::uint32_t maximum_fake_dns_records{65'536};
@@ -34,6 +35,11 @@ inline constexpr std::uint32_t default_fake_dns_stop_batch{256};
 inline constexpr std::uint32_t maximum_fake_dns_stop_batch{1'024};
 
 struct fake_dns_config final {
+    [[nodiscard]] runtime::result<void>
+    validate(const scheduler_limits& limits) const noexcept;
+    [[nodiscard]] std::uint64_t required_events() const noexcept;
+    [[nodiscard]] std::uint32_t cleanup_batches() const noexcept;
+
     runtime::dns_config query_limits{};
     std::uint32_t maximum_records{default_fake_dns_records};
     std::uint32_t maximum_answers{default_fake_dns_answers};

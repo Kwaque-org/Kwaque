@@ -214,6 +214,7 @@ kwaque_cc_benchmark(
         ":event_sequence",
         ":event_sink",
         "//src/resource:workload_class",
+        "//src/runtime:operation_statistics",
         "//src/runtime:time",
         "@seastar",
     ],

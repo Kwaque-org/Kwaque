@@ -399,6 +399,9 @@ private:
     bool moved_from_{false};
 };
 
+// remove_file unlinks a non-directory entry, including a symlink.
+// remove_directory requires an empty directory. A kind mismatch rejects
+// without removing the target; durability still requires directory sync.
 template<typename FileSystem>
 concept file_system_backend = requires(
   FileSystem& file_system,
