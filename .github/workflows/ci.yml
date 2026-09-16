@@ -208,6 +208,8 @@ jobs:
           --cache_test_results=no
           //src/simulation/tests:determinism_goldens
           //src/storage/tests:format_tests
+          //src/model/tests:checkpoint_tests
+          //src/protocol/tests:golden_tests
 
       - name: Retain failed test diagnostics
         if: failure() && steps.tests.outcome == 'failure'
@@ -348,6 +350,8 @@ jobs:
           //src/codec/tests:codec_cooperative_fuzz
           //src/compression/tests:compression_fuzz
           //src/model/tests:record_fuzz
+          //src/model/tests:checkpoint_fuzz
+          //src/protocol/tests:frame_fuzz
           //src/storage/tests:storage_format_fuzz
           //src/simulation/tests:scheduler_fuzz
           //src/simulation/tests:fault_schedule_fuzz
@@ -387,6 +391,8 @@ jobs:
           bazel test --config=ci-release
           //src/compression/tests:format_tests
           //src/storage/tests:format_tests
+          //src/model/tests:checkpoint_tests
+          //src/protocol/tests:golden_tests
           //src/model/tests:batch_compression_test
           //bazel/tests:seastar_gtest
           //src/runtime/tests:reactor_smoke_test

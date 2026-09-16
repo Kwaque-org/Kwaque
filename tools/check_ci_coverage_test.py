@@ -42,6 +42,8 @@ SMOKE_FUZZERS = {f"//src/simulation/tests:{name}" for name in STATEFUL_FUZZERS} 
     "//src/codec/tests:codec_cooperative_fuzz",
     "//src/compression/tests:compression_fuzz",
     "//src/model/tests:record_fuzz",
+    "//src/model/tests:checkpoint_fuzz",
+    "//src/protocol/tests:frame_fuzz",
     "//src/storage/tests:storage_format_fuzz",
     "//src/simulation/tests:signal_canary_test",
 }
@@ -330,7 +332,7 @@ def coverage_errors(workflow: str) -> list[str]:
                 f"goldens: requires both {field} values for all four native jobs"
             )
     commands = run_commands(goldens)
-    expected = f'bazel test --config="${{{{ matrix.config }}}}" --cache_test_results=no {GOLDENS} //src/storage/tests:format_tests'
+    expected = f'bazel test --config="${{{{ matrix.config }}}}" --cache_test_results=no {GOLDENS} //src/storage/tests:format_tests //src/model/tests:checkpoint_tests //src/protocol/tests:golden_tests'
     if commands != [expected]:
         errors.append(
             "goldens: all four jobs must execute the identical explicit uncached suite"
@@ -344,6 +346,8 @@ def coverage_errors(workflow: str) -> list[str]:
     for target in (
         "//src/compression/tests:format_tests",
         "//src/model/tests:batch_compression_test",
+        "//src/model/tests:checkpoint_tests",
+        "//src/protocol/tests:golden_tests",
         "//src/storage/tests:format_tests",
     ):
         if not any(

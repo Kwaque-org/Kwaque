@@ -1,7 +1,5 @@
 #include "src/storage/page_internal.h"
 
-#include "src/storage/retry_format.h"
-
 namespace kwaque::storage::detail {
 codec::result<void> check_subkind(
   std::uint16_t actual, std::uint16_t expected, codec::field_context c) {
@@ -12,13 +10,17 @@ codec::result<void> check_subkind(
         return codec::failure(page_error(errc::wrong_context, c));
     return {};
 }
-codec::result<void> check_retry_ref(
+codec::result<void> check_page_ref(
   const page_ref& ref,
   std::uint32_t ordinal,
   std::uint32_t first,
+  std::uint32_t fixed_bytes,
+  std::uint32_t entry_bytes,
   storage_alignment alignment,
   const codec::limits& policy,
   codec::field_context c) {
+    if (fixed_bytes == 0 || entry_bytes == 0)
+        return codec::failure(page_error(errc::invalid_argument, c));
     if (ref.ordinal().value() != ordinal || ref.first_entry() != first)
         return codec::failure(page_error(errc::malformed_data, c));
     if (
@@ -29,8 +31,8 @@ codec::result<void> check_retry_ref(
     // The actual page may have more header bytes, but never fewer than 32.
     const auto minimum = aligned_envelope_layout::make(
       {byte_count{32},
-       retry_page_fixed_bytes,
-       byte_count{static_cast<std::uint64_t>(ref.entry_count()) * 160U}},
+       byte_count{fixed_bytes},
+       byte_count{static_cast<std::uint64_t>(ref.entry_count()) * entry_bytes}},
       alignment,
       policy,
       {policy.config().max_page_bytes, policy.config().max_page_bytes});

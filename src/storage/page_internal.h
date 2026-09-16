@@ -128,10 +128,14 @@ void write_digest(std::array<char, N>& out, Digest digest) noexcept {
 
 [[nodiscard]] codec::result<void> check_subkind(
   std::uint16_t actual, std::uint16_t expected, codec::field_context);
-[[nodiscard]] codec::result<void> check_retry_ref(
+// Concrete codecs supply nonzero wire widths. A root checks minimum-header
+// feasibility; the page reader checks its actual header, body and padding.
+[[nodiscard]] codec::result<void> check_page_ref(
   const page_ref&,
   std::uint32_t ordinal,
   std::uint32_t first,
+  std::uint32_t fixed_bytes,
+  std::uint32_t entry_bytes,
   storage_alignment,
   const codec::limits&,
   codec::field_context);
@@ -184,9 +188,11 @@ codec::result<codec::decode_budget> reserve_entries(
 // precisely the verified envelope, including extensions/CRCs/padding. No hash
 // alias or whole-buffer copy; neither parsed state nor cursor is published
 // before the independently pinned digest and final abort poll pass.
+// family is the concrete owner's expected family, never a value from the wire.
 template<typename T, typename Reader>
 seastar::future<codec::result<T>> decode_pinned(
   bytes::fragmented_buffer_parser& input,
+  codec::format_family family,
   codec::immutable_object_digest digest,
   codec::decode_budget memory,
   codec::cooperative_work& work,
@@ -211,7 +217,7 @@ seastar::future<codec::result<T>> decode_pinned(
             output.emplace(
               co_await codec::decode_envelope<T>(
                 input,
-                sealed_family,
+                family,
                 page_limits,
                 memory,
                 work,
@@ -357,5 +363,75 @@ seastar::future<codec::result<bytes::fragmented_buffer>> encode_entries(
         co_return codec::failure(*failed);
     }
     co_return std::move(*output);
+}
+
+struct encoded_page_object final {
+    bytes::fragmented_buffer bytes;
+    codec::immutable_object_digest digest;
+};
+// Owning assembly shared by concrete page/root writers. The caller keeps
+// fixed fields and borrowed entries alive until this child completes, and
+// polls cancellation again after awaiting it before publishing its result.
+template<std::size_t Width, std::size_t N, typename Entry, typename Write>
+seastar::future<codec::result<encoded_page_object>> encode_page_object(
+  const std::array<char, N>& fixed,
+  std::span<const Entry> entries,
+  Write write,
+  aligned_envelope_layout layout,
+  codec::format_family family,
+  codec::cooperative_work& work,
+  byte_count remaining,
+  bytes::allocation_charge_fn charge,
+  codec::field_context c) {
+    bytes::fragmented_buffer tail, output;
+    std::optional<codec::immutable_object_digest> digest;
+    std::optional<codec::error> failed;
+    std::exception_ptr exception;
+    try {
+        do {
+            auto encoded = co_await encode_entries<Width>(
+              entries, write, work, remaining, charge, c);
+            if (!encoded) {
+                failed = encoded.error();
+                break;
+            }
+            tail = std::move(*encoded);
+            encoded = co_await encode_padded(
+              fixed,
+              std::move(tail),
+              layout,
+              family,
+              work,
+              remaining,
+              charge,
+              c);
+            if (!encoded) {
+                failed = encoded.error();
+                break;
+            }
+            output = std::move(*encoded);
+            const auto hash = co_await hash_exact(output, work, c);
+            if (!hash) {
+                failed = hash.error();
+                break;
+            }
+            digest = *hash;
+        } while (false);
+    } catch (...) {
+        exception = std::current_exception();
+    }
+    co_await work.drain_inline(work.byte_quantum(), work.item_quantum());
+    tail = bytes::fragmented_buffer{};
+    if (!failed && !exception) {
+        if (auto ready = work.poll(page_error(errc::success, c)); !ready)
+            failed = ready.error();
+    }
+    if (failed || exception) {
+        co_await work.drain_inline(work.byte_quantum(), work.item_quantum());
+        output = bytes::fragmented_buffer{};
+        if (exception) std::rethrow_exception(exception);
+        co_return codec::failure(*failed);
+    }
+    co_return encoded_page_object{std::move(output), *digest};
 }
 } // namespace kwaque::storage::detail

@@ -116,6 +116,7 @@ kwaque_cc_library(
         "//src/codec/tests:__pkg__",
         "//src/model:__pkg__",
         "//src/model/tests:__pkg__",
+        "//src/protocol/tests:__pkg__",
         "//src/simulation:__pkg__",
         "//src/simulation/tests:__pkg__",
         "//src/storage:__pkg__",
@@ -268,6 +269,31 @@ kwaque_cc_library(
 )
 
 kwaque_cc_library(
+    name = "framing_internal",
+    srcs = [
+        "framing_internal.cc",
+        "header_integrity.cc",
+    ],
+    hdrs = [
+        "framing_internal.h",
+        "header_integrity.h",
+    ],
+    visibility = ["//src/protocol:__pkg__"],
+    deps = [
+        ":cooperative",
+        ":crc32c",
+        ":error",
+        ":integer",
+        ":limits",
+        "//src/base",
+        "//src/base:error",
+        "//src/base:invariant",
+        "//src/bytes:fragmented_buffer",
+        "@seastar",
+    ],
+)
+
+kwaque_cc_library(
     name = "envelope",
     srcs = [
         "envelope.cc",
@@ -298,6 +324,7 @@ kwaque_cc_library(
         ":crc32c_cooperative",
         ":error",
         ":format_registry",
+        ":framing_internal",
         ":integer",
         ":limits",
         ":staging_cooperative",

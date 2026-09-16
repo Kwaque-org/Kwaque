@@ -4,6 +4,7 @@
 #include "src/codec/cooperative.h"
 #include "src/codec/digest.h"
 #include "src/model/batch_context.h"
+#include "src/model/checkpoint.h"
 
 namespace kwaque::model {
 
@@ -27,6 +28,23 @@ seastar::future<codec::result<codec::semantic_batch_digest>>
 compute_submitted_fingerprint(
   submitted_batch_context,
   const bytes::fragmented_buffer&&,
+  codec::cooperative_work&,
+  codec::error = codec::error{errc::success}) = delete;
+
+// Domain plus TopicID, fixed u32 count and canonical (RangeID, next-u64)
+// entries. No envelope fields enter the projection. value/work/abort stay alive
+// and unchanged through completion; caller reserves input, native SHA and frame
+// costs. Native SHA state ends before the final abort poll and publication.
+// Each fixed projection leaf needs at least 256 work bytes and 16 items.
+[[nodiscard]] seastar::future<codec::result<codec::checkpoint_digest>>
+compute_checkpoint_fingerprint(
+  const read_checkpoint& value,
+  codec::cooperative_work& work,
+  codec::error anchor = codec::error{errc::success});
+
+seastar::future<codec::result<codec::checkpoint_digest>>
+compute_checkpoint_fingerprint(
+  const read_checkpoint&&,
   codec::cooperative_work&,
   codec::error = codec::error{errc::success}) = delete;
 

@@ -245,10 +245,14 @@ kwaque_cc_library(
 
 kwaque_cc_library(
     name = "fingerprint",
-    srcs = ["fingerprint.cc"],
+    srcs = [
+        "checkpoint_fingerprint.cc",
+        "fingerprint.cc",
+    ],
     hdrs = ["fingerprint.h"],
     implementation_deps = [
         ":batch_wire",
+        ":checkpoint_wire",
         "//src/codec:sha256",
     ],
     visibility = [
@@ -260,6 +264,7 @@ kwaque_cc_library(
     ],
     deps = [
         ":batch_context",
+        ":checkpoint",
         "//src/base",
         "//src/bytes:fragmented_buffer",
         "//src/codec:cooperative",
@@ -373,4 +378,73 @@ kwaque_cc_library(
 filegroup(
     name = "package_boundary",
     srcs = ["README.md"],
+)
+
+kwaque_cc_library(
+    name = "checkpoint",
+    hdrs = ["checkpoint.h"],
+    visibility = [
+        "//src/model/tests:__pkg__",
+        "//src/protocol:__pkg__",
+        "//src/protocol/tests:__pkg__",
+    ],
+    deps = [
+        ":identity",
+        ":position",
+        "//src/base",
+        "//src/base:error",
+    ],
+)
+
+kwaque_cc_library(
+    name = "checkpoint_wire",
+    hdrs = ["checkpoint_wire.h"],
+    deps = [
+        ":checkpoint",
+        ":identity",
+        "//src/base",
+        "//src/base:error",
+        "//src/codec:error",
+        "//src/codec:integer",
+        "//src/codec:limits",
+        "@seastar",
+    ],
+)
+
+kwaque_cc_library(
+    name = "checkpoint_codec",
+    srcs = [
+        "checkpoint_codec.cc",
+        "checkpoint_encode.cc",
+    ],
+    hdrs = ["checkpoint_codec.h"],
+    implementation_deps = [
+        ":checkpoint_wire",
+        ":fingerprint",
+        "//src/base:invariant",
+        "//src/bytes:fragmented_buffer_builder",
+        "//src/codec:collection",
+        "//src/codec:envelope",
+        "//src/codec:format_registry",
+    ],
+    visibility = [
+        "//src/model/tests:__pkg__",
+        "//src/protocol:__pkg__",
+        "//src/protocol/tests:__pkg__",
+    ],
+    deps = [
+        ":checkpoint",
+        ":identity",
+        ":position",
+        "//src/base",
+        "//src/base:error",
+        "//src/bytes:fragmented_buffer",
+        "//src/bytes:fragmented_buffer_parser",
+        "//src/codec:cooperative",
+        "//src/codec:digest",
+        "//src/codec:error",
+        "//src/codec:integer",
+        "//src/codec:limits",
+        "@seastar",
+    ],
 )

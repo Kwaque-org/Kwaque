@@ -4,16 +4,14 @@
 #include "src/base/invariant.h"
 #include "src/codec/crc32c.h"
 #include "src/codec/crc32c_cooperative.h"
+#include "src/codec/framing_internal.h"
 #include "src/codec/staging_cooperative.h"
 #include "src/codec/transaction.h"
 
 #include <seastar/core/byteorder.hh>
 #include <seastar/core/coroutine.hh>
-#include <seastar/core/deleter.hh>
 
 #include <algorithm>
-#include <array>
-#include <cstddef>
 #include <cstdint>
 #include <exception>
 #include <optional>
@@ -25,180 +23,12 @@ namespace {
 
 using bytes::fragmented_buffer;
 
-error encode_error(errc reason, field_context context) noexcept {
-    return error{reason, context.family, context.field, context.origin};
-}
-
-result<void> add_charge(
-  byte_count& target, byte_count amount, field_context context) noexcept {
-    const auto sum = target.checked_add(amount);
-    if (!sum) {
-        return codec::failure(encode_error(errc::out_of_range, context));
-    }
-    target = *sum;
-    return {};
-}
-
-result<void> admit_usage(
-  const operation_usage& live,
-  const limits& policy,
-  byte_count parent_remaining,
-  field_context context) {
-    const auto remaining = policy.remaining_operation_bytes(
-      live, parent_remaining);
-    if (!remaining) {
-        return codec::failure(
-          detail::allocation_cost_error(
-            remaining.error(), context, context.origin));
-    }
-    return {};
-}
-
-// A slice does not allocate its backing again. Gate the same conservative
-// descriptor request used by slice_allocation_cost, plus native promotion;
-// its aggregate descriptor peak is charged separately to operation usage.
-result<byte_count> admit_alias_allocations(
-  const bytes::buffer_allocation_cost& cost,
-  const limits& policy,
-  bytes::allocation_charge_fn charge,
-  field_context context) {
-    if (cost.fragments.value() == 0) {
-        return byte_count{};
-    }
-    KWAQUE_INVARIANT(
-      invariant_id{"KQ-ENVELOPE-WRITER-FRAGMENTS"},
-      cost.fragments.value() <= bytes::max_buffer_fragments,
-      "checksum alias exceeds the substrate fragment ceiling");
-    const std::array requests{
-      byte_count{
-        2U * cost.fragments.value()
-        * fragmented_buffer::fragment_descriptor_size()},
-      byte_count{sizeof(seastar::free_deleter_impl)}};
-    std::array<byte_count, requests.size()> served{};
-    for (std::size_t index = 0; index < requests.size(); ++index) {
-        served[index] = charge(requests[index]);
-        if (served[index] < requests[index]) {
-            return codec::failure(
-              encode_error(errc::invalid_argument, context));
-        }
-        if (auto valid = policy.validate_allocation(served[index]); !valid) {
-            return codec::failure(
-              detail::allocation_cost_error(
-                valid.error(), context, context.origin));
-        }
-    }
-    const auto peak = served[0].checked_add(served[0]);
-    if (!peak) {
-        return codec::failure(encode_error(errc::out_of_range, context));
-    }
-    return *peak;
-}
-
-// Keep the existing staging cost scan's bounded ranges and charge order. The
-// first range includes retained descriptor capacity, even for an empty body.
-seastar::future<result<bytes::buffer_allocation_cost>> body_input_cost(
-  const fragmented_buffer& body,
-  cooperative_work& work,
-  bytes::allocation_charge_fn charge,
-  field_context context) {
-    const auto anchor = encode_error(errc::success, context);
-    bytes::buffer_allocation_cost total;
-    byte_count aggregate;
-    const auto quantum = work.item_quantum().value();
-    if (!body.empty() && quantum < 6) {
-        co_return codec::failure(
-          encode_error(errc::resource_exhausted, context));
-    }
-    const auto batch = quantum < 6 ? 1U : (quantum - 2U) / 4U;
-    std::size_t first = 0;
-    do {
-        const auto count = std::min<std::size_t>(
-          body.fragment_count() - first, batch);
-        auto admitted = co_await work.admit(
-          byte_count{}, item_count{count == 0 ? 1U : 4U * count + 2U}, anchor);
-        if (!admitted) {
-            co_return codec::failure(admitted.error());
-        }
-        if (auto ready = work.poll(anchor); !ready) {
-            co_return codec::failure(ready.error());
-        }
-        const auto part = body.allocation_cost(first, count, charge);
-        if (!part) {
-            co_return codec::failure(
-              detail::allocation_cost_error(
-                part.error(), context, context.origin));
-        }
-        for (const auto amount :
-             {part->backing, part->descriptors, part->share_controls}) {
-            if (auto summed = add_charge(aggregate, amount, context); !summed) {
-                co_return codec::failure(summed.error());
-            }
-        }
-        // Each category is bounded by the already checked aggregate.
-        total.backing = byte_count{
-          total.backing.value() + part->backing.value()};
-        total.descriptors = byte_count{
-          total.descriptors.value() + part->descriptors.value()};
-        total.share_controls = byte_count{
-          total.share_controls.value() + part->share_controls.value()};
-        total.largest_allocation = std::max(
-          total.largest_allocation, part->largest_allocation);
-        first += count;
-    } while (first != body.fragment_count());
-    total.fragments = item_count{body.fragment_count()};
-    co_return total;
-}
-
-// copy_of(32 bytes) uses one native temporary_buffer allocation and one exact
-// fresh descriptor reservation. Its later sharing uses the native free-deleter
-// control already included by the substrate's allocation-cost contract.
-result<void> admit_header_owner(
-  const bytes::buffer_allocation_cost& body_cost,
-  operation_usage live,
-  const limits& policy,
-  byte_count parent_remaining,
-  bytes::allocation_charge_fn charge,
-  field_context context) {
-    constexpr std::array requests{
-      byte_count{envelope_prefix_bytes},
-      byte_count{fragmented_buffer::fragment_descriptor_size()},
-      byte_count{sizeof(seastar::free_deleter_impl)}};
-    std::array<byte_count, requests.size()> charges{};
-    for (std::size_t index = 0; index < requests.size(); ++index) {
-        charges[index] = charge(requests[index]);
-        if (charges[index] < requests[index]) {
-            return codec::failure(
-              encode_error(errc::invalid_argument, context));
-        }
-        if (
-          const auto valid = policy.validate_allocation(charges[index]);
-          !valid) {
-            return codec::failure(
-              detail::allocation_cost_error(
-                valid.error(), context, context.origin));
-        }
-    }
-    const auto retained = body_cost.backing.checked_add(charges[0]);
-    if (!retained) {
-        return codec::failure(encode_error(errc::out_of_range, context));
-    }
-    if (*retained > policy.config().max_retained_bytes) {
-        return codec::failure(encode_error(errc::resource_exhausted, context));
-    }
-    if (
-      auto added = add_charge(live.retained_input, charges[0], context);
-      !added) {
-        return added;
-    }
-    for (const auto cost : {charges[1], charges[2]}) {
-        if (
-          auto added = add_charge(live.payload_bookkeeping, cost, context);
-          !added) {
-            return added;
-        }
-    }
-    return admit_usage(live, policy, parent_remaining, context);
-}
+using detail::framing::add_charge;
+using detail::framing::admit_alias_allocations;
+using detail::framing::admit_header_owner;
+using detail::framing::admit_usage;
+using detail::framing::body_input_cost;
+using detail::framing::encode_error;
 
 seastar::future<result<fragmented_buffer>> encode_owned(
   fragmented_buffer& body,
@@ -358,7 +188,13 @@ seastar::future<result<fragmented_buffer>> encode_owned(
     seastar::write_le(prefix->data() + 28, header_checksum.value());
     if (
       auto admitted = admit_header_owner(
-        *body_cost, body_live, policy, parent_remaining, charge, context);
+        byte_count{envelope_prefix_bytes},
+        *body_cost,
+        body_live,
+        policy,
+        parent_remaining,
+        charge,
+        context);
       !admitted) {
         co_return codec::failure(admitted.error());
     }

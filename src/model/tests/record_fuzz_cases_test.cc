@@ -1,4 +1,5 @@
 #include "src/model/tests/record_fuzz_cases.h"
+#include "src/model/tests/record_fuzz_oracle.h"
 
 #include <seastar/core/thread.hh>
 
@@ -10,6 +11,54 @@
 
 TEST(RecordFuzzCasesTest, IndependentOracleLiterals) {
     kwaque::model::testing::verify_record_oracle();
+}
+TEST(RecordFuzzCasesTest, BatchHeaderFamilyAndVersionPrecedence) {
+    using namespace kwaque::model::testing;
+    using kwaque::errc;
+    const std::array<std::uint8_t, 5> zero_family{5, 3, 0, 0, 1};
+    exercise_record_case(zero_family);
+
+    struct header_case final {
+        std::uint16_t family, writer, reader;
+        errc error;
+    };
+    for (const bool assigned : {false, true}) {
+        for (const auto test : std::array{
+               header_case{0, 1, 1, errc::malformed_data},
+               header_case{0, 2, 2, errc::malformed_data},
+               header_case{0, 1, 0, errc::unsupported_format},
+               header_case{0, 0, 0, errc::unsupported_format},
+               header_case{0, 0, 1, errc::malformed_data},
+               header_case{11, 1, 1, errc::unsupported_format},
+               header_case{65535, 1, 1, errc::unsupported_format},
+               header_case{11, 1, 2, errc::malformed_data}}) {
+            SCOPED_TRACE(
+              ::testing::Message() << assigned << ':' << test.family << ':'
+                                   << test.writer << ':' << test.reader);
+            auto wire = frame({}, assigned, false);
+            put(wire, 4, test.family, 2);
+            put(wire, 6, test.writer, 2);
+            put(wire, 8, test.reader, 2);
+            repair_crc(wire);
+            EXPECT_EQ(
+              probe_batch(wire, assigned, true, false).error, test.error);
+            for (const std::uint8_t layout :
+                 std::array<std::uint8_t, 3>{0, 1, 2}) {
+                std::vector<std::uint8_t> input{
+                  assigned ? std::uint8_t{3} : std::uint8_t{2},
+                  0,
+                  0,
+                  layout,
+                  8,
+                  0,
+                  0,
+                  0};
+                for (const char byte : wire)
+                    input.push_back(static_cast<std::uint8_t>(byte));
+                exercise_record_case(input);
+            }
+        }
+    }
 }
 TEST(RecordFuzzCasesTest, GrammarMutationAndOwnershipControls) {
     for (std::uint8_t mode = 0; mode < 7; ++mode) {
