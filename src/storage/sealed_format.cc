@@ -166,10 +166,12 @@ struct sealed_reader final {
             const auto ref = detail::read_page_ref(raw, entry_context);
             if (!ref) co_return codec::failure(ref.error());
             if (
-              auto valid = detail::check_retry_ref(
+              auto valid = detail::check_page_ref(
                 *ref,
                 ordinal,
                 first,
+                100,
+                160,
                 expected.history.alignment,
                 work.policy(),
                 entry_context);
@@ -250,6 +252,7 @@ seastar::future<codec::result<decoded_sealed_footer>> decode_sealed_footer(
         return fail(valid.error());
     return detail::decode_pinned<decoded_sealed_footer>(
       input,
+      detail::sealed_family,
       digest,
       memory,
       work,
@@ -296,8 +299,15 @@ seastar::future<codec::result<encoded_sealed_footer>> encode_sealed_footer(
         if (auto ready = work.poll(anchor); !ready)
             co_return codec::failure(ready.error());
         if (
-          auto valid = detail::check_retry_ref(
-            refs[i], i, first, expected.history.alignment, work.policy(), c);
+          auto valid = detail::check_page_ref(
+            refs[i],
+            i,
+            first,
+            100,
+            160,
+            expected.history.alignment,
+            work.policy(),
+            c);
           !valid)
             co_return codec::failure(valid.error());
         first += refs[i].entry_count();

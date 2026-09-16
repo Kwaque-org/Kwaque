@@ -1,6 +1,7 @@
 #include "src/storage/tests/storage_format_fuzz_cases.h"
 
 #include "src/storage/tests/storage_format_fixture.h"
+#include "src/storage/tests/storage_metadata_fuzz_cases.h"
 
 namespace kwaque::storage::testing {
 namespace {
@@ -82,7 +83,11 @@ void exercise_storage_case(std::span<const std::uint8_t> script) {
     const auto prefix = std::min(script.size(), control.size());
     std::copy_n(script.begin(), prefix, control.begin());
     script = script.subspan(prefix);
-    const auto selected = control[0] % 7U;
+    const auto selected = control[0] % 14U;
+    if (selected >= 7) {
+        exercise_metadata_case(control, script, selected);
+        return;
+    }
     if (selected == 6) {
         extent_case(control);
         return;

@@ -239,10 +239,12 @@ seastar::future<codec::result<decoded_retry_page>> decode_page(
       || root.pages().size() > work.policy().config().max_object_pages.value())
         return fail(page_error(errc::resource_exhausted, c));
     if (
-      auto valid = detail::check_retry_ref(
+      auto valid = detail::check_page_ref(
         ref,
         ordinal.value(),
         ref.first_entry(),
+        100,
+        160,
         root.location().history.alignment,
         work.policy(),
         c);
@@ -250,6 +252,7 @@ seastar::future<codec::result<decoded_retry_page>> decode_page(
         return fail(valid.error());
     return detail::decode_pinned<decoded_retry_page>(
       input,
+      detail::sealed_family,
       ref.digest(),
       memory,
       work,

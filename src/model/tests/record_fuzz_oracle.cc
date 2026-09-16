@@ -427,9 +427,11 @@ batch_probe probe_batch(
     const auto writer = little(wire, 6, 2), reader = little(wire, 8, 2),
                family = little(wire, 4, 2);
     if (reader > writer) return {.error = errc::malformed_data};
-    if (
-      writer == 0 || reader != 1 || family == 0 || family > 10
-      || little(wire, 16, 8) != 0)
+    if (writer == 0 || reader == 0) return {.error = errc::unsupported_format};
+    // Zero is an invalid family, not an unknown future family. Sender value
+    // checks precede this; reader-profile compatibility and features follow it.
+    if (family == 0) return {.error = errc::malformed_data};
+    if (family > 10 || reader != 1 || little(wire, 16, 8) != 0)
         return {.error = errc::unsupported_format};
     std::size_t extension = 32;
     std::uint64_t previous_tag = 0, extensions = 0;

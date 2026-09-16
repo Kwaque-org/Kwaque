@@ -4,6 +4,64 @@ load(":identity_dependency_test.bzl", "identity_dependency_test")
 
 package(default_visibility = ["//visibility:private"])
 
+kwaque_cc_library(
+    name = "lineage_model",
+    testonly = True,
+    srcs = ["lineage_model.cc"],
+    hdrs = ["lineage_model.h"],
+    deps = [
+        "//src/base",
+        "//src/base:error",
+        "//src/model:checkpoint",
+        "//src/model:identity",
+        "//src/model:keyspace",
+        "//src/model:position",
+    ],
+)
+
+kwaque_cc_test(
+    name = "lineage_model_test",
+    srcs = [
+        "lineage_model_test.cc",
+        "lineage_test_support.h",
+    ],
+    deps = [
+        ":lineage_model",
+        "//src/base",
+        "//src/base:error",
+        "//src/model:checkpoint",
+        "//src/model:identity",
+        "//src/model:keyspace",
+        "//src/model:position",
+    ],
+)
+
+kwaque_cc_seastar_gtest(
+    name = "lineage_checkpoint_test",
+    srcs = [
+        "lineage_checkpoint_test.cc",
+        "lineage_test_support.h",
+    ],
+    memory = "256MiB",
+    deps = [
+        ":lineage_model",
+        "//src/base",
+        "//src/base:error",
+        "//src/bytes:allocation_test_profile",
+        "//src/bytes:fragmented_buffer",
+        "//src/bytes:fragmented_buffer_parser",
+        "//src/codec:cooperative",
+        "//src/codec:error",
+        "//src/codec:integer",
+        "//src/codec:limits",
+        "//src/model:checkpoint",
+        "//src/model:checkpoint_codec",
+        "//src/model:identity",
+        "//src/model:keyspace",
+        "//src/model:position",
+    ],
+)
+
 kwaque_cc_seastar_gtest(
     name = "record_codec_test",
     srcs = ["record_codec_test.cc"],
@@ -162,6 +220,7 @@ kwaque_cc_library(
         "record_fuzz_cases.h",
         "record_fuzz_oracle.h",
     ],
+    visibility = ["//src/protocol/tests:__pkg__"],
     deps = [
         "//src/base",
         "//src/base:error",
@@ -250,6 +309,7 @@ kwaque_cc_library(
         "model_bench_fixture.h",
         "model_bench_reference.h",
     ],
+    visibility = ["//src/protocol/tests:__pkg__"],
     deps = [
         "//src/base",
         "//src/base:error",
@@ -307,10 +367,12 @@ kwaque_cc_benchmark(
     name = "model_bench",
     srcs = [
         "batch_compression_bench.cc",
+        "checkpoint_bench.cc",
         "model_bench.cc",
     ],
     memory = "512MiB",
     deps = [
+        ":checkpoint_test_support",
         ":model_bench_support",
         "//src/base",
         "//src/base:error",
@@ -327,6 +389,8 @@ kwaque_cc_benchmark(
         "//src/model:batch_builder",
         "//src/model:batch_codec",
         "//src/model:batch_context",
+        "//src/model:checkpoint",
+        "//src/model:checkpoint_codec",
         "//src/model:fingerprint",
         "//src/model:record",
         "//src/model:record_codec",
@@ -555,5 +619,128 @@ test_suite(
         ":transport_identity_test",
         ":uuid_dependency_compatibility_test",
         ":value_boundary_test",
+    ],
+)
+
+kwaque_cc_seastar_gtest(
+    name = "checkpoint_test",
+    srcs = ["checkpoint_test.cc"],
+    memory = "256MiB",
+    deps = [
+        ":checkpoint_test_support",
+        "//src/base",
+        "//src/base:error",
+        "//src/bytes:allocation_test_profile",
+        "//src/bytes:fragmented_buffer",
+        "//src/bytes:fragmented_buffer_parser",
+        "//src/codec:cooperative",
+        "//src/codec:digest",
+        "//src/codec:error",
+        "//src/codec:integer",
+        "//src/codec:limits",
+        "//src/model:checkpoint",
+        "//src/model:checkpoint_codec",
+        "//src/model:fingerprint",
+        "//src/model:identity",
+        "//src/model:position",
+    ],
+)
+
+kwaque_cc_library(
+    name = "checkpoint_test_support",
+    testonly = True,
+    srcs = ["checkpoint_test_support.cc"],
+    hdrs = ["checkpoint_test_support.h"],
+    deps = [
+        "//src/base",
+        "//src/base:error",
+        "//src/bytes:fragmented_buffer",
+        "//src/codec:digest",
+        "//src/codec:limits",
+        "//src/codec:sha256",
+        "//src/model:checkpoint",
+        "//src/model:identity",
+        "//src/model:position",
+        "@crc32c",
+        "@seastar",
+    ],
+)
+
+kwaque_cc_library(
+    name = "checkpoint_fuzz_cases",
+    testonly = True,
+    srcs = ["checkpoint_fuzz_cases.cc"],
+    hdrs = ["checkpoint_fuzz_cases.h"],
+    deps = [
+        ":checkpoint_test_support",
+        "//src/base",
+        "//src/base:error",
+        "//src/bytes:allocation_test_profile",
+        "//src/bytes:fragmented_buffer",
+        "//src/bytes:fragmented_buffer_parser",
+        "//src/codec:cooperative",
+        "//src/codec:error",
+        "//src/codec:integer",
+        "//src/codec:limits",
+        "//src/model:checkpoint",
+        "//src/model:checkpoint_codec",
+        "//src/model:identity",
+        "//src/model:position",
+        "@seastar",
+    ],
+)
+
+kwaque_cc_fuzz_test(
+    name = "checkpoint_fuzz",
+    srcs = ["checkpoint_fuzz.cc"],
+    args = [
+        "-max_len=16384",
+        "-rss_limit_mb=1024",
+    ],
+    corpus = glob(["testdata/checkpoint_fuzz_corpus/*.bin"]),
+    tags = [
+        "resources:cpu:1",
+        "resources:memory:1024",
+    ],
+    deps = [
+        ":checkpoint_fuzz_cases",
+        "//src/runtime/testing:seastar_fuzz",
+        "@openssl",
+        "@seastar",
+    ],
+)
+
+kwaque_cc_seastar_gtest(
+    name = "checkpoint_qualification_test",
+    srcs = ["checkpoint_qualification_test.cc"],
+    memory = "256MiB",
+    deps = [
+        ":checkpoint_fuzz_cases",
+        ":checkpoint_test_support",
+        "//src/base",
+        "//src/base:error",
+        "//src/bytes:allocation_test_profile",
+        "//src/bytes:fragmented_buffer",
+        "//src/bytes:fragmented_buffer_parser",
+        "//src/codec:collection",
+        "//src/codec:cooperative",
+        "//src/codec:error",
+        "//src/codec:integer",
+        "//src/codec:limits",
+        "//src/model:checkpoint",
+        "//src/model:checkpoint_codec",
+        "//src/model:fingerprint",
+        "//src/model:identity",
+        "//src/model:position",
+    ],
+)
+
+test_suite(
+    name = "checkpoint_tests",
+    tests = [
+        ":checkpoint_qualification_test",
+        ":checkpoint_test",
+        ":lineage_checkpoint_test",
+        ":lineage_model_test",
     ],
 )
