@@ -6,6 +6,7 @@
 #include "src/codec/digest.h"
 #include "src/codec/transaction.h"
 #include "src/model/checkpoint.h"
+#include "src/model/checkpoint_wire.h"
 
 #include <seastar/core/chunked_fifo.hh>
 #include <seastar/core/future.hh>
@@ -14,9 +15,6 @@
 #include <span>
 
 namespace kwaque::model {
-
-inline constexpr byte_count checkpoint_fixed_bytes{20};
-inline constexpr byte_count checkpoint_cursor_bytes{24};
 
 enum class checkpoint_field : std::uint16_t {
     topic = 128,

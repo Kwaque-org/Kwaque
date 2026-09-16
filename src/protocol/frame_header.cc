@@ -40,7 +40,10 @@ seastar::future<result<void>> check_header(
   field_context context,
   std::uint64_t start) {
     const auto anchor = framing_error(
-      errc::success, context, frame_field::header_crc32c, start + 40);
+      errc::success,
+      context,
+      frame_field::header_crc32c,
+      start + frame_header_crc_offset);
     if (auto ready = co_await work.checkpoint(anchor); !ready) {
         co_return codec::failure(ready.error());
     }
@@ -204,7 +207,7 @@ seastar::future<result<void>> verify_frame_header_crc(
       context,
       {frame_prefix_bytes,
        8,
-       40,
+       frame_header_crc_offset,
        static_cast<std::uint16_t>(frame_field::header_bytes),
        static_cast<std::uint16_t>(frame_field::header_crc32c)});
 }

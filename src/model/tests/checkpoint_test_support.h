@@ -109,6 +109,7 @@ inline void repair(std::string& wire, std::size_t header = 32) {
     put(wire, 28, crc(std::string_view{wire}.substr(0, header)), 4);
 }
 inline std::string extended(std::string wire, std::size_t header) {
+    if (header < 40 || header > 4096) __builtin_trap();
     std::string extension(header - 32, '\0');
     put(extension, 0, 77, 2);
     put(extension, 4, header - 40, 4);

@@ -169,7 +169,7 @@ seastar::future<result<fragmented_buffer>> encode_owned(
       errc::success,
       context.family,
       static_cast<std::uint16_t>(frame_field::payload_crc32c),
-      context.origin + 44};
+      context.origin + frame_payload_crc_offset};
     const auto body_checksum = co_await crc32c_cooperatively(
       std::move(*checksum_input), work, 0, body_anchor);
     if (!body_checksum) {
@@ -189,10 +189,12 @@ seastar::future<result<fragmented_buffer>> encode_owned(
     }
     // Retain native placeholder completion on PRIVATE inline bytes. The body
     // CRC is part of the header checksum; its own slot is still four zeros.
-    seastar::write_le(prefix->data() + 44, *body_checksum);
+    seastar::write_le(
+      prefix->data() + frame_payload_crc_offset, *body_checksum);
     crc32c header_checksum;
     header_checksum.extend(std::span<const char>{*prefix});
-    seastar::write_le(prefix->data() + 40, header_checksum.value());
+    seastar::write_le(
+      prefix->data() + frame_header_crc_offset, header_checksum.value());
     if (
       auto admitted = admit_header_owner(
         byte_count{frame_prefix_bytes},

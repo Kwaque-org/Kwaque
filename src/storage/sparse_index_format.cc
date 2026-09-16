@@ -187,8 +187,10 @@ struct root_reader final {
                 *ref,
                 ordinal,
                 first,
-                172,
-                16,
+                static_cast<std::uint32_t>(
+                  sparse_index_page_fixed_bytes.value()),
+                static_cast<std::uint32_t>(
+                  sparse_index_entry_wire_bytes.value()),
                 expected.alignment(),
                 work.policy(),
                 entry_context);
@@ -375,8 +377,8 @@ seastar::future<codec::result<decoded_sparse_index_page>> decode_page(
         ref,
         ordinal.value(),
         ref.first_entry(),
-        172,
-        16,
+        static_cast<std::uint32_t>(sparse_index_page_fixed_bytes.value()),
+        static_cast<std::uint32_t>(sparse_index_entry_wire_bytes.value()),
         root.context().alignment(),
         work.policy(),
         c);
@@ -599,7 +601,14 @@ encode_sparse_index_root(
             co_return codec::failure(ready.error());
         if (
           auto valid = detail::check_page_ref(
-            refs[i], i, first, 172, 16, context.alignment(), work.policy(), c);
+            refs[i],
+            i,
+            first,
+            static_cast<std::uint32_t>(sparse_index_page_fixed_bytes.value()),
+            static_cast<std::uint32_t>(sparse_index_entry_wire_bytes.value()),
+            context.alignment(),
+            work.policy(),
+            c);
           !valid)
             co_return codec::failure(valid.error());
         first += refs[i].entry_count();

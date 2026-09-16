@@ -237,8 +237,10 @@ struct root_reader final {
                 *ref,
                 ordinal,
                 first,
-                92,
-                104,
+                static_cast<std::uint32_t>(
+                  range_manifest_page_fixed_bytes.value()),
+                static_cast<std::uint32_t>(
+                  range_manifest_entry_wire_bytes.value()),
                 alignment,
                 work.policy(),
                 entry_context);
@@ -429,8 +431,8 @@ seastar::future<codec::result<decoded_range_manifest_page>> decode_page(
         ref,
         ordinal.value(),
         ref.first_entry(),
-        92,
-        104,
+        static_cast<std::uint32_t>(range_manifest_page_fixed_bytes.value()),
+        static_cast<std::uint32_t>(range_manifest_entry_wire_bytes.value()),
         root.alignment(),
         work.policy(),
         c);
@@ -667,7 +669,14 @@ encode_range_manifest_root(
             co_return codec::failure(ready.error());
         if (
           auto valid = detail::check_page_ref(
-            refs[i], i, first, 92, 104, alignment, work.policy(), c);
+            refs[i],
+            i,
+            first,
+            static_cast<std::uint32_t>(range_manifest_page_fixed_bytes.value()),
+            static_cast<std::uint32_t>(range_manifest_entry_wire_bytes.value()),
+            alignment,
+            work.policy(),
+            c);
           !valid)
             co_return codec::failure(valid.error());
         first += refs[i].entry_count();
