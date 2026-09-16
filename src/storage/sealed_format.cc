@@ -2,6 +2,7 @@
 
 #include "src/storage/footer_internal.h"
 #include "src/storage/page_internal.h"
+#include "src/storage/retry_format.h"
 
 namespace kwaque::storage {
 namespace detail {
@@ -170,8 +171,8 @@ struct sealed_reader final {
                 *ref,
                 ordinal,
                 first,
-                100,
-                160,
+                static_cast<std::uint32_t>(retry_page_fixed_bytes.value()),
+                static_cast<std::uint32_t>(completed_retry_wire_bytes.value()),
                 expected.history.alignment,
                 work.policy(),
                 entry_context);
@@ -303,8 +304,8 @@ seastar::future<codec::result<encoded_sealed_footer>> encode_sealed_footer(
             refs[i],
             i,
             first,
-            100,
-            160,
+            static_cast<std::uint32_t>(retry_page_fixed_bytes.value()),
+            static_cast<std::uint32_t>(completed_retry_wire_bytes.value()),
             expected.history.alignment,
             work.policy(),
             c);

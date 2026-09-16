@@ -1,5 +1,6 @@
 #pragma once
 
+#include "src/codec/envelope.h"
 #include "src/codec/error.h"
 #include "src/codec/integer.h"
 #include "src/codec/limits.h"
@@ -10,7 +11,12 @@
 #include <bit>
 #include <cstdint>
 
-namespace kwaque::model::detail {
+namespace kwaque::model {
+
+inline constexpr byte_count checkpoint_fixed_bytes{20};
+inline constexpr byte_count checkpoint_cursor_bytes{24};
+
+namespace detail {
 
 inline codec::error checkpoint_error(
   errc code, codec::field_context context, std::uint64_t offset = 0) noexcept {
@@ -35,18 +41,20 @@ inline codec::result<byte_count> checkpoint_body_size(
          limits.max_object_entries.value()}))
         return codec::failure(
           checkpoint_error(errc::resource_exhausted, context));
-    const byte_count body{20U + 24U * count};
+    const byte_count body{
+      checkpoint_fixed_bytes.value() + checkpoint_cursor_bytes.value() * count};
     if (
       body > limits.max_encoded_body_bytes
-      || body.value() + 32U > limits.max_checkpoint_bytes.value())
+      || body.value() + codec::envelope_prefix_bytes
+           > limits.max_checkpoint_bytes.value())
         return codec::failure(
           checkpoint_error(errc::resource_exhausted, context));
     return body;
 }
 
-inline std::array<char, 20>
+inline std::array<char, checkpoint_fixed_bytes.value()>
 encode_checkpoint_prefix(topic_id topic, std::uint32_t count) noexcept {
-    std::array<char, 20> out{};
+    std::array<char, checkpoint_fixed_bytes.value()> out{};
     std::copy(topic.bytes().begin(), topic.bytes().end(), out.begin());
     const auto encoded = std::bit_cast<std::array<char, 4>>(
       seastar::cpu_to_le(count));
@@ -54,9 +62,9 @@ encode_checkpoint_prefix(topic_id topic, std::uint32_t count) noexcept {
     return out;
 }
 
-inline std::array<char, 24>
+inline std::array<char, checkpoint_cursor_bytes.value()>
 encode_checkpoint_cursor(range_cursor cursor) noexcept {
-    std::array<char, 24> out{};
+    std::array<char, checkpoint_cursor_bytes.value()> out{};
     const auto range = cursor.range();
     std::copy(range.bytes().begin(), range.bytes().end(), out.begin());
     const auto encoded = std::bit_cast<std::array<char, 8>>(
@@ -65,4 +73,5 @@ encode_checkpoint_cursor(range_cursor cursor) noexcept {
     return out;
 }
 
-} // namespace kwaque::model::detail
+} // namespace detail
+} // namespace kwaque::model

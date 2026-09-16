@@ -42,7 +42,10 @@ seastar::future<frame_read_result<frame_header>> inspect_frame_in_transaction(
     if (!inspected) co_return codec::failure(inspected.error());
     if (std::holds_alternative<need_more>(*inspected)) co_return inspected;
     const auto anchor = frame_error(
-      errc::success, context, frame_field::payload_crc32c, start + 44);
+      errc::success,
+      context,
+      frame_field::payload_crc32c,
+      start + frame_payload_crc_offset);
     if (auto ready = work.poll(anchor); !ready)
         co_return codec::failure(ready.error());
     const auto header = std::get<frame_header>(*inspected);
@@ -82,7 +85,7 @@ seastar::future<frame_read_result<frame_header>> inspect_frame_in_transaction(
           errc::corrupt_data,
           context,
           frame_field::payload_crc32c,
-          start + 44));
+          start + frame_payload_crc_offset));
     if (expected_kind && header.metadata.kind != *expected_kind)
         co_return codec::failure(frame_error(
           errc::wrong_context, context, frame_field::kind, start + 6));

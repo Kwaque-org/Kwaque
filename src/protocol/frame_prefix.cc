@@ -136,8 +136,10 @@ result<unverified_frame_prefix> peek_frame_prefix(
       .stream = seastar::read_le<std::uint64_t>(encoded.data() + 16),
       .correlation = seastar::read_le<std::uint64_t>(encoded.data() + 24),
       .sequence = seastar::read_le<std::uint64_t>(encoded.data() + 32),
-      .header_crc32c = seastar::read_le<std::uint32_t>(encoded.data() + 40),
-      .payload_crc32c = seastar::read_le<std::uint32_t>(encoded.data() + 44)};
+      .header_crc32c = seastar::read_le<std::uint32_t>(
+        encoded.data() + frame_header_crc_offset),
+      .payload_crc32c = seastar::read_le<std::uint32_t>(
+        encoded.data() + frame_payload_crc_offset)};
     if (
       auto valid = validate_prefix_extents(
         prefix.header_bytes,
@@ -230,8 +232,10 @@ result<encoded_frame_prefix> encode_frame_prefix(
     seastar::write_le(encoded.data() + 16, fields.metadata.stream.value());
     seastar::write_le(encoded.data() + 24, fields.metadata.correlation.value());
     seastar::write_le(encoded.data() + 32, fields.metadata.sequence.value());
-    seastar::write_le(encoded.data() + 40, fields.header_crc32c);
-    seastar::write_le(encoded.data() + 44, fields.payload_crc32c);
+    seastar::write_le(
+      encoded.data() + frame_header_crc_offset, fields.header_crc32c);
+    seastar::write_le(
+      encoded.data() + frame_payload_crc_offset, fields.payload_crc32c);
     return encoded;
 }
 

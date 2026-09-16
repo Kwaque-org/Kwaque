@@ -404,6 +404,7 @@ kwaque_cc_library(
         ":identity",
         "//src/base",
         "//src/base:error",
+        "//src/codec:envelope",
         "//src/codec:error",
         "//src/codec:integer",
         "//src/codec:limits",
@@ -419,7 +420,6 @@ kwaque_cc_library(
     ],
     hdrs = ["checkpoint_codec.h"],
     implementation_deps = [
-        ":checkpoint_wire",
         ":fingerprint",
         "//src/base:invariant",
         "//src/bytes:fragmented_buffer_builder",
@@ -434,6 +434,7 @@ kwaque_cc_library(
     ],
     deps = [
         ":checkpoint",
+        ":checkpoint_wire",
         ":identity",
         ":position",
         "//src/base",

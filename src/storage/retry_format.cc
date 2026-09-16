@@ -243,8 +243,8 @@ seastar::future<codec::result<decoded_retry_page>> decode_page(
         ref,
         ordinal.value(),
         ref.first_entry(),
-        100,
-        160,
+        static_cast<std::uint32_t>(retry_page_fixed_bytes.value()),
+        static_cast<std::uint32_t>(completed_retry_wire_bytes.value()),
         root.location().history.alignment,
         work.policy(),
         c);

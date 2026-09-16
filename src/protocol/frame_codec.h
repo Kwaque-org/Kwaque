@@ -15,6 +15,8 @@
 namespace kwaque::protocol {
 
 inline constexpr std::size_t frame_prefix_bytes = 48;
+inline constexpr std::size_t frame_header_crc_offset = 40;
+inline constexpr std::size_t frame_payload_crc_offset = 44;
 using encoded_frame_prefix = std::array<char, frame_prefix_bytes>;
 // Includes local initialization/copy/scalar work and one fragment per octet.
 inline constexpr byte_count frame_prefix_work_bytes{4 * frame_prefix_bytes};
