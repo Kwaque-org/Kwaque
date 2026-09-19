@@ -123,15 +123,13 @@ checks protect cleanup identity, not arbitrary external directory replacement.
 
 Production restart limiting defaults to `crash_loop_limit: 5`; developer mode
 bypasses it. Prepared crash reports and restart state are created only after PID
-ownership, which is held through shutdown bookkeeping. See the
-[broker lifecycle policy](src/broker/README.md) for reset boundaries, drain health,
-and the 15/120-second shutdown warning timers.
+ownership, which is held through shutdown bookkeeping.
 
 Startup reports read-only host checks for filesystem, free space, cgroup limits,
 descriptors, swap, selected tuning state, and matching device I/O configuration.
 It does not tune the host or treat configured I/O rates as measured throughput.
 The admin listener uses bounded connections, headers, metrics work and absolute
-request lifetimes; see [admin limits](src/admin/README.md).
+request lifetimes.
 
 ## Development
 
@@ -447,15 +445,12 @@ locally is a convenience rather than a requirement.
 | `src/broker` | Broker assembly: entry point, application ownership, ordered startup, data directory, PID file. |
 | `src/simulation` | Deterministic scheduler, virtual time and timers, counter-addressed randomness, replayable faults, fake files/network/DNS, structured-event capture, and owner-local metrics. |
 | `src/observability` | Bounded typed structured events, canonical event logs, owner-stamped sinks, and the fixed metric descriptor inventory. |
-| `src/model`, `src/storage`, `src/protocol`, `src/raft`, `src/metadata`, `src/cluster`, `src/replication`, `src/consumer`, `src/cloud`, `src/security` | Ownership boundaries reserved for future work. Each holds a `BUILD` file and a `README.md` describing what belongs there. |
+| `src/model`, `src/storage`, `src/protocol`, `src/raft`, `src/metadata`, `src/cluster`, `src/replication`, `src/consumer`, `src/cloud`, `src/security` | Additional core packages. |
 | `proto/` | Versioned Protocol Buffers control schemas and their generated-code consumers. |
 | `conf/` | Example broker configuration. |
 | `bazel/` | Build rules, dependency declarations, third-party overlays, packaging, rule probes. |
 | `tools/` | Repository scripts: formatting, static analysis, compilation database, integrity checks. |
 | `tests/smoke/` | Subprocess tests that exercise the built broker as a process. |
-
-Read a package's `README.md` before adding code to it; that file, not this table,
-is the authoritative statement of what the package owns.
 
 ### Dependency direction
 

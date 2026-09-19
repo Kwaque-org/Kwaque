@@ -4,6 +4,38 @@ load(":identity_dependency_test.bzl", "identity_dependency_test")
 
 package(default_visibility = ["//visibility:private"])
 
+kwaque_cc_seastar_gtest(
+    name = "format_fixture_test",
+    srcs = ["format_fixture_test.cc"],
+    data = ["//src/codec/tests:format_fixture_data"],
+    memory = "256MiB",
+    deps = [
+        "//src/base",
+        "//src/base:error",
+        "//src/bytes:allocation_test_profile",
+        "//src/bytes:fragmented_buffer",
+        "//src/bytes:fragmented_buffer_parser",
+        "//src/codec:cooperative",
+        "//src/codec:error",
+        "//src/codec:integer",
+        "//src/codec:limits",
+        "//src/codec:sha256",
+        "//src/codec/tests:envelope_test_fixture",
+        "//src/codec/tests:format_fixture",
+        "//src/codec/tests:format_test_support",
+        "//src/model:batch",
+        "//src/model:batch_codec",
+        "//src/model:batch_context",
+        "//src/model:batch_identity",
+        "//src/model:checkpoint_codec",
+        "//src/model:epoch",
+        "//src/model:identity",
+        "//src/model:position",
+        "//src/model:record_codec",
+        "//src/runtime:time",
+    ],
+)
+
 kwaque_cc_library(
     name = "lineage_model",
     testonly = True,

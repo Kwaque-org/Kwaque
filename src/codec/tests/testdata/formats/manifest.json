@@ -1,0 +1,6541 @@
+{
+  "version": 1,
+  "fixtures": [
+    {
+      "name": "record",
+      "path": "record.hex",
+      "size": 7,
+      "fields": [
+        {
+          "name": "body_varint",
+          "offset": 0,
+          "width": 1,
+          "le": 6
+        },
+        {
+          "name": "attributes",
+          "offset": 1,
+          "width": 1,
+          "le": 0
+        },
+        {
+          "name": "timestamp_zigzag",
+          "offset": 2,
+          "width": 1,
+          "le": 0
+        },
+        {
+          "name": "logical_delta_varint",
+          "offset": 3,
+          "width": 1,
+          "le": 0
+        },
+        {
+          "name": "null_key_zigzag",
+          "offset": 4,
+          "width": 1,
+          "le": 1
+        },
+        {
+          "name": "empty_value_zigzag",
+          "offset": 5,
+          "width": 1,
+          "le": 0
+        },
+        {
+          "name": "header_count_varint",
+          "offset": 6,
+          "width": 1,
+          "le": 0
+        }
+      ]
+    },
+    {
+      "name": "record_rich",
+      "path": "record_rich.hex",
+      "size": 13,
+      "fields": [
+        {
+          "name": "body_varint",
+          "offset": 0,
+          "width": 1,
+          "hex": "0c"
+        },
+        {
+          "name": "attributes",
+          "offset": 1,
+          "width": 1,
+          "hex": "00"
+        },
+        {
+          "name": "timestamp_zigzag",
+          "offset": 2,
+          "width": 1,
+          "hex": "00"
+        },
+        {
+          "name": "logical_delta_varint",
+          "offset": 3,
+          "width": 1,
+          "hex": "00"
+        },
+        {
+          "name": "key_length_zigzag",
+          "offset": 4,
+          "width": 1,
+          "hex": "02"
+        },
+        {
+          "name": "key",
+          "offset": 5,
+          "width": 1,
+          "hex": "6b"
+        },
+        {
+          "name": "null_value_zigzag",
+          "offset": 6,
+          "width": 1,
+          "hex": "01"
+        },
+        {
+          "name": "header_count_varint",
+          "offset": 7,
+          "width": 1,
+          "hex": "02"
+        },
+        {
+          "name": "empty_name_length",
+          "offset": 8,
+          "width": 1,
+          "hex": "00"
+        },
+        {
+          "name": "null_header_value",
+          "offset": 9,
+          "width": 1,
+          "hex": "01"
+        },
+        {
+          "name": "second_name_length",
+          "offset": 10,
+          "width": 1,
+          "hex": "01"
+        },
+        {
+          "name": "second_name",
+          "offset": 11,
+          "width": 1,
+          "hex": "ff"
+        },
+        {
+          "name": "empty_header_value",
+          "offset": 12,
+          "width": 1,
+          "hex": "00"
+        }
+      ]
+    },
+    {
+      "name": "submitted",
+      "path": "submitted.hex",
+      "size": 207,
+      "fields": [
+        {
+          "name": "magic",
+          "offset": 0,
+          "width": 4,
+          "hex": "4b514246"
+        },
+        {
+          "name": "family",
+          "offset": 4,
+          "width": 2,
+          "le": 1
+        },
+        {
+          "name": "writer_version",
+          "offset": 6,
+          "width": 2,
+          "le": 1
+        },
+        {
+          "name": "minimum_reader",
+          "offset": 8,
+          "width": 2,
+          "le": 1
+        },
+        {
+          "name": "header_bytes",
+          "offset": 10,
+          "width": 2,
+          "le": 32
+        },
+        {
+          "name": "body_bytes",
+          "offset": 12,
+          "width": 4,
+          "le": 175
+        },
+        {
+          "name": "required_features",
+          "offset": 16,
+          "width": 8,
+          "le": 0
+        },
+        {
+          "name": "body_crc32c",
+          "offset": 24,
+          "width": 4,
+          "le": 2930454827
+        },
+        {
+          "name": "header_crc32c",
+          "offset": 28,
+          "width": 4,
+          "le": 2812764735
+        },
+        {
+          "name": "body",
+          "offset": 32,
+          "width": 175,
+          "fields": [
+            {
+              "name": "original_identity",
+              "offset": 0,
+              "width": 104,
+              "fields": [
+                {
+                  "name": "batch_id",
+                  "offset": 0,
+                  "width": 40,
+                  "fields": [
+                    {
+                      "name": "producer",
+                      "offset": 0,
+                      "width": 16,
+                      "hex": "40404040404040404040404040404040"
+                    },
+                    {
+                      "name": "producer_epoch",
+                      "offset": 16,
+                      "width": 8,
+                      "le": 1
+                    },
+                    {
+                      "name": "producer_stream",
+                      "offset": 24,
+                      "width": 8,
+                      "le": 1
+                    },
+                    {
+                      "name": "batch_sequence",
+                      "offset": 32,
+                      "width": 8,
+                      "le": 0
+                    }
+                  ]
+                },
+                {
+                  "name": "binding",
+                  "offset": 40,
+                  "width": 64,
+                  "fields": [
+                    {
+                      "name": "topic",
+                      "offset": 0,
+                      "width": 16,
+                      "hex": "10101010101010101010101010101010"
+                    },
+                    {
+                      "name": "range",
+                      "offset": 16,
+                      "width": 16,
+                      "hex": "20202020202020202020202020202020"
+                    },
+                    {
+                      "name": "routing_epoch",
+                      "offset": 32,
+                      "width": 8,
+                      "le": 1
+                    },
+                    {
+                      "name": "original_segment",
+                      "offset": 40,
+                      "width": 16,
+                      "hex": "30303030303030303030303030303030"
+                    },
+                    {
+                      "name": "original_generation",
+                      "offset": 56,
+                      "width": 8,
+                      "le": 1
+                    }
+                  ]
+                }
+              ]
+            },
+            {
+              "name": "semantic_fingerprint",
+              "offset": 104,
+              "width": 32,
+              "hex": "faf92b853fd9029baa6091b240ff60cbd8e82375f8d26d28e65160c5b88b8a02"
+            },
+            {
+              "name": "timestamp_base",
+              "offset": 136,
+              "width": 8,
+              "le": 0
+            },
+            {
+              "name": "original_count",
+              "offset": 144,
+              "width": 4,
+              "le": 1
+            },
+            {
+              "name": "retained_count",
+              "offset": 148,
+              "width": 4,
+              "le": 1
+            },
+            {
+              "name": "header_count",
+              "offset": 152,
+              "width": 4,
+              "le": 0
+            },
+            {
+              "name": "codec",
+              "offset": 156,
+              "width": 1,
+              "le": 0
+            },
+            {
+              "name": "reserved",
+              "offset": 157,
+              "width": 1,
+              "zero": true
+            },
+            {
+              "name": "record_profile",
+              "offset": 158,
+              "width": 2,
+              "le": 1
+            },
+            {
+              "name": "encoded_records",
+              "offset": 160,
+              "width": 4,
+              "le": 7
+            },
+            {
+              "name": "expanded_records",
+              "offset": 164,
+              "width": 4,
+              "le": 7
+            },
+            {
+              "name": "records",
+              "offset": 168,
+              "width": 7,
+              "fixture": "record"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "batch_digest",
+      "path": "batch_digest.hex",
+      "size": 32,
+      "fields": [
+        {
+          "name": "sha256",
+          "offset": 0,
+          "width": 32,
+          "hex": "faf92b853fd9029baa6091b240ff60cbd8e82375f8d26d28e65160c5b88b8a02"
+        }
+      ]
+    },
+    {
+      "name": "assigned_dense",
+      "path": "assigned_dense.hex",
+      "size": 223,
+      "fields": [
+        {
+          "name": "magic",
+          "offset": 0,
+          "width": 4,
+          "hex": "4b514246"
+        },
+        {
+          "name": "family",
+          "offset": 4,
+          "width": 2,
+          "le": 2
+        },
+        {
+          "name": "writer_version",
+          "offset": 6,
+          "width": 2,
+          "le": 1
+        },
+        {
+          "name": "minimum_reader",
+          "offset": 8,
+          "width": 2,
+          "le": 1
+        },
+        {
+          "name": "header_bytes",
+          "offset": 10,
+          "width": 2,
+          "le": 32
+        },
+        {
+          "name": "body_bytes",
+          "offset": 12,
+          "width": 4,
+          "le": 191
+        },
+        {
+          "name": "required_features",
+          "offset": 16,
+          "width": 8,
+          "le": 0
+        },
+        {
+          "name": "body_crc32c",
+          "offset": 24,
+          "width": 4,
+          "le": 3606038752
+        },
+        {
+          "name": "header_crc32c",
+          "offset": 28,
+          "width": 4,
+          "le": 1538969501
+        },
+        {
+          "name": "body",
+          "offset": 32,
+          "width": 191,
+          "fields": [
+            {
+              "name": "original_identity",
+              "offset": 0,
+              "width": 104,
+              "fields": [
+                {
+                  "name": "batch_id",
+                  "offset": 0,
+                  "width": 40,
+                  "fields": [
+                    {
+                      "name": "producer",
+                      "offset": 0,
+                      "width": 16,
+                      "hex": "40404040404040404040404040404040"
+                    },
+                    {
+                      "name": "producer_epoch",
+                      "offset": 16,
+                      "width": 8,
+                      "le": 1
+                    },
+                    {
+                      "name": "producer_stream",
+                      "offset": 24,
+                      "width": 8,
+                      "le": 1
+                    },
+                    {
+                      "name": "batch_sequence",
+                      "offset": 32,
+                      "width": 8,
+                      "le": 0
+                    }
+                  ]
+                },
+                {
+                  "name": "binding",
+                  "offset": 40,
+                  "width": 64,
+                  "fields": [
+                    {
+                      "name": "topic",
+                      "offset": 0,
+                      "width": 16,
+                      "hex": "10101010101010101010101010101010"
+                    },
+                    {
+                      "name": "range",
+                      "offset": 16,
+                      "width": 16,
+                      "hex": "20202020202020202020202020202020"
+                    },
+                    {
+                      "name": "routing_epoch",
+                      "offset": 32,
+                      "width": 8,
+                      "le": 1
+                    },
+                    {
+                      "name": "original_segment",
+                      "offset": 40,
+                      "width": 16,
+                      "hex": "30303030303030303030303030303030"
+                    },
+                    {
+                      "name": "original_generation",
+                      "offset": 56,
+                      "width": 8,
+                      "le": 1
+                    }
+                  ]
+                }
+              ]
+            },
+            {
+              "name": "semantic_fingerprint",
+              "offset": 104,
+              "width": 32,
+              "hex": "faf92b853fd9029baa6091b240ff60cbd8e82375f8d26d28e65160c5b88b8a02"
+            },
+            {
+              "name": "timestamp_base",
+              "offset": 136,
+              "width": 8,
+              "le": 0
+            },
+            {
+              "name": "original_count",
+              "offset": 144,
+              "width": 4,
+              "le": 1
+            },
+            {
+              "name": "retained_count",
+              "offset": 148,
+              "width": 4,
+              "le": 1
+            },
+            {
+              "name": "header_count",
+              "offset": 152,
+              "width": 4,
+              "le": 0
+            },
+            {
+              "name": "codec",
+              "offset": 156,
+              "width": 1,
+              "le": 0
+            },
+            {
+              "name": "reserved",
+              "offset": 157,
+              "width": 1,
+              "zero": true
+            },
+            {
+              "name": "record_profile",
+              "offset": 158,
+              "width": 2,
+              "le": 1
+            },
+            {
+              "name": "encoded_records",
+              "offset": 160,
+              "width": 4,
+              "le": 7
+            },
+            {
+              "name": "expanded_records",
+              "offset": 164,
+              "width": 4,
+              "le": 7
+            },
+            {
+              "name": "logical_begin",
+              "offset": 168,
+              "width": 8,
+              "le": 100
+            },
+            {
+              "name": "logical_end",
+              "offset": 176,
+              "width": 8,
+              "le": 101
+            },
+            {
+              "name": "records",
+              "offset": 184,
+              "width": 7,
+              "fixture": "record"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "assigned_sparse",
+      "path": "assigned_sparse.hex",
+      "size": 230,
+      "fields": [
+        {
+          "name": "magic",
+          "offset": 0,
+          "width": 4,
+          "hex": "4b514246"
+        },
+        {
+          "name": "family",
+          "offset": 4,
+          "width": 2,
+          "le": 2
+        },
+        {
+          "name": "writer_version",
+          "offset": 6,
+          "width": 2,
+          "le": 1
+        },
+        {
+          "name": "minimum_reader",
+          "offset": 8,
+          "width": 2,
+          "le": 1
+        },
+        {
+          "name": "header_bytes",
+          "offset": 10,
+          "width": 2,
+          "le": 32
+        },
+        {
+          "name": "body_bytes",
+          "offset": 12,
+          "width": 4,
+          "le": 198
+        },
+        {
+          "name": "required_features",
+          "offset": 16,
+          "width": 8,
+          "le": 0
+        },
+        {
+          "name": "body_crc32c",
+          "offset": 24,
+          "width": 4,
+          "le": 4197044584
+        },
+        {
+          "name": "header_crc32c",
+          "offset": 28,
+          "width": 4,
+          "le": 962979325
+        },
+        {
+          "name": "body",
+          "offset": 32,
+          "width": 198,
+          "fields": [
+            {
+              "name": "original_identity",
+              "offset": 0,
+              "width": 104,
+              "fields": [
+                {
+                  "name": "batch_id",
+                  "offset": 0,
+                  "width": 40,
+                  "fields": [
+                    {
+                      "name": "producer",
+                      "offset": 0,
+                      "width": 16,
+                      "hex": "40404040404040404040404040404040"
+                    },
+                    {
+                      "name": "producer_epoch",
+                      "offset": 16,
+                      "width": 8,
+                      "le": 1
+                    },
+                    {
+                      "name": "producer_stream",
+                      "offset": 24,
+                      "width": 8,
+                      "le": 1
+                    },
+                    {
+                      "name": "batch_sequence",
+                      "offset": 32,
+                      "width": 8,
+                      "le": 0
+                    }
+                  ]
+                },
+                {
+                  "name": "binding",
+                  "offset": 40,
+                  "width": 64,
+                  "fields": [
+                    {
+                      "name": "topic",
+                      "offset": 0,
+                      "width": 16,
+                      "hex": "10101010101010101010101010101010"
+                    },
+                    {
+                      "name": "range",
+                      "offset": 16,
+                      "width": 16,
+                      "hex": "20202020202020202020202020202020"
+                    },
+                    {
+                      "name": "routing_epoch",
+                      "offset": 32,
+                      "width": 8,
+                      "le": 1
+                    },
+                    {
+                      "name": "original_segment",
+                      "offset": 40,
+                      "width": 16,
+                      "hex": "30303030303030303030303030303030"
+                    },
+                    {
+                      "name": "original_generation",
+                      "offset": 56,
+                      "width": 8,
+                      "le": 1
+                    }
+                  ]
+                }
+              ]
+            },
+            {
+              "name": "semantic_fingerprint",
+              "offset": 104,
+              "width": 32,
+              "hex": "1ca1f5939c787dc18baed7e6a9869863589d8164d20bf7511b779f928fab5c64"
+            },
+            {
+              "name": "timestamp_base",
+              "offset": 136,
+              "width": 8,
+              "le": 0
+            },
+            {
+              "name": "original_count",
+              "offset": 144,
+              "width": 4,
+              "le": 5
+            },
+            {
+              "name": "retained_count",
+              "offset": 148,
+              "width": 4,
+              "le": 2
+            },
+            {
+              "name": "header_count",
+              "offset": 152,
+              "width": 4,
+              "le": 0
+            },
+            {
+              "name": "codec",
+              "offset": 156,
+              "width": 1,
+              "le": 0
+            },
+            {
+              "name": "reserved",
+              "offset": 157,
+              "width": 1,
+              "zero": true
+            },
+            {
+              "name": "record_profile",
+              "offset": 158,
+              "width": 2,
+              "le": 1
+            },
+            {
+              "name": "encoded_records",
+              "offset": 160,
+              "width": 4,
+              "le": 14
+            },
+            {
+              "name": "expanded_records",
+              "offset": 164,
+              "width": 4,
+              "le": 14
+            },
+            {
+              "name": "logical_begin",
+              "offset": 168,
+              "width": 8,
+              "le": 100
+            },
+            {
+              "name": "logical_end",
+              "offset": 176,
+              "width": 8,
+              "le": 105
+            },
+            {
+              "name": "records",
+              "offset": 184,
+              "width": 14,
+              "fields": [
+                {
+                  "name": "record_0",
+                  "offset": 0,
+                  "width": 7,
+                  "fields": [
+                    {
+                      "name": "body_varint",
+                      "offset": 0,
+                      "width": 1,
+                      "le": 6
+                    },
+                    {
+                      "name": "attributes",
+                      "offset": 1,
+                      "width": 1,
+                      "le": 0
+                    },
+                    {
+                      "name": "timestamp_zigzag",
+                      "offset": 2,
+                      "width": 1,
+                      "le": 1
+                    },
+                    {
+                      "name": "logical_delta_varint",
+                      "offset": 3,
+                      "width": 1,
+                      "le": 1
+                    },
+                    {
+                      "name": "null_key_zigzag",
+                      "offset": 4,
+                      "width": 1,
+                      "le": 1
+                    },
+                    {
+                      "name": "empty_value_zigzag",
+                      "offset": 5,
+                      "width": 1,
+                      "le": 0
+                    },
+                    {
+                      "name": "header_count_varint",
+                      "offset": 6,
+                      "width": 1,
+                      "le": 0
+                    }
+                  ]
+                },
+                {
+                  "name": "record_1",
+                  "offset": 7,
+                  "width": 7,
+                  "fields": [
+                    {
+                      "name": "body_varint",
+                      "offset": 0,
+                      "width": 1,
+                      "le": 6
+                    },
+                    {
+                      "name": "attributes",
+                      "offset": 1,
+                      "width": 1,
+                      "le": 0
+                    },
+                    {
+                      "name": "timestamp_zigzag",
+                      "offset": 2,
+                      "width": 1,
+                      "le": 3
+                    },
+                    {
+                      "name": "logical_delta_varint",
+                      "offset": 3,
+                      "width": 1,
+                      "le": 3
+                    },
+                    {
+                      "name": "null_key_zigzag",
+                      "offset": 4,
+                      "width": 1,
+                      "le": 1
+                    },
+                    {
+                      "name": "empty_value_zigzag",
+                      "offset": 5,
+                      "width": 1,
+                      "le": 0
+                    },
+                    {
+                      "name": "header_count_varint",
+                      "offset": 6,
+                      "width": 1,
+                      "le": 0
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "segment_header",
+      "path": "segment_header.hex",
+      "size": 512,
+      "fields": [
+        {
+          "name": "magic",
+          "offset": 0,
+          "width": 4,
+          "hex": "4b514246"
+        },
+        {
+          "name": "family",
+          "offset": 4,
+          "width": 2,
+          "le": 3
+        },
+        {
+          "name": "writer_version",
+          "offset": 6,
+          "width": 2,
+          "le": 1
+        },
+        {
+          "name": "minimum_reader",
+          "offset": 8,
+          "width": 2,
+          "le": 1
+        },
+        {
+          "name": "header_bytes",
+          "offset": 10,
+          "width": 2,
+          "le": 32
+        },
+        {
+          "name": "body_bytes",
+          "offset": 12,
+          "width": 4,
+          "le": 480
+        },
+        {
+          "name": "required_features",
+          "offset": 16,
+          "width": 8,
+          "le": 0
+        },
+        {
+          "name": "body_crc32c",
+          "offset": 24,
+          "width": 4,
+          "le": 1563983165
+        },
+        {
+          "name": "header_crc32c",
+          "offset": 28,
+          "width": 4,
+          "le": 1111191369
+        },
+        {
+          "name": "body",
+          "offset": 32,
+          "width": 480,
+          "fields": [
+            {
+              "name": "context",
+              "offset": 0,
+              "width": 72,
+              "fields": [
+                {
+                  "name": "cluster",
+                  "offset": 0,
+                  "width": 16,
+                  "hex": "50505050505050505050505050505050"
+                },
+                {
+                  "name": "topic",
+                  "offset": 16,
+                  "width": 16,
+                  "hex": "10101010101010101010101010101010"
+                },
+                {
+                  "name": "range",
+                  "offset": 32,
+                  "width": 16,
+                  "hex": "20202020202020202020202020202020"
+                },
+                {
+                  "name": "segment",
+                  "offset": 48,
+                  "width": 16,
+                  "hex": "30303030303030303030303030303030"
+                },
+                {
+                  "name": "generation",
+                  "offset": 64,
+                  "width": 8,
+                  "le": 1
+                }
+              ]
+            },
+            {
+              "name": "logical_origin",
+              "offset": 72,
+              "width": 8,
+              "le": 100
+            },
+            {
+              "name": "storage_profile",
+              "offset": 80,
+              "width": 2,
+              "le": 1
+            },
+            {
+              "name": "record_profile",
+              "offset": 82,
+              "width": 2,
+              "le": 1
+            },
+            {
+              "name": "alignment",
+              "offset": 84,
+              "width": 4,
+              "le": 512
+            },
+            {
+              "name": "padding_bytes",
+              "offset": 88,
+              "width": 4,
+              "le": 384
+            },
+            {
+              "name": "reserved",
+              "offset": 92,
+              "width": 4,
+              "zero": true
+            },
+            {
+              "name": "alignment_padding",
+              "offset": 96,
+              "width": 384,
+              "zero": true
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "segment_block",
+      "path": "segment_block.hex",
+      "size": 512,
+      "fields": [
+        {
+          "name": "magic",
+          "offset": 0,
+          "width": 4,
+          "hex": "4b514246"
+        },
+        {
+          "name": "family",
+          "offset": 4,
+          "width": 2,
+          "le": 4
+        },
+        {
+          "name": "writer_version",
+          "offset": 6,
+          "width": 2,
+          "le": 1
+        },
+        {
+          "name": "minimum_reader",
+          "offset": 8,
+          "width": 2,
+          "le": 1
+        },
+        {
+          "name": "header_bytes",
+          "offset": 10,
+          "width": 2,
+          "le": 32
+        },
+        {
+          "name": "body_bytes",
+          "offset": 12,
+          "width": 4,
+          "le": 480
+        },
+        {
+          "name": "required_features",
+          "offset": 16,
+          "width": 8,
+          "le": 0
+        },
+        {
+          "name": "body_crc32c",
+          "offset": 24,
+          "width": 4,
+          "le": 1984691835
+        },
+        {
+          "name": "header_crc32c",
+          "offset": 28,
+          "width": 4,
+          "le": 802502107
+        },
+        {
+          "name": "body",
+          "offset": 32,
+          "width": 480,
+          "fields": [
+            {
+              "name": "context",
+              "offset": 0,
+              "width": 72,
+              "fields": [
+                {
+                  "name": "cluster",
+                  "offset": 0,
+                  "width": 16,
+                  "hex": "50505050505050505050505050505050"
+                },
+                {
+                  "name": "topic",
+                  "offset": 16,
+                  "width": 16,
+                  "hex": "10101010101010101010101010101010"
+                },
+                {
+                  "name": "range",
+                  "offset": 32,
+                  "width": 16,
+                  "hex": "20202020202020202020202020202020"
+                },
+                {
+                  "name": "segment",
+                  "offset": 48,
+                  "width": 16,
+                  "hex": "30303030303030303030303030303030"
+                },
+                {
+                  "name": "generation",
+                  "offset": 64,
+                  "width": 8,
+                  "le": 1
+                }
+              ]
+            },
+            {
+              "name": "block_position",
+              "offset": 72,
+              "width": 8,
+              "le": 512
+            },
+            {
+              "name": "physical_begin",
+              "offset": 80,
+              "width": 8,
+              "le": 0
+            },
+            {
+              "name": "physical_end",
+              "offset": 88,
+              "width": 8,
+              "le": 1
+            },
+            {
+              "name": "logical_begin",
+              "offset": 96,
+              "width": 8,
+              "le": 100
+            },
+            {
+              "name": "logical_end",
+              "offset": 104,
+              "width": 8,
+              "le": 101
+            },
+            {
+              "name": "assigned_bytes",
+              "offset": 112,
+              "width": 4,
+              "le": 223
+            },
+            {
+              "name": "padding_bytes",
+              "offset": 116,
+              "width": 4,
+              "le": 137
+            },
+            {
+              "name": "assigned_batch",
+              "offset": 120,
+              "width": 223,
+              "fixture": "assigned_dense"
+            },
+            {
+              "name": "alignment_padding",
+              "offset": 343,
+              "width": 137,
+              "zero": true
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "extent_digest",
+      "path": "extent_digest.hex",
+      "size": 32,
+      "fields": [
+        {
+          "name": "sha256",
+          "offset": 0,
+          "width": 32,
+          "hex": "4bacf574184ef2d1218c77affe027f49ade8655632c335a34e093bc2bc9913ef"
+        }
+      ]
+    },
+    {
+      "name": "wal_prepare",
+      "path": "wal_prepare.hex",
+      "size": 512,
+      "fields": [
+        {
+          "name": "magic",
+          "offset": 0,
+          "width": 4,
+          "hex": "4b514246"
+        },
+        {
+          "name": "family",
+          "offset": 4,
+          "width": 2,
+          "le": 5
+        },
+        {
+          "name": "writer_version",
+          "offset": 6,
+          "width": 2,
+          "le": 1
+        },
+        {
+          "name": "minimum_reader",
+          "offset": 8,
+          "width": 2,
+          "le": 1
+        },
+        {
+          "name": "header_bytes",
+          "offset": 10,
+          "width": 2,
+          "le": 32
+        },
+        {
+          "name": "body_bytes",
+          "offset": 12,
+          "width": 4,
+          "le": 480
+        },
+        {
+          "name": "required_features",
+          "offset": 16,
+          "width": 8,
+          "le": 0
+        },
+        {
+          "name": "body_crc32c",
+          "offset": 24,
+          "width": 4,
+          "le": 311132255
+        },
+        {
+          "name": "header_crc32c",
+          "offset": 28,
+          "width": 4,
+          "le": 2668743452
+        },
+        {
+          "name": "body",
+          "offset": 32,
+          "width": 480,
+          "fields": [
+            {
+              "name": "wal_incarnation",
+              "offset": 0,
+              "width": 16,
+              "hex": "70707070707070707070707070707070"
+            },
+            {
+              "name": "wal_position",
+              "offset": 16,
+              "width": 8,
+              "le": 0
+            },
+            {
+              "name": "target_context",
+              "offset": 24,
+              "width": 72,
+              "fields": [
+                {
+                  "name": "cluster",
+                  "offset": 0,
+                  "width": 16,
+                  "hex": "50505050505050505050505050505050"
+                },
+                {
+                  "name": "topic",
+                  "offset": 16,
+                  "width": 16,
+                  "hex": "10101010101010101010101010101010"
+                },
+                {
+                  "name": "range",
+                  "offset": 32,
+                  "width": 16,
+                  "hex": "20202020202020202020202020202020"
+                },
+                {
+                  "name": "segment",
+                  "offset": 48,
+                  "width": 16,
+                  "hex": "30303030303030303030303030303030"
+                },
+                {
+                  "name": "generation",
+                  "offset": 64,
+                  "width": 8,
+                  "le": 1
+                }
+              ]
+            },
+            {
+              "name": "routing_epoch",
+              "offset": 96,
+              "width": 8,
+              "le": 1
+            },
+            {
+              "name": "physical_begin",
+              "offset": 104,
+              "width": 8,
+              "le": 0
+            },
+            {
+              "name": "segment_position",
+              "offset": 112,
+              "width": 8,
+              "le": 512
+            },
+            {
+              "name": "wal_alignment",
+              "offset": 120,
+              "width": 4,
+              "le": 512
+            },
+            {
+              "name": "replay_profile",
+              "offset": 124,
+              "width": 2,
+              "le": 1
+            },
+            {
+              "name": "reserved",
+              "offset": 126,
+              "width": 2,
+              "zero": true
+            },
+            {
+              "name": "assigned_bytes",
+              "offset": 128,
+              "width": 4,
+              "le": 223
+            },
+            {
+              "name": "padding_bytes",
+              "offset": 132,
+              "width": 4,
+              "le": 121
+            },
+            {
+              "name": "assigned_batch",
+              "offset": 136,
+              "width": 223,
+              "fixture": "assigned_dense"
+            },
+            {
+              "name": "alignment_padding",
+              "offset": 359,
+              "width": 121,
+              "zero": true
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "durable_footer",
+      "path": "durable_footer.hex",
+      "size": 512,
+      "fields": [
+        {
+          "name": "magic",
+          "offset": 0,
+          "width": 4,
+          "hex": "4b514246"
+        },
+        {
+          "name": "family",
+          "offset": 4,
+          "width": 2,
+          "le": 6
+        },
+        {
+          "name": "writer_version",
+          "offset": 6,
+          "width": 2,
+          "le": 1
+        },
+        {
+          "name": "minimum_reader",
+          "offset": 8,
+          "width": 2,
+          "le": 1
+        },
+        {
+          "name": "header_bytes",
+          "offset": 10,
+          "width": 2,
+          "le": 32
+        },
+        {
+          "name": "body_bytes",
+          "offset": 12,
+          "width": 4,
+          "le": 480
+        },
+        {
+          "name": "required_features",
+          "offset": 16,
+          "width": 8,
+          "le": 0
+        },
+        {
+          "name": "body_crc32c",
+          "offset": 24,
+          "width": 4,
+          "le": 1569560526
+        },
+        {
+          "name": "header_crc32c",
+          "offset": 28,
+          "width": 4,
+          "le": 923758758
+        },
+        {
+          "name": "body",
+          "offset": 32,
+          "width": 480,
+          "fields": [
+            {
+              "name": "context",
+              "offset": 0,
+              "width": 72,
+              "fields": [
+                {
+                  "name": "cluster",
+                  "offset": 0,
+                  "width": 16,
+                  "hex": "50505050505050505050505050505050"
+                },
+                {
+                  "name": "topic",
+                  "offset": 16,
+                  "width": 16,
+                  "hex": "10101010101010101010101010101010"
+                },
+                {
+                  "name": "range",
+                  "offset": 32,
+                  "width": 16,
+                  "hex": "20202020202020202020202020202020"
+                },
+                {
+                  "name": "segment",
+                  "offset": 48,
+                  "width": 16,
+                  "hex": "30303030303030303030303030303030"
+                },
+                {
+                  "name": "generation",
+                  "offset": 64,
+                  "width": 8,
+                  "le": 1
+                }
+              ]
+            },
+            {
+              "name": "footer_position",
+              "offset": 72,
+              "width": 8,
+              "le": 1536
+            },
+            {
+              "name": "coverage",
+              "offset": 80,
+              "width": 48,
+              "fields": [
+                {
+                  "name": "logical_begin",
+                  "offset": 0,
+                  "width": 8,
+                  "le": 100
+                },
+                {
+                  "name": "logical_end",
+                  "offset": 8,
+                  "width": 8,
+                  "le": 101
+                },
+                {
+                  "name": "physical_begin",
+                  "offset": 16,
+                  "width": 8,
+                  "le": 0
+                },
+                {
+                  "name": "physical_end",
+                  "offset": 24,
+                  "width": 8,
+                  "le": 1
+                },
+                {
+                  "name": "bytes_begin",
+                  "offset": 32,
+                  "width": 8,
+                  "le": 512
+                },
+                {
+                  "name": "bytes_end",
+                  "offset": 40,
+                  "width": 8,
+                  "le": 1024
+                }
+              ]
+            },
+            {
+              "name": "block_count",
+              "offset": 128,
+              "width": 4,
+              "le": 1
+            },
+            {
+              "name": "last_block_present",
+              "offset": 132,
+              "width": 1,
+              "le": 1
+            },
+            {
+              "name": "reserved",
+              "offset": 133,
+              "width": 3,
+              "zero": true
+            },
+            {
+              "name": "last_block",
+              "offset": 136,
+              "width": 48,
+              "fields": [
+                {
+                  "name": "logical_begin",
+                  "offset": 0,
+                  "width": 8,
+                  "le": 100
+                },
+                {
+                  "name": "logical_end",
+                  "offset": 8,
+                  "width": 8,
+                  "le": 101
+                },
+                {
+                  "name": "physical_begin",
+                  "offset": 16,
+                  "width": 8,
+                  "le": 0
+                },
+                {
+                  "name": "physical_end",
+                  "offset": 24,
+                  "width": 8,
+                  "le": 1
+                },
+                {
+                  "name": "bytes_begin",
+                  "offset": 32,
+                  "width": 8,
+                  "le": 512
+                },
+                {
+                  "name": "bytes_end",
+                  "offset": 40,
+                  "width": 8,
+                  "le": 1024
+                }
+              ]
+            },
+            {
+              "name": "data_crc32c",
+              "offset": 184,
+              "width": 4,
+              "le": 270303200
+            },
+            {
+              "name": "padding_bytes",
+              "offset": 188,
+              "width": 4,
+              "le": 288
+            },
+            {
+              "name": "alignment_padding",
+              "offset": 192,
+              "width": 288,
+              "zero": true
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "retry_page",
+      "path": "retry_page.hex",
+      "size": 512,
+      "fields": [
+        {
+          "name": "magic",
+          "offset": 0,
+          "width": 4,
+          "hex": "4b514246"
+        },
+        {
+          "name": "family",
+          "offset": 4,
+          "width": 2,
+          "le": 7
+        },
+        {
+          "name": "writer_version",
+          "offset": 6,
+          "width": 2,
+          "le": 1
+        },
+        {
+          "name": "minimum_reader",
+          "offset": 8,
+          "width": 2,
+          "le": 1
+        },
+        {
+          "name": "header_bytes",
+          "offset": 10,
+          "width": 2,
+          "le": 32
+        },
+        {
+          "name": "body_bytes",
+          "offset": 12,
+          "width": 4,
+          "le": 480
+        },
+        {
+          "name": "required_features",
+          "offset": 16,
+          "width": 8,
+          "le": 0
+        },
+        {
+          "name": "body_crc32c",
+          "offset": 24,
+          "width": 4,
+          "le": 3259066529
+        },
+        {
+          "name": "header_crc32c",
+          "offset": 28,
+          "width": 4,
+          "le": 185015207
+        },
+        {
+          "name": "body",
+          "offset": 32,
+          "width": 480,
+          "fields": [
+            {
+              "name": "subkind",
+              "offset": 0,
+              "width": 2,
+              "le": 2
+            },
+            {
+              "name": "reserved",
+              "offset": 2,
+              "width": 2,
+              "zero": true
+            },
+            {
+              "name": "context",
+              "offset": 4,
+              "width": 72,
+              "fields": [
+                {
+                  "name": "cluster",
+                  "offset": 0,
+                  "width": 16,
+                  "hex": "50505050505050505050505050505050"
+                },
+                {
+                  "name": "topic",
+                  "offset": 16,
+                  "width": 16,
+                  "hex": "10101010101010101010101010101010"
+                },
+                {
+                  "name": "range",
+                  "offset": 32,
+                  "width": 16,
+                  "hex": "20202020202020202020202020202020"
+                },
+                {
+                  "name": "segment",
+                  "offset": 48,
+                  "width": 16,
+                  "hex": "30303030303030303030303030303030"
+                },
+                {
+                  "name": "generation",
+                  "offset": 64,
+                  "width": 8,
+                  "le": 1
+                }
+              ]
+            },
+            {
+              "name": "sealed_position",
+              "offset": 76,
+              "width": 8,
+              "le": 1536
+            },
+            {
+              "name": "ordinal",
+              "offset": 84,
+              "width": 4,
+              "le": 0
+            },
+            {
+              "name": "first_entry",
+              "offset": 88,
+              "width": 4,
+              "le": 0
+            },
+            {
+              "name": "entry_count",
+              "offset": 92,
+              "width": 4,
+              "le": 1
+            },
+            {
+              "name": "padding_bytes",
+              "offset": 96,
+              "width": 4,
+              "le": 220
+            },
+            {
+              "name": "completed_result",
+              "offset": 100,
+              "width": 160,
+              "fields": [
+                {
+                  "name": "id",
+                  "offset": 0,
+                  "width": 40,
+                  "fields": [
+                    {
+                      "name": "producer",
+                      "offset": 0,
+                      "width": 16,
+                      "hex": "40404040404040404040404040404040"
+                    },
+                    {
+                      "name": "producer_epoch",
+                      "offset": 16,
+                      "width": 8,
+                      "le": 1
+                    },
+                    {
+                      "name": "producer_stream",
+                      "offset": 24,
+                      "width": 8,
+                      "le": 1
+                    },
+                    {
+                      "name": "batch_sequence",
+                      "offset": 32,
+                      "width": 8,
+                      "le": 0
+                    }
+                  ]
+                },
+                {
+                  "name": "submitted_digest",
+                  "offset": 40,
+                  "width": 32,
+                  "fixture": "batch_digest"
+                },
+                {
+                  "name": "original_binding",
+                  "offset": 72,
+                  "width": 64,
+                  "fields": [
+                    {
+                      "name": "topic",
+                      "offset": 0,
+                      "width": 16,
+                      "hex": "10101010101010101010101010101010"
+                    },
+                    {
+                      "name": "range",
+                      "offset": 16,
+                      "width": 16,
+                      "hex": "20202020202020202020202020202020"
+                    },
+                    {
+                      "name": "routing_epoch",
+                      "offset": 32,
+                      "width": 8,
+                      "le": 1
+                    },
+                    {
+                      "name": "original_segment",
+                      "offset": 40,
+                      "width": 16,
+                      "hex": "30303030303030303030303030303030"
+                    },
+                    {
+                      "name": "original_generation",
+                      "offset": 56,
+                      "width": 8,
+                      "le": 1
+                    }
+                  ]
+                },
+                {
+                  "name": "returned_begin",
+                  "offset": 136,
+                  "width": 8,
+                  "le": 100
+                },
+                {
+                  "name": "returned_end",
+                  "offset": 144,
+                  "width": 8,
+                  "le": 101
+                },
+                {
+                  "name": "ack_generation",
+                  "offset": 152,
+                  "width": 8,
+                  "le": 1
+                }
+              ]
+            },
+            {
+              "name": "alignment_padding",
+              "offset": 260,
+              "width": 220,
+              "zero": true
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "sealed_footer",
+      "path": "sealed_footer.hex",
+      "size": 512,
+      "fields": [
+        {
+          "name": "magic",
+          "offset": 0,
+          "width": 4,
+          "hex": "4b514246"
+        },
+        {
+          "name": "family",
+          "offset": 4,
+          "width": 2,
+          "le": 7
+        },
+        {
+          "name": "writer_version",
+          "offset": 6,
+          "width": 2,
+          "le": 1
+        },
+        {
+          "name": "minimum_reader",
+          "offset": 8,
+          "width": 2,
+          "le": 1
+        },
+        {
+          "name": "header_bytes",
+          "offset": 10,
+          "width": 2,
+          "le": 32
+        },
+        {
+          "name": "body_bytes",
+          "offset": 12,
+          "width": 4,
+          "le": 480
+        },
+        {
+          "name": "required_features",
+          "offset": 16,
+          "width": 8,
+          "le": 0
+        },
+        {
+          "name": "body_crc32c",
+          "offset": 24,
+          "width": 4,
+          "le": 319414920
+        },
+        {
+          "name": "header_crc32c",
+          "offset": 28,
+          "width": 4,
+          "le": 3867631501
+        },
+        {
+          "name": "body",
+          "offset": 32,
+          "width": 480,
+          "fields": [
+            {
+              "name": "subkind",
+              "offset": 0,
+              "width": 2,
+              "le": 1
+            },
+            {
+              "name": "reserved",
+              "offset": 2,
+              "width": 2,
+              "zero": true
+            },
+            {
+              "name": "context",
+              "offset": 4,
+              "width": 72,
+              "fields": [
+                {
+                  "name": "cluster",
+                  "offset": 0,
+                  "width": 16,
+                  "hex": "50505050505050505050505050505050"
+                },
+                {
+                  "name": "topic",
+                  "offset": 16,
+                  "width": 16,
+                  "hex": "10101010101010101010101010101010"
+                },
+                {
+                  "name": "range",
+                  "offset": 32,
+                  "width": 16,
+                  "hex": "20202020202020202020202020202020"
+                },
+                {
+                  "name": "segment",
+                  "offset": 48,
+                  "width": 16,
+                  "hex": "30303030303030303030303030303030"
+                },
+                {
+                  "name": "generation",
+                  "offset": 64,
+                  "width": 8,
+                  "le": 1
+                }
+              ]
+            },
+            {
+              "name": "footer_position",
+              "offset": 76,
+              "width": 8,
+              "le": 1536
+            },
+            {
+              "name": "coverage",
+              "offset": 84,
+              "width": 48,
+              "fields": [
+                {
+                  "name": "logical_begin",
+                  "offset": 0,
+                  "width": 8,
+                  "le": 100
+                },
+                {
+                  "name": "logical_end",
+                  "offset": 8,
+                  "width": 8,
+                  "le": 101
+                },
+                {
+                  "name": "physical_begin",
+                  "offset": 16,
+                  "width": 8,
+                  "le": 0
+                },
+                {
+                  "name": "physical_end",
+                  "offset": 24,
+                  "width": 8,
+                  "le": 1
+                },
+                {
+                  "name": "bytes_begin",
+                  "offset": 32,
+                  "width": 8,
+                  "le": 512
+                },
+                {
+                  "name": "bytes_end",
+                  "offset": 40,
+                  "width": 8,
+                  "le": 1024
+                }
+              ]
+            },
+            {
+              "name": "block_count",
+              "offset": 132,
+              "width": 4,
+              "le": 1
+            },
+            {
+              "name": "last_block_present",
+              "offset": 136,
+              "width": 1,
+              "le": 1
+            },
+            {
+              "name": "reserved_last",
+              "offset": 137,
+              "width": 3,
+              "zero": true
+            },
+            {
+              "name": "last_block",
+              "offset": 140,
+              "width": 48,
+              "fields": [
+                {
+                  "name": "logical_begin",
+                  "offset": 0,
+                  "width": 8,
+                  "le": 100
+                },
+                {
+                  "name": "logical_end",
+                  "offset": 8,
+                  "width": 8,
+                  "le": 101
+                },
+                {
+                  "name": "physical_begin",
+                  "offset": 16,
+                  "width": 8,
+                  "le": 0
+                },
+                {
+                  "name": "physical_end",
+                  "offset": 24,
+                  "width": 8,
+                  "le": 1
+                },
+                {
+                  "name": "bytes_begin",
+                  "offset": 32,
+                  "width": 8,
+                  "le": 512
+                },
+                {
+                  "name": "bytes_end",
+                  "offset": 40,
+                  "width": 8,
+                  "le": 1024
+                }
+              ]
+            },
+            {
+              "name": "extent_digest",
+              "offset": 188,
+              "width": 32,
+              "fixture": "extent_digest"
+            },
+            {
+              "name": "retry_count",
+              "offset": 220,
+              "width": 4,
+              "le": 1
+            },
+            {
+              "name": "page_count",
+              "offset": 224,
+              "width": 4,
+              "le": 1
+            },
+            {
+              "name": "padding_bytes",
+              "offset": 228,
+              "width": 4,
+              "le": 200
+            },
+            {
+              "name": "page_ref",
+              "offset": 232,
+              "width": 48,
+              "fields": [
+                {
+                  "name": "ordinal",
+                  "offset": 0,
+                  "width": 4,
+                  "le": 0
+                },
+                {
+                  "name": "first_entry",
+                  "offset": 4,
+                  "width": 4,
+                  "le": 0
+                },
+                {
+                  "name": "entry_count",
+                  "offset": 8,
+                  "width": 4,
+                  "le": 1
+                },
+                {
+                  "name": "encoded_bytes",
+                  "offset": 12,
+                  "width": 4,
+                  "le": 512
+                },
+                {
+                  "name": "sha256",
+                  "offset": 16,
+                  "width": 32,
+                  "hex": "aaeebc8455f2e54711a569bde4951538dfe2a2fd24688562360530ce161e3906"
+                }
+              ]
+            },
+            {
+              "name": "alignment_padding",
+              "offset": 280,
+              "width": 200,
+              "zero": true
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "index_page",
+      "path": "index_page.hex",
+      "size": 512,
+      "fields": [
+        {
+          "name": "magic",
+          "offset": 0,
+          "width": 4,
+          "hex": "4b514246"
+        },
+        {
+          "name": "family",
+          "offset": 4,
+          "width": 2,
+          "le": 8
+        },
+        {
+          "name": "writer_version",
+          "offset": 6,
+          "width": 2,
+          "le": 1
+        },
+        {
+          "name": "minimum_reader",
+          "offset": 8,
+          "width": 2,
+          "le": 1
+        },
+        {
+          "name": "header_bytes",
+          "offset": 10,
+          "width": 2,
+          "le": 32
+        },
+        {
+          "name": "body_bytes",
+          "offset": 12,
+          "width": 4,
+          "le": 480
+        },
+        {
+          "name": "required_features",
+          "offset": 16,
+          "width": 8,
+          "le": 0
+        },
+        {
+          "name": "body_crc32c",
+          "offset": 24,
+          "width": 4,
+          "le": 1732774874
+        },
+        {
+          "name": "header_crc32c",
+          "offset": 28,
+          "width": 4,
+          "le": 3189953167
+        },
+        {
+          "name": "body",
+          "offset": 32,
+          "width": 480,
+          "fields": [
+            {
+              "name": "subkind",
+              "offset": 0,
+              "width": 2,
+              "le": 2
+            },
+            {
+              "name": "reserved",
+              "offset": 2,
+              "width": 2,
+              "zero": true
+            },
+            {
+              "name": "context",
+              "offset": 4,
+              "width": 72,
+              "fields": [
+                {
+                  "name": "cluster",
+                  "offset": 0,
+                  "width": 16,
+                  "hex": "50505050505050505050505050505050"
+                },
+                {
+                  "name": "topic",
+                  "offset": 16,
+                  "width": 16,
+                  "hex": "10101010101010101010101010101010"
+                },
+                {
+                  "name": "range",
+                  "offset": 32,
+                  "width": 16,
+                  "hex": "20202020202020202020202020202020"
+                },
+                {
+                  "name": "segment",
+                  "offset": 48,
+                  "width": 16,
+                  "hex": "30303030303030303030303030303030"
+                },
+                {
+                  "name": "generation",
+                  "offset": 64,
+                  "width": 8,
+                  "le": 1
+                }
+              ]
+            },
+            {
+              "name": "coverage",
+              "offset": 76,
+              "width": 48,
+              "fields": [
+                {
+                  "name": "logical_begin",
+                  "offset": 0,
+                  "width": 8,
+                  "le": 100
+                },
+                {
+                  "name": "logical_end",
+                  "offset": 8,
+                  "width": 8,
+                  "le": 101
+                },
+                {
+                  "name": "physical_begin",
+                  "offset": 16,
+                  "width": 8,
+                  "le": 0
+                },
+                {
+                  "name": "physical_end",
+                  "offset": 24,
+                  "width": 8,
+                  "le": 1
+                },
+                {
+                  "name": "bytes_begin",
+                  "offset": 32,
+                  "width": 8,
+                  "le": 512
+                },
+                {
+                  "name": "bytes_end",
+                  "offset": 40,
+                  "width": 8,
+                  "le": 1024
+                }
+              ]
+            },
+            {
+              "name": "extent_digest",
+              "offset": 124,
+              "width": 32,
+              "fixture": "extent_digest"
+            },
+            {
+              "name": "ordinal",
+              "offset": 156,
+              "width": 4,
+              "le": 0
+            },
+            {
+              "name": "first_entry",
+              "offset": 160,
+              "width": 4,
+              "le": 0
+            },
+            {
+              "name": "entry_count",
+              "offset": 164,
+              "width": 4,
+              "le": 1
+            },
+            {
+              "name": "padding_bytes",
+              "offset": 168,
+              "width": 4,
+              "le": 292
+            },
+            {
+              "name": "logical_anchor",
+              "offset": 172,
+              "width": 8,
+              "le": 100
+            },
+            {
+              "name": "block_position",
+              "offset": 180,
+              "width": 8,
+              "le": 512
+            },
+            {
+              "name": "alignment_padding",
+              "offset": 188,
+              "width": 292,
+              "zero": true
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "index_root",
+      "path": "index_root.hex",
+      "size": 512,
+      "fields": [
+        {
+          "name": "magic",
+          "offset": 0,
+          "width": 4,
+          "hex": "4b514246"
+        },
+        {
+          "name": "family",
+          "offset": 4,
+          "width": 2,
+          "le": 8
+        },
+        {
+          "name": "writer_version",
+          "offset": 6,
+          "width": 2,
+          "le": 1
+        },
+        {
+          "name": "minimum_reader",
+          "offset": 8,
+          "width": 2,
+          "le": 1
+        },
+        {
+          "name": "header_bytes",
+          "offset": 10,
+          "width": 2,
+          "le": 32
+        },
+        {
+          "name": "body_bytes",
+          "offset": 12,
+          "width": 4,
+          "le": 480
+        },
+        {
+          "name": "required_features",
+          "offset": 16,
+          "width": 8,
+          "le": 0
+        },
+        {
+          "name": "body_crc32c",
+          "offset": 24,
+          "width": 4,
+          "le": 594354744
+        },
+        {
+          "name": "header_crc32c",
+          "offset": 28,
+          "width": 4,
+          "le": 453762261
+        },
+        {
+          "name": "body",
+          "offset": 32,
+          "width": 480,
+          "fields": [
+            {
+              "name": "subkind",
+              "offset": 0,
+              "width": 2,
+              "le": 1
+            },
+            {
+              "name": "reserved",
+              "offset": 2,
+              "width": 2,
+              "zero": true
+            },
+            {
+              "name": "context",
+              "offset": 4,
+              "width": 72,
+              "fields": [
+                {
+                  "name": "cluster",
+                  "offset": 0,
+                  "width": 16,
+                  "hex": "50505050505050505050505050505050"
+                },
+                {
+                  "name": "topic",
+                  "offset": 16,
+                  "width": 16,
+                  "hex": "10101010101010101010101010101010"
+                },
+                {
+                  "name": "range",
+                  "offset": 32,
+                  "width": 16,
+                  "hex": "20202020202020202020202020202020"
+                },
+                {
+                  "name": "segment",
+                  "offset": 48,
+                  "width": 16,
+                  "hex": "30303030303030303030303030303030"
+                },
+                {
+                  "name": "generation",
+                  "offset": 64,
+                  "width": 8,
+                  "le": 1
+                }
+              ]
+            },
+            {
+              "name": "coverage",
+              "offset": 76,
+              "width": 48,
+              "fields": [
+                {
+                  "name": "logical_begin",
+                  "offset": 0,
+                  "width": 8,
+                  "le": 100
+                },
+                {
+                  "name": "logical_end",
+                  "offset": 8,
+                  "width": 8,
+                  "le": 101
+                },
+                {
+                  "name": "physical_begin",
+                  "offset": 16,
+                  "width": 8,
+                  "le": 0
+                },
+                {
+                  "name": "physical_end",
+                  "offset": 24,
+                  "width": 8,
+                  "le": 1
+                },
+                {
+                  "name": "bytes_begin",
+                  "offset": 32,
+                  "width": 8,
+                  "le": 512
+                },
+                {
+                  "name": "bytes_end",
+                  "offset": 40,
+                  "width": 8,
+                  "le": 1024
+                }
+              ]
+            },
+            {
+              "name": "extent_digest",
+              "offset": 124,
+              "width": 32,
+              "fixture": "extent_digest"
+            },
+            {
+              "name": "entry_count",
+              "offset": 156,
+              "width": 4,
+              "le": 1
+            },
+            {
+              "name": "page_count",
+              "offset": 160,
+              "width": 4,
+              "le": 1
+            },
+            {
+              "name": "padding_bytes",
+              "offset": 164,
+              "width": 4,
+              "le": 264
+            },
+            {
+              "name": "page_ref",
+              "offset": 168,
+              "width": 48,
+              "fields": [
+                {
+                  "name": "ordinal",
+                  "offset": 0,
+                  "width": 4,
+                  "le": 0
+                },
+                {
+                  "name": "first_entry",
+                  "offset": 4,
+                  "width": 4,
+                  "le": 0
+                },
+                {
+                  "name": "entry_count",
+                  "offset": 8,
+                  "width": 4,
+                  "le": 1
+                },
+                {
+                  "name": "encoded_bytes",
+                  "offset": 12,
+                  "width": 4,
+                  "le": 512
+                },
+                {
+                  "name": "sha256",
+                  "offset": 16,
+                  "width": 32,
+                  "hex": "c9eb30df3b1d1c9d573e037d0acd5558758548cd971b1db4f8f5de744c290e09"
+                }
+              ]
+            },
+            {
+              "name": "alignment_padding",
+              "offset": 216,
+              "width": 264,
+              "zero": true
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "manifest_page",
+      "path": "manifest_page.hex",
+      "size": 512,
+      "fields": [
+        {
+          "name": "magic",
+          "offset": 0,
+          "width": 4,
+          "hex": "4b514246"
+        },
+        {
+          "name": "family",
+          "offset": 4,
+          "width": 2,
+          "le": 9
+        },
+        {
+          "name": "writer_version",
+          "offset": 6,
+          "width": 2,
+          "le": 1
+        },
+        {
+          "name": "minimum_reader",
+          "offset": 8,
+          "width": 2,
+          "le": 1
+        },
+        {
+          "name": "header_bytes",
+          "offset": 10,
+          "width": 2,
+          "le": 32
+        },
+        {
+          "name": "body_bytes",
+          "offset": 12,
+          "width": 4,
+          "le": 480
+        },
+        {
+          "name": "required_features",
+          "offset": 16,
+          "width": 8,
+          "le": 0
+        },
+        {
+          "name": "body_crc32c",
+          "offset": 24,
+          "width": 4,
+          "le": 4052171630
+        },
+        {
+          "name": "header_crc32c",
+          "offset": 28,
+          "width": 4,
+          "le": 2767816044
+        },
+        {
+          "name": "body",
+          "offset": 32,
+          "width": 480,
+          "fields": [
+            {
+              "name": "subkind",
+              "offset": 0,
+              "width": 2,
+              "le": 2
+            },
+            {
+              "name": "reserved",
+              "offset": 2,
+              "width": 2,
+              "zero": true
+            },
+            {
+              "name": "topic",
+              "offset": 4,
+              "width": 16,
+              "hex": "10101010101010101010101010101010"
+            },
+            {
+              "name": "range",
+              "offset": 20,
+              "width": 16,
+              "hex": "20202020202020202020202020202020"
+            },
+            {
+              "name": "manifest",
+              "offset": 36,
+              "width": 16,
+              "hex": "60606060606060606060606060606060"
+            },
+            {
+              "name": "manifest_generation",
+              "offset": 52,
+              "width": 8,
+              "le": 3
+            },
+            {
+              "name": "logical_begin",
+              "offset": 60,
+              "width": 8,
+              "le": 100
+            },
+            {
+              "name": "logical_end",
+              "offset": 68,
+              "width": 8,
+              "le": 101
+            },
+            {
+              "name": "ordinal",
+              "offset": 76,
+              "width": 4,
+              "le": 0
+            },
+            {
+              "name": "first_entry",
+              "offset": 80,
+              "width": 4,
+              "le": 0
+            },
+            {
+              "name": "entry_count",
+              "offset": 84,
+              "width": 4,
+              "le": 1
+            },
+            {
+              "name": "padding_bytes",
+              "offset": 88,
+              "width": 4,
+              "le": 284
+            },
+            {
+              "name": "entry",
+              "offset": 92,
+              "width": 104,
+              "fields": [
+                {
+                  "name": "logical_begin",
+                  "offset": 0,
+                  "width": 8,
+                  "le": 100
+                },
+                {
+                  "name": "logical_end",
+                  "offset": 8,
+                  "width": 8,
+                  "le": 101
+                },
+                {
+                  "name": "segment",
+                  "offset": 16,
+                  "width": 16,
+                  "hex": "30303030303030303030303030303030"
+                },
+                {
+                  "name": "generation",
+                  "offset": 32,
+                  "width": 8,
+                  "le": 1
+                },
+                {
+                  "name": "physical_begin",
+                  "offset": 40,
+                  "width": 8,
+                  "le": 0
+                },
+                {
+                  "name": "physical_end",
+                  "offset": 48,
+                  "width": 8,
+                  "le": 1
+                },
+                {
+                  "name": "bytes_begin",
+                  "offset": 56,
+                  "width": 8,
+                  "le": 512
+                },
+                {
+                  "name": "bytes_end",
+                  "offset": 64,
+                  "width": 8,
+                  "le": 1024
+                },
+                {
+                  "name": "extent_digest",
+                  "offset": 72,
+                  "width": 32,
+                  "fixture": "extent_digest"
+                }
+              ]
+            },
+            {
+              "name": "alignment_padding",
+              "offset": 196,
+              "width": 284,
+              "zero": true
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "manifest_root",
+      "path": "manifest_root.hex",
+      "size": 512,
+      "fields": [
+        {
+          "name": "magic",
+          "offset": 0,
+          "width": 4,
+          "hex": "4b514246"
+        },
+        {
+          "name": "family",
+          "offset": 4,
+          "width": 2,
+          "le": 9
+        },
+        {
+          "name": "writer_version",
+          "offset": 6,
+          "width": 2,
+          "le": 1
+        },
+        {
+          "name": "minimum_reader",
+          "offset": 8,
+          "width": 2,
+          "le": 1
+        },
+        {
+          "name": "header_bytes",
+          "offset": 10,
+          "width": 2,
+          "le": 32
+        },
+        {
+          "name": "body_bytes",
+          "offset": 12,
+          "width": 4,
+          "le": 480
+        },
+        {
+          "name": "required_features",
+          "offset": 16,
+          "width": 8,
+          "le": 0
+        },
+        {
+          "name": "body_crc32c",
+          "offset": 24,
+          "width": 4,
+          "le": 899054443
+        },
+        {
+          "name": "header_crc32c",
+          "offset": 28,
+          "width": 4,
+          "le": 551888697
+        },
+        {
+          "name": "body",
+          "offset": 32,
+          "width": 480,
+          "fields": [
+            {
+              "name": "subkind",
+              "offset": 0,
+              "width": 2,
+              "le": 1
+            },
+            {
+              "name": "reserved",
+              "offset": 2,
+              "width": 2,
+              "zero": true
+            },
+            {
+              "name": "topic",
+              "offset": 4,
+              "width": 16,
+              "hex": "10101010101010101010101010101010"
+            },
+            {
+              "name": "range",
+              "offset": 20,
+              "width": 16,
+              "hex": "20202020202020202020202020202020"
+            },
+            {
+              "name": "manifest",
+              "offset": 36,
+              "width": 16,
+              "hex": "60606060606060606060606060606060"
+            },
+            {
+              "name": "manifest_generation",
+              "offset": 52,
+              "width": 8,
+              "le": 3
+            },
+            {
+              "name": "logical_begin",
+              "offset": 60,
+              "width": 8,
+              "le": 100
+            },
+            {
+              "name": "logical_end",
+              "offset": 68,
+              "width": 8,
+              "le": 101
+            },
+            {
+              "name": "entry_count",
+              "offset": 76,
+              "width": 4,
+              "le": 1
+            },
+            {
+              "name": "page_count",
+              "offset": 80,
+              "width": 4,
+              "le": 1
+            },
+            {
+              "name": "padding_bytes",
+              "offset": 84,
+              "width": 4,
+              "le": 344
+            },
+            {
+              "name": "page_ref",
+              "offset": 88,
+              "width": 48,
+              "fields": [
+                {
+                  "name": "ordinal",
+                  "offset": 0,
+                  "width": 4,
+                  "le": 0
+                },
+                {
+                  "name": "first_entry",
+                  "offset": 4,
+                  "width": 4,
+                  "le": 0
+                },
+                {
+                  "name": "entry_count",
+                  "offset": 8,
+                  "width": 4,
+                  "le": 1
+                },
+                {
+                  "name": "encoded_bytes",
+                  "offset": 12,
+                  "width": 4,
+                  "le": 512
+                },
+                {
+                  "name": "sha256",
+                  "offset": 16,
+                  "width": 32,
+                  "hex": "5a9f913d499a5b7893e3c10973b322345d49891ffd20da68c2329c212ce94a85"
+                }
+              ]
+            },
+            {
+              "name": "alignment_padding",
+              "offset": 136,
+              "width": 344,
+              "zero": true
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "checkpoint",
+      "path": "checkpoint.hex",
+      "size": 100,
+      "fields": [
+        {
+          "name": "magic",
+          "offset": 0,
+          "width": 4,
+          "hex": "4b514246"
+        },
+        {
+          "name": "family",
+          "offset": 4,
+          "width": 2,
+          "le": 10
+        },
+        {
+          "name": "writer_version",
+          "offset": 6,
+          "width": 2,
+          "le": 1
+        },
+        {
+          "name": "minimum_reader",
+          "offset": 8,
+          "width": 2,
+          "le": 1
+        },
+        {
+          "name": "header_bytes",
+          "offset": 10,
+          "width": 2,
+          "le": 32
+        },
+        {
+          "name": "body_bytes",
+          "offset": 12,
+          "width": 4,
+          "le": 68
+        },
+        {
+          "name": "required_features",
+          "offset": 16,
+          "width": 8,
+          "le": 0
+        },
+        {
+          "name": "body_crc32c",
+          "offset": 24,
+          "width": 4,
+          "le": 3765219707
+        },
+        {
+          "name": "header_crc32c",
+          "offset": 28,
+          "width": 4,
+          "le": 4194360220
+        },
+        {
+          "name": "body",
+          "offset": 32,
+          "width": 68,
+          "fields": [
+            {
+              "name": "topic",
+              "offset": 0,
+              "width": 16,
+              "hex": "0102030405060708090a0b0c0d0e0f10"
+            },
+            {
+              "name": "cursor_count",
+              "offset": 16,
+              "width": 4,
+              "le": 2
+            },
+            {
+              "name": "cursor_1",
+              "offset": 20,
+              "width": 24,
+              "fields": [
+                {
+                  "name": "range",
+                  "offset": 0,
+                  "width": 16,
+                  "hex": "00000000000000000000000000000001"
+                },
+                {
+                  "name": "next",
+                  "offset": 16,
+                  "width": 8,
+                  "le": 0
+                }
+              ]
+            },
+            {
+              "name": "cursor_2",
+              "offset": 44,
+              "width": 24,
+              "fields": [
+                {
+                  "name": "range",
+                  "offset": 0,
+                  "width": 16,
+                  "hex": "00000000000000000000000000000002"
+                },
+                {
+                  "name": "next",
+                  "offset": 16,
+                  "width": 8,
+                  "le": 1
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "checkpoint_extended",
+      "path": "checkpoint_extended.hex",
+      "size": 109,
+      "fields": [
+        {
+          "name": "magic",
+          "offset": 0,
+          "width": 4,
+          "hex": "4b514246"
+        },
+        {
+          "name": "family",
+          "offset": 4,
+          "width": 2,
+          "le": 10
+        },
+        {
+          "name": "writer_version",
+          "offset": 6,
+          "width": 2,
+          "le": 2
+        },
+        {
+          "name": "minimum_reader",
+          "offset": 8,
+          "width": 2,
+          "le": 1
+        },
+        {
+          "name": "header_bytes",
+          "offset": 10,
+          "width": 2,
+          "le": 41
+        },
+        {
+          "name": "body_bytes",
+          "offset": 12,
+          "width": 4,
+          "le": 68
+        },
+        {
+          "name": "required_features",
+          "offset": 16,
+          "width": 8,
+          "le": 0
+        },
+        {
+          "name": "body_crc32c",
+          "offset": 24,
+          "width": 4,
+          "le": 3765219707
+        },
+        {
+          "name": "header_crc32c",
+          "offset": 28,
+          "width": 4,
+          "le": 2160038572
+        },
+        {
+          "name": "extension_tag",
+          "offset": 32,
+          "width": 2,
+          "le": 77
+        },
+        {
+          "name": "extension_flags",
+          "offset": 34,
+          "width": 2,
+          "le": 0
+        },
+        {
+          "name": "extension_bytes",
+          "offset": 36,
+          "width": 4,
+          "le": 1
+        },
+        {
+          "name": "extension_value",
+          "offset": 40,
+          "width": 1,
+          "hex": "78"
+        },
+        {
+          "name": "body",
+          "offset": 41,
+          "width": 68,
+          "fields": [
+            {
+              "name": "topic",
+              "offset": 0,
+              "width": 16,
+              "hex": "0102030405060708090a0b0c0d0e0f10"
+            },
+            {
+              "name": "cursor_count",
+              "offset": 16,
+              "width": 4,
+              "le": 2
+            },
+            {
+              "name": "cursor_1",
+              "offset": 20,
+              "width": 24,
+              "fields": [
+                {
+                  "name": "range",
+                  "offset": 0,
+                  "width": 16,
+                  "hex": "00000000000000000000000000000001"
+                },
+                {
+                  "name": "next",
+                  "offset": 16,
+                  "width": 8,
+                  "le": 0
+                }
+              ]
+            },
+            {
+              "name": "cursor_2",
+              "offset": 44,
+              "width": 24,
+              "fields": [
+                {
+                  "name": "range",
+                  "offset": 0,
+                  "width": 16,
+                  "hex": "00000000000000000000000000000002"
+                },
+                {
+                  "name": "next",
+                  "offset": 16,
+                  "width": 8,
+                  "le": 1
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "checkpoint_digest",
+      "path": "checkpoint_digest.hex",
+      "size": 32,
+      "fields": [
+        {
+          "name": "sha256",
+          "offset": 0,
+          "width": 32,
+          "hex": "17accedcac8b0257accbfd9f5e864705f9137c4d0d5730e6e0a7967138d15223"
+        }
+      ]
+    },
+    {
+      "name": "lz4_raw_abc",
+      "path": "lz4_raw_abc.hex",
+      "size": 34,
+      "fields": [
+        {
+          "name": "magic",
+          "offset": 0,
+          "width": 4,
+          "hex": "04224d18"
+        },
+        {
+          "name": "flags",
+          "offset": 4,
+          "width": 1,
+          "le": 124
+        },
+        {
+          "name": "block_descriptor",
+          "offset": 5,
+          "width": 1,
+          "le": 64
+        },
+        {
+          "name": "content_size",
+          "offset": 6,
+          "width": 8,
+          "le": 3
+        },
+        {
+          "name": "header_xxh32_octet",
+          "offset": 14,
+          "width": 1,
+          "le": 116
+        },
+        {
+          "name": "raw_block_size",
+          "offset": 15,
+          "width": 4,
+          "le": 2147483651
+        },
+        {
+          "name": "content",
+          "offset": 19,
+          "width": 3,
+          "hex": "616263"
+        },
+        {
+          "name": "block_xxh32",
+          "offset": 22,
+          "width": 4,
+          "le": 852579327
+        },
+        {
+          "name": "end_marker",
+          "offset": 26,
+          "width": 4,
+          "le": 0
+        },
+        {
+          "name": "content_xxh32",
+          "offset": 30,
+          "width": 4,
+          "le": 852579327
+        }
+      ]
+    },
+    {
+      "name": "control_request",
+      "path": "control_request.hex",
+      "size": 54,
+      "fields": [
+        {
+          "name": "peer_kind",
+          "offset": 0,
+          "width": 2,
+          "fields": [
+            {
+              "name": "tag",
+              "offset": 0,
+              "width": 1,
+              "varint": 8
+            },
+            {
+              "name": "value",
+              "offset": 1,
+              "width": 1,
+              "varint": 2
+            }
+          ]
+        },
+        {
+          "name": "build",
+          "offset": 2,
+          "width": 2,
+          "fields": [
+            {
+              "name": "tag",
+              "offset": 0,
+              "width": 1,
+              "varint": 34
+            },
+            {
+              "name": "length",
+              "offset": 1,
+              "width": 1,
+              "varint": 0
+            }
+          ]
+        },
+        {
+          "name": "capabilities",
+          "offset": 4,
+          "width": 50,
+          "fields": [
+            {
+              "name": "tag",
+              "offset": 0,
+              "width": 1,
+              "varint": 42
+            },
+            {
+              "name": "length",
+              "offset": 1,
+              "width": 1,
+              "varint": 48
+            },
+            {
+              "name": "value",
+              "offset": 2,
+              "width": 48,
+              "fields": [
+                {
+                  "name": "versions",
+                  "offset": 0,
+                  "width": 4,
+                  "fields": [
+                    {
+                      "name": "tag",
+                      "offset": 0,
+                      "width": 1,
+                      "varint": 10
+                    },
+                    {
+                      "name": "length",
+                      "offset": 1,
+                      "width": 1,
+                      "varint": 2
+                    },
+                    {
+                      "name": "value",
+                      "offset": 2,
+                      "width": 2,
+                      "fields": [
+                        {
+                          "name": "first",
+                          "offset": 0,
+                          "width": 1,
+                          "varint": 1
+                        },
+                        {
+                          "name": "second",
+                          "offset": 1,
+                          "width": 1,
+                          "varint": 2
+                        }
+                      ]
+                    }
+                  ]
+                },
+                {
+                  "name": "format",
+                  "offset": 4,
+                  "width": 19,
+                  "fields": [
+                    {
+                      "name": "tag",
+                      "offset": 0,
+                      "width": 1,
+                      "varint": 18
+                    },
+                    {
+                      "name": "length",
+                      "offset": 1,
+                      "width": 1,
+                      "varint": 17
+                    },
+                    {
+                      "name": "value",
+                      "offset": 2,
+                      "width": 17,
+                      "fields": [
+                        {
+                          "name": "family",
+                          "offset": 0,
+                          "width": 4,
+                          "fields": [
+                            {
+                              "name": "tag",
+                              "offset": 0,
+                              "width": 1,
+                              "varint": 8
+                            },
+                            {
+                              "name": "value",
+                              "offset": 1,
+                              "width": 3,
+                              "varint": 65000
+                            }
+                          ]
+                        },
+                        {
+                          "name": "oldest_readable",
+                          "offset": 4,
+                          "width": 2,
+                          "fields": [
+                            {
+                              "name": "tag",
+                              "offset": 0,
+                              "width": 1,
+                              "varint": 16
+                            },
+                            {
+                              "name": "value",
+                              "offset": 1,
+                              "width": 1,
+                              "varint": 1
+                            }
+                          ]
+                        },
+                        {
+                          "name": "current",
+                          "offset": 6,
+                          "width": 2,
+                          "fields": [
+                            {
+                              "name": "tag",
+                              "offset": 0,
+                              "width": 1,
+                              "varint": 24
+                            },
+                            {
+                              "name": "value",
+                              "offset": 1,
+                              "width": 1,
+                              "varint": 9
+                            }
+                          ]
+                        },
+                        {
+                          "name": "features",
+                          "offset": 8,
+                          "width": 9,
+                          "fields": [
+                            {
+                              "name": "tag",
+                              "offset": 0,
+                              "width": 1,
+                              "le": 33
+                            },
+                            {
+                              "name": "mask",
+                              "offset": 1,
+                              "width": 8,
+                              "le": 9223372036854775808
+                            }
+                          ]
+                        }
+                      ]
+                    }
+                  ]
+                },
+                {
+                  "name": "codecs",
+                  "offset": 23,
+                  "width": 5,
+                  "fields": [
+                    {
+                      "name": "tag",
+                      "offset": 0,
+                      "width": 1,
+                      "varint": 26
+                    },
+                    {
+                      "name": "length",
+                      "offset": 1,
+                      "width": 1,
+                      "varint": 3
+                    },
+                    {
+                      "name": "value",
+                      "offset": 2,
+                      "width": 3,
+                      "fields": [
+                        {
+                          "name": "none",
+                          "offset": 0,
+                          "width": 1,
+                          "varint": 0
+                        },
+                        {
+                          "name": "future",
+                          "offset": 1,
+                          "width": 2,
+                          "varint": 255
+                        }
+                      ]
+                    }
+                  ]
+                },
+                {
+                  "name": "max_frame_body_bytes",
+                  "offset": 28,
+                  "width": 5,
+                  "fields": [
+                    {
+                      "name": "tag",
+                      "offset": 0,
+                      "width": 1,
+                      "varint": 32
+                    },
+                    {
+                      "name": "value",
+                      "offset": 1,
+                      "width": 4,
+                      "varint": 16777216
+                    }
+                  ]
+                },
+                {
+                  "name": "max_expanded_batch_bytes",
+                  "offset": 33,
+                  "width": 5,
+                  "fields": [
+                    {
+                      "name": "tag",
+                      "offset": 0,
+                      "width": 1,
+                      "varint": 40
+                    },
+                    {
+                      "name": "value",
+                      "offset": 1,
+                      "width": 4,
+                      "varint": 8388608
+                    }
+                  ]
+                },
+                {
+                  "name": "max_header_bytes",
+                  "offset": 38,
+                  "width": 3,
+                  "fields": [
+                    {
+                      "name": "tag",
+                      "offset": 0,
+                      "width": 1,
+                      "varint": 48
+                    },
+                    {
+                      "name": "value",
+                      "offset": 1,
+                      "width": 2,
+                      "varint": 4096
+                    }
+                  ]
+                },
+                {
+                  "name": "max_record_bytes",
+                  "offset": 41,
+                  "width": 4,
+                  "fields": [
+                    {
+                      "name": "tag",
+                      "offset": 0,
+                      "width": 1,
+                      "varint": 56
+                    },
+                    {
+                      "name": "value",
+                      "offset": 1,
+                      "width": 3,
+                      "varint": 1048576
+                    }
+                  ]
+                },
+                {
+                  "name": "max_original_records",
+                  "offset": 45,
+                  "width": 3,
+                  "fields": [
+                    {
+                      "name": "tag",
+                      "offset": 0,
+                      "width": 1,
+                      "varint": 64
+                    },
+                    {
+                      "name": "value",
+                      "offset": 1,
+                      "width": 2,
+                      "varint": 4096
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "control_response",
+      "path": "control_response.hex",
+      "size": 91,
+      "fields": [
+        {
+          "name": "cluster",
+          "offset": 0,
+          "width": 18,
+          "fields": [
+            {
+              "name": "tag",
+              "offset": 0,
+              "width": 1,
+              "varint": 10
+            },
+            {
+              "name": "length",
+              "offset": 1,
+              "width": 1,
+              "varint": 16
+            },
+            {
+              "name": "value",
+              "offset": 2,
+              "width": 16,
+              "fields": [
+                {
+                  "name": "id",
+                  "offset": 0,
+                  "width": 16,
+                  "hex": "63636363636363636363636363636363"
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "name": "broker",
+          "offset": 18,
+          "width": 18,
+          "fields": [
+            {
+              "name": "tag",
+              "offset": 0,
+              "width": 1,
+              "varint": 18
+            },
+            {
+              "name": "length",
+              "offset": 1,
+              "width": 1,
+              "varint": 16
+            },
+            {
+              "name": "value",
+              "offset": 2,
+              "width": 16,
+              "fields": [
+                {
+                  "name": "id",
+                  "offset": 0,
+                  "width": 16,
+                  "hex": "62626262626262626262626262626262"
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "name": "build",
+          "offset": 36,
+          "width": 5,
+          "fields": [
+            {
+              "name": "tag",
+              "offset": 0,
+              "width": 1,
+              "varint": 26
+            },
+            {
+              "name": "length",
+              "offset": 1,
+              "width": 1,
+              "varint": 3
+            },
+            {
+              "name": "value",
+              "offset": 2,
+              "width": 3,
+              "fields": [
+                {
+                  "name": "version",
+                  "offset": 0,
+                  "width": 3,
+                  "fields": [
+                    {
+                      "name": "tag",
+                      "offset": 0,
+                      "width": 1,
+                      "varint": 10
+                    },
+                    {
+                      "name": "length",
+                      "offset": 1,
+                      "width": 1,
+                      "varint": 1
+                    },
+                    {
+                      "name": "value",
+                      "offset": 2,
+                      "width": 1,
+                      "fields": [
+                        {
+                          "name": "text",
+                          "offset": 0,
+                          "width": 1,
+                          "hex": "76"
+                        }
+                      ]
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "name": "capabilities",
+          "offset": 41,
+          "width": 50,
+          "fields": [
+            {
+              "name": "tag",
+              "offset": 0,
+              "width": 1,
+              "varint": 34
+            },
+            {
+              "name": "length",
+              "offset": 1,
+              "width": 1,
+              "varint": 48
+            },
+            {
+              "name": "value",
+              "offset": 2,
+              "width": 48,
+              "fields": [
+                {
+                  "name": "versions",
+                  "offset": 0,
+                  "width": 4,
+                  "fields": [
+                    {
+                      "name": "tag",
+                      "offset": 0,
+                      "width": 1,
+                      "varint": 10
+                    },
+                    {
+                      "name": "length",
+                      "offset": 1,
+                      "width": 1,
+                      "varint": 2
+                    },
+                    {
+                      "name": "value",
+                      "offset": 2,
+                      "width": 2,
+                      "fields": [
+                        {
+                          "name": "first",
+                          "offset": 0,
+                          "width": 1,
+                          "varint": 1
+                        },
+                        {
+                          "name": "second",
+                          "offset": 1,
+                          "width": 1,
+                          "varint": 2
+                        }
+                      ]
+                    }
+                  ]
+                },
+                {
+                  "name": "format",
+                  "offset": 4,
+                  "width": 19,
+                  "fields": [
+                    {
+                      "name": "tag",
+                      "offset": 0,
+                      "width": 1,
+                      "varint": 18
+                    },
+                    {
+                      "name": "length",
+                      "offset": 1,
+                      "width": 1,
+                      "varint": 17
+                    },
+                    {
+                      "name": "value",
+                      "offset": 2,
+                      "width": 17,
+                      "fields": [
+                        {
+                          "name": "family",
+                          "offset": 0,
+                          "width": 4,
+                          "fields": [
+                            {
+                              "name": "tag",
+                              "offset": 0,
+                              "width": 1,
+                              "varint": 8
+                            },
+                            {
+                              "name": "value",
+                              "offset": 1,
+                              "width": 3,
+                              "varint": 65000
+                            }
+                          ]
+                        },
+                        {
+                          "name": "oldest_readable",
+                          "offset": 4,
+                          "width": 2,
+                          "fields": [
+                            {
+                              "name": "tag",
+                              "offset": 0,
+                              "width": 1,
+                              "varint": 16
+                            },
+                            {
+                              "name": "value",
+                              "offset": 1,
+                              "width": 1,
+                              "varint": 1
+                            }
+                          ]
+                        },
+                        {
+                          "name": "current",
+                          "offset": 6,
+                          "width": 2,
+                          "fields": [
+                            {
+                              "name": "tag",
+                              "offset": 0,
+                              "width": 1,
+                              "varint": 24
+                            },
+                            {
+                              "name": "value",
+                              "offset": 1,
+                              "width": 1,
+                              "varint": 9
+                            }
+                          ]
+                        },
+                        {
+                          "name": "features",
+                          "offset": 8,
+                          "width": 9,
+                          "fields": [
+                            {
+                              "name": "tag",
+                              "offset": 0,
+                              "width": 1,
+                              "le": 33
+                            },
+                            {
+                              "name": "mask",
+                              "offset": 1,
+                              "width": 8,
+                              "le": 9223372036854775808
+                            }
+                          ]
+                        }
+                      ]
+                    }
+                  ]
+                },
+                {
+                  "name": "codecs",
+                  "offset": 23,
+                  "width": 5,
+                  "fields": [
+                    {
+                      "name": "tag",
+                      "offset": 0,
+                      "width": 1,
+                      "varint": 26
+                    },
+                    {
+                      "name": "length",
+                      "offset": 1,
+                      "width": 1,
+                      "varint": 3
+                    },
+                    {
+                      "name": "value",
+                      "offset": 2,
+                      "width": 3,
+                      "fields": [
+                        {
+                          "name": "none",
+                          "offset": 0,
+                          "width": 1,
+                          "varint": 0
+                        },
+                        {
+                          "name": "future",
+                          "offset": 1,
+                          "width": 2,
+                          "varint": 255
+                        }
+                      ]
+                    }
+                  ]
+                },
+                {
+                  "name": "max_frame_body_bytes",
+                  "offset": 28,
+                  "width": 5,
+                  "fields": [
+                    {
+                      "name": "tag",
+                      "offset": 0,
+                      "width": 1,
+                      "varint": 32
+                    },
+                    {
+                      "name": "value",
+                      "offset": 1,
+                      "width": 4,
+                      "varint": 16777216
+                    }
+                  ]
+                },
+                {
+                  "name": "max_expanded_batch_bytes",
+                  "offset": 33,
+                  "width": 5,
+                  "fields": [
+                    {
+                      "name": "tag",
+                      "offset": 0,
+                      "width": 1,
+                      "varint": 40
+                    },
+                    {
+                      "name": "value",
+                      "offset": 1,
+                      "width": 4,
+                      "varint": 8388608
+                    }
+                  ]
+                },
+                {
+                  "name": "max_header_bytes",
+                  "offset": 38,
+                  "width": 3,
+                  "fields": [
+                    {
+                      "name": "tag",
+                      "offset": 0,
+                      "width": 1,
+                      "varint": 48
+                    },
+                    {
+                      "name": "value",
+                      "offset": 1,
+                      "width": 2,
+                      "varint": 4096
+                    }
+                  ]
+                },
+                {
+                  "name": "max_record_bytes",
+                  "offset": 41,
+                  "width": 4,
+                  "fields": [
+                    {
+                      "name": "tag",
+                      "offset": 0,
+                      "width": 1,
+                      "varint": 56
+                    },
+                    {
+                      "name": "value",
+                      "offset": 1,
+                      "width": 3,
+                      "varint": 1048576
+                    }
+                  ]
+                },
+                {
+                  "name": "max_original_records",
+                  "offset": 45,
+                  "width": 3,
+                  "fields": [
+                    {
+                      "name": "tag",
+                      "offset": 0,
+                      "width": 1,
+                      "varint": 64
+                    },
+                    {
+                      "name": "value",
+                      "offset": 1,
+                      "width": 2,
+                      "varint": 4096
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "control_redirect",
+      "path": "control_redirect.hex",
+      "size": 106,
+      "fields": [
+        {
+          "name": "destination",
+          "offset": 0,
+          "width": 69,
+          "fields": [
+            {
+              "name": "tag",
+              "offset": 0,
+              "width": 1,
+              "varint": 10
+            },
+            {
+              "name": "length",
+              "offset": 1,
+              "width": 1,
+              "varint": 67
+            },
+            {
+              "name": "value",
+              "offset": 2,
+              "width": 67,
+              "fields": [
+                {
+                  "name": "topic",
+                  "offset": 0,
+                  "width": 18,
+                  "fields": [
+                    {
+                      "name": "tag",
+                      "offset": 0,
+                      "width": 1,
+                      "varint": 10
+                    },
+                    {
+                      "name": "length",
+                      "offset": 1,
+                      "width": 1,
+                      "varint": 16
+                    },
+                    {
+                      "name": "value",
+                      "offset": 2,
+                      "width": 16,
+                      "fields": [
+                        {
+                          "name": "id",
+                          "offset": 0,
+                          "width": 16,
+                          "hex": "74747474747474747474747474747474"
+                        }
+                      ]
+                    }
+                  ]
+                },
+                {
+                  "name": "range",
+                  "offset": 18,
+                  "width": 18,
+                  "fields": [
+                    {
+                      "name": "tag",
+                      "offset": 0,
+                      "width": 1,
+                      "varint": 18
+                    },
+                    {
+                      "name": "length",
+                      "offset": 1,
+                      "width": 1,
+                      "varint": 16
+                    },
+                    {
+                      "name": "value",
+                      "offset": 2,
+                      "width": 16,
+                      "fields": [
+                        {
+                          "name": "id",
+                          "offset": 0,
+                          "width": 16,
+                          "hex": "72727272727272727272727272727272"
+                        }
+                      ]
+                    }
+                  ]
+                },
+                {
+                  "name": "routing_epoch",
+                  "offset": 36,
+                  "width": 11,
+                  "fields": [
+                    {
+                      "name": "tag",
+                      "offset": 0,
+                      "width": 1,
+                      "varint": 24
+                    },
+                    {
+                      "name": "value",
+                      "offset": 1,
+                      "width": 10,
+                      "varint": 18446744073709551615
+                    }
+                  ]
+                },
+                {
+                  "name": "segment",
+                  "offset": 47,
+                  "width": 18,
+                  "fields": [
+                    {
+                      "name": "tag",
+                      "offset": 0,
+                      "width": 1,
+                      "varint": 34
+                    },
+                    {
+                      "name": "length",
+                      "offset": 1,
+                      "width": 1,
+                      "varint": 16
+                    },
+                    {
+                      "name": "value",
+                      "offset": 2,
+                      "width": 16,
+                      "fields": [
+                        {
+                          "name": "id",
+                          "offset": 0,
+                          "width": 16,
+                          "hex": "73737373737373737373737373737373"
+                        }
+                      ]
+                    }
+                  ]
+                },
+                {
+                  "name": "generation",
+                  "offset": 65,
+                  "width": 2,
+                  "fields": [
+                    {
+                      "name": "tag",
+                      "offset": 0,
+                      "width": 1,
+                      "varint": 40
+                    },
+                    {
+                      "name": "value",
+                      "offset": 1,
+                      "width": 1,
+                      "varint": 1
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "name": "broker",
+          "offset": 69,
+          "width": 18,
+          "fields": [
+            {
+              "name": "tag",
+              "offset": 0,
+              "width": 1,
+              "varint": 18
+            },
+            {
+              "name": "length",
+              "offset": 1,
+              "width": 1,
+              "varint": 16
+            },
+            {
+              "name": "value",
+              "offset": 2,
+              "width": 16,
+              "fields": [
+                {
+                  "name": "id",
+                  "offset": 0,
+                  "width": 16,
+                  "hex": "62626262626262626262626262626262"
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "name": "endpoint",
+          "offset": 87,
+          "width": 17,
+          "fields": [
+            {
+              "name": "tag",
+              "offset": 0,
+              "width": 1,
+              "varint": 26
+            },
+            {
+              "name": "length",
+              "offset": 1,
+              "width": 1,
+              "varint": 15
+            },
+            {
+              "name": "value",
+              "offset": 2,
+              "width": 15,
+              "fields": [
+                {
+                  "name": "host",
+                  "offset": 0,
+                  "width": 11,
+                  "fields": [
+                    {
+                      "name": "tag",
+                      "offset": 0,
+                      "width": 1,
+                      "varint": 10
+                    },
+                    {
+                      "name": "length",
+                      "offset": 1,
+                      "width": 1,
+                      "varint": 9
+                    },
+                    {
+                      "name": "value",
+                      "offset": 2,
+                      "width": 9,
+                      "fields": [
+                        {
+                          "name": "utf8",
+                          "offset": 0,
+                          "width": 9,
+                          "hex": "6c6f63616c686f7374"
+                        }
+                      ]
+                    }
+                  ]
+                },
+                {
+                  "name": "port",
+                  "offset": 11,
+                  "width": 4,
+                  "fields": [
+                    {
+                      "name": "tag",
+                      "offset": 0,
+                      "width": 1,
+                      "varint": 16
+                    },
+                    {
+                      "name": "value",
+                      "offset": 1,
+                      "width": 3,
+                      "varint": 65535
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "name": "reason",
+          "offset": 104,
+          "width": 2,
+          "fields": [
+            {
+              "name": "tag",
+              "offset": 0,
+              "width": 1,
+              "varint": 32
+            },
+            {
+              "name": "value",
+              "offset": 1,
+              "width": 1,
+              "varint": 3
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "control_error",
+      "path": "control_error.hex",
+      "size": 4,
+      "fields": [
+        {
+          "name": "code",
+          "offset": 0,
+          "width": 2,
+          "fields": [
+            {
+              "name": "tag",
+              "offset": 0,
+              "width": 1,
+              "varint": 8
+            },
+            {
+              "name": "value",
+              "offset": 1,
+              "width": 1,
+              "varint": 1
+            }
+          ]
+        },
+        {
+          "name": "reason",
+          "offset": 2,
+          "width": 2,
+          "fields": [
+            {
+              "name": "tag",
+              "offset": 0,
+              "width": 1,
+              "varint": 18
+            },
+            {
+              "name": "length",
+              "offset": 1,
+              "width": 1,
+              "varint": 0
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "frame_request",
+      "path": "frame_request.hex",
+      "size": 102,
+      "fields": [
+        {
+          "name": "magic",
+          "offset": 0,
+          "width": 4,
+          "hex": "4b515746"
+        },
+        {
+          "name": "version",
+          "offset": 4,
+          "width": 2,
+          "le": 1
+        },
+        {
+          "name": "kind",
+          "offset": 6,
+          "width": 2,
+          "le": 1
+        },
+        {
+          "name": "header_bytes",
+          "offset": 8,
+          "width": 2,
+          "le": 48
+        },
+        {
+          "name": "flags",
+          "offset": 10,
+          "width": 2,
+          "le": 0
+        },
+        {
+          "name": "payload_bytes",
+          "offset": 12,
+          "width": 4,
+          "le": 54
+        },
+        {
+          "name": "stream",
+          "offset": 16,
+          "width": 8,
+          "le": 0
+        },
+        {
+          "name": "correlation",
+          "offset": 24,
+          "width": 8,
+          "le": 72623859790382856
+        },
+        {
+          "name": "sequence",
+          "offset": 32,
+          "width": 8,
+          "le": 1230066625199609624
+        },
+        {
+          "name": "header_crc32c",
+          "offset": 40,
+          "width": 4,
+          "le": 2487192746
+        },
+        {
+          "name": "payload_crc32c",
+          "offset": 44,
+          "width": 4,
+          "le": 254883585
+        },
+        {
+          "name": "payload",
+          "offset": 48,
+          "width": 54,
+          "fixture": "control_request"
+        }
+      ]
+    },
+    {
+      "name": "frame_response",
+      "path": "frame_response.hex",
+      "size": 139,
+      "fields": [
+        {
+          "name": "magic",
+          "offset": 0,
+          "width": 4,
+          "hex": "4b515746"
+        },
+        {
+          "name": "version",
+          "offset": 4,
+          "width": 2,
+          "le": 1
+        },
+        {
+          "name": "kind",
+          "offset": 6,
+          "width": 2,
+          "le": 2
+        },
+        {
+          "name": "header_bytes",
+          "offset": 8,
+          "width": 2,
+          "le": 48
+        },
+        {
+          "name": "flags",
+          "offset": 10,
+          "width": 2,
+          "le": 0
+        },
+        {
+          "name": "payload_bytes",
+          "offset": 12,
+          "width": 4,
+          "le": 91
+        },
+        {
+          "name": "stream",
+          "offset": 16,
+          "width": 8,
+          "le": 0
+        },
+        {
+          "name": "correlation",
+          "offset": 24,
+          "width": 8,
+          "le": 72623859790382856
+        },
+        {
+          "name": "sequence",
+          "offset": 32,
+          "width": 8,
+          "le": 1230066625199609624
+        },
+        {
+          "name": "header_crc32c",
+          "offset": 40,
+          "width": 4,
+          "le": 84641157
+        },
+        {
+          "name": "payload_crc32c",
+          "offset": 44,
+          "width": 4,
+          "le": 2093863539
+        },
+        {
+          "name": "payload",
+          "offset": 48,
+          "width": 91,
+          "fixture": "control_response"
+        }
+      ]
+    },
+    {
+      "name": "frame_redirect",
+      "path": "frame_redirect.hex",
+      "size": 154,
+      "fields": [
+        {
+          "name": "magic",
+          "offset": 0,
+          "width": 4,
+          "hex": "4b515746"
+        },
+        {
+          "name": "version",
+          "offset": 4,
+          "width": 2,
+          "le": 1
+        },
+        {
+          "name": "kind",
+          "offset": 6,
+          "width": 2,
+          "le": 3
+        },
+        {
+          "name": "header_bytes",
+          "offset": 8,
+          "width": 2,
+          "le": 48
+        },
+        {
+          "name": "flags",
+          "offset": 10,
+          "width": 2,
+          "le": 0
+        },
+        {
+          "name": "payload_bytes",
+          "offset": 12,
+          "width": 4,
+          "le": 106
+        },
+        {
+          "name": "stream",
+          "offset": 16,
+          "width": 8,
+          "le": 0
+        },
+        {
+          "name": "correlation",
+          "offset": 24,
+          "width": 8,
+          "le": 72623859790382856
+        },
+        {
+          "name": "sequence",
+          "offset": 32,
+          "width": 8,
+          "le": 1230066625199609624
+        },
+        {
+          "name": "header_crc32c",
+          "offset": 40,
+          "width": 4,
+          "le": 1386351328
+        },
+        {
+          "name": "payload_crc32c",
+          "offset": 44,
+          "width": 4,
+          "le": 3543696973
+        },
+        {
+          "name": "payload",
+          "offset": 48,
+          "width": 106,
+          "fixture": "control_redirect"
+        }
+      ]
+    },
+    {
+      "name": "frame_error",
+      "path": "frame_error.hex",
+      "size": 52,
+      "fields": [
+        {
+          "name": "magic",
+          "offset": 0,
+          "width": 4,
+          "hex": "4b515746"
+        },
+        {
+          "name": "version",
+          "offset": 4,
+          "width": 2,
+          "le": 1
+        },
+        {
+          "name": "kind",
+          "offset": 6,
+          "width": 2,
+          "le": 4
+        },
+        {
+          "name": "header_bytes",
+          "offset": 8,
+          "width": 2,
+          "le": 48
+        },
+        {
+          "name": "flags",
+          "offset": 10,
+          "width": 2,
+          "le": 0
+        },
+        {
+          "name": "payload_bytes",
+          "offset": 12,
+          "width": 4,
+          "le": 4
+        },
+        {
+          "name": "stream",
+          "offset": 16,
+          "width": 8,
+          "le": 0
+        },
+        {
+          "name": "correlation",
+          "offset": 24,
+          "width": 8,
+          "le": 72623859790382856
+        },
+        {
+          "name": "sequence",
+          "offset": 32,
+          "width": 8,
+          "le": 1230066625199609624
+        },
+        {
+          "name": "header_crc32c",
+          "offset": 40,
+          "width": 4,
+          "le": 1447109209
+        },
+        {
+          "name": "payload_crc32c",
+          "offset": 44,
+          "width": 4,
+          "le": 65174320
+        },
+        {
+          "name": "payload",
+          "offset": 48,
+          "width": 4,
+          "fixture": "control_error"
+        }
+      ]
+    },
+    {
+      "name": "frame_submitted",
+      "path": "frame_submitted.hex",
+      "size": 255,
+      "fields": [
+        {
+          "name": "magic",
+          "offset": 0,
+          "width": 4,
+          "hex": "4b515746"
+        },
+        {
+          "name": "version",
+          "offset": 4,
+          "width": 2,
+          "le": 1
+        },
+        {
+          "name": "kind",
+          "offset": 6,
+          "width": 2,
+          "le": 16
+        },
+        {
+          "name": "header_bytes",
+          "offset": 8,
+          "width": 2,
+          "le": 48
+        },
+        {
+          "name": "flags",
+          "offset": 10,
+          "width": 2,
+          "le": 0
+        },
+        {
+          "name": "payload_bytes",
+          "offset": 12,
+          "width": 4,
+          "le": 207
+        },
+        {
+          "name": "stream",
+          "offset": 16,
+          "width": 8,
+          "le": 7
+        },
+        {
+          "name": "correlation",
+          "offset": 24,
+          "width": 8,
+          "le": 72623859790382856
+        },
+        {
+          "name": "sequence",
+          "offset": 32,
+          "width": 8,
+          "le": 1230066625199609624
+        },
+        {
+          "name": "header_crc32c",
+          "offset": 40,
+          "width": 4,
+          "le": 2051999320
+        },
+        {
+          "name": "payload_crc32c",
+          "offset": 44,
+          "width": 4,
+          "le": 566137582
+        },
+        {
+          "name": "payload",
+          "offset": 48,
+          "width": 207,
+          "fixture": "submitted"
+        }
+      ]
+    },
+    {
+      "name": "frame_assigned",
+      "path": "frame_assigned.hex",
+      "size": 271,
+      "fields": [
+        {
+          "name": "magic",
+          "offset": 0,
+          "width": 4,
+          "hex": "4b515746"
+        },
+        {
+          "name": "version",
+          "offset": 4,
+          "width": 2,
+          "le": 1
+        },
+        {
+          "name": "kind",
+          "offset": 6,
+          "width": 2,
+          "le": 17
+        },
+        {
+          "name": "header_bytes",
+          "offset": 8,
+          "width": 2,
+          "le": 48
+        },
+        {
+          "name": "flags",
+          "offset": 10,
+          "width": 2,
+          "le": 0
+        },
+        {
+          "name": "payload_bytes",
+          "offset": 12,
+          "width": 4,
+          "le": 223
+        },
+        {
+          "name": "stream",
+          "offset": 16,
+          "width": 8,
+          "le": 7
+        },
+        {
+          "name": "correlation",
+          "offset": 24,
+          "width": 8,
+          "le": 72623859790382856
+        },
+        {
+          "name": "sequence",
+          "offset": 32,
+          "width": 8,
+          "le": 1230066625199609624
+        },
+        {
+          "name": "header_crc32c",
+          "offset": 40,
+          "width": 4,
+          "le": 791230452
+        },
+        {
+          "name": "payload_crc32c",
+          "offset": 44,
+          "width": 4,
+          "le": 4259881747
+        },
+        {
+          "name": "payload",
+          "offset": 48,
+          "width": 223,
+          "fixture": "assigned_dense"
+        }
+      ]
+    }
+  ],
+  "checks": [
+    {
+      "name": "submitted_body_crc",
+      "algorithm": "crc32c",
+      "parts": [
+        {
+          "fixture": "submitted",
+          "range": [
+            32,
+            175
+          ]
+        }
+      ],
+      "expected": "2b31abae",
+      "stored": {
+        "fixture": "submitted",
+        "offset": 24
+      }
+    },
+    {
+      "name": "submitted_header_crc",
+      "algorithm": "crc32c",
+      "parts": [
+        {
+          "fixture": "submitted",
+          "range": [
+            0,
+            32
+          ],
+          "zero": [
+            [
+              28,
+              4
+            ]
+          ]
+        }
+      ],
+      "expected": "3f62a7a7",
+      "stored": {
+        "fixture": "submitted",
+        "offset": 28
+      }
+    },
+    {
+      "name": "submitted_semantic",
+      "algorithm": "sha256",
+      "parts": [
+        {
+          "hex": "4b512f42415443482f3100"
+        },
+        {
+          "fixture": "submitted",
+          "range": [
+            32,
+            104
+          ]
+        },
+        {
+          "fixture": "submitted",
+          "range": [
+            168,
+            12
+          ]
+        },
+        {
+          "fixture": "record",
+          "range": [
+            0,
+            7
+          ]
+        }
+      ],
+      "expected": "faf92b853fd9029baa6091b240ff60cbd8e82375f8d26d28e65160c5b88b8a02",
+      "stored": {
+        "fixture": "submitted",
+        "offset": 136
+      }
+    },
+    {
+      "name": "assigned_dense_body_crc",
+      "algorithm": "crc32c",
+      "parts": [
+        {
+          "fixture": "assigned_dense",
+          "range": [
+            32,
+            191
+          ]
+        }
+      ],
+      "expected": "e0c8efd6",
+      "stored": {
+        "fixture": "assigned_dense",
+        "offset": 24
+      }
+    },
+    {
+      "name": "assigned_dense_header_crc",
+      "algorithm": "crc32c",
+      "parts": [
+        {
+          "fixture": "assigned_dense",
+          "range": [
+            0,
+            32
+          ],
+          "zero": [
+            [
+              28,
+              4
+            ]
+          ]
+        }
+      ],
+      "expected": "9dcfba5b",
+      "stored": {
+        "fixture": "assigned_dense",
+        "offset": 28
+      }
+    },
+    {
+      "name": "assigned_dense_semantic",
+      "algorithm": "sha256",
+      "parts": [
+        {
+          "hex": "4b512f42415443482f3100"
+        },
+        {
+          "fixture": "assigned_dense",
+          "range": [
+            32,
+            104
+          ]
+        },
+        {
+          "fixture": "assigned_dense",
+          "range": [
+            168,
+            12
+          ]
+        },
+        {
+          "fixture": "record",
+          "range": [
+            0,
+            7
+          ]
+        }
+      ],
+      "expected": "faf92b853fd9029baa6091b240ff60cbd8e82375f8d26d28e65160c5b88b8a02",
+      "stored": {
+        "fixture": "assigned_dense",
+        "offset": 136
+      }
+    },
+    {
+      "name": "assigned_sparse_body_crc",
+      "algorithm": "crc32c",
+      "parts": [
+        {
+          "fixture": "assigned_sparse",
+          "range": [
+            32,
+            198
+          ]
+        }
+      ],
+      "expected": "68d129fa",
+      "stored": {
+        "fixture": "assigned_sparse",
+        "offset": 24
+      }
+    },
+    {
+      "name": "assigned_sparse_header_crc",
+      "algorithm": "crc32c",
+      "parts": [
+        {
+          "fixture": "assigned_sparse",
+          "range": [
+            0,
+            32
+          ],
+          "zero": [
+            [
+              28,
+              4
+            ]
+          ]
+        }
+      ],
+      "expected": "fde56539",
+      "stored": {
+        "fixture": "assigned_sparse",
+        "offset": 28
+      }
+    },
+    {
+      "name": "assigned_sparse_semantic",
+      "algorithm": "sha256",
+      "parts": [
+        {
+          "hex": "4b512f42415443482f3100"
+        },
+        {
+          "fixture": "assigned_sparse",
+          "range": [
+            32,
+            104
+          ]
+        },
+        {
+          "fixture": "assigned_sparse",
+          "range": [
+            168,
+            12
+          ]
+        },
+        {
+          "hex": "0600000001000006000101010000060014020100000600030301000006000204010000"
+        }
+      ],
+      "expected": "1ca1f5939c787dc18baed7e6a9869863589d8164d20bf7511b779f928fab5c64",
+      "stored": {
+        "fixture": "assigned_sparse",
+        "offset": 136
+      }
+    },
+    {
+      "name": "segment_header_body_crc",
+      "algorithm": "crc32c",
+      "parts": [
+        {
+          "fixture": "segment_header",
+          "range": [
+            32,
+            480
+          ]
+        }
+      ],
+      "expected": "3d7d385d",
+      "stored": {
+        "fixture": "segment_header",
+        "offset": 24
+      }
+    },
+    {
+      "name": "segment_header_header_crc",
+      "algorithm": "crc32c",
+      "parts": [
+        {
+          "fixture": "segment_header",
+          "range": [
+            0,
+            32
+          ],
+          "zero": [
+            [
+              28,
+              4
+            ]
+          ]
+        }
+      ],
+      "expected": "496f3b42",
+      "stored": {
+        "fixture": "segment_header",
+        "offset": 28
+      }
+    },
+    {
+      "name": "segment_block_body_crc",
+      "algorithm": "crc32c",
+      "parts": [
+        {
+          "fixture": "segment_block",
+          "range": [
+            32,
+            480
+          ]
+        }
+      ],
+      "expected": "7bfe4b76",
+      "stored": {
+        "fixture": "segment_block",
+        "offset": 24
+      }
+    },
+    {
+      "name": "segment_block_header_crc",
+      "algorithm": "crc32c",
+      "parts": [
+        {
+          "fixture": "segment_block",
+          "range": [
+            0,
+            32
+          ],
+          "zero": [
+            [
+              28,
+              4
+            ]
+          ]
+        }
+      ],
+      "expected": "db35d52f",
+      "stored": {
+        "fixture": "segment_block",
+        "offset": 28
+      }
+    },
+    {
+      "name": "extent_digest",
+      "algorithm": "sha256",
+      "parts": [
+        {
+          "fixture": "segment_block",
+          "range": [
+            0,
+            512
+          ]
+        }
+      ],
+      "expected": "4bacf574184ef2d1218c77affe027f49ade8655632c335a34e093bc2bc9913ef",
+      "stored": {
+        "fixture": "extent_digest",
+        "offset": 0
+      }
+    },
+    {
+      "name": "wal_prepare_body_crc",
+      "algorithm": "crc32c",
+      "parts": [
+        {
+          "fixture": "wal_prepare",
+          "range": [
+            32,
+            480
+          ]
+        }
+      ],
+      "expected": "5f808b12",
+      "stored": {
+        "fixture": "wal_prepare",
+        "offset": 24
+      }
+    },
+    {
+      "name": "wal_prepare_header_crc",
+      "algorithm": "crc32c",
+      "parts": [
+        {
+          "fixture": "wal_prepare",
+          "range": [
+            0,
+            32
+          ],
+          "zero": [
+            [
+              28,
+              4
+            ]
+          ]
+        }
+      ],
+      "expected": "1ccb119f",
+      "stored": {
+        "fixture": "wal_prepare",
+        "offset": 28
+      }
+    },
+    {
+      "name": "durable_footer_body_crc",
+      "algorithm": "crc32c",
+      "parts": [
+        {
+          "fixture": "durable_footer",
+          "range": [
+            32,
+            480
+          ]
+        }
+      ],
+      "expected": "ce978d5d",
+      "stored": {
+        "fixture": "durable_footer",
+        "offset": 24
+      }
+    },
+    {
+      "name": "durable_footer_header_crc",
+      "algorithm": "crc32c",
+      "parts": [
+        {
+          "fixture": "durable_footer",
+          "range": [
+            0,
+            32
+          ],
+          "zero": [
+            [
+              28,
+              4
+            ]
+          ]
+        }
+      ],
+      "expected": "a6700f37",
+      "stored": {
+        "fixture": "durable_footer",
+        "offset": 28
+      }
+    },
+    {
+      "name": "durable_data_crc",
+      "algorithm": "crc32c",
+      "parts": [
+        {
+          "fixture": "segment_block",
+          "range": [
+            0,
+            512
+          ]
+        }
+      ],
+      "expected": "e07f1c10",
+      "stored": {
+        "fixture": "durable_footer",
+        "offset": 216
+      }
+    },
+    {
+      "name": "retry_page_body_crc",
+      "algorithm": "crc32c",
+      "parts": [
+        {
+          "fixture": "retry_page",
+          "range": [
+            32,
+            480
+          ]
+        }
+      ],
+      "expected": "a16841c2",
+      "stored": {
+        "fixture": "retry_page",
+        "offset": 24
+      }
+    },
+    {
+      "name": "retry_page_header_crc",
+      "algorithm": "crc32c",
+      "parts": [
+        {
+          "fixture": "retry_page",
+          "range": [
+            0,
+            32
+          ],
+          "zero": [
+            [
+              28,
+              4
+            ]
+          ]
+        }
+      ],
+      "expected": "a71b070b",
+      "stored": {
+        "fixture": "retry_page",
+        "offset": 28
+      }
+    },
+    {
+      "name": "sealed_footer_body_crc",
+      "algorithm": "crc32c",
+      "parts": [
+        {
+          "fixture": "sealed_footer",
+          "range": [
+            32,
+            480
+          ]
+        }
+      ],
+      "expected": "88e20913",
+      "stored": {
+        "fixture": "sealed_footer",
+        "offset": 24
+      }
+    },
+    {
+      "name": "sealed_footer_header_crc",
+      "algorithm": "crc32c",
+      "parts": [
+        {
+          "fixture": "sealed_footer",
+          "range": [
+            0,
+            32
+          ],
+          "zero": [
+            [
+              28,
+              4
+            ]
+          ]
+        }
+      ],
+      "expected": "8d5f87e6",
+      "stored": {
+        "fixture": "sealed_footer",
+        "offset": 28
+      }
+    },
+    {
+      "name": "sealed_extent",
+      "algorithm": "sha256",
+      "parts": [
+        {
+          "fixture": "segment_block",
+          "range": [
+            0,
+            512
+          ]
+        }
+      ],
+      "expected": "4bacf574184ef2d1218c77affe027f49ade8655632c335a34e093bc2bc9913ef",
+      "stored": {
+        "fixture": "sealed_footer",
+        "offset": 220
+      }
+    },
+    {
+      "name": "retry_page_ref",
+      "algorithm": "sha256",
+      "parts": [
+        {
+          "fixture": "retry_page",
+          "range": [
+            0,
+            512
+          ]
+        }
+      ],
+      "expected": "aaeebc8455f2e54711a569bde4951538dfe2a2fd24688562360530ce161e3906",
+      "stored": {
+        "fixture": "sealed_footer",
+        "offset": 280
+      }
+    },
+    {
+      "name": "index_page_body_crc",
+      "algorithm": "crc32c",
+      "parts": [
+        {
+          "fixture": "index_page",
+          "range": [
+            32,
+            480
+          ]
+        }
+      ],
+      "expected": "da0b4867",
+      "stored": {
+        "fixture": "index_page",
+        "offset": 24
+      }
+    },
+    {
+      "name": "index_page_header_crc",
+      "algorithm": "crc32c",
+      "parts": [
+        {
+          "fixture": "index_page",
+          "range": [
+            0,
+            32
+          ],
+          "zero": [
+            [
+              28,
+              4
+            ]
+          ]
+        }
+      ],
+      "expected": "8fd222be",
+      "stored": {
+        "fixture": "index_page",
+        "offset": 28
+      }
+    },
+    {
+      "name": "index_root_body_crc",
+      "algorithm": "crc32c",
+      "parts": [
+        {
+          "fixture": "index_root",
+          "range": [
+            32,
+            480
+          ]
+        }
+      ],
+      "expected": "38226d23",
+      "stored": {
+        "fixture": "index_root",
+        "offset": 24
+      }
+    },
+    {
+      "name": "index_root_header_crc",
+      "algorithm": "crc32c",
+      "parts": [
+        {
+          "fixture": "index_root",
+          "range": [
+            0,
+            32
+          ],
+          "zero": [
+            [
+              28,
+              4
+            ]
+          ]
+        }
+      ],
+      "expected": "d5dc0b1b",
+      "stored": {
+        "fixture": "index_root",
+        "offset": 28
+      }
+    },
+    {
+      "name": "index_page_ref",
+      "algorithm": "sha256",
+      "parts": [
+        {
+          "fixture": "index_page",
+          "range": [
+            0,
+            512
+          ]
+        }
+      ],
+      "expected": "c9eb30df3b1d1c9d573e037d0acd5558758548cd971b1db4f8f5de744c290e09",
+      "stored": {
+        "fixture": "index_root",
+        "offset": 216
+      }
+    },
+    {
+      "name": "manifest_page_body_crc",
+      "algorithm": "crc32c",
+      "parts": [
+        {
+          "fixture": "manifest_page",
+          "range": [
+            32,
+            480
+          ]
+        }
+      ],
+      "expected": "6e3b87f1",
+      "stored": {
+        "fixture": "manifest_page",
+        "offset": 24
+      }
+    },
+    {
+      "name": "manifest_page_header_crc",
+      "algorithm": "crc32c",
+      "parts": [
+        {
+          "fixture": "manifest_page",
+          "range": [
+            0,
+            32
+          ],
+          "zero": [
+            [
+              28,
+              4
+            ]
+          ]
+        }
+      ],
+      "expected": "6c85f9a4",
+      "stored": {
+        "fixture": "manifest_page",
+        "offset": 28
+      }
+    },
+    {
+      "name": "manifest_root_body_crc",
+      "algorithm": "crc32c",
+      "parts": [
+        {
+          "fixture": "manifest_root",
+          "range": [
+            32,
+            480
+          ]
+        }
+      ],
+      "expected": "6b7b9635",
+      "stored": {
+        "fixture": "manifest_root",
+        "offset": 24
+      }
+    },
+    {
+      "name": "manifest_root_header_crc",
+      "algorithm": "crc32c",
+      "parts": [
+        {
+          "fixture": "manifest_root",
+          "range": [
+            0,
+            32
+          ],
+          "zero": [
+            [
+              28,
+              4
+            ]
+          ]
+        }
+      ],
+      "expected": "3927e520",
+      "stored": {
+        "fixture": "manifest_root",
+        "offset": 28
+      }
+    },
+    {
+      "name": "manifest_page_ref",
+      "algorithm": "sha256",
+      "parts": [
+        {
+          "fixture": "manifest_page",
+          "range": [
+            0,
+            512
+          ]
+        }
+      ],
+      "expected": "5a9f913d499a5b7893e3c10973b322345d49891ffd20da68c2329c212ce94a85",
+      "stored": {
+        "fixture": "manifest_root",
+        "offset": 136
+      }
+    },
+    {
+      "name": "checkpoint_body_crc",
+      "algorithm": "crc32c",
+      "parts": [
+        {
+          "fixture": "checkpoint",
+          "range": [
+            32,
+            68
+          ]
+        }
+      ],
+      "expected": "7bb16ce0",
+      "stored": {
+        "fixture": "checkpoint",
+        "offset": 24
+      }
+    },
+    {
+      "name": "checkpoint_header_crc",
+      "algorithm": "crc32c",
+      "parts": [
+        {
+          "fixture": "checkpoint",
+          "range": [
+            0,
+            32
+          ],
+          "zero": [
+            [
+              28,
+              4
+            ]
+          ]
+        }
+      ],
+      "expected": "9cdb00fa",
+      "stored": {
+        "fixture": "checkpoint",
+        "offset": 28
+      }
+    },
+    {
+      "name": "checkpoint_extended_body_crc",
+      "algorithm": "crc32c",
+      "parts": [
+        {
+          "fixture": "checkpoint_extended",
+          "range": [
+            41,
+            68
+          ]
+        }
+      ],
+      "expected": "7bb16ce0",
+      "stored": {
+        "fixture": "checkpoint_extended",
+        "offset": 24
+      }
+    },
+    {
+      "name": "checkpoint_extended_header_crc",
+      "algorithm": "crc32c",
+      "parts": [
+        {
+          "fixture": "checkpoint_extended",
+          "range": [
+            0,
+            41
+          ],
+          "zero": [
+            [
+              28,
+              4
+            ]
+          ]
+        }
+      ],
+      "expected": "ac92bf80",
+      "stored": {
+        "fixture": "checkpoint_extended",
+        "offset": 28
+      }
+    },
+    {
+      "name": "checkpoint_semantic",
+      "algorithm": "sha256",
+      "parts": [
+        {
+          "hex": "4b512f434845434b504f494e542f3100"
+        },
+        {
+          "fixture": "checkpoint",
+          "range": [
+            32,
+            68
+          ]
+        }
+      ],
+      "expected": "17accedcac8b0257accbfd9f5e864705f9137c4d0d5730e6e0a7967138d15223",
+      "stored": {
+        "fixture": "checkpoint_digest",
+        "offset": 0
+      }
+    },
+    {
+      "name": "extended_checkpoint_semantic",
+      "algorithm": "sha256",
+      "parts": [
+        {
+          "hex": "4b512f434845434b504f494e542f3100"
+        },
+        {
+          "fixture": "checkpoint_extended",
+          "range": [
+            41,
+            68
+          ]
+        }
+      ],
+      "expected": "17accedcac8b0257accbfd9f5e864705f9137c4d0d5730e6e0a7967138d15223"
+    },
+    {
+      "name": "frame_request_header_crc",
+      "algorithm": "crc32c",
+      "parts": [
+        {
+          "fixture": "frame_request",
+          "range": [
+            0,
+            48
+          ],
+          "zero": [
+            [
+              40,
+              4
+            ]
+          ]
+        }
+      ],
+      "expected": "aa8c3f94",
+      "stored": {
+        "fixture": "frame_request",
+        "offset": 40
+      }
+    },
+    {
+      "name": "frame_request_payload_crc",
+      "algorithm": "crc32c",
+      "parts": [
+        {
+          "fixture": "frame_request",
+          "range": [
+            48,
+            54
+          ]
+        }
+      ],
+      "expected": "0137310f",
+      "stored": {
+        "fixture": "frame_request",
+        "offset": 44
+      }
+    },
+    {
+      "name": "frame_response_header_crc",
+      "algorithm": "crc32c",
+      "parts": [
+        {
+          "fixture": "frame_response",
+          "range": [
+            0,
+            48
+          ],
+          "zero": [
+            [
+              40,
+              4
+            ]
+          ]
+        }
+      ],
+      "expected": "85850b05",
+      "stored": {
+        "fixture": "frame_response",
+        "offset": 40
+      }
+    },
+    {
+      "name": "frame_response_payload_crc",
+      "algorithm": "crc32c",
+      "parts": [
+        {
+          "fixture": "frame_response",
+          "range": [
+            48,
+            91
+          ]
+        }
+      ],
+      "expected": "73d2cd7c",
+      "stored": {
+        "fixture": "frame_response",
+        "offset": 44
+      }
+    },
+    {
+      "name": "frame_redirect_header_crc",
+      "algorithm": "crc32c",
+      "parts": [
+        {
+          "fixture": "frame_redirect",
+          "range": [
+            0,
+            48
+          ],
+          "zero": [
+            [
+              40,
+              4
+            ]
+          ]
+        }
+      ],
+      "expected": "e00aa252",
+      "stored": {
+        "fixture": "frame_redirect",
+        "offset": 40
+      }
+    },
+    {
+      "name": "frame_redirect_payload_crc",
+      "algorithm": "crc32c",
+      "parts": [
+        {
+          "fixture": "frame_redirect",
+          "range": [
+            48,
+            106
+          ]
+        }
+      ],
+      "expected": "4d8638d3",
+      "stored": {
+        "fixture": "frame_redirect",
+        "offset": 44
+      }
+    },
+    {
+      "name": "frame_error_header_crc",
+      "algorithm": "crc32c",
+      "parts": [
+        {
+          "fixture": "frame_error",
+          "range": [
+            0,
+            48
+          ],
+          "zero": [
+            [
+              40,
+              4
+            ]
+          ]
+        }
+      ],
+      "expected": "59224156",
+      "stored": {
+        "fixture": "frame_error",
+        "offset": 40
+      }
+    },
+    {
+      "name": "frame_error_payload_crc",
+      "algorithm": "crc32c",
+      "parts": [
+        {
+          "fixture": "frame_error",
+          "range": [
+            48,
+            4
+          ]
+        }
+      ],
+      "expected": "307be203",
+      "stored": {
+        "fixture": "frame_error",
+        "offset": 44
+      }
+    },
+    {
+      "name": "frame_submitted_header_crc",
+      "algorithm": "crc32c",
+      "parts": [
+        {
+          "fixture": "frame_submitted",
+          "range": [
+            0,
+            48
+          ],
+          "zero": [
+            [
+              40,
+              4
+            ]
+          ]
+        }
+      ],
+      "expected": "58064f7a",
+      "stored": {
+        "fixture": "frame_submitted",
+        "offset": 40
+      }
+    },
+    {
+      "name": "frame_submitted_payload_crc",
+      "algorithm": "crc32c",
+      "parts": [
+        {
+          "fixture": "frame_submitted",
+          "range": [
+            48,
+            207
+          ]
+        }
+      ],
+      "expected": "ee92be21",
+      "stored": {
+        "fixture": "frame_submitted",
+        "offset": 44
+      }
+    },
+    {
+      "name": "frame_assigned_header_crc",
+      "algorithm": "crc32c",
+      "parts": [
+        {
+          "fixture": "frame_assigned",
+          "range": [
+            0,
+            48
+          ],
+          "zero": [
+            [
+              40,
+              4
+            ]
+          ]
+        }
+      ],
+      "expected": "f437292f",
+      "stored": {
+        "fixture": "frame_assigned",
+        "offset": 40
+      }
+    },
+    {
+      "name": "frame_assigned_payload_crc",
+      "algorithm": "crc32c",
+      "parts": [
+        {
+          "fixture": "frame_assigned",
+          "range": [
+            48,
+            223
+          ]
+        }
+      ],
+      "expected": "13a3e8fd",
+      "stored": {
+        "fixture": "frame_assigned",
+        "offset": 44
+      }
+    },
+    {
+      "name": "lz4_descriptor",
+      "algorithm": "lz4_descriptor",
+      "parts": [
+        {
+          "fixture": "lz4_raw_abc",
+          "range": [
+            4,
+            10
+          ]
+        }
+      ],
+      "expected": "74",
+      "stored": {
+        "fixture": "lz4_raw_abc",
+        "offset": 14
+      }
+    },
+    {
+      "name": "lz4_block_checksum",
+      "algorithm": "xxh32_short",
+      "parts": [
+        {
+          "fixture": "lz4_raw_abc",
+          "range": [
+            19,
+            3
+          ]
+        }
+      ],
+      "expected": "ff53d132",
+      "stored": {
+        "fixture": "lz4_raw_abc",
+        "offset": 22
+      }
+    },
+    {
+      "name": "lz4_content_checksum",
+      "algorithm": "xxh32_short",
+      "parts": [
+        {
+          "fixture": "lz4_raw_abc",
+          "range": [
+            19,
+            3
+          ]
+        }
+      ],
+      "expected": "ff53d132",
+      "stored": {
+        "fixture": "lz4_raw_abc",
+        "offset": 30
+      }
+    },
+    {
+      "name": "record_exact",
+      "algorithm": "sha256",
+      "parts": [
+        {
+          "fixture": "record",
+          "range": [
+            0,
+            7
+          ]
+        }
+      ],
+      "expected": "270f88251667190a1af167bef57a8c3ed38305303cd7ddbbc95e6af633496132"
+    },
+    {
+      "name": "record_rich_exact",
+      "algorithm": "sha256",
+      "parts": [
+        {
+          "fixture": "record_rich",
+          "range": [
+            0,
+            13
+          ]
+        }
+      ],
+      "expected": "b0712b1f0bfa573c2b93f636cdf9743adf7c0b287aa6c8f940e6a2ddbc091500"
+    },
+    {
+      "name": "submitted_exact",
+      "algorithm": "sha256",
+      "parts": [
+        {
+          "fixture": "submitted",
+          "range": [
+            0,
+            207
+          ]
+        }
+      ],
+      "expected": "4663cf388b075c1497a469cc1ae73bec5cbf16d2eb084c055f9b1cfbc5fb689d"
+    },
+    {
+      "name": "batch_digest_exact",
+      "algorithm": "sha256",
+      "parts": [
+        {
+          "fixture": "batch_digest",
+          "range": [
+            0,
+            32
+          ]
+        }
+      ],
+      "expected": "35ad1ede79c850c03b4f7c20c1c109c2a177297c73671d2421bbdcfaef45b910"
+    },
+    {
+      "name": "assigned_dense_exact",
+      "algorithm": "sha256",
+      "parts": [
+        {
+          "fixture": "assigned_dense",
+          "range": [
+            0,
+            223
+          ]
+        }
+      ],
+      "expected": "16fdc5c6b7f93b3fea2ffcd1213b94f371e7150295720422c7b270f38d176648"
+    },
+    {
+      "name": "assigned_sparse_exact",
+      "algorithm": "sha256",
+      "parts": [
+        {
+          "fixture": "assigned_sparse",
+          "range": [
+            0,
+            230
+          ]
+        }
+      ],
+      "expected": "f89c8e721c9a2d0864d3d8d7ae2b56166876bc5a8e23684c2950ccd1ae14dee1"
+    },
+    {
+      "name": "segment_header_exact",
+      "algorithm": "sha256",
+      "parts": [
+        {
+          "fixture": "segment_header",
+          "range": [
+            0,
+            512
+          ]
+        }
+      ],
+      "expected": "5a1c2543f7505095bb28dee8109313b8ed6fa97dea0a6deebd745e0c8bdf042f"
+    },
+    {
+      "name": "segment_block_exact",
+      "algorithm": "sha256",
+      "parts": [
+        {
+          "fixture": "segment_block",
+          "range": [
+            0,
+            512
+          ]
+        }
+      ],
+      "expected": "4bacf574184ef2d1218c77affe027f49ade8655632c335a34e093bc2bc9913ef"
+    },
+    {
+      "name": "extent_digest_exact",
+      "algorithm": "sha256",
+      "parts": [
+        {
+          "fixture": "extent_digest",
+          "range": [
+            0,
+            32
+          ]
+        }
+      ],
+      "expected": "d9edb23a5e762253ebf9d4c26c0513deb730733a325e2288d4078c788e235c12"
+    },
+    {
+      "name": "wal_prepare_exact",
+      "algorithm": "sha256",
+      "parts": [
+        {
+          "fixture": "wal_prepare",
+          "range": [
+            0,
+            512
+          ]
+        }
+      ],
+      "expected": "69acf69f724db5c084b6e61eb542d477a35d0ebac909a60bc268dcd917f2111e"
+    },
+    {
+      "name": "durable_footer_exact",
+      "algorithm": "sha256",
+      "parts": [
+        {
+          "fixture": "durable_footer",
+          "range": [
+            0,
+            512
+          ]
+        }
+      ],
+      "expected": "b6e47026e37cbf4194c1fd3b07cd600dbe94463483fd70d4c65b92d2e54bd871"
+    },
+    {
+      "name": "retry_page_exact",
+      "algorithm": "sha256",
+      "parts": [
+        {
+          "fixture": "retry_page",
+          "range": [
+            0,
+            512
+          ]
+        }
+      ],
+      "expected": "aaeebc8455f2e54711a569bde4951538dfe2a2fd24688562360530ce161e3906"
+    },
+    {
+      "name": "sealed_footer_exact",
+      "algorithm": "sha256",
+      "parts": [
+        {
+          "fixture": "sealed_footer",
+          "range": [
+            0,
+            512
+          ]
+        }
+      ],
+      "expected": "a1d588f7e7a438275637741d8bffacf07bac8875e4bbd62c01a5655d07deb6cd"
+    },
+    {
+      "name": "index_page_exact",
+      "algorithm": "sha256",
+      "parts": [
+        {
+          "fixture": "index_page",
+          "range": [
+            0,
+            512
+          ]
+        }
+      ],
+      "expected": "c9eb30df3b1d1c9d573e037d0acd5558758548cd971b1db4f8f5de744c290e09"
+    },
+    {
+      "name": "index_root_exact",
+      "algorithm": "sha256",
+      "parts": [
+        {
+          "fixture": "index_root",
+          "range": [
+            0,
+            512
+          ]
+        }
+      ],
+      "expected": "c058e4cb85e4ebfb5bab318b04cf3ae1b452ef49eefc7d8fe3ecb346dcc58240"
+    },
+    {
+      "name": "manifest_page_exact",
+      "algorithm": "sha256",
+      "parts": [
+        {
+          "fixture": "manifest_page",
+          "range": [
+            0,
+            512
+          ]
+        }
+      ],
+      "expected": "5a9f913d499a5b7893e3c10973b322345d49891ffd20da68c2329c212ce94a85"
+    },
+    {
+      "name": "manifest_root_exact",
+      "algorithm": "sha256",
+      "parts": [
+        {
+          "fixture": "manifest_root",
+          "range": [
+            0,
+            512
+          ]
+        }
+      ],
+      "expected": "73fc3f506e66c2d5e00f99ab0daf05afe208f92d495e2b394b325f733526c1b0"
+    },
+    {
+      "name": "checkpoint_exact",
+      "algorithm": "sha256",
+      "parts": [
+        {
+          "fixture": "checkpoint",
+          "range": [
+            0,
+            100
+          ]
+        }
+      ],
+      "expected": "3e78a12ba19878b27d35bb966eb96720361920befb3deaf5c4e18987f6e18fd9"
+    },
+    {
+      "name": "checkpoint_extended_exact",
+      "algorithm": "sha256",
+      "parts": [
+        {
+          "fixture": "checkpoint_extended",
+          "range": [
+            0,
+            109
+          ]
+        }
+      ],
+      "expected": "b9460367e4dc3d444ed297bb967b70660d6acf2b9fe8936cdfb7fb0de23aa524"
+    },
+    {
+      "name": "checkpoint_digest_exact",
+      "algorithm": "sha256",
+      "parts": [
+        {
+          "fixture": "checkpoint_digest",
+          "range": [
+            0,
+            32
+          ]
+        }
+      ],
+      "expected": "249737cfdaf112e1cd923eda8d3c0eedd8278e62ec0bc60c60e822531c52d760"
+    },
+    {
+      "name": "lz4_raw_abc_exact",
+      "algorithm": "sha256",
+      "parts": [
+        {
+          "fixture": "lz4_raw_abc",
+          "range": [
+            0,
+            34
+          ]
+        }
+      ],
+      "expected": "1c9031389fddefa6e4b0b0892be4e5372a9a74022dd4c481f24a9ed4fe70c426"
+    },
+    {
+      "name": "control_request_exact",
+      "algorithm": "sha256",
+      "parts": [
+        {
+          "fixture": "control_request",
+          "range": [
+            0,
+            54
+          ]
+        }
+      ],
+      "expected": "993bb77b0fc06153aef44b2cbb60cafb4818dd06f7ad6a3798b6cb1ca8da9f63"
+    },
+    {
+      "name": "control_response_exact",
+      "algorithm": "sha256",
+      "parts": [
+        {
+          "fixture": "control_response",
+          "range": [
+            0,
+            91
+          ]
+        }
+      ],
+      "expected": "e6fb74856f3b0f0951d178aaad93d3c325f50f5968bca7241bd537a667c4bb17"
+    },
+    {
+      "name": "control_redirect_exact",
+      "algorithm": "sha256",
+      "parts": [
+        {
+          "fixture": "control_redirect",
+          "range": [
+            0,
+            106
+          ]
+        }
+      ],
+      "expected": "9dca5884f8cc92a73391811b6af281fa13221aa0a91949ae8399a34cf5e20763"
+    },
+    {
+      "name": "control_error_exact",
+      "algorithm": "sha256",
+      "parts": [
+        {
+          "fixture": "control_error",
+          "range": [
+            0,
+            4
+          ]
+        }
+      ],
+      "expected": "4de9abddf21de33739cabce5c67ab3e8c70086274c6d65e8434ec56cb47379d3"
+    },
+    {
+      "name": "frame_request_exact",
+      "algorithm": "sha256",
+      "parts": [
+        {
+          "fixture": "frame_request",
+          "range": [
+            0,
+            102
+          ]
+        }
+      ],
+      "expected": "a5213be271000a588813ebc799e9a6ff91c75fcd5897e5ade24b85954161f330"
+    },
+    {
+      "name": "frame_response_exact",
+      "algorithm": "sha256",
+      "parts": [
+        {
+          "fixture": "frame_response",
+          "range": [
+            0,
+            139
+          ]
+        }
+      ],
+      "expected": "35df7d6a5bd71556f098cfb0413d4e80ccc6cbefbda2360d27596741c35c6ecb"
+    },
+    {
+      "name": "frame_redirect_exact",
+      "algorithm": "sha256",
+      "parts": [
+        {
+          "fixture": "frame_redirect",
+          "range": [
+            0,
+            154
+          ]
+        }
+      ],
+      "expected": "ef5365750a509449efd5bdec55d9fb21a654263f19f7968c404ed51c714a7b6f"
+    },
+    {
+      "name": "frame_error_exact",
+      "algorithm": "sha256",
+      "parts": [
+        {
+          "fixture": "frame_error",
+          "range": [
+            0,
+            52
+          ]
+        }
+      ],
+      "expected": "e3eb881c8133d607370cd0edac8db8703df46a0ab7ddb8d3950470d0eeb7e9c5"
+    },
+    {
+      "name": "frame_submitted_exact",
+      "algorithm": "sha256",
+      "parts": [
+        {
+          "fixture": "frame_submitted",
+          "range": [
+            0,
+            255
+          ]
+        }
+      ],
+      "expected": "22dea873dd83481ff5536d4c1535298a24b3de403fd968b048590f49b4e4e062"
+    },
+    {
+      "name": "frame_assigned_exact",
+      "algorithm": "sha256",
+      "parts": [
+        {
+          "fixture": "frame_assigned",
+          "range": [
+            0,
+            271
+          ]
+        }
+      ],
+      "expected": "24883a0a75232cae2f2b3ed4de72396c17995b909ee6c682d4aa5f590592c526"
+    }
+  ]
+}

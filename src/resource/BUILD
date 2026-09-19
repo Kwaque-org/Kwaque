@@ -2,11 +2,6 @@ load("//bazel:build.bzl", "kwaque_cc_library")
 
 package(default_visibility = ["//visibility:private"])
 
-filegroup(
-    name = "package_boundary",
-    srcs = ["README.md"],
-)
-
 kwaque_cc_library(
     name = "workload_class",
     srcs = ["workload_class.cc"],

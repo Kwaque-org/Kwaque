@@ -165,17 +165,16 @@ bool message_graph(
         }
         if (
           field.kind == control_field_kind::message && count != 0
-          && depth < limits.max_nesting_depth.value()) {
-            if (!message_graph(
-                  *schema_for(field.child),
-                  copies * count,
-                  depth + 1U,
-                  units,
-                  limits,
-                  bound,
-                  objects))
-                return false;
-        }
+          && depth < limits.max_nesting_depth.value()
+          && !message_graph(
+            *schema_for(field.child),
+            copies * count,
+            depth + 1U,
+            units,
+            limits,
+            bound,
+            objects))
+            return false;
     }
     return true;
 }

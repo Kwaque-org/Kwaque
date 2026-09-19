@@ -2,6 +2,25 @@ load("@rules_python//python:defs.bzl", "py_binary", "py_library", "py_test")
 
 package(default_visibility = ["//visibility:private"])
 
+py_binary(
+    name = "verify_format_fixtures",
+    srcs = ["verify_format_fixtures.py"],
+    data = ["//src/codec/tests:format_fixture_data"],
+    main = "verify_format_fixtures.py",
+    visibility = ["//visibility:public"],
+)
+
+py_test(
+    name = "verify_format_fixtures_test",
+    size = "small",
+    srcs = [
+        "verify_format_fixtures.py",
+        "verify_format_fixtures_test.py",
+    ],
+    data = ["//src/codec/tests:format_fixture_data"],
+    main = "verify_format_fixtures_test.py",
+)
+
 py_test(
     name = "ci_changes_test",
     size = "small",
