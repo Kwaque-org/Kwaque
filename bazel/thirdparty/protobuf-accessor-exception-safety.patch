@@ -1,0 +1,52 @@
+diff --git a/src/google/protobuf/compiler/cpp/field_generators/string_field.cc b/src/google/protobuf/compiler/cpp/field_generators/string_field.cc
+--- a/src/google/protobuf/compiler/cpp/field_generators/string_field.cc
++++ b/src/google/protobuf/compiler/cpp/field_generators/string_field.cc
+@@ -423,7 +423,12 @@
+            }
+          )cc");
+        }},
+-      {"update_hasbit", [&] { UpdateHasbitSet(p, is_oneof()); }},
++      {"update_hasbit_before", [&] {
++         if (is_oneof()) UpdateHasbitSet(p, true);
++       }},
++      {"update_hasbit_after", [&] {
++         if (!is_oneof()) UpdateHasbitSet(p, false);
++       }},
+       {"set_args", [&] { ArgsForSetter(p, is_inlined()); }},
+       {"check_hasbit",
+        [&] {
+@@ -454,8 +459,9 @@
+       $WeakDescriptorSelfPin$;
+       $TsanDetectConcurrentMutation$;
+       $PrepareSplitMessageForWrite$;
+-      $update_hasbit$;
++      $update_hasbit_before$;
+       $field_$.$Set$(static_cast<Arg_&&>(arg), args..., $set_args$);
++      $update_hasbit_after$;
+       $annotate_set$;
+       // @@protoc_insertion_point(field_set:$pkg.Msg.field$)
+     }
+@@ -463,8 +469,9 @@
+         ABSL_ATTRIBUTE_LIFETIME_BOUND {
+       $WeakDescriptorSelfPin$;
+       $PrepareSplitMessageForWrite$;
+-      $update_hasbit$;
++      $update_hasbit_before$;
+       ::std::string* _s = _internal_mutable_$name_internal$();
++      $update_hasbit_after$;
+       $annotate_mutable$;
+       // @@protoc_insertion_point(field_mutable:$pkg.Msg.field$)
+       return _s;
+diff --git a/src/google/protobuf/compiler/cpp/field_generators/message_field.cc b/src/google/protobuf/compiler/cpp/field_generators/message_field.cc
+--- a/src/google/protobuf/compiler/cpp/field_generators/message_field.cc
++++ b/src/google/protobuf/compiler/cpp/field_generators/message_field.cc
+@@ -268,8 +268,8 @@
+       //~ able to prepare split message allocation.
+       $WeakDescriptorSelfPin$;
+       $PrepareSplitMessageForWrite$;
++      $Submsg$* _msg = _internal_mutable_$name_internal$();
+       $set_hasbit$;
+-      $Submsg$* _msg = _internal_mutable_$name_internal$();
+       $annotate_mutable$;
+       // @@protoc_insertion_point(field_mutable:$pkg.Msg.field$)
+       return _msg;

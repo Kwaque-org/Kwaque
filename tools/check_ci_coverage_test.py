@@ -44,6 +44,7 @@ SMOKE_FUZZERS = {f"//src/simulation/tests:{name}" for name in STATEFUL_FUZZERS} 
     "//src/model/tests:record_fuzz",
     "//src/model/tests:checkpoint_fuzz",
     "//src/protocol/tests:frame_fuzz",
+    "//src/protocol/tests:control_fuzz",
     "//src/storage/tests:storage_format_fuzz",
     "//src/simulation/tests:signal_canary_test",
 }

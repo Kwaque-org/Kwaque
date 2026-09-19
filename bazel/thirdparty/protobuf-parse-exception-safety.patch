@@ -1,0 +1,205 @@
+diff --git a/src/google/protobuf/generated_message_tctable_lite.cc b/src/google/protobuf/generated_message_tctable_lite.cc
+--- a/src/google/protobuf/generated_message_tctable_lite.cc
++++ b/src/google/protobuf/generated_message_tctable_lite.cc
+@@ -518,10 +518,12 @@
+   if (export_called_function) {
+     test_out = reinterpret_cast<TestMiniParseResult*>(
+         static_cast<uintptr_t>(data.data));
+   }
+ 
++  // Commit prior scalar stores before a fallback can allocate.
++  SyncHasbits(msg, hasbits, table);
+   uint32_t tag;
+   ptr = ReadTagInlined(ptr, &tag);
+   if (ABSL_PREDICT_FALSE(ptr == nullptr)) {
+     if (export_called_function) *test_out = {Error};
+     PROTOBUF_MUSTTAIL return Error(PROTOBUF_TC_PARAM_NO_DATA_PASS);
+@@ -652,20 +654,22 @@
+   if (ABSL_PREDICT_FALSE(data.coded_tag<TagType>() != 0)) {
+     PROTOBUF_MUSTTAIL return MiniParse(PROTOBUF_TC_PARAM_NO_DATA_PASS);
+   }
+   auto saved_tag = UnalignedLoad<TagType>(ptr);
+   ptr += sizeof(TagType);
+-  SetCachedHasBit(hasbits, data.hasbit_idx());
+   SyncHasbits(msg, hasbits, table);
+   auto& field = RefAt<MessageLite*>(msg, data.offset());
+   const auto aux = *table->field_aux(data.aux_idx());
+   const auto* inner_table =
+       aux_is_table ? aux.table : aux.message_default()->GetTcParseTable();
+ 
+   if (field == nullptr) {
+     field = NewMessage(inner_table, msg->GetArena());
+   }
++  // Presence must not describe a null child if allocation throws.
++  SetCachedHasBit(hasbits, data.hasbit_idx());
++  SyncHasbits(msg, hasbits, table);
+   const auto inner_loop = [&](const char* ptr) {
+     return ParseLoop(field, ptr, ctx, inner_table);
+   };
+   return group_coding
+              ? ctx->ParseGroupInlined(ptr, FastDecodeTag(saved_tag), inner_loop)
+@@ -732,10 +736,11 @@
+   if (ABSL_PREDICT_FALSE(data.coded_tag<TagType>() != 0)) {
+     PROTOBUF_MUSTTAIL return MiniParse(PROTOBUF_TC_PARAM_NO_DATA_PASS);
+   }
+   PROTOBUF_PREFETCH_WITH_OFFSET(ptr, 256);
+   SetCachedHasBitForRepeated(hasbits, data.hasbit_idx());
++  SyncHasbits(msg, hasbits, table);
+   Arena* arena = msg->GetArena();
+   const auto expected_tag = UnalignedLoad<TagType>(ptr);
+   const auto aux = *table->field_aux(data.aux_idx());
+   auto& field = RefAt<RepeatedPtrFieldBase>(msg, data.offset());
+   ABSL_DCHECK_EQ(field.GetArena(), arena);
+@@ -1153,10 +1158,11 @@
+     PROTOBUF_TC_PARAM_DECL) {
+   if (ABSL_PREDICT_FALSE(data.coded_tag<TagType>() != 0)) {
+     PROTOBUF_MUSTTAIL return MiniParse(PROTOBUF_TC_PARAM_NO_DATA_PASS);
+   }
+   SetCachedHasBitForRepeated(hasbits, data.hasbit_idx());
++  SyncHasbits(msg, hasbits, table);
+   auto& field = RefAt<RepeatedField<FieldType>>(msg, data.offset());
+   const auto expected_tag = UnalignedLoad<TagType>(ptr);
+   do {
+     ptr += sizeof(TagType);
+     FieldType tmp;
+@@ -1708,10 +1714,13 @@
+   if (ABSL_PREDICT_FALSE(data.coded_tag<TagType>() != 0)) {
+     PROTOBUF_MUSTTAIL return MiniParse(PROTOBUF_TC_PARAM_NO_DATA_PASS);
+   }
+   auto saved_tag = UnalignedLoad<TagType>(ptr);
+   ptr += sizeof(TagType);
++  // The current string may still be the default if its allocation throws.
++  // Only flush earlier fields until a string owner has been installed.
++  SyncHasbits(msg, hasbits, table);
+   SetCachedHasBit(hasbits, data.hasbit_idx());
+   auto& field = RefAt<FieldType>(msg, data.offset());
+   auto arena = msg->GetArena();
+   if (arena) {
+     ptr =
+@@ -2501,11 +2510,12 @@
+   const uint16_t xform_val = type_card & field_layout::kTvMask;
+   const uint16_t rep = type_card & field_layout::kRepMask;
+ 
+   // Mark the field as present:
+   const bool is_oneof = card == field_layout::kFcOneof;
+-  if (card == field_layout::kFcOptional) {
++  if (card == field_layout::kFcOptional &&
++      rep != field_layout::kRepAString) {
+     SetHas(entry, msg);
+   } else if (is_oneof) {
+     ChangeOneof(table, /*inner_table=*/nullptr, entry, data.tag() >> 3, ctx,
+                 msg);
+   }
+@@ -2553,10 +2563,15 @@
+ 
+     default:
+       Unreachable();
+   }
+ 
++  // ArenaStringPtr now owns a string, including the malformed-input path.
++  if (card == field_layout::kFcOptional &&
++      rep == field_layout::kRepAString) {
++    SetHas(entry, msg);
++  }
+   if (ABSL_PREDICT_FALSE(ptr == nullptr || !is_valid)) {
+     PROTOBUF_MUSTTAIL return Error(PROTOBUF_TC_PARAM_NO_DATA_PASS);
+   }
+   PROTOBUF_MUSTTAIL return ToTagDispatch(PROTOBUF_TC_PARAM_NO_DATA_PASS);
+ }
+@@ -2704,22 +2719,23 @@
+ 
+   const TcParseTableBase* inner_table =
+       GetTableFromAux(type_card, *table->field_aux(&entry));
+ 
+   const bool is_oneof = card == field_layout::kFcOneof;
+-  if (card == field_layout::kFcOptional) {
+-    SetHas(entry, msg);
+-  } else if (is_oneof) {
++  if (is_oneof) {
+     ChangeOneof(table, inner_table, entry, data.tag() >> 3, ctx, msg);
+   }
+ 
+   SyncHasbits(msg, hasbits, table);
+ 
+   void* const base = MaybeGetSplitBase(msg, is_split, table);
+   MessageLite*& field = RefAt<MessageLite*>(base, entry.offset);
+   if (field == nullptr) {
+     field = NewMessage(inner_table, msg->GetArena());
++  }
++  if (card == field_layout::kFcOptional) {
++    SetHas(entry, msg);
+   }
+   const auto inner_loop = [&](const char* ptr) {
+     return ParseLoopPreserveNone(field, ptr, ctx, inner_table);
+   };
+   return is_group ? ctx->ParseGroupInlined(ptr, decoded_tag, inner_loop)
+diff --git a/src/google/protobuf/repeated_ptr_field.h b/src/google/protobuf/repeated_ptr_field.h
+--- a/src/google/protobuf/repeated_ptr_field.h
++++ b/src/google/protobuf/repeated_ptr_field.h
+@@ -800,12 +800,12 @@
+ 
+ inline void* RepeatedPtrFieldBase::AddInternal(
+     Arena* arena, absl::FunctionRef<ElementNewFn> factory) {
+   ABSL_DCHECK_EQ(arena, GetArena());
+   if (tagged_rep_or_elem_ == nullptr) {
++    factory(arena, tagged_rep_or_elem_);
+     ExchangeCurrentSize(1);
+-    factory(arena, tagged_rep_or_elem_);
+     return tagged_rep_or_elem_;
+   }
+   absl::PrefetchToLocalCache(tagged_rep_or_elem_);
+   if (using_sso()) {
+     if (current_size_ == 0) {
+@@ -826,13 +826,15 @@
+   } else {
+     if (ClearedCount() > 0) {
+       return r->elements[ExchangeCurrentSize(current_size_ + 1)];
+     }
+   }
++  void*& result = r->elements[current_size_];
++  factory(arena, result);
++  // Destruction must only visit successfully constructed elements.
+   ++r->allocated_size;
+-  void*& result = r->elements[ExchangeCurrentSize(current_size_ + 1)];
+-  factory(arena, result);
++  ExchangeCurrentSize(current_size_ + 1);
+   return result;
+ }
+ 
+ template <typename TypeHandler>
+ PROTOBUF_NOINLINE void RepeatedPtrFieldBase::SwapFallback(
+diff --git a/src/google/protobuf/unknown_field_set.cc b/src/google/protobuf/unknown_field_set.cc
+--- a/src/google/protobuf/unknown_field_set.cc
++++ b/src/google/protobuf/unknown_field_set.cc
+@@ -127,21 +127,28 @@
+ 
+ template <int&...>
+ void UnknownFieldSet::AddLengthDelimited(int number, std::string&& value) {
+   auto& field = *fields_.Add();
+   field.number_ = number;
++  // Keep the newly appended slot destructible until string creation succeeds.
++  field.SetType(UnknownField::TYPE_VARINT);
++  field.data_.varint = 0;
++  auto* string_value = Arena::Create<std::string>(arena(), std::move(value));
+   field.SetType(UnknownField::TYPE_LENGTH_DELIMITED);
+-  field.data_.string_value =
+-      Arena::Create<std::string>(arena(), std::move(value));
++  field.data_.string_value = string_value;
+ }
+ template void UnknownFieldSet::AddLengthDelimited(int, std::string&&);
+ 
+ std::string* UnknownFieldSet::AddLengthDelimited(int number) {
+   auto& field = *fields_.Add();
+   field.number_ = number;
++  // Keep the newly appended slot destructible until string creation succeeds.
++  field.SetType(UnknownField::TYPE_VARINT);
++  field.data_.varint = 0;
++  auto* string_value = Arena::Create<std::string>(arena());
+   field.SetType(UnknownField::TYPE_LENGTH_DELIMITED);
+-  field.data_.string_value = Arena::Create<std::string>(arena());
++  field.data_.string_value = string_value;
+   return field.data_.string_value;
+ }
+ 
+ UnknownFieldSet* UnknownFieldSet::AddGroup(int number) {
+   auto& field = *fields_.Add();

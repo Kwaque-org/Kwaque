@@ -1,7 +1,267 @@
 load("//bazel:build.bzl", "kwaque_cc_library")
-load("//bazel:test.bzl", "kwaque_cc_benchmark", "kwaque_cc_fuzz_test", "kwaque_cc_seastar_gtest")
+load("//bazel:test.bzl", "kwaque_cc_benchmark", "kwaque_cc_fuzz_test", "kwaque_cc_seastar_gtest", "kwaque_cc_test")
 
 package(default_visibility = ["//visibility:private"])
+
+kwaque_cc_library(
+    name = "control_test_support",
+    testonly = True,
+    srcs = ["control_test_payload.cc"],
+    hdrs = [
+        "control_test_payload.h",
+        "control_test_support.h",
+    ],
+    deps = [
+        "//src/base",
+        "//src/bytes:allocation_test_profile",
+        "//src/bytes:fragmented_buffer",
+        "//src/bytes:fragmented_buffer_parser",
+        "//src/codec:cooperative",
+        "//src/codec:integer",
+        "//src/codec/tests:envelope_test_fixture",
+        "//src/protocol:control",
+        "//src/protocol:control_codec",
+        "//src/protocol:frame",
+        "@seastar",
+    ],
+)
+
+kwaque_cc_library(
+    name = "control_fuzz_oracle",
+    testonly = True,
+    srcs = ["control_fuzz_oracle.cc"],
+    hdrs = ["control_fuzz_oracle.h"],
+    deps = [
+        "//proto/kwaque/common/v1:build_info_cc_proto",
+        "//proto/kwaque/common/v1:capability_cc_proto",
+        "//proto/kwaque/common/v1:error_cc_proto",
+        "//proto/kwaque/common/v1:identity_cc_proto",
+        "//proto/kwaque/control/v1:handshake_cc_proto",
+        "//proto/kwaque/control/v1:redirect_cc_proto",
+        "//src/model:epoch",
+        "//src/model:identity",
+        "//src/protocol:control",
+        "//src/protocol:control_codec",
+        "//src/protocol:frame",
+        "@protobuf",
+        "@protobuf//src/google/protobuf/io",
+        "@protobuf//third_party/utf8_range",
+    ],
+)
+
+kwaque_cc_library(
+    name = "control_fuzz_cases",
+    testonly = True,
+    srcs = ["control_fuzz_cases.cc"],
+    hdrs = ["control_fuzz_cases.h"],
+    deps = [
+        ":control_fuzz_oracle",
+        ":control_test_support",
+        ":frame_fuzz_cases",
+        ":frame_test_support",
+        "//src/base",
+        "//src/base:error",
+        "//src/bytes:fragmented_buffer_parser",
+        "//src/codec:cooperative",
+        "//src/codec:error",
+        "//src/codec:integer",
+        "//src/codec:limits",
+        "//src/model:identity",
+        "//src/model:transport_identity",
+        "//src/model/tests:record_fuzz_cases",
+        "//src/protocol:control",
+        "//src/protocol:control_codec",
+        "//src/protocol:control_frame_codec",
+        "//src/protocol:frame",
+        "//src/protocol:frame_codec",
+        "@seastar",
+    ],
+)
+
+kwaque_cc_seastar_gtest(
+    name = "control_fuzz_cases_test",
+    srcs = ["control_fuzz_cases_test.cc"],
+    memory = "256MiB",
+    deps = [
+        ":control_fuzz_cases",
+        ":control_fuzz_oracle",
+        ":control_test_support",
+        ":frame_test_support",
+        "//src/base",
+        "//src/base:error",
+        "//src/bytes:fragmented_buffer_parser",
+        "//src/codec:cooperative",
+        "//src/codec:integer",
+        "//src/codec:limits",
+        "//src/model:transport_identity",
+        "//src/protocol:control",
+        "//src/protocol:control_codec",
+        "//src/protocol:control_frame_codec",
+        "//src/protocol:frame",
+        "//src/protocol:frame_codec",
+    ],
+)
+
+kwaque_cc_fuzz_test(
+    name = "control_fuzz",
+    srcs = ["control_fuzz.cc"],
+    args = [
+        "-max_len=16384",
+        "-rss_limit_mb=1024",
+    ],
+    corpus = glob(["testdata/control_fuzz_corpus/*.bin"]),
+    tags = [
+        "resources:cpu:1",
+        "resources:memory:1024",
+    ],
+    deps = [
+        ":control_fuzz_cases",
+        "//src/runtime/testing:seastar_fuzz",
+        "@openssl",
+        "@seastar",
+    ],
+)
+
+[
+    kwaque_cc_seastar_gtest(
+        name = name,
+        srcs = [name + ".cc"],
+        memory = "192MiB",
+        deps = [
+            ":control_test_support",
+            "//src/base",
+            "//src/base:error",
+            "//src/bytes:fragmented_buffer",
+            "//src/codec:cooperative",
+            "//src/codec:error",
+            "//src/codec:integer",
+            "//src/codec:limits",
+            "//src/model:epoch",
+            "//src/model:identity",
+            "//src/protocol:control",
+            "//src/protocol:control_codec",
+            "//src/protocol:frame",
+        ] + extra_deps,
+    )
+    for name, extra_deps in [
+        (
+            "control_encode_test",
+            [
+                "//proto/kwaque/common/v1:error_cc_proto",
+                "//proto/kwaque/control/v1:handshake_cc_proto",
+            ],
+        ),
+        (
+            "control_frame_codec_test",
+            [
+                ":frame_test_support",
+                "//src/bytes:fragmented_buffer_parser",
+                "//src/model:transport_identity",
+                "//src/protocol:control_frame_codec",
+                "//src/protocol:frame_codec",
+            ],
+        ),
+        (
+            "control_qualification_test",
+            [
+                ":frame_test_support",
+                "//proto/kwaque/common/v1:build_info_cc_proto",
+                "//proto/kwaque/common/v1:capability_cc_proto",
+                "//proto/kwaque/common/v1:error_cc_proto",
+                "//proto/kwaque/common/v1:identity_cc_proto",
+                "//proto/kwaque/control/v1:handshake_cc_proto",
+                "//proto/kwaque/control/v1:redirect_cc_proto",
+                "//src/bytes:fragmented_buffer_parser",
+                "//src/model:transport_identity",
+                "//src/protocol:control_frame_codec",
+                "//src/protocol:control_preflight",
+                "//src/protocol:control_schema",
+                "//src/protocol:frame_codec",
+                "@protobuf",
+            ],
+        ),
+    ]
+]
+
+kwaque_cc_seastar_gtest(
+    name = "control_preflight_test",
+    srcs = ["control_preflight_test.cc"],
+    memory = "192MiB",
+    deps = [
+        ":control_test_support",
+        "//proto/kwaque/common/v1:error_cc_proto",
+        "//proto/kwaque/control/v1:handshake_cc_proto",
+        "//src/base",
+        "//src/base:error",
+        "//src/codec:cooperative",
+        "//src/codec:error",
+        "//src/codec:integer",
+        "//src/codec:limits",
+        "//src/protocol:control_preflight",
+        "//src/protocol:control_schema",
+    ],
+)
+
+kwaque_cc_seastar_gtest(
+    name = "control_codec_test",
+    srcs = ["control_codec_test.cc"],
+    memory = "192MiB",
+    deps = [
+        ":control_test_support",
+        "//src/base",
+        "//src/base:error",
+        "//src/bytes:fragmented_buffer_parser",
+        "//src/codec:cooperative",
+        "//src/codec:error",
+        "//src/codec:integer",
+        "//src/codec:limits",
+        "//src/model:epoch",
+        "//src/model:identity",
+        "//src/protocol:control",
+        "//src/protocol:control_codec",
+        "//src/protocol:control_memory",
+        "//src/protocol:control_schema",
+        "//src/protocol:frame",
+    ],
+)
+
+kwaque_cc_test(
+    name = "control_schema_test",
+    srcs = ["control_schema_test.cc"],
+    deps = [
+        "//proto/kwaque/common/v1:build_info_cc_proto",
+        "//proto/kwaque/common/v1:capability_cc_proto",
+        "//proto/kwaque/common/v1:error_cc_proto",
+        "//proto/kwaque/common/v1:identity_cc_proto",
+        "//proto/kwaque/control/v1:handshake_cc_proto",
+        "//proto/kwaque/control/v1:redirect_cc_proto",
+        "//src/protocol:control_schema",
+        "@protobuf",
+    ],
+)
+
+kwaque_cc_seastar_gtest(
+    name = "control_memory_test",
+    srcs = ["control_memory_test.cc"],
+    memory = "192MiB",
+    deps = [
+        "//proto/kwaque/common/v1:build_info_cc_proto",
+        "//proto/kwaque/common/v1:capability_cc_proto",
+        "//proto/kwaque/common/v1:error_cc_proto",
+        "//proto/kwaque/common/v1:identity_cc_proto",
+        "//proto/kwaque/control/v1:handshake_cc_proto",
+        "//proto/kwaque/control/v1:redirect_cc_proto",
+        "//src/base",
+        "//src/base:error",
+        "//src/bytes:allocation_test_profile",
+        "//src/codec:integer",
+        "//src/codec:limits",
+        "//src/protocol:control_memory",
+        "//src/protocol:control_schema",
+        "@protobuf",
+        "@protobuf//:protobuf_lite",
+    ],
+)
 
 kwaque_cc_library(
     name = "batch_frame_test_support",
@@ -77,6 +337,14 @@ test_suite(
     name = "format_tests",
     tests = [
         ":batch_frame_codec_test",
+        ":control_codec_test",
+        ":control_encode_test",
+        ":control_frame_codec_test",
+        ":control_fuzz_cases_test",
+        ":control_memory_test",
+        ":control_preflight_test",
+        ":control_qualification_test",
+        ":control_schema_test",
         ":frame_corruption_test",
         ":frame_decode_test",
         ":frame_encode_test",
@@ -247,10 +515,18 @@ kwaque_cc_fuzz_test(
 
 kwaque_cc_benchmark(
     name = "protocol_bench",
-    srcs = ["frame_bench.cc"],
+    srcs = [
+        "control_bench.cc",
+        "frame_bench.cc",
+    ],
     memory = "512MiB",
     deps = [
+        ":control_fuzz_oracle",
+        ":control_test_support",
         ":frame_test_support",
+        "//proto/kwaque/common/v1:error_cc_proto",
+        "//proto/kwaque/control/v1:handshake_cc_proto",
+        "//proto/kwaque/control/v1:redirect_cc_proto",
         "//src/base",
         "//src/base:error",
         "//src/bytes:fragmented_buffer",
@@ -266,10 +542,17 @@ kwaque_cc_benchmark(
         "//src/model:batch_context",
         "//src/model/tests:model_bench_support",
         "//src/protocol:batch_frame_codec",
+        "//src/protocol:control",
+        "//src/protocol:control_codec",
+        "//src/protocol:control_frame_codec",
+        "//src/protocol:control_memory",
+        "//src/protocol:control_preflight",
+        "//src/protocol:control_schema",
         "//src/protocol:frame",
         "//src/protocol:frame_codec",
         "@crc32c",
         "@fmt",
+        "@protobuf//src/google/protobuf/io",
     ],
 )
 
@@ -277,6 +560,14 @@ test_suite(
     name = "golden_tests",
     tests = [
         ":batch_frame_codec_test",
+        ":control_codec_test",
+        ":control_encode_test",
+        ":control_frame_codec_test",
+        ":control_fuzz_cases_test",
+        ":control_memory_test",
+        ":control_preflight_test",
+        ":control_qualification_test",
+        ":control_schema_test",
         ":frame_corruption_test",
         ":frame_decode_test",
         ":frame_encode_test",

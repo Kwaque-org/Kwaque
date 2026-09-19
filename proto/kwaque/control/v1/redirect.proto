@@ -1,0 +1,31 @@
+syntax = "proto3";
+
+package kwaque.control.v1;
+
+import "proto/kwaque/common/v1/error.proto";
+import "proto/kwaque/common/v1/identity.proto";
+
+// A destination token; resolution belongs to the connection owner.
+// Retired field numbers and names must be reserved permanently and never
+// reused.
+message Endpoint {
+    // Required UTF-8, 1..253 bytes, without NUL or ASCII control/whitespace.
+    optional string host = 1;
+    // Required in 1..65535. No implicit default port.
+    optional uint32 port = 2;
+}
+
+// A routing observation, not authority to change ranges or compare epochs from
+// different scopes. The control boundary checks independent topic context.
+// Retired field numbers and names must be reserved permanently and never
+// reused.
+message Redirect {
+    // Required identities and positive scoped epochs/generations.
+    kwaque.common.v1.RoutingContext destination = 1;
+    // Required, exactly 16 octets and not all zero.
+    optional bytes broker_id = 2;
+    // Required bounded destination.
+    Endpoint endpoint = 3;
+    // Required: STALE_ROUTING, STALE_SEGMENT or NOT_LEADER only.
+    optional kwaque.common.v1.ErrorCode reason = 4;
+}

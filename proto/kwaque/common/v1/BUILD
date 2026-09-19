@@ -6,6 +6,52 @@ load("//bazel:test.bzl", "kwaque_cc_fuzz_test", "kwaque_cc_seastar_test", "kwaqu
 package(default_visibility = ["//visibility:private"])
 
 proto_library(
+    name = "identity_proto",
+    srcs = ["identity.proto"],
+    visibility = ["//proto/kwaque/control/v1:__pkg__"],
+)
+
+cc_proto_library(
+    name = "identity_cc_proto",
+    visibility = [
+        "//src/protocol:__pkg__",
+        "//src/protocol/tests:__pkg__",
+    ],
+    deps = [":identity_proto"],
+)
+
+proto_library(
+    name = "capability_proto",
+    srcs = ["capability.proto"],
+    visibility = ["//proto/kwaque/control/v1:__pkg__"],
+)
+
+cc_proto_library(
+    name = "capability_cc_proto",
+    visibility = [
+        "//src/protocol:__pkg__",
+        "//src/protocol/tests:__pkg__",
+    ],
+    deps = [":capability_proto"],
+)
+
+proto_library(
+    name = "error_proto",
+    srcs = ["error.proto"],
+    visibility = ["//proto/kwaque/control/v1:__pkg__"],
+    deps = [":identity_proto"],
+)
+
+cc_proto_library(
+    name = "error_cc_proto",
+    visibility = [
+        "//src/protocol:__pkg__",
+        "//src/protocol/tests:__pkg__",
+    ],
+    deps = [":error_proto"],
+)
+
+proto_library(
     name = "build_info_proto",
     srcs = ["build_info.proto"],
     visibility = ["//visibility:public"],

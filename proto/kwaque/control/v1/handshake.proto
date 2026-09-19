@@ -1,0 +1,49 @@
+syntax = "proto3";
+
+package kwaque.control.v1;
+
+import "proto/kwaque/common/v1/build_info.proto";
+import "proto/kwaque/common/v1/capability.proto";
+
+// Retired enum numbers and names must be reserved permanently and never reused.
+enum PeerKind {
+    PEER_KIND_UNSPECIFIED = 0;
+    PEER_KIND_BROKER = 1;
+    PEER_KIND_CLIENT = 2;
+}
+
+// Advertises peer identity and support. Acceptance, authentication and
+// negotiation belong to the connection owner.
+// Retired field numbers and names must be reserved permanently and never
+// reused.
+message HandshakeRequest {
+    // Required. UNSPECIFIED is invalid; unrecognized values are unsupported.
+    optional PeerKind peer_kind = 1;
+
+    // Optional for discovery. When present: exactly 16 octets, not all zero,
+    // compared with the independently supplied cluster expectation.
+    optional bytes expected_cluster_id = 2;
+
+    // Present iff peer_kind is BROKER; exactly 16 octets and not all zero.
+    optional bytes broker_id = 3;
+
+    // Both messages are required. BuildInfo may have empty informational
+    // fields.
+    kwaque.common.v1.BuildInfo build = 4;
+    kwaque.common.v1.Capabilities capabilities = 5;
+}
+
+// Server identity and advertised support; no selected version or lease grant.
+// Retired field numbers and names must be reserved permanently and never
+// reused.
+message HandshakeResponse {
+    // Required, exactly 16 octets and not all zero; checked against independent
+    // cluster/broker expectations when supplied.
+    optional bytes cluster_id = 1;
+    optional bytes broker_id = 2;
+
+    // Both messages are required. BuildInfo retains its existing wire
+    // semantics.
+    kwaque.common.v1.BuildInfo build = 3;
+    kwaque.common.v1.Capabilities capabilities = 4;
+}

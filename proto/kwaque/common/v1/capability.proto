@@ -1,0 +1,41 @@
+syntax = "proto3";
+
+package kwaque.common.v1;
+
+// An advertisement, not a negotiated choice or a requirement on the receiver.
+// Retired field numbers and names must be reserved permanently and never
+// reused.
+message FormatCapability {
+    // Required nonzero u16 domains; oldest_readable must not exceed current.
+    optional uint32 family = 1;
+    optional uint32 oldest_readable = 2;
+    optional uint32 current = 3;
+
+    // Required even when zero. Unknown advertised bits remain data.
+    optional fixed64 supported_features = 4;
+}
+
+// Advertised support and limits. The control boundary validates domains,
+// presence, aggregate bounds and ordering before accepting these fields.
+// Retired field numbers and names must be reserved permanently and never
+// reused.
+message Capabilities {
+    // Nonempty, strictly increasing u16 values; at most 16 entries.
+    repeated uint32 protocol_versions = 1 [packed = true];
+
+    // Nonempty, strictly increasing by family; at most 32 entries.
+    repeated FormatCapability formats = 2;
+
+    // Nonempty, strictly increasing u8 values; at most 16 entries. Zero is
+    // none.
+    repeated uint32 compression_codecs = 3 [packed = true];
+
+    // Required positive limits within the control profile's absolute ceilings:
+    // 16 MiB, 8 MiB, 4096 bytes, 1 MiB and 4096 records respectively.
+    // max_header_bytes must also be at least 48.
+    optional uint32 max_frame_body_bytes = 4;
+    optional uint32 max_expanded_batch_bytes = 5;
+    optional uint32 max_header_bytes = 6;
+    optional uint32 max_record_bytes = 7;
+    optional uint32 max_original_records = 8;
+}
