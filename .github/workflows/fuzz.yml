@@ -13,19 +13,39 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  stateful-fuzz:
-    name: ASan and UBSan (${{ matrix.target }})
+  fuzz-campaign:
+    name: ASan and UBSan (${{ matrix.name }})
     runs-on: ubuntu-24.04
     timeout-minutes: 90
     strategy:
       fail-fast: false
       max-parallel: 4
       matrix:
-        target:
-          - scheduler_fuzz
-          - fault_schedule_fuzz
-          - fake_file_fuzz
-          - fake_network_fuzz
+        include:
+          - name: scheduler_fuzz
+            target: //src/simulation/tests:scheduler_fuzz
+          - name: fault_schedule_fuzz
+            target: //src/simulation/tests:fault_schedule_fuzz
+          - name: fake_file_fuzz
+            target: //src/simulation/tests:fake_file_fuzz
+          - name: fake_network_fuzz
+            target: //src/simulation/tests:fake_network_fuzz
+          - name: codec_fuzz
+            target: //src/codec/tests:codec_fuzz
+          - name: codec_cooperative_fuzz
+            target: //src/codec/tests:codec_cooperative_fuzz
+          - name: compression_fuzz
+            target: //src/compression/tests:compression_fuzz
+          - name: record_fuzz
+            target: //src/model/tests:record_fuzz
+          - name: checkpoint_fuzz
+            target: //src/model/tests:checkpoint_fuzz
+          - name: storage_format_fuzz
+            target: //src/storage/tests:storage_format_fuzz
+          - name: frame_fuzz
+            target: //src/protocol/tests:frame_fuzz
+          - name: control_fuzz
+            target: //src/protocol/tests:control_fuzz
     steps:
       - name: Check out source
         uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # 6.0.1
@@ -34,7 +54,7 @@ jobs:
       - uses: ./.github/actions/setup-build
         with:
           cache-scope: fuzz
-      - name: Run a bounded stateful campaign
+      - name: Run a bounded fuzz campaign
         id: tests
         env:
           FUZZ_TARGET: ${{ matrix.target }}
@@ -43,9 +63,10 @@ jobs:
           --test_output=all --test_timeout=720
           --test_env=KWAQUE_FUZZ_MINIMIZE_SECONDS=30
           --test_arg=-max_total_time=600
-          "//src/simulation/tests:${FUZZ_TARGET}"
+          --test_arg=-timeout=15
+          "${FUZZ_TARGET}"
       - name: Retain failed test diagnostics
         if: failure() && steps.tests.outcome == 'failure'
         uses: ./.github/actions/retain-logs
         with:
-          name: fuzz-${{ matrix.target }}-${{ github.run_attempt }}
+          name: fuzz-${{ matrix.name }}-${{ github.run_attempt }}

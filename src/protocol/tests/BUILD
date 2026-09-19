@@ -3,6 +3,40 @@ load("//bazel:test.bzl", "kwaque_cc_benchmark", "kwaque_cc_fuzz_test", "kwaque_c
 
 package(default_visibility = ["//visibility:private"])
 
+kwaque_cc_seastar_gtest(
+    name = "format_fixture_test",
+    srcs = ["format_fixture_test.cc"],
+    data = ["//src/codec/tests:format_fixture_data"],
+    memory = "256MiB",
+    deps = [
+        ":control_fuzz_oracle",
+        ":control_test_support",
+        ":frame_test_support",
+        "//src/base",
+        "//src/base:error",
+        "//src/bytes:allocation_test_profile",
+        "//src/bytes:fragmented_buffer",
+        "//src/bytes:fragmented_buffer_parser",
+        "//src/codec:cooperative",
+        "//src/codec:error",
+        "//src/codec:integer",
+        "//src/codec:limits",
+        "//src/codec/tests:format_fixture",
+        "//src/codec/tests:format_test_support",
+        "//src/model:batch",
+        "//src/model:batch_codec",
+        "//src/model:batch_context",
+        "//src/model:identity",
+        "//src/model:transport_identity",
+        "//src/protocol:batch_frame_codec",
+        "//src/protocol:control",
+        "//src/protocol:control_codec",
+        "//src/protocol:control_frame_codec",
+        "//src/protocol:frame",
+        "//src/protocol:frame_codec",
+    ],
+)
+
 kwaque_cc_library(
     name = "control_test_support",
     testonly = True,
@@ -345,6 +379,7 @@ test_suite(
         ":control_preflight_test",
         ":control_qualification_test",
         ":control_schema_test",
+        ":format_fixture_test",
         ":frame_corruption_test",
         ":frame_decode_test",
         ":frame_encode_test",
@@ -568,6 +603,7 @@ test_suite(
         ":control_preflight_test",
         ":control_qualification_test",
         ":control_schema_test",
+        ":format_fixture_test",
         ":frame_corruption_test",
         ":frame_decode_test",
         ":frame_encode_test",

@@ -321,6 +321,29 @@ TEST(BatchBuilderTest, FingerprintUsesOnePrefixThenRawRecordStream) {
     }
 }
 
+TEST(BatchBuilderTest, RecordOrderAndOriginalCountAreNotPermutationInvariant) {
+    std::optional<codec::semantic_batch_digest> baseline;
+    for (const unsigned mode : {0U, 1U, 2U}) {
+        SCOPED_TRACE(mode);
+        seastar::abort_source abort;
+        codec::cooperative_work work{codec::limits::defaults(), abort};
+        auto out = builder();
+        const auto first = null_value();
+        const auto second = header_value();
+        add(out, mode == 1 ? second : first, wall_time{100}, work);
+        if (mode != 2)
+            add(out, mode == 1 ? first : second, wall_time{100}, work);
+        const auto batch
+          = out.finalize(work, memory().operation_remaining).get().value();
+        EXPECT_EQ(
+          batch.context().original_count().value(), mode == 2 ? 1U : 2U);
+        if (mode == 0)
+            baseline = batch.fingerprint();
+        else
+            EXPECT_NE(batch.fingerprint(), *baseline);
+    }
+}
+
 TEST(
   BatchBuilderTest,
   EmptySubmissionAndTimestampOverflowCloseWithoutPublication) {

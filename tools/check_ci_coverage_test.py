@@ -34,10 +34,7 @@ STATEFUL_FUZZERS = {
     "fake_file_fuzz",
     "fake_network_fuzz",
 }
-SMOKE_FUZZERS = {f"//src/simulation/tests:{name}" for name in STATEFUL_FUZZERS} | {
-    "//src/config:bootstrap_config_fuzz",
-    "//proto/kwaque/common/v1:build_info_fuzz",
-    "//src/bytes:fragmented_buffer_fuzz",
+FORMAT_FUZZERS = {
     "//src/codec/tests:codec_fuzz",
     "//src/codec/tests:codec_cooperative_fuzz",
     "//src/compression/tests:compression_fuzz",
@@ -46,6 +43,14 @@ SMOKE_FUZZERS = {f"//src/simulation/tests:{name}" for name in STATEFUL_FUZZERS} 
     "//src/protocol/tests:frame_fuzz",
     "//src/protocol/tests:control_fuzz",
     "//src/storage/tests:storage_format_fuzz",
+}
+SCHEDULED_FUZZERS = FORMAT_FUZZERS | {
+    f"//src/simulation/tests:{name}" for name in STATEFUL_FUZZERS
+}
+SMOKE_FUZZERS = SCHEDULED_FUZZERS | {
+    "//src/config:bootstrap_config_fuzz",
+    "//proto/kwaque/common/v1:build_info_fuzz",
+    "//src/bytes:fragmented_buffer_fuzz",
     "//src/simulation/tests:signal_canary_test",
 }
 
@@ -76,6 +81,8 @@ def fuzz_coverage_errors(workflow: str, scheduled: str, config: str) -> list[str
                 errors.append(f"smoke requires {flag}")
     if "build:fuzz --config=san-all" not in config.splitlines():
         errors.append("fuzz mode must select the full sanitizer configuration")
+    if "test:fuzz --cache_test_results=no" not in config.splitlines():
+        errors.append("fuzz campaigns must execute without cached test results")
     for option in ("--copt", "--linkopt"):
         if (
             f"build:san-all {option}=-fsanitize=address,undefined,vptr,function,alignment"
@@ -84,16 +91,27 @@ def fuzz_coverage_errors(workflow: str, scheduled: str, config: str) -> list[str
             errors.append(
                 "fuzz mode must compile and link address and undefined behavior checks"
             )
-    campaign = job_blocks(scheduled).get("stateful-fuzz", "")
-    targets = set(re.findall(r"^          - ([a-z_]+)$", campaign, re.MULTILINE))
-    if targets != STATEFUL_FUZZERS:
+    campaign = job_blocks(scheduled).get("fuzz-campaign", "")
+    entries = re.findall(
+        r"^          - name: ([a-z_]+)\n            target: (//\S+)$",
+        campaign,
+        re.MULTILINE,
+    )
+    expected_entries = {
+        (target.rsplit(":", 1)[1], target) for target in SCHEDULED_FUZZERS
+    }
+    if set(entries) != expected_entries or len(entries) != len(expected_entries):
         errors.append(
-            "scheduled matrix must contain every stateful target exactly once"
+            "scheduled matrix must contain every simulation and format target exactly once"
         )
     if "  schedule:" not in scheduled or "    - cron:" not in scheduled:
-        errors.append("stateful campaigns must be scheduled")
+        errors.append("fuzz campaigns must be scheduled")
     if "fail-fast: false" not in campaign:
         errors.append("one failure must not cancel the remaining campaigns")
+    if not re.search(r"^      max-parallel: [1-4]$", campaign, re.MULTILINE):
+        errors.append("scheduled campaigns must run at most four jobs together")
+    if "          FUZZ_TARGET: ${{ matrix.target }}" not in campaign.splitlines():
+        errors.append("scheduled campaigns must pass the selected full target label")
     commands = run_commands(campaign)
     if len(commands) != 1 or not commands[0].startswith("bazel test "):
         errors.append("scheduled matrix must execute its fuzzer")
@@ -104,7 +122,8 @@ def fuzz_coverage_errors(workflow: str, scheduled: str, config: str) -> list[str
             "--test_output=all",
             "--test_timeout=720",
             "--test_arg=-max_total_time=600",
-            '"//src/simulation/tests:${FUZZ_TARGET}"',
+            "--test_arg=-timeout=15",
+            '"${FUZZ_TARGET}"',
         ):
             if flag not in commands[0].split():
                 errors.append(f"scheduled campaign requires {flag}")
@@ -333,7 +352,7 @@ def coverage_errors(workflow: str) -> list[str]:
                 f"goldens: requires both {field} values for all four native jobs"
             )
     commands = run_commands(goldens)
-    expected = f'bazel test --config="${{{{ matrix.config }}}}" --cache_test_results=no {GOLDENS} //src/storage/tests:format_tests //src/model/tests:checkpoint_tests //src/protocol/tests:golden_tests'
+    expected = f'bazel test --config="${{{{ matrix.config }}}}" --cache_test_results=no {GOLDENS} //src/storage/tests:format_tests //src/model/tests:checkpoint_tests //src/model/tests:format_fixture_test //src/model/tests:batch_builder_test //src/protocol/tests:golden_tests //src/compression/tests:format_fixture_test //tools:verify_format_fixtures_test'
     if commands != [expected]:
         errors.append(
             "goldens: all four jobs must execute the identical explicit uncached suite"
@@ -347,6 +366,8 @@ def coverage_errors(workflow: str) -> list[str]:
     for target in (
         "//src/compression/tests:format_tests",
         "//src/model/tests:batch_compression_test",
+        "//src/model/tests:batch_builder_test",
+        "//src/model/tests:format_fixture_test",
         "//src/model/tests:checkpoint_tests",
         "//src/protocol/tests:golden_tests",
         "//src/storage/tests:format_tests",
@@ -450,8 +471,8 @@ class CiCoverageTest(unittest.TestCase):
                     if name == "goldens":
                         self.assertIn("${{ runner.arch }}", retention[0])
                         self.assertIn("${{ matrix.config }}", retention[0])
-                    elif name == "stateful-fuzz":
-                        self.assertIn("${{ matrix.target }}", retention[0])
+                    elif name == "fuzz-campaign":
+                        self.assertIn("${{ matrix.name }}", retention[0])
                     elif name != "fuzz-smoke":
                         self.assertIn("${{ github.job }}", retention[0])
 
@@ -496,8 +517,7 @@ class CiCoverageTest(unittest.TestCase):
             failed = logs / "pkg/test/run_2_of_3"
             failed.mkdir(parents=True)
             (failed / "test.xml").write_text(
-                '<testsuite><testcase><error message="aborted"/>'
-                "</testcase></testsuite>"
+                '<testsuite><testcase><error message="aborted"/></testcase></testsuite>'
             )
             passed = logs / "pkg/test/run_1_of_3"
             passed.mkdir(parents=True)
@@ -523,8 +543,10 @@ class CiCoverageTest(unittest.TestCase):
             for xml in (
                 '<testsuite failures="1"/>',
                 '<testsuite errors="1"/>',
-                '<testsuites xmlns="urn:junit"><testsuite><testcase><failure/>'
-                "</testcase></testsuite></testsuites>",
+                (
+                    '<testsuites xmlns="urn:junit"><testsuite><testcase><failure/>'
+                    "</testcase></testsuite></testsuites>"
+                ),
                 "<testsuite",
             ):
                 with self.subTest(report=xml):
@@ -659,11 +681,15 @@ class CiCoverageTest(unittest.TestCase):
 
     def test_each_omitted_campaign_or_retention_setting_fails(self) -> None:
         scheduled = FUZZ_WORKFLOW.read_text()
-        for value in STATEFUL_FUZZERS | {
+        for value in SCHEDULED_FUZZERS | {
             "--test_arg=-max_total_time=600",
+            "--test_arg=-timeout=15",
             "if: failure()",
             "--test_timeout=720",
             "fail-fast: false",
+            "max-parallel: 4",
+            "FUZZ_TARGET: ${{ matrix.target }}",
+            '"${FUZZ_TARGET}"',
             "  schedule:",
         }:
             with self.subTest(value=value):
@@ -672,6 +698,48 @@ class CiCoverageTest(unittest.TestCase):
                         self.workflow,
                         scheduled.replace(value, ""),
                         BAZEL_CONFIG.read_text(),
+                    )
+                )
+
+    def test_campaign_duplicates_canary_or_wrong_target_binding_fail(self) -> None:
+        scheduled = FUZZ_WORKFLOW.read_text()
+        entry = (
+            "          - name: codec_fuzz\n"
+            "            target: //src/codec/tests:codec_fuzz\n"
+        )
+        for altered in (
+            scheduled.replace(entry, entry + entry),
+            scheduled.replace(
+                entry,
+                entry
+                + (
+                    "          - name: signal_canary_fuzz\n"
+                    "            target: //src/simulation/tests:signal_canary_fuzz\n"
+                ),
+            ),
+            scheduled.replace("name: codec_fuzz", "name: frame_fuzz"),
+            scheduled.replace('"${FUZZ_TARGET}"', "//src/codec/tests:codec_fuzz"),
+            scheduled.replace("bazel test", "bazel build"),
+            scheduled.replace("max-parallel: 4", "max-parallel: 12"),
+        ):
+            with self.subTest(workflow=altered):
+                self.assertTrue(
+                    fuzz_coverage_errors(
+                        self.workflow, altered, BAZEL_CONFIG.read_text()
+                    )
+                )
+
+    def test_fuzz_cache_cannot_skip_a_campaign(self) -> None:
+        config = BAZEL_CONFIG.read_text()
+        for replacement in ("", "test:fuzz --cache_test_results=yes"):
+            with self.subTest(replacement=replacement):
+                self.assertTrue(
+                    fuzz_coverage_errors(
+                        self.workflow,
+                        FUZZ_WORKFLOW.read_text(),
+                        config.replace(
+                            "test:fuzz --cache_test_results=no", replacement
+                        ),
                     )
                 )
 
@@ -770,6 +838,14 @@ class CiCoverageTest(unittest.TestCase):
         self.assertTrue(
             coverage_errors(self.workflow.replace("--cache_test_results=no", ""))
         )
+        for target in (
+            "//src/model/tests:format_fixture_test",
+            "//src/model/tests:batch_builder_test",
+            "//src/compression/tests:format_fixture_test",
+            "//tools:verify_format_fixtures_test",
+        ):
+            with self.subTest(target=target):
+                self.assertTrue(coverage_errors(self.workflow.replace(target, "")))
 
     def test_actual_test_execution_and_configuration_isolation_are_required(
         self,

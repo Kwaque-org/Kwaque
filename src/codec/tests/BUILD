@@ -4,10 +4,56 @@ load("//bazel:test.bzl", "kwaque_cc_benchmark", "kwaque_cc_fuzz_test", "kwaque_c
 package(default_visibility = ["//visibility:private"])
 
 kwaque_cc_library(
+    name = "format_fixture",
+    testonly = True,
+    hdrs = ["format_fixture.h"],
+    visibility = [
+        "//src/compression/tests:__pkg__",
+        "//src/model/tests:__pkg__",
+        "//src/protocol/tests:__pkg__",
+        "//src/storage/tests:__pkg__",
+    ],
+)
+
+kwaque_cc_library(
+    name = "format_test_support",
+    testonly = True,
+    hdrs = ["format_test_support.h"],
+    visibility = [
+        "//src/model/tests:__pkg__",
+        "//src/protocol/tests:__pkg__",
+        "//src/storage/tests:__pkg__",
+    ],
+    deps = [
+        "//src/base",
+        "//src/base:error",
+        "//src/bytes:fragmented_buffer_parser",
+        "//src/codec:error",
+        "@googletest//:gtest",
+    ],
+)
+
+filegroup(
+    name = "format_fixture_data",
+    srcs = glob(["testdata/formats/*.hex"]) + ["testdata/formats/manifest.json"],
+    visibility = [
+        "//src/compression/tests:__pkg__",
+        "//src/model/tests:__pkg__",
+        "//src/protocol/tests:__pkg__",
+        "//src/storage/tests:__pkg__",
+        "//tools:__pkg__",
+    ],
+)
+
+kwaque_cc_library(
     name = "envelope_test_fixture",
     testonly = True,
     hdrs = ["envelope_decode_test_support.h"],
-    visibility = ["//src/protocol/tests:__pkg__"],
+    visibility = [
+        "//src/compression/tests:__pkg__",
+        "//src/model/tests:__pkg__",
+        "//src/protocol/tests:__pkg__",
+    ],
     deps = [
         "//src/bytes:fragmented_buffer",
         "@seastar",

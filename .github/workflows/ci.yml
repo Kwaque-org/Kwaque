@@ -209,7 +209,11 @@ jobs:
           //src/simulation/tests:determinism_goldens
           //src/storage/tests:format_tests
           //src/model/tests:checkpoint_tests
+          //src/model/tests:format_fixture_test
+          //src/model/tests:batch_builder_test
           //src/protocol/tests:golden_tests
+          //src/compression/tests:format_fixture_test
+          //tools:verify_format_fixtures_test
 
       - name: Retain failed test diagnostics
         if: failure() && steps.tests.outcome == 'failure'
@@ -241,7 +245,7 @@ jobs:
     needs: workflow-lint
     if: needs.workflow-lint.outputs.run_checks != 'false'
     runs-on: ubuntu-24.04
-    timeout-minutes: 90
+    timeout-minutes: 240
     steps:
       - name: Check out source
         uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # 6.0.1
@@ -269,7 +273,7 @@ jobs:
     needs: workflow-lint
     if: needs.workflow-lint.outputs.run_checks != 'false'
     runs-on: ubuntu-24.04
-    timeout-minutes: 90
+    timeout-minutes: 240
     steps:
       - name: Check out source
         uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # 6.0.1
@@ -393,6 +397,8 @@ jobs:
           //src/compression/tests:format_tests
           //src/storage/tests:format_tests
           //src/model/tests:checkpoint_tests
+          //src/model/tests:format_fixture_test
+          //src/model/tests:batch_builder_test
           //src/protocol/tests:golden_tests
           //src/model/tests:batch_compression_test
           //bazel/tests:seastar_gtest

@@ -3,11 +3,6 @@ load("//bazel:test.bzl", "kwaque_cc_benchmark", "kwaque_cc_seastar_test", "kwaqu
 
 package(default_visibility = ["//visibility:private"])
 
-filegroup(
-    name = "package_boundary",
-    srcs = ["README.md"],
-)
-
 kwaque_cc_library(
     name = "event",
     srcs = ["event.cc"],

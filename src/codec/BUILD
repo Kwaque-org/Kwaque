@@ -336,8 +336,3 @@ kwaque_cc_library(
         "@seastar",
     ],
 )
-
-filegroup(
-    name = "package_boundary",
-    srcs = ["README.md"],
-)

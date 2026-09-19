@@ -4,6 +4,27 @@ load("//bazel:test.bzl", "kwaque_cc_benchmark", "kwaque_cc_fuzz_test", "kwaque_c
 package(default_visibility = ["//visibility:private"])
 
 kwaque_cc_seastar_gtest(
+    name = "format_fixture_test",
+    srcs = ["format_fixture_test.cc"],
+    data = ["//src/codec/tests:format_fixture_data"],
+    memory = "256MiB",
+    deps = [
+        "//src/base",
+        "//src/base:error",
+        "//src/bytes:allocation_test_profile",
+        "//src/bytes:fragmented_buffer",
+        "//src/bytes:fragmented_buffer_parser",
+        "//src/codec:cooperative",
+        "//src/codec:error",
+        "//src/codec:integer",
+        "//src/codec:limits",
+        "//src/codec/tests:envelope_test_fixture",
+        "//src/codec/tests:format_fixture",
+        "//src/compression",
+    ],
+)
+
+kwaque_cc_seastar_gtest(
     name = "compression_test",
     srcs = [
         "compression_test.cc",
@@ -54,6 +75,7 @@ test_suite(
         ":compression_cooperation_test",
         ":compression_fuzz_cases_test",
         ":compression_test",
+        ":format_fixture_test",
         ":lz4_context_test",
         ":lz4_header_test",
         ":lz4_stream_test",

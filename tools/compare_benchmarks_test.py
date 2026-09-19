@@ -157,17 +157,36 @@ class BenchmarkComparisonTest(unittest.TestCase):
                 baseline.write_bytes(b"changed during measurement")
             return result
 
-        with mock.patch.object(driver.subprocess, "run", side_effect=mutate):
-            with self.assertRaisesRegex(driver.ComparisonError, "changed during"):
-                driver.run_comparison(
-                    self.binary, [PAIR], self.output, baseline_binary=baseline
-                )
+        with (
+            mock.patch.object(driver.subprocess, "run", side_effect=mutate),
+            self.assertRaisesRegex(driver.ComparisonError, "changed during"),
+        ):
+            driver.run_comparison(
+                self.binary, [PAIR], self.output, baseline_binary=baseline
+            )
 
     def test_same_case_requires_saved_binary(self):
         with self.assertRaises(driver.ComparisonError):
             driver.run_comparison(
                 self.binary, [driver.Pair("group.case", "group.case")], self.output
             )
+        self.assertFalse(self.output.exists())
+
+    def test_copy_of_candidate_is_not_a_before_after_baseline(self):
+        baseline = self.root / "copied baseline"
+        baseline.write_bytes(self.binary.read_bytes())
+        baseline.chmod(0o755)
+        with (
+            mock.patch.object(driver.subprocess, "run") as child,
+            self.assertRaisesRegex(driver.ComparisonError, "different binary contents"),
+        ):
+            driver.run_comparison(
+                self.binary,
+                [driver.Pair("group.case", "group.case")],
+                self.output,
+                baseline_binary=baseline,
+            )
+        child.assert_not_called()
         self.assertFalse(self.output.exists())
 
     def test_runtime_profile_requires_native_optimized_oom_abort_without_instrumentation(
@@ -195,9 +214,11 @@ class BenchmarkComparisonTest(unittest.TestCase):
                 with self.assertRaises(driver.ComparisonError):
                     driver.read_runtime_profile(path)
         path.write_bytes(PROFILE_LINE)
-        with mock.patch.object(driver, "MAXIMUM_PROFILE_LOG_BYTES", 16):
-            with self.assertRaisesRegex(driver.ComparisonError, "size limit"):
-                driver.read_runtime_profile(path)
+        with (
+            mock.patch.object(driver, "MAXIMUM_PROFILE_LOG_BYTES", 16),
+            self.assertRaisesRegex(driver.ComparisonError, "size limit"),
+        ):
+            driver.read_runtime_profile(path)
 
     def test_valid_measurements_with_wrong_runtime_profile_cannot_pass(self) -> None:
         def wrong_profile(arguments, **kwargs):
@@ -238,9 +259,11 @@ class BenchmarkComparisonTest(unittest.TestCase):
             {"results": {PAIR.baseline: []}, "summary": {}},
             {"results": {PAIR.baseline: {}}, "summary": {}},
         ):
-            with self.subTest(document=document):
-                with self.assertRaises(driver.ComparisonError):
-                    driver.parse_measurement(document, PAIR.baseline, 7)
+            with (
+                self.subTest(document=document),
+                self.assertRaises(driver.ComparisonError),
+            ):
+                driver.parse_measurement(document, PAIR.baseline, 7)
 
     def test_native_numeric_fields_require_finite_valid_measurements(self) -> None:
         for field, values in {
@@ -269,9 +292,11 @@ class BenchmarkComparisonTest(unittest.TestCase):
             with self.assertRaises(driver.ComparisonError):
                 driver.read_measurement(path, PAIR.baseline, 7)
         path.write_bytes(b" " * 20)
-        with mock.patch.object(driver, "MAXIMUM_RESULT_BYTES", 10):
-            with self.assertRaisesRegex(driver.ComparisonError, "size limit"):
-                driver.read_measurement(path, PAIR.baseline, 7)
+        with (
+            mock.patch.object(driver, "MAXIMUM_RESULT_BYTES", 10),
+            self.assertRaisesRegex(driver.ComparisonError, "size limit"),
+        ):
+            driver.read_measurement(path, PAIR.baseline, 7)
 
     def test_thresholds_use_median_of_paired_ratios_and_all_rounds_for_a_win(
         self,
@@ -320,11 +345,13 @@ class BenchmarkComparisonTest(unittest.TestCase):
 
     def test_extreme_finite_medians_cannot_produce_an_invalid_ratio(self) -> None:
         for baseline, candidate in ((1e-320, 1e308), (1e308, 1e-320)):
-            with self.subTest(baseline=baseline, candidate=candidate):
-                with self.assertRaisesRegex(driver.ComparisonError, "ratio"):
-                    driver.compare_pair(
-                        PAIR, [(measurement(baseline), measurement(candidate))] * 3
-                    )
+            with (
+                self.subTest(baseline=baseline, candidate=candidate),
+                self.assertRaisesRegex(driver.ComparisonError, "ratio"),
+            ):
+                driver.compare_pair(
+                    PAIR, [(measurement(baseline), measurement(candidate))] * 3
+                )
 
     def test_order_is_recorded_reproducible_and_pairs_every_round(self) -> None:
         pairs = [PAIR, driver.Pair("other.native", "other.kwaque")]
@@ -350,9 +377,11 @@ class BenchmarkComparisonTest(unittest.TestCase):
             "group.case;bad=other.case",
             "group.case=other.$(bad)",
         ):
-            with self.subTest(pair=pair):
-                with self.assertRaises(driver.ComparisonError):
-                    driver.parse_pair(pair)
+            with (
+                self.subTest(pair=pair),
+                self.assertRaises(driver.ComparisonError),
+            ):
+                driver.parse_pair(pair)
 
     def test_every_case_uses_a_fresh_process_with_relative_artifact_paths(self) -> None:
         parent_cwd = Path.cwd()
@@ -400,11 +429,14 @@ class BenchmarkComparisonTest(unittest.TestCase):
     def test_cpu_override_is_fixed_for_all_pairs_roles_and_rounds(self) -> None:
         self.expected_cpu = 7
         pairs = [PAIR, driver.Pair("other.native", "other.kwaque")]
-        with mock.patch.object(
-            driver.subprocess, "run", side_effect=self.fake_native
-        ) as child, mock.patch.object(
-            driver.os, "sched_setaffinity", create=True
-        ) as set_affinity:
+        with (
+            mock.patch.object(
+                driver.subprocess, "run", side_effect=self.fake_native
+            ) as child,
+            mock.patch.object(
+                driver.os, "sched_setaffinity", create=True
+            ) as set_affinity,
+        ):
             result = driver.run_comparison(self.binary, pairs, self.output, cpu=7)
         self.affinity.assert_called_once_with(0)
         set_affinity.assert_not_called()
@@ -427,9 +459,10 @@ class BenchmarkComparisonTest(unittest.TestCase):
 
     def test_invalid_cpu_is_rejected_before_output_or_children(self) -> None:
         for cpu in (-1, True, False, 3.0, "3", 4):
-            with self.subTest(cpu=cpu), mock.patch.object(
-                driver.subprocess, "run"
-            ) as child:
+            with (
+                self.subTest(cpu=cpu),
+                mock.patch.object(driver.subprocess, "run") as child,
+            ):
                 with self.assertRaises(driver.ComparisonError):
                     driver.run_comparison(self.binary, [PAIR], self.output, cpu=cpu)
                 child.assert_not_called()
@@ -461,9 +494,10 @@ class BenchmarkComparisonTest(unittest.TestCase):
 
     def test_invalid_task_quota_is_rejected_before_output_or_children(self) -> None:
         for quota in (0, -0.0, -1, math.nan, math.inf, -math.inf, True, False, "1"):
-            with self.subTest(quota=quota), mock.patch.object(
-                driver.subprocess, "run"
-            ) as child:
+            with (
+                self.subTest(quota=quota),
+                mock.patch.object(driver.subprocess, "run") as child,
+            ):
                 with self.assertRaisesRegex(driver.ComparisonError, "task_quota_ms"):
                     driver.run_comparison(
                         self.binary, [PAIR], self.output, task_quota_ms=quota
@@ -483,10 +517,12 @@ class BenchmarkComparisonTest(unittest.TestCase):
             "--task-quota-ms",
             "60000",
         ]
-        with mock.patch.object(
-            driver.subprocess, "run", side_effect=self.fake_native
-        ) as child, mock.patch.object(driver.sys, "argv", arguments), mock.patch(
-            "builtins.print"
+        with (
+            mock.patch.object(
+                driver.subprocess, "run", side_effect=self.fake_native
+            ) as child,
+            mock.patch.object(driver.sys, "argv", arguments),
+            mock.patch("builtins.print"),
         ):
             self.assertEqual(driver.main(), 0)
         self.assertEqual(child.call_count, 6)
@@ -510,10 +546,11 @@ class BenchmarkComparisonTest(unittest.TestCase):
                 str(self.output),
                 f"--task-quota-ms={quota}",
             ]
-            with self.subTest(quota=quota), mock.patch.object(
-                driver.subprocess, "run"
-            ) as child, mock.patch.object(driver.sys, "argv", arguments), mock.patch(
-                "builtins.print"
+            with (
+                self.subTest(quota=quota),
+                mock.patch.object(driver.subprocess, "run") as child,
+                mock.patch.object(driver.sys, "argv", arguments),
+                mock.patch("builtins.print"),
             ):
                 self.assertEqual(driver.main(), 1)
                 child.assert_not_called()
@@ -528,9 +565,10 @@ class BenchmarkComparisonTest(unittest.TestCase):
         ):
             self.affinity.side_effect = error
             self.affinity.return_value = set()
-            with self.subTest(error=error), mock.patch.object(
-                driver.subprocess, "run"
-            ) as child:
+            with (
+                self.subTest(error=error),
+                mock.patch.object(driver.subprocess, "run") as child,
+            ):
                 with self.assertRaisesRegex(driver.ComparisonError, "affinity"):
                     driver.run_comparison(self.binary, [PAIR], self.output)
                 child.assert_not_called()
@@ -549,10 +587,12 @@ class BenchmarkComparisonTest(unittest.TestCase):
             "--cpu",
             "7",
         ]
-        with mock.patch.object(
-            driver.subprocess, "run", side_effect=self.fake_native
-        ) as child, mock.patch.object(driver.sys, "argv", arguments), mock.patch(
-            "builtins.print"
+        with (
+            mock.patch.object(
+                driver.subprocess, "run", side_effect=self.fake_native
+            ) as child,
+            mock.patch.object(driver.sys, "argv", arguments),
+            mock.patch("builtins.print"),
         ):
             self.assertEqual(driver.main(), 0)
         self.assertEqual(child.call_count, 6)
@@ -562,7 +602,7 @@ class BenchmarkComparisonTest(unittest.TestCase):
     ) -> None:
         for failure in ("exit", "timeout", "missing", "malformed"):
 
-            def failed(arguments, **kwargs):
+            def failed(arguments, *, failure=failure, **kwargs):
                 kwargs["stdout"].write(PROFILE_LINE)
                 if failure == "exit":
                     return subprocess.CompletedProcess(arguments, 2)
@@ -605,7 +645,7 @@ class BenchmarkComparisonTest(unittest.TestCase):
         for reason in ("counter_failure", "timing_regression"):
             self.output = self.root / reason
 
-            def regressed(arguments, **kwargs):
+            def regressed(arguments, *, reason=reason, **kwargs):
                 result = self.fake_native(arguments, **kwargs)
                 filename = next(
                     a.removeprefix("--json-output=")
@@ -634,12 +674,12 @@ class BenchmarkComparisonTest(unittest.TestCase):
                 "41",
             ]
             with self.subTest(reason=reason):
-                with mock.patch.object(
-                    driver.subprocess, "run", side_effect=regressed
-                ) as child, mock.patch.object(
-                    driver.sys, "argv", arguments
-                ), mock.patch(
-                    "builtins.print"
+                with (
+                    mock.patch.object(
+                        driver.subprocess, "run", side_effect=regressed
+                    ) as child,
+                    mock.patch.object(driver.sys, "argv", arguments),
+                    mock.patch("builtins.print"),
                 ):
                     self.assertEqual(driver.main(), 1)
                 self.assertEqual(child.call_count, 6)

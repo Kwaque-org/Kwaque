@@ -375,11 +375,6 @@ kwaque_cc_library(
     ],
 )
 
-filegroup(
-    name = "package_boundary",
-    srcs = ["README.md"],
-)
-
 kwaque_cc_library(
     name = "checkpoint",
     hdrs = ["checkpoint.h"],

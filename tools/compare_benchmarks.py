@@ -385,6 +385,10 @@ def run_comparison(
     output_dir = output_dir.expanduser().resolve()
     digest = binary_digest(binary)
     baseline_digest = binary_digest(baseline_binary) if baseline_binary else digest
+    if baseline_binary is not None and baseline_digest == digest:
+        raise ComparisonError(
+            "before/after comparison requires different binary contents"
+        )
     try:
         output_dir.mkdir(parents=True, exist_ok=False)
     except OSError as error:
