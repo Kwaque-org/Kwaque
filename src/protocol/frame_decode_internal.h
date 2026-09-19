@@ -78,7 +78,7 @@ concept frame_payload_decoder = requires(
 // leave child extent/marks intact, consume it exactly on success, and report
 // persistent result charges relative to the supplied residual. No callback may
 // access the parent or publish state. Direct type checks cannot inspect borrows
-// hidden inside aggregates; these three owning consumers are reviewed together.
+// hidden inside aggregates; owning consumers are reviewed with their adapters.
 template<typename T, typename Decoder>
 requires frame_payload_decoder<T, Decoder>
 [[nodiscard]] seastar::future<frame_read_result<T>> decode_frame_payload(

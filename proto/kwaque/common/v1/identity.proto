@@ -1,0 +1,22 @@
+syntax = "proto3";
+
+package kwaque.common.v1;
+
+// Identifies one routing destination. Presence and domain constraints are
+// checked by the control boundary; generated parsing alone does not validate
+// it. Retired field numbers and names must be reserved permanently and never
+// reused.
+message RoutingContext {
+    // Required, exactly 16 octets, and not all zero.
+    optional bytes topic_id = 1;
+    optional bytes range_id = 2;
+
+    // Required positive epoch scoped to this topic/range.
+    optional uint64 routing_epoch = 3;
+
+    // Required, exactly 16 octets, and not all zero.
+    optional bytes segment_id = 4;
+
+    // Required positive generation scoped to this segment.
+    optional uint64 segment_generation = 5;
+}
