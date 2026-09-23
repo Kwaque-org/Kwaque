@@ -102,7 +102,10 @@ errc native_error(std::size_t code) {
     }
 }
 errc expand_records(
-  std::string_view frame, std::size_t expected, expanded_bytes& output) {
+  std::string_view frame,
+  std::size_t expected,
+  expanded_bytes& output,
+  bool& body_started) {
     if (frame.size() < 5) return errc::malformed_data;
     const auto header_size = LZ4F_headerSize(frame.data(), frame.size());
     if (const auto error = native_error(header_size); error != errc::success)
@@ -133,6 +136,7 @@ errc expand_records(
     frame.remove_prefix(consumed);
     auto bounce = std::make_unique<std::array<char, expanded_bytes::width>>();
     const char sentinel = 0;
+    body_started = true;
     for (;;) {
         const auto offered = std::min(frame.size(), expanded_bytes::width);
         consumed = offered;
@@ -431,7 +435,7 @@ batch_probe probe_batch(
     // Zero is an invalid family, not an unknown future family. Sender value
     // checks precede this; reader-profile compatibility and features follow it.
     if (family == 0) return {.error = errc::malformed_data};
-    if (family > 10 || reader != 1 || little(wire, 16, 8) != 0)
+    if (family > 11 || reader != 1 || little(wire, 16, 8) != 0)
         return {.error = errc::unsupported_format};
     std::size_t extension = 32;
     std::uint64_t previous_tag = 0, extensions = 0;
@@ -506,11 +510,14 @@ batch_probe probe_batch(
     expanded_bytes expanded_records;
     if (encoding == 1) {
         if (narrow_compression_work) return {.error = errc::resource_exhausted};
+        bool body_started = false;
         const auto error = expand_records(
           body.substr(fixed),
           static_cast<std::size_t>(expanded),
-          expanded_records);
-        if (error != errc::success) return {.error = error};
+          expanded_records,
+          body_started);
+        if (error != errc::success)
+            return {.error = error, .compression_body_error = body_started};
     }
     const auto records = encoding == 1 ? oracle_view{expanded_records}
                                        : oracle_view{body.substr(fixed)};

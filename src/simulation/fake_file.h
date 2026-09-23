@@ -27,6 +27,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <deque>
+#include <exception>
 #include <map>
 #include <memory>
 #include <optional>
@@ -57,6 +58,30 @@ inline constexpr byte_count maximum_fake_retained_path_bytes{
   std::uint64_t{256} * 1024U * 1024U};
 
 class fake_file_test_access;
+class fake_file_system;
+
+// Await close before destruction. Concurrent close rejects with queue_full;
+// the first caller owns the drain. Moves preserve stable pending state.
+class fake_directory_cursor final {
+public:
+    fake_directory_cursor(fake_directory_cursor&&) noexcept;
+    fake_directory_cursor& operator=(fake_directory_cursor&&) noexcept;
+    fake_directory_cursor(const fake_directory_cursor&) = delete;
+    fake_directory_cursor& operator=(const fake_directory_cursor&) = delete;
+    ~fake_directory_cursor();
+    [[nodiscard]] seastar::future<runtime::result<runtime::directory_page>>
+    next(runtime::directory_page_limits limits);
+    // Uses the retained directory; next/sync are single-flight, close joins
+    // both.
+    [[nodiscard]] seastar::future<runtime::result<void>> sync();
+    [[nodiscard]] seastar::future<runtime::result<void>> close();
+
+private:
+    friend class fake_file_system;
+    struct state;
+    explicit fake_directory_cursor(std::unique_ptr<state> value) noexcept;
+    std::unique_ptr<state> state_;
+};
 
 class fake_object_id final {
 public:
@@ -128,9 +153,24 @@ struct fake_directory_entry final {
     bool operator==(const fake_directory_entry&) const = default;
 };
 
+// Optional crash campaign. Ordinary default crashes retain only synced state.
+// Percentages sample candidate granules, EOF, and namespace groups. Namespace
+// dependencies can force a candidate to survive. A granule is a model choice,
+// not a hardware atomicity claim.
+struct fake_crash_policy final {
+    std::uint8_t data_percent{0};
+    std::uint8_t namespace_percent{0};
+    std::uint8_t eof_percent{0};
+    std::uint32_t granule_bytes{512};
+    std::uint32_t maximum_namespace_groups{4096};
+    byte_count maximum_scratch_bytes{64U * 1024U * 1024U};
+    bool operator==(const fake_crash_policy&) const = default;
+};
+
 struct fake_file_system_config final {
     [[nodiscard]] std::uint64_t required_events() const noexcept {
-        return static_cast<std::uint64_t>(maximum_pending_operations) * 3U;
+        return static_cast<std::uint64_t>(maximum_pending_operations) * 3U
+               + (crash_policy ? 1U : 0U);
     }
     [[nodiscard]] runtime::result<void> validate_scheduling(
       const scheduler_limits& limits,
@@ -157,6 +197,12 @@ struct fake_file_system_config final {
     std::uint32_t disk_overwrite_dma_alignment{4'096};
     std::uint32_t native_max_length{
       static_cast<std::uint32_t>(maximum_contiguous_allocation_bytes)};
+    // Optional advisory sample independent of modeled file-byte retention.
+    // A configured error replaces the sample after successful path lookup.
+    std::optional<runtime::file_system_space> space_override;
+    std::optional<errc> space_error;
+    std::optional<fake_crash_policy> crash_policy;
+    std::uint64_t device_scope{1};
 };
 
 enum class fake_file_system_state : std::uint8_t {
@@ -168,6 +214,11 @@ enum class fake_file_system_state : std::uint8_t {
 
 class fake_file_system final : public runtime::shard_affine {
 public:
+    using directory_cursor_type = fake_directory_cursor;
+    [[nodiscard]] seastar::future<runtime::result<fake_directory_cursor>>
+    open_directory(
+      runtime::file_path path,
+      runtime::file_close_policy policy = runtime::file_close_policy::legacy);
     [[nodiscard]] static runtime::result<canonical_fake_path>
     validate_config(const fake_file_system_config& config);
 
@@ -203,6 +254,8 @@ public:
     exists(runtime::file_path path);
     [[nodiscard]] seastar::future<runtime::result<runtime::file_status>>
     stat(runtime::file_path path);
+    [[nodiscard]] seastar::future<runtime::result<runtime::file_system_space>>
+    space(runtime::file_path path);
     [[nodiscard]] seastar::future<runtime::result<runtime::directory_listing>>
     list(runtime::file_path path, runtime::directory_listing_limits limits);
     [[nodiscard]] seastar::future<runtime::result<void>>
@@ -211,10 +264,14 @@ public:
     remove_file(runtime::file_path path);
     [[nodiscard]] seastar::future<runtime::result<void>>
     remove_directory(runtime::file_path path);
-    [[nodiscard]] seastar::future<runtime::result<void>>
-    rename(runtime::file_path source, runtime::file_path destination);
-    [[nodiscard]] seastar::future<runtime::result<void>>
-    sync_directory(runtime::file_path path);
+    [[nodiscard]] seastar::future<runtime::result<void>> rename(
+      runtime::file_path source,
+      runtime::file_path destination,
+      runtime::file_rename_policy policy
+      = runtime::file_rename_policy::replace);
+    [[nodiscard]] seastar::future<runtime::result<void>> sync_directory(
+      runtime::file_path path,
+      runtime::file_close_policy policy = runtime::file_close_policy::legacy);
     [[nodiscard]] seastar::future<runtime::result<void>> crash();
     [[nodiscard]] seastar::future<runtime::result<void>> stop();
     [[nodiscard]] fake_file_system_state state() const {
@@ -240,6 +297,7 @@ public:
 
 private:
     friend class fake_file_test_access;
+    friend class fake_directory_cursor;
     class native_file_impl;
 
     struct unsigned_name_less {
@@ -257,6 +315,7 @@ private:
     struct directory_state final {
         directory_map durable;
         directory_delta unsynced;
+        std::uint64_t synced_sequence{0};
     };
 
     using page = std::array<std::byte, fake_file_page_bytes>;
@@ -316,6 +375,7 @@ private:
         std::variant<regular_file_state, directory_state> state;
         std::uint32_t open_references{0};
         std::uint32_t pending_references{0};
+        std::uint32_t history_references{0};
         std::uint32_t visible_links{0};
         std::uint32_t durable_links{0};
         std::array<std::uint64_t, runtime::builtin_fault_points.size()>
@@ -327,6 +387,45 @@ private:
 
     using inode_map
       = seastar::chunked_hash_map<std::uint64_t, std::unique_ptr<inode>>;
+
+    struct namespace_change final {
+        fake_object_id parent;
+        std::string name;
+        std::optional<fake_object_id> before;
+        std::optional<fake_object_id> after;
+    };
+    struct namespace_group final {
+        std::array<std::optional<namespace_change>, 2> changes;
+        bool committed{false};
+    };
+    class namespace_transaction final {
+    public:
+        namespace_transaction(
+          fake_file_system& owner,
+          namespace_change first,
+          std::optional<namespace_change> second = std::nullopt,
+          std::uint64_t sequence = 0);
+        ~namespace_transaction();
+        namespace_transaction(const namespace_transaction&) = delete;
+        namespace_transaction& operator=(const namespace_transaction&) = delete;
+        void commit() noexcept;
+
+    private:
+        fake_file_system& owner_;
+        std::uint64_t id_{0};
+        bool committed_{false};
+    };
+    void release_namespace_group(namespace_group& group) noexcept;
+    void prune_namespace_history();
+    struct crash_state;
+    struct crash_pause;
+    [[nodiscard]] runtime::result<void>
+    prepare_selective_crash(fake_operation_id active);
+    [[nodiscard]] seastar::future<runtime::result<void>>
+    run_selective_crash(fake_operation_id active);
+    void finish_selective_crash(
+      fake_operation_id active,
+      seastar::future<runtime::result<void>> outcome) noexcept;
 
     enum class pending_kind : std::uint8_t {
         open,
@@ -346,6 +445,11 @@ private:
         size,
         close,
         crash_control,
+        space,
+        cursor_open,
+        cursor_next,
+        cursor_close,
+        cursor_sync,
         count,
     };
 
@@ -370,15 +474,21 @@ private:
         std::uint64_t generation{0};
     };
 
+    seastar::future<runtime::result<void>>
+    sync_directory_checked(runtime::file_path path);
+
     struct pending_open final {
         seastar::file native;
         runtime::operation_statistics_owner statistics;
+        runtime::file_close_policy close_policy{
+          runtime::file_close_policy::legacy};
 
         [[nodiscard]] runtime::file publish() && {
             return runtime::file{
               std::move(native),
               runtime::file_io_limits{},
-              std::move(statistics)};
+              std::move(statistics),
+              close_policy};
         }
     };
 
@@ -387,7 +497,9 @@ private:
       bool,
       pending_open,
       runtime::file_status,
+      runtime::file_system_space,
       runtime::directory_listing,
+      runtime::directory_page,
       byte_count,
       std::uint64_t,
       seastar::temporary_buffer<std::uint8_t>>;
@@ -396,8 +508,14 @@ private:
         std::optional<canonical_fake_path> path;
         std::optional<canonical_fake_path> destination_path;
         runtime::file_open_options open_options{};
+        runtime::file_rename_policy rename_policy{
+          runtime::file_rename_policy::replace};
         runtime::directory_listing_limits listing_limits{};
         std::optional<pending_open> parked_open;
+        event_trace::reservation space_trace;
+        fake_directory_cursor::state* cursor{nullptr};
+        runtime::directory_page_limits page_limits{};
+        std::optional<seastar::semaphore_units<>> page_reservation;
     };
 
     struct native_io_operation final {
@@ -446,6 +564,13 @@ private:
         std::optional<prepared_truncate> truncate_commit;
         std::uint64_t fault_a{0};
         std::uint64_t fault_b{0};
+        event_trace::reservation effect_trace;
+        event_trace::reservation result_trace;
+        bool effect_observed{false};
+        std::uint64_t effect_bytes{0};
+        std::uint64_t effect_position{0};
+        std::uint64_t effect_generation{0};
+        std::uint64_t effect_epoch{0};
         byte_count accounted_bytes;
         std::uint64_t accounted_path_bytes{0};
         trace_event_kind trace_kind{trace_event_kind::generic};
@@ -572,10 +697,13 @@ private:
     apply_open(metadata_operation& metadata, bool& open_slot);
     [[nodiscard]] runtime::result<void>
     remove(const canonical_fake_path& path, fake_file_kind kind);
-    [[nodiscard]] runtime::result<void>
-    rename(const canonical_fake_path& from, const canonical_fake_path& to);
+    [[nodiscard]] runtime::result<void> rename(
+      const canonical_fake_path& from,
+      const canonical_fake_path& to,
+      runtime::file_rename_policy);
     [[nodiscard]] runtime::result<void>
     sync_directory(const canonical_fake_path& path);
+    [[nodiscard]] runtime::result<void> sync_directory(fake_object_id);
     [[nodiscard]] runtime::result<seastar::chunked_vector<fake_directory_entry>>
     list(const canonical_fake_path& path) const;
     template<typename Visitor>
@@ -657,10 +785,29 @@ private:
     void complete(fake_operation_id id) noexcept;
     [[nodiscard]] runtime::result<pending_value>
     apply(pending_operation& operation);
+    [[nodiscard]] runtime::result<pending_value>
+    apply_file_failure(pending_operation& operation);
+    void observe_file_effect(std::uint64_t bytes, bool applied = true);
+    [[nodiscard]] runtime::result<void> observe_file_result(
+      pending_operation& operation,
+      const runtime::operation_error* error,
+      std::uint32_t receipt) noexcept;
+    [[nodiscard]] runtime::result<runtime::directory_page> read_cursor_page(
+      fake_directory_cursor::state& cursor,
+      runtime::directory_page_limits limits,
+      seastar::semaphore_units<> reservation);
+    [[nodiscard]] seastar::future<runtime::result<pending_value>> submit_cursor(
+      fake_directory_cursor::state& cursor,
+      pending_kind kind,
+      runtime::builtin_fault_point point,
+      runtime::directory_page_limits limits = {},
+      std::optional<seastar::semaphore_units<>> reservation = std::nullopt);
     void finish(
       pending_operation& operation,
       runtime::result<pending_value> result,
       bool resolve);
+    void finish_exception(
+      pending_operation& operation, std::exception_ptr exception) noexcept;
     [[nodiscard]] runtime::result<void> validate_submission(
       pending_kind kind,
       byte_count retained_bytes,
@@ -748,8 +895,15 @@ private:
     std::uint64_t pending_path_bytes_{0};
     std::uint64_t retained_path_bytes_{0};
     std::uint32_t open_handles_{0};
+    seastar::lw_shared_ptr<seastar::semaphore> cursor_slots_;
     std::uint32_t pending_opens_{0};
     std::uint64_t generation_{1};
+    std::uint64_t crash_epoch_{0};
+    std::uint64_t next_namespace_sequence_{1};
+    std::map<std::uint64_t, namespace_group> namespace_history_;
+    std::uint64_t history_name_bytes_{0};
+    std::unique_ptr<crash_state> crash_;
+    std::optional<seastar::future<>> crash_task_;
     object_worklist collection_worklist_;
     seastar::chunked_hash_set<std::uint64_t> open_objects_;
     std::uint64_t dirty_head_{0};
@@ -757,6 +911,7 @@ private:
     std::optional<seastar::shared_promise<runtime::result<void>>> stop_done_;
     std::optional<runtime::operation_error> stop_failure_;
     fake_file_system_state state_{fake_file_system_state::open};
+    pending_operation* effect_operation_{nullptr};
 };
 
 static_assert(!std::is_move_constructible_v<fake_file_system>);

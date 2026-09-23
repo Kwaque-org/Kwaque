@@ -161,12 +161,7 @@ codec::result<lz4_plan> admit_lz4(
             return lz4_plan{
               direction,
               policy,
-              {*remaining,
-               byte_count{
-                 std::min(memory.metadata_remaining, config.max_metadata_bytes)
-                   .value()
-                 - metadata.value()},
-               memory.charge},
+              memory.charge,
               native,
               bounce,
               scratch,
@@ -283,7 +278,7 @@ codec::result<void> lz4_memory::status(codec::field_context context) const {
 }
 
 lz4_context::lz4_context(const lz4_plan& plan)
-  : memory_(plan.policy, plan.native_bytes, plan.remaining.charge) {
+  : memory_(plan.policy, plan.native_bytes, plan.charge) {
     if (plan.direction == lz4_direction::compress)
         compressor_.reset(LZ4F_createCompressionContext_advanced(
           memory_.callbacks(), LZ4F_VERSION));

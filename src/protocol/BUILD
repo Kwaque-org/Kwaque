@@ -168,6 +168,7 @@ kwaque_cc_library(
         "//src/base:invariant",
         "//src/bytes:fragmented_buffer",
         "//src/bytes:fragmented_buffer_parser",
+        "//src/codec:buffer_cost_internal",
         "//src/codec:cooperative",
         "//src/codec:crc32c",
         "//src/codec:crc32c_cooperative",

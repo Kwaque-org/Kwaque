@@ -6,6 +6,7 @@
 
 #include <seastar/core/deleter.hh>
 
+#include <algorithm>
 #include <exception>
 #include <optional>
 
@@ -129,7 +130,7 @@ seastar::future<codec::result<kwaque::bytes::fragmented_buffer>> encode_padded(
                                                    layout.padding_bytes())
                                                : std::nullopt;
             if (
-              charge == nullptr || fixed.empty() || fixed.size() > 232
+              charge == nullptr || fixed.empty() || fixed.size() > 320
               || layout.header_bytes().value() != codec::envelope_prefix_bytes
               || !body_bytes || layout.body_bytes() != *body_bytes) {
                 failed = at(errc::invalid_argument, context);
@@ -200,7 +201,9 @@ seastar::future<codec::result<kwaque::bytes::fragmented_buffer>> encode_padded(
             }
             if (
               auto ready = co_await work.admit(
-                byte_count{512}, item_count{8}, anchor);
+                std::max(byte_count{512}, byte_count{2U * fixed.size()}),
+                item_count{8},
+                anchor);
               !ready) {
                 failed = ready.error();
                 break;

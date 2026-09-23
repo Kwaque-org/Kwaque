@@ -43,7 +43,11 @@ kwaque_cc_library(
     name = "test_directory",
     testonly = True,
     hdrs = ["test_directory.h"],
-    visibility = ["//src/runtime/tests:__pkg__"],
+    visibility = [
+        "//src/broker:__pkg__",
+        "//src/runtime/tests:__pkg__",
+        "//src/storage/tests:__pkg__",
+    ],
 )
 
 kwaque_cc_binary(

@@ -1,5 +1,6 @@
 #include "src/model/tests/record_fuzz_cases.h"
 
+#include "src/bytes/test_allocation_profile.h"
 #include "src/codec/sha256.h"
 #include "src/model/batch_codec.h"
 #include "src/model/batch_rewrite.h"
@@ -31,19 +32,7 @@ constexpr codec::field_context coordinates{.origin = 1024};
 void require(bool condition) {
     if (!condition) __builtin_trap();
 }
-byte_count charge(byte_count request) noexcept {
-    if (request.value() == 0) return {};
-    if (request.value() > (std::uint64_t{1} << 62U))
-        return byte_count{UINT64_MAX};
-#if defined(SEASTAR_DEFAULT_ALLOCATOR)
-    return byte_count{
-      std::bit_ceil(std::max(request.value() + 32U, std::uint64_t{32}))};
-#else
-    const auto rounded = std::bit_ceil(
-      std::max(request.value(), std::uint64_t{16}));
-    return byte_count{request.value() <= 16384 ? 2U * rounded : rounded};
-#endif
-}
+using kwaque::bytes::testing::charge;
 codec::decode_budget memory() {
     return {byte_count{32U << 20U}, byte_count{1U << 20U}, charge};
 }
@@ -276,7 +265,7 @@ auto joined(F&& function, bool queued, seastar::abort_source& abort) {
 }
 void compare(
   errc actual,
-  errc oracle,
+  bool matches_oracle,
   std::uint8_t flags,
   std::uint8_t depth,
   bool queued,
@@ -292,9 +281,9 @@ void compare(
     else if ((flags & 96U) != 0)
         require(
           actual != errc::success
-          && (actual == oracle || actual == errc::resource_exhausted));
+          && (matches_oracle || actual == errc::resource_exhausted));
     else
-        require(actual == oracle);
+        require(matches_oracle);
 }
 void exercise_record(
   std::string_view raw,
@@ -347,9 +336,10 @@ void exercise_record(
       },
       queued,
       abort);
+    const auto actual_code = actual ? errc::success : actual.error().code();
     compare(
-      actual ? errc::success : actual.error().code(),
-      oracle.error,
+      actual_code,
+      actual_code == oracle.error,
       flags,
       depth,
       queued,
@@ -435,9 +425,10 @@ void exercise_batch(
       },
       queued,
       abort);
+    const auto actual_code = actual ? errc::success : actual.error().code();
     compare(
-      actual ? errc::success : actual.error().code(),
-      oracle.error,
+      actual_code,
+      oracle.matches_error(actual_code),
       flags,
       depth,
       queued,

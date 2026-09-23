@@ -30,8 +30,7 @@ writer_preferences(byte_count expanded) noexcept;
 struct lz4_plan final {
     lz4_direction direction;
     codec::limits policy;
-    // Residual after reserving the complete scratch/output geometry below.
-    codec::decode_budget remaining;
+    bytes::allocation_charge_fn charge;
     byte_count native_bytes;
     byte_count bounce_bytes;
     // Additional heap scratch; fixed C++ owners are in the caller's

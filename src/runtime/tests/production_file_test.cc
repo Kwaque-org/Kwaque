@@ -40,9 +40,23 @@ SEASTAR_TEST_CASE(production_file_owner_writes_flushes_truncates_and_reopens) {
             path,
             seastar::open_flags::rw | seastar::open_flags::create
               | seastar::open_flags::exclusive);
+          const auto memory_alignment = native.memory_dma_alignment();
+          const auto read_max = native.disk_read_max_length();
+          const auto write_max = native.disk_write_max_length();
           kwaque::runtime::file owner{std::move(native)};
 
-          const auto exercise = [&owner] -> seastar::future<> {
+          const auto exercise = [&owner,
+                                 memory_alignment,
+                                 read_max,
+                                 write_max] -> seastar::future<> {
+              const auto geometry = owner.geometry();
+              BOOST_REQUIRE(geometry.has_value());
+              BOOST_CHECK_EQUAL(
+                geometry->memory_alignment().value(), memory_alignment);
+              BOOST_CHECK_EQUAL(
+                geometry->native_read_max_length().value(), read_max);
+              BOOST_CHECK_EQUAL(
+                geometry->native_write_max_length().value(), write_max);
               const auto written = co_await owner.write(
                 kwaque::runtime::file_position{0}, aligned_data(4096, 'k'));
               const auto flushed = co_await owner.flush();

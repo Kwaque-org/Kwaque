@@ -1,12 +1,14 @@
 #include "src/runtime/file.h"
 
 #include "src/base/invariant.h"
+#include "src/runtime/directory_cursor_internal.h"
 #include "src/runtime/file_error_internal.h"
 #include "src/runtime/fragmented_buffer_internal.h"
 
 #include <seastar/core/coroutine.hh>
 #include <seastar/core/semaphore.hh>
 #include <seastar/core/temporary_buffer.hh>
+#include <seastar/util/defer.hh>
 
 #include <algorithm>
 #include <bit>
@@ -20,6 +22,43 @@
 #include <utility>
 
 namespace kwaque::runtime {
+
+result<void> directory_page_limits::validate() const noexcept {
+    if (
+      maximum_entries.value() == 0
+      || maximum_entries.value() > maximum_directory_page_entries
+      || maximum_name_bytes.value() == 0
+      || maximum_name_bytes > maximum_directory_page_name_bytes) {
+        return failure(
+          operation_error{errc::invalid_argument, operation_kind::file});
+    }
+    return {};
+}
+
+directory_page::directory_page(
+  directory_listing listing,
+  bool end,
+  seastar::lw_shared_ptr<detail::directory_cursor_memory> memory,
+  seastar::semaphore_units<> reservation) noexcept
+  : memory_(std::move(memory))
+  , reservation_(std::move(reservation))
+  , listing_(std::move(listing))
+  , end_(end) {}
+directory_page::directory_page(directory_page&&) noexcept = default;
+directory_page::~directory_page() {
+    if (memory_) memory_->assert_current();
+}
+directory_page& directory_page::operator=(directory_page&& other) noexcept {
+    if (this != &other) {
+        directory_page previous(std::move(other));
+        using std::swap;
+        swap(memory_, previous.memory_);
+        swap(reservation_, previous.reservation_);
+        swap(listing_, previous.listing_);
+        swap(end_, previous.end_);
+    }
+    return *this;
+}
 
 namespace {
 
@@ -47,17 +86,28 @@ file_io_limits validated_file_io_limits(file_io_limits limits) {
 operation_error file_error_from_exception(std::exception_ptr exception) {
     try {
         std::rethrow_exception(std::move(exception));
+    } catch (const kwaque::runtime::detail::file_operation_exception& error) {
+        return error.error();
     } catch (const seastar::cancelled_error&) {
         return file_error(errc::aborted);
     } catch (const std::system_error& error) {
-        return file_error(detail::map_file_system_error(error.code()));
+        return detail::map_file_operation_error(error.code());
     }
 }
 
-seastar::file require_open_file(seastar::file&& native_file) {
+seastar::file
+require_open_file(seastar::file&& native_file, file_close_policy policy) {
     if (!native_file) {
         throw std::invalid_argument("file requires an open native handle");
     }
+    if (
+      policy != file_close_policy::legacy
+      && policy != file_close_policy::checked)
+        throw std::invalid_argument("invalid file close policy");
+    if (
+      policy == file_close_policy::checked
+      && !native_file.supports_checked_close())
+        throw detail::file_operation_exception{file_error(errc::unavailable)};
     return std::move(native_file);
 }
 
@@ -129,6 +179,47 @@ stage_aligned_write(
 
 } // namespace
 
+bool file_geometry::supports_disk_alignment(
+  byte_count alignment) const noexcept {
+    const auto value = alignment.value();
+    return std::has_single_bit(value) && value % read_.value() == 0
+           && value % write_.value() == 0 && value % overwrite_.value() == 0;
+}
+
+result<file_system_space> file_system_space::make(
+  byte_count capacity,
+  byte_count free,
+  byte_count available,
+  bool read_only) noexcept {
+    const auto sentinel = std::numeric_limits<std::uint64_t>::max();
+    if (
+      capacity.value() == sentinel || free.value() == sentinel
+      || available.value() == sentinel || available > free || free > capacity)
+        return failure(file_error(errc::invalid_argument));
+    return file_system_space{capacity, free, available, read_only};
+}
+
+result<file_system_space> file_system_space::from_blocks(
+  std::uint64_t fragment_bytes,
+  std::uint64_t blocks,
+  std::uint64_t free_blocks,
+  std::uint64_t available_blocks,
+  bool read_only) noexcept {
+    const auto maximum = std::numeric_limits<std::uint64_t>::max();
+    if (
+      fragment_bytes == 0 || fragment_bytes == maximum || blocks == maximum
+      || free_blocks == maximum || available_blocks == maximum
+      || available_blocks > free_blocks || free_blocks > blocks)
+        return failure(file_error(errc::invalid_argument));
+    if (blocks > maximum / fragment_bytes)
+        return failure(file_error(errc::out_of_range));
+    return make(
+      byte_count{blocks * fragment_bytes},
+      byte_count{free_blocks * fragment_bytes},
+      byte_count{available_blocks * fragment_bytes},
+      read_only);
+}
+
 class file::writer final {
 public:
     writer(
@@ -166,7 +257,7 @@ public:
             queued.reset();
             static_cast<void>(*serialization);
             static_cast<void>(self.holder_);
-            if (auto rejected = self.owner_.operation_rejection()) {
+            if (auto rejected = self.owner_.mutation_rejection(true)) {
                 co_return failure(std::move(*rejected));
             }
 
@@ -246,8 +337,8 @@ public:
                         fragment.size(),
                         &self.owner_.io_intent_);
                     if (written == 0 || written > fragment.size()) {
-                        throw std::system_error(
-                          std::make_error_code(std::errc::io_error));
+                        throw detail::file_operation_exception{make_file_error(
+                          errc::io_failure, file_failure_detail::unknown)};
                     }
                     if (written != fragment.size()) {
                         co_await recover_short_write(
@@ -286,8 +377,8 @@ public:
                     staged_size,
                     &self.owner_.io_intent_);
                 if (written == 0 || written > staged_size) {
-                    throw std::system_error(
-                      std::make_error_code(std::errc::io_error));
+                    throw detail::file_operation_exception{make_file_error(
+                      errc::io_failure, file_failure_detail::unknown)};
                 }
                 if (written != staged_size) {
                     co_await recover_short_write(
@@ -313,16 +404,15 @@ public:
             }
             self.metric_.add_completed_bytes(self.total_bytes_);
             co_return byte_count{self.total_bytes_};
-        } catch (const std::bad_alloc&) {
-            throw;
         } catch (...) {
             co_return failure(
-              file_error_from_exception(std::current_exception()));
+              self.owner_.remember_io_failure(std::current_exception()));
         }
     }
 
     [[nodiscard]] static seastar::future<result<byte_count>> finish_direct(
       file& owner,
+      seastar::gate::holder holder,
       std::uint64_t position,
       bytes::fragmented_buffer data,
       seastar::temporary_buffer<char> fragment,
@@ -331,6 +421,7 @@ public:
       std::uint64_t write_alignment,
       std::uint64_t memory_alignment,
       operation_statistics::reservation metric) {
+        static_cast<void>(holder);
         static_cast<void>(data);
         static_cast<void>(serialization);
         const auto size = fragment.size();
@@ -345,11 +436,9 @@ public:
               memory_alignment);
             metric.add_completed_bytes(static_cast<std::uint64_t>(size));
             co_return byte_count{static_cast<std::uint64_t>(size)};
-        } catch (const std::bad_alloc&) {
-            throw;
         } catch (...) {
             co_return failure(
-              file_error_from_exception(std::current_exception()));
+              owner.remember_io_failure(std::current_exception()));
         }
     }
 
@@ -363,7 +452,8 @@ private:
       std::uint64_t write_alignment,
       std::uint64_t memory_alignment) {
         if (completed > size) {
-            throw std::system_error(std::make_error_code(std::errc::io_error));
+            throw detail::file_operation_exception{
+              make_file_error(errc::io_failure, file_failure_detail::unknown)};
         }
         while (completed < size) {
             const auto current_position
@@ -373,8 +463,8 @@ private:
               !is_aligned(current_position, write_alignment)
               || !is_aligned(
                 static_cast<std::uint64_t>(remaining), write_alignment)) {
-                throw std::system_error(
-                  std::make_error_code(std::errc::io_error));
+                throw detail::file_operation_exception{make_file_error(
+                  errc::io_failure, file_failure_detail::unknown)};
             }
 
             const char* submitted = data + completed;
@@ -393,16 +483,16 @@ private:
             const auto written = co_await owner.native_file_.dma_write(
               current_position, submitted, remaining, &owner.io_intent_);
             if (written == 0 || written > remaining) {
-                throw std::system_error(
-                  std::make_error_code(std::errc::io_error));
+                throw detail::file_operation_exception{make_file_error(
+                  errc::io_failure, file_failure_detail::unknown)};
             }
             completed += written;
             if (
               completed < size
               && !is_aligned(
                 static_cast<std::uint64_t>(completed), write_alignment)) {
-                throw std::system_error(
-                  std::make_error_code(std::errc::io_error));
+                throw detail::file_operation_exception{make_file_error(
+                  errc::io_failure, file_failure_detail::unknown)};
             }
         }
     }
@@ -425,8 +515,8 @@ private:
             const auto read = co_await owner_.native_file_.dma_read(
               block_start, block.get_write(), block.size(), &owner_.io_intent_);
             if (read < existing || read > block.size()) {
-                throw std::system_error(
-                  std::make_error_code(std::errc::io_error));
+                throw detail::file_operation_exception{make_file_error(
+                  errc::io_failure, file_failure_detail::unknown)};
             }
         }
 
@@ -441,7 +531,8 @@ private:
         const auto written = co_await owner_.native_file_.dma_write(
           block_start, block.get(), block.size(), &owner_.io_intent_);
         if (written == 0 || written > block.size()) {
-            throw std::system_error(std::make_error_code(std::errc::io_error));
+            throw detail::file_operation_exception{
+              make_file_error(errc::io_failure, file_failure_detail::unknown)};
         }
         if (written != block.size()) {
             co_await recover_short_write(
@@ -541,8 +632,9 @@ result<void> file_open_options::validate() const noexcept {
     if (
       access_value > static_cast<std::uint8_t>(file_access::read_write)
       || (exclusive && !create)
-      || (truncate && access == file_access::read_only)
-      || permissions > 0777U) {
+      || (truncate && access == file_access::read_only) || permissions > 0777U
+      || static_cast<std::uint8_t>(close_policy)
+           > static_cast<std::uint8_t>(file_close_policy::checked)) {
         return failure(file_error(errc::invalid_argument));
     }
     return {};
@@ -586,11 +678,12 @@ result<void> file_io_limits::validate() const noexcept {
 file::file(
   seastar::file&& native_file,
   file_io_limits limits,
-  operation_statistics_owner statistics)
+  operation_statistics_owner statistics,
+  file_close_policy close_policy)
   : statistics_owner_(std::move(statistics))
   , statistics_(&statistics_owner_.get())
   , limits_(validated_file_io_limits(limits))
-  , native_file_(require_open_file(std::move(native_file)))
+  , native_file_(require_open_file(std::move(native_file), close_policy))
   , read_operation_units_(limits_.pending_reads)
   , read_byte_units_(limits_.pending_read_bytes.value())
   , metadata_operation_units_(limits_.pending_metadata_operations)
@@ -607,7 +700,8 @@ file::file(
         native_file_.disk_write_max_length(),
         maximum_contiguous_allocation_bytes))
   , append_chunk_limit_(
-      round_down(native_write_max_length_, disk_write_dma_alignment_)) {
+      round_down(native_write_max_length_, disk_write_dma_alignment_))
+  , close_policy_(close_policy) {
     KWAQUE_INVARIANT(
       file_alignment_invariant,
       std::has_single_bit(native_file_.memory_dma_alignment())
@@ -675,6 +769,8 @@ file::file(file&& other) noexcept
   , native_write_max_length_(other.native_write_max_length_)
   , append_chunk_limit_(other.append_chunk_limit_)
   , close_done_(std::move(other.close_done_))
+  , first_failure_(other.first_failure_)
+  , close_policy_(other.close_policy_)
   , state_(other.state_)
   , abort_requested_(other.abort_requested_) {
     other.state_ = file_state::closed;
@@ -746,16 +842,137 @@ void file::request_abort() {
     io_intent_.cancel();
 }
 
-seastar::future<result<void>> file::flush() {
+file::metadata_reservation::metadata_reservation(
+  file& owner, seastar::semaphore_units<> units) noexcept
+  : owner_(&owner)
+  , units_(std::move(units)) {}
+
+file::metadata_reservation::metadata_reservation(
+  metadata_reservation&& other) noexcept
+  : owner_(other.owner_) {
+    if (owner_) owner_->owner_.assert_current();
+    KWAQUE_INVARIANT(
+      file_move_invariant,
+      !other.active_,
+      "metadata reservation moved during a flush");
+    units_ = std::move(other.units_);
+    other.owner_ = nullptr;
+}
+
+file::metadata_reservation&
+file::metadata_reservation::operator=(metadata_reservation&& other) noexcept {
+    if (this != &other) {
+        release();
+        if (other.owner_) other.owner_->owner_.assert_current();
+        KWAQUE_INVARIANT(
+          file_move_invariant,
+          !other.active_,
+          "metadata reservation moved during a flush");
+        owner_ = std::exchange(other.owner_, nullptr);
+        units_ = std::move(other.units_);
+    }
+    return *this;
+}
+
+file::metadata_reservation::~metadata_reservation() { release(); }
+
+void file::metadata_reservation::release() noexcept {
+    if (owner_) owner_->owner_.assert_current();
+    KWAQUE_INVARIANT(
+      file_stopped_invariant,
+      !active_,
+      "metadata reservation released during a flush");
+    units_.return_all();
+    owner_ = nullptr;
+}
+
+result<file::metadata_reservation> file::try_reserve_metadata() {
     owner_.assert_current();
     if (auto rejected = operation_rejection()) {
+        return failure(*rejected);
+    }
+    auto admission = try_acquire_metadata();
+    if (!admission) {
+        return failure(make_file_error(
+          errc::queue_full, file_failure_detail::admission_not_dispatched));
+    }
+    return metadata_reservation{*this, std::move(*admission)};
+}
+
+seastar::future<result<void>> file::flush(metadata_reservation& reservation) {
+    owner_.assert_current();
+    if (reservation.owner_ != this || reservation.units_.count() != 1) {
+        statistics_->reject();
+        co_return failure(make_file_error(
+          errc::invalid_argument,
+          file_failure_detail::admission_not_dispatched));
+    }
+    if (auto rejected = mutation_rejection()) {
+        statistics_->reject();
+        co_return failure(*rejected);
+    }
+    if (reservation.active_) {
+        statistics_->reject();
+        co_return failure(make_file_error(
+          errc::queue_full, file_failure_detail::admission_not_dispatched));
+    }
+    auto holder = operations_.hold();
+    reservation.active_ = true;
+    auto active = seastar::defer(
+      [&reservation] noexcept { reservation.active_ = false; });
+    [[maybe_unused]] auto metric = statistics_->accept();
+    try {
+        co_await native_file_.flush();
+        if (first_failure_.failed()) co_return first_failure_.outcome();
+        co_return result<void>{};
+    } catch (...) {
+        co_return failure(remember_io_failure(std::current_exception()));
+    }
+}
+
+operation_error file::remember_error(operation_error error) {
+    const auto detail = file_detail(error);
+    bool qualified = false;
+    for (std::size_t index = 0; index < error.context_size(); ++index)
+        qualified |= error.context_at(index)->key
+                     == operation_context_key::detail;
+    if (
+      qualified && detail
+      && *detail != file_failure_detail::admission_not_dispatched
+      && error.code() != errc::aborted && !first_failure_.failed())
+        first_failure_.observe(error);
+    if (
+      close_policy_ == file_close_policy::checked
+      && (!detail || *detail != file_failure_detail::admission_not_dispatched)) {
+        first_failure_.observe(error);
+        if (first_failure_.exception())
+            std::rethrow_exception(first_failure_.exception());
+        return *first_failure_.error();
+    }
+    return first_failure_.error().value_or(error);
+}
+
+operation_error file::remember_io_failure(std::exception_ptr exception) {
+    try {
+        return remember_error(file_error_from_exception(exception));
+    } catch (...) {
+        if (close_policy_ == file_close_policy::checked)
+            first_failure_.observe(exception);
+        throw;
+    }
+}
+
+seastar::future<result<void>> file::flush() {
+    owner_.assert_current();
+    if (auto rejected = mutation_rejection()) {
         statistics_->reject();
         co_return failure(std::move(*rejected));
     }
     auto admission = try_acquire_metadata();
     if (!admission) {
         statistics_->reject();
-        co_return failure(file_error(errc::queue_full));
+        co_return failure(make_file_error(
+          errc::queue_full, file_failure_detail::admission_not_dispatched));
     }
     static_cast<void>(*admission);
     auto holder = operations_.try_hold();
@@ -766,11 +983,10 @@ seastar::future<result<void>> file::flush() {
     [[maybe_unused]] auto metric = statistics_->accept();
     try {
         co_await native_file_.flush();
+        if (first_failure_.failed()) co_return first_failure_.outcome();
         co_return result<void>{};
-    } catch (const std::bad_alloc&) {
-        throw;
     } catch (...) {
-        co_return failure(file_error_from_exception(std::current_exception()));
+        co_return failure(remember_io_failure(std::current_exception()));
     }
 }
 
@@ -779,8 +995,8 @@ file::read_validated(file_position position, byte_count maximum_bytes) {
     auto admission = try_acquire_read(maximum_bytes);
     if (!admission) {
         statistics_->reject();
-        result<file_read_result> outcome = failure(
-          file_error(errc::queue_full));
+        result<file_read_result> outcome = failure(make_file_error(
+          errc::queue_full, file_failure_detail::admission_not_dispatched));
         return seastar::make_ready_future<result<file_read_result>>(
           std::move(outcome));
     }
@@ -899,6 +1115,10 @@ file::write_validated(file_position position, bytes::fragmented_buffer&& data) {
           && is_aligned(data_size, append_alignment)
           && data_size <= append_chunk_limit_
           && (has_one_fragment || front_fragment.size() < append_alignment || !aligned_front)) {
+            seastar::gate::holder holder;
+            if (close_policy_ == file_close_policy::checked) {
+                holder = seastar::gate::holder{operations_};
+            }
             auto metric = statistics_->accept();
             seastar::temporary_buffer<char> fragment;
             if (has_one_fragment && aligned_front) {
@@ -909,7 +1129,7 @@ file::write_validated(file_position position, bytes::fragmented_buffer&& data) {
                 fragment = stage_aligned_write(
                   data, data_size, memory_alignment);
             }
-            if (auto rejected = operation_rejection()) {
+            if (auto rejected = mutation_rejection()) {
                 return seastar::make_ready_future<result<byte_count>>(
                   failure(std::move(*rejected)));
             }
@@ -922,7 +1142,7 @@ file::write_validated(file_position position, bytes::fragmented_buffer&& data) {
                 const auto written = completed.get();
                 if (written == 0 || written > expected) {
                     return seastar::make_ready_future<result<byte_count>>(
-                      failure(file_error(errc::io_failure)));
+                      failure(remember_error(file_error(errc::io_failure))));
                 }
                 if (written == expected) {
                     metric.add_completed_bytes(
@@ -932,6 +1152,7 @@ file::write_validated(file_position position, bytes::fragmented_buffer&& data) {
                 }
                 return writer::finish_direct(
                   *this,
+                  std::move(holder),
                   position.value(),
                   std::move(data),
                   std::move(fragment),
@@ -944,6 +1165,7 @@ file::write_validated(file_position position, bytes::fragmented_buffer&& data) {
 #endif
             return std::move(completed).then_wrapped(
               [this,
+               holder = std::move(holder),
                position = position.value(),
                data = std::move(data),
                fragment = std::move(fragment),
@@ -957,7 +1179,7 @@ file::write_validated(file_position position, bytes::fragmented_buffer&& data) {
                       const auto written = completed.get();
                       if (written == 0 || written > expected) {
                           result<byte_count> outcome = failure(
-                            file_error(errc::io_failure));
+                            remember_error(file_error(errc::io_failure)));
                           return seastar::make_ready_future<result<byte_count>>(
                             std::move(outcome));
                       }
@@ -971,6 +1193,7 @@ file::write_validated(file_position position, bytes::fragmented_buffer&& data) {
                       }
                       return writer::finish_direct(
                         *this,
+                        std::move(holder),
                         position,
                         std::move(data),
                         std::move(fragment),
@@ -979,12 +1202,9 @@ file::write_validated(file_position position, bytes::fragmented_buffer&& data) {
                         append_alignment,
                         memory_alignment,
                         std::move(metric));
-                  } catch (const std::bad_alloc&) {
-                      return seastar::current_exception_as_future<
-                        result<byte_count>>();
                   } catch (...) {
                       result<byte_count> outcome = failure(
-                        file_error_from_exception(std::current_exception()));
+                        remember_io_failure(std::current_exception()));
                       return seastar::make_ready_future<result<byte_count>>(
                         std::move(outcome));
                   }
@@ -992,12 +1212,10 @@ file::write_validated(file_position position, bytes::fragmented_buffer&& data) {
         }
         return write_general(
           position, std::move(data), std::move(serialization));
-    } catch (const std::bad_alloc&) {
-        return seastar::current_exception_as_future<result<byte_count>>();
     } catch (...) {
         return seastar::futurize_invoke(
-          [exception = std::current_exception()] -> result<byte_count> {
-              return failure(file_error_from_exception(exception));
+          [this, exception = std::current_exception()] -> result<byte_count> {
+              return failure(remember_io_failure(exception));
           });
     }
 }
@@ -1011,7 +1229,8 @@ seastar::future<result<byte_count>> file::write_general(
         queued = try_acquire_queued_write(data.retained_bytes());
         if (!queued) {
             statistics_->reject();
-            result<byte_count> outcome = failure(file_error(errc::queue_full));
+            result<byte_count> outcome = failure(make_file_error(
+              errc::queue_full, file_failure_detail::admission_not_dispatched));
             return seastar::make_ready_future<result<byte_count>>(
               std::move(outcome));
         }
@@ -1035,7 +1254,7 @@ seastar::future<result<byte_count>> file::write_general(
 
 seastar::future<result<void>> file::truncate(std::uint64_t size) {
     owner_.assert_current();
-    if (auto rejected = operation_rejection()) {
+    if (auto rejected = mutation_rejection()) {
         statistics_->reject();
         co_return failure(std::move(*rejected));
     }
@@ -1045,7 +1264,8 @@ seastar::future<result<void>> file::truncate(std::uint64_t size) {
         queued = try_acquire_queued_write(byte_count{});
         if (!queued) {
             statistics_->reject();
-            co_return failure(file_error(errc::queue_full));
+            co_return failure(make_file_error(
+              errc::queue_full, file_failure_detail::admission_not_dispatched));
         }
     }
     auto holder = operations_.try_hold();
@@ -1062,15 +1282,13 @@ seastar::future<result<void>> file::truncate(std::uint64_t size) {
         }
         queued.reset();
         static_cast<void>(*serialization);
-        if (auto rejected = operation_rejection()) {
+        if (auto rejected = mutation_rejection(true)) {
             co_return failure(std::move(*rejected));
         }
         co_await native_file_.truncate(size);
         co_return result<void>{};
-    } catch (const std::bad_alloc&) {
-        throw;
     } catch (...) {
-        co_return failure(file_error_from_exception(std::current_exception()));
+        co_return failure(remember_io_failure(std::current_exception()));
     }
 }
 
@@ -1083,7 +1301,8 @@ seastar::future<result<std::uint64_t>> file::size() {
     auto admission = try_acquire_metadata();
     if (!admission) {
         statistics_->reject();
-        co_return failure(file_error(errc::queue_full));
+        co_return failure(make_file_error(
+          errc::queue_full, file_failure_detail::admission_not_dispatched));
     }
     static_cast<void>(*admission);
     auto holder = operations_.try_hold();
@@ -1105,6 +1324,21 @@ seastar::future<result<void>> file::close() {
     owner_.assert_current();
     if (moved_from_) {
         return seastar::make_ready_future<result<void>>(result<void>{});
+    }
+    if (close_policy_ == file_close_policy::checked) {
+        if (state_ == file_state::closing)
+            return seastar::make_ready_future<result<void>>(
+              failure(make_file_error(
+                errc::queue_full,
+                file_failure_detail::admission_not_dispatched)));
+        if (state_ == file_state::closed) {
+            if (first_failure_.exception())
+                return seastar::make_exception_future<result<void>>(
+                  first_failure_.exception());
+            return seastar::make_ready_future<result<void>>(
+              first_failure_.outcome());
+        }
+        return close_checked_once();
     }
     if (state_ == file_state::closing) {
         return close_done_->get_shared_future();
@@ -1139,6 +1373,35 @@ seastar::future<result<void>> file::close() {
     return close_done_->get_shared_future();
 }
 
+seastar::future<result<void>> file::close_checked_once() {
+    // The coroutine frame is obtained before admission changes. No shared
+    // promise or unbounded close-waiter list is created during shutdown.
+    state_ = file_state::closing;
+    [[maybe_unused]] auto metric = statistics_->accept();
+    co_await operations_.close();
+    // Checked direct writes retain the gate through short-write recovery too.
+    // Draining it leaves the serializer free without allocating a close waiter.
+    auto serialization = seastar::try_get_units(write_serialization_, 1);
+    KWAQUE_INVARIANT(
+      file_gate_invariant,
+      serialization.has_value(),
+      "file close drained its gate with a writer still active");
+    try {
+        co_await native_file_.close_checked();
+    } catch (...) {
+        if (!first_failure_.failed()) {
+            try {
+                first_failure_.observe(
+                  file_error_from_exception(std::current_exception()));
+            } catch (...) {
+                first_failure_.observe(std::current_exception());
+            }
+        }
+    }
+    state_ = file_state::closed;
+    co_return first_failure_.outcome();
+}
+
 seastar::future<result<void>> file::close_once() {
     co_await operations_.close();
     try {
@@ -1158,6 +1421,32 @@ seastar::future<result<void>> file::close_once() {
 file_state file::state() const {
     owner_.assert_current();
     return state_;
+}
+
+result<file_geometry> file::geometry() const noexcept {
+    owner_.assert_current();
+    if (auto rejected = operation_rejection()) return failure(*rejected);
+    const auto memory = native_file_.memory_dma_alignment();
+    const auto read_max = native_file_.disk_read_max_length();
+    const auto write_max = native_file_.disk_write_max_length();
+    // Do not advertise a recommendation too small for even one aligned request,
+    // or the writer's fallback chunk as though it respected that
+    // recommendation.
+    if (
+      read_max < disk_read_dma_alignment_
+      || write_max
+           < std::max(disk_write_dma_alignment_, disk_overwrite_dma_alignment_)
+      || append_chunk_limit_ > write_max)
+        return failure(file_error(errc::invalid_argument));
+    return file_geometry{
+      byte_count{memory},
+      byte_count{disk_read_dma_alignment_},
+      byte_count{disk_write_dma_alignment_},
+      byte_count{disk_overwrite_dma_alignment_},
+      byte_count{read_max},
+      byte_count{write_max},
+      byte_count{append_chunk_limit_},
+      limits_.pending_read_bytes};
 }
 
 bool file::abort_requested() const {

@@ -331,3 +331,14 @@ py_test(
     ],
     main = "cpp_format_test.py",
 )
+
+py_test(
+    name = "verify_local_metadata_fixtures_test",
+    size = "small",
+    srcs = [
+        "verify_format_fixtures.py",
+        "verify_local_metadata_fixtures_test.py",
+    ],
+    data = ["//src/storage/tests:local_metadata_fixture_data"],
+    main = "verify_local_metadata_fixtures_test.py",
+)

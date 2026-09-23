@@ -1,4 +1,5 @@
 #include "src/codec/tests/benchmark_buffer.h"
+#include "src/codec/tests/qualification_profile.h"
 #include "src/compression/compression.h"
 #include "src/compression/lz4.h"
 
@@ -271,7 +272,9 @@ public:
 private:
     codec::decode_budget budget() const {
         return {
-          byte_count{(63U << 20U) - cache_},
+          byte_count{
+            ((64U << 20U) - codec::testing::execution_reservation.value())
+            - cache_},
           byte_count{1U << 20U},
           capacity_bound};
     }

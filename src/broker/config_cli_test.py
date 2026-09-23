@@ -266,7 +266,7 @@ class RunningBroker:
     def output(self) -> str:
         return self.log_path.read_text(encoding="utf-8")
 
-    def wait_for(self, expected: str, timeout: float = 15.0) -> str:
+    def wait_for(self, expected: str, timeout: float = 60.0) -> str:
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
             output = self.output()

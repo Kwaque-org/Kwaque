@@ -270,7 +270,7 @@ sample_matches_draws(const trace_entry& entry) noexcept {
     const auto action = static_cast<runtime::fault_action>(encoded_action);
     return (entry.result & UINT32_C(0xffff0000)) == 0 && encoded_action != 0
            && encoded_action <= static_cast<std::uint8_t>(
-                runtime::fault_action::partial_resize)
+                runtime::fault_action::file_failure_after_effect)
            && (outcome == 1U || outcome == 2U) && descriptor != nullptr
            && descriptor->permitted_actions.contains(action);
 }
@@ -282,13 +282,45 @@ effect_position_is_valid(const trace_entry& entry) noexcept {
              : entry.deadline == entry.time;
 }
 
+[[nodiscard]] bool file_trace_kind_matches(
+  const runtime::fault_point_descriptor* descriptor,
+  trace_event_kind kind) noexcept {
+    if (descriptor == nullptr) return false;
+    using point = runtime::builtin_fault_point;
+    switch (descriptor->point) {
+    case point::file_read:
+    case point::file_write:
+    case point::file_flush:
+    case point::file_truncate:
+    case point::file_size:
+    case point::file_close:
+        return kind == trace_event_kind::file;
+    case point::file_open:
+    case point::file_exists:
+    case point::file_stat:
+    case point::file_list:
+    case point::directory_create:
+    case point::file_remove:
+    case point::directory_remove:
+    case point::file_rename:
+    case point::directory_sync:
+    case point::filesystem_space:
+    case point::directory_cursor_open:
+    case point::directory_cursor_next:
+    case point::directory_cursor_close:
+        return kind == trace_event_kind::filesystem;
+    default:
+        return false;
+    }
+}
+
 [[nodiscard]] runtime::result<void> validate_entry_shape(
   const trace_entry& entry, const trace_header& header) noexcept {
     const auto action = static_cast<std::uint8_t>(entry.action);
     const auto kind = static_cast<std::uint8_t>(entry.kind);
     if (
       entry.sequence == 0 || action == 0
-      || action > static_cast<std::uint8_t>(trace_action::stop_terminal)
+      || action > static_cast<std::uint8_t>(trace_action::storage_configuration)
       || kind > static_cast<std::uint8_t>(trace_event_kind::dns)
       || entry.context_size > entry.context.size()
       || !trace_event_domain_is_valid(entry.kind, entry.domain)
@@ -351,11 +383,37 @@ effect_position_is_valid(const trace_entry& entry) noexcept {
           entry.event_id != 0 || entry.kind != trace_event_kind::fault
           || entry.deadline.nanoseconds() != 0 || entry.priority != 0
           || entry.domain == 0 || entry.stable_id == 0
-          || entry.coordinate_a == 0 || entry.context_size != 0
-          || !sample_matches_draws(entry)
+          || entry.coordinate_a == 0 || !sample_matches_draws(entry)
           || !fault_result_is_well_formed(entry, descriptor)) {
             return invalid_trace(errc::malformed_data);
         }
+        const auto action = static_cast<runtime::fault_action>(
+          entry.result & 0xffU);
+        const bool typed = action
+                           >= runtime::fault_action::file_failure_before_effect;
+        if (typed) {
+            if (
+              entry.context_size != 2
+              || entry.context[0].key != trace_context_key::detail
+              || entry.context[1].key != trace_context_key::limit
+              || entry.context[0].value > static_cast<std::uint8_t>(
+                   runtime::file_failure_detail::quota))
+                return invalid_trace(errc::malformed_data);
+            auto decision = runtime::fault_decision::make_file_failure(
+              action,
+              static_cast<runtime::file_failure_detail>(entry.context[0].value),
+              byte_count{entry.context[1].value});
+            if (
+              !decision
+              || !runtime::validate_fault_decision(
+                runtime::fault_request{
+                  descriptor->id,
+                  runtime::fault_occurrence::first(),
+                  runtime::fault_object_key::none()},
+                *decision))
+                return invalid_trace(errc::malformed_data);
+        } else if (entry.context_size != 0)
+            return invalid_trace(errc::malformed_data);
         break;
     }
     case trace_action::operation_discarded:
@@ -508,6 +566,83 @@ effect_position_is_valid(const trace_entry& entry) noexcept {
             return invalid_trace(errc::malformed_data);
         }
         break;
+    case trace_action::filesystem_space_sampled: {
+        const auto failed = (entry.result & UINT32_C(0xffffff00))
+                            == UINT32_C(0x100);
+        const auto code = entry.result & UINT32_C(0xff);
+        const auto maximum = std::numeric_limits<std::uint64_t>::max();
+        if (entry.kind != trace_event_kind::filesystem || entry.stable_id == 0
+            || entry.domain != runtime::descriptor_for(runtime::builtin_fault_point::filesystem_space)->id.value()
+            || !effect_position_is_valid(entry)
+            || (failed ? (code == 0 || code > static_cast<std::uint32_t>(errc::unsupported_format)
+                          || entry.coordinate_a != 0 || entry.coordinate_b != 0 || entry.value != 0)
+                       : (entry.result > 1 || entry.coordinate_a == maximum
+                          || entry.coordinate_b > entry.coordinate_a || entry.value > entry.coordinate_b))) {
+            return invalid_trace(errc::malformed_data);
+        }
+        break;
+    }
+    case trace_action::file_effect_applied:
+    case trace_action::file_operation_result: {
+        const auto point = runtime::fault_point_id::make(entry.domain);
+        const auto* descriptor = point
+                                   ? runtime::find_builtin_fault_point(*point)
+                                   : nullptr;
+        if (
+          !file_trace_kind_matches(descriptor, entry.kind)
+          || entry.stable_id == 0
+          || (entry.kind == trace_event_kind::filesystem && entry.value != 0)
+          || !effect_position_is_valid(entry) || entry.context_size != 3
+          || entry.context[0].key != trace_context_key::expected
+          || entry.context[0].value == 0
+          || entry.context[1].key != trace_context_key::actual
+          || entry.context[2].key != trace_context_key::detail
+          || entry.context[2].value == 0
+          || entry.context[2].value > (UINT64_MAX >> 8U))
+            return invalid_trace(errc::malformed_data);
+        if (entry.action == trace_action::file_effect_applied) {
+            if (entry.result > 2 || (entry.result == 0 && entry.value != 0)
+                || (entry.result == 1 && (entry.value == 0
+                    || (descriptor->point != runtime::builtin_fault_point::file_write
+                        && descriptor->point != runtime::builtin_fault_point::file_truncate))))
+                return invalid_trace(errc::malformed_data);
+        } else {
+            const auto code = entry.result & 0xffU;
+            const auto detail = (entry.result >> 8U) & 0xffU;
+            const auto receipt = entry.result >> 16U;
+            if (
+              code > static_cast<std::uint32_t>(errc::unsupported_format)
+              || detail > static_cast<std::uint8_t>(
+                   runtime::file_failure_detail::quota)
+              || receipt == 0 || receipt > 3 || (code == 0 && detail != 0)
+              || (receipt == 3 && (code != 0 || detail != 0)))
+                return invalid_trace(errc::malformed_data);
+        }
+        break;
+    }
+    case trace_action::crash_selection:
+    case trace_action::storage_configuration:
+        if (
+          entry.kind != trace_event_kind::filesystem || entry.stable_id == 0
+          || !effect_position_is_valid(entry) || entry.context_size != 4
+          || entry.result != 0)
+            return invalid_trace(errc::malformed_data);
+        for (std::size_t index = 0; index < 4; ++index)
+            if (
+              entry.context[index].key
+              != static_cast<trace_context_key>(
+                static_cast<std::uint8_t>(trace_context_key::digest_word_0)
+                + index))
+                return invalid_trace(errc::malformed_data);
+        break;
+    case trace_action::crash_started:
+    case trace_action::crash_completed:
+        if (
+          entry.kind != trace_event_kind::filesystem || entry.stable_id == 0
+          || !effect_position_is_valid(entry) || entry.context_size != 0
+          || entry.result != 0)
+            return invalid_trace(errc::malformed_data);
+        break;
     case trace_action::none:
         return invalid_trace(errc::malformed_data);
     }
@@ -533,6 +668,10 @@ effect_position_is_valid(const trace_entry& entry) noexcept {
     }
     if (
       entry.action != trace_action::bandwidth_rebalanced
+      && entry.action != trace_action::crash_selection
+      && entry.action != trace_action::storage_configuration
+      && entry.action != trace_action::file_effect_applied
+      && entry.action != trace_action::file_operation_result
       && static_cast<std::uint8_t>(entry.action)
            >= static_cast<std::uint8_t>(trace_action::partial_resize_applied)
       && entry.context_size != 0) {
@@ -711,6 +850,25 @@ private:
 };
 
 } // namespace
+
+bool trace_effect_is_valid(
+  trace_event_descriptor descriptor,
+  std::span<const trace_context_field> context) noexcept {
+    if (context.size() > trace_context_fields_max) return false;
+    trace_entry entry{
+      .sequence = 1,
+      .action = descriptor.effect,
+      .kind = descriptor.kind,
+      .domain = descriptor.domain,
+      .stable_id = descriptor.stable_id,
+      .coordinate_a = descriptor.coordinate_a,
+      .coordinate_b = descriptor.coordinate_b,
+      .value = descriptor.value,
+      .result = descriptor.result,
+      .context_size = static_cast<std::uint8_t>(context.size())};
+    std::copy(context.begin(), context.end(), entry.context.begin());
+    return validate_entry_shape(entry, trace_header{}).has_value();
+}
 
 bool trace_descriptor_is_valid(trace_event_descriptor descriptor) noexcept {
     // Timing and sequencing are validated by the scheduler. Equal zero times

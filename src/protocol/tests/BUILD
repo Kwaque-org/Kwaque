@@ -525,6 +525,7 @@ kwaque_cc_seastar_gtest(
         ":frame_fuzz_cases",
         ":frame_test_support",
         "//src/base:error",
+        "//src/model/tests:record_fuzz_cases",
     ],
 )
 

@@ -1,6 +1,7 @@
 #include "src/runtime/file.h"
 #include "src/runtime/fragmented_buffer_internal.h"
 
+#include <seastar/core/coroutine.hh>
 #include <seastar/core/file.hh>
 #include <seastar/core/future.hh>
 #include <seastar/core/gate.hh>
@@ -222,6 +223,58 @@ private:
     std::size_t source_offset_;
     std::size_t write_size_;
     std::uint64_t position_;
+};
+
+// These ready-file fixtures measure admission/dispatch overhead. They perform
+// no physical disk I/O and do not measure durable flush latency.
+class native_reserved_flush_fixture {
+public:
+    native_reserved_flush_fixture()
+      : owner_(make_native_file(state_))
+      , reservation_(seastar::try_get_units(metadata_, 1)) {}
+    ~native_reserved_flush_fixture() {
+        reservation_.reset();
+        operations_.close().get();
+        owner_.close().get();
+    }
+    [[gnu::noinline]] seastar::future<std::size_t> execute() {
+        if (!owner_ || !reservation_ || reservation_->count() != 1)
+            std::terminate();
+        auto holder = operations_.hold();
+        co_await owner_.flush();
+        co_return 1;
+    }
+
+private:
+    benchmark_file_state state_;
+    seastar::file owner_;
+    seastar::semaphore metadata_{64};
+    std::optional<seastar::semaphore_units<>> reservation_;
+    seastar::gate operations_;
+};
+
+class kwaque_reserved_flush_fixture {
+public:
+    kwaque_reserved_flush_fixture()
+      : owner_(make_native_file(state_)) {
+        auto reserved = owner_.try_reserve_metadata();
+        if (!reserved) std::terminate();
+        reservation_.emplace(std::move(*reserved));
+    }
+    ~kwaque_reserved_flush_fixture() {
+        reservation_.reset();
+        if (!owner_.close().get()) std::terminate();
+    }
+    [[gnu::noinline]] seastar::future<std::size_t> execute() {
+        const auto result = co_await owner_.flush(*reservation_);
+        if (!result) std::terminate();
+        co_return 1;
+    }
+
+private:
+    benchmark_file_state state_;
+    file owner_;
+    std::optional<file::metadata_reservation> reservation_;
 };
 
 struct kwaque_aligned_file_fixture : kwaque_file_fixture {
@@ -778,5 +831,13 @@ PERF_TEST_F(native_raw_file_read_fixture, direct_read_4096) {
 PERF_TEST_F(native_file_read_fixture, validated_read_4096) { return execute(); }
 
 PERF_TEST_F(kwaque_file_read_fixture, read_4096) { return execute(); }
+
+PERF_TEST_F(native_reserved_flush_fixture, ready_flush_with_reserved_metadata) {
+    return execute();
+}
+
+PERF_TEST_F(kwaque_reserved_flush_fixture, ready_flush_with_reserved_metadata) {
+    return execute();
+}
 
 } // namespace kwaque::runtime

@@ -680,7 +680,7 @@ TEST(EnvelopeDecodeTest, InvalidSuccessorsAreNotSkippedAsRecoveryOrZeroEof) {
            tail_case{bad_header, errc::corrupt_data},
            tail_case{bad_length, errc::corrupt_data},
            tail_case{
-             fixture::make_envelope(fixture::fixed_body, {}, 11),
+             fixture::make_envelope(fixture::fixed_body, {}, 12),
              errc::unsupported_format}}) {
         fragmented_buffer_parser input{
           fixture::fragmented(valid + tail.bytes + valid, 31)};
@@ -999,7 +999,7 @@ TEST(
 
 TEST(EnvelopeDecodeTest, SenderStructuralFailurePrecedesUnknownOrZeroFamily) {
     for (const std::uint16_t family :
-         {std::uint16_t{0}, std::uint16_t{11}, std::uint16_t{65535}}) {
+         {std::uint16_t{0}, std::uint16_t{12}, std::uint16_t{65535}}) {
         for (const std::uint16_t writer :
              {std::uint16_t{0}, std::uint16_t{1}}) {
             SCOPED_TRACE(::testing::Message() << family << ':' << writer);

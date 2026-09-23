@@ -1,7 +1,7 @@
 load("@rules_python//python:defs.bzl", "py_test")
 load("//bazel:build.bzl", "kwaque_cc_binary", "kwaque_cc_library")
 load("//bazel:launcher.bzl", "kwaque_launcher")
-load("//bazel:test.bzl", "kwaque_cc_seastar_test", "kwaque_cc_test", "kwaque_py_native_test")
+load("//bazel:test.bzl", "kwaque_cc_seastar_gtest", "kwaque_cc_seastar_test", "kwaque_cc_test", "kwaque_py_native_test")
 
 package(default_visibility = ["//visibility:private"])
 
@@ -406,6 +406,21 @@ kwaque_cc_seastar_test(
     ],
 )
 
+kwaque_cc_seastar_test(
+    name = "storage_shutdown_test",
+    srcs = ["storage_shutdown_test.cc"],
+    cpu = 2,
+    memory = "384MiB",
+    deps = [
+        ":application_internal",
+        ":application_test_support",
+        "//src/runtime:cross_shard",
+        "//src/runtime/production:environment",
+        "//src/runtime/testing:test_directory",
+        "//src/storage/tests:completion_contract",
+    ],
+)
+
 kwaque_cc_binary(
     name = "crash_recorder_probe",
     testonly = True,
@@ -425,4 +440,100 @@ kwaque_py_native_test(
     srcs = ["crash_recorder_test.py"],
     data = [":crash_recorder_probe"],
     main = "crash_recorder_test.py",
+)
+
+kwaque_cc_library(
+    name = "storage_directories",
+    srcs = ["storage_directories.cc"],
+    hdrs = ["storage_directories.h"],
+    deps = [
+        ":pid_file",
+        "//src/base:error",
+        "//src/runtime:error",
+        "//src/runtime:file",
+        "//src/storage:local_paths",
+        "//src/storage:local_store_config",
+        "@seastar",
+    ],
+)
+
+kwaque_cc_seastar_test(
+    name = "local_store_test",
+    srcs = ["local_store_test.cc"],
+    data = ["//src/storage/tests:local_metadata_fixture_data"],
+    deps = [
+        ":pid_file",
+        ":storage_directories",
+        "//src/base",
+        "//src/base:error",
+        "//src/resource:resource_manager",
+        "//src/resource:resource_registry",
+        "//src/resource:workload_class",
+        "//src/runtime:file",
+        "//src/runtime/production:file",
+        "//src/runtime/testing:test_directory",
+        "//src/storage:workload_budget",
+        "//src/storage/tests:local_store_contract",
+    ],
+)
+
+kwaque_cc_seastar_test(
+    name = "local_installation_test",
+    srcs = ["local_installation_test.cc"],
+    data = ["//src/storage/tests:local_metadata_fixture_data"],
+    deps = [
+        ":pid_file",
+        ":storage_directories",
+        "//src/base",
+        "//src/base:error",
+        "//src/resource:resource_manager",
+        "//src/resource:resource_registry",
+        "//src/resource:workload_class",
+        "//src/runtime:file",
+        "//src/runtime/production:file",
+        "//src/runtime/testing:test_directory",
+        "//src/storage:workload_budget",
+        "//src/storage/tests:local_installation_contract",
+    ],
+)
+
+kwaque_cc_seastar_test(
+    name = "local_reader_test",
+    srcs = ["local_reader_test.cc"],
+    data = ["//src/storage/tests:local_metadata_fixture_data"],
+    deps = [
+        ":pid_file",
+        ":storage_directories",
+        "//src/base",
+        "//src/base:error",
+        "//src/resource:resource_manager",
+        "//src/resource:resource_registry",
+        "//src/resource:workload_class",
+        "//src/runtime:file",
+        "//src/runtime/production:file",
+        "//src/runtime/testing:test_directory",
+        "//src/storage:workload_budget",
+        "//src/storage/tests:local_reader_contract",
+    ],
+)
+
+kwaque_cc_seastar_gtest(
+    name = "local_qualification_test",
+    timeout = "moderate",
+    srcs = ["local_qualification_test.cc"],
+    data = ["//src/storage/tests:local_metadata_fixture_data"],
+    linkstatic = True,
+    deps = [
+        ":storage_directories",
+        "//src/base",
+        "//src/base:error",
+        "//src/resource:resource_manager",
+        "//src/resource:resource_registry",
+        "//src/resource:workload_class",
+        "//src/runtime:file",
+        "//src/runtime/production:file",
+        "//src/runtime/testing:test_directory",
+        "//src/storage:workload_budget",
+        "//src/storage/tests:local_qualification_contract",
+    ],
 )

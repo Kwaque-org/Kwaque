@@ -11,6 +11,26 @@ load(
 
 package(default_visibility = ["//visibility:private"])
 
+kwaque_cc_seastar_test(
+    name = "storage_completion_test",
+    srcs = ["storage_completion_test.cc"],
+    memory = "256MiB",
+    deps = [
+        "//src/base",
+        "//src/base:error",
+        "//src/runtime:error",
+        "//src/runtime:fault",
+        "//src/runtime:file",
+        "//src/runtime:file_error",
+        "//src/simulation:environment",
+        "//src/simulation:fake_file",
+        "//src/simulation:fake_file_test_support",
+        "//src/simulation:fault_schedule",
+        "//src/simulation:scheduler_driver",
+        "//src/storage/tests:completion_contract",
+    ],
+)
+
 test_suite(
     name = "determinism_goldens",
     tests = [
@@ -623,6 +643,7 @@ kwaque_cc_seastar_test(
         "//src/bytes:fragmented_buffer",
         "//src/runtime:file",
         "//src/runtime:random",
+        "//src/runtime/testing/contracts:file_system_contract",
         "//src/simulation:deterministic_random",
         "//src/simulation:event_trace",
         "//src/simulation:fake_file",
@@ -643,6 +664,7 @@ kwaque_cc_seastar_test(
         "//src/bytes:fragmented_buffer",
         "//src/runtime:fault",
         "//src/runtime:file",
+        "//src/runtime/testing/contracts:file_system_contract",
         "//src/simulation:event_trace",
         "//src/simulation:fake_file",
         "//src/simulation:fake_file_test_support",
@@ -700,5 +722,85 @@ kwaque_cc_seastar_test(
         "//src/simulation:fault_schedule",
         "//src/simulation:scheduler",
         "//src/simulation:scheduler_driver",
+    ],
+)
+
+kwaque_cc_seastar_test(
+    name = "fake_file_persistence_test",
+    srcs = ["fake_file_persistence_test.cc"],
+    cpu = 1,
+    memory = "256MiB",
+    deps = [
+        "//src/bytes:fragmented_buffer",
+        "//src/runtime:fault",
+        "//src/runtime:file",
+        "//src/simulation:deterministic_random",
+        "//src/simulation:event_trace",
+        "//src/simulation:fake_file",
+        "//src/simulation:fake_file_test_support",
+        "//src/simulation:fault_schedule",
+        "//src/simulation:scheduler",
+        "//src/simulation:scheduler_driver",
+        "//src/simulation:storage_fault_key",
+    ],
+)
+
+kwaque_cc_seastar_test(
+    name = "local_publication_test",
+    srcs = ["local_publication_test.cc"],
+    deps = [
+        "//src/base",
+        "//src/base:error",
+        "//src/bytes:allocation_test_profile",
+        "//src/codec:cooperative",
+        "//src/resource:resource_manager",
+        "//src/resource:workload_class",
+        "//src/runtime:fault",
+        "//src/runtime:file",
+        "//src/runtime:first_failure",
+        "//src/simulation:environment",
+        "//src/simulation:fake_file",
+        "//src/simulation:fake_file_test_support",
+        "//src/simulation:fault_schedule",
+        "//src/simulation:scheduler_driver",
+        "//src/storage:local_paths",
+        "//src/storage:local_publication",
+        "//src/storage:workload_budget",
+        "//src/storage/tests:local_publication_contract",
+    ],
+)
+
+kwaque_cc_seastar_test(
+    name = "local_store_test",
+    timeout = "moderate",
+    srcs = ["local_store_test.cc"],
+    data = ["//src/storage/tests:local_metadata_fixture_data"],
+    deps = [
+        "//src/base",
+        "//src/base:error",
+        "//src/bytes:allocation_test_profile",
+        "//src/codec:cooperative",
+        "//src/resource:resource_manager",
+        "//src/resource:workload_class",
+        "//src/runtime:fault",
+        "//src/runtime:file",
+        "//src/runtime:first_failure",
+        "//src/simulation:environment",
+        "//src/simulation:fake_file",
+        "//src/simulation:fake_file_test_support",
+        "//src/simulation:fault_schedule",
+        "//src/simulation:scheduler_driver",
+        "//src/storage:local_control",
+        "//src/storage:local_id_allocator",
+        "//src/storage:local_metadata_file",
+        "//src/storage:local_paths",
+        "//src/storage:local_store_bootstrap",
+        "//src/storage:local_store_config",
+        "//src/storage:local_store_inspection",
+        "//src/storage:workload_budget",
+        "//src/storage/tests:local_installation_contract",
+        "//src/storage/tests:local_qualification_contract",
+        "//src/storage/tests:local_reader_contract",
+        "//src/storage/tests:local_store_contract",
     ],
 )

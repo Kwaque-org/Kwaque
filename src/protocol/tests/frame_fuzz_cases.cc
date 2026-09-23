@@ -211,9 +211,12 @@ void observe(
   unsigned depth,
   unsigned kind) {
     require(input.checkpoint_depth() == depth);
-    require(
-      result ? reference.error == errc::success
-             : result.error().code() == reference.error);
+    if (result)
+        require(reference.error == errc::success);
+    else if (reference.batch.compression_body_error)
+        require(reference.batch.matches_error(result.error().code()));
+    else
+        require(result.error().code() == reference.error);
     if (!result) {
         require(input.bytes_consumed() == byte_count{1});
         require(

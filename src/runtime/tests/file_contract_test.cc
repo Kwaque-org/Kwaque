@@ -1,5 +1,6 @@
 #include "src/base/units.h"
 #include "src/runtime/file.h"
+#include "src/runtime/file_error_internal.h"
 #include "src/runtime/file_position.h"
 
 #include <seastar/core/future.hh>
@@ -7,22 +8,46 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <array>
+#include <cerrno>
 #include <cstddef>
 #include <cstdint>
 #include <limits>
 #include <string>
+#include <system_error>
 #include <type_traits>
 #include <utility>
 
 namespace {
 
-struct contract_file_system final {
+struct contract_directory_cursor {
+    contract_directory_cursor(contract_directory_cursor&&) noexcept = default;
+    contract_directory_cursor&
+    operator=(contract_directory_cursor&&) noexcept = default;
+    contract_directory_cursor(const contract_directory_cursor&) = delete;
+    contract_directory_cursor&
+    operator=(const contract_directory_cursor&) = delete;
+    seastar::future<kwaque::runtime::result<kwaque::runtime::directory_page>>
+      next(kwaque::runtime::directory_page_limits);
+    seastar::future<kwaque::runtime::result<void>> sync();
+    seastar::future<kwaque::runtime::result<void>> close();
+};
+
+struct contract_file_system {
+    using directory_cursor_type = contract_directory_cursor;
+    seastar::future<kwaque::runtime::result<directory_cursor_type>>
+      open_directory(
+        kwaque::runtime::file_path,
+        kwaque::runtime::file_close_policy
+        = kwaque::runtime::file_close_policy::legacy);
     seastar::future<kwaque::runtime::result<kwaque::runtime::file>>
       open(kwaque::runtime::file_path, kwaque::runtime::file_open_options);
     seastar::future<kwaque::runtime::result<bool>>
       exists(kwaque::runtime::file_path);
     seastar::future<kwaque::runtime::result<kwaque::runtime::file_status>>
       stat(kwaque::runtime::file_path);
+    seastar::future<kwaque::runtime::result<kwaque::runtime::file_system_space>>
+      space(kwaque::runtime::file_path);
     seastar::future<kwaque::runtime::result<kwaque::runtime::directory_listing>>
       list(
         kwaque::runtime::file_path, kwaque::runtime::directory_listing_limits);
@@ -32,21 +57,77 @@ struct contract_file_system final {
       remove_file(kwaque::runtime::file_path);
     seastar::future<kwaque::runtime::result<void>>
       remove_directory(kwaque::runtime::file_path);
-    seastar::future<kwaque::runtime::result<void>>
-      rename(kwaque::runtime::file_path, kwaque::runtime::file_path);
-    seastar::future<kwaque::runtime::result<void>>
-      sync_directory(kwaque::runtime::file_path);
+    seastar::future<kwaque::runtime::result<void>> rename(
+      kwaque::runtime::file_path,
+      kwaque::runtime::file_path,
+      kwaque::runtime::file_rename_policy
+      = kwaque::runtime::file_rename_policy::replace);
+    seastar::future<kwaque::runtime::result<void>> sync_directory(
+      kwaque::runtime::file_path,
+      kwaque::runtime::file_close_policy
+      = kwaque::runtime::file_close_policy::legacy);
 };
 
 struct invalid_file_system final {
     void open(kwaque::runtime::file_path, kwaque::runtime::file_open_options);
 };
 
+struct missing_retained_sync : contract_directory_cursor {
+    void sync();
+};
+struct missing_sync_backend : contract_file_system {
+    using directory_cursor_type = missing_retained_sync;
+    seastar::future<kwaque::runtime::result<directory_cursor_type>>
+      open_directory(
+        kwaque::runtime::file_path, kwaque::runtime::file_close_policy);
+};
+struct missing_rename_policy : contract_file_system {
+    seastar::future<kwaque::runtime::result<void>>
+      rename(kwaque::runtime::file_path, kwaque::runtime::file_path);
+};
+struct missing_directory_close_policy : contract_file_system {
+    seastar::future<kwaque::runtime::result<directory_cursor_type>>
+      open_directory(kwaque::runtime::file_path);
+};
+static_assert(!kwaque::runtime::file_system_backend<missing_sync_backend>);
+static_assert(!kwaque::runtime::file_system_backend<missing_rename_policy>);
+static_assert(
+  !kwaque::runtime::file_system_backend<missing_directory_close_policy>);
+
 static_assert(kwaque::runtime::file_system_backend<contract_file_system>);
 static_assert(!kwaque::runtime::file_system_backend<invalid_file_system>);
 static_assert(std::is_move_constructible_v<kwaque::runtime::file>);
 static_assert(!std::is_move_assignable_v<kwaque::runtime::file>);
 static_assert(!std::is_copy_constructible_v<kwaque::runtime::file>);
+
+template<typename T>
+concept exposes_preallocation = requires(T& owner) { owner.allocate(0, 4096); };
+static_assert(!exposes_preallocation<kwaque::runtime::file>);
+
+TEST(FileContractTest, DirectoryPagesHaveIndependentHardLimits) {
+    using kwaque::runtime::directory_page_limits;
+    EXPECT_TRUE(directory_page_limits{}.validate().has_value());
+    EXPECT_TRUE((directory_page_limits{
+      kwaque::item_count{1024}, kwaque::byte_count{256U * 1024U}}
+                   .validate()
+                   .has_value()));
+    EXPECT_FALSE(
+      (directory_page_limits{kwaque::item_count{}, kwaque::byte_count{1}}
+         .validate()
+         .has_value()));
+    EXPECT_FALSE(
+      (directory_page_limits{kwaque::item_count{1025}, kwaque::byte_count{1}}
+         .validate()
+         .has_value()));
+    EXPECT_FALSE(
+      (directory_page_limits{kwaque::item_count{1}, kwaque::byte_count{}}
+         .validate()
+         .has_value()));
+    EXPECT_FALSE((directory_page_limits{
+      kwaque::item_count{1}, kwaque::byte_count{256U * 1024U + 1U}}
+                    .validate()
+                    .has_value()));
+}
 
 TEST(FileContractTest, FilePositionPreservesItsExistingInterface) {
     using kwaque::runtime::file_position;
@@ -216,3 +297,114 @@ TEST(FileContractTest, DirectoryListingCrossesChunkBoundaries) {
 }
 
 } // namespace
+
+TEST(FileContractTest, SpaceSamplesCheckUnitsSentinelsAndOrdering) {
+    using kwaque::byte_count;
+    using kwaque::runtime::file_system_space;
+    static_assert(!std::is_default_constructible_v<file_system_space>);
+    static_assert(std::is_trivially_copyable_v<file_system_space>);
+    static_assert(
+      !std::is_default_constructible_v<kwaque::runtime::file_geometry>);
+    const auto sample = file_system_space::from_blocks(
+      4096, 256, 128, 64, true);
+    ASSERT_TRUE(sample.has_value());
+    EXPECT_EQ(sample->capacity(), byte_count{1048576});
+    EXPECT_EQ(sample->free(), byte_count{524288});
+    EXPECT_EQ(sample->available(), byte_count{262144});
+    EXPECT_TRUE(sample->read_only());
+    EXPECT_TRUE(file_system_space::from_blocks(4096, 256, 0, 0, false));
+    EXPECT_TRUE(file_system_space::make({}, {}, {}, true));
+    const auto maximum = std::numeric_limits<std::uint64_t>::max();
+    EXPECT_FALSE(file_system_space::from_blocks(0, 1, 1, 1, false));
+    EXPECT_FALSE(file_system_space::from_blocks(maximum, 0, 0, 0, false));
+    EXPECT_FALSE(file_system_space::from_blocks(1, maximum, 0, 0, false));
+    EXPECT_FALSE(file_system_space::from_blocks(1, 1, maximum, 0, false));
+    EXPECT_FALSE(file_system_space::from_blocks(1, 1, 1, maximum, false));
+    EXPECT_FALSE(file_system_space::from_blocks(4096, 1, 2, 0, false));
+    EXPECT_FALSE(file_system_space::from_blocks(4096, 2, 1, 2, false));
+    const auto overflow = file_system_space::from_blocks(
+      4096, maximum / 4096 + 1, 0, 0, false);
+    ASSERT_FALSE(overflow);
+    EXPECT_EQ(overflow.error().code(), kwaque::errc::out_of_range);
+    EXPECT_TRUE(file_system_space::from_blocks(1, maximum - 1, 0, 0, false));
+    EXPECT_FALSE(file_system_space::make(byte_count{maximum}, {}, {}, false));
+}
+
+TEST(FileContractTest, FileFailureDetailsPreserveRealCausesWithoutGuessing) {
+    using kwaque::runtime::file_failure_detail;
+    using kwaque::runtime::detail::map_file_operation_error;
+    struct sample {
+        std::error_code native;
+        kwaque::errc code;
+        file_failure_detail detail;
+    };
+    const std::array cases{
+      sample{
+        std::make_error_code(std::errc::no_space_on_device),
+        kwaque::errc::resource_exhausted,
+        file_failure_detail::no_space},
+      sample{
+        std::make_error_code(std::errc::too_many_files_open),
+        kwaque::errc::resource_exhausted,
+        file_failure_detail::descriptor_limit},
+      sample{
+        std::make_error_code(std::errc::too_many_files_open_in_system),
+        kwaque::errc::resource_exhausted,
+        file_failure_detail::descriptor_limit},
+      sample{
+        std::make_error_code(std::errc::read_only_file_system),
+        kwaque::errc::permission_denied,
+        file_failure_detail::read_only},
+      sample{
+        std::make_error_code(std::errc::permission_denied),
+        kwaque::errc::permission_denied,
+        file_failure_detail::permission},
+      sample{
+        std::make_error_code(std::errc::io_error),
+        kwaque::errc::io_failure,
+        file_failure_detail::device_io},
+      sample{
+        std::error_code{EDQUOT, std::system_category()},
+        kwaque::errc::resource_exhausted,
+        file_failure_detail::quota},
+      sample{
+        std::error_code{123456, std::generic_category()},
+        kwaque::errc::io_failure,
+        file_failure_detail::unknown}};
+    for (const auto& value : cases) {
+        const auto mapped = map_file_operation_error(value.native);
+        EXPECT_EQ(mapped.code(), value.code);
+        const auto detail = kwaque::runtime::file_detail(mapped);
+        ASSERT_TRUE(detail.has_value());
+        EXPECT_EQ(*detail, value.detail);
+    }
+    const auto absent = kwaque::runtime::file_detail(
+      kwaque::runtime::operation_error{
+        kwaque::errc::resource_exhausted,
+        kwaque::runtime::operation_kind::file});
+    ASSERT_TRUE(absent.has_value());
+    EXPECT_EQ(*absent, file_failure_detail::unknown);
+    EXPECT_FALSE(
+      kwaque::runtime::file_detail(
+        kwaque::runtime::operation_error{
+          kwaque::errc::io_failure, kwaque::runtime::operation_kind::network})
+        .has_value());
+    kwaque::runtime::operation_error invalid{
+      kwaque::errc::io_failure, kwaque::runtime::operation_kind::file};
+    ASSERT_TRUE(
+      invalid.add_context(kwaque::runtime::operation_context_key::detail, 8));
+    EXPECT_FALSE(kwaque::runtime::file_detail(invalid).has_value());
+    auto bounded = kwaque::runtime::make_file_error(
+      kwaque::errc::io_failure, file_failure_detail::device_io);
+    EXPECT_TRUE(
+      bounded.add_context(kwaque::runtime::operation_context_key::bytes, 11));
+    EXPECT_TRUE(
+      bounded.add_context(kwaque::runtime::operation_context_key::attempt, 2));
+    EXPECT_TRUE(bounded.add_context(
+      kwaque::runtime::operation_context_key::stable_id, 3));
+    EXPECT_FALSE(
+      bounded.add_context(kwaque::runtime::operation_context_key::shard, 4));
+    EXPECT_EQ(
+      bounded.context_at(0)->key,
+      kwaque::runtime::operation_context_key::detail);
+}

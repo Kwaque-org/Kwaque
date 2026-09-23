@@ -1,4 +1,5 @@
 #include "src/runtime/file.h"
+#include "src/runtime/file_error_internal.h"
 #include "src/runtime/file_test_support.h"
 #include "src/runtime/fragmented_buffer_internal.h"
 
@@ -63,11 +64,14 @@ struct file_probe final {
     unsigned read_alignment{4096};
     unsigned write_alignment{4096};
     unsigned overwrite_alignment{4096};
+    unsigned read_max_length{1U << 30U};
+    unsigned write_max_length{1U << 30U};
     unsigned flushes{0};
     unsigned truncates{0};
     unsigned sizes{0};
     unsigned bulk_reads{0};
     unsigned closes{0};
+    bool checked_close_supported{true};
     bool fail_flush{false};
     bool fail_allocation{false};
     bool delayed_write_consumed{false};
@@ -86,6 +90,8 @@ public:
         _disk_read_dma_alignment = probe.read_alignment;
         _disk_write_dma_alignment = probe.write_alignment;
         _disk_overwrite_dma_alignment = probe.overwrite_alignment;
+        _read_max_length = probe.read_max_length;
+        _write_max_length = probe.write_max_length;
     }
 
     seastar::future<std::size_t> write_dma(
@@ -229,6 +235,11 @@ public:
         ++probe_.sizes;
         return seastar::make_ready_future<std::uint64_t>(probe_.size);
     }
+
+    bool supports_checked_close() const noexcept final {
+        return probe_.checked_close_supported;
+    }
+    seastar::future<> close_checked() final { return close(); }
 
     seastar::future<> close() final {
         ++probe_.closes;
@@ -1479,4 +1490,494 @@ SEASTAR_TEST_CASE(file_write_admission_bounds_retained_contenders) {
     BOOST_CHECK_EQUAL(owner.queued_write_bytes().value(), 0U);
     const auto closed = co_await owner.close();
     BOOST_REQUIRE(closed.has_value());
+}
+
+SEASTAR_TEST_CASE(file_geometry_is_an_owning_snapshot_with_independent_limits) {
+    file_probe probe;
+    probe.memory_alignment = 512;
+    probe.read_alignment = 1024;
+    probe.write_alignment = 4096;
+    probe.overwrite_alignment = 8192;
+    probe.read_max_length = 1U << 20U;
+    probe.write_max_length = 300000;
+    kwaque::runtime::file_io_limits limits;
+    limits.pending_read_bytes = kwaque::byte_count{65536};
+    auto owner = make_file(probe, limits);
+    const auto geometry = owner.geometry();
+    auto moved = std::move(owner);
+    // Geometry must report the moved-from owner's canonical closed state.
+    // NOLINTNEXTLINE(bugprone-use-after-move)
+    const auto moved_from = owner.geometry();
+    const auto current = moved.geometry();
+    moved.request_abort();
+    const auto aborted = moved.geometry();
+    const auto closed = co_await moved.close();
+    const auto after_close = moved.geometry();
+    BOOST_REQUIRE(closed.has_value());
+    BOOST_REQUIRE(geometry.has_value());
+    BOOST_REQUIRE(current.has_value());
+    BOOST_CHECK(*geometry == *current);
+    BOOST_CHECK_EQUAL(geometry->memory_alignment().value(), 512U);
+    BOOST_CHECK_EQUAL(geometry->read_alignment().value(), 1024U);
+    BOOST_CHECK_EQUAL(geometry->write_alignment().value(), 4096U);
+    BOOST_CHECK_EQUAL(geometry->overwrite_alignment().value(), 8192U);
+    BOOST_CHECK_EQUAL(geometry->native_read_max_length().value(), 1048576U);
+    BOOST_CHECK_EQUAL(geometry->native_write_max_length().value(), 300000U);
+    BOOST_CHECK_EQUAL(geometry->append_chunk_bytes().value(), 131072U);
+    BOOST_CHECK_EQUAL(geometry->read_operation_limit().value(), 65536U);
+    BOOST_CHECK_EQUAL(geometry->operation_limit().value(), 67108864U);
+    BOOST_CHECK(geometry->supports_disk_alignment(kwaque::byte_count{8192}));
+    BOOST_CHECK(!geometry->supports_disk_alignment(kwaque::byte_count{4096}));
+    BOOST_CHECK(!geometry->supports_disk_alignment(kwaque::byte_count{12288}));
+    BOOST_CHECK(!geometry->supports_disk_alignment(kwaque::byte_count{}));
+    BOOST_REQUIRE(!moved_from);
+    BOOST_CHECK(moved_from.error().code() == kwaque::errc::closed);
+    BOOST_REQUIRE(!aborted);
+    BOOST_CHECK(aborted.error().code() == kwaque::errc::aborted);
+    BOOST_REQUIRE(!after_close);
+    BOOST_CHECK(after_close.error().code() == kwaque::errc::closed);
+    BOOST_CHECK_EQUAL(probe.sizes + probe.flushes + probe.bulk_reads, 0U);
+    BOOST_CHECK(probe.writes.empty());
+}
+
+SEASTAR_TEST_CASE(file_geometry_rejects_unusable_recommendations) {
+    for (unsigned which = 0; which != 3; ++which) {
+        file_probe probe;
+        if (which == 0) probe.read_max_length = 1;
+        if (which == 1) probe.write_max_length = 1;
+        if (which == 2) {
+            probe.write_alignment = 512;
+            probe.overwrite_alignment = 4096;
+            probe.write_max_length = 1024;
+        }
+        auto owner = make_file(probe);
+        const auto geometry = owner.geometry();
+        const auto closed = co_await owner.close();
+        BOOST_REQUIRE(closed.has_value());
+        BOOST_REQUIRE(!geometry);
+        BOOST_CHECK(geometry.error().code() == kwaque::errc::invalid_argument);
+        BOOST_CHECK(probe.writes.empty());
+    }
+}
+
+SEASTAR_TEST_CASE(
+  file_owner_retains_typed_failure_and_cannot_heal_by_flushing) {
+    using namespace kwaque::runtime;
+    file_probe probe;
+    auto expected = make_file_error(
+      kwaque::errc::io_failure, file_failure_detail::unknown);
+    BOOST_REQUIRE(expected.add_context(operation_context_key::bytes, 23));
+    BOOST_REQUIRE(expected.add_context(operation_context_key::attempt, 4));
+    BOOST_REQUIRE(expected.add_context(operation_context_key::stable_id, 19));
+    probe.write_failure = std::make_exception_ptr(
+      detail::file_operation_exception{expected});
+    auto owner = make_file(probe);
+    const auto written = co_await owner.write(
+      file_position{}, aligned_data(4096, 'x'));
+    probe.write_failure = {};
+    const auto flushed = co_await owner.flush();
+    const auto closed = co_await owner.close();
+    BOOST_REQUIRE(!written.has_value());
+    BOOST_CHECK(written.error() == expected);
+    BOOST_REQUIRE(!flushed.has_value());
+    BOOST_CHECK(flushed.error() == expected);
+    BOOST_CHECK_EQUAL(probe.flushes, 0U);
+    BOOST_REQUIRE(closed.has_value());
+}
+
+SEASTAR_TEST_CASE(
+  file_owner_admission_failure_remains_retryable_without_device_cause) {
+    using namespace kwaque::runtime;
+    file_probe probe;
+    const auto pressure = make_file_error(
+      kwaque::errc::resource_exhausted,
+      file_failure_detail::admission_not_dispatched);
+    probe.flush_failure = std::make_exception_ptr(
+      detail::file_operation_exception{pressure});
+    auto owner = make_file(probe);
+    const auto rejected = co_await owner.flush();
+    probe.flush_failure = {};
+    const auto retried = co_await owner.flush();
+    const auto closed = co_await owner.close();
+    BOOST_REQUIRE(!rejected.has_value());
+    BOOST_CHECK(rejected.error() == pressure);
+    BOOST_REQUIRE(retried.has_value());
+    BOOST_REQUIRE(closed.has_value());
+    BOOST_CHECK_EQUAL(probe.flushes, 2U);
+}
+
+SEASTAR_TEST_CASE(checked_close_retains_the_first_failure_and_releases_once) {
+    using namespace kwaque::runtime;
+    for (const bool fail_flush_first : {false, true}) {
+        file_probe probe;
+        probe.close_failure = std::make_exception_ptr(
+          std::system_error(
+            std::make_error_code(std::errc::no_space_on_device)));
+        if (fail_flush_first)
+            probe.flush_failure = std::make_exception_ptr(
+              std::system_error(
+                std::make_error_code(std::errc::permission_denied)));
+        file owner{
+          seastar::file{seastar::make_shared<probe_file_impl>(probe)},
+          {},
+          {},
+          file_close_policy::checked};
+        const auto flushed = co_await owner.flush();
+        const auto closed = co_await owner.close();
+        const auto repeated = co_await owner.close();
+        BOOST_CHECK_EQUAL(flushed.has_value(), !fail_flush_first);
+        BOOST_REQUIRE(!closed.has_value());
+        BOOST_REQUIRE(!repeated.has_value());
+        BOOST_CHECK(closed.error() == repeated.error());
+        const auto cause = file_detail(closed.error());
+        BOOST_REQUIRE(cause.has_value());
+        BOOST_CHECK(
+          *cause
+          == (fail_flush_first ? file_failure_detail::permission : file_failure_detail::no_space));
+        BOOST_CHECK_EQUAL(probe.closes, 1U);
+        BOOST_CHECK_EQUAL(owner.statistics().active, 0U);
+    }
+}
+
+SEASTAR_TEST_CASE(
+  checked_close_drains_accepted_writes_and_bounds_close_callers) {
+    using namespace kwaque::runtime;
+    file_probe probe;
+    probe.delayed_write.emplace();
+    file owner{
+      seastar::file{seastar::make_shared<probe_file_impl>(probe)},
+      {},
+      {},
+      file_close_policy::checked};
+    auto writing = owner.write(file_position{0}, aligned_data(4096, 'a'));
+    auto queued = owner.write(file_position{4096}, aligned_data(4096, 'b'));
+    auto closing = owner.close();
+    const bool pending = !closing.available();
+    const auto overlap = co_await owner.close();
+    complete_delayed_write(probe, 4096);
+    const auto first = co_await std::move(writing);
+    const auto second = co_await std::move(queued);
+    const auto closed = co_await std::move(closing);
+    BOOST_CHECK(pending);
+    BOOST_REQUIRE(!overlap.has_value());
+    BOOST_CHECK(overlap.error().code() == kwaque::errc::queue_full);
+    BOOST_CHECK(first.has_value());
+    BOOST_CHECK(second.has_value());
+    BOOST_CHECK(closed.has_value());
+    BOOST_CHECK_EQUAL(probe.closes, 1U);
+    BOOST_CHECK_EQUAL(probe.size, 8192U);
+}
+
+SEASTAR_TEST_CASE(
+  checked_close_caches_exception_identity_and_rejects_unqualified_native) {
+    using namespace kwaque::runtime;
+    file_probe probe;
+    const auto original = std::make_exception_ptr(std::bad_alloc{});
+    probe.write_failure = original;
+    probe.close_failure = std::make_exception_ptr(
+      std::runtime_error("later cleanup failure"));
+    file owner{
+      seastar::file{seastar::make_shared<probe_file_impl>(probe)},
+      {},
+      {},
+      file_close_policy::checked};
+    std::exception_ptr write_error;
+    try {
+        static_cast<void>(
+          co_await owner.write(file_position{}, aligned_data(4096, 'a')));
+    } catch (...) {
+        write_error = std::current_exception();
+    }
+    for (unsigned i = 0; i < 2; ++i) {
+        std::exception_ptr closed;
+        try {
+            static_cast<void>(co_await owner.close());
+        } catch (...) {
+            closed = std::current_exception();
+        }
+        BOOST_CHECK(closed == original);
+    }
+    BOOST_CHECK(write_error == original);
+    BOOST_CHECK_EQUAL(probe.closes, 1U);
+    probe.checked_close_supported = false;
+    auto native = seastar::file{seastar::make_shared<probe_file_impl>(probe)};
+    bool rejected = false;
+    try {
+        file unsupported{std::move(native), {}, {}, file_close_policy::checked};
+    } catch (const detail::file_operation_exception& error) {
+        rejected = error.error().code() == kwaque::errc::unavailable;
+    }
+    // Unsupported checked close rejects before consuming the native handle.
+    // NOLINTNEXTLINE(bugprone-use-after-move)
+    const bool retained = bool(native);
+    co_await native.close();
+    BOOST_CHECK(rejected && retained);
+}
+
+SEASTAR_TEST_CASE(checked_file_construction_needs_no_waiter_allocation) {
+#if defined(SEASTAR_ENABLE_ALLOC_FAILURE_INJECTION)
+    using namespace kwaque::runtime;
+    file_probe probe;
+    auto native = seastar::file{seastar::make_shared<probe_file_impl>(probe)};
+    operation_statistics_owner statistics;
+    std::optional<file> owner;
+    auto& injector = seastar::memory::local_failure_injector();
+    injector.fail_after(0);
+    bool allocation_failed = false;
+    try {
+        owner.emplace(
+          std::move(native),
+          file_io_limits{},
+          std::move(statistics),
+          file_close_policy::checked);
+    } catch (const std::bad_alloc&) {
+        allocation_failed = true;
+    }
+    const bool injected = injector.failed();
+    injector.cancel();
+    result<void> closed;
+    // Failed construction may leave the native handle unconsumed for cleanup.
+    if (owner) {
+        closed = co_await owner->close();
+    } else if (native) { // NOLINT(bugprone-use-after-move)
+        co_await native.close();
+    }
+    BOOST_CHECK(!injected);
+    BOOST_CHECK(!allocation_failed);
+    BOOST_CHECK(owner.has_value());
+    BOOST_CHECK(closed.has_value());
+    BOOST_CHECK_EQUAL(probe.closes, 1U);
+#endif
+    co_return;
+}
+
+SEASTAR_TEST_CASE(checked_close_drains_direct_short_write_recovery) {
+    using namespace kwaque::runtime;
+    for (const bool fail_recovery : {false, true}) {
+        file_probe probe;
+        probe.maximum_write_result = 4096;
+        probe.delayed_write.emplace();
+        probe.delayed_write_index = 1;
+        const auto failure = std::make_exception_ptr(
+          std::system_error(
+            std::make_error_code(std::errc::no_space_on_device)));
+        file owner{
+          seastar::file{seastar::make_shared<probe_file_impl>(probe)},
+          {},
+          {},
+          file_close_policy::checked};
+        auto writing = owner.write(file_position{}, aligned_data(8192, 'a'));
+        auto closing = owner.close();
+        while (!probe.delayed_write_consumed && !writing.available()) {
+            co_await seastar::yield();
+        }
+        const bool recovery_held = probe.delayed_write_consumed
+                                   && !writing.available()
+                                   && !closing.available() && probe.closes == 0;
+        if (probe.delayed_write_consumed) {
+            if (fail_recovery) {
+                probe.delayed_write->set_exception(failure);
+            } else {
+                complete_delayed_write(probe, 4096);
+            }
+        }
+        const auto written = co_await std::move(writing);
+        const auto closed = co_await std::move(closing);
+        const auto repeated = co_await owner.close();
+        BOOST_CHECK(recovery_held);
+        BOOST_CHECK_EQUAL(written.has_value(), !fail_recovery);
+        BOOST_CHECK_EQUAL(closed.has_value(), !fail_recovery);
+        BOOST_CHECK_EQUAL(repeated.has_value(), !fail_recovery);
+        if (!written && !closed && !repeated) {
+            BOOST_CHECK(closed.error() == written.error());
+            BOOST_CHECK(repeated.error() == written.error());
+        }
+        BOOST_CHECK_EQUAL(owner.statistics().active, 0U);
+        BOOST_CHECK(owner.state() == file_state::closed);
+        BOOST_CHECK_EQUAL(probe.closes, 1U);
+        if (written) {
+            BOOST_CHECK_EQUAL(written->value(), 8192U);
+            BOOST_CHECK_EQUAL(probe.size, 8192U);
+            BOOST_CHECK_EQUAL(probe.writes.size(), 2U);
+        }
+    }
+}
+
+SEASTAR_TEST_CASE(checked_close_needs_no_late_waiter_allocation) {
+#if defined(SEASTAR_ENABLE_ALLOC_FAILURE_INJECTION)
+    using namespace kwaque::runtime;
+    for (const bool staged : {false, true}) {
+        file_probe probe;
+        probe.delayed_write.emplace();
+        file owner{
+          seastar::file{seastar::make_shared<probe_file_impl>(probe)},
+          {},
+          {},
+          file_close_policy::checked};
+        auto data = staged ? staging_data(true, 4096) : aligned_data(4096, 'a');
+        auto writing = owner.write(file_position{}, std::move(data));
+        auto& injector = seastar::memory::local_failure_injector();
+        injector.fail_after(0);
+        auto closing = owner.close();
+        const bool injected = injector.failed();
+        injector.cancel();
+        const bool close_waited = !closing.available() && probe.closes == 0;
+        complete_delayed_write(probe, 4096);
+        const auto written = co_await std::move(writing);
+        const auto closed = co_await std::move(closing);
+        const auto repeated = co_await owner.close();
+        BOOST_CHECK(!injected);
+        BOOST_CHECK(close_waited);
+        BOOST_CHECK(written.has_value());
+        BOOST_CHECK(closed.has_value());
+        BOOST_CHECK(repeated.has_value());
+        BOOST_CHECK(owner.state() == file_state::closed);
+        BOOST_CHECK_EQUAL(owner.statistics().active, 0U);
+        BOOST_CHECK_EQUAL(probe.closes, 1U);
+    }
+#endif
+    co_return;
+}
+
+SEASTAR_TEST_CASE(file_reserved_metadata_flush_survives_ordinary_saturation) {
+    using namespace kwaque::runtime;
+    file_probe probe;
+    probe.delayed_flush.emplace();
+    file owner{
+      seastar::file{seastar::make_shared<probe_file_impl>(probe)},
+      {.pending_metadata_operations = 1},
+      {},
+      file_close_policy::checked};
+    auto reserved = owner.try_reserve_metadata();
+    BOOST_REQUIRE(reserved.has_value());
+    const auto full_size = co_await owner.size();
+    const auto full_flush = co_await owner.flush();
+    auto flushing = owner.flush(*reserved);
+    const bool pending = !flushing.available();
+    const auto overlap = co_await owner.flush(*reserved);
+    probe.delayed_flush->set_value();
+    const auto flushed = co_await std::move(flushing);
+    const auto retained = owner.pending_metadata_operations();
+    reserved->release();
+    const auto returned = owner.pending_metadata_operations();
+    const auto closed = co_await owner.close();
+    BOOST_CHECK(pending);
+    BOOST_CHECK(
+      !full_size && full_size.error().code() == kwaque::errc::queue_full);
+    BOOST_CHECK(
+      !full_flush && full_flush.error().code() == kwaque::errc::queue_full);
+    BOOST_CHECK(!overlap && overlap.error().code() == kwaque::errc::queue_full);
+    BOOST_CHECK(flushed.has_value());
+    BOOST_CHECK(closed.has_value());
+    BOOST_CHECK_EQUAL(retained, 1U);
+    BOOST_CHECK_EQUAL(returned, 0U);
+    BOOST_CHECK_EQUAL(probe.flushes, 1U);
+    BOOST_CHECK_EQUAL(probe.closes, 1U);
+}
+
+SEASTAR_TEST_CASE(
+  file_metadata_reservation_rejects_foreign_moved_and_released_use) {
+    using namespace kwaque::runtime;
+    file_probe first_probe, second_probe;
+    auto first = make_file(first_probe);
+    auto second = make_file(second_probe);
+    auto reserved = first.try_reserve_metadata();
+    BOOST_REQUIRE(reserved.has_value());
+    auto moved = std::move(*reserved);
+    const auto foreign = co_await second.flush(moved);
+    const auto moved_from = co_await first.flush(*reserved);
+    const auto valid = co_await first.flush(moved);
+    moved.release();
+    const auto released = co_await first.flush(moved);
+    const auto first_closed = co_await first.close();
+    const auto second_closed = co_await second.close();
+    const auto after_close = first.try_reserve_metadata();
+    for (const auto* result : {&foreign, &moved_from, &released}) {
+        BOOST_CHECK(
+          !*result && result->error().code() == kwaque::errc::invalid_argument);
+    }
+    BOOST_CHECK(valid.has_value());
+    BOOST_CHECK(first_closed.has_value());
+    BOOST_CHECK(second_closed.has_value());
+    BOOST_CHECK(
+      !after_close && after_close.error().code() == kwaque::errc::closed);
+    BOOST_CHECK_EQUAL(first_probe.flushes, 1U);
+    BOOST_CHECK_EQUAL(second_probe.flushes, 0U);
+}
+
+SEASTAR_TEST_CASE(
+  file_reserved_flush_preserves_native_failure_and_releases_capacity) {
+    using namespace kwaque::runtime;
+    file_probe probe;
+    probe.flush_failure = std::make_exception_ptr(
+      std::system_error(std::make_error_code(std::errc::no_space_on_device)));
+    file owner{
+      seastar::file{seastar::make_shared<probe_file_impl>(probe)},
+      {},
+      {},
+      file_close_policy::checked};
+    auto reservation = owner.try_reserve_metadata();
+    BOOST_REQUIRE(reservation.has_value());
+    const auto flushed = co_await owner.flush(*reservation);
+    reservation->release();
+    const auto capacity = owner.pending_metadata_operations();
+    const auto closed = co_await owner.close();
+    BOOST_REQUIRE(!flushed && !closed);
+    BOOST_CHECK(flushed.error() == closed.error());
+    BOOST_CHECK(file_detail(flushed.error()) == file_failure_detail::no_space);
+    BOOST_CHECK_EQUAL(capacity, 0U);
+    BOOST_CHECK_EQUAL(owner.statistics().active, 0U);
+    BOOST_CHECK_EQUAL(probe.closes, 1U);
+}
+
+SEASTAR_TEST_CASE(
+  file_metadata_reservations_cover_the_maximum_without_waiter_allocation) {
+    using namespace kwaque::runtime;
+    file_probe probe;
+    file owner{
+      seastar::file{seastar::make_shared<probe_file_impl>(probe)},
+      {.pending_metadata_operations = maximum_pending_file_metadata_operations},
+      {},
+      file_close_policy::checked};
+    std::array<
+      std::optional<file::metadata_reservation>,
+      maximum_pending_file_metadata_operations>
+      slots;
+    bool admitted = true, overflow_rejected = false, allocation_failed = false;
+#if defined(SEASTAR_ENABLE_ALLOC_FAILURE_INJECTION)
+    auto& injector = seastar::memory::local_failure_injector();
+    injector.fail_after(0);
+#endif
+    try {
+        for (auto& slot : slots) {
+            auto next = owner.try_reserve_metadata();
+            if (!next) {
+                admitted = false;
+                break;
+            }
+            slot.emplace(std::move(*next));
+        }
+        const auto overflow = owner.try_reserve_metadata();
+        overflow_rejected = !overflow
+                            && overflow.error().code()
+                                 == kwaque::errc::queue_full;
+    } catch (const std::bad_alloc&) {
+        allocation_failed = true;
+    }
+#if defined(SEASTAR_ENABLE_ALLOC_FAILURE_INJECTION)
+    const bool injected = injector.failed();
+    injector.cancel();
+#endif
+    const bool pinned = !kwaque::runtime::file_test_access::move_is_idle(owner);
+    for (auto& slot : slots)
+        slot.reset();
+    const auto returned = owner.pending_metadata_operations();
+    const auto closed = co_await owner.close();
+    BOOST_CHECK(admitted && pinned && !allocation_failed);
+    BOOST_CHECK(overflow_rejected);
+    BOOST_CHECK_EQUAL(returned, 0U);
+    BOOST_CHECK(closed.has_value());
+#if defined(SEASTAR_ENABLE_ALLOC_FAILURE_INJECTION)
+    BOOST_CHECK(!injected);
+#endif
 }

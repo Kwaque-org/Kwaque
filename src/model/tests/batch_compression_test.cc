@@ -1,3 +1,4 @@
+#include "src/bytes/test_allocation_profile.h"
 #include "src/model/batch_builder.h"
 #include "src/model/batch_codec.h"
 #include "src/model/batch_rewrite.h"
@@ -33,19 +34,7 @@ using kwaque::bytes::fragmented_buffer;
 using kwaque::bytes::fragmented_buffer_parser;
 constexpr codec::field_context coordinates{.origin = 1234};
 
-byte_count charge(byte_count request) noexcept {
-    if (request.value() == 0) return {};
-    if (request.value() > (std::uint64_t{1} << 62U))
-        return byte_count{UINT64_MAX};
-#if defined(SEASTAR_DEFAULT_ALLOCATOR)
-    return byte_count{
-      std::bit_ceil(std::max(request.value() + 32U, std::uint64_t{32}))};
-#else
-    const auto rounded = std::bit_ceil(
-      std::max(request.value(), std::uint64_t{16}));
-    return byte_count{request.value() <= 16384 ? 2U * rounded : rounded};
-#endif
-}
+using kwaque::bytes::testing::charge;
 codec::decode_budget memory() {
     return {byte_count{32U << 20U}, byte_count{1U << 20U}, charge};
 }

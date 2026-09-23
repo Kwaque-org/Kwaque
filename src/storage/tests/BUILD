@@ -1,7 +1,36 @@
 load("//bazel:build.bzl", "kwaque_cc_library")
-load("//bazel:test.bzl", "kwaque_cc_benchmark", "kwaque_cc_fuzz_test", "kwaque_cc_seastar_gtest", "kwaque_cc_test")
+load("//bazel:test.bzl", "kwaque_cc_benchmark", "kwaque_cc_fuzz_test", "kwaque_cc_seastar_gtest", "kwaque_cc_seastar_test", "kwaque_cc_test")
 
 package(default_visibility = ["//visibility:private"])
+
+kwaque_cc_library(
+    name = "completion_contract",
+    testonly = True,
+    hdrs = ["completion_contract.h"],
+    visibility = [
+        "//src/broker:__pkg__",
+        "//src/simulation/tests:__pkg__",
+    ],
+    deps = [
+        "//src/base",
+        "//src/base:error",
+        "//src/bytes:allocation_test_profile",
+        "//src/bytes:fragmented_buffer",
+        "//src/bytes:fragmented_buffer_builder",
+        "//src/resource:resource_manager",
+        "//src/resource:workload_class",
+        "//src/runtime:environment",
+        "//src/runtime:error",
+        "//src/runtime:file",
+        "//src/runtime:first_failure",
+        "//src/runtime:timer",
+        "//src/storage:completion_resources",
+        "//src/storage:operation_scope",
+        "//src/storage:statistics",
+        "//src/storage:workload_budget",
+        "@seastar",
+    ],
+)
 
 kwaque_cc_seastar_gtest(
     name = "format_fixture_test",
@@ -194,6 +223,11 @@ test_suite(
         ":format_integration_test",
         ":format_size_test",
         ":index_manifest_qualification_test",
+        ":local_metadata_fixture_test",
+        ":local_metadata_test",
+        ":local_paths_test",
+        ":local_store_config_test",
+        ":local_types_test",
         ":range_manifest_decode_test",
         ":range_manifest_format_test",
         ":retry_format_test",
@@ -571,5 +605,376 @@ kwaque_cc_benchmark(
         "//src/storage:sparse_index_format",
         "//src/storage:wal_format",
         "@fmt",
+    ],
+)
+
+kwaque_cc_seastar_test(
+    name = "workload_budget_test",
+    srcs = ["workload_budget_test.cc"],
+    memory = "256MiB",
+    deps = [
+        "//src/base",
+        "//src/base:error",
+        "//src/base:metric_schema",
+        "//src/bytes:allocation_test_profile",
+        "//src/bytes:fragmented_buffer",
+        "//src/resource:bounded_work_queue",
+        "//src/resource:resource_config",
+        "//src/resource:resource_manager",
+        "//src/resource:resource_registry",
+        "//src/resource:workload_class",
+        "//src/runtime:cross_shard",
+        "//src/runtime:error",
+        "//src/storage:metrics",
+        "//src/storage:operation_scope",
+        "//src/storage:statistics",
+        "//src/storage:workload_budget",
+    ],
+)
+
+kwaque_cc_seastar_test(
+    name = "completion_resources_test",
+    srcs = ["completion_resources_test.cc"],
+    memory = "256MiB",
+    deps = [
+        ":completion_contract",
+        "//src/base",
+        "//src/base:error",
+        "//src/bytes:allocation_test_profile",
+        "//src/resource:resource_config",
+        "//src/resource:resource_manager",
+        "//src/resource:resource_registry",
+        "//src/resource:workload_class",
+        "//src/runtime:cross_shard",
+        "//src/runtime:error",
+        "//src/runtime:file",
+        "//src/runtime/production:file",
+        "//src/runtime/testing:test_directory",
+        "//src/storage:completion_resources",
+        "//src/storage:workload_budget",
+    ],
+)
+
+kwaque_cc_test(
+    name = "local_types_test",
+    srcs = ["local_types_test.cc"],
+    deps = [
+        "//src/base",
+        "//src/base:error",
+        "//src/codec:digest",
+        "//src/codec:limits",
+        "//src/model:epoch",
+        "//src/model:identity",
+        "//src/runtime:file_position",
+        "//src/storage:format_context",
+        "//src/storage:format_size",
+        "//src/storage:local_metadata_layout",
+        "//src/storage:local_types",
+        "//src/storage:page_ref",
+    ],
+)
+
+kwaque_cc_seastar_gtest(
+    name = "local_metadata_test",
+    srcs = ["local_metadata_test.cc"],
+    deps = [
+        ":storage_test_support",
+        "//src/base",
+        "//src/base:error",
+        "//src/bytes:allocation_test_profile",
+        "//src/bytes:fragmented_buffer",
+        "//src/bytes:fragmented_buffer_parser",
+        "//src/codec:cooperative",
+        "//src/codec:digest",
+        "//src/codec:envelope",
+        "//src/codec:error",
+        "//src/codec:integer",
+        "//src/codec:limits",
+        "//src/codec:sha256",
+        "//src/model:batch_identity",
+        "//src/model:epoch",
+        "//src/model:identity",
+        "//src/model:position",
+        "//src/runtime:file_position",
+        "//src/runtime:time",
+        "//src/storage:completed_retry",
+        "//src/storage:format_context",
+        "//src/storage:local_metadata",
+        "//src/storage:local_metadata_layout",
+        "//src/storage:local_types",
+        "//src/storage:page_ref",
+    ],
+)
+
+filegroup(
+    name = "local_metadata_fixture_data",
+    srcs = glob([
+        "testdata/local_metadata/*.hex",
+        "testdata/local_metadata/*.json",
+    ]),
+    visibility = [
+        "//src/broker:__pkg__",
+        "//src/simulation/tests:__pkg__",
+        "//tools:__pkg__",
+    ],
+)
+
+kwaque_cc_library(
+    name = "local_publication_contract",
+    testonly = True,
+    hdrs = ["local_publication_contract.h"],
+    visibility = ["//src/simulation/tests:__pkg__"],
+    deps = [
+        "//src/base",
+        "//src/base:error",
+        "//src/bytes:fragmented_buffer",
+        "//src/runtime:error",
+        "//src/runtime:file",
+        "//src/runtime:first_failure",
+        "//src/runtime/testing/contracts:file_system_contract",
+        "//src/storage:local_paths",
+        "//src/storage:local_publication",
+        "//src/storage:local_types",
+        "//src/storage:workload_budget",
+        "@seastar",
+    ],
+)
+
+kwaque_cc_test(
+    name = "local_paths_test",
+    srcs = ["local_paths_test.cc"],
+    deps = [
+        "//src/model:epoch",
+        "//src/model:identity",
+        "//src/runtime:file",
+        "//src/storage:local_paths",
+        "//src/storage:local_types",
+    ],
+)
+
+kwaque_cc_seastar_test(
+    name = "local_publication_test",
+    srcs = ["local_publication_test.cc"],
+    deps = [
+        ":local_publication_contract",
+        "//src/base",
+        "//src/base:error",
+        "//src/bytes:allocation_test_profile",
+        "//src/codec:cooperative",
+        "//src/resource:resource_manager",
+        "//src/resource:resource_registry",
+        "//src/resource:workload_class",
+        "//src/runtime:file",
+        "//src/runtime/production:file",
+        "//src/runtime/testing:test_directory",
+        "//src/storage:local_paths",
+        "//src/storage:workload_budget",
+    ],
+)
+
+kwaque_cc_seastar_gtest(
+    name = "local_metadata_fixture_test",
+    srcs = [
+        "local_metadata_fixture_test.cc",
+    ],
+    data = [":local_metadata_fixture_data"],
+    deps = [
+        ":local_metadata_fixture",
+        ":storage_test_support",
+        "//src/base",
+        "//src/base:error",
+        "//src/bytes:allocation_test_profile",
+        "//src/bytes:fragmented_buffer",
+        "//src/bytes:fragmented_buffer_parser",
+        "//src/codec:cooperative",
+        "//src/codec:digest",
+        "//src/codec:envelope",
+        "//src/codec:error",
+        "//src/codec:integer",
+        "//src/codec:limits",
+        "//src/codec:sha256",
+        "//src/model:batch_identity",
+        "//src/model:epoch",
+        "//src/model:identity",
+        "//src/model:position",
+        "//src/runtime:file_position",
+        "//src/runtime:time",
+        "//src/storage:completed_retry",
+        "//src/storage:format_context",
+        "//src/storage:local_metadata",
+        "//src/storage:local_metadata_layout",
+        "//src/storage:local_types",
+        "//src/storage:page_ref",
+    ],
+)
+
+kwaque_cc_library(
+    name = "local_metadata_fixture",
+    testonly = True,
+    hdrs = [
+        "local_metadata_fixture.h",
+        "local_metadata_fixture_cases.h",
+    ],
+    deps = ["//src/base:error"],
+)
+
+kwaque_cc_library(
+    name = "local_store_contract",
+    testonly = True,
+    hdrs = ["local_store_contract.h"],
+    visibility = [
+        "//src/broker:__pkg__",
+        "//src/simulation/tests:__pkg__",
+    ],
+    deps = [
+        ":local_metadata_fixture",
+        ":local_publication_contract",
+        ":storage_test_support",
+        "//src/base",
+        "//src/base:error",
+        "//src/bytes:allocation_test_profile",
+        "//src/bytes:fragmented_buffer",
+        "//src/codec:cooperative",
+        "//src/runtime:file",
+        "//src/runtime:first_failure",
+        "//src/storage:local_control",
+        "//src/storage:local_metadata",
+        "//src/storage:local_paths",
+        "//src/storage:local_publication",
+        "//src/storage:local_store_bootstrap",
+        "//src/storage:local_store_config",
+        "//src/storage:local_store_inspection",
+        "//src/storage:workload_budget",
+        "@seastar",
+    ],
+)
+
+kwaque_cc_test(
+    name = "local_store_config_test",
+    srcs = ["local_store_config_test.cc"],
+    deps = [
+        "//src/base:error",
+        "//src/model:identity",
+        "//src/runtime:file",
+        "//src/storage:local_metadata",
+        "//src/storage:local_store_config",
+        "//src/storage:local_types",
+    ],
+)
+
+kwaque_cc_library(
+    name = "local_installation_contract",
+    testonly = True,
+    hdrs = [
+        "local_installation_contract.h",
+        "sparse_index_test_support.h",
+    ],
+    visibility = [
+        "//src/broker:__pkg__",
+        "//src/simulation/tests:__pkg__",
+    ],
+    deps = [
+        ":local_metadata_fixture",
+        ":local_store_contract",
+        ":storage_test_support",
+        "//src/base",
+        "//src/base:error",
+        "//src/bytes:fragmented_buffer",
+        "//src/bytes:fragmented_buffer_builder",
+        "//src/codec:cooperative",
+        "//src/codec:digest",
+        "//src/codec:sha256",
+        "//src/runtime:file",
+        "//src/runtime:first_failure",
+        "//src/storage:format_context",
+        "//src/storage:local_bundle",
+        "//src/storage:local_control",
+        "//src/storage:local_id_allocator",
+        "//src/storage:local_metadata",
+        "//src/storage:local_paths",
+        "//src/storage:local_publication",
+        "//src/storage:local_segment",
+        "//src/storage:local_store_bootstrap",
+        "//src/storage:local_store_config",
+        "//src/storage:local_types",
+        "//src/storage:page_ref",
+        "//src/storage:segment_format",
+        "//src/storage:sparse_index_format",
+        "//src/storage:workload_budget",
+        "@seastar",
+    ],
+)
+
+kwaque_cc_library(
+    name = "local_reader_contract",
+    testonly = True,
+    hdrs = ["local_reader_contract.h"],
+    visibility = [
+        "//src/broker:__pkg__",
+        "//src/simulation/tests:__pkg__",
+    ],
+    deps = [
+        ":local_installation_contract",
+        ":local_metadata_fixture",
+        ":local_store_contract",
+        ":storage_test_support",
+        "//src/base",
+        "//src/base:error",
+        "//src/bytes:fragmented_buffer",
+        "//src/codec:cooperative",
+        "//src/codec:digest",
+        "//src/runtime:file",
+        "//src/runtime:first_failure",
+        "//src/storage:footer_format",
+        "//src/storage:format_context",
+        "//src/storage:local_bundle",
+        "//src/storage:local_cleanup",
+        "//src/storage:local_discovery",
+        "//src/storage:local_generation",
+        "//src/storage:local_metadata",
+        "//src/storage:local_metadata_file",
+        "//src/storage:local_namespace",
+        "//src/storage:local_paths",
+        "//src/storage:local_publication",
+        "//src/storage:local_root",
+        "//src/storage:local_segment",
+        "//src/storage:local_store_bootstrap",
+        "//src/storage:local_store_config",
+        "//src/storage:local_types",
+        "//src/storage:page_ref",
+        "//src/storage:sparse_index_format",
+        "//src/storage:workload_budget",
+        "@seastar",
+    ],
+)
+
+kwaque_cc_test(
+    name = "local_cleanup_test",
+    srcs = ["local_cleanup_test.cc"],
+    deps = [
+        "//src/base",
+        "//src/base:error",
+        "//src/model:identity",
+        "//src/runtime:file",
+        "//src/storage:local_cleanup",
+        "//src/storage:local_discovery",
+        "//src/storage:local_metadata",
+        "//src/storage:local_namespace",
+        "//src/storage:local_paths",
+        "//src/storage:local_types",
+    ],
+)
+
+kwaque_cc_library(
+    name = "local_qualification_contract",
+    testonly = True,
+    hdrs = ["local_qualification_contract.h"],
+    visibility = [
+        "//src/broker:__pkg__",
+        "//src/simulation/tests:__pkg__",
+    ],
+    deps = [
+        ":local_reader_contract",
+        "@seastar",
     ],
 )

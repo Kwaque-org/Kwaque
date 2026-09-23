@@ -5,6 +5,23 @@
 
 namespace kwaque::runtime {
 
+result<fault_decision> fault_decision::make_file_failure(
+  fault_action action, file_failure_detail cause, byte_count prefix) noexcept {
+    if (
+      action < fault_action::file_failure_before_effect
+      || action > fault_action::file_failure_after_effect
+      || static_cast<std::uint8_t>(cause)
+           > static_cast<std::uint8_t>(file_failure_detail::quota)
+      || cause == file_failure_detail::admission_not_dispatched
+      || prefix.value() > (std::numeric_limits<std::uint64_t>::max() >> 8U)
+      || ((action == fault_action::file_failure_after_prefix) != (prefix.value() != 0))) {
+        return failure(
+          operation_error{errc::invalid_argument, operation_kind::fault});
+    }
+    return fault_decision{
+      action, (prefix.value() << 8U) | static_cast<std::uint8_t>(cause)};
+}
+
 namespace {
 
 operation_error fault_error(errc code) noexcept {

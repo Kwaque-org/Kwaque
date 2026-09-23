@@ -113,7 +113,7 @@ TEST(EnvelopePrefixTest, EncodesIndependentExactBytesForCurrentWriter) {
       fields(), codec::limits::defaults(), owner_limits, context);
     ASSERT_TRUE(encoded.has_value());
     EXPECT_EQ(std::string_view(encoded->data(), encoded->size()), golden);
-    for (std::uint16_t family = 1; family <= 10; ++family) {
+    for (std::uint16_t family = 1; family <= 11; ++family) {
         auto supplied = fields();
         supplied.family = static_cast<codec::format_family>(family);
         auto expected = std::string{golden};
@@ -361,7 +361,7 @@ TEST(EnvelopePrefixTest, CheckedCoordinatesSeparateCallerAndDeclaredOverflow) {
 
 TEST(EnvelopePrefixTest, WriterRejectsUnknownFamiliesAndNarrowingBeforeOutput) {
     for (const std::uint16_t family :
-         {std::uint16_t{0}, std::uint16_t{11}, std::uint16_t{UINT16_MAX}}) {
+         {std::uint16_t{0}, std::uint16_t{12}, std::uint16_t{UINT16_MAX}}) {
         auto supplied = fields();
         supplied.family = static_cast<codec::format_family>(family);
         expect_error(

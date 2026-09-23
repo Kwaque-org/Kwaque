@@ -1089,6 +1089,31 @@ runtime::result<void> scheduler::validate_effect(
       || context.size() > trace_context_fields_max) {
         return runtime::failure(scheduler_error(errc::invalid_argument));
     }
+    if (
+      descriptor.effect == trace_action::file_effect_applied
+      || descriptor.effect == trace_action::file_operation_result)
+        return trace_effect_is_valid(descriptor, context)
+                 ? runtime::result<void>{}
+                 : runtime::result<void>{
+                     runtime::failure(scheduler_error(errc::invalid_argument))};
+    if (
+      descriptor.effect == trace_action::crash_selection
+      || descriptor.effect == trace_action::storage_configuration) {
+        if (
+          descriptor.kind != trace_event_kind::filesystem
+          || descriptor.stable_id == 0 || descriptor.result != 0
+          || context.size() != 4)
+            return runtime::failure(scheduler_error(errc::invalid_argument));
+        for (std::size_t index = 0; index < 4; ++index)
+            if (
+              context[index].key
+              != static_cast<trace_context_key>(
+                static_cast<std::uint8_t>(trace_context_key::digest_word_0)
+                + index))
+                return runtime::failure(
+                  scheduler_error(errc::invalid_argument));
+        return {};
+    }
     if (descriptor.effect == trace_action::bandwidth_rebalanced) {
         if (
           descriptor.kind != trace_event_kind::bandwidth

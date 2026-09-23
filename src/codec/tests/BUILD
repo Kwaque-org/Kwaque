@@ -1,5 +1,7 @@
+load("@rules_python//python:defs.bzl", "py_library")
 load("//bazel:build.bzl", "kwaque_cc_binary", "kwaque_cc_library")
 load("//bazel:test.bzl", "kwaque_cc_benchmark", "kwaque_cc_fuzz_test", "kwaque_cc_seastar_gtest", "kwaque_cc_test", "kwaque_py_native_test")
+load(":allocation_observer.bzl", "ALLOCATION_OBSERVER_LINKOPTS")
 
 package(default_visibility = ["//visibility:private"])
 
@@ -254,6 +256,7 @@ kwaque_cc_benchmark(
     memory = "512MiB",
     deps = [
         ":codec_bench_reference",
+        ":qualification_profile",
         "//src/base",
         "//src/base:error",
         "//src/base:invariant",
@@ -559,4 +562,103 @@ kwaque_cc_seastar_gtest(
         "//src/codec:integer",
         "//src/codec:limits",
     ],
+)
+
+kwaque_cc_library(
+    name = "qualification_profile",
+    testonly = True,
+    hdrs = ["qualification_profile.h"],
+    visibility = [
+        "//src/compression/tests:__pkg__",
+        "//src/model/tests:__pkg__",
+    ],
+    deps = ["//src/base"],
+)
+
+kwaque_cc_library(
+    name = "allocation_observer",
+    testonly = True,
+    srcs = ["allocation_observer.cc"],
+    hdrs = ["allocation_observer.h"],
+    visibility = [
+        "//src/broker:__pkg__",
+        "//src/model/tests:__pkg__",
+    ],
+    deps = [
+        "@openssl",
+        "@seastar",
+    ],
+)
+
+kwaque_cc_binary(
+    name = "memory_qualification_probe",
+    testonly = True,
+    srcs = [
+        "envelope_bench_fixture.h",
+        "envelope_bench_reference.cc",
+        "memory_qualification_probe.cc",
+    ],
+    linkopts = ALLOCATION_OBSERVER_LINKOPTS,
+    visibility = ["//src/model/tests:__pkg__"],
+    deps = [
+        ":allocation_observer",
+        ":codec_bench_reference",
+        ":memory_qualification_support",
+        ":qualification_profile",
+        "//src/base",
+        "//src/base:error",
+        "//src/bytes:allocation_test_profile",
+        "//src/bytes:fragmented_buffer",
+        "//src/bytes:fragmented_buffer_parser",
+        "//src/codec:collection",
+        "//src/codec:cooperative",
+        "//src/codec:crc32c",
+        "//src/codec:crc32c_cooperative",
+        "//src/codec:digest",
+        "//src/codec:envelope",
+        "//src/codec:error",
+        "//src/codec:format_registry",
+        "//src/codec:integer",
+        "//src/codec:limits",
+        "//src/codec:sha256",
+        "//src/codec:sha256_cooperative",
+        "//src/codec:staging_cooperative",
+        "@boost//:program_options",
+        "@crc32c",
+        "@seastar",
+    ],
+)
+
+kwaque_py_native_test(
+    name = "memory_qualification_test",
+    timeout = "moderate",
+    srcs = ["memory_qualification_test.py"],
+    data = [":memory_qualification_probe"],
+    tags = [
+        "resources:cpu:1",
+        "resources:memory:256",
+    ],
+    deps = [":memory_qualification_driver"],
+)
+
+kwaque_cc_library(
+    name = "memory_qualification_support",
+    testonly = True,
+    hdrs = ["memory_qualification_support.h"],
+    visibility = ["//src/model/tests:__pkg__"],
+    deps = [
+        ":allocation_observer",
+        ":qualification_profile",
+        "//src/base",
+        "//src/bytes:allocation_test_profile",
+        "//src/bytes:fragmented_buffer",
+        "@seastar",
+    ],
+)
+
+py_library(
+    name = "memory_qualification_driver",
+    testonly = True,
+    srcs = ["memory_qualification_driver.py"],
+    visibility = ["//src/model/tests:__pkg__"],
 )

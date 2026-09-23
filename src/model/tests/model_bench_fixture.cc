@@ -1,5 +1,6 @@
 #include "src/model/tests/model_bench_fixture.h"
 
+#include "src/codec/tests/qualification_profile.h"
 #include "src/model/batch_rewrite.h"
 
 #include <seastar/core/abort_source.hh>
@@ -72,7 +73,10 @@ seastar::future<> model_fixture::account(codec::cooperative_work& work) {
     // Cache aliases are conservatively counted separately. A distinct 1-MiB
     // allowance covers native engines and fixture/coroutine frames; native
     // qualification remains required for that allowance.
-    remaining = byte_count{63U << 20U}.checked_sub(total).value();
+    remaining
+      = byte_count{(64U << 20U) - codec::testing::execution_reservation.value()}
+          .checked_sub(total)
+          .value();
 }
 seastar::future<submitted_batch>
 model_fixture::build(codec::cooperative_work& work) {

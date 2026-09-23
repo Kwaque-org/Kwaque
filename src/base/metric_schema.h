@@ -66,6 +66,17 @@ enum class metric_id : std::uint16_t {
     fake_file_active = 43,
     fake_network_active = 44,
     fake_dns_active = 45,
+    storage_active = 46,
+    storage_accepted_total = 47,
+    storage_completed_total = 48,
+    storage_rejected_total = 49,
+    storage_succeeded_total = 50,
+    storage_failed_total = 51,
+    storage_uncertain_total = 52,
+    storage_durable_total = 53,
+    storage_reserved_tasks = 54,
+    storage_reserved_bytes = 55,
+    storage_reserved_handles = 56,
 };
 
 struct metric_descriptor final {
@@ -80,7 +91,7 @@ struct metric_descriptor final {
     bool operator==(const metric_descriptor&) const = default;
 };
 
-inline constexpr std::size_t metric_inventory_size{45};
+inline constexpr std::size_t metric_inventory_size{56};
 inline constexpr std::string_view metric_workload_label{"workload"};
 inline constexpr std::array<std::string_view, 8> metric_workload_label_values{
   "foreground_protocol",
@@ -94,7 +105,7 @@ inline constexpr std::array<std::string_view, 8> metric_workload_label_values{
 };
 inline constexpr std::size_t metric_workload_values
   = metric_workload_label_values.size();
-inline constexpr std::size_t metric_series_per_shard{73};
+inline constexpr std::size_t metric_series_per_shard{84};
 
 // Totals are plain unsigned 64-bit owner fields. Their overflow behavior is
 // the language-defined modulo-2^64 arithmetic, with no update-path branch.

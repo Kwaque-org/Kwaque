@@ -27,7 +27,7 @@ namespace kwaque::simulation {
 
 class scheduler;
 
-inline constexpr std::uint32_t event_trace_schema_version{5};
+inline constexpr std::uint32_t event_trace_schema_version{10};
 inline constexpr std::uint32_t scheduler_ordering_version{1};
 inline constexpr std::size_t trace_context_fields_max{4};
 inline constexpr std::size_t canonical_entry_encoded_size{244};
@@ -164,6 +164,20 @@ enum class trace_action : std::uint8_t {
     dns_result_applied = 20,
     operation_parked = 21,
     stop_terminal = 22,
+    // Coordinates: capacity/free/available. Result: readonly bit for success,
+    // or 0x100 | errc with zero coordinates for a failed sample.
+    filesystem_space_sampled = 23,
+    // File effects: object/position/amount, result 0=none, 1=prefix,
+    // 2=complete.
+    file_effect_applied = 24,
+    // Same coordinates. Result: code | detail<<8 | receipt<<16,
+    // receipt 1=returned, 2=withheld, 3=exceptional.
+    file_operation_result = 25,
+    // Whole crash plan bound to full-context/content digest before commit.
+    crash_selection = 26,
+    crash_started = 27,
+    crash_completed = 28,
+    storage_configuration = 29,
 };
 
 enum class trace_event_kind : std::uint8_t {
@@ -307,6 +321,9 @@ struct trace_event_descriptor final {
 // before its callback, ID, or trace reservation is committed.
 [[nodiscard]] bool
 trace_descriptor_is_valid(trace_event_descriptor descriptor) noexcept;
+[[nodiscard]] bool trace_effect_is_valid(
+  trace_event_descriptor descriptor,
+  std::span<const trace_context_field> context) noexcept;
 
 struct trace_entry final {
     std::uint64_t sequence{0};

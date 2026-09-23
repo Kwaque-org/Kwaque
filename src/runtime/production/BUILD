@@ -47,8 +47,13 @@ kwaque_cc_library(
     name = "file",
     srcs = ["file.cc"],
     hdrs = ["file.h"],
-    visibility = ["//src/runtime/tests:__pkg__"],
+    visibility = [
+        "//src/broker:__pkg__",
+        "//src/runtime/tests:__pkg__",
+        "//src/storage/tests:__pkg__",
+    ],
     deps = [
+        "//src/base:invariant",
         "//src/runtime:error",
         "//src/runtime:file",
         "//src/runtime:file_error_internal",

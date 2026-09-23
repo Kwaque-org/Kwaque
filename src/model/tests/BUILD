@@ -1,5 +1,6 @@
-load("//bazel:build.bzl", "kwaque_cc_library")
-load("//bazel:test.bzl", "kwaque_cc_benchmark", "kwaque_cc_fuzz_test", "kwaque_cc_seastar_gtest", "kwaque_cc_test")
+load("//bazel:build.bzl", "kwaque_cc_binary", "kwaque_cc_library")
+load("//bazel:test.bzl", "kwaque_cc_benchmark", "kwaque_cc_fuzz_test", "kwaque_cc_seastar_gtest", "kwaque_cc_test", "kwaque_py_native_test")
+load("//src/codec/tests:allocation_observer.bzl", "ALLOCATION_OBSERVER_LINKOPTS")
 load(":identity_dependency_test.bzl", "identity_dependency_test")
 
 package(default_visibility = ["//visibility:private"])
@@ -256,6 +257,7 @@ kwaque_cc_library(
     deps = [
         "//src/base",
         "//src/base:error",
+        "//src/bytes:allocation_test_profile",
         "//src/bytes:fragmented_buffer",
         "//src/bytes:fragmented_buffer_parser",
         "//src/codec:cooperative",
@@ -294,6 +296,7 @@ kwaque_cc_seastar_gtest(
         ":record_fuzz_cases",
         "//src/base",
         "//src/base:error",
+        "//src/bytes:allocation_test_profile",
         "//src/bytes:fragmented_buffer",
         "//src/bytes:fragmented_buffer_builder",
         "//src/bytes:fragmented_buffer_parser",
@@ -357,6 +360,7 @@ kwaque_cc_library(
         "//src/codec:limits",
         "//src/codec:staging_cooperative",
         "//src/codec/tests:codec_bench_reference",
+        "//src/codec/tests:qualification_profile",
         "//src/model:batch",
         "//src/model:batch_builder",
         "//src/model:batch_codec",
@@ -416,6 +420,7 @@ kwaque_cc_benchmark(
         "//src/codec:limits",
         "//src/codec:sha256",
         "//src/codec/tests:codec_bench_reference",
+        "//src/codec/tests:qualification_profile",
         "//src/compression",
         "//src/model:batch",
         "//src/model:batch_builder",
@@ -631,6 +636,34 @@ kwaque_cc_test(
     ],
 )
 
+kwaque_cc_binary(
+    name = "value_allocation_probe",
+    testonly = True,
+    srcs = ["value_allocation_probe.cc"],
+    deps = [
+        "//src/base",
+        "//src/base:error",
+        "//src/codec:limits",
+        "//src/model:batch_context",
+        "//src/model:batch_identity",
+        "//src/model:epoch",
+        "//src/model:identity",
+        "//src/model:keyspace",
+        "//src/model:position",
+        "//src/runtime:time",
+        "@abseil-cpp//absl/hash:hash",
+        "@boost//:program_options",
+        "@seastar",
+    ],
+)
+
+kwaque_py_native_test(
+    name = "value_allocation_test",
+    timeout = "moderate",
+    srcs = ["value_allocation_test.py"],
+    data = [":value_allocation_probe"],
+)
+
 test_suite(
     name = "value_tests",
     tests = [
@@ -650,6 +683,7 @@ test_suite(
         ":topic_policy_test",
         ":transport_identity_test",
         ":uuid_dependency_compatibility_test",
+        ":value_allocation_test",
         ":value_boundary_test",
     ],
 )
@@ -775,4 +809,49 @@ test_suite(
         ":lineage_checkpoint_test",
         ":lineage_model_test",
     ],
+)
+
+kwaque_cc_binary(
+    name = "memory_qualification_probe",
+    testonly = True,
+    srcs = ["memory_qualification_probe.cc"],
+    linkopts = ALLOCATION_OBSERVER_LINKOPTS,
+    deps = [
+        ":model_bench_support",
+        "//src/base",
+        "//src/base:error",
+        "//src/bytes:fragmented_buffer",
+        "//src/bytes:fragmented_buffer_parser",
+        "//src/codec:cooperative",
+        "//src/codec:error",
+        "//src/codec:integer",
+        "//src/codec:limits",
+        "//src/codec/tests:allocation_observer",
+        "//src/codec/tests:codec_bench_reference",
+        "//src/codec/tests:memory_qualification_support",
+        "//src/compression",
+        "//src/model:batch_builder",
+        "//src/model:batch_codec",
+        "//src/model:fingerprint",
+        "//src/model:record_codec",
+        "//src/runtime:time",
+        "@boost//:program_options",
+        "@lz4",
+        "@seastar",
+    ],
+)
+
+kwaque_py_native_test(
+    name = "memory_qualification_test",
+    timeout = "moderate",
+    srcs = ["memory_qualification_test.py"],
+    data = [
+        ":memory_qualification_probe",
+        "//src/codec/tests:memory_qualification_probe",
+    ],
+    tags = [
+        "resources:cpu:1",
+        "resources:memory:256",
+    ],
+    deps = ["//src/codec/tests:memory_qualification_driver"],
 )

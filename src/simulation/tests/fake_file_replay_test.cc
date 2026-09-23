@@ -1,5 +1,6 @@
 #include "src/bytes/fragmented_buffer.h"
 #include "src/runtime/file.h"
+#include "src/runtime/testing/contracts/file_system_contract.h"
 #include "src/simulation/determinism_version.h"
 #include "src/simulation/event_trace.h"
 #include "src/simulation/fake_file.h"
@@ -1180,4 +1181,113 @@ SEASTAR_TEST_CASE(
     BOOST_REQUIRE(!stopped.has_value());
     BOOST_CHECK(stopped.error().code() == kwaque::errc::replay_divergence);
     co_return;
+}
+
+namespace {
+struct cursor_replay_driver {
+    scheduler* events;
+    template<typename T>
+    seastar::future<T> operator()(seastar::future<T> operation) const {
+        co_await pump_until(*events, operation);
+        co_return co_await std::move(operation);
+    }
+};
+
+seastar::future<>
+run_cursor_contract(event_trace& trace, const scheduler_limits& budget) {
+    fixture test{budget, trace, {}};
+    co_await kwaque::runtime::testing::run_file_system_contract(
+      *test.files,
+      path("/kwaque/capabilities"),
+      cursor_replay_driver{&test.events});
+    BOOST_CHECK_EQUAL(fake_file_test_access::open_handles(*test.files), 0U);
+}
+} // namespace
+
+SEASTAR_TEST_CASE(
+  fake_directory_capabilities_capture_replays_byte_identically) {
+    const auto scheduler_budget = make_scheduler_limits();
+    const auto trace_budget = make_trace_limits();
+    const auto header = trace_header::current(
+      seed,
+      kwaque::simulation::deterministic_random_algorithm_version,
+      kwaque::simulation::deterministic_random_coordinate_version,
+      kwaque::simulation::trace_budget(scheduler_budget),
+      trace_budget,
+      digest("directory-capabilities-defaults-v1"),
+      digest("shared-directory-contract-v1"));
+    event_trace capture{header, trace_budget};
+    co_await run_cursor_contract(capture, scheduler_budget);
+    auto encoded = capture.encode();
+    BOOST_REQUIRE(encoded.has_value());
+    auto decoded = event_trace::decode(*encoded, trace_budget);
+    BOOST_REQUIRE(decoded.has_value());
+    auto replay = event_trace::replay(
+      header, trace_budget, std::move(*decoded));
+    BOOST_REQUIRE(replay.has_value());
+    co_await run_cursor_contract(**replay, scheduler_budget);
+    BOOST_REQUIRE((*replay)->finish_replay().has_value());
+    auto replayed = (*replay)->encode();
+    BOOST_REQUIRE(replayed.has_value());
+    BOOST_CHECK(*replayed == *encoded);
+}
+
+namespace {
+seastar::future<kwaque::errc> rename_policy_scenario(
+  event_trace& trace,
+  const scheduler_limits& limits,
+  kwaque::runtime::file_rename_policy policy) {
+    fixture target{limits, trace, {}};
+    auto creating = target.files->create_directories(
+      path("/kwaque/rename-policy"));
+    co_await require_success(target.events, creating);
+    auto opening = target.files->open(
+      path("/kwaque/rename-policy/a"),
+      {.access = kwaque::runtime::file_access::read_write,
+       .create = true,
+       .exclusive = true,
+       .close_policy = kwaque::runtime::file_close_policy::checked});
+    co_await pump_until(target.events, opening);
+    auto file_result = co_await std::move(opening);
+    BOOST_REQUIRE(file_result.has_value());
+    auto file = std::move(*file_result);
+    auto closing = file.close();
+    co_await require_success(target.events, closing);
+    auto rename = target.files->rename(
+      path("/kwaque/rename-policy/a"), path("/kwaque/rename-policy/b"), policy);
+    // A mismatched request can reject immediately, without a scheduled effect.
+    if (!rename.available()) co_await pump_until(target.events, rename);
+    auto result = co_await std::move(rename);
+    auto stopping = target.files->stop();
+    co_await pump_until(target.events, stopping);
+    static_cast<void>(co_await std::move(stopping));
+    co_return result ? kwaque::errc::success : result.error().code();
+}
+} // namespace
+
+SEASTAR_TEST_CASE(fake_rename_policy_is_bound_to_replay) {
+    const auto scheduling = make_scheduler_limits();
+    const auto limits = make_trace_limits();
+    const auto header = make_header(scheduling, limits);
+    event_trace capture{header, limits};
+    const auto captured = co_await rename_policy_scenario(
+      capture, scheduling, kwaque::runtime::file_rename_policy::no_replace);
+    BOOST_CHECK(captured == kwaque::errc::success);
+    auto wire = capture.encode();
+    BOOST_REQUIRE(wire.has_value());
+    for (auto policy :
+         {kwaque::runtime::file_rename_policy::no_replace,
+          kwaque::runtime::file_rename_policy::replace}) {
+        auto decoded = event_trace::decode(*wire, limits);
+        BOOST_REQUIRE(decoded.has_value());
+        auto replay = event_trace::replay(header, limits, std::move(*decoded));
+        BOOST_REQUIRE(replay.has_value());
+        auto result = co_await rename_policy_scenario(
+          **replay, scheduling, policy);
+        BOOST_CHECK(
+          result
+          == (policy == kwaque::runtime::file_rename_policy::no_replace ? kwaque::errc::success : kwaque::errc::replay_divergence));
+        if (policy == kwaque::runtime::file_rename_policy::no_replace)
+            BOOST_CHECK((*replay)->finish_replay().has_value());
+    }
 }

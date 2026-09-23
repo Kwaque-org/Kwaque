@@ -1,5 +1,6 @@
 #include "src/bytes/fragmented_buffer.h"
 #include "src/runtime/file.h"
+#include "src/runtime/testing/contracts/file_system_contract.h"
 #include "src/simulation/event_trace.h"
 #include "src/simulation/fake_file.h"
 #include "src/simulation/fake_file_test_support.h"
@@ -30,6 +31,15 @@
 #include <vector>
 
 namespace {
+
+struct fake_file_driver {
+    kwaque::simulation::scheduler* events;
+    template<typename T>
+    seastar::future<T> operator()(seastar::future<T> operation) const {
+        co_await kwaque::simulation::testing::pump_until(*events, operation);
+        co_return co_await std::move(operation);
+    }
+};
 
 using kwaque::runtime::builtin_fault_point;
 using kwaque::runtime::fault_decision;
@@ -2619,4 +2629,467 @@ SEASTAR_TEST_CASE(fake_partial_resize_apply_uses_only_prepared_storage) {
     auto stopping = environment.files->stop();
     co_await pump_until(environment.events, stopping);
     co_await require_ready_success(stopping);
+}
+
+SEASTAR_TEST_CASE(fake_space_samples_are_scheduled_owned_and_independent) {
+    fake_file_system_config config;
+    config.space_override = kwaque::runtime::file_system_space::make(
+                              kwaque::byte_count{1048576},
+                              kwaque::byte_count{4096},
+                              kwaque::byte_count{0},
+                              true)
+                              .value();
+    config.memory_dma_alignment = 512;
+    config.disk_read_dma_alignment = 1024;
+    config.disk_write_dma_alignment = 4096;
+    config.disk_overwrite_dma_alignment = 8192;
+    fixture environment{{}, config};
+    auto sampling = environment.files->space(path("/kwaque"));
+    BOOST_CHECK(!sampling.available());
+    co_await pump_until(environment.events, sampling);
+    const auto sample = co_await std::move(sampling);
+    BOOST_REQUIRE(sample.has_value());
+    BOOST_CHECK(*sample == *config.space_override);
+    BOOST_CHECK_EQUAL(environment.files->retained_capacity().value(), 0U);
+    auto opening = environment.files->open(
+      path("/kwaque/data"),
+      {.access = kwaque::runtime::file_access::read_write, .create = true});
+    co_await pump_until(environment.events, opening);
+    auto opened = co_await std::move(opening);
+    BOOST_REQUIRE(opened.has_value());
+    const auto geometry = opened->geometry();
+    auto closing = opened->close();
+    co_await pump_until(environment.events, closing);
+    co_await require_ready_success(closing);
+    BOOST_REQUIRE(geometry.has_value());
+    BOOST_CHECK_EQUAL(geometry->memory_alignment().value(), 512U);
+    BOOST_CHECK_EQUAL(geometry->read_alignment().value(), 1024U);
+    BOOST_CHECK_EQUAL(geometry->overwrite_alignment().value(), 8192U);
+    auto missing = environment.files->space(path("/kwaque/missing"));
+    co_await pump_until(environment.events, missing);
+    const auto absent = co_await std::move(missing);
+    BOOST_REQUIRE(!absent);
+    BOOST_CHECK(absent.error().code() == kwaque::errc::not_found);
+    unsigned observations = 0;
+    for (const auto& entry : environment.trace.entries()) {
+        if (
+          entry.action
+          != kwaque::simulation::trace_action::filesystem_space_sampled)
+            continue;
+        ++observations;
+        if (observations == 1) {
+            BOOST_CHECK_EQUAL(entry.coordinate_a, 1048576U);
+            BOOST_CHECK_EQUAL(entry.coordinate_b, 4096U);
+            BOOST_CHECK_EQUAL(entry.value, 0U);
+            BOOST_CHECK_EQUAL(entry.result, 1U);
+        } else {
+            BOOST_CHECK_EQUAL(
+              entry.result,
+              0x100U | static_cast<unsigned>(kwaque::errc::not_found));
+        }
+    }
+    BOOST_CHECK_EQUAL(observations, 2U);
+    BOOST_CHECK_EQUAL(environment.files->pending_operations(), 0U);
+}
+
+SEASTAR_TEST_CASE(fake_space_default_tracks_capacity_without_mutating_files) {
+    fake_file_system_config config;
+    config.logical_capacity = kwaque::byte_count{8192};
+    fixture environment{{}, config};
+    auto opening = environment.files->open(
+      path("/kwaque/data"),
+      {.access = kwaque::runtime::file_access::read_write, .create = true});
+    co_await pump_until(environment.events, opening);
+    auto opened = co_await std::move(opening);
+    BOOST_REQUIRE(opened.has_value());
+    auto resizing = opened->truncate(4096);
+    co_await pump_until(environment.events, resizing);
+    const auto resized = co_await std::move(resizing);
+    auto sampling = environment.files->space(path("/kwaque/data"));
+    co_await pump_until(environment.events, sampling);
+    const auto sample = co_await std::move(sampling);
+    auto closing = opened->close();
+    co_await pump_until(environment.events, closing);
+    co_await require_ready_success(closing);
+    BOOST_REQUIRE(resized.has_value());
+    BOOST_REQUIRE(sample.has_value());
+    BOOST_CHECK_EQUAL(sample->capacity().value(), 8192U);
+    BOOST_CHECK_EQUAL(sample->free().value(), 4096U);
+    BOOST_CHECK_EQUAL(sample->available().value(), 4096U);
+    BOOST_CHECK(!sample->read_only());
+}
+
+SEASTAR_TEST_CASE(
+  fake_space_errors_and_lost_completion_keep_pending_ownership) {
+    for (const auto error :
+         {kwaque::errc::permission_denied,
+          kwaque::errc::unavailable,
+          kwaque::errc::io_failure,
+          kwaque::errc::resource_exhausted}) {
+        fake_file_system_config config;
+        config.space_error = error;
+        fixture environment{{}, config};
+        auto sampling = environment.files->space(path("/kwaque"));
+        co_await pump_until(environment.events, sampling);
+        const auto sample = co_await std::move(sampling);
+        BOOST_REQUIRE(!sample);
+        BOOST_CHECK(sample.error().code() == error);
+    }
+    seastar::chunked_vector<fault_rule> rules;
+    rules.push_back(rule(
+      301,
+      builtin_fault_point::filesystem_space,
+      1,
+      1,
+      fault_decision::make_drop_completion()));
+    fixture environment{std::move(rules)};
+    auto sampling = environment.files->space(path("/kwaque"));
+    BOOST_REQUIRE(environment.events.advance_to_next().has_value());
+    const auto ran = environment.events.run_ready();
+    BOOST_REQUIRE(ran.has_value());
+    BOOST_CHECK(!sampling.available());
+    BOOST_CHECK_EQUAL(environment.files->pending_operations(), 1U);
+    auto stopping = environment.files->stop();
+    co_await pump_until(environment.events, stopping);
+    co_await require_ready_success(stopping);
+    const auto stopped = co_await std::move(sampling);
+    BOOST_REQUIRE(!stopped);
+    BOOST_CHECK_EQUAL(environment.files->pending_operations(), 0U);
+}
+
+SEASTAR_TEST_CASE(
+  fake_space_rejects_saturation_and_trace_exhaustion_before_submission) {
+    fake_file_system_config config;
+    config.maximum_pending_operations = 1;
+    fixture environment{{}, config};
+    auto first = environment.files->space(path("/kwaque"));
+    const auto before = fake_file_test_access::snapshot(*environment.files);
+    auto second = environment.files->space(path("/kwaque"));
+    const auto rejected = co_await std::move(second);
+    const auto after = fake_file_test_access::snapshot(*environment.files);
+    co_await pump_until(environment.events, first);
+    co_await require_ready_success(first);
+    BOOST_REQUIRE(!rejected);
+    BOOST_CHECK(rejected.error().code() == kwaque::errc::queue_full);
+    BOOST_REQUIRE(before.has_value());
+    BOOST_REQUIRE(after.has_value());
+    BOOST_CHECK(*before == *after);
+
+    const auto tiny
+      = trace_limits::make(
+          trace_limit_values{
+            .entries = 1,
+            .encoded_bytes = kwaque::simulation::canonical_header_encoded_size
+                             + kwaque::simulation::canonical_entry_encoded_size,
+            .line_bytes = 1024})
+          .value();
+    fixture constrained{{}, {}, make_scheduler_limits(), tiny};
+    const auto pristine = fake_file_test_access::snapshot(*constrained.files);
+    auto no_trace = constrained.files->space(path("/kwaque"));
+    const auto failed = co_await std::move(no_trace);
+    BOOST_REQUIRE(!failed);
+    BOOST_CHECK(failed.error().code() == kwaque::errc::resource_exhausted);
+    BOOST_REQUIRE(pristine.has_value());
+    const auto unchanged = fake_file_test_access::snapshot(*constrained.files);
+    BOOST_REQUIRE(unchanged.has_value());
+    BOOST_CHECK(*pristine == *unchanged);
+    BOOST_CHECK_EQUAL(constrained.files->pending_operations(), 0U);
+}
+
+SEASTAR_TEST_CASE(fake_file_system_runs_shared_capability_contract) {
+    fixture test;
+    co_await kwaque::runtime::testing::run_file_system_contract(
+      *test.files,
+      path("/kwaque/capabilities"),
+      fake_file_driver{&test.events});
+    const auto snapshot = fake_file_test_access::snapshot(*test.files);
+    BOOST_REQUIRE(snapshot.has_value());
+    BOOST_CHECK_EQUAL(snapshot->open_handles, 0U);
+    BOOST_CHECK_EQUAL(snapshot->pending_operations, 0U);
+}
+
+namespace {
+
+template<typename Body>
+seastar::future<> with_fake_directory(fixture& test, Body body) {
+    fake_file_driver drive{&test.events};
+    auto opened = co_await drive(test.files->open_directory(path("/kwaque")));
+    BOOST_REQUIRE(opened.has_value());
+    std::exception_ptr failure;
+    try {
+        co_await body(*opened);
+    } catch (...) {
+        failure = std::current_exception();
+    }
+    try {
+        static_cast<void>(co_await drive(opened->close()));
+    } catch (...) {
+        if (!failure) failure = std::current_exception();
+    }
+    if (failure) std::rethrow_exception(failure);
+    BOOST_CHECK_EQUAL(fake_file_test_access::open_handles(*test.files), 0U);
+}
+
+void add_cursor_file(fixture& test, std::string_view name) {
+    auto canonical = fake_file_test_access::resolve(
+      *test.files, std::string{"/kwaque/"} + std::string{name});
+    BOOST_REQUIRE(canonical.has_value());
+    BOOST_REQUIRE(
+      fake_file_test_access::create_file(*test.files, *canonical).has_value());
+}
+
+} // namespace
+
+SEASTAR_TEST_CASE(fake_directory_close_joins_pending_next_after_move) {
+    seastar::chunked_vector<fault_rule> rules;
+    rules.push_back(rule(
+      1,
+      builtin_fault_point::directory_cursor_next,
+      1,
+      1,
+      fault_decision::make_delay(kwaque::runtime::monotonic_duration{50})));
+    fixture test{std::move(rules)};
+    add_cursor_file(test, "owned");
+    co_await with_fake_directory(test, [&](auto& cursor) -> seastar::future<> {
+        auto pending = cursor.next({});
+        const bool was_pending = !pending.available();
+        auto second = co_await cursor.next({});
+        auto moved = std::move(cursor);
+        auto closing = moved.close();
+        const bool joined = !closing.available();
+        auto repeated = co_await moved.close();
+        auto late = co_await moved.next({});
+        fake_file_driver drive{&test.events};
+        auto closed = co_await drive(std::move(closing));
+        auto page = co_await std::move(pending);
+        BOOST_REQUIRE(closed.has_value());
+        BOOST_CHECK(was_pending && joined);
+        BOOST_REQUIRE(!second.has_value());
+        BOOST_CHECK(second.error().code() == kwaque::errc::queue_full);
+        BOOST_REQUIRE(!repeated.has_value());
+        BOOST_CHECK(repeated.error().code() == kwaque::errc::queue_full);
+        BOOST_REQUIRE(!late.has_value());
+        BOOST_CHECK(late.error().code() == kwaque::errc::closed);
+        BOOST_REQUIRE(page.has_value());
+        BOOST_REQUIRE_EQUAL(page->entries().size(), 1U);
+        BOOST_CHECK_EQUAL(page->entries().front().name.value(), "owned");
+    });
+}
+
+SEASTAR_TEST_CASE(
+  fake_directory_returned_page_retains_pool_admission_after_close) {
+    fixture test{{}, fake_file_system_config{.maximum_open_handles = 1}};
+    fake_file_driver drive{&test.events};
+    auto opened = co_await drive(test.files->open_directory(path("/kwaque")));
+    BOOST_REQUIRE(opened.has_value());
+    std::optional<kwaque::runtime::directory_page> retained;
+    {
+        auto page = co_await drive(opened->next({}));
+        BOOST_REQUIRE(page.has_value());
+        retained.emplace(std::move(*page));
+    }
+    auto closed = co_await drive(opened->close());
+    BOOST_REQUIRE(closed.has_value());
+    auto pressure = co_await drive(test.files->open_directory(path("/kwaque")));
+    BOOST_REQUIRE(!pressure.has_value());
+    BOOST_CHECK(pressure.error().code() == kwaque::errc::queue_full);
+    retained.reset();
+    auto reopened = co_await drive(test.files->open_directory(path("/kwaque")));
+    BOOST_REQUIRE(reopened.has_value());
+    BOOST_REQUIRE((co_await drive(reopened->close())).has_value());
+}
+
+SEASTAR_TEST_CASE(fake_directory_resumes_lexically_without_borrowed_iterators) {
+    fixture test;
+    add_cursor_file(test, "a");
+    add_cursor_file(test, "c");
+    co_await with_fake_directory(test, [&](auto& cursor) -> seastar::future<> {
+        fake_file_driver drive{&test.events};
+        {
+            auto page = co_await drive(
+              cursor.next({.maximum_entries = kwaque::item_count{1}}));
+            BOOST_REQUIRE(page.has_value());
+            BOOST_REQUIRE_EQUAL(page->entries().size(), 1U);
+            BOOST_CHECK_EQUAL(page->entries().front().name.value(), "a");
+            BOOST_CHECK(!page->end());
+        }
+        auto old = fake_file_test_access::resolve(*test.files, "/kwaque/a");
+        BOOST_REQUIRE(old.has_value());
+        BOOST_REQUIRE(
+          fake_file_test_access::remove_file(*test.files, *old).has_value());
+        add_cursor_file(test, "b");
+        auto page = co_await drive(cursor.next({}));
+        BOOST_REQUIRE(page.has_value());
+        BOOST_REQUIRE_EQUAL(page->entries().size(), 2U);
+        BOOST_CHECK_EQUAL(page->entries()[0].name.value(), "b");
+        BOOST_CHECK_EQUAL(page->entries()[1].name.value(), "c");
+        BOOST_CHECK(page->end());
+    });
+}
+
+SEASTAR_TEST_CASE(
+  fake_directory_crash_invalidates_cursor_and_keeps_page_owned) {
+    fixture test;
+    add_cursor_file(test, "owned");
+    co_await with_fake_directory(test, [&](auto& cursor) -> seastar::future<> {
+        fake_file_driver drive{&test.events};
+        auto page = co_await drive(cursor.next({}));
+        BOOST_REQUIRE(page.has_value());
+        BOOST_REQUIRE((co_await drive(test.files->crash())).has_value());
+        auto stale = co_await cursor.next({});
+        BOOST_REQUIRE(!stale.has_value());
+        BOOST_CHECK(stale.error().code() == kwaque::errc::aborted);
+        BOOST_REQUIRE((co_await drive(cursor.close())).has_value());
+        BOOST_REQUIRE_EQUAL(page->entries().size(), 1U);
+        BOOST_CHECK_EQUAL(page->entries().front().name.value(), "owned");
+    });
+}
+
+SEASTAR_TEST_CASE(fake_directory_lost_next_completion_stays_owned_until_stop) {
+    seastar::chunked_vector<fault_rule> rules;
+    rules.push_back(rule(
+      1,
+      builtin_fault_point::directory_cursor_next,
+      1,
+      1,
+      fault_decision::make_drop_completion()));
+    fixture test{std::move(rules)};
+    co_await with_fake_directory(test, [&](auto& cursor) -> seastar::future<> {
+        auto pending = cursor.next({});
+        BOOST_REQUIRE(test.events.advance_to_next().has_value());
+        BOOST_REQUIRE(test.events.run_ready().has_value());
+        co_await seastar::yield();
+        const bool retained = !pending.available()
+                              && test.files->pending_operations() == 1;
+        auto closing = cursor.close();
+        const bool joined = !closing.available();
+        fake_file_driver drive{&test.events};
+        auto stopped = co_await drive(test.files->stop());
+        auto outcome = co_await std::move(pending);
+        auto closed = co_await drive(std::move(closing));
+        BOOST_REQUIRE(stopped.has_value());
+        BOOST_CHECK(retained && joined);
+        BOOST_CHECK(!outcome.has_value());
+        BOOST_CHECK(!closed.has_value());
+        BOOST_CHECK_EQUAL(test.files->pending_operations(), 0U);
+    });
+}
+
+SEASTAR_TEST_CASE(fake_directory_open_and_next_faults_release_ownership) {
+    for (const auto point :
+         {builtin_fault_point::directory_cursor_open,
+          builtin_fault_point::directory_cursor_next,
+          builtin_fault_point::directory_cursor_close}) {
+        seastar::chunked_vector<fault_rule> rules;
+        rules.push_back(rule(1, point, 1, 1, fault_decision::make_error()));
+        fixture test{std::move(rules)};
+        fake_file_driver drive{&test.events};
+        auto opened = co_await drive(
+          test.files->open_directory(path("/kwaque")));
+        if (point == builtin_fault_point::directory_cursor_open) {
+            BOOST_REQUIRE(!opened.has_value());
+            BOOST_CHECK(opened.error().code() == kwaque::errc::fault_injected);
+        } else {
+            BOOST_REQUIRE(opened.has_value());
+            auto page = co_await drive(opened->next({}));
+            auto closed = co_await drive(opened->close());
+            BOOST_REQUIRE(!closed.has_value());
+            BOOST_CHECK(closed.error().code() == kwaque::errc::fault_injected);
+            BOOST_CHECK(
+              page.has_value()
+              == (point != builtin_fault_point::directory_cursor_next));
+        }
+        BOOST_CHECK_EQUAL(fake_file_test_access::open_handles(*test.files), 0U);
+        BOOST_CHECK_EQUAL(test.files->pending_operations(), 0U);
+    }
+}
+
+SEASTAR_TEST_CASE(fake_directory_bounds_tombstone_work_without_false_eof) {
+    fixture test;
+    for (std::size_t index = 0; index < 1025; ++index)
+        add_cursor_file(test, std::to_string(index));
+    auto root = fake_file_test_access::resolve(*test.files, "/kwaque");
+    BOOST_REQUIRE(root.has_value());
+    BOOST_REQUIRE(
+      fake_file_test_access::sync_directory(*test.files, *root).has_value());
+    for (std::size_t index = 0; index < 1025; ++index) {
+        auto name = fake_file_test_access::resolve(
+          *test.files, "/kwaque/" + std::to_string(index));
+        BOOST_REQUIRE(name.has_value());
+        BOOST_REQUIRE(
+          fake_file_test_access::remove_file(*test.files, *name).has_value());
+    }
+    co_await with_fake_directory(test, [&](auto& cursor) -> seastar::future<> {
+        fake_file_driver drive{&test.events};
+        {
+            auto page = co_await drive(cursor.next({}));
+            BOOST_REQUIRE(page.has_value());
+            BOOST_CHECK(page->entries().empty());
+            BOOST_CHECK(!page->end());
+        }
+        auto page = co_await drive(cursor.next({}));
+        BOOST_REQUIRE(page.has_value());
+        BOOST_CHECK(page->entries().empty());
+        BOOST_CHECK(page->end());
+    });
+}
+
+SEASTAR_TEST_CASE(
+  fake_directory_rejects_pressure_and_trace_exhaustion_before_open) {
+    fixture test{{}, fake_file_system_config{.maximum_pending_operations = 1}};
+    auto first = test.files->open_directory(path("/kwaque"));
+    const auto before = fake_file_test_access::snapshot(*test.files);
+    auto second = co_await test.files->open_directory(path("/kwaque"));
+    const auto after = fake_file_test_access::snapshot(*test.files);
+    fake_file_driver drive{&test.events};
+    auto opened = co_await drive(std::move(first));
+    BOOST_REQUIRE(opened.has_value());
+    BOOST_REQUIRE((co_await drive(opened->close())).has_value());
+    BOOST_REQUIRE(!second.has_value());
+    BOOST_CHECK(second.error().code() == kwaque::errc::queue_full);
+    BOOST_REQUIRE(before.has_value());
+    BOOST_REQUIRE(after.has_value());
+    BOOST_CHECK(*before == *after);
+
+    const auto tiny = trace_limits::make(
+      {.entries = 1,
+       .encoded_bytes = kwaque::simulation::canonical_header_encoded_size
+                        + kwaque::simulation::canonical_entry_encoded_size,
+       .line_bytes = 1024});
+    BOOST_REQUIRE(tiny.has_value());
+    fixture constrained{{}, {}, make_scheduler_limits(), *tiny};
+    const auto pristine = fake_file_test_access::snapshot(*constrained.files);
+    auto rejected = co_await constrained.files->open_directory(path("/kwaque"));
+    const auto unchanged = fake_file_test_access::snapshot(*constrained.files);
+    BOOST_REQUIRE(!rejected.has_value());
+    BOOST_CHECK(rejected.error().code() == kwaque::errc::resource_exhausted);
+    BOOST_REQUIRE(pristine.has_value());
+    BOOST_REQUIRE(unchanged.has_value());
+    BOOST_CHECK(*pristine == *unchanged);
+}
+
+SEASTAR_TEST_CASE(
+  fake_directory_lost_open_completion_releases_unpublished_cursor_on_stop) {
+    seastar::chunked_vector<fault_rule> rules;
+    rules.push_back(rule(
+      1,
+      builtin_fault_point::directory_cursor_open,
+      1,
+      1,
+      fault_decision::make_drop_completion()));
+    fixture test{std::move(rules)};
+    auto opening = test.files->open_directory(path("/kwaque"));
+    BOOST_REQUIRE(test.events.advance_to_next().has_value());
+    BOOST_REQUIRE(test.events.run_ready().has_value());
+    co_await seastar::yield();
+    const bool retained = !opening.available()
+                          && fake_file_test_access::open_handles(*test.files)
+                               == 1;
+    fake_file_driver drive{&test.events};
+    BOOST_REQUIRE((co_await drive(test.files->stop())).has_value());
+    const auto outcome = co_await std::move(opening);
+    BOOST_CHECK(retained);
+    BOOST_CHECK(!outcome.has_value());
+    BOOST_CHECK_EQUAL(fake_file_test_access::open_handles(*test.files), 0U);
+    BOOST_CHECK_EQUAL(test.files->pending_operations(), 0U);
 }

@@ -10,6 +10,7 @@
 #include "src/codec/integer.h"
 #include "src/codec/limits.h"
 #include "src/codec/tests/envelope_bench_fixture.h"
+#include "src/codec/tests/qualification_profile.h"
 #include "src/codec/transaction.h"
 
 #include <seastar/core/abort_source.hh>
@@ -44,7 +45,7 @@ constexpr envelope_expected_body expected{object_id, object_generation};
 constexpr field_context coordinates{.origin = 512, .family = 1, .field = 3};
 constexpr envelope_extent_limits extent_limits{
   byte_count{16U * 1024U * 1024U}, byte_count{32U * 1024U * 1024U}};
-constexpr byte_count frame_reservation{1024U * 1024U};
+constexpr byte_count frame_reservation = testing::execution_reservation;
 constexpr byte_count parent_remainder{
   64U * 1024U * 1024U - frame_reservation.value()};
 

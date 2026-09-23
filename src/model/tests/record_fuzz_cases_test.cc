@@ -29,9 +29,11 @@ TEST(RecordFuzzCasesTest, BatchHeaderFamilyAndVersionPrecedence) {
                header_case{0, 1, 0, errc::unsupported_format},
                header_case{0, 0, 0, errc::unsupported_format},
                header_case{0, 0, 1, errc::malformed_data},
-               header_case{11, 1, 1, errc::unsupported_format},
+               header_case{11, 1, 1, errc::wrong_context},
+               header_case{12, 1, 1, errc::unsupported_format},
                header_case{65535, 1, 1, errc::unsupported_format},
-               header_case{11, 1, 2, errc::malformed_data}}) {
+               header_case{11, 1, 2, errc::malformed_data},
+               header_case{12, 1, 2, errc::malformed_data}}) {
             SCOPED_TRACE(
               ::testing::Message() << assigned << ':' << test.family << ':'
                                    << test.writer << ':' << test.reader);

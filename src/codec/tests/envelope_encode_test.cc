@@ -179,7 +179,7 @@ TEST(EnvelopeEncodeTest, BodyChecksumIsFinalBeforeHeaderChecksum) {
 }
 
 TEST(EnvelopeEncodeTest, EveryRegisteredFamilyUsesOnlyTheCurrentWriterProfile) {
-    for (std::uint16_t raw = 1; raw <= 10; ++raw) {
+    for (std::uint16_t raw = 1; raw <= 11; ++raw) {
         seastar::abort_source abort;
         codec::cooperative_work work{codec::limits::defaults(), abort};
         const auto encoded = encode(
@@ -271,7 +271,7 @@ TEST(EnvelopeEncodeTest, NarrowPolicyCannotBeWidenedByOwnerBounds) {
 TEST(EnvelopeEncodeTest, InvalidFamilyChargeAndOriginConsumeTheDonor) {
     for (const auto raw :
          {std::uint16_t{0},
-          std::uint16_t{11},
+          std::uint16_t{12},
           std::numeric_limits<std::uint16_t>::max()}) {
         seastar::abort_source abort;
         codec::cooperative_work work{codec::limits::defaults(), abort};
