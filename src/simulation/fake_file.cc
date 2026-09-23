@@ -1,16 +1,26 @@
 #include "src/simulation/fake_file.h"
 
 #include "src/base/invariant.h"
+#include "src/runtime/directory_cursor_internal.h"
+#include "src/runtime/file_error_internal.h"
+#include "src/simulation/storage_fault_key.h"
+
+#include <seastar/core/coroutine.hh>
+#include <seastar/core/task.hh>
+#include <seastar/util/defer.hh>
 
 #include <sys/stat.h>
 #include <sys/uio.h>
 
 #include <algorithm>
 #include <bit>
+#include <coroutine>
 #include <cstring>
 #include <exception>
 #include <functional>
 #include <limits>
+#include <ranges>
+#include <set>
 #include <stdexcept>
 #include <system_error>
 
@@ -30,38 +40,57 @@ constexpr invariant_id fake_storage_drained_invariant{
     return runtime::operation_error{code, runtime::operation_kind::file};
 }
 
-[[nodiscard]] std::error_code native_error(errc code) noexcept {
-    switch (code) {
-    case errc::not_found:
-        return std::make_error_code(std::errc::no_such_file_or_directory);
-    case errc::already_exists:
-        return std::make_error_code(std::errc::file_exists);
-    case errc::permission_denied:
-        return std::make_error_code(std::errc::permission_denied);
-    case errc::directory_not_empty:
-        return std::make_error_code(std::errc::directory_not_empty);
-    case errc::is_a_directory:
-        return std::make_error_code(std::errc::is_a_directory);
-    case errc::not_a_directory:
-        return std::make_error_code(std::errc::not_a_directory);
-    case errc::aborted:
-        return std::make_error_code(std::errc::operation_canceled);
-    case errc::resource_exhausted:
-    case errc::queue_full:
-        return std::make_error_code(std::errc::no_space_on_device);
-    case errc::out_of_range:
-        return std::make_error_code(std::errc::file_too_large);
-    case errc::invalid_argument:
-        return std::make_error_code(std::errc::invalid_argument);
-    default:
-        return std::make_error_code(std::errc::io_error);
-    }
-}
-
 template<typename T>
 T native_value(runtime::result<T> result) {
     if (!result) {
-        throw std::system_error(native_error(result.error().code()));
+        const auto& original = result.error();
+        // Preserve the existing raw cancellation contract for native probes.
+        if (original.code() == errc::aborted && original.context_size() == 0)
+            throw std::system_error(
+              std::make_error_code(std::errc::operation_canceled));
+        if (
+          original.operation() == runtime::operation_kind::file
+          && original.code() != errc::queue_full) {
+            for (std::size_t index = 0; index < original.context_size();
+                 ++index)
+                if (
+                  original.context_at(index)->key
+                  == runtime::operation_context_key::detail)
+                    throw runtime::detail::file_operation_exception{original};
+        }
+        // Retain legacy broad results without inventing a device errno.
+        auto code = original.code();
+        switch (code) {
+        case errc::not_found:
+        case errc::already_exists:
+        case errc::permission_denied:
+        case errc::directory_not_empty:
+        case errc::aborted:
+        case errc::resource_exhausted:
+        case errc::out_of_range:
+        case errc::invalid_argument:
+        case errc::is_a_directory:
+        case errc::not_a_directory:
+            break;
+        case errc::queue_full:
+            code = errc::resource_exhausted;
+            break;
+        default:
+            code = errc::io_failure;
+            break;
+        }
+        runtime::operation_error transported{
+          code, runtime::operation_kind::file};
+        for (std::size_t index = 0; index < original.context_size(); ++index) {
+            const auto field = *original.context_at(index);
+            // A foreign domain's detail is not a file-failure cause.
+            if (
+              original.operation() != runtime::operation_kind::file
+              && field.key == runtime::operation_context_key::detail)
+                continue;
+            static_cast<void>(transported.add_context(field.key, field.value));
+        }
+        throw runtime::detail::file_operation_exception{std::move(transported)};
     }
     return std::move(*result);
 }
@@ -79,6 +108,512 @@ T native_value(runtime::result<T> result) {
 }
 
 } // namespace
+
+struct fake_file_system::crash_state final {
+    struct page_change final {
+        fake_object_id object;
+        std::uint64_t index;
+        page_pointer replacement;
+        bool inserted{false};
+    };
+    struct file_change final {
+        fake_object_id object;
+        std::uint64_t size;
+    };
+    struct name_change final {
+        fake_object_id parent;
+        std::string name;
+        std::optional<fake_object_id> before;
+        std::optional<fake_object_id> visible;
+        std::optional<fake_object_id> chosen;
+        bool inserted{false};
+    };
+    explicit crash_state(fake_operation_id operation, std::uint64_t next_epoch)
+      : active(operation)
+      , epoch(next_epoch) {}
+    fake_operation_id active;
+    std::uint64_t epoch;
+    std::uint64_t step{0}, work{0}, scratch{0};
+    bool committed{false};
+    scheduler::event_id_reservation work_ids;
+    scheduler::event_slot_reservation work_slot;
+    event_trace::reservation work_trace, selection_trace, applied_trace;
+    std::optional<runtime::operation_error> failure;
+    std::exception_ptr exception;
+    seastar::chunked_vector<page_change> pages;
+    seastar::chunked_vector<file_change> files;
+    seastar::chunked_vector<name_change> names;
+    std::
+      map<std::pair<std::uint64_t, std::string>, std::optional<fake_object_id>>
+        overrides;
+    std::set<std::uint64_t> required;
+    std::set<std::uint64_t> empty_dependencies;
+    std::set<std::pair<std::uint64_t, std::string>> required_names;
+    void charge(std::uint64_t bytes, std::uint64_t maximum) {
+        if (bytes > maximum - scratch)
+            throw runtime::detail::file_operation_exception{
+              file_error(errc::resource_exhausted)};
+        scratch += bytes;
+    }
+};
+
+// A bounded CPU continuation remains owned by the crash future. Normal work
+// resumes inside a deterministic scheduler callback. After a sticky trace
+// failure only cleanup runs, yielding through the native reactor task queue.
+struct fake_file_system::crash_pause final {
+    fake_file_system& owner;
+    bool await_ready() const noexcept { return false; }
+    template<typename Promise>
+    void await_suspend(std::coroutine_handle<Promise> handle) {
+        auto& state = *owner.crash_;
+        if (
+          owner.scheduler_->trace_failed() || state.exception
+          || state.failure) {
+            seastar::schedule(&handle.promise());
+            return;
+        }
+        if (
+          owner.scheduler_->limits().total_events()
+            - owner.scheduler_->executed_events()
+          <= static_cast<std::uint64_t>(
+               owner.scheduler_->limits().pending_events())
+               + 1U) {
+            state.failure = file_error(errc::resource_exhausted);
+            seastar::schedule(&handle.promise());
+            return;
+        }
+        bool published = false;
+        try {
+            auto id = state.work_ids.split(1);
+            auto trace = state.work_trace.split(2);
+            if (!id || !trace) {
+                state.failure = !id ? id.error() : trace.error();
+                seastar::schedule(&handle.promise());
+                return;
+            }
+            id->release();
+            state.work_slot.release();
+            auto scheduled = owner.scheduler_->schedule(
+              owner.scheduler_->now(),
+              event_priority::highest(),
+              [handle] noexcept {
+                  if (
+                    handle.promise().group()
+                    == seastar::current_scheduling_group())
+                      handle.resume();
+                  else
+                      seastar::schedule(&handle.promise());
+              },
+              {.kind = trace_event_kind::filesystem,
+               .stable_id = state.active.value(),
+               .coordinate_a = state.epoch,
+               .coordinate_b = ++state.step},
+              event_cleanup_policy::invoke,
+              std::move(*trace));
+            if (!scheduled) {
+                state.failure = scheduled.error();
+                seastar::schedule(&handle.promise());
+                return;
+            }
+            published = true;
+            auto slot = owner.scheduler_->reserve_event_slot();
+            if (!slot)
+                state.failure = slot.error();
+            else
+                state.work_slot = std::move(*slot);
+        } catch (...) {
+            state.exception = std::current_exception();
+            if (!published) seastar::schedule(&handle.promise());
+        }
+    }
+    void await_resume() const noexcept {}
+};
+
+struct fake_directory_cursor::state final : runtime::shard_affine {
+    state(
+      fake_file_system& source,
+      seastar::lw_shared_ptr<runtime::detail::directory_cursor_memory> budget)
+      : owner(&source)
+      , memory(std::move(budget))
+      , handle(seastar::make_lw_shared<fake_file_system::open_handle_state>()) {
+        handle->generation = source.generation_;
+    }
+    ~state() {
+        assert_current();
+        KWAQUE_INVARIANT(
+          invariant_id{"KQ-FAKE-DIRECTORY-CLOSED"},
+          !opened && !busy && !closing,
+          "directory cursor destroyed before joined close");
+    }
+    void release() {
+        if (object) owner->release_handle_reference(*object, handle);
+        opened = false;
+        lookahead.reset();
+        memory = {};
+    }
+
+    seastar::future<runtime::result<runtime::directory_page>> read_page(
+      runtime::directory_page_limits limits,
+      seastar::semaphore_units<> reservation,
+      seastar::gate::holder holder) {
+        busy = true;
+        auto idle = seastar::defer([this] noexcept { busy = false; });
+        static_cast<void>(holder);
+        try {
+            auto outcome = co_await owner->submit_cursor(
+              *this,
+              fake_file_system::pending_kind::cursor_next,
+              runtime::builtin_fault_point::directory_cursor_next,
+              limits,
+              std::move(reservation));
+            if (!outcome) {
+                const auto cause = runtime::file_detail(outcome.error());
+                const bool page_limit
+                  = outcome.error().code() == errc::resource_exhausted && cause
+                    && *cause == runtime::file_failure_detail::unknown;
+                const bool admission
+                  = outcome.error().code() == errc::queue_full && cause
+                    && (*cause == runtime::file_failure_detail::unknown || *cause == runtime::file_failure_detail::admission_not_dispatched);
+                if (!page_limit && !admission) failed = outcome.error();
+                co_return runtime::failure(outcome.error());
+            }
+            co_return std::get<runtime::directory_page>(std::move(*outcome));
+        } catch (...) {
+            exception = std::current_exception();
+            throw;
+        }
+    }
+
+    seastar::future<runtime::result<void>>
+    sync_directory(seastar::gate::holder holder) {
+        busy = true;
+        auto idle = seastar::defer([this] noexcept { busy = false; });
+        static_cast<void>(holder);
+        try {
+            auto outcome = co_await owner->submit_cursor(
+              *this,
+              fake_file_system::pending_kind::cursor_sync,
+              runtime::builtin_fault_point::directory_sync);
+            if (!outcome) {
+                auto detail = runtime::file_detail(outcome.error());
+                const bool admission
+                  = outcome.error().code() == errc::queue_full && detail
+                    && (*detail == runtime::file_failure_detail::unknown || *detail == runtime::file_failure_detail::admission_not_dispatched);
+                if (!admission) failed = outcome.error();
+                co_return runtime::failure(outcome.error());
+            }
+            co_return runtime::result<void>{};
+        } catch (...) {
+            exception = std::current_exception();
+            throw;
+        }
+    }
+
+    seastar::future<runtime::result<void>> drain() {
+        closing = true;
+        co_await operations.close();
+        try {
+            if (
+              handle->generation == owner->generation_
+              && owner->state_ == fake_file_system_state::open) {
+                auto outcome = co_await owner->submit_cursor(
+                  *this,
+                  fake_file_system::pending_kind::cursor_close,
+                  runtime::builtin_fault_point::directory_cursor_close);
+                if (!outcome && !failed && !exception) failed = outcome.error();
+            }
+        } catch (...) {
+            if (!exception && !failed) exception = std::current_exception();
+        }
+        release();
+        closing = false;
+        if (exception) std::rethrow_exception(exception);
+        if (failed) co_return runtime::failure(*failed);
+        co_return runtime::result<void>{};
+    }
+
+    fake_file_system* owner;
+    seastar::lw_shared_ptr<runtime::detail::directory_cursor_memory> memory;
+    seastar::lw_shared_ptr<fake_file_system::open_handle_state> handle;
+    std::optional<fake_object_id> object;
+    std::string resume;
+    std::optional<runtime::directory_entry> lookahead;
+    seastar::gate operations;
+    std::optional<runtime::operation_error> failed;
+    std::exception_ptr exception;
+    bool opened{false}, busy{false}, closing{false}, end{false};
+};
+
+fake_directory_cursor::fake_directory_cursor(
+  std::unique_ptr<state> value) noexcept
+  : state_(std::move(value)) {}
+fake_directory_cursor::fake_directory_cursor(
+  fake_directory_cursor&& other) noexcept {
+    if (other.state_) other.state_->assert_current();
+    state_ = std::move(other.state_);
+}
+fake_directory_cursor&
+fake_directory_cursor::operator=(fake_directory_cursor&& other) noexcept {
+    if (state_) state_->assert_current();
+    if (other.state_) other.state_->assert_current();
+    if (this != &other) state_ = std::move(other.state_);
+    return *this;
+}
+fake_directory_cursor::~fake_directory_cursor() = default;
+
+seastar::future<runtime::result<runtime::directory_page>>
+fake_directory_cursor::next(runtime::directory_page_limits limits) {
+    if (!state_)
+        return seastar::make_ready_future<
+          runtime::result<runtime::directory_page>>(
+          runtime::failure(file_error(errc::closed)));
+    auto& state = *state_;
+    state.assert_current();
+    if (auto valid = limits.validate(); !valid)
+        return seastar::make_ready_future<
+          runtime::result<runtime::directory_page>>(
+          runtime::failure(valid.error()));
+    if (!state.opened || state.closing)
+        return seastar::make_ready_future<
+          runtime::result<runtime::directory_page>>(
+          runtime::failure(file_error(errc::closed)));
+    if (state.exception)
+        return seastar::make_exception_future<
+          runtime::result<runtime::directory_page>>(state.exception);
+    if (state.failed)
+        return seastar::make_ready_future<
+          runtime::result<runtime::directory_page>>(
+          runtime::failure(*state.failed));
+    if (state.handle->generation != state.owner->generation_)
+        return seastar::make_ready_future<
+          runtime::result<runtime::directory_page>>(
+          runtime::failure(file_error(errc::aborted)));
+    auto reservation = seastar::try_get_units(state.memory->page, 1);
+    if (state.busy || !reservation)
+        return seastar::make_ready_future<
+          runtime::result<runtime::directory_page>>(runtime::failure(
+          runtime::make_file_error(
+            errc::queue_full,
+            runtime::file_failure_detail::admission_not_dispatched)));
+    return state.read_page(
+      limits, std::move(*reservation), state.operations.hold());
+}
+
+seastar::future<runtime::result<void>> fake_directory_cursor::sync() {
+    auto reject = [](runtime::operation_error error) {
+        return seastar::make_ready_future<runtime::result<void>>(
+          runtime::failure(std::move(error)));
+    };
+    if (!state_) return reject(file_error(errc::closed));
+    auto& state = *state_;
+    state.assert_current();
+    if (!state.opened || state.closing) return reject(file_error(errc::closed));
+    if (state.exception)
+        return seastar::make_exception_future<runtime::result<void>>(
+          state.exception);
+    if (state.failed) return reject(*state.failed);
+    if (state.handle->generation != state.owner->generation_)
+        return reject(file_error(errc::aborted));
+    if (state.busy)
+        return reject(
+          runtime::make_file_error(
+            errc::queue_full,
+            runtime::file_failure_detail::admission_not_dispatched));
+    return state.sync_directory(state.operations.hold());
+}
+
+seastar::future<runtime::result<void>> fake_directory_cursor::close() {
+    if (!state_)
+        return seastar::make_ready_future<runtime::result<void>>(
+          runtime::result<void>{});
+    auto& state = *state_;
+    state.assert_current();
+    if (state.closing)
+        return seastar::make_ready_future<runtime::result<void>>(
+          runtime::failure(
+            runtime::make_file_error(
+              errc::queue_full,
+              runtime::file_failure_detail::admission_not_dispatched)));
+    if (!state.opened) {
+        if (state.exception)
+            return seastar::make_exception_future<runtime::result<void>>(
+              state.exception);
+        return seastar::make_ready_future<runtime::result<void>>(
+          state.failed ? runtime::result<void>{runtime::failure(*state.failed)}
+                       : runtime::result<void>{});
+    }
+    return state.drain();
+}
+
+seastar::future<runtime::result<fake_directory_cursor>>
+fake_file_system::open_directory(
+  runtime::file_path path, runtime::file_close_policy policy) {
+    if (
+      policy != runtime::file_close_policy::legacy
+      && policy != runtime::file_close_policy::checked)
+        co_return runtime::failure(file_error(errc::invalid_argument));
+    assert_current();
+    auto canonical = resolve(path.value());
+    if (!canonical) co_return runtime::failure(canonical.error());
+    auto slot = seastar::try_get_units(*cursor_slots_, 1);
+    if (!slot)
+        co_return runtime::failure(
+          runtime::make_file_error(
+            errc::queue_full,
+            runtime::file_failure_detail::admission_not_dispatched));
+    auto memory
+      = seastar::make_lw_shared<runtime::detail::directory_cursor_memory>(
+        cursor_slots_, std::move(*slot));
+    auto cursor = std::make_unique<fake_directory_cursor::state>(
+      *this, std::move(memory));
+    prepared_operation operation{
+      fake_operation_id{next_operation_id_},
+      pending_kind::cursor_open,
+      runtime::builtin_fault_point::directory_cursor_open};
+    auto& metadata = operation.payload.emplace<metadata_operation>();
+    metadata.path = std::move(*canonical);
+    metadata.cursor = cursor.get();
+    operation.fault_b = static_cast<std::uint8_t>(policy);
+    operation.open_slot = true;
+    const auto existing = lookup(*metadata.path);
+    if (existing) operation.object = *existing;
+    try {
+        auto outcome = co_await submit(
+          std::move(operation),
+          existing ? runtime::fault_object_key::from_u64(existing->value())
+                   : runtime::fault_object_key::none(),
+          byte_count{},
+          {.kind = trace_event_kind::filesystem,
+           .stable_id = next_operation_id_});
+        if (!outcome) {
+            cursor->release();
+            co_return runtime::failure(outcome.error());
+        }
+    } catch (...) {
+        cursor->release();
+        throw;
+    }
+    co_return fake_directory_cursor{std::move(cursor)};
+}
+
+seastar::future<runtime::result<fake_file_system::pending_value>>
+fake_file_system::submit_cursor(
+  fake_directory_cursor::state& cursor,
+  pending_kind kind,
+  runtime::builtin_fault_point point,
+  runtime::directory_page_limits limits,
+  std::optional<seastar::semaphore_units<>> reservation) {
+    if (cursor.handle->generation != generation_)
+        return seastar::make_ready_future<runtime::result<pending_value>>(
+          runtime::failure(file_error(errc::aborted)));
+    prepared_operation operation{
+      fake_operation_id{next_operation_id_}, kind, point};
+    operation.object = cursor.object;
+    auto& metadata = operation.payload.emplace<metadata_operation>();
+    metadata.cursor = &cursor;
+    metadata.page_limits = limits;
+    metadata.page_reservation = std::move(reservation);
+    if (kind == pending_kind::cursor_sync) operation.fault_b = 1;
+    if (kind == pending_kind::cursor_next) {
+        operation.fault_a = limits.maximum_entries.value();
+        operation.fault_b = limits.maximum_name_bytes.value();
+    }
+    return submit(
+      std::move(operation),
+      runtime::fault_object_key::from_u64(cursor.object->value()),
+      byte_count{},
+      {.kind = trace_event_kind::filesystem, .stable_id = next_operation_id_});
+}
+
+runtime::result<runtime::directory_page> fake_file_system::read_cursor_page(
+  fake_directory_cursor::state& cursor,
+  runtime::directory_page_limits limits,
+  seastar::semaphore_units<> reservation) {
+    auto* selected = find_inode(*cursor.object);
+    const auto& directory = std::get<directory_state>(selected->state);
+    auto resume = cursor.resume;
+    auto lookahead = cursor.lookahead;
+    bool end = cursor.end;
+    const auto& start = lookahead ? lookahead->name.value() : resume;
+    auto durable = directory.durable.upper_bound(start);
+    auto changed = directory.unsynced.upper_bound(start);
+    seastar::chunked_vector<runtime::directory_entry> entries;
+    std::uint64_t name_bytes = 0;
+    // Bound tombstone work as well as emitted entries. An empty nonterminal
+    // page can advance past deletions without monopolizing the reactor.
+    for (std::size_t scanned = 0;
+         !end && scanned < 1024
+         && entries.size() < limits.maximum_entries.value();
+         ++scanned) {
+        if (!lookahead) {
+            if (
+              durable == directory.durable.end()
+              && changed == directory.unsynced.end()) {
+                end = true;
+                break;
+            }
+            const bool take_durable
+              = changed == directory.unsynced.end()
+                || (durable != directory.durable.end()
+                    && unsigned_name_less{}(durable->first, changed->first));
+            const bool take_changed
+              = durable == directory.durable.end()
+                || (changed != directory.unsynced.end()
+                    && unsigned_name_less{}(changed->first, durable->first));
+            std::string_view name;
+            std::optional<fake_object_id> id;
+            if (take_durable) {
+                name = durable->first;
+                id = durable->second;
+                ++durable;
+            } else if (take_changed) {
+                name = changed->first;
+                id = changed->second;
+                ++changed;
+            } else {
+                name = changed->first;
+                id = changed->second;
+                ++durable;
+                ++changed;
+            }
+            if (!id) {
+                resume = name;
+                continue;
+            }
+            auto checked = runtime::file_name::make(name);
+            if (!checked) return runtime::failure(checked.error());
+            lookahead.emplace(
+              runtime::directory_entry{
+                .name = std::move(*checked),
+                .kind = find_inode(*id)->kind == fake_file_kind::regular
+                          ? runtime::file_kind::regular
+                          : runtime::file_kind::directory});
+        }
+        const auto size = lookahead->name.value().size();
+        if (size > limits.maximum_name_bytes.value() - name_bytes) {
+            if (entries.empty()) {
+                cursor.lookahead = std::move(lookahead);
+                return runtime::failure(file_error(errc::resource_exhausted));
+            }
+            break;
+        }
+        resume = lookahead->name.value();
+        entries.push_back(std::move(*lookahead));
+        lookahead.reset();
+        name_bytes += size;
+    }
+    auto listing = runtime::directory_listing::make(
+      std::move(entries),
+      {.maximum_entries = limits.maximum_entries,
+       .maximum_name_bytes = limits.maximum_name_bytes});
+    if (!listing) return runtime::failure(listing.error());
+    runtime::directory_page page{
+      std::move(*listing), end, cursor.memory, std::move(reservation)};
+    cursor.resume = std::move(resume);
+    cursor.lookahead = std::move(lookahead);
+    cursor.end = end;
+    return page;
+}
 
 class fake_file_system::native_file_impl final : public seastar::file_impl {
 public:
@@ -126,11 +661,13 @@ public:
               length,
               _write_max_length)) {
             return seastar::make_exception_future<std::size_t>(
-              std::system_error(native_error(errc::invalid_argument)));
+              std::system_error(
+                std::make_error_code(std::errc::invalid_argument)));
         }
         if (access_ == runtime::file_access::read_only) {
             return seastar::make_exception_future<std::size_t>(
-              std::system_error(native_error(errc::permission_denied)));
+              std::system_error(
+                std::make_error_code(std::errc::permission_denied)));
         }
         return owner_
           ->submit_file_operation(
@@ -167,11 +704,13 @@ public:
         if (!valid_dma(
               pending_kind::read, position, buffer, length, _read_max_length)) {
             return seastar::make_exception_future<std::size_t>(
-              std::system_error(native_error(errc::invalid_argument)));
+              std::system_error(
+                std::make_error_code(std::errc::invalid_argument)));
         }
         if (access_ == runtime::file_access::write_only) {
             return seastar::make_exception_future<std::size_t>(
-              std::system_error(native_error(errc::permission_denied)));
+              std::system_error(
+                std::make_error_code(std::errc::permission_denied)));
         }
         return owner_
           ->submit_file_operation(
@@ -209,8 +748,8 @@ public:
         }
         if (access_ == runtime::file_access::write_only) {
             return seastar::make_exception_future<
-              seastar::temporary_buffer<std::uint8_t>>(
-              std::system_error(native_error(errc::permission_denied)));
+              seastar::temporary_buffer<std::uint8_t>>(std::system_error(
+              std::make_error_code(std::errc::permission_denied)));
         }
         return owner_
           ->submit_file_operation(
@@ -248,8 +787,8 @@ public:
         owner_->assert_current();
         handle_->assert_current();
         if (access_ == runtime::file_access::read_only) {
-            return seastar::make_exception_future<>(
-              std::system_error(native_error(errc::permission_denied)));
+            return seastar::make_exception_future<>(std::system_error(
+              std::make_error_code(std::errc::permission_denied)));
         }
         return void_operation(
           pending_kind::truncate,
@@ -291,7 +830,11 @@ public:
           });
     }
 
-    seastar::future<> close() final {
+    bool supports_checked_close() const noexcept final { return true; }
+    seastar::future<> close() final { return close_impl(false); }
+    seastar::future<> close_checked() final { return close_impl(true); }
+
+    seastar::future<> close_impl(bool checked) {
         owner_->assert_current();
         handle_->assert_current();
         if (handle_->lifecycle == handle_lifecycle::closed) {
@@ -305,31 +848,35 @@ public:
             return closed<>();
         }
         handle_->lifecycle = handle_lifecycle::closing;
-        return owner_
-          ->submit_file_operation(
-            pending_kind::close,
-            runtime::builtin_fault_point::file_close,
-            object_,
-            0,
-            0,
-            nullptr,
-            nullptr,
-            nullptr,
-            generation_,
-            handle_)
-          .then_wrapped(
-            [owner = owner_, object = object_, handle = handle_](
-              seastar::future<runtime::result<pending_value>> done) {
-                try {
-                    static_cast<void>(native_value(done.get()));
-                    handle->lifecycle = handle_lifecycle::closed;
-                } catch (...) {
-                    // seastar::file::close() reports and swallows file_impl
-                    // failures. Settle fake ownership here as successful close
-                    // would, avoiding a misleading native close-error report.
-                    owner->release_handle_reference(object, handle);
-                }
-            });
+        try {
+            return owner_
+              ->submit_file_operation(
+                pending_kind::close,
+                runtime::builtin_fault_point::file_close,
+                object_,
+                0,
+                0,
+                nullptr,
+                nullptr,
+                nullptr,
+                generation_,
+                handle_)
+              .then_wrapped(
+                [owner = owner_, object = object_, handle = handle_, checked](
+                  seastar::future<runtime::result<pending_value>> done) {
+                    try {
+                        static_cast<void>(native_value(done.get()));
+                        handle->lifecycle = handle_lifecycle::closed;
+                    } catch (...) {
+                        owner->release_handle_reference(object, handle);
+                        if (checked) throw;
+                    }
+                });
+        } catch (...) {
+            owner_->release_handle_reference(object_, handle_);
+            if (checked) return seastar::current_exception_as_future<>();
+            return seastar::make_ready_future<>();
+        }
     }
 
     seastar::subscription<seastar::directory_entry> list_directory(
@@ -632,6 +1179,28 @@ fake_file_system::canonicalize_root(std::string_view root) {
 
 runtime::result<canonical_fake_path>
 fake_file_system::validate_config(const fake_file_system_config& config) {
+    if (config.device_scope == 0 || config.device_scope > (UINT64_MAX >> 8U))
+        return runtime::failure(file_error(errc::invalid_argument));
+    if (config.crash_policy) {
+        const auto& policy = *config.crash_policy;
+        if (
+          policy.data_percent > 100 || policy.namespace_percent > 100
+          || policy.eof_percent > 100 || policy.granule_bytes == 0
+          || policy.granule_bytes > fake_file_page_bytes
+          || (policy.granule_bytes & (policy.granule_bytes - 1U)) != 0
+          || policy.maximum_namespace_groups == 0
+          || policy.maximum_namespace_groups > 4096
+          || policy.maximum_scratch_bytes.value() < 16U * 1024U
+          || policy.maximum_scratch_bytes > maximum_fake_pending_bytes)
+            return runtime::failure(file_error(errc::invalid_argument));
+    }
+    if (
+      config.space_error && *config.space_error != errc::permission_denied
+      && *config.space_error != errc::unavailable
+      && *config.space_error != errc::io_failure
+      && *config.space_error != errc::resource_exhausted) {
+        return runtime::failure(file_error(errc::invalid_argument));
+    }
     if (
       config.logical_capacity.value() == 0
       || config.logical_capacity > maximum_fake_disk_capacity
@@ -683,6 +1252,8 @@ fake_file_system::validate_config(const fake_file_system_config& config) {
 
 runtime::result<std::unique_ptr<fake_file_system>>
 fake_file_system::make(fake_file_system_config config) {
+    if (config.crash_policy)
+        return runtime::failure(file_error(errc::unavailable));
     auto root = validate_config(config);
     if (!root) {
         return runtime::failure(root.error());
@@ -719,9 +1290,81 @@ runtime::result<std::unique_ptr<fake_file_system>> fake_file_system::make(
       !valid) {
         return runtime::failure(valid.error());
     }
+    std::optional<std::array<trace_context_field, 4>> configuration;
+    event_trace::reservation reservation;
+    const auto descriptor = trace_event_descriptor{
+      .kind = trace_event_kind::filesystem,
+      .stable_id = config.device_scope,
+      .effect = trace_action::storage_configuration};
+    if (config.crash_policy || config.device_scope != 1) {
+        codec::sha256_hasher hash;
+        auto field = [&hash](std::uint64_t value) {
+            std::array<std::uint8_t, 8> encoded{};
+            for (std::size_t i = 0; i < 8; ++i)
+                encoded[i] = static_cast<std::uint8_t>(value >> (i * 8U));
+            hash.update(encoded.data(), encoded.size());
+        };
+        constexpr std::string_view tag{"storage-configuration-v1"};
+        hash.update(tag.data(), tag.size());
+        field(root->bytes().size());
+        hash.update(root->bytes().data(), root->bytes().size());
+        field(config.device_scope);
+        field(config.logical_capacity.value());
+        field(config.maximum_objects);
+        field(config.maximum_operation_bytes.value());
+        field(config.maximum_retained_path_bytes.value());
+        field(config.maximum_open_handles);
+        field(config.maximum_pending_operations);
+        field(config.maximum_pending_bytes.value());
+        field(config.base_latency.nanoseconds());
+        field(config.read_latency_min.nanoseconds());
+        field(config.read_latency_mean.nanoseconds());
+        field(config.write_latency_min.nanoseconds());
+        field(config.write_latency_mean.nanoseconds());
+        field(config.maximum_pending_reads);
+        field(config.maximum_pending_writes);
+        field(config.memory_dma_alignment);
+        field(config.disk_read_dma_alignment);
+        field(config.disk_write_dma_alignment);
+        field(config.disk_overwrite_dma_alignment);
+        field(config.native_max_length);
+        field(config.crash_policy.has_value());
+        if (config.crash_policy) {
+            const auto& policy = *config.crash_policy;
+            field(policy.data_percent);
+            field(policy.namespace_percent);
+            field(policy.eof_percent);
+            field(policy.granule_bytes);
+            field(policy.maximum_namespace_groups);
+            field(policy.maximum_scratch_bytes.value());
+        }
+        field(config.space_override.has_value());
+        if (config.space_override) {
+            field(config.space_override->capacity().value());
+            field(config.space_override->free().value());
+            field(config.space_override->available().value());
+            field(config.space_override->read_only());
+        }
+        field(
+          config.space_error ? static_cast<std::uint64_t>(*config.space_error)
+                             : 0U);
+        configuration = storage_digest_fields(std::move(hash).final());
+        auto reserved = event_scheduler.reserve_effect(
+          descriptor, *configuration);
+        if (!reserved) return runtime::failure(reserved.error());
+        reservation = std::move(*reserved);
+    }
     std::string{}.swap(config.virtual_root);
-    return std::unique_ptr<fake_file_system>{new fake_file_system{
+    auto owner = std::unique_ptr<fake_file_system>{new fake_file_system{
       std::move(config), std::move(*root), &event_scheduler, &faults}};
+    if (configuration) {
+        if (
+          auto observed = event_scheduler.observe_effect(
+            descriptor, *configuration, reservation);
+          !observed)
+            return runtime::failure(observed.error());
+    }
+    return owner;
 }
 
 fake_file_system::fake_file_system(
@@ -734,6 +1377,8 @@ fake_file_system::fake_file_system(
   , scheduler_(event_scheduler)
   , faults_(faults)
   , pending_(config_.maximum_pending_operations)
+  , cursor_slots_(
+      seastar::make_lw_shared<seastar::semaphore>(config_.maximum_open_handles))
   , collection_worklist_(std::size_t{3} * config_.maximum_objects) {
     pending_ids_.reserve(config_.maximum_pending_operations);
     open_objects_.reserve(config_.maximum_open_handles);
@@ -762,7 +1407,7 @@ fake_file_system::~fake_file_system() {
     }
     KWAQUE_INVARIANT(
       fake_storage_drained_invariant,
-      pending_operations_ == 0 && pending_bytes_.value() == 0
+      !crash_ && pending_operations_ == 0 && pending_bytes_.value() == 0
         && pending_path_bytes_ == 0 && pending_opens_ == 0
         && pending_reads_ == 0 && pending_writes_ == 0
         && parked_operations_ == 0,
@@ -789,6 +1434,7 @@ seastar::future<runtime::result<runtime::file>> fake_file_system::open(
     auto& metadata = operation.payload.emplace<metadata_operation>();
     metadata.path = std::move(*canonical);
     metadata.open_options = options;
+    operation.fault_b = static_cast<std::uint8_t>(options.close_policy);
     operation.open_slot = true;
     if (existing) {
         operation.object = *existing;
@@ -889,6 +1535,44 @@ fake_file_system::stat(runtime::file_path path) {
         });
 }
 
+seastar::future<runtime::result<runtime::file_system_space>>
+fake_file_system::space(runtime::file_path path) {
+    assert_current();
+    auto canonical = resolve(path.value());
+    if (!canonical) {
+        return seastar::make_ready_future<
+          runtime::result<runtime::file_system_space>>(
+          runtime::failure(canonical.error()));
+    }
+    prepared_operation operation{
+      fake_operation_id{next_operation_id_},
+      pending_kind::space,
+      runtime::builtin_fault_point::filesystem_space};
+    auto& metadata = operation.payload.emplace<metadata_operation>();
+    metadata.path = std::move(*canonical);
+    const auto existing = lookup(*metadata.path);
+    if (existing) {
+        operation.object = *existing;
+    }
+    return submit(
+             std::move(operation),
+             existing ? runtime::fault_object_key::from_u64(existing->value())
+                      : runtime::fault_object_key::none(),
+             byte_count{},
+             trace_event_descriptor{
+               .kind = trace_event_kind::filesystem,
+               .stable_id = next_operation_id_,
+             })
+      .then(
+        [](runtime::result<pending_value> outcome)
+          -> runtime::result<runtime::file_system_space> {
+            if (!outcome) {
+                return runtime::failure(outcome.error());
+            }
+            return std::get<runtime::file_system_space>(*outcome);
+        });
+}
+
 seastar::future<runtime::result<runtime::directory_listing>>
 fake_file_system::list(
   runtime::file_path path, runtime::directory_listing_limits limits) {
@@ -986,13 +1670,14 @@ seastar::future<runtime::result<void>> fake_file_system::stop() {
     state_ = fake_file_system_state::stopping;
     operation_changed_.broadcast();
     if (scheduler_ == nullptr) {
-        invalidate_handles();
+        if (!crash_) invalidate_handles();
         finish_stop();
         return stop_done_->get_shared_future();
     }
     pending_.copy_keys(pending_ids_);
     std::ranges::sort(pending_ids_);
     for (const auto value : pending_ids_) {
+        if (crash_ && value == crash_->active.value()) continue;
         auto* operation = pending_.find(value);
         if (operation == nullptr) {
             continue;
@@ -1015,9 +1700,9 @@ seastar::future<runtime::result<void>> fake_file_system::stop() {
         }
         static_cast<void>(scheduler_->discard_failed());
         discard_remaining(*scheduler_->trace_failure());
-        invalidate_handles();
+        if (!crash_) invalidate_handles();
     } else {
-        invalidate_handles();
+        if (!crash_) invalidate_handles();
     }
     if (
       state_ == fake_file_system_state::stopping && pending_operations_ == 0) {
@@ -1114,7 +1799,17 @@ fake_file_system::remove_directory(runtime::file_path path) {
 }
 
 seastar::future<runtime::result<void>> fake_file_system::rename(
-  runtime::file_path source, runtime::file_path destination) {
+  runtime::file_path source,
+  runtime::file_path destination,
+  runtime::file_rename_policy policy) {
+    if (
+      policy != runtime::file_rename_policy::replace
+      && policy != runtime::file_rename_policy::no_replace)
+        return seastar::make_ready_future<runtime::result<void>>(
+          runtime::failure(
+            runtime::make_file_error(
+              errc::invalid_argument,
+              runtime::file_failure_detail::admission_not_dispatched)));
     assert_current();
     auto from = resolve(source.value());
     auto to = resolve(destination.value());
@@ -1129,6 +1824,8 @@ seastar::future<runtime::result<void>> fake_file_system::rename(
     auto& metadata = operation.payload.emplace<metadata_operation>();
     metadata.path = std::move(*from);
     metadata.destination_path = std::move(*to);
+    metadata.rename_policy = policy;
+    operation.fault_b = static_cast<std::uint8_t>(policy);
     const auto existing = lookup(*metadata.path);
     if (existing) {
         operation.object = *existing;
@@ -1145,7 +1842,32 @@ seastar::future<runtime::result<void>> fake_file_system::rename(
 }
 
 seastar::future<runtime::result<void>>
-fake_file_system::sync_directory(runtime::file_path path) {
+fake_file_system::sync_directory_checked(runtime::file_path path) {
+    auto opened = co_await open_directory(
+      path, runtime::file_close_policy::checked);
+    if (!opened) co_return runtime::failure(opened.error());
+    auto cursor = std::move(*opened);
+    runtime::first_failure failed;
+    try {
+        failed.observe(co_await sync_directory(std::move(path)));
+    } catch (...) {
+        failed.observe(std::current_exception());
+    }
+    try {
+        failed.observe(co_await cursor.close());
+    } catch (...) {
+        failed.observe(std::current_exception());
+    }
+    co_return failed.outcome();
+}
+
+seastar::future<runtime::result<void>> fake_file_system::sync_directory(
+  runtime::file_path path, runtime::file_close_policy policy) {
+    if (policy == runtime::file_close_policy::checked)
+        return sync_directory_checked(std::move(path));
+    if (policy != runtime::file_close_policy::legacy)
+        return seastar::make_ready_future<runtime::result<void>>(
+          runtime::failure(file_error(errc::invalid_argument)));
     assert_current();
     auto canonical = resolve(path.value());
     if (!canonical) {
@@ -1312,6 +2034,96 @@ std::int64_t fake_file_system::directory_change_path_delta(
              : static_cast<std::int64_t>(name.size());
 }
 
+fake_file_system::namespace_transaction::namespace_transaction(
+  fake_file_system& owner,
+  namespace_change first,
+  std::optional<namespace_change> second,
+  std::uint64_t sequence)
+  : owner_(owner) {
+    if (!owner.config_.crash_policy) return;
+    const auto bytes = first.name.size() + (second ? second->name.size() : 0U);
+    if (
+      owner.namespace_history_.size()
+        == owner.config_.crash_policy->maximum_namespace_groups
+      || owner.next_namespace_sequence_ == UINT64_MAX)
+        throw runtime::detail::file_operation_exception{
+          file_error(errc::resource_exhausted)};
+    if (
+      auto valid = owner.validate_path_delta(static_cast<std::int64_t>(bytes));
+      !valid)
+        throw runtime::detail::file_operation_exception{valid.error()};
+    const auto id = sequence == 0 ? owner.next_namespace_sequence_ : sequence;
+    auto [found, inserted] = owner.namespace_history_.try_emplace(
+      id, namespace_group{.changes = {std::move(first), std::move(second)}});
+    KWAQUE_INVARIANT(
+      fake_storage_transaction_invariant,
+      inserted,
+      "namespace sequence reused");
+    id_ = id;
+    for (const auto& change : found->second.changes) {
+        if (!change) continue;
+        ++owner.find_inode(change->parent)->history_references;
+        if (change->before)
+            ++owner.find_inode(*change->before)->history_references;
+        if (change->after)
+            ++owner.find_inode(*change->after)->history_references;
+        owner.history_name_bytes_ += change->name.size();
+    }
+}
+
+fake_file_system::namespace_transaction::~namespace_transaction() {
+    if (id_ == 0 || committed_) return;
+    auto found = owner_.namespace_history_.find(id_);
+    owner_.release_namespace_group(found->second);
+    owner_.namespace_history_.erase(found);
+}
+
+void fake_file_system::namespace_transaction::commit() noexcept {
+    if (id_ == 0) return;
+    owner_.namespace_history_.find(id_)->second.committed = true;
+    owner_.next_namespace_sequence_ = std::max(
+      owner_.next_namespace_sequence_, id_ + 1U);
+    committed_ = true;
+}
+
+void fake_file_system::release_namespace_group(
+  namespace_group& group) noexcept {
+    for (const auto& change : group.changes) {
+        if (!change) continue;
+        --find_inode(change->parent)->history_references;
+        if (change->before) --find_inode(*change->before)->history_references;
+        if (change->after) --find_inode(*change->after)->history_references;
+        history_name_bytes_ -= change->name.size();
+    }
+}
+
+void fake_file_system::prune_namespace_history() {
+    for (auto it = namespace_history_.begin();
+         it != namespace_history_.end();) {
+        bool synced = true;
+        for (const auto& change : it->second.changes)
+            if (
+              change
+              && std::get<directory_state>(find_inode(change->parent)->state)
+                     .synced_sequence
+                   < it->first)
+                synced = false;
+        if (!synced) {
+            ++it;
+            continue;
+        }
+        auto group = std::move(it->second);
+        it = namespace_history_.erase(it);
+        release_namespace_group(group);
+        for (const auto& change : group.changes) {
+            if (!change) continue;
+            if (change->before) collect_unreachable(*change->before);
+            if (change->after) collect_unreachable(*change->after);
+            collect_unreachable(change->parent);
+        }
+    }
+}
+
 fake_file_system::prepared_directory_change::prepared_directory_change(
   fake_file_system& owner,
   fake_object_id directory_id,
@@ -1420,8 +2232,9 @@ fake_file_system::validate_path_delta(std::int64_t delta) const noexcept {
     const auto added = static_cast<std::uint64_t>(delta);
     const auto maximum = config_.maximum_retained_path_bytes.value();
     if (
-      retained_path_bytes_ > maximum - pending_path_bytes_
-      || added > maximum - pending_path_bytes_ - retained_path_bytes_) {
+      retained_path_bytes_ + history_name_bytes_ > maximum - pending_path_bytes_
+      || added > maximum - pending_path_bytes_ - retained_path_bytes_
+                   - history_name_bytes_) {
         return runtime::failure(file_error(errc::resource_exhausted));
     }
     return {};
@@ -1445,13 +2258,21 @@ runtime::result<void> fake_file_system::apply_directory_change(
   directory_state& directory,
   std::string name,
   std::optional<fake_object_id> id) {
+    std::optional<namespace_transaction> history;
+    if (config_.crash_policy)
+        history.emplace(
+          *this,
+          namespace_change{
+            directory_id, name, visible_child(directory, name), id});
     const auto delta = directory_change_path_delta(directory, name);
     if (auto valid = validate_path_delta(delta); !valid) {
         return runtime::failure(valid.error());
     }
     prepared_directory_change change{
       *this, directory_id, directory, std::move(name), id};
+    observe_file_effect(0);
     change.commit();
+    if (history) history->commit();
     return {};
 }
 
@@ -1548,7 +2369,9 @@ fake_file_system::remove(const canonical_fake_path& path, fake_file_kind kind) {
 }
 
 runtime::result<void> fake_file_system::rename(
-  const canonical_fake_path& from, const canonical_fake_path& to) {
+  const canonical_fake_path& from,
+  const canonical_fake_path& to,
+  runtime::file_rename_policy policy) {
     assert_current();
     auto from_parent_id = lookup_parent(from);
     auto to_parent_id = lookup_parent(to);
@@ -1569,6 +2392,10 @@ runtime::result<void> fake_file_system::rename(
         return runtime::failure(file_error(errc::not_found));
     }
     const auto source_id = *source_position;
+    if (
+      policy == runtime::file_rename_policy::no_replace
+      && visible_child(to_directory, to_name))
+        return runtime::failure(file_error(errc::already_exists));
     if (from == to) {
         return {};
     }
@@ -1601,6 +2428,12 @@ runtime::result<void> fake_file_system::rename(
         }
     }
 
+    std::optional<namespace_transaction> history;
+    if (config_.crash_policy)
+        history.emplace(
+          *this,
+          namespace_change{*from_parent_id, from_name, source_id, std::nullopt},
+          namespace_change{*to_parent_id, to_name, target_position, source_id});
     const auto path_delta
       = directory_change_path_delta(from_directory, from_name)
         + directory_change_path_delta(to_directory, to_name);
@@ -1611,8 +2444,10 @@ runtime::result<void> fake_file_system::rename(
       *this, *from_parent_id, from_directory, from_name, std::nullopt};
     prepared_directory_change add_destination{
       *this, *to_parent_id, to_directory, to_name, source_id};
+    observe_file_effect(0);
     remove_source.commit();
     add_destination.commit();
+    if (history) history->commit();
     if (replaced && *replaced != source_id) {
         collect_unreachable(*replaced);
     }
@@ -1626,11 +2461,17 @@ fake_file_system::sync_directory(const canonical_fake_path& path) {
     if (!selected_id) {
         return runtime::failure(selected_id.error());
     }
-    auto selected = directory(path);
-    if (!selected) {
-        return runtime::failure(selected.error());
-    }
-    auto& state = **selected;
+    return sync_directory(*selected_id);
+}
+
+runtime::result<void>
+fake_file_system::sync_directory(fake_object_id selected_id) {
+    assert_current();
+    auto* selected = find_inode(selected_id);
+    if (!selected) return runtime::failure(file_error(errc::not_found));
+    if (selected->kind != fake_file_kind::directory)
+        return runtime::failure(file_error(errc::not_a_directory));
+    auto& state = std::get<directory_state>(selected->state);
 
     struct sync_change final {
         std::string name;
@@ -1685,6 +2526,7 @@ fake_file_system::sync_directory(const canonical_fake_path& path) {
                 change.inserted = true;
             }
         }
+        observe_file_effect(0);
     } catch (...) {
         for (std::size_t index = 0; index < prepared; ++index) {
             if (changes[index].inserted) {
@@ -1712,9 +2554,11 @@ fake_file_system::sync_directory(const canonical_fake_path& path) {
         }
     }
     state.unsynced.clear();
-    clear_dirty(*find_inode(*selected_id));
+    state.synced_sequence = next_namespace_sequence_ - 1U;
+    clear_dirty(*find_inode(selected_id));
     apply_path_delta(path_delta);
     collect_unreachable_from(std::move(maybe_unreachable));
+    if (config_.crash_policy) prune_namespace_history();
     return {};
 }
 
@@ -1837,7 +2681,9 @@ runtime::result<void> fake_file_system::update_retained_capacity(
       after > before
       && after - before
            > config_.logical_capacity.value() - retained_capacity_.value()) {
-        return runtime::failure(file_error(errc::resource_exhausted));
+        return runtime::failure(
+          runtime::make_file_error(
+            errc::resource_exhausted, runtime::file_failure_detail::no_space));
     }
     retained_capacity_ = byte_count{
       retained_capacity_.value() - before + after};
@@ -1914,7 +2760,9 @@ runtime::result<byte_count> fake_file_system::write(
       after > before
       && after - before
            > config_.logical_capacity.value() - retained_capacity_.value()) {
-        return runtime::failure(file_error(errc::resource_exhausted));
+        return runtime::failure(
+          runtime::make_file_error(
+            errc::resource_exhausted, runtime::file_failure_detail::no_space));
     }
 
     struct page_update final {
@@ -1977,6 +2825,7 @@ runtime::result<byte_count> fake_file_system::write(
               "new visible page was already present");
             update.inserted = true;
         }
+        observe_file_effect(bytes.size());
     } catch (...) {
         for (const auto& update : updates) {
             if (update.inserted) {
@@ -2075,6 +2924,7 @@ fake_file_system::truncate(fake_object_id id, std::uint64_t size) {
     if (!prepared) {
         return runtime::failure(prepared.error());
     }
+    observe_file_effect(size);
     commit_truncate(std::move(*prepared));
     return {};
 }
@@ -2097,7 +2947,9 @@ fake_file_system::prepare_truncate(fake_object_id id, std::uint64_t size) {
       after > before
       && after - before
            > config_.logical_capacity.value() - retained_capacity_.value()) {
-        return runtime::failure(file_error(errc::resource_exhausted));
+        return runtime::failure(
+          runtime::make_file_error(
+            errc::resource_exhausted, runtime::file_failure_detail::no_space));
     }
 
     prepared_truncate prepared{
@@ -2237,6 +3089,7 @@ runtime::result<void> fake_file_system::flush(fake_object_id id) {
                 throw;
             }
         }
+        observe_file_effect(0);
     } catch (...) {
         for (const auto page_index : inserted_pages) {
             file.durable_pages.erase(page_index);
@@ -2266,6 +3119,579 @@ runtime::result<void> fake_file_system::flush(fake_object_id id) {
     clear_dirty(*object);
     static_cast<void>(update_retained_capacity(before, retained_size(file)));
     return {};
+}
+
+runtime::result<void>
+fake_file_system::prepare_selective_crash(fake_operation_id active) {
+    if (crash_ || crash_epoch_ == UINT64_MAX)
+        return runtime::failure(file_error(errc::out_of_range));
+    const auto& policy = *config_.crash_policy;
+    const auto pages = retained_capacity_.value() / fake_file_page_bytes
+                       + objects_.size() + 1U;
+    const auto work = pages
+                        * (fake_file_page_bytes / policy.granule_bytes + 16U)
+                      + (objects_.size() + retained_path_bytes_
+                         + history_name_bytes_ + namespace_history_.size())
+                          * 16U
+                      + 512U;
+    const auto continuations = work / 64U + 32U;
+    if (
+      continuations > UINT32_MAX / 2U
+      || continuations + scheduler_->limits().pending_events() + 1U
+           > scheduler_->limits().total_events()
+               - scheduler_->executed_events())
+        return runtime::failure(file_error(errc::resource_exhausted));
+    auto state = std::make_unique<crash_state>(active, crash_epoch_ + 1U);
+    state->charge(16U * 1024U, policy.maximum_scratch_bytes.value());
+    auto ids = scheduler_->reserve_event_id(continuations);
+    auto slot = scheduler_->reserve_event_slot();
+    auto work_trace = scheduler_->reserve_trace(
+      {.kind = trace_event_kind::filesystem, .stable_id = active.value()},
+      static_cast<std::uint32_t>(continuations));
+    const auto digest = storage_digest_fields(codec::sha256_digest{});
+    auto selection = scheduler_->reserve_effect(
+      {.kind = trace_event_kind::filesystem,
+       .stable_id = active.value(),
+       .effect = trace_action::crash_selection},
+      digest);
+    auto applied = scheduler_->reserve_effect(
+      {.kind = trace_event_kind::filesystem,
+       .stable_id = active.value(),
+       .effect = trace_action::crash_completed});
+    if (!ids || !slot || !work_trace || !selection || !applied) {
+        return runtime::failure(
+          !ids          ? ids.error()
+          : !slot       ? slot.error()
+          : !work_trace ? work_trace.error()
+          : !selection  ? selection.error()
+                        : applied.error());
+    }
+    state->work_ids = std::move(*ids);
+    state->work_slot = std::move(*slot);
+    state->work_trace = std::move(*work_trace);
+    state->selection_trace = std::move(*selection);
+    state->applied_trace = std::move(*applied);
+    crash_ = std::move(state);
+    return {};
+}
+
+seastar::future<runtime::result<void>>
+fake_file_system::run_selective_crash(fake_operation_id active) {
+    auto& state = *crash_;
+    const auto policy = *config_.crash_policy;
+    const auto original_generation = generation_;
+    auto check = [&] {
+        if (state.exception) std::rethrow_exception(state.exception);
+        if (state.failure)
+            throw runtime::detail::file_operation_exception{*state.failure};
+        if (scheduler_->trace_failed())
+            throw runtime::detail::file_operation_exception{
+              *scheduler_->trace_failure()};
+        if (state_ == fake_file_system_state::stopping)
+            throw runtime::detail::file_operation_exception{
+              file_error(errc::aborted)};
+    };
+    auto pause = [&state] { return (++state.work % 64U) == 0; };
+    try {
+        check();
+        codec::sha256_hasher hash;
+        auto word = [&hash](std::uint64_t value) {
+            std::array<std::uint8_t, 8> encoded{};
+            for (std::size_t i = 0; i < 8; ++i)
+                encoded[i] = static_cast<std::uint8_t>(value >> (i * 8U));
+            hash.update(encoded.data(), encoded.size());
+        };
+        word(config_.device_scope);
+        word(original_generation);
+        word(state.epoch);
+        word(policy.data_percent);
+        word(policy.eof_percent);
+        word(policy.namespace_percent);
+        word(policy.granule_bytes);
+        auto required = [&](std::uint64_t object) {
+            if (!state.required.contains(object)) {
+                state.charge(128, policy.maximum_scratch_bytes.value());
+                state.required.insert(object);
+            }
+        };
+        // Undo selected mutation groups in reverse order. A retained group
+        // requires the preceding prefix on every participating directory/inode.
+        // This keeps a rename's two endpoints and ancestor dependencies
+        // together.
+        for (auto& group : std::views::reverse(namespace_history_)) {
+            check();
+            bool keep = storage_survives(
+              faults_->master_seed(),
+              {(config_.device_scope << 8U) | 0x82U,
+               group.first,
+               original_generation,
+               0,
+               state.epoch},
+              policy.namespace_percent);
+            for (const auto& change : group.second.changes) {
+                if (!change) continue;
+                const auto& directory = std::get<directory_state>(
+                  find_inode(change->parent)->state);
+                keep |= directory.synced_sequence >= group.first
+                  || state.required_names.contains({change->parent.value(), change->name})
+                  || state.empty_dependencies.contains(change->parent.value())
+                  || (change->before && state.required.contains(change->before->value()))
+                  || (change->after && state.required.contains(change->after->value()));
+            }
+            word(group.first);
+            word(keep);
+            for (const auto& change : group.second.changes) {
+                if (!change) continue;
+                word(change->parent.value());
+                word(change->name.size());
+                hash.update(change->name.data(), change->name.size());
+                word(change->before ? change->before->value() : 0U);
+                word(change->after ? change->after->value() : 0U);
+                if (keep) {
+                    required(change->parent.value());
+                    if (!state.required_names.contains(
+                          {change->parent.value(), change->name})) {
+                        state.charge(
+                          256U + 2U * change->name.size(),
+                          policy.maximum_scratch_bytes.value());
+                        state.required_names.emplace(
+                          change->parent.value(), change->name);
+                    }
+                    if (change->before) required(change->before->value());
+                    if (change->after) required(change->after->value());
+                    if (
+                      change->before
+                      && find_inode(*change->before)->kind
+                           == fake_file_kind::directory) {
+                        const bool moved = std::ranges::any_of(
+                          group.second.changes, [&](const auto& member) {
+                              return member && member->after == change->before;
+                          });
+                        if (
+                          !moved
+                          && !state.empty_dependencies.contains(
+                            change->before->value())) {
+                            state.charge(
+                              128U, policy.maximum_scratch_bytes.value());
+                            state.empty_dependencies.insert(
+                              change->before->value());
+                        }
+                    }
+                } else {
+                    state.charge(
+                      256U + change->name.size() * 2U,
+                      policy.maximum_scratch_bytes.value());
+                    state.overrides.insert_or_assign(
+                      {change->parent.value(), change->name}, change->before);
+                }
+            }
+            if (pause()) co_await crash_pause{*this};
+        }
+        // Retain synced backing; overlay selected current granules. No dense
+        // file/store clone is made, and unchanged/full surviving pages alias.
+        for (auto object_id = dirty_head_; object_id != 0;) {
+            check();
+            auto& object = *find_inode(fake_object_id{object_id});
+            object_id = object.dirty_next;
+            if (object.kind == fake_file_kind::directory) {
+                auto& directory = std::get<directory_state>(object.state);
+                for (const auto& [name, visible] : directory.unsynced) {
+                    check();
+                    auto replacement = state.overrides.find(
+                      {object.id.value(), name});
+                    const auto chosen = replacement == state.overrides.end()
+                                          ? visible
+                                          : replacement->second;
+                    const auto previous = directory.durable.find(name);
+                    const auto before = previous == directory.durable.end()
+                                          ? std::optional<fake_object_id>{}
+                                          : std::optional<fake_object_id>{
+                                              previous->second};
+                    state.charge(
+                      2U * sizeof(crash_state::name_change) + name.size() * 2U
+                        + 128U,
+                      policy.maximum_scratch_bytes.value());
+                    state.names.push_back(
+                      {object.id, name, before, visible, chosen});
+                    auto& staged = state.names.back();
+                    if (chosen && !before) {
+                        directory.durable.try_emplace(name, *chosen);
+                        staged.inserted = true;
+                    }
+                    word(object.id.value());
+                    word(name.size());
+                    hash.update(name.data(), name.size());
+                    word(chosen ? chosen->value() : 0U);
+                    if (pause()) co_await crash_pause{*this};
+                }
+                continue;
+            }
+            auto& file = std::get<regular_file_state>(object.state);
+            const bool eof = storage_survives(
+              faults_->master_seed(),
+              {(config_.device_scope << 8U) | 0x81U,
+               object.id.value(),
+               original_generation,
+               0,
+               state.epoch},
+              policy.eof_percent);
+            const auto size = eof ? file.visible_size : file.durable_size;
+            state.charge(
+              2U * sizeof(crash_state::file_change),
+              policy.maximum_scratch_bytes.value());
+            state.files.push_back({object.id, size});
+            word(object.id.value());
+            word(file.durable_size);
+            word(file.visible_size);
+            word(size);
+            // Numeric page order is independent of hash capacity and allocation
+            // history. Sparse positions are bounded by retained logical extent.
+            for (std::uint64_t index = 0;
+                 index < page_count(retained_size(file));
+                 ++index) {
+                check();
+                if (
+                  !file.visible_pages.contains(index)
+                  && !file.durable_pages.contains(index)) {
+                    if (pause()) co_await crash_pause{*this};
+                    continue;
+                }
+                const auto old = file.durable_pages.find(index);
+                const page_pointer old_page = old == file.durable_pages.end()
+                                                ? page_pointer{}
+                                                : old->second.bytes;
+                page_pointer chosen;
+                if (index < page_count(size)) {
+                    page mixed{};
+                    if (old_page) mixed = *old_page;
+                    const auto current = file.visible_pages.find(index);
+                    page_pointer current_page
+                      = current != file.visible_pages.end()
+                          ? current->second.bytes
+                        : index < file.cleared_from_page.value_or(UINT64_MAX)
+                          ? old_page
+                          : page_pointer{};
+                    const auto base = index * fake_file_page_bytes;
+                    for (std::size_t at = 0; at < fake_file_page_bytes;
+                         at += policy.granule_bytes) {
+                        const auto end = std::min<std::uint64_t>(
+                          base + at + policy.granule_bytes, file.visible_size);
+                        if (base + at < end) {
+                            const bool keep = storage_survives(
+                              faults_->master_seed(),
+                              {(config_.device_scope << 8U) | 0x80U,
+                               object.id.value(),
+                               original_generation,
+                               base + at,
+                               state.epoch},
+                              policy.data_percent);
+                            word(object.id.value());
+                            word(base + at);
+                            word(keep);
+                            if (keep) {
+                                const auto bytes = static_cast<std::size_t>(
+                                  end - base - at);
+                                if (current_page)
+                                    std::copy_n(
+                                      current_page->begin()
+                                        + static_cast<std::ptrdiff_t>(at),
+                                      bytes,
+                                      mixed.begin()
+                                        + static_cast<std::ptrdiff_t>(at));
+                                else
+                                    std::fill_n(
+                                      mixed.begin()
+                                        + static_cast<std::ptrdiff_t>(at),
+                                      bytes,
+                                      std::byte{});
+                            }
+                        }
+                        if (pause()) {
+                            co_await crash_pause{*this};
+                            check();
+                        }
+                    }
+                    if (size < base + fake_file_page_bytes)
+                        std::fill(
+                          mixed.begin()
+                            + static_cast<std::ptrdiff_t>(size - base),
+                          mixed.end(),
+                          std::byte{});
+                    if (old_page && mixed == *old_page)
+                        chosen = old_page;
+                    else if (current_page && mixed == *current_page)
+                        chosen = current_page;
+                    else if (std::ranges::any_of(mixed, [](std::byte value) {
+                                 return value != std::byte{};
+                             })) {
+                        state.charge(
+                          8192, policy.maximum_scratch_bytes.value());
+                        chosen = seastar::make_lw_shared<page>(
+                          std::move(mixed));
+                    }
+                }
+                if (chosen != old_page) {
+                    state.charge(
+                      2U * sizeof(crash_state::page_change) + 128U,
+                      policy.maximum_scratch_bytes.value());
+                    state.pages.push_back({object.id, index, chosen});
+                    auto& staged = state.pages.back();
+                    if (chosen && !old_page) {
+                        // Hidden by the crashing admission gate; rollback
+                        // removes every prepared insertion before
+                        // reopening.
+                        file.durable_pages.try_emplace(
+                          index, page_state{chosen});
+                        staged.inserted = true;
+                    }
+                    word(object.id.value());
+                    word(index);
+                    word(static_cast<bool>(chosen));
+                    if (chosen) hash.update(chosen->data(), chosen->size());
+                }
+                if (pause()) co_await crash_pause{*this};
+            }
+        }
+        check();
+        const auto digest = storage_digest_fields(std::move(hash).final());
+        auto selected = scheduler_->observe_effect(
+          {.kind = trace_event_kind::filesystem,
+           .stable_id = active.value(),
+           .coordinate_a = state.epoch,
+           .coordinate_b = state.pages.size(),
+           .value = state.names.size(),
+           .effect = trace_action::crash_selection},
+          digest,
+          state.selection_trace);
+        if (!selected)
+            throw runtime::detail::file_operation_exception{selected.error()};
+        KWAQUE_INVARIANT(
+          fake_storage_transaction_invariant,
+          generation_ == original_generation,
+          "crash selection lost its file generation");
+        state.committed = true;
+        crash_epoch_ = state.epoch;
+        // All commit storage is prepared. Until completion the namespace/data
+        // admission gate remains closed, including while these loops yield.
+        for (auto& change : state.pages) {
+            auto& file = std::get<regular_file_state>(
+              find_inode(change.object)->state);
+            if (change.replacement)
+                file.durable_pages.find(change.index)->second.bytes = std::move(
+                  change.replacement);
+            else
+                file.durable_pages.erase(change.index);
+            if (pause()) co_await crash_pause{*this};
+        }
+        for (const auto& change : state.files) {
+            auto& object = *find_inode(change.object);
+            auto& file = std::get<regular_file_state>(object.state);
+            const auto before = retained_size(file);
+            while (!file.visible_pages.empty()) {
+                file.visible_pages.erase(file.visible_pages.begin());
+                if (pause()) co_await crash_pause{*this};
+            }
+            file.visible_size = file.durable_size = change.size;
+            file.cleared_from_page.reset();
+            static_cast<void>(update_retained_capacity(before, change.size));
+            clear_dirty(object);
+            if (pause()) co_await crash_pause{*this};
+        }
+        for (const auto& change : state.names) {
+            auto& object = *find_inode(change.parent);
+            auto& directory = std::get<directory_state>(object.state);
+            if (change.before) --find_inode(*change.before)->durable_links;
+            if (change.visible) --find_inode(*change.visible)->visible_links;
+            if (change.chosen) {
+                auto* target = find_inode(*change.chosen);
+                ++target->durable_links;
+                ++target->visible_links;
+                directory.durable.find(change.name)->second = *change.chosen;
+            } else if (change.before)
+                directory.durable.erase(change.name);
+            directory.unsynced.erase(change.name);
+            std::int64_t delta = -static_cast<std::int64_t>(change.name.size());
+            if (change.chosen && !change.before)
+                delta += static_cast<std::int64_t>(change.name.size());
+            if (!change.chosen && change.before)
+                delta -= static_cast<std::int64_t>(change.name.size());
+            apply_path_delta(delta);
+            directory.synced_sequence = next_namespace_sequence_ - 1U;
+            if (directory.unsynced.empty()) clear_dirty(object);
+            if (pause()) co_await crash_pause{*this};
+        }
+        while (!namespace_history_.empty()) {
+            auto group = namespace_history_.begin();
+            release_namespace_group(group->second);
+            namespace_history_.erase(group);
+            if (pause()) co_await crash_pause{*this};
+        }
+    } catch (const runtime::detail::file_operation_exception& error) {
+        state.failure = error.error();
+    } catch (...) {
+        state.exception = std::current_exception();
+    }
+    // Preparation failure rolls back hidden placeholders. Each destructor and
+    // erasure is bounded; no whole-store destruction is hidden in clear().
+    if (!state.committed) {
+        for (const auto& change : state.pages) {
+            if (change.inserted)
+                std::get<regular_file_state>(find_inode(change.object)->state)
+                  .durable_pages.erase(change.index);
+            if (pause()) co_await crash_pause{*this};
+        }
+        for (const auto& change : state.names) {
+            if (change.inserted)
+                std::get<directory_state>(find_inode(change.parent)->state)
+                  .durable.erase(change.name);
+            if (pause()) co_await crash_pause{*this};
+        }
+    }
+    while (!state.pages.empty()) {
+        state.pages.pop_back();
+        if (pause()) co_await crash_pause{*this};
+    }
+    while (!state.files.empty()) {
+        state.files.pop_back();
+        if (pause()) co_await crash_pause{*this};
+    }
+    while (!state.names.empty()) {
+        state.names.pop_back();
+        if (pause()) co_await crash_pause{*this};
+    }
+    while (!state.overrides.empty()) {
+        state.overrides.erase(state.overrides.begin());
+        if (pause()) co_await crash_pause{*this};
+    }
+    while (!state.required_names.empty()) {
+        state.required_names.erase(state.required_names.begin());
+        if (pause()) co_await crash_pause{*this};
+    }
+    while (!state.empty_dependencies.empty()) {
+        state.empty_dependencies.erase(state.empty_dependencies.begin());
+        if (pause()) co_await crash_pause{*this};
+    }
+    while (!state.required.empty()) {
+        state.required.erase(state.required.begin());
+        if (pause()) co_await crash_pause{*this};
+    }
+    if (state.committed || state_ == fake_file_system_state::stopping) {
+        generation_ = generation_ == UINT64_MAX ? 1U : generation_ + 1U;
+        while (!open_objects_.empty()) {
+            const auto id = *open_objects_.begin();
+            if (auto* object = find_inode(fake_object_id{id}))
+                object->open_references = 0;
+            open_objects_.erase(id);
+            if (pause()) co_await crash_pause{*this};
+        }
+        open_handles_ = 0;
+    }
+    // Reuse startup-bounded ID work storage, not a filesystem snapshot. New
+    // requests are excluded, and reference release only queues descendants.
+    collection_worklist_.reset();
+    for (const auto& [id, object] : objects_) {
+        static_cast<void>(object);
+        collection_worklist_.push_back(id);
+        if (pause()) co_await crash_pause{*this};
+    }
+    const auto active_object = pending_.at(active.value()).object;
+    for (std::size_t index = 0; index < collection_worklist_.size(); ++index) {
+        const auto id = fake_object_id{collection_worklist_[index]};
+        auto* object = find_inode(id);
+        if (
+          object == nullptr || id.value() == 1 || object->visible_links
+          || object->durable_links || object->history_references
+          || object->open_references
+          || object->pending_references
+               > (active_object && *active_object == id ? 1U : 0U)) {
+            if (pause()) co_await crash_pause{*this};
+            continue;
+        }
+        if (object->kind == fake_file_kind::regular) {
+            auto& file = std::get<regular_file_state>(object->state);
+            const auto retained = retained_size(file);
+            while (!file.visible_pages.empty()) {
+                file.visible_pages.erase(file.visible_pages.begin());
+                if (pause()) co_await crash_pause{*this};
+            }
+            while (!file.durable_pages.empty()) {
+                file.durable_pages.erase(file.durable_pages.begin());
+                if (pause()) co_await crash_pause{*this};
+            }
+            file.visible_size = file.durable_size = 0;
+            file.cleared_from_page.reset();
+            static_cast<void>(update_retained_capacity(retained, 0));
+        } else {
+            auto& directory = std::get<directory_state>(object->state);
+            while (!directory.durable.empty()) {
+                const auto child_id = directory.durable.begin()->second;
+                const auto& name = directory.durable.begin()->first;
+                auto* child = find_inode(child_id);
+                --child->durable_links;
+                if (!directory.unsynced.contains(name)) --child->visible_links;
+                retained_path_bytes_ -= name.size();
+                directory.durable.erase(directory.durable.begin());
+                collection_worklist_.push_back(child_id.value());
+                if (pause()) co_await crash_pause{*this};
+            }
+            while (!directory.unsynced.empty()) {
+                const auto child_id = directory.unsynced.begin()->second;
+                retained_path_bytes_
+                  -= directory.unsynced.begin()->first.size();
+                if (child_id) {
+                    --find_inode(*child_id)->visible_links;
+                    collection_worklist_.push_back(child_id->value());
+                }
+                directory.unsynced.erase(directory.unsynced.begin());
+                if (pause()) co_await crash_pause{*this};
+            }
+        }
+        clear_dirty(*object);
+        if (object->pending_references == 0) objects_.erase(id.value());
+        if (pause()) co_await crash_pause{*this};
+    }
+    if (scheduler_->trace_failed() && !state.failure)
+        state.failure = *scheduler_->trace_failure();
+    if (state.committed && !scheduler_->trace_failed()) {
+        auto observed = scheduler_->observe_effect(
+          {.kind = trace_event_kind::filesystem,
+           .stable_id = active.value(),
+           .coordinate_a = state.epoch,
+           .effect = trace_action::crash_completed},
+          {},
+          state.applied_trace);
+        if (!observed && !state.failure) state.failure = observed.error();
+    }
+    if (state.exception) std::rethrow_exception(state.exception);
+    if (state.failure) co_return runtime::failure(*state.failure);
+    co_return runtime::result<void>{};
+}
+
+void fake_file_system::finish_selective_crash(
+  fake_operation_id active,
+  seastar::future<runtime::result<void>> outcome) noexcept {
+    auto* operation = pending_.find(active.value());
+    KWAQUE_INVARIANT(
+      fake_storage_transaction_invariant,
+      operation != nullptr,
+      "crash lost its completion owner");
+    crash_.reset();
+    if (state_ != fake_file_system_state::stopping)
+        state_ = fake_file_system_state::open;
+    operation_changed_.broadcast();
+    runtime::result<void> result;
+    try {
+        result = outcome.get();
+    } catch (...) {
+        finish_exception(*operation, std::current_exception());
+        return;
+    }
+    if (!result)
+        finish(*operation, runtime::failure(result.error()), true);
+    else if (operation->kind == pending_kind::crash_control)
+        finish(*operation, pending_value{std::monostate{}}, true);
+    else
+        finish(*operation, runtime::failure(file_error(errc::aborted)), true);
 }
 
 void fake_file_system::restore_durable_state() noexcept {
@@ -2401,7 +3827,13 @@ fake_file_system::schedule_terminal(pending_operation& operation) noexcept {
 
 runtime::result<void> fake_file_system::begin_crash(fake_operation_id active) {
     assert_current();
+    if (crash_epoch_ == UINT64_MAX)
+        return runtime::failure(file_error(errc::out_of_range));
     auto& active_operation = pending_.at(active.value());
+    if (config_.crash_policy) {
+        if (auto prepared = prepare_selective_crash(active); !prepared)
+            return prepared;
+    }
 
     pending_.copy_keys(pending_ids_);
     std::ranges::sort(pending_ids_);
@@ -2414,6 +3846,7 @@ runtime::result<void> fake_file_system::begin_crash(fake_operation_id active) {
             continue;
         }
         if (auto scheduled = schedule_terminal(*operation); !scheduled) {
+            crash_.reset();
             return runtime::failure(scheduled.error());
         }
     }
@@ -2427,21 +3860,26 @@ runtime::result<void> fake_file_system::begin_crash(fake_operation_id active) {
     active_operation.crash_event.release();
     auto applied = scheduler_->schedule(
       scheduler_->now(),
-      event_priority::highest(),
+      config_.crash_policy ? event_priority::normal()
+                           : event_priority::highest(),
       [this, active] noexcept { apply_crash(active); },
       trace_event_descriptor{
         .kind = trace_event_kind::filesystem,
         .domain = runtime::descriptor_for(active_operation.point)->id.value(),
         .stable_id = active.value(),
         .result = static_cast<std::uint32_t>(
-          active_operation.kind == pending_kind::crash_control ? errc::success
-                                                               : errc::aborted),
-        .effect = trace_action::crash_applied,
+          config_.crash_policy
+              || active_operation.kind == pending_kind::crash_control
+            ? errc::success
+            : errc::aborted),
+        .effect = config_.crash_policy ? trace_action::crash_started
+                                       : trace_action::crash_applied,
       },
       event_cleanup_policy::invoke,
       std::move(active_operation.crash_trace));
     if (!applied) {
         active_operation.phase = pending_phase::queued;
+        crash_.reset();
         return runtime::failure(applied.error());
     }
     active_operation.completion_event = *applied;
@@ -2523,6 +3961,16 @@ void fake_file_system::apply_crash(fake_operation_id active) noexcept {
     if (operation == nullptr) {
         return;
     }
+    if (crash_) {
+        if (scheduler_->discarding_failed_event())
+            crash_->failure = *scheduler_->trace_failure();
+        crash_task_.emplace(run_selective_crash(active).then_wrapped(
+          [this,
+           active](seastar::future<runtime::result<void>> outcome) noexcept {
+              finish_selective_crash(active, std::move(outcome));
+          }));
+        return;
+    }
     if (scheduler_->discarding_failed_event()) [[unlikely]] {
         const auto* failure = scheduler_->trace_failure();
         KWAQUE_INVARIANT(
@@ -2532,6 +3980,7 @@ void fake_file_system::apply_crash(fake_operation_id active) noexcept {
         discard_operation(*operation, *failure);
         return;
     }
+    ++crash_epoch_;
     restore_durable_state();
     state_ = fake_file_system_state::open;
     operation_changed_.broadcast();
@@ -2584,6 +4033,7 @@ void fake_file_system::discard_remaining(
     pending_.copy_keys(pending_ids_);
     std::ranges::sort(pending_ids_);
     for (const auto value : pending_ids_) {
+        if (crash_ && value == crash_->active.value()) continue;
         if (auto* operation = pending_.find(value); operation != nullptr) {
             discard_operation(*operation, failure);
         }
@@ -2638,7 +4088,10 @@ runtime::result<seastar::file> fake_file_system::make_native_file_for_test(
         return runtime::failure(file_error(errc::is_a_directory));
     }
     if (open_handles_ == config_.maximum_open_handles) {
-        return runtime::failure(file_error(errc::queue_full));
+        return runtime::failure(
+          runtime::make_file_error(
+            errc::queue_full,
+            runtime::file_failure_detail::admission_not_dispatched));
     }
     auto handle = seastar::make_lw_shared<open_handle_state>();
     seastar::file native{seastar::make_shared<native_file_impl>(
@@ -2765,11 +4218,15 @@ runtime::result<void> fake_file_system::validate_submission(
       || retained_bytes.value()
            > config_.maximum_pending_bytes.value() - pending_bytes_.value()
       || retained_path_bytes > config_.maximum_retained_path_bytes.value()
-                                 - retained_path_bytes_ - pending_path_bytes_
+                                 - retained_path_bytes_ - history_name_bytes_
+                                 - pending_path_bytes_
       || (open_slot && open_handles_ + pending_opens_ == config_.maximum_open_handles)
       || (is_read_operation(kind) && pending_reads_ == config_.maximum_pending_reads)
       || (is_write_operation(kind) && pending_writes_ == config_.maximum_pending_writes)) {
-        return runtime::failure(file_error(errc::queue_full));
+        return runtime::failure(
+          runtime::make_file_error(
+            errc::queue_full,
+            runtime::file_failure_detail::admission_not_dispatched));
     }
     if (operation_ids_exhausted_) {
         return runtime::failure(file_error(errc::out_of_range));
@@ -2966,12 +4423,21 @@ fake_file_system::submit(
         return seastar::make_ready_future<runtime::result<pending_value>>(
           runtime::failure(occurrence_value.error()));
     }
-    auto prepared = faults_->prepare(
-      runtime::fault_request{
-        .point = runtime::descriptor_for(operation->point)->id,
-        .occurrence = *occurrence_value,
-        .object = object_key,
-      });
+    const runtime::fault_request request{
+      .point = runtime::descriptor_for(operation->point)->id,
+      .occurrence = *occurrence_value,
+      .object = object_key};
+    auto prepared
+      = faults_->has_contextual_rules(operation->point)
+          ? faults_->prepare_contextual(
+              request,
+              storage_fault_key(
+                {.scope = (config_.device_scope << 8U) | request.point.value(),
+                 .object = operation->object ? operation->object->value() : 0U,
+                 .generation = generation_,
+                 .position = io_position,
+                 .epoch = crash_epoch_}))
+          : faults_->prepare(request);
     if (!prepared) {
         return seastar::make_ready_future<runtime::result<pending_value>>(
           runtime::failure(prepared.error()));
@@ -3089,6 +4555,49 @@ fake_file_system::submit(
     operation->terminal_event = std::move(*terminal_event);
     operation->terminal_trace = std::move(*terminal_trace);
     if (
+      operation->fault.file_failure()
+      || operation->fault.action() == runtime::fault_action::drop_completion) {
+        operation->effect_generation = generation_;
+        operation->effect_epoch = crash_epoch_;
+        const std::array context{
+          trace_context_field{trace_context_key::expected, generation_},
+          trace_context_field{trace_context_key::actual, crash_epoch_},
+          trace_context_field{trace_context_key::detail, config_.device_scope}};
+        const auto observed = trace_event_descriptor{
+          .kind = descriptor.kind,
+          .domain = descriptor.domain,
+          .stable_id = operation->id.value(),
+          .effect = trace_action::file_effect_applied};
+        auto effect = scheduler_->reserve_effect(observed, context);
+        auto returned_descriptor = observed;
+        returned_descriptor.effect = trace_action::file_operation_result;
+        returned_descriptor.result = UINT32_C(0x10000);
+        auto returned = scheduler_->reserve_effect(
+          returned_descriptor, context);
+        if (!effect || !returned)
+            return seastar::make_ready_future<runtime::result<pending_value>>(
+              runtime::failure(!effect ? effect.error() : returned.error()));
+        operation->effect_trace = std::move(*effect);
+        operation->result_trace = std::move(*returned);
+        operation->effect_position = io_position;
+    }
+    if (operation->kind == pending_kind::space) {
+        auto reserved = scheduler_->reserve_effect(
+          trace_event_descriptor{
+            .kind = trace_event_kind::filesystem,
+            .domain = runtime::descriptor_for(
+                        runtime::builtin_fault_point::filesystem_space)
+                        ->id.value(),
+            .stable_id = operation->id.value(),
+            .effect = trace_action::filesystem_space_sampled});
+        if (!reserved) {
+            return seastar::make_ready_future<runtime::result<pending_value>>(
+              runtime::failure(reserved.error()));
+        }
+        std::get<metadata_operation>(operation->payload).space_trace
+          = std::move(*reserved);
+    }
+    if (
       operation->fault.action() == runtime::fault_action::partial_resize
       && applicable) {
         auto partial_resize_event = scheduler_->reserve_event_slot();
@@ -3127,9 +4636,12 @@ fake_file_system::submit(
             .domain = runtime::descriptor_for(operation->point)->id.value(),
             .stable_id = operation->id.value(),
             .result = static_cast<std::uint32_t>(
-              operation->kind == pending_kind::crash_control ? errc::success
-                                                             : errc::aborted),
-            .effect = trace_action::crash_applied,
+              config_.crash_policy
+                  || operation->kind == pending_kind::crash_control
+                ? errc::success
+                : errc::aborted),
+            .effect = config_.crash_policy ? trace_action::crash_started
+                                           : trace_action::crash_applied,
           });
         if (!crash_event || !crash_trace) {
             const auto error = !crash_event ? crash_event.error()
@@ -3150,16 +4662,17 @@ fake_file_system::submit(
     operation->accounted_bytes = retained_bytes;
     operation->accounted_path_bytes = path_bytes;
     operation->trace_kind = descriptor.kind;
-    auto waiting = operation->completion.get_future();
     const auto id = operation->id;
     const auto submitted_kind = operation->kind;
     const auto [position, inserted] = pending_.try_emplace(
       id.value(), std::move(owned_operation));
-    static_cast<void>(position);
     KWAQUE_INVARIANT(
       fake_storage_transaction_invariant,
       inserted,
       "pending fake operation ID was already present");
+    // Insertion can allocate. Attach the future only after its promise has
+    // stable ownership, so rollback cannot abandon a broken promise.
+    auto waiting = position->completion.get_future();
 
     const auto fault_committed = prepared->commit();
     if (!fault_committed) {
@@ -3218,8 +4731,16 @@ void fake_file_system::complete(fake_operation_id id) noexcept {
           failure != nullptr ? *failure : file_error(errc::replay_divergence));
         return;
     }
+    const bool observe = operation.fault.file_failure()
+                         || operation.fault.action()
+                              == runtime::fault_action::drop_completion;
+    auto reset_effect = seastar::defer(
+      [this] noexcept { effect_operation_ = nullptr; });
+    effect_operation_ = observe ? &operation : nullptr;
     try {
-        auto result = apply(operation);
+        auto result = operation.fault.file_failure()
+                        ? apply_file_failure(operation)
+                        : apply(operation);
         if (
           operation.phase == pending_phase::crash_apply_scheduled
           || operation.phase == pending_phase::partial_resize_apply_scheduled) {
@@ -3227,37 +4748,86 @@ void fake_file_system::complete(fake_operation_id id) noexcept {
         }
         const bool resolve = operation.fault.action()
                              != runtime::fault_action::drop_completion;
+        if (observe) {
+            if (!operation.effect_observed) {
+                std::uint64_t bytes = 0;
+                if (result) {
+                    if (const auto* count = std::get_if<byte_count>(&*result))
+                        bytes = count->value();
+                    else if (
+                      const auto* buffer
+                      = std::get_if<seastar::temporary_buffer<std::uint8_t>>(
+                        &*result))
+                        bytes = buffer->size();
+                }
+                observe_file_effect(bytes, result.has_value());
+            }
+            auto recorded = observe_file_result(
+              operation, result ? nullptr : &result.error(), resolve ? 1U : 2U);
+            if (!recorded) result = runtime::failure(recorded.error());
+        }
+        effect_operation_ = nullptr;
         finish(operation, std::move(result), resolve);
+    } catch (const runtime::detail::file_operation_exception& error) {
+        auto delivered = error.error();
+        if (observe && !scheduler_->trace_failed()) {
+            try {
+                if (!operation.effect_observed) observe_file_effect(0, false);
+                if (
+                  auto recorded = observe_file_result(operation, &delivered, 1);
+                  !recorded)
+                    delivered = recorded.error();
+            } catch (...) {
+                if (scheduler_->trace_failed())
+                    delivered = *scheduler_->trace_failure();
+            }
+        }
+        effect_operation_ = nullptr;
+        finish(operation, runtime::failure(delivered), true);
     } catch (...) {
-        auto completion = std::move(operation.completion);
-        const auto accounted_bytes = operation.accounted_bytes;
-        const auto accounted_path_bytes = operation.accounted_path_bytes;
-        const auto kind = operation.kind;
-        const bool open_slot = operation.open_slot;
-        const auto object = operation.object;
-        const auto erased = pending_.erase(id.value());
-        KWAQUE_INVARIANT(
-          fake_storage_transaction_invariant,
-          erased,
-          "failed fake operation disappeared during cleanup");
-        --pending_operations_;
-        pending_reads_ -= is_read_operation(kind);
-        pending_writes_ -= is_write_operation(kind);
-        pending_bytes_ = *pending_bytes_.checked_sub(accounted_bytes);
-        pending_path_bytes_ -= accounted_path_bytes;
-        if (open_slot) {
-            --pending_opens_;
+        const auto exception = std::current_exception();
+        if (observe && !scheduler_->trace_failed()) {
+            try {
+                if (!operation.effect_observed) observe_file_effect(0, false);
+                static_cast<void>(observe_file_result(operation, nullptr, 3));
+            } catch (...) { /* The original exception remains primary. */
+            }
         }
-        if (object) {
-            --find_inode(*object)->pending_references;
-            collect_unreachable(*object);
-        }
-        completion.set_exception(std::current_exception());
-        if (
-          state_ == fake_file_system_state::stopping
-          && pending_operations_ == 0) {
-            finish_stop();
-        }
+        effect_operation_ = nullptr;
+        finish_exception(operation, exception);
+    }
+}
+
+void fake_file_system::finish_exception(
+  pending_operation& operation, std::exception_ptr exception) noexcept {
+    const auto id = operation.id;
+    auto completion = std::move(operation.completion);
+    const auto accounted_bytes = operation.accounted_bytes;
+    const auto accounted_path_bytes = operation.accounted_path_bytes;
+    const auto kind = operation.kind;
+    const bool open_slot = operation.open_slot;
+    const auto object = operation.object;
+    const auto erased = pending_.erase(id.value());
+    KWAQUE_INVARIANT(
+      fake_storage_transaction_invariant,
+      erased,
+      "failed fake operation disappeared during cleanup");
+    --pending_operations_;
+    pending_reads_ -= is_read_operation(kind);
+    pending_writes_ -= is_write_operation(kind);
+    pending_bytes_ = *pending_bytes_.checked_sub(accounted_bytes);
+    pending_path_bytes_ -= accounted_path_bytes;
+    if (open_slot) {
+        --pending_opens_;
+    }
+    if (object) {
+        --find_inode(*object)->pending_references;
+        collect_unreachable(*object);
+    }
+    completion.set_exception(exception);
+    if (
+      state_ == fake_file_system_state::stopping && pending_operations_ == 0) {
+        finish_stop();
     }
 }
 
@@ -3373,7 +4943,123 @@ fake_file_system::apply_open(metadata_operation& metadata, bool& open_slot) {
         --pending_opens_;
         open_slot = false;
     }
-    return pending_open{std::move(native), std::move(statistics)};
+    return pending_open{
+      std::move(native),
+      std::move(statistics),
+      metadata.open_options.close_policy};
+}
+
+void fake_file_system::observe_file_effect(std::uint64_t bytes, bool applied) {
+    auto* operation = effect_operation_;
+    if (operation == nullptr || operation->effect_observed) return;
+    const auto effect = !applied ? 0U
+                        : operation->configured_action
+                            == runtime::fault_action::file_failure_after_prefix
+                          ? 1U
+                          : 2U;
+    const std::array context{
+      trace_context_field{
+        trace_context_key::expected, operation->effect_generation},
+      trace_context_field{trace_context_key::actual, operation->effect_epoch},
+      trace_context_field{trace_context_key::detail, config_.device_scope}};
+    auto observed = scheduler_->observe_effect(
+      {.kind = operation->trace_kind,
+       .domain = runtime::descriptor_for(operation->point)->id.value(),
+       .stable_id = operation->id.value(),
+       .coordinate_a = operation->object ? operation->object->value() : 0U,
+       .coordinate_b = operation->effect_position,
+       .value = applied ? bytes : 0U,
+       .result = effect,
+       .effect = trace_action::file_effect_applied},
+      context,
+      operation->effect_trace);
+    if (!observed)
+        throw runtime::detail::file_operation_exception{observed.error()};
+    operation->effect_bytes = applied ? bytes : 0U;
+    operation->effect_observed = true;
+}
+
+runtime::result<void> fake_file_system::observe_file_result(
+  pending_operation& operation,
+  const runtime::operation_error* error,
+  std::uint32_t receipt) noexcept {
+    auto detail = runtime::file_failure_detail::unknown;
+    if (error != nullptr) {
+        if (auto value = runtime::file_detail(*error); value) detail = *value;
+    }
+    const std::array context{
+      trace_context_field{
+        trace_context_key::expected, operation.effect_generation},
+      trace_context_field{trace_context_key::actual, operation.effect_epoch},
+      trace_context_field{trace_context_key::detail, config_.device_scope}};
+    return scheduler_->observe_effect(
+      {.kind = operation.trace_kind,
+       .domain = runtime::descriptor_for(operation.point)->id.value(),
+       .stable_id = operation.id.value(),
+       .coordinate_a = operation.object ? operation.object->value() : 0U,
+       .coordinate_b = operation.effect_position,
+       .value = operation.effect_bytes,
+       .result = (receipt << 16U) | (static_cast<std::uint32_t>(detail) << 8U)
+                 | static_cast<std::uint32_t>(
+                   error ? error->code() : errc::success),
+       .effect = trace_action::file_operation_result},
+      context,
+      operation.result_trace);
+}
+
+runtime::result<fake_file_system::pending_value>
+fake_file_system::apply_file_failure(pending_operation& operation) {
+    const auto decision = operation.fault;
+    auto* io = std::get_if<native_io_operation>(&operation.payload);
+    if (io && io->generation != generation_)
+        return runtime::failure(file_error(errc::aborted));
+    auto failure = runtime::make_file_error(
+      runtime::file_failure_code(decision.file_cause()), decision.file_cause());
+    static_cast<void>(failure.add_context(
+      runtime::operation_context_key::bytes, io ? io->requested_bytes : 0U));
+    static_cast<void>(failure.add_context(
+      runtime::operation_context_key::stable_id,
+      operation.object ? operation.object->value() : 0U));
+    static_cast<void>(failure.add_context(
+      runtime::operation_context_key::sequence, operation.id.value()));
+    if (
+      decision.action() == runtime::fault_action::file_failure_before_effect) {
+        if (io && io->intent) static_cast<void>(io->intent->retrieve());
+        observe_file_effect(0, false);
+        return runtime::failure(failure);
+    }
+    const auto position = io ? io->position : 0U;
+    const auto bytes = io ? io->requested_bytes : 0U;
+    if (decision.action() == runtime::fault_action::file_failure_after_prefix) {
+        const auto prefix = decision.file_prefix().value();
+        if (operation.kind == pending_kind::write) {
+            if (prefix >= bytes)
+                return runtime::failure(file_error(errc::invalid_argument));
+            io->requested_bytes = prefix;
+        } else if (operation.kind == pending_kind::truncate) {
+            const auto old = std::get<regular_file_state>(
+                               find_inode(*operation.object)->state)
+                               .visible_size;
+            if (
+              prefix <= std::min(old, position)
+              || prefix >= std::max(old, position))
+                return runtime::failure(file_error(errc::invalid_argument));
+            io->position = prefix;
+        } else
+            return runtime::failure(file_error(errc::invalid_argument));
+    }
+    auto restore = seastar::defer(
+      [&operation, io, position, bytes, decision] noexcept {
+          operation.fault = decision;
+          if (io) {
+              io->position = position;
+              io->requested_bytes = bytes;
+          }
+      });
+    operation.fault = runtime::fault_decision{};
+    auto applied = apply(operation);
+    if (!applied) return applied;
+    return runtime::failure(failure);
 }
 
 runtime::result<fake_file_system::pending_value>
@@ -3432,6 +5118,42 @@ fake_file_system::apply(pending_operation& operation) {
     }
 
     switch (operation.kind) {
+    case pending_kind::cursor_open: {
+        auto& cursor = *metadata->cursor;
+        auto object = lookup(*metadata->path);
+        if (!object) return runtime::failure(object.error());
+        if (find_inode(*object)->kind != fake_file_kind::directory)
+            return runtime::failure(file_error(errc::not_a_directory));
+        if (auto retained = retain_open_reference(*object); !retained)
+            return runtime::failure(retained.error());
+        cursor.object = *object;
+        cursor.handle->reference_owned = true;
+        cursor.opened = true;
+        ++open_handles_;
+        --pending_opens_;
+        operation.open_slot = false;
+        return pending_value{std::monostate{}};
+    }
+    case pending_kind::cursor_next: {
+        if (metadata->cursor->handle->generation != generation_)
+            return runtime::failure(file_error(errc::aborted));
+        auto page = read_cursor_page(
+          *metadata->cursor,
+          metadata->page_limits,
+          std::move(*metadata->page_reservation));
+        metadata->page_reservation.reset();
+        if (!page) return runtime::failure(page.error());
+        return pending_value{std::move(*page)};
+    }
+    case pending_kind::cursor_sync: {
+        auto result = sync_directory(*metadata->cursor->object);
+        if (!result) return runtime::failure(result.error());
+        return pending_value{std::monostate{}};
+    }
+    case pending_kind::cursor_close:
+        release_handle_reference(
+          *metadata->cursor->object, metadata->cursor->handle);
+        return pending_value{std::monostate{}};
     case pending_kind::open: {
         auto opened = apply_open(*metadata, operation.open_slot);
         if (!opened) {
@@ -3462,6 +5184,48 @@ fake_file_system::apply(pending_operation& operation) {
                     : runtime::file_kind::directory,
           .size = byte_count{size},
         }};
+    }
+    case pending_kind::space: {
+        const auto sampled =
+          [&] -> runtime::result<runtime::file_system_space> {
+            const auto found = lookup(*metadata->path);
+            if (!found) return runtime::failure(found.error());
+            if (config_.space_error)
+                return runtime::failure(file_error(*config_.space_error));
+            if (config_.space_override) return *config_.space_override;
+            const auto free = config_.logical_capacity.checked_sub(
+              retained_capacity_);
+            KWAQUE_INVARIANT(
+              fake_storage_transaction_invariant,
+              free.has_value(),
+              "retained bytes exceeded configured capacity");
+            return runtime::file_system_space::make(
+              config_.logical_capacity, *free, *free, false);
+        }();
+        trace_event_descriptor observation{
+          .kind = trace_event_kind::filesystem,
+          .domain = runtime::descriptor_for(
+                      runtime::builtin_fault_point::filesystem_space)
+                      ->id.value(),
+          .stable_id = operation.id.value(),
+          .effect = trace_action::filesystem_space_sampled};
+        if (sampled) {
+            observation.coordinate_a = sampled->capacity().value();
+            observation.coordinate_b = sampled->free().value();
+            observation.value = sampled->available().value();
+            observation.result = sampled->read_only() ? 1U : 0U;
+        } else {
+            observation.result = UINT32_C(0x100)
+                                 | static_cast<std::uint32_t>(
+                                   sampled.error().code());
+        }
+        if (
+          auto observed = scheduler_->observe_effect(
+            observation, {}, metadata->space_trace);
+          !observed)
+            return runtime::failure(observed.error());
+        if (!sampled) return runtime::failure(sampled.error());
+        return pending_value{*sampled};
     }
     case pending_kind::list: {
         seastar::chunked_vector<runtime::directory_entry> entries;
@@ -3558,6 +5322,19 @@ fake_file_system::apply(pending_operation& operation) {
             return runtime::failure(valid.error());
         }
 
+        if (config_.crash_policy) {
+            if (
+              missing.size() > config_.crash_policy->maximum_namespace_groups
+                                 - namespace_history_.size()
+              || missing.size() >= UINT64_MAX - next_namespace_sequence_)
+                return runtime::failure(file_error(errc::resource_exhausted));
+            std::int64_t names = path_delta;
+            for (const auto& path : missing)
+                names += static_cast<std::int64_t>(
+                  path.components().back().size());
+            if (auto valid = validate_path_delta(names); !valid)
+                return runtime::failure(valid.error());
+        }
         seastar::chunked_vector<fake_object_id> staged_ids;
         staged_ids.reserve(missing.size());
         objects_.reserve(objects_.size() + missing.size());
@@ -3594,9 +5371,11 @@ fake_file_system::apply(pending_operation& operation) {
             throw;
         }
 
+        seastar::chunked_vector<std::unique_ptr<namespace_transaction>>
+          histories;
         seastar::chunked_vector<prepared_directory_change> changes;
-        changes.reserve(missing.size());
         try {
+            changes.reserve(missing.size());
             for (std::size_t index = 0; index < missing.size(); ++index) {
                 auto& parent_state
                   = index == 0 ? first_parent_state
@@ -3608,8 +5387,21 @@ fake_file_system::apply(pending_operation& operation) {
                   parent_state,
                   missing[index].components().back(),
                   staged_ids[index]);
+                if (config_.crash_policy)
+                    histories.push_back(
+                      std::make_unique<namespace_transaction>(
+                        *this,
+                        namespace_change{
+                          index == 0 ? *first_parent : staged_ids[index - 1U],
+                          missing[index].components().back(),
+                          std::nullopt,
+                          staged_ids[index]},
+                        std::nullopt,
+                        next_namespace_sequence_ + index));
             }
+            observe_file_effect(0);
         } catch (...) {
+            histories.clear();
             changes.clear();
             for (const auto id : staged_ids) {
                 objects_.erase(id.value());
@@ -3620,6 +5412,8 @@ fake_file_system::apply(pending_operation& operation) {
         for (auto& change : changes) {
             change.commit();
         }
+        for (auto& history : histories)
+            history->commit();
         const auto final_id = staged_ids.back().value();
         if (final_id == std::numeric_limits<std::uint64_t>::max()) {
             object_ids_exhausted_ = true;
@@ -3643,7 +5437,10 @@ fake_file_system::apply(pending_operation& operation) {
         return pending_value{std::monostate{}};
     }
     case pending_kind::rename: {
-        auto result = rename(*metadata->path, *metadata->destination_path);
+        auto result = rename(
+          *metadata->path,
+          *metadata->destination_path,
+          metadata->rename_policy);
         if (!result) {
             return runtime::failure(result.error());
         }
@@ -3824,6 +5621,7 @@ void fake_file_system::finish(
 }
 
 void fake_file_system::collect_unreachable(fake_object_id candidate) {
+    if (crash_) return;
     collection_worklist_.reset();
     collection_worklist_.push_back(candidate.value());
     seastar::chunked_vector<std::uint64_t> none;
@@ -3832,6 +5630,7 @@ void fake_file_system::collect_unreachable(fake_object_id candidate) {
 
 void fake_file_system::collect_unreachable_from(
   seastar::chunked_vector<std::uint64_t> pending) {
+    if (crash_) return;
     if (!pending.empty()) {
         collection_worklist_.reset();
         for (const auto id : pending) {
@@ -3847,7 +5646,7 @@ void fake_file_system::collect_unreachable_from(
         if (
           object.id.value() == 1 || object.visible_links != 0
           || object.durable_links != 0 || object.open_references != 0
-          || object.pending_references != 0) {
+          || object.pending_references != 0 || object.history_references != 0) {
             continue;
         }
         if (object.kind == fake_file_kind::regular) {
@@ -3866,7 +5665,8 @@ void fake_file_system::collect_unreachable_from(
                 if (
                   child->visible_links == 0 && child->durable_links == 0
                   && child->open_references == 0
-                  && child->pending_references == 0) {
+                  && child->pending_references == 0
+                  && child->history_references == 0) {
                     collection_worklist_.push_back(child_id.value());
                 }
             }
@@ -3880,7 +5680,8 @@ void fake_file_system::collect_unreachable_from(
                 if (
                   child->visible_links == 0 && child->durable_links == 0
                   && child->open_references == 0
-                  && child->pending_references == 0) {
+                  && child->pending_references == 0
+                  && child->history_references == 0) {
                     collection_worklist_.push_back(replacement->value());
                 }
             }

@@ -807,3 +807,13 @@ cc_binary(
         "@yaml-cpp",
     ],
 )
+
+cc_library(
+    name = "file_test_support",
+    testonly = True,
+    hdrs = ["src/core/file-impl.hh"],
+    include_prefix = "seastar/testing",
+    strip_include_prefix = "src/core",
+    visibility = ["//visibility:public"],
+    deps = [":seastar"],
+)

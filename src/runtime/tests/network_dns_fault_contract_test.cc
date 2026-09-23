@@ -105,7 +105,7 @@ static_assert(sizeof(kwaque::runtime::network_endpoint) <= 32);
 static_assert(sizeof(kwaque::runtime::fault_object_key) <= 40);
 static_assert(sizeof(kwaque::runtime::fault_request) <= 64);
 static_assert(sizeof(kwaque::runtime::fault_decision) <= 16);
-static_assert(kwaque::runtime::builtin_fault_points.size() == 27);
+static_assert(kwaque::runtime::builtin_fault_points.size() == 31);
 
 TEST(NetworkContractTest, ParsesOnlyCanonicalNumericEndpoints) {
     const auto ipv4 = kwaque::runtime::network_address::try_parse_numeric(
@@ -511,7 +511,20 @@ TEST(FaultContractTest, BuiltinPointTableHasExactLegalActionSets) {
     EXPECT_FALSE(environment_stop->permitted_actions.contains(
       kwaque::runtime::fault_action::drop_completion));
 
-    const auto unknown_point = kwaque::runtime::fault_point_id::make(28);
+    const auto* space = kwaque::runtime::descriptor_for(
+      kwaque::runtime::builtin_fault_point::filesystem_space);
+    ASSERT_NE(space, nullptr);
+    EXPECT_EQ(space->id.value(), 28U);
+    EXPECT_EQ(space->name, "filesystem_space");
+    EXPECT_TRUE(
+      space->permitted_actions.contains(kwaque::runtime::fault_action::delay));
+    EXPECT_TRUE(space->permitted_actions.contains(
+      kwaque::runtime::fault_action::drop_completion));
+    EXPECT_FALSE(space->permitted_actions.contains(
+      kwaque::runtime::fault_action::torn_write));
+
+    const auto unknown_point = kwaque::runtime::fault_point_id::make(
+      kwaque::runtime::builtin_fault_points.back().id.value() + 1U);
     ASSERT_TRUE(unknown_point.has_value());
     EXPECT_EQ(
       kwaque::runtime::find_builtin_fault_point(*unknown_point), nullptr);
@@ -533,3 +546,54 @@ TEST(FaultContractTest, BuiltinPointTableHasExactLegalActionSets) {
 }
 
 } // namespace
+
+TEST(
+  FaultContractTest, TypedFileFailuresRejectInvalidCausesAndMetadataPrefixes) {
+    using namespace kwaque::runtime;
+    for (const auto action :
+         {fault_action::file_failure_before_effect,
+          fault_action::file_failure_after_prefix,
+          fault_action::file_failure_after_effect}) {
+        auto made = fault_decision::make_file_failure(
+          action,
+          file_failure_detail::no_space,
+          kwaque::byte_count{
+            action == fault_action::file_failure_after_prefix ? 512U : 0U});
+        ASSERT_TRUE(made.has_value());
+        EXPECT_TRUE(made->file_failure());
+        EXPECT_EQ(made->file_cause(), file_failure_detail::no_space);
+        fault_request write{
+          descriptor_for(builtin_fault_point::file_write)->id,
+          fault_occurrence::first(),
+          fault_object_key::none()};
+        EXPECT_TRUE(validate_fault_decision(write, *made).has_value());
+        fault_request rename{
+          descriptor_for(builtin_fault_point::file_rename)->id,
+          fault_occurrence::first(),
+          fault_object_key::none()};
+        EXPECT_EQ(
+          validate_fault_decision(rename, *made).has_value(),
+          action != fault_action::file_failure_after_prefix);
+        EXPECT_FALSE(
+          fault_decision::make_file_failure(
+            action,
+            file_failure_detail::admission_not_dispatched,
+            made->file_prefix())
+            .has_value());
+    }
+    EXPECT_FALSE(
+      fault_decision::make_file_failure(
+        fault_action::error, file_failure_detail::unknown)
+        .has_value());
+    EXPECT_FALSE(
+      fault_decision::make_file_failure(
+        fault_action::file_failure_after_prefix, file_failure_detail::device_io)
+        .has_value());
+    EXPECT_FALSE(
+      fault_decision::make_file_failure(
+        fault_action::file_failure_before_effect,
+        static_cast<file_failure_detail>(8))
+        .has_value());
+    static_assert(
+      static_cast<std::uint8_t>(fault_action::partial_resize) == 13);
+}

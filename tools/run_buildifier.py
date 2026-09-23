@@ -77,10 +77,17 @@ def main() -> int:
     if not files:
         print("No Bazel or Starlark files selected.")
         return 0
+    # Hooks and CI must produce terminal diffs even in a desktop environment.
+    diff_options = (
+        ["-diff_command=diff -u", "-multi_diff=false"]
+        if arguments.mode == "diff"
+        else []
+    )
     result = subprocess.run(
         [
             str(resolve_runfile(arguments.tool)),
             f"-mode={arguments.mode}",
+            *diff_options,
             *map(str, files),
         ],
         cwd=root,

@@ -255,6 +255,15 @@ public:
 
     [[nodiscard]] runtime::result<prepared_fault_evaluation>
     prepare(const runtime::fault_request& request) noexcept;
+    [[nodiscard]] runtime::result<prepared_fault_evaluation> prepare_contextual(
+      const runtime::fault_request& request,
+      runtime::fault_object_key context) noexcept;
+    [[nodiscard]] bool
+    has_contextual_rules(runtime::builtin_fault_point point) const noexcept {
+        assert_current();
+        const auto index = static_cast<std::size_t>(point);
+        return index < contextual_points_.size() && contextual_points_[index];
+    }
     [[nodiscard]] runtime::result<prepared_fault_evaluation> prepare(
       const runtime::fault_request& request,
       runtime::monotonic_time now,
@@ -281,6 +290,11 @@ public:
 
 private:
     friend class prepared_fault_evaluation;
+    [[nodiscard]] runtime::result<prepared_fault_evaluation> prepare_impl(
+      const runtime::fault_request& request,
+      runtime::monotonic_time now,
+      runtime::monotonic_time maximum_deadline,
+      const runtime::fault_object_key* context) noexcept;
 
     struct rule_group final {
         runtime::builtin_fault_point point;
@@ -298,6 +312,7 @@ private:
         seastar::chunked_vector<rule_group> groups;
         std::array<group_range, runtime::builtin_fault_points.size()> ranges;
     };
+    std::array<bool, runtime::builtin_fault_points.size()> contextual_points_{};
     [[nodiscard]] static runtime::result<rule_index> index_rules(
       seastar::chunked_vector<fault_rule>& rules, fault_schedule_limits limits);
 

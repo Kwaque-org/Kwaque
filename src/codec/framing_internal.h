@@ -18,12 +18,6 @@ admit_usage(const operation_usage&, const limits&, byte_count, field_context);
   const limits&,
   bytes::allocation_charge_fn,
   field_context);
-[[nodiscard]] seastar::future<result<bytes::buffer_allocation_cost>>
-body_input_cost(
-  const bytes::fragmented_buffer&,
-  cooperative_work&,
-  bytes::allocation_charge_fn,
-  field_context);
 [[nodiscard]] result<void> admit_header_owner(
   byte_count prefix_bytes,
   const bytes::buffer_allocation_cost&,

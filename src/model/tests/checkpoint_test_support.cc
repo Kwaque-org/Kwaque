@@ -113,7 +113,7 @@ probe_result probe(std::string_view wire, topic_id expected, bool complete) {
     if (reader > writer) return {.error = errc::malformed_data};
     if (writer == 0 || reader == 0) return {.error = errc::unsupported_format};
     if (family == 0) return {.error = errc::malformed_data};
-    if (family > 10 || reader > 1 || little(wire, 16, 8) != 0)
+    if (family > 11 || reader > 1 || little(wire, 16, 8) != 0)
         return {.error = errc::unsupported_format};
     std::size_t extension = 32;
     std::uint64_t previous = 0;

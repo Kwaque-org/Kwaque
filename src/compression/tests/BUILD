@@ -216,6 +216,7 @@ kwaque_cc_benchmark(
         "//src/codec:integer",
         "//src/codec:limits",
         "//src/codec/tests:codec_bench_reference",
+        "//src/codec/tests:qualification_profile",
         "//src/compression",
         "//src/compression:lz4",
         "@fmt",

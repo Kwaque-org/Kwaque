@@ -3,6 +3,18 @@ load("//bazel:build.bzl", "kwaque_cc_library")
 package(default_visibility = ["//visibility:private"])
 
 kwaque_cc_library(
+    name = "storage_fault_key",
+    hdrs = ["storage_fault_key.h"],
+    visibility = ["//src/simulation/tests:__pkg__"],
+    deps = [
+        ":deterministic_random",
+        "//src/codec:sha256",
+        "//src/runtime:fault",
+        "//src/runtime:random",
+    ],
+)
+
+kwaque_cc_library(
     name = "event_trace",
     srcs = ["event_trace.cc"],
     hdrs = [
@@ -312,11 +324,14 @@ kwaque_cc_library(
     deps = [
         ":fault_schedule",
         ":scheduler",
+        ":storage_fault_key",
         "//src/base",
         "//src/base:invariant",
+        "//src/codec:sha256",
         "//src/runtime:error",
         "//src/runtime:fault_api",
         "//src/runtime:file",
+        "//src/runtime:file_error_internal",
         "//src/runtime:shard_affinity",
         "@abseil-cpp//absl/container:btree",
         "@seastar",

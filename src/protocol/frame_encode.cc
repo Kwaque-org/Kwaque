@@ -1,5 +1,6 @@
 #include "src/base/error.h"
 #include "src/base/invariant.h"
+#include "src/codec/buffer_cost_internal.h"
 #include "src/codec/crc32c.h"
 #include "src/codec/crc32c_cooperative.h"
 #include "src/codec/framing_internal.h"
@@ -30,11 +31,11 @@ namespace {
 
 using bytes::fragmented_buffer;
 
+using codec::detail::buffer_input_cost;
 using codec::detail::framing::add_charge;
 using codec::detail::framing::admit_alias_allocations;
 using codec::detail::framing::admit_header_owner;
 using codec::detail::framing::admit_usage;
-using codec::detail::framing::body_input_cost;
 using codec::detail::framing::encode_error;
 
 seastar::future<result<fragmented_buffer>> encode_owned(
@@ -85,7 +86,7 @@ seastar::future<result<fragmented_buffer>> encode_owned(
     if (auto ready = work.poll(anchor); !ready) {
         co_return codec::failure(ready.error());
     }
-    const auto body_cost = co_await body_input_cost(
+    const auto body_cost = co_await buffer_input_cost(
       body, work, charge, context);
     if (!body_cost) {
         co_return codec::failure(body_cost.error());

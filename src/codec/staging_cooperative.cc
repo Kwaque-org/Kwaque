@@ -2,13 +2,12 @@
 
 #include "src/base/invariant.h"
 #include "src/bytes/fragmented_buffer_builder.h"
+#include "src/codec/buffer_cost_internal.h"
 #include "src/codec/transaction.h"
 
 #include <seastar/core/coroutine.hh>
 #include <seastar/coroutine/maybe_yield.hh>
 
-#include <algorithm>
-#include <array>
 #include <cstdint>
 #include <exception>
 #include <limits>
@@ -43,60 +42,6 @@ multiply(byte_count amount, std::uint64_t count, field_context context) {
         return codec::failure(at(errc::out_of_range, context));
     }
     return byte_count{amount.value() * count};
-}
-
-// The native descriptor query is divided before it enters its synchronous
-// loop. Descriptor history is charged once by the range starting at zero.
-seastar::future<result<bytes::buffer_allocation_cost>> input_cost(
-  const fragmented_buffer& input,
-  cooperative_work& work,
-  bytes::allocation_charge_fn charge,
-  field_context context) {
-    const auto anchor = at(errc::success, context);
-    bytes::buffer_allocation_cost total;
-    byte_count aggregate;
-    const auto quantum = work.item_quantum().value();
-    if (!input.empty() && quantum < 6) {
-        co_return codec::failure(at(errc::resource_exhausted, context));
-    }
-    const auto batch = quantum < 6 ? 1U : (quantum - 2U) / 4U;
-    std::size_t first = 0;
-    do {
-        const auto count = std::min<std::size_t>(
-          input.fragment_count() - first, batch);
-        auto admitted = co_await work.admit(
-          byte_count{}, item_count{count == 0 ? 1U : 4U * count + 2U}, anchor);
-        if (!admitted) {
-            co_return codec::failure(admitted.error());
-        }
-        if (auto ready = work.poll(anchor); !ready) {
-            co_return codec::failure(ready.error());
-        }
-        const auto part = input.allocation_cost(first, count, charge);
-        if (!part) {
-            co_return codec::failure(
-              detail::allocation_cost_error(
-                part.error(), context, context.origin));
-        }
-        for (const auto amount :
-             {part->backing, part->descriptors, part->share_controls}) {
-            if (auto summed = add(aggregate, amount, context); !summed) {
-                co_return codec::failure(summed.error());
-            }
-        }
-        // Each category is bounded by the already checked aggregate.
-        total.backing = byte_count{
-          total.backing.value() + part->backing.value()};
-        total.descriptors = byte_count{
-          total.descriptors.value() + part->descriptors.value()};
-        total.share_controls = byte_count{
-          total.share_controls.value() + part->share_controls.value()};
-        total.largest_allocation = std::max(
-          total.largest_allocation, part->largest_allocation);
-        first += count;
-    } while (first != input.fragment_count());
-    total.fragments = item_count{input.fragment_count()};
-    co_return total;
 }
 
 // Both sources are published owners, so assembly transfers whole fragments.
@@ -229,7 +174,8 @@ seastar::future<result<fragmented_buffer>> assemble_owned(
     const auto policy = work.policy();
     byte_count input_backing;
     for (const auto* source : {&prefix, &payload}) {
-        const auto cost = co_await input_cost(*source, work, charge, context);
+        const auto cost = co_await detail::buffer_input_cost(
+          *source, work, charge, context);
         if (!cost) {
             co_return codec::failure(cost.error());
         }

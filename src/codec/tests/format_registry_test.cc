@@ -59,7 +59,8 @@ constexpr std::array families{
   format_family::sealed_extent,
   format_family::sparse_index,
   format_family::range_manifest,
-  format_family::read_checkpoint};
+  format_family::read_checkpoint,
+  format_family::local_storage};
 
 static_assert(
   std::same_as<std::underlying_type_t<format_family>, std::uint16_t>);
@@ -84,7 +85,7 @@ static_assert(std::same_as<
 static_assert(noexcept(lookup_format(1)));
 static_assert(lookup_format(1).has_value());
 static_assert(!lookup_format(0).has_value());
-static_assert(!lookup_format(11).has_value());
+static_assert(!lookup_format(12).has_value());
 static_assert(lookup_format(1)->current() == 1);
 static_assert(lookup_format(10)->family() == format_family::read_checkpoint);
 
@@ -114,7 +115,7 @@ static_assert(replacement_is_rejected(
     static_cast<format_family>(0), 1, 1, 1, 1)));
 static_assert(replacement_is_rejected(
   format_registry_test_access::make(
-    static_cast<format_family>(11), 1, 1, 1, 1)));
+    static_cast<format_family>(12), 1, 1, 1, 1)));
 static_assert(replacement_is_rejected(
   format_registry_test_access::make(
     format_family::submitted_batch, 0, 0, 0, 0)));
@@ -153,7 +154,7 @@ static_assert(
 static_assert(
   validate_required_features(0, current_reader, features_anchor).has_value());
 
-TEST(FormatRegistryTest, ExactlyTenNamedFamiliesUseTheInitialProfile) {
+TEST(FormatRegistryTest, RegisteredNamedFamiliesUseTheInitialProfile) {
     for (std::size_t index = 0; index < families.size(); ++index) {
         const auto selected = lookup_format(
           static_cast<std::uint16_t>(index + 1U), family_anchor);
@@ -178,7 +179,7 @@ TEST(FormatRegistryTest, EveryRawFamilyIsCheckedAndKeepsTrustedDiagnostics) {
     for (std::uint32_t raw = 0; raw <= maximum_version; ++raw) {
         const auto selected = lookup_format(
           static_cast<std::uint16_t>(raw), family_anchor);
-        ASSERT_EQ(selected.has_value(), raw >= 1U && raw <= 10U) << raw;
+        ASSERT_EQ(selected.has_value(), raw >= 1U && raw <= 11U) << raw;
         if (!selected) {
             EXPECT_EQ(
               selected.error(),

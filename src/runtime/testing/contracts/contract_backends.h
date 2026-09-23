@@ -69,8 +69,28 @@ private:
     std::uint64_t next_{1};
 };
 
+class contract_directory_cursor final {
+public:
+    contract_directory_cursor(contract_directory_cursor&&) noexcept = default;
+    contract_directory_cursor&
+    operator=(contract_directory_cursor&&) noexcept = default;
+    contract_directory_cursor(const contract_directory_cursor&) = delete;
+    contract_directory_cursor&
+    operator=(const contract_directory_cursor&) = delete;
+    seastar::future<result<directory_page>> next(directory_page_limits) {
+        return detail::unavailable<directory_page>(operation_kind::file);
+    }
+    seastar::future<result<void>> sync() { return detail::success(); }
+    seastar::future<result<void>> close() { return detail::success(); }
+};
+
 class contract_file_system final {
 public:
+    using directory_cursor_type = contract_directory_cursor;
+    seastar::future<result<directory_cursor_type>>
+    open_directory(file_path, file_close_policy = file_close_policy::legacy) {
+        return detail::unavailable<directory_cursor_type>(operation_kind::file);
+    }
     seastar::future<result<file>> open(file_path, file_open_options) {
         return detail::unavailable<file>(operation_kind::file);
     }
@@ -80,6 +100,9 @@ public:
     seastar::future<result<file_status>> stat(file_path) {
         return seastar::make_ready_future<result<file_status>>(
           result<file_status>{file_status{file_kind::regular, byte_count{}}});
+    }
+    seastar::future<result<file_system_space>> space(file_path) {
+        return detail::unavailable<file_system_space>(operation_kind::file);
     }
     seastar::future<result<directory_listing>>
     list(file_path, directory_listing_limits limits) {
@@ -97,10 +120,12 @@ public:
     seastar::future<result<void>> remove_directory(file_path) {
         return detail::success();
     }
-    seastar::future<result<void>> rename(file_path, file_path) {
+    seastar::future<result<void>> rename(
+      file_path, file_path, file_rename_policy = file_rename_policy::replace) {
         return detail::success();
     }
-    seastar::future<result<void>> sync_directory(file_path) {
+    seastar::future<result<void>>
+    sync_directory(file_path, file_close_policy = file_close_policy::legacy) {
         return detail::success();
     }
 };

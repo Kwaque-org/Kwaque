@@ -31,6 +31,19 @@ struct batch_probe final {
     codec::sha256_digest record_digest{};
     bool compressed{false};
     bool canonical{false};
+    // Set only after LZ4 header/profile validation, when body expansion fails.
+    // Input splits can expose excess output before a later checksum failure.
+    bool compression_body_error{false};
+
+    [[nodiscard]] bool matches_error(errc actual) const noexcept {
+        if (actual == error) return true;
+        if (!compression_body_error) return false;
+        const bool expected_damage = error == errc::malformed_data
+                                     || error == errc::corrupt_data;
+        const bool actual_damage = actual == errc::malformed_data
+                                   || actual == errc::corrupt_data;
+        return expected_damage && actual_damage;
+    }
 };
 
 // Independent bounded arithmetic grammar. Encoded fuzz bytes are contiguous;

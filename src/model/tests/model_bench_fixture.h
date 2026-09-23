@@ -1,6 +1,7 @@
 #pragma once
 
 #include "src/codec/tests/benchmark_buffer.h"
+#include "src/codec/tests/qualification_profile.h"
 #include "src/model/batch_builder.h"
 #include "src/model/batch_codec.h"
 #include "src/model/record_codec.h"
@@ -53,7 +54,8 @@ public:
     std::optional<codec::semantic_batch_digest> digest;
     byte_count record_region_bytes;
     byte_count cache_charge;
-    byte_count remaining{63U << 20U};
+    byte_count remaining{
+      (64U << 20U) - codec::testing::execution_reservation.value()};
 
 private:
     bool initialized_{false};

@@ -244,7 +244,8 @@ class Writer:
 
 
 # These declarations index state by stable IDs. Export sorts keys; page cleanup
-# and handle invalidation are commutative. No hash traversal assigns event IDs.
+# and handle invalidation are commutative. Cleanup progress exposes only counts,
+# never the identity of a hash-selected object.
 ALLOWANCES = (
     Allowance(
         "src/observability/event_codec_test.cc", "host-clock",
@@ -515,6 +516,7 @@ ALLOWANCES += (
                     .id = id, .kind = object->kind,
                     .open_references = object->open_references,
                     .pending_references = object->pending_references,
+                    .history_references = object->history_references,
                     .visible_links = object->visible_links,
                     .durable_links = object->durable_links,
                     .occurrences = object->occurrences,
@@ -535,6 +537,7 @@ ALLOWANCES += (
                       copy_pages(file.durable_pages, copy.durable_bytes);
                   } else {
                       const auto& directory = std::get<fake_file_system::directory_state>(object->state);
+                      copy.namespace_synced_sequence = directory.synced_sequence;
                       for (const auto& [name, child] : directory.durable) {
                           copy.durable_entries.emplace_back(name, child.value());
                       }
@@ -760,6 +763,57 @@ ALLOWANCES += (
     }""",
         1,
         "Volatile overrides are std::map nodes traversed in ascending page order.",
+    ),
+)
+
+
+# Exact bounded cursor/crash traversals and already-byte copies.
+ALLOWANCES += (
+    Allowance(
+        "src/simulation/fake_file.cc", "unordered-iteration",
+        'for (auto& change : state.pages) {\n            auto& file = std::get<regular_file_state>(\n              find_inode(change.object)->state);\n            if (change.replacement)\n                file.durable_pages.find(change.index)->second.bytes = std::move(\n                  change.replacement);\n            else\n                file.durable_pages.erase(change.index);\n            if (pause()) co_await crash_pause{*this};\n        }',
+        1, 'The staged changes are a chunked_vector in canonical page order; hash maps are accessed only by the recorded index.',
+    ),
+    Allowance(
+        "src/simulation/fake_file.cc", "unordered-iteration",
+        'while (!file.visible_pages.empty()) {\n                file.visible_pages.erase(file.visible_pages.begin());\n                if (pause()) co_await crash_pause{*this};\n            }',
+        2, 'The volatile map is ordered; each entry is erased once under the closed admission gate, with count-only progress.',
+    ),
+    Allowance(
+        "src/simulation/fake_file.cc", "unordered-iteration",
+        'for (const auto& change : state.pages) {\n            if (change.inserted)\n                std::get<regular_file_state>(find_inode(change.object)->state)\n                  .durable_pages.erase(change.index);\n            if (pause()) co_await crash_pause{*this};\n        }',
+        1, 'Rollback follows the owned ordered change vector and removes only prepared index-addressed insertions.',
+    ),
+    Allowance(
+        "src/simulation/fake_file.cc", "unordered-iteration",
+        'while (!open_objects_.empty()) {\n            const auto id = *open_objects_.begin();\n            if (auto* object = find_inode(fake_object_id{id}))\n                object->open_references = 0;\n            open_objects_.erase(id);\n            if (pause()) co_await crash_pause{*this};\n        }',
+        1, 'Commutative generation invalidation: every old reference is cleared once; progress records counts, never hash-selected IDs.',
+    ),
+    Allowance(
+        "src/simulation/fake_file.cc", "unordered-iteration",
+        'for (const auto& [id, object] : objects_) {\n        static_cast<void>(object);\n        collection_worklist_.push_back(id);\n        if (pause()) co_await crash_pause{*this};\n    }',
+        1, 'Bounded reclamation worklist only: no selections or digests depend on its order; every removed edge adds exactly one descendant visit.',
+    ),
+    Allowance(
+        "src/simulation/fake_file.cc", "unordered-iteration",
+        'while (!file.durable_pages.empty()) {\n                file.durable_pages.erase(file.durable_pages.begin());\n                if (pause()) co_await crash_pause{*this};\n            }',
+        1, 'Commutative destruction of an unreachable file; each page contributes one fixed cleanup unit and no content-dependent trace.',
+    ),
+    Allowance(
+        'src/simulation/storage_fault_key.h', "native-byte-layout",
+        'std::as_bytes(std::span{digest})', 1, 'SHA-256 output is already 32 canonical byte values; integers were encoded explicitly before hashing.',
+    ),
+    Allowance(
+        'src/simulation/tests/fake_file_persistence_test.cc', "native-byte-layout",
+        'std::as_bytes(std::span{data.data(), data.size()})', 1, 'Test payload consists only of character bytes, never a native integer representation.',
+    ),
+    Allowance(
+        'src/simulation/tests/local_store_test.cc', "native-byte-layout",
+        'std::as_bytes(std::span{bytes.data(), bytes.size()})', 1, 'Fixture input is an already encoded byte string; no native integer representation is copied.',
+    ),
+    Allowance(
+        'src/simulation/tests/fake_file_persistence_test.cc', "native-byte-layout",
+        'reinterpret_cast<const char*>(data.data())', 1, 'Reads an existing byte buffer as text for byte-for-byte assertions; no native scalar encoding.',
     ),
 )
 

@@ -3,6 +3,22 @@ load("//bazel:build.bzl", "kwaque_cc_library")
 package(default_visibility = ["//visibility:private"])
 
 kwaque_cc_library(
+    name = "file_system_contract",
+    testonly = True,
+    hdrs = ["file_system_contract.h"],
+    visibility = [
+        "//src/runtime/tests:__pkg__",
+        "//src/simulation/tests:__pkg__",
+        "//src/storage/tests:__pkg__",
+    ],
+    deps = [
+        ":cleanup",
+        "//src/runtime:file",
+        "@seastar",
+    ],
+)
+
+kwaque_cc_library(
     name = "environment_component",
     testonly = True,
     hdrs = ["environment_component.h"],

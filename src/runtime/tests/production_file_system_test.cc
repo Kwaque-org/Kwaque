@@ -1,20 +1,27 @@
 #include "src/runtime/file.h"
 #include "src/runtime/production/file.h"
 #include "src/runtime/testing/contracts/cleanup.h"
+#include "src/runtime/testing/contracts/file_system_contract.h"
 #include "src/runtime/testing/test_directory.h"
 
 #include <seastar/core/coroutine.hh>
+#include <seastar/core/reactor.hh>
 #include <seastar/core/seastar.hh>
 #include <seastar/testing/test_case.hh>
+#include <seastar/util/alloc_failure_injector.hh>
+#include <seastar/util/defer.hh>
 #include <seastar/util/tmp_file.hh>
 
 #include <boost/test/unit_test.hpp>
+#include <sys/statvfs.h>
 
 #include <algorithm>
 #include <exception>
 #include <filesystem>
 #include <fstream>
+#include <new>
 #include <optional>
+#include <set>
 #include <string>
 #include <string_view>
 #include <system_error>
@@ -22,6 +29,13 @@
 #include <utility>
 
 namespace {
+
+struct native_file_driver {
+    template<typename T>
+    seastar::future<T> operator()(seastar::future<T> operation) const {
+        return operation;
+    }
+};
 
 kwaque::runtime::file_path path_of(const std::filesystem::path& path) {
     auto made = kwaque::runtime::file_path::make(path.string());
@@ -32,6 +46,18 @@ kwaque::runtime::file_path path_of(const std::filesystem::path& path) {
 }
 
 } // namespace
+
+SEASTAR_TEST_CASE(production_file_system_runs_shared_capability_contract) {
+    return seastar::tmp_dir::do_with(
+      kwaque::runtime::testing::test_directory_template(),
+      [](seastar::tmp_dir& directory) -> seastar::future<> {
+          kwaque::runtime::production::file_system files;
+          co_await kwaque::runtime::testing::run_file_system_contract(
+            files,
+            path_of(directory.get_path() / "capabilities"),
+            native_file_driver{});
+      });
+}
 
 SEASTAR_TEST_CASE(production_file_system_creates_opens_stats_and_reopens) {
     return seastar::tmp_dir::do_with(
@@ -331,5 +357,177 @@ SEASTAR_TEST_CASE(production_file_system_maps_permission_denied) {
                 seastar::file_permissions::user_permissions);
           });
           co_return;
+      });
+}
+
+SEASTAR_TEST_CASE(
+  production_space_samples_native_statvfs_and_reports_missing_path) {
+    return seastar::tmp_dir::do_with(
+      kwaque::runtime::testing::test_directory_template(),
+      [](seastar::tmp_dir& directory) -> seastar::future<> {
+          kwaque::runtime::production::file_system files;
+          const auto native = co_await seastar::engine().statvfs(
+            directory.get_path().string());
+          const auto sample = co_await files.space(
+            path_of(directory.get_path()));
+          BOOST_REQUIRE(sample.has_value());
+          BOOST_CHECK_EQUAL(
+            sample->capacity().value(), native.f_frsize * native.f_blocks);
+          BOOST_CHECK(sample->available() <= sample->free());
+          BOOST_CHECK(sample->free() <= sample->capacity());
+          BOOST_CHECK_EQUAL(
+            sample->read_only(), (native.f_flag & ST_RDONLY) != 0);
+          // Free/available may change between calls on a shared filesystem.
+          const auto missing = co_await files.space(
+            path_of(directory.get_path() / "missing/child"));
+          BOOST_REQUIRE(!missing);
+          BOOST_CHECK(missing.error().code() == kwaque::errc::not_found);
+          BOOST_CHECK_EQUAL(files.statistics().active, 0U);
+          BOOST_CHECK_EQUAL(files.statistics().completed, 2U);
+      });
+}
+
+SEASTAR_TEST_CASE(production_space_preserves_permission_failure) {
+    if (::geteuid() == 0) co_return; // Root may bypass directory permissions.
+    co_await seastar::tmp_dir::do_with(
+      kwaque::runtime::testing::test_directory_template(),
+      [](seastar::tmp_dir& directory) -> seastar::future<> {
+          const auto denied = directory.get_path() / "denied";
+          std::filesystem::create_directories(denied / "child");
+          auto restore = seastar::defer([&denied] {
+              std::filesystem::permissions(
+                denied, std::filesystem::perms::owner_all);
+          });
+          std::filesystem::permissions(denied, std::filesystem::perms::none);
+          kwaque::runtime::production::file_system files;
+          const auto failed = co_await files.space(path_of(denied / "child"));
+          BOOST_REQUIRE(!failed);
+          BOOST_CHECK(failed.error().code() == kwaque::errc::permission_denied);
+          BOOST_CHECK_EQUAL(files.statistics().active, 0U);
+      });
+}
+
+SEASTAR_TEST_CASE(
+  production_directory_cursor_joins_pending_read_and_classifies_links) {
+    return seastar::tmp_dir::do_with(
+      kwaque::runtime::testing::test_directory_template(),
+      [](seastar::tmp_dir& directory) -> seastar::future<> {
+          std::filesystem::create_symlink(
+            "missing", directory.get_path() / "link");
+          kwaque::runtime::production::file_system files;
+          auto opened = co_await files.open_directory(
+            path_of(directory.get_path()));
+          BOOST_REQUIRE(opened.has_value());
+          auto pending = opened->next({});
+          auto moved = std::move(*opened);
+          auto closing = moved.close();
+          auto closed = co_await std::move(closing);
+          auto page = co_await std::move(pending);
+          BOOST_REQUIRE(closed.has_value());
+          BOOST_REQUIRE(page.has_value());
+          BOOST_REQUIRE_EQUAL(page->entries().size(), 1U);
+          BOOST_CHECK_EQUAL(page->entries().front().name.value(), "link");
+          BOOST_CHECK(
+            page->entries().front().kind == kwaque::runtime::file_kind::other);
+      });
+}
+
+SEASTAR_TEST_CASE(production_directory_cursor_can_close_before_first_next) {
+    return seastar::tmp_dir::do_with(
+      kwaque::runtime::testing::test_directory_template(),
+      [](seastar::tmp_dir& directory) -> seastar::future<> {
+          kwaque::runtime::production::file_system files;
+          for (std::size_t count = 0; count < 80; ++count) {
+              auto opened = co_await files.open_directory(
+                path_of(directory.get_path()));
+              BOOST_REQUIRE(opened.has_value());
+              auto closed = co_await opened->close();
+              BOOST_REQUIRE(closed.has_value());
+          }
+      });
+}
+
+SEASTAR_TEST_CASE(
+  production_directory_cursor_crosses_native_buffers_with_small_pages) {
+    return seastar::tmp_dir::do_with(
+      kwaque::runtime::testing::test_directory_template(),
+      [](seastar::tmp_dir& directory) -> seastar::future<> {
+          for (std::size_t index = 0; index < 600; ++index)
+              std::ofstream(
+                directory.get_path()
+                / (std::string(64, 'n') + std::to_string(index)))
+                << "";
+          kwaque::runtime::production::file_system files;
+          auto opened = co_await files.open_directory(
+            path_of(directory.get_path()));
+          BOOST_REQUIRE(opened.has_value());
+          std::set<std::string> names;
+          std::exception_ptr failure;
+          try {
+              bool end = false;
+              for (std::size_t pages = 0; !end; ++pages) {
+                  BOOST_REQUIRE_LT(pages, 100U);
+                  auto page = co_await opened->next(
+                    {.maximum_entries = kwaque::item_count{17},
+                     .maximum_name_bytes = kwaque::byte_count{1024}});
+                  BOOST_REQUIRE(page.has_value());
+                  BOOST_CHECK_LE(page->entries().size(), 17U);
+                  std::size_t bytes = 0;
+                  for (const auto& entry : page->entries()) {
+                      bytes += entry.name.value().size();
+                      BOOST_CHECK(names.insert(entry.name.value()).second);
+                  }
+                  BOOST_CHECK_LE(bytes, 1024U);
+                  end = page->end();
+              }
+          } catch (...) {
+              failure = std::current_exception();
+          }
+          const auto closed = co_await opened->close();
+          if (failure) std::rethrow_exception(failure);
+          BOOST_REQUIRE(closed.has_value());
+          BOOST_CHECK_EQUAL(names.size(), 600U);
+      });
+}
+
+SEASTAR_TEST_CASE(
+  production_directory_cursor_open_allocation_failure_releases_admission) {
+    return seastar::tmp_dir::do_with(
+      kwaque::runtime::testing::test_directory_template(),
+      [](seastar::tmp_dir& directory) -> seastar::future<> {
+          kwaque::runtime::production::file_system files;
+#if defined(SEASTAR_ENABLE_ALLOC_FAILURE_INJECTION)
+          auto directory_path = path_of(directory.get_path());
+          auto& injector = seastar::memory::local_failure_injector();
+          injector.fail_after(0);
+          auto opening = files.open_directory(std::move(directory_path));
+          const bool injected = injector.failed();
+          injector.cancel();
+          bool allocation_failure = false;
+          try {
+              auto opened = co_await std::move(opening);
+              if (opened) static_cast<void>(co_await opened->close());
+          } catch (const std::bad_alloc&) {
+              allocation_failure = true;
+          }
+          BOOST_CHECK(injected && allocation_failure);
+#endif
+          std::optional<kwaque::runtime::production::directory_cursor> retained;
+          {
+              kwaque::runtime::production::file_system temporary;
+              auto opened = co_await temporary.open_directory(
+                path_of(directory.get_path()));
+              BOOST_REQUIRE(opened.has_value());
+              retained.emplace(std::move(*opened));
+          }
+          auto page = co_await retained->next({});
+          auto closed = co_await retained->close();
+          BOOST_REQUIRE(page.has_value());
+          BOOST_CHECK(page->end());
+          BOOST_REQUIRE(closed.has_value());
+          auto reopened = co_await files.open_directory(
+            path_of(directory.get_path()));
+          BOOST_REQUIRE(reopened.has_value());
+          BOOST_REQUIRE((co_await reopened->close()).has_value());
       });
 }

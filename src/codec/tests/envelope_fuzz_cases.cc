@@ -226,7 +226,7 @@ void mutate_wire(std::string& wire, std::uint8_t mutation, std::uint8_t index) {
         wire[24] = static_cast<char>(static_cast<unsigned char>(wire[24]) ^ 1U);
         break;
     case 28:
-        fixture::put_u16(wire, 4, 11);
+        fixture::put_u16(wire, 4, 12);
         fixture::put_u16(wire, 8, 2);
         break;
     case 29:
@@ -385,7 +385,7 @@ oracle_result oracle(const case_data& test, envelope_fuzz_options options) {
     if (family == 0) {
         return fail(errc::malformed_data, 2, 4);
     }
-    if (family > 10) {
+    if (family > 11) {
         return fail(errc::unsupported_format, 2, 4);
     }
     if (minimum > 1) {

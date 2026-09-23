@@ -3,6 +3,7 @@
 
 #include "src/base/units.h"
 #include "src/runtime/error.h"
+#include "src/runtime/file_error.h"
 #include "src/runtime/time.h"
 
 #include <array>
@@ -119,6 +120,9 @@ enum class fault_action : std::uint8_t {
     drop_completion,
     crash,
     partial_resize = 13,
+    file_failure_before_effect = 14,
+    file_failure_after_prefix = 15,
+    file_failure_after_effect = 16,
 };
 
 class fault_action_set final {
@@ -128,8 +132,8 @@ public:
     template<fault_action... Actions>
     [[nodiscard]] static consteval fault_action_set constant() noexcept {
         static_assert(
-          ((static_cast<std::uint8_t>(Actions)
-            <= static_cast<std::uint8_t>(fault_action::partial_resize))
+          ((static_cast<std::uint8_t>(Actions) <= static_cast<std::uint8_t>(
+              fault_action::file_failure_after_effect))
            && ...),
           "unknown fault action");
         fault_action_set result;
@@ -185,6 +189,10 @@ enum class builtin_fault_point : std::uint8_t {
     resource_group_create,
     queue_admission,
     environment_stop,
+    filesystem_space,
+    directory_cursor_open,
+    directory_cursor_next,
+    directory_cursor_close,
 };
 
 struct fault_point_descriptor final {
@@ -250,7 +258,8 @@ inline constexpr std::array builtin_fault_points{
       fault_action::corrupt,
       fault_action::misdirect,
       fault_action::drop_completion,
-      fault_action::crash>()},
+      fault_action::crash,
+      fault_action::file_failure_before_effect>()},
   fault_point_descriptor{
     .point = builtin_fault_point::file_write,
     .id = fault_point_id::constant<7>(),
@@ -263,7 +272,10 @@ inline constexpr std::array builtin_fault_points{
       fault_action::misdirect,
       fault_action::torn_write,
       fault_action::drop_completion,
-      fault_action::crash>()},
+      fault_action::crash,
+      fault_action::file_failure_before_effect,
+      fault_action::file_failure_after_prefix,
+      fault_action::file_failure_after_effect>()},
   fault_point_descriptor{
     .point = builtin_fault_point::network_read,
     .id = fault_point_id::constant<8>(),
@@ -306,7 +318,8 @@ inline constexpr std::array builtin_fault_points{
       fault_action::error,
       fault_action::delay,
       fault_action::drop_completion,
-      fault_action::crash>()},
+      fault_action::crash,
+      fault_action::file_failure_before_effect>()},
   fault_point_descriptor{
     .point = builtin_fault_point::file_exists,
     .id = fault_point_id::constant<12>(),
@@ -315,7 +328,8 @@ inline constexpr std::array builtin_fault_points{
       fault_action::error,
       fault_action::delay,
       fault_action::drop_completion,
-      fault_action::crash>()},
+      fault_action::crash,
+      fault_action::file_failure_before_effect>()},
   fault_point_descriptor{
     .point = builtin_fault_point::file_stat,
     .id = fault_point_id::constant<13>(),
@@ -324,7 +338,8 @@ inline constexpr std::array builtin_fault_points{
       fault_action::error,
       fault_action::delay,
       fault_action::drop_completion,
-      fault_action::crash>()},
+      fault_action::crash,
+      fault_action::file_failure_before_effect>()},
   fault_point_descriptor{
     .point = builtin_fault_point::file_list,
     .id = fault_point_id::constant<14>(),
@@ -333,7 +348,8 @@ inline constexpr std::array builtin_fault_points{
       fault_action::error,
       fault_action::delay,
       fault_action::drop_completion,
-      fault_action::crash>()},
+      fault_action::crash,
+      fault_action::file_failure_before_effect>()},
   fault_point_descriptor{
     .point = builtin_fault_point::directory_create,
     .id = fault_point_id::constant<15>(),
@@ -342,7 +358,8 @@ inline constexpr std::array builtin_fault_points{
       fault_action::error,
       fault_action::delay,
       fault_action::drop_completion,
-      fault_action::crash>()},
+      fault_action::crash,
+      fault_action::file_failure_before_effect>()},
   fault_point_descriptor{
     .point = builtin_fault_point::file_remove,
     .id = fault_point_id::constant<16>(),
@@ -351,7 +368,9 @@ inline constexpr std::array builtin_fault_points{
       fault_action::error,
       fault_action::delay,
       fault_action::drop_completion,
-      fault_action::crash>()},
+      fault_action::crash,
+      fault_action::file_failure_before_effect,
+      fault_action::file_failure_after_effect>()},
   fault_point_descriptor{
     .point = builtin_fault_point::directory_remove,
     .id = fault_point_id::constant<17>(),
@@ -360,7 +379,9 @@ inline constexpr std::array builtin_fault_points{
       fault_action::error,
       fault_action::delay,
       fault_action::drop_completion,
-      fault_action::crash>()},
+      fault_action::crash,
+      fault_action::file_failure_before_effect,
+      fault_action::file_failure_after_effect>()},
   fault_point_descriptor{
     .point = builtin_fault_point::file_rename,
     .id = fault_point_id::constant<18>(),
@@ -369,7 +390,9 @@ inline constexpr std::array builtin_fault_points{
       fault_action::error,
       fault_action::delay,
       fault_action::drop_completion,
-      fault_action::crash>()},
+      fault_action::crash,
+      fault_action::file_failure_before_effect,
+      fault_action::file_failure_after_effect>()},
   fault_point_descriptor{
     .point = builtin_fault_point::directory_sync,
     .id = fault_point_id::constant<19>(),
@@ -378,7 +401,9 @@ inline constexpr std::array builtin_fault_points{
       fault_action::error,
       fault_action::delay,
       fault_action::drop_completion,
-      fault_action::crash>()},
+      fault_action::crash,
+      fault_action::file_failure_before_effect,
+      fault_action::file_failure_after_effect>()},
   fault_point_descriptor{
     .point = builtin_fault_point::file_flush,
     .id = fault_point_id::constant<20>(),
@@ -387,7 +412,9 @@ inline constexpr std::array builtin_fault_points{
       fault_action::error,
       fault_action::delay,
       fault_action::drop_completion,
-      fault_action::crash>()},
+      fault_action::crash,
+      fault_action::file_failure_before_effect,
+      fault_action::file_failure_after_effect>()},
   fault_point_descriptor{
     .point = builtin_fault_point::file_truncate,
     .id = fault_point_id::constant<21>(),
@@ -397,7 +424,10 @@ inline constexpr std::array builtin_fault_points{
       fault_action::delay,
       fault_action::drop_completion,
       fault_action::crash,
-      fault_action::partial_resize>()},
+      fault_action::partial_resize,
+      fault_action::file_failure_before_effect,
+      fault_action::file_failure_after_prefix,
+      fault_action::file_failure_after_effect>()},
   fault_point_descriptor{
     .point = builtin_fault_point::file_size,
     .id = fault_point_id::constant<22>(),
@@ -406,7 +436,8 @@ inline constexpr std::array builtin_fault_points{
       fault_action::error,
       fault_action::delay,
       fault_action::drop_completion,
-      fault_action::crash>()},
+      fault_action::crash,
+      fault_action::file_failure_before_effect>()},
   fault_point_descriptor{
     .point = builtin_fault_point::file_close,
     .id = fault_point_id::constant<23>(),
@@ -414,7 +445,8 @@ inline constexpr std::array builtin_fault_points{
     .permitted_actions = fault_action_set::constant<
       fault_action::delay,
       fault_action::drop_completion,
-      fault_action::crash>()},
+      fault_action::crash,
+      fault_action::file_failure_before_effect>()},
   fault_point_descriptor{
     .point = builtin_fault_point::environment_start,
     .id = fault_point_id::constant<24>(),
@@ -438,6 +470,42 @@ inline constexpr std::array builtin_fault_points{
     .name = "environment_stop",
     .permitted_actions
     = fault_action_set::constant<fault_action::error, fault_action::delay>()},
+  fault_point_descriptor{
+    .point = builtin_fault_point::filesystem_space,
+    .id = fault_point_id::constant<28>(),
+    .name = "filesystem_space",
+    .permitted_actions = fault_action_set::constant<
+      fault_action::error,
+      fault_action::delay,
+      fault_action::drop_completion,
+      fault_action::file_failure_before_effect>()},
+  fault_point_descriptor{
+    .point = builtin_fault_point::directory_cursor_open,
+    .id = fault_point_id::constant<29>(),
+    .name = "directory_cursor_open",
+    .permitted_actions = fault_action_set::constant<
+      fault_action::error,
+      fault_action::delay,
+      fault_action::drop_completion,
+      fault_action::file_failure_before_effect>()},
+  fault_point_descriptor{
+    .point = builtin_fault_point::directory_cursor_next,
+    .id = fault_point_id::constant<30>(),
+    .name = "directory_cursor_next",
+    .permitted_actions = fault_action_set::constant<
+      fault_action::error,
+      fault_action::delay,
+      fault_action::drop_completion,
+      fault_action::file_failure_before_effect>()},
+  fault_point_descriptor{
+    .point = builtin_fault_point::directory_cursor_close,
+    .id = fault_point_id::constant<31>(),
+    .name = "directory_cursor_close",
+    .permitted_actions = fault_action_set::constant<
+      fault_action::error,
+      fault_action::delay,
+      fault_action::drop_completion,
+      fault_action::file_failure_before_effect>()},
 };
 
 [[nodiscard]] consteval bool valid_builtin_fault_points() noexcept {
@@ -538,6 +606,23 @@ public:
     [[nodiscard]] static constexpr fault_decision
     make_partial_resize() noexcept {
         return fault_decision{fault_action::partial_resize, 0};
+    }
+
+    // Prefix means written bytes, or the intermediate EOF for a truncate.
+    // It is rejected for indivisible metadata operations by point validation.
+    [[nodiscard]] static result<fault_decision> make_file_failure(
+      fault_action action,
+      file_failure_detail cause,
+      byte_count prefix = byte_count{}) noexcept;
+    [[nodiscard]] constexpr bool file_failure() const noexcept {
+        return action_ >= fault_action::file_failure_before_effect
+               && action_ <= fault_action::file_failure_after_effect;
+    }
+    [[nodiscard]] constexpr file_failure_detail file_cause() const noexcept {
+        return static_cast<file_failure_detail>(payload_ & 0xffU);
+    }
+    [[nodiscard]] constexpr byte_count file_prefix() const noexcept {
+        return byte_count{payload_ >> 8U};
     }
 
     [[nodiscard]] constexpr fault_action action() const noexcept {

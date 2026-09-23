@@ -7,7 +7,6 @@
 #include <seastar/core/coroutine.hh>
 #include <seastar/core/deleter.hh>
 
-#include <algorithm>
 #include <array>
 #include <cstddef>
 #include <cstdint>
@@ -83,61 +82,6 @@ result<byte_count> admit_alias_allocations(
         return codec::failure(encode_error(errc::out_of_range, context));
     }
     return *peak;
-}
-
-// Keep the existing staging cost scan's bounded ranges and charge order. The
-// first range includes retained descriptor capacity, even for an empty body.
-seastar::future<result<bytes::buffer_allocation_cost>> body_input_cost(
-  const fragmented_buffer& body,
-  cooperative_work& work,
-  bytes::allocation_charge_fn charge,
-  field_context context) {
-    const auto anchor = encode_error(errc::success, context);
-    bytes::buffer_allocation_cost total;
-    byte_count aggregate;
-    const auto quantum = work.item_quantum().value();
-    if (!body.empty() && quantum < 6) {
-        co_return codec::failure(
-          encode_error(errc::resource_exhausted, context));
-    }
-    const auto batch = quantum < 6 ? 1U : (quantum - 2U) / 4U;
-    std::size_t first = 0;
-    do {
-        const auto count = std::min<std::size_t>(
-          body.fragment_count() - first, batch);
-        auto admitted = co_await work.admit(
-          byte_count{}, item_count{count == 0 ? 1U : 4U * count + 2U}, anchor);
-        if (!admitted) {
-            co_return codec::failure(admitted.error());
-        }
-        if (auto ready = work.poll(anchor); !ready) {
-            co_return codec::failure(ready.error());
-        }
-        const auto part = body.allocation_cost(first, count, charge);
-        if (!part) {
-            co_return codec::failure(
-              detail::allocation_cost_error(
-                part.error(), context, context.origin));
-        }
-        for (const auto amount :
-             {part->backing, part->descriptors, part->share_controls}) {
-            if (auto summed = add_charge(aggregate, amount, context); !summed) {
-                co_return codec::failure(summed.error());
-            }
-        }
-        // Each category is bounded by the already checked aggregate.
-        total.backing = byte_count{
-          total.backing.value() + part->backing.value()};
-        total.descriptors = byte_count{
-          total.descriptors.value() + part->descriptors.value()};
-        total.share_controls = byte_count{
-          total.share_controls.value() + part->share_controls.value()};
-        total.largest_allocation = std::max(
-          total.largest_allocation, part->largest_allocation);
-        first += count;
-    } while (first != body.fragment_count());
-    total.fragments = item_count{body.fragment_count()};
-    co_return total;
 }
 
 // copy_of(prefix_bytes) uses one native temporary_buffer allocation and one

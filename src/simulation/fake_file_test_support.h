@@ -24,10 +24,12 @@ struct fake_inode_snapshot final {
     fake_file_kind kind{fake_file_kind::regular};
     std::uint32_t open_references{0};
     std::uint32_t pending_references{0};
+    std::uint32_t history_references{0};
     std::uint32_t visible_links{0};
     std::uint32_t durable_links{0};
     std::uint64_t visible_size{0};
     std::uint64_t durable_size{0};
+    std::uint64_t namespace_synced_sequence{0};
     std::vector<std::byte> visible_bytes;
     std::vector<std::byte> durable_bytes;
     std::deque<std::pair<std::string, std::uint64_t>> visible_entries;
@@ -38,11 +40,31 @@ struct fake_inode_snapshot final {
     bool operator==(const fake_inode_snapshot&) const = default;
 };
 
+struct fake_namespace_change_snapshot final {
+    std::uint64_t parent{0};
+    std::string name;
+    std::optional<std::uint64_t> before;
+    std::optional<std::uint64_t> after;
+    bool operator==(const fake_namespace_change_snapshot&) const = default;
+};
+
+struct fake_namespace_group_snapshot final {
+    std::uint64_t sequence{0};
+    std::array<std::optional<fake_namespace_change_snapshot>, 2> changes;
+    bool committed{false};
+    bool operator==(const fake_namespace_group_snapshot&) const = default;
+};
+
 struct fake_file_state_snapshot final {
     std::deque<fake_inode_snapshot> objects;
+    std::deque<fake_namespace_group_snapshot> namespace_history;
     std::uint64_t retained_capacity{0};
     std::uint64_t retained_path_bytes{0};
     std::uint64_t generation{0};
+    std::uint64_t crash_epoch{0};
+    std::uint64_t namespace_groups{0};
+    std::uint64_t history_name_bytes{0};
+    std::uint64_t next_namespace_sequence{0};
     std::uint64_t next_object_id{0};
     std::uint64_t next_operation_id{0};
     std::uint32_t open_handles{0};
@@ -64,6 +86,7 @@ struct fake_file_state_snapshot final {
 struct fake_file_snapshot_limits final {
     std::uint32_t maximum_objects{4'096};
     byte_count maximum_dense_bytes{maximum_contiguous_allocation_bytes};
+    std::uint32_t maximum_namespace_groups{4096};
 };
 
 using fake_file_state_digest = std::array<std::uint64_t, 4>;
@@ -73,6 +96,7 @@ enum class fake_submission_kind : std::uint8_t {
     write,
     flush,
     truncate,
+    close,
 };
 
 class fake_native_file_probe final {
@@ -135,6 +159,9 @@ public:
         case fake_submission_kind::truncate:
             pending = fake_file_system::pending_kind::truncate;
             break;
+        case fake_submission_kind::close:
+            pending = fake_file_system::pending_kind::close;
+            break;
         }
         const auto index = static_cast<std::size_t>(pending);
         return pending == fake_file_system::pending_kind::read
@@ -162,6 +189,9 @@ public:
         case fake_submission_kind::truncate:
             pending = fake_file_system::pending_kind::truncate;
             break;
+        case fake_submission_kind::close:
+            pending = fake_file_system::pending_kind::close;
+            break;
         }
         return filesystem.wait_submitted(pending, count);
     }
@@ -184,6 +214,9 @@ public:
         case fake_submission_kind::truncate:
             pending = fake_file_system::pending_kind::truncate;
             break;
+        case fake_submission_kind::close:
+            pending = fake_file_system::pending_kind::close;
+            break;
         }
         return filesystem.wait_parked(pending, count);
     }
@@ -195,6 +228,8 @@ public:
         if (
           limits.maximum_objects == 0
           || filesystem.objects_.size() > limits.maximum_objects
+          || filesystem.namespace_history_.size()
+               > limits.maximum_namespace_groups
           || limits.maximum_dense_bytes.value() == 0
           || limits.maximum_dense_bytes.value()
                > maximum_contiguous_allocation_bytes) {
@@ -231,6 +266,25 @@ public:
         mix(result, filesystem.retained_capacity_.value());
         mix(result, filesystem.retained_path_bytes_);
         mix(result, filesystem.generation_);
+        if (filesystem.config_.crash_policy) {
+            mix(result, filesystem.crash_epoch_);
+            mix(result, filesystem.namespace_history_.size());
+            mix(result, filesystem.history_name_bytes_);
+            mix(result, filesystem.next_namespace_sequence_);
+            for (const auto& [sequence, group] :
+                 filesystem.namespace_history_) {
+                mix(result, sequence);
+                mix(result, group.committed);
+                for (const auto& change : group.changes) {
+                    mix(result, change.has_value());
+                    if (!change) continue;
+                    mix(result, change->parent.value());
+                    append_name(result, change->name);
+                    mix(result, change->before ? change->before->value() : 0U);
+                    mix(result, change->after ? change->after->value() : 0U);
+                }
+            }
+        }
         mix(result, filesystem.next_object_id_);
         mix(result, filesystem.next_operation_id_);
         mix(result, filesystem.open_handles_);
@@ -274,6 +328,8 @@ public:
             mix(result, static_cast<std::uint8_t>(object.kind));
             mix(result, object.open_references);
             mix(result, object.pending_references);
+            if (filesystem.config_.crash_policy)
+                mix(result, object.history_references);
             mix(result, object.visible_links);
             mix(result, object.durable_links);
             mix(result, object.crash_dirty);
@@ -297,6 +353,8 @@ public:
             } else {
                 const auto& directory
                   = std::get<fake_file_system::directory_state>(object.state);
+                if (filesystem.config_.crash_policy)
+                    mix(result, directory.synced_sequence);
                 append_directory(result, directory.durable, 3);
                 mix(result, 4);
                 for (const auto& [name, child] : directory.unsynced) {
@@ -315,6 +373,8 @@ public:
         if (
           limits.maximum_objects == 0
           || filesystem.objects_.size() > limits.maximum_objects
+          || filesystem.namespace_history_.size()
+               > limits.maximum_namespace_groups
           || limits.maximum_dense_bytes.value() == 0
           || limits.maximum_dense_bytes.value()
                > maximum_contiguous_allocation_bytes) {
@@ -326,6 +386,10 @@ public:
           .retained_capacity = filesystem.retained_capacity_.value(),
           .retained_path_bytes = filesystem.retained_path_bytes_,
           .generation = filesystem.generation_,
+          .crash_epoch = filesystem.crash_epoch_,
+          .namespace_groups = filesystem.namespace_history_.size(),
+          .history_name_bytes = filesystem.history_name_bytes_,
+          .next_namespace_sequence = filesystem.next_namespace_sequence_,
           .next_object_id = filesystem.next_object_id_,
           .next_operation_id = filesystem.next_operation_id_,
           .open_handles = filesystem.open_handles_,
@@ -340,6 +404,24 @@ public:
           .operation_ids_exhausted = filesystem.operation_ids_exhausted_,
           .global_occurrences = filesystem.global_occurrences_,
         };
+        for (const auto& [sequence, group] : filesystem.namespace_history_) {
+            fake_namespace_group_snapshot copy{
+              .sequence = sequence, .committed = group.committed};
+            for (std::size_t index = 0; index < group.changes.size(); ++index) {
+                const auto& change = group.changes[index];
+                if (!change) continue;
+                copy.changes[index] = fake_namespace_change_snapshot{
+                  change->parent.value(),
+                  change->name,
+                  change->before
+                    ? std::optional<std::uint64_t>{change->before->value()}
+                    : std::nullopt,
+                  change->after
+                    ? std::optional<std::uint64_t>{change->after->value()}
+                    : std::nullopt};
+            }
+            result.namespace_history.push_back(std::move(copy));
+        }
         std::uint64_t dense_bytes = 0;
         for (const auto& [id, object] : filesystem.objects_) {
             fake_inode_snapshot copy{
@@ -347,6 +429,7 @@ public:
               .kind = object->kind,
               .open_references = object->open_references,
               .pending_references = object->pending_references,
+              .history_references = object->history_references,
               .visible_links = object->visible_links,
               .durable_links = object->durable_links,
               .occurrences = object->occurrences,
@@ -379,6 +462,7 @@ public:
             } else {
                 const auto& directory
                   = std::get<fake_file_system::directory_state>(object->state);
+                copy.namespace_synced_sequence = directory.synced_sequence;
                 for (const auto& [name, child] : directory.durable) {
                     copy.durable_entries.emplace_back(name, child.value());
                 }
@@ -438,8 +522,10 @@ public:
     [[nodiscard]] static runtime::result<void> rename(
       fake_file_system& filesystem,
       const canonical_fake_path& from,
-      const canonical_fake_path& to) {
-        return filesystem.rename(from, to);
+      const canonical_fake_path& to,
+      runtime::file_rename_policy policy
+      = runtime::file_rename_policy::replace) {
+        return filesystem.rename(from, to, policy);
     }
     [[nodiscard]] static runtime::result<void> sync_directory(
       fake_file_system& filesystem, const canonical_fake_path& path) {

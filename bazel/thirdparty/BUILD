@@ -11,6 +11,7 @@ exports_files([
     "rules-boost-uuid-value.patch",
     "seastar.BUILD",
     "seastar-chunked-vector-exception-safety.patch",
+    "seastar-checked-close.patch",
     "seastar-http-resource-limits.patch",
     "seastar-file-removal-kind.patch",
     "seastar-metrics-registration-exception-safety.patch",

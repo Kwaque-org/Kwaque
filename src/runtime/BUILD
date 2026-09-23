@@ -3,6 +3,13 @@ load("//bazel:build.bzl", "kwaque_cc_binary", "kwaque_cc_library")
 package(default_visibility = ["//visibility:private"])
 
 kwaque_cc_library(
+    name = "first_failure",
+    hdrs = ["first_failure.h"],
+    visibility = ["//visibility:public"],
+    deps = [":error"],
+)
+
+kwaque_cc_library(
     name = "error",
     srcs = ["error.cc"],
     hdrs = ["error.h"],
@@ -68,21 +75,37 @@ kwaque_cc_library(
 )
 
 kwaque_cc_library(
+    name = "file_error",
+    hdrs = ["file_error.h"],
+    visibility = ["//visibility:public"],
+    deps = [":error"],
+)
+
+kwaque_cc_library(
     name = "file_error_internal",
     hdrs = ["file_error_internal.h"],
-    visibility = ["//src/runtime/production:__pkg__"],
-    deps = ["//src/base:error"],
+    visibility = [
+        "//src/runtime/production:__pkg__",
+        "//src/runtime/tests:__pkg__",
+        "//src/simulation:__pkg__",
+    ],
+    deps = [":file_error"],
 )
 
 kwaque_cc_library(
     name = "file",
     srcs = ["file.cc"],
-    hdrs = ["file.h"],
+    hdrs = [
+        "directory_cursor_internal.h",
+        "file.h",
+    ],
     visibility = ["//visibility:public"],
     deps = [
         ":error",
+        ":file_error",
         ":file_error_internal",
         ":file_position",
+        ":first_failure",
         ":fragmented_buffer_internal",
         ":operation_statistics",
         ":shard_affinity",
@@ -153,6 +176,7 @@ kwaque_cc_library(
     visibility = ["//visibility:public"],
     deps = [
         ":error",
+        ":file_error",
         ":time",
         "//src/base",
     ],

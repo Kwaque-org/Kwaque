@@ -96,6 +96,14 @@ public:
         return target.shutdown_failed_;
     }
 
+    [[nodiscard]] static seastar::future<> start_dependent_service(
+      application_state& target,
+      service_lifecycle::action start,
+      service_lifecycle::action stop) {
+        return target.lifecycle_->start_step(
+          "storage", std::move(start), std::move(stop));
+    }
+
     template<typename Function, typename... Args>
     [[nodiscard]] static seastar::future<> on_environments(
       application_state& target, Function function, Args... args) {

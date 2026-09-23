@@ -140,6 +140,7 @@ kwaque_cc_library(
         "//src/model/tests:__pkg__",
         "//src/protocol:__pkg__",
         "//src/protocol/tests:__pkg__",
+        "//src/simulation/tests:__pkg__",
         "//src/storage:__pkg__",
         "//src/storage/tests:__pkg__",
     ],
@@ -197,6 +198,21 @@ kwaque_cc_library(
 )
 
 kwaque_cc_library(
+    name = "buffer_cost_internal",
+    hdrs = ["buffer_cost_internal.h"],
+    visibility = ["//src/protocol:__pkg__"],
+    deps = [
+        ":cooperative",
+        ":error",
+        ":integer",
+        "//src/base",
+        "//src/base:error",
+        "//src/bytes:fragmented_buffer",
+        "@seastar",
+    ],
+)
+
+kwaque_cc_library(
     name = "staging_cooperative",
     srcs = ["staging_cooperative.cc"],
     hdrs = ["staging_cooperative.h"],
@@ -212,6 +228,7 @@ kwaque_cc_library(
         "//src/storage/tests:__pkg__",
     ],
     deps = [
+        ":buffer_cost_internal",
         ":cooperative",
         ":error",
         ":integer",
@@ -319,6 +336,7 @@ kwaque_cc_library(
         "//src/storage/tests:__pkg__",
     ],
     deps = [
+        ":buffer_cost_internal",
         ":cooperative",
         ":crc32c",
         ":crc32c_cooperative",

@@ -20,6 +20,7 @@ enum class format_family : std::uint16_t {
     sparse_index = 8,
     range_manifest = 9,
     read_checkpoint = 10,
+    local_storage = 11,
 };
 
 namespace detail {
@@ -80,8 +81,23 @@ private:
 
 namespace detail {
 
+inline constexpr std::array registered_format_families{
+  format_family::submitted_batch,
+  format_family::assigned_batch,
+  format_family::segment_header,
+  format_family::segment_batch_block,
+  format_family::wal_prepare,
+  format_family::durable_boundary_footer,
+  format_family::sealed_extent,
+  format_family::sparse_index,
+  format_family::range_manifest,
+  format_family::read_checkpoint,
+  format_family::local_storage};
+
 struct format_registry_access final {
-    [[nodiscard]] static consteval std::array<format_descriptor, 10> make() {
+    [[nodiscard]] static consteval std::
+      array<format_descriptor, registered_format_families.size()>
+      make() {
         return {{
           {format_family::submitted_batch, 1, 1, 1, 1, 0},
           {format_family::assigned_batch, 1, 1, 1, 1, 0},
@@ -93,22 +109,26 @@ struct format_registry_access final {
           {format_family::sparse_index, 1, 1, 1, 1, 0},
           {format_family::range_manifest, 1, 1, 1, 1, 0},
           {format_family::read_checkpoint, 1, 1, 1, 1, 0},
+          {format_family::local_storage, 1, 1, 1, 1, 0},
         }};
     }
 };
 
 [[nodiscard]] consteval bool
 valid_format_registry(std::span<const format_descriptor> descriptors) noexcept {
-    if (descriptors.size() != 10) {
+    if (descriptors.size() != registered_format_families.size()) {
         return false;
     }
-    std::array<bool, 10> seen{};
+    std::array<bool, registered_format_families.size()> seen{};
     for (const auto descriptor : descriptors) {
-        const auto family = static_cast<std::uint16_t>(descriptor.family());
-        if (family == 0 || family > seen.size() || seen[family - 1U]) {
+        std::size_t index = 0;
+        while (index < registered_format_families.size()
+               && registered_format_families[index] != descriptor.family())
+            ++index;
+        if (index == seen.size() || seen[index]) {
             return false;
         }
-        seen[family - 1U] = true;
+        seen[index] = true;
         if (
           descriptor.oldest_readable() == 0
           || descriptor.oldest_readable() > descriptor.current()

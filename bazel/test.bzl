@@ -24,15 +24,17 @@ def _merged_env(extra):
     result.update(extra)
     return result
 
-def kwaque_py_native_test(name, srcs = [], data = [], main = None, timeout = None):
+def kwaque_py_native_test(name, srcs = [], data = [], main = None, timeout = None, tags = [], deps = []):
     """Defines a Python subprocess test with the native sanitizer environment."""
     py_test(
         name = name,
         srcs = srcs,
         data = data + _SANITIZER_DATA,
+        deps = deps,
         env = _merged_env({}),
         main = main,
         size = "small",
+        tags = tags,
         timeout = timeout,
     )
 
@@ -134,13 +136,17 @@ def kwaque_cc_seastar_gtest(
         memory = "128MiB",
         size = "small",
         timeout = None,
-        tags = []):
+        tags = [],
+        linkopts = [],
+        linkstatic = None):
     """Defines a GoogleTest that executes in a configured Seastar thread."""
+    linking = {} if linkstatic == None else {"linkstatic": linkstatic}
     cc_test(
         name = name,
         srcs = srcs,
         args = _reactor_args(cpu, memory, args, False),
         copts = kwaque_copts(),
+        linkopts = linkopts,
         data = data + _SANITIZER_DATA,
         defines = defines,
         deps = deps + [
@@ -154,6 +160,7 @@ def kwaque_cc_seastar_gtest(
         size = size,
         tags = _resource_tags(cpu, memory) + tags,
         timeout = timeout,
+        **linking
     )
 
 def kwaque_cc_seastar_test(
@@ -169,17 +176,21 @@ def kwaque_cc_seastar_test(
         memory = "128MiB",
         size = "small",
         timeout = None,
-        tags = []):
+        tags = [],
+        linkopts = [],
+        linkstatic = None):
     """Defines a Seastar asynchronous test using Seastar's test runner.
 
     SEASTAR_TESTING_MAIN applies to every source. Only one translation unit
     may include the Seastar test registration headers that define main.
     """
+    linking = {} if linkstatic == None else {"linkstatic": linkstatic}
     cc_test(
         name = name,
         srcs = srcs,
         args = _reactor_args(cpu, memory, args, True),
         copts = kwaque_copts(),
+        linkopts = linkopts,
         data = data + _SANITIZER_DATA,
         defines = defines,
         deps = deps + [
@@ -193,6 +204,7 @@ def kwaque_cc_seastar_test(
         size = size,
         tags = _resource_tags(cpu, memory) + tags,
         timeout = timeout,
+        **linking
     )
 
 def kwaque_cc_benchmark(

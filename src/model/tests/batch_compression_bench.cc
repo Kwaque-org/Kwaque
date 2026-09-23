@@ -1,4 +1,5 @@
 #include "src/codec/sha256.h"
+#include "src/codec/tests/qualification_profile.h"
 #include "src/model/tests/model_bench_fixture.h"
 
 #include <seastar/core/abort_source.hh>
@@ -231,7 +232,9 @@ private:
         const auto cost = wire_.allocation_cost(capacity_bound).value();
         const auto retained = cost.backing.value() + cost.descriptors.value()
                               + cost.share_controls.value();
-        remaining_ = byte_count{(63U << 20U) - retained};
+        remaining_ = byte_count{
+          ((64U << 20U) - codec::testing::execution_reservation.value())
+          - retained};
         fmt::print(
           "kwaque-compressed-batch-v1 kind={} original_records={} "
           "retained_records={} pattern={} "
@@ -257,7 +260,8 @@ private:
     std::optional<codec::semantic_batch_digest> digest_;
     std::optional<codec::sha256_digest> retained_digest_;
     byte_count expanded_;
-    byte_count remaining_{63U << 20U};
+    byte_count remaining_{
+      (64U << 20U) - codec::testing::execution_reservation.value()};
     bool initialized_{false};
     bool reported_output_{false};
 };

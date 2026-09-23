@@ -98,7 +98,7 @@ trace_entry fault_entry(
 }
 
 constexpr std::string_view golden_trace
-  = "KQTR 05 0000000000000000 00000001 00000001 00000001 00000004 "
+  = "KQTR 0a 0000000000000000 00000001 00000001 00000001 00000004 "
     "0000000000000004 0000000000000008 0000000000000064 00000004 "
     "0000000000001000 00000400 0000000000000001 "
     "0000000000000000000000000000000000000000000000000000000000000000 "
@@ -111,8 +111,8 @@ constexpr std::string_view golden_trace
 static_assert(canonical_header_encoded_size == 294);
 static_assert(canonical_entry_encoded_size == 244);
 static_assert(golden_trace.size() == 538);
-static_assert(kwaque::simulation::event_trace_schema_version == 5);
-static_assert(kwaque::runtime::builtin_fault_points.size() == 27);
+static_assert(kwaque::simulation::event_trace_schema_version == 10);
+static_assert(kwaque::runtime::builtin_fault_points.size() == 31);
 static_assert(
   kwaque::runtime::fault_action::partial_resize
   == static_cast<kwaque::runtime::fault_action>(13));
@@ -220,10 +220,9 @@ TEST(EventTraceTest, EncodingAndParsingMatchTheCanonicalGoldenFixture) {
     ASSERT_TRUE(encoded_text.has_value());
     EXPECT_EQ(*encoded_text, golden_trace);
     constexpr kwaque::codec::sha256_digest expected_hash{
-      0xf1, 0xf0, 0x4f, 0x77, 0x25, 0xe5, 0xe4, 0x85, 0x85, 0x8a, 0x00,
-      0x9c, 0x3c, 0x1a, 0x9f, 0x84, 0xd1, 0x50, 0x23, 0x4c, 0x21, 0xb5,
-      0x64, 0xc6, 0x32, 0xfd, 0x9c, 0xab, 0x78, 0x7a, 0x9c, 0x91,
-    };
+      0xa2, 0xe8, 0x52, 0x27, 0x0e, 0x7d, 0xb9, 0x10, 0x93, 0x78, 0xe7,
+      0x32, 0xa7, 0x94, 0xce, 0xdf, 0x04, 0xd0, 0xc1, 0xee, 0xf8, 0x06,
+      0x47, 0xbb, 0x89, 0x3b, 0xf5, 0xb5, 0x0f, 0x52, 0xe4, 0xec};
     kwaque::codec::sha256_hasher hasher;
     for (const auto& chunk : encoded->chunks()) {
         hasher.update(chunk.data(), chunk.size());
@@ -233,7 +232,7 @@ TEST(EventTraceTest, EncodingAndParsingMatchTheCanonicalGoldenFixture) {
     EXPECT_EQ(encoded_text->find("/home/"), std::string::npos);
     EXPECT_EQ(encoded_text->find('\n'), canonical_header_encoded_size - 1U);
 
-    for (const char version : {'1', '2', '3', '4'}) {
+    for (const char version : {'1', '2', '3', '4', '5', '6', '7', '8'}) {
         auto old_version = *encoded_text;
         old_version[6] = version;
         EXPECT_FALSE(event_trace::decode(old_version, limits).has_value());
@@ -311,7 +310,13 @@ TEST(EventTraceTest, ParserRejectsEveryNoncanonicalBoundary) {
     EXPECT_FALSE(event_trace::decode(invalid_action, limits).has_value());
 
     auto unknown_schema = *encoded_text;
-    replace_token(unknown_schema, 0, 1, "06");
+    constexpr auto next_schema = kwaque::simulation::event_trace_schema_version
+                                 + 1U;
+    static_assert(next_schema <= 0xffU);
+    constexpr std::string_view hex_digits{"0123456789abcdef"};
+    const std::string unknown_schema_token{
+      hex_digits[next_schema >> 4U], hex_digits[next_schema & 0xfU]};
+    replace_token(unknown_schema, 0, 1, unknown_schema_token);
     EXPECT_FALSE(event_trace::decode(unknown_schema, limits).has_value());
 
     auto unknown_random = *encoded_text;
@@ -480,10 +485,15 @@ TEST(EventTraceTest, ValidatesFaultAndFileLifecycleVocabulary) {
     }
 
     auto unknown_point = fault_entry();
-    unknown_point.domain = 28;
-    EXPECT_EQ(
-      trace.observe(unknown_point).error().code(),
-      kwaque::errc::malformed_data);
+    unknown_point.domain
+      = kwaque::runtime::builtin_fault_points.back().id.value() + 1U;
+    const auto unknown_id = kwaque::runtime::fault_point_id::make(
+      unknown_point.domain);
+    ASSERT_TRUE(unknown_id.has_value());
+    ASSERT_EQ(kwaque::runtime::find_builtin_fault_point(*unknown_id), nullptr);
+    const auto rejected_point = trace.observe(unknown_point);
+    ASSERT_FALSE(rejected_point.has_value());
+    EXPECT_EQ(rejected_point.error().code(), kwaque::errc::malformed_data);
     auto unsupported_resource_delay = fault_entry(
       std::numeric_limits<std::uint64_t>::max(),
       0,
@@ -1046,4 +1056,107 @@ TEST(EventTraceTest, SplitReservationsRetainCountAndEncodedByteOwnership) {
     EXPECT_EQ(trace.entries().size(), 4U);
     EXPECT_EQ(trace.encoded_bytes(), limits.encoded_bytes());
     EXPECT_FALSE(last->active());
+}
+
+TEST(EventTraceTest, SpaceObservationChecksShapeAndReplaySample) {
+    const auto limits = test_limits();
+    trace_entry sample{
+      .time = kwaque::runtime::monotonic_time{2},
+      .action = trace_action::filesystem_space_sampled,
+      .kind = trace_event_kind::filesystem,
+      .domain = kwaque::runtime::descriptor_for(
+                  kwaque::runtime::builtin_fault_point::filesystem_space)
+                  ->id.value(),
+      .stable_id = 1,
+      .coordinate_a = 1024,
+      .coordinate_b = 512,
+      .value = 256,
+      .result = 1,
+    };
+    event_trace captured{test_header(limits), limits};
+    ASSERT_TRUE(captured.observe(sample));
+    const auto encoded = captured.encode();
+    ASSERT_TRUE(encoded);
+    auto decoded = event_trace::decode(*encoded, limits);
+    ASSERT_TRUE(decoded);
+    auto replay = event_trace::replay(
+      captured.header(), limits, std::move(*decoded));
+    ASSERT_TRUE(replay);
+    auto changed = sample;
+    ++changed.value;
+    const auto divergent = (*replay)->observe(changed);
+    ASSERT_FALSE(divergent);
+    EXPECT_EQ(divergent.error().code(), kwaque::errc::replay_divergence);
+    for (unsigned mutation = 0; mutation < 7; ++mutation) {
+        event_trace rejected{test_header(limits), limits};
+        auto bad = sample;
+        if (mutation == 0) bad.coordinate_b = 1025;
+        if (mutation == 1) bad.value = 513;
+        if (mutation == 2)
+            bad.coordinate_a = std::numeric_limits<std::uint64_t>::max();
+        if (mutation == 3) bad.result = 2;
+        if (mutation == 4) bad.domain = 0;
+        if (mutation == 5) bad.kind = trace_event_kind::file;
+        if (mutation == 6)
+            bad.result = 0x100U
+                         | static_cast<unsigned>(kwaque::errc::io_failure);
+        EXPECT_FALSE(rejected.observe(bad));
+    }
+    auto error = sample;
+    error.coordinate_a = error.coordinate_b = error.value = 0;
+    error.result = 0x100U
+                   | static_cast<unsigned>(kwaque::errc::permission_denied);
+    EXPECT_TRUE(captured.observe(error));
+}
+
+TEST(EventTraceTest, ValidatesTypedFileEffectAndReceiptAsSeparateRecords) {
+    const auto limits = test_limits(32, 16384);
+    event_trace trace{test_header(limits), limits};
+    kwaque::simulation::trace_entry effect{
+      .action = kwaque::simulation::trace_action::file_effect_applied,
+      .kind = kwaque::simulation::trace_event_kind::file,
+      .domain = kwaque::runtime::descriptor_for(
+                  kwaque::runtime::builtin_fault_point::file_write)
+                  ->id.value(),
+      .stable_id = 9,
+      .coordinate_a = 2,
+      .coordinate_b = 4096,
+      .value = 512,
+      .result = 1,
+      .context
+      = {kwaque::simulation::trace_context_field{trace_context_key::expected, 1}, kwaque::simulation::trace_context_field{trace_context_key::actual, 3}, kwaque::simulation::trace_context_field{trace_context_key::detail, 1}},
+      .context_size = 3};
+    EXPECT_TRUE(trace.observe(effect).has_value());
+    auto returned = effect;
+    returned.action = kwaque::simulation::trace_action::file_operation_result;
+    returned.result = UINT32_C(0x10000) | UINT32_C(0x100)
+                      | static_cast<std::uint32_t>(
+                        kwaque::errc::resource_exhausted);
+    EXPECT_TRUE(trace.observe(returned).has_value());
+    auto missing_context = effect;
+    missing_context.context_size = 0;
+    missing_context.context = {};
+    EXPECT_FALSE(trace.observe(missing_context).has_value());
+    auto wrong_kind = effect;
+    wrong_kind.kind = kwaque::simulation::trace_event_kind::filesystem;
+    EXPECT_FALSE(trace.observe(wrong_kind).has_value());
+    auto metadata_prefix = effect;
+    metadata_prefix.kind = kwaque::simulation::trace_event_kind::filesystem;
+    metadata_prefix.domain
+      = kwaque::runtime::descriptor_for(
+          kwaque::runtime::builtin_fault_point::file_rename)
+          ->id.value();
+    EXPECT_FALSE(trace.observe(metadata_prefix).has_value());
+    auto no_effect_bytes = effect;
+    no_effect_bytes.result = 0;
+    EXPECT_FALSE(trace.observe(no_effect_bytes).has_value());
+    auto unknown_detail = returned;
+    unknown_detail.result = UINT32_C(0x10808);
+    EXPECT_FALSE(trace.observe(unknown_detail).has_value());
+    auto exceptional_code = returned;
+    exceptional_code.result = UINT32_C(0x30001);
+    EXPECT_FALSE(trace.observe(exceptional_code).has_value());
+    auto missing_scope = effect;
+    missing_scope.context[2].value = 0;
+    EXPECT_FALSE(trace.observe(missing_scope).has_value());
 }

@@ -86,7 +86,7 @@ frame_probe probe_frame(
         result.batch = oracle::probe_batch(
           body, expected_kind == 17, true, (flags & wrong_topic) != 0);
         if (result.batch.error != errc::success)
-            return {.error = result.batch.error};
+            return {.error = result.batch.error, .batch = result.batch};
         if (result.batch.used != payload)
             return {.error = errc::malformed_data};
     }

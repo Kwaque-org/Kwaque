@@ -62,6 +62,7 @@ kwaque_cc_test(
     deps = [
         "//src/base",
         "//src/runtime:file",
+        "//src/runtime:file_error_internal",
         "//src/runtime:file_position",
         "@seastar",
     ],
@@ -125,6 +126,7 @@ kwaque_cc_seastar_test(
     memory = "128MiB",
     deps = [
         "//src/runtime:file",
+        "//src/runtime:file_error_internal",
         "//src/runtime:file_test_support",
         "//src/runtime:fragmented_buffer_internal",
     ],
@@ -153,6 +155,7 @@ kwaque_cc_seastar_test(
         "//src/runtime/production:file",
         "//src/runtime/testing:test_directory",
         "//src/runtime/testing/contracts:cleanup",
+        "//src/runtime/testing/contracts:file_system_contract",
     ],
 )
 
@@ -443,5 +446,19 @@ kwaque_cc_seastar_test(
         "//src/runtime:error",
         "//src/runtime/testing:test_directory",
         "//src/runtime/testing/contracts:cleanup",
+    ],
+)
+
+kwaque_cc_seastar_test(
+    name = "native_checked_close_test",
+    srcs = ["native_checked_close_test.cc"],
+    linkopts = [
+        "-Wl,--wrap=close",
+        "-Wl,--wrap=ftruncate",
+    ],
+    deps = [
+        "//src/runtime:file",
+        "//src/runtime/testing:test_directory",
+        "@seastar//:file_test_support",
     ],
 )

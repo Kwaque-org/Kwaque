@@ -214,7 +214,14 @@ fault_schedule::fault_schedule(
   , random_(master_seed)
   , rules_(std::move(rules))
   , groups_(std::move(groups))
-  , ranges_(ranges) {}
+  , ranges_(ranges) {
+    for (const auto& group : groups_)
+        if (
+          group.object
+          && group.object->bytes().size()
+               == runtime::maximum_fault_object_key_bytes)
+            contextual_points_[static_cast<std::size_t>(group.point)] = true;
+}
 
 runtime::result<fault_schedule::rule_index> fault_schedule::index_rules(
   seastar::chunked_vector<fault_rule>& rules, fault_schedule_limits limits) {
@@ -444,10 +451,30 @@ fault_schedule::prepare(const runtime::fault_request& request) noexcept {
       request, scheduler_->now(), scheduler_->limits().maximum_deadline());
 }
 
+runtime::result<prepared_fault_evaluation> fault_schedule::prepare_contextual(
+  const runtime::fault_request& request,
+  runtime::fault_object_key context) noexcept {
+    if (context.bytes().size() != runtime::maximum_fault_object_key_bytes)
+        return runtime::failure(fault_error(errc::invalid_argument));
+    return prepare_impl(
+      request,
+      scheduler_->now(),
+      scheduler_->limits().maximum_deadline(),
+      &context);
+}
+
 runtime::result<prepared_fault_evaluation> fault_schedule::prepare(
   const runtime::fault_request& request,
   runtime::monotonic_time now,
   runtime::monotonic_time maximum_deadline) noexcept {
+    return prepare_impl(request, now, maximum_deadline, nullptr);
+}
+
+runtime::result<prepared_fault_evaluation> fault_schedule::prepare_impl(
+  const runtime::fault_request& request,
+  runtime::monotonic_time now,
+  runtime::monotonic_time maximum_deadline,
+  const runtime::fault_object_key* context) noexcept {
     assert_current();
     if (now != scheduler_->now() || now > maximum_deadline) {
         return runtime::failure(fault_error(errc::invalid_argument));
@@ -456,7 +483,12 @@ runtime::result<prepared_fault_evaluation> fault_schedule::prepare(
     if (!descriptor) {
         return runtime::failure(descriptor.error());
     }
-    const auto* rule = find_rule(request, (**descriptor).point);
+    const fault_rule* rule = nullptr;
+    if (context != nullptr) {
+        if (const auto* group = find_group((**descriptor).point, *context))
+            rule = find_occurrence(*group, request.occurrence);
+    }
+    if (rule == nullptr) rule = find_rule(request, (**descriptor).point);
     const auto selected = rule != nullptr ? select(*rule, request.occurrence)
                                           : selector_result{};
     const auto allowed_maximum = std::min(
@@ -482,22 +514,32 @@ runtime::result<prepared_fault_evaluation> fault_schedule::prepare(
         return runtime::failure(reservation.error());
     }
     const auto outcome = selected.applied ? selector_applied : selector_skipped;
+    trace_entry entry{
+      .time = scheduler_->now(),
+      .action = trace_action::fault_evaluated,
+      .kind = trace_event_kind::fault,
+      .domain = request.point.value(),
+      .stable_id = rule->id().value(),
+      .coordinate_a = request.occurrence.value(),
+      .coordinate_b = selected.draws,
+      .value = selected.sample,
+      .result = static_cast<std::uint32_t>(rule->decision().action())
+                | (outcome << 8U),
+    };
+    if (rule->decision().file_failure()) {
+        entry.context_size = 2;
+        entry.context[0] = {
+          .key = trace_context_key::detail,
+          .value = static_cast<std::uint8_t>(rule->decision().file_cause())};
+        entry.context[1] = {
+          .key = trace_context_key::limit,
+          .value = rule->decision().file_prefix().value()};
+    }
     return prepared_fault_evaluation{
       *this,
       rule->decision(),
       selected.applied,
-      trace_entry{
-        .time = scheduler_->now(),
-        .action = trace_action::fault_evaluated,
-        .kind = trace_event_kind::fault,
-        .domain = request.point.value(),
-        .stable_id = rule->id().value(),
-        .coordinate_a = request.occurrence.value(),
-        .coordinate_b = selected.draws,
-        .value = selected.sample,
-        .result = static_cast<std::uint32_t>(rule->decision().action())
-                  | (outcome << 8U),
-      },
+      entry,
       std::move(*reservation),
       random_.master_seed(),
       selected.draws};

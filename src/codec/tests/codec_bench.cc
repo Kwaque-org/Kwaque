@@ -9,6 +9,7 @@
 #include "src/codec/limits.h"
 #include "src/codec/staging_cooperative.h"
 #include "src/codec/tests/codec_bench_reference.h"
+#include "src/codec/tests/qualification_profile.h"
 #include "src/codec/transaction.h"
 
 #include <seastar/core/abort_source.hh>
@@ -199,7 +200,7 @@ byte_count capacity_bound(byte_count requested) noexcept {
     return byte_count{2U * std::bit_ceil(size)};
 }
 
-constexpr byte_count frame_reservation{1024U * 1024U};
+constexpr byte_count frame_reservation = testing::execution_reservation;
 constexpr byte_count parent_remainder{
   64U * 1024U * 1024U - frame_reservation.value()};
 

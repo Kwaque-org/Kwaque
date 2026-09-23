@@ -73,12 +73,8 @@ public:
       range_logical_end begin,
       range_logical_end end) noexcept {
         const auto original = submitted.original_count();
-        if (
-          original.value() == 0 || retained.value() == 0
-          || retained.value() > original.value())
+        if (retained.value() == 0 || retained.value() > original.value())
             return failure(errc::invalid_argument);
-        if (original.value() > codec::absolute_max_original_records)
-            return failure(errc::resource_exhausted);
         const auto span = range_logical_span::from_count(begin, original);
         if (!span) return failure(span.error());
         if (span->end() != end) return failure(errc::invalid_argument);

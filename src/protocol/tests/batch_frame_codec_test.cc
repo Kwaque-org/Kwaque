@@ -184,7 +184,7 @@ TEST(BatchFrameCodecTest, WrongFrameKindFamilyAndExpectedContextNeverCommit) {
     expect_error(submitted(wrong_family, work), errc::wrong_context);
     EXPECT_EQ(wrong_family.bytes_consumed(), byte_count{});
     auto unknown = batch;
-    oracle::put(unknown, 4, 11, 2);
+    oracle::put(unknown, 4, 12, 2);
     oracle::repair_crc(unknown);
     fragmented_buffer_parser unknown_family{
       fixture::fragmented(frame(unknown), 7)};
