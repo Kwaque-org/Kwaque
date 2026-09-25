@@ -40,6 +40,9 @@ public:
     ~workload_reservation();
     [[nodiscard]] workload_reservation share() const noexcept;
     [[nodiscard]] byte_count bytes() const noexcept;
+    // Requested storage allowance, excluding this reservation's own control
+    // allocation. Only this amount can cover a transferred payload.
+    [[nodiscard]] byte_count retained_bytes() const noexcept;
     // Acquire after the caller pins its object, before obtaining an I/O slot.
     // No wait or new allocation; failure leaves the existing reservation owned.
     [[nodiscard]] runtime::result<void>

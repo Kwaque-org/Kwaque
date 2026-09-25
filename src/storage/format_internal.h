@@ -7,10 +7,24 @@
 #include <array>
 #include <bit>
 #include <cstddef>
+#include <cstdint>
 #include <span>
 #include <type_traits>
 
 namespace kwaque::storage::detail {
+struct padded_prefix_cost final {
+    byte_count backing;
+    std::uint32_t fragments;
+};
+
+// Choose one combined allocation only when it fits and costs no more than
+// separate envelope/fixed owners. Admission and encoding use the same choice.
+[[nodiscard]] codec::result<padded_prefix_cost> plan_padded_prefix(
+  byte_count fixed_bytes,
+  const codec::limits&,
+  kwaque::bytes::allocation_charge_fn,
+  codec::field_context = {});
+
 // Fixed field leaves use explicit byte order, never native struct layout.
 template<std::size_t Offset, codec::fixed_width_integer T, std::size_t N>
 void store(std::array<char, N>& out, T value) noexcept {

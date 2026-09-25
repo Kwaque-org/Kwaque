@@ -1,4 +1,5 @@
 #include "src/storage/tests/wal_test_support.h"
+#include "src/storage/wal_group.h"
 
 #include <seastar/core/preempt.hh>
 #include <seastar/util/alloc_failure_injector.hh>
@@ -62,6 +63,52 @@ TEST(WalFormatTest, IndependentGoldenAndCompletePayload) {
     EXPECT_EQ(decoded->value.wal_extent().end().value(), 512U);
     EXPECT_EQ(decoded->value.batch().info(), info);
     EXPECT_EQ(flat(decoded->value.batch().bytes()), assigned_wire());
+}
+
+TEST(WalFormatTest, CombinedPrefixPreservesChildWithAndWithoutPadding) {
+    for (const std::size_t header_bytes : {32U, 153U}) {
+        seastar::abort_source abort;
+        codec::cooperative_work preparation{codec::limits::defaults(), abort};
+        const auto wire = assigned_wire(false, header_bytes);
+        auto raw = buffer(wire, 7);
+        auto child = validate_encoded_assigned_batch(
+                       std::move(raw), batch_expected(), budget(), preparation)
+                       .get()
+                       .value();
+        auto alias = child.share(budget(), preparation).get().value();
+        const auto* backing = alias.bytes().fragment_at(0)->data();
+        codec::limits_config policy;
+        policy.max_work_bytes = byte_count{512};
+        policy.max_work_items = item_count{64};
+        codec::cooperative_work work{
+          codec::limits::make(policy).value(), abort};
+        const auto expected = wal_expected();
+        const auto layout = preflight_wal_prepare(
+                              child,
+                              expected,
+                              work.policy(),
+                              {byte_count{512}, byte_count{512}})
+                              .value();
+        EXPECT_EQ(layout.padding_bytes().value() == 0, header_bytes == 153);
+        auto too_small = policy;
+        too_small.max_work_items = item_count{63};
+        const auto rejected = kwaque::storage::detail::wal_prepare_memory(
+          child, layout, codec::limits::make(too_small).value(), charge);
+        ASSERT_FALSE(rejected);
+        EXPECT_EQ(rejected.error().code(), errc::resource_exhausted);
+        const auto cost = detail::wal_prepare_memory(
+                            child, layout, work.policy(), charge)
+                            .value();
+        auto encoded
+          = encode_wal_prepare(
+              std::move(child), expected, work, cost.codec_bytes, charge)
+              .get();
+        ASSERT_TRUE(encoded);
+        EXPECT_EQ(flat(*encoded), wal_wire(wire, expected));
+        EXPECT_EQ(encoded->fragment_at(0)->size(), 168U);
+        EXPECT_EQ(encoded->fragment_at(1)->data(), backing);
+        EXPECT_TRUE(alias.bytes().content_equals(wire));
+    }
 }
 
 TEST(WalFormatTest, EveryTruncationAndFragmentCutNeedsTheWholeEnvelope) {
@@ -595,7 +642,7 @@ TEST(WalFormatTest, FinalBodyAndFragmentLimitsIncludeHeadersAndPadding) {
             EXPECT_EQ(flat(*output), wal_wire());
         }
     }
-    for (const std::uint64_t cap : {225U, 226U}) {
+    for (const std::uint64_t cap : {224U, 225U}) {
         seastar::abort_source abort;
         codec::cooperative_work prepare{codec::limits::defaults(), abort};
         auto source = buffer(assigned_wire(), 1);
@@ -615,12 +662,12 @@ TEST(WalFormatTest, FinalBodyAndFragmentLimitsIncludeHeadersAndPadding) {
                               budget().operation_remaining,
                               charge)
                               .get();
-        if (cap == 225) {
+        if (cap == 224) {
             ASSERT_FALSE(output.has_value());
             EXPECT_EQ(output.error().code(), errc::resource_exhausted);
         } else {
             ASSERT_TRUE(output.has_value());
-            EXPECT_EQ(output->fragment_count(), 226U);
+            EXPECT_EQ(output->fragment_count(), 225U);
         }
     }
 }
@@ -747,6 +794,91 @@ TEST(WalFormatTest, CancellationAfterChildAndPaddingValidationPreventsCommit) {
             EXPECT_EQ(input.bytes_consumed(), byte_count{1});
         }
         EXPECT_EQ(input.checkpoint_depth(), 1U);
+    }
+}
+TEST(WalFormatTest, PreflightSharesContextAndGeometryWithoutConsumingTheChild) {
+    seastar::abort_source abort;
+    codec::cooperative_work work{codec::limits::defaults(), abort};
+    auto child = checked_child(work, true, 48, true);
+    auto expected = wal_expected(8192, 16384);
+    expected.wal = wal_write_context::make(
+                     expected.wal.incarnation(),
+                     alignment(8192),
+                     runtime::file_position{8192})
+                     .value();
+    const codec::envelope_extent_limits cap{
+      byte_count{65536}, byte_count{65536}};
+    auto layout = preflight_wal_prepare(child, expected, work.policy(), cap);
+    ASSERT_TRUE(layout);
+    EXPECT_EQ(layout->encoded_bytes(), byte_count{8192});
+    EXPECT_EQ(
+      layout->at(expected.wal.position())->end(),
+      runtime::file_position{16384});
+    auto tight = preflight_wal_prepare(
+      child, expected, work.policy(), {byte_count{4096}, byte_count{4096}});
+    EXPECT_FALSE(tight);
+    auto wrong = expected;
+    wrong.routing_epoch = model::range_routing_epoch::make(9).value();
+    auto rejected = preflight_wal_prepare(child, wrong, work.policy(), cap);
+    ASSERT_FALSE(rejected);
+    EXPECT_EQ(rejected.error().code(), errc::wrong_context);
+    auto exhausted = expected;
+    exhausted.wal = wal_write_context::make(
+                      expected.wal.incarnation(),
+                      alignment(8192),
+                      runtime::file_position{UINT64_MAX - 8191})
+                      .value();
+    rejected = preflight_wal_prepare(child, exhausted, work.policy(), cap);
+    ASSERT_FALSE(rejected);
+    EXPECT_EQ(rejected.error().code(), errc::out_of_range);
+    EXPECT_TRUE(child.bytes().content_equals(assigned_wire(true, 48, true)));
+    auto encoded = encode_wal_prepare(
+                     std::move(child),
+                     expected,
+                     work,
+                     budget().operation_remaining,
+                     charge)
+                     .get();
+    ASSERT_TRUE(encoded);
+    EXPECT_EQ(encoded->size(), layout->encoded_bytes());
+    EXPECT_EQ(
+      flat(*encoded), wal_wire(assigned_wire(true, 48, true), expected));
+}
+TEST(WalFormatTest, GroupMemoryBoundCoversTheEncoderAtTheFragmentCeiling) {
+    for (const std::size_t header_bytes : {831U, 832U}) {
+        seastar::abort_source abort;
+        codec::cooperative_work work{codec::limits::defaults(), abort};
+        const auto wire = assigned_wire(false, header_bytes);
+        auto raw = buffer(wire, 1);
+        const auto memory = reserve(raw, work);
+        auto checked = validate_encoded_assigned_batch(
+                         std::move(raw), batch_expected(), memory, work)
+                         .get();
+        ASSERT_TRUE(checked);
+        auto expected = wal_expected(8192, 16384);
+        auto layout = preflight_wal_prepare(
+          *checked,
+          expected,
+          work.policy(),
+          {byte_count{65536}, byte_count{65536}});
+        ASSERT_TRUE(layout);
+        auto bound = kwaque::storage::detail::wal_prepare_memory(
+          *checked, *layout, work.policy(), charge);
+        if (header_bytes == 832) {
+            ASSERT_FALSE(bound);
+            EXPECT_EQ(bound.error().code(), errc::resource_exhausted);
+            continue;
+        }
+        ASSERT_TRUE(bound);
+        EXPECT_EQ(bound->fragments, item_count{1024});
+        auto encoded
+          = encode_wal_prepare(
+              std::move(*checked), expected, work, bound->codec_bytes, charge)
+              .get();
+        ASSERT_TRUE(encoded);
+        EXPECT_LE(encoded->retained_bytes(), bound->retained);
+        EXPECT_EQ(encoded->fragment_count(), 1024U);
+        EXPECT_EQ(flat(*encoded), wal_wire(wire, expected));
     }
 }
 } // namespace

@@ -538,7 +538,7 @@ struct body_reader final {
     std::uint64_t start;
     codec::decode_budget original;
     bool selected_mutable_generation{false};
-    std::optional<wal_descriptor_expectation> wal_expected{};
+    std::optional<wal_descriptor_expectation> wal_expected = std::nullopt;
     seastar::future<codec::result<decoded_local_metadata>> operator()(
       bytes::fragmented_buffer_parser& input,
       codec::field_context c,

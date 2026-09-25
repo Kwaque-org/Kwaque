@@ -158,21 +158,41 @@ def analysis_coverage_errors(workflow: str) -> list[str]:
     jobs = job_blocks(workflow)
     errors = []
     ordinary = run_commands(jobs.get("clang-tidy", ""))
+    analysis_inputs = (
+        "--remote_download_outputs=all",
+        "--aspects=//bazel:analysis_inputs.bzl%analysis_inputs",
+        "--output_groups=clang_tidy_inputs",
+        "//...",
+    )
     if not any(
-        "bazel build --config=ci-debug --remote_download_outputs=all "
-        "--build_tag_filters=-fuzz,-manual //..." == command
+        command.startswith("bazel build ")
+        and all(
+            flag in command.split()
+            for flag in (
+                *analysis_inputs,
+                "--config=ci-debug",
+                "--build_tag_filters=-fuzz,-manual",
+            )
+        )
         for command in ordinary
     ):
         errors.append(
-            "ordinary analysis must materialize all selected translation units"
+            "ordinary analysis must materialize all compilation prerequisites"
         )
     for target in (
         "//tools:compile_commands",
         "//tools:clang_tidy",
-        "//tools:clang_tidy_strict",
     ):
         if not any(target in command.split() for command in ordinary):
             errors.append(f"ordinary analysis requires {target}")
+    if not any(
+        "//tools:clang_tidy" in command.split()
+        and "--production-config=.clang-tidy-strict" in command.split()
+        for command in ordinary
+    ):
+        errors.append(
+            "ordinary analysis must cover the disjoint strict production commands"
+        )
     fuzz = run_commands(jobs.get("clang-tidy-fuzz", ""))
     if not any(
         "--fuzz-only" in command.split()
@@ -184,18 +204,18 @@ def analysis_coverage_errors(workflow: str) -> list[str]:
         command.startswith("bazel build ")
         and all(
             flag in command.split()
-            for flag in (
-                "--remote_download_outputs=all",
-                "--build_tag_filters=fuzz",
-                "//...",
-            )
+            for flag in (*analysis_inputs, "--build_tag_filters=fuzz")
         )
         for command in fuzz
     ):
         errors.append("fuzz analysis must materialize all fuzz roots and cached inputs")
     if not any("//tools:clang_tidy" in command.split() for command in fuzz):
         errors.append("fuzz analysis must execute ordinary clang-tidy")
-    if any("//tools:clang_tidy_strict" in command.split() for command in fuzz):
+    if any(
+        "//tools:clang_tidy_strict" in command.split()
+        or "--production-config=.clang-tidy-strict" in command.split()
+        for command in fuzz
+    ):
         errors.append("strict clang-tidy is reserved for production")
     if any("--config=fuzz" not in command.split() for command in fuzz):
         errors.append("keep fuzz analysis in its own build configuration")
@@ -574,8 +594,8 @@ class CiCoverageTest(unittest.TestCase):
             "native-policy": "ci-native",
             "cpp-format": "tools",
             "repository-checks": "tools",
-            "clang-tidy": "ci-debug",
-            "clang-tidy-fuzz": "fuzz",
+            "clang-tidy": "analysis-debug",
+            "clang-tidy-fuzz": "analysis-fuzz",
             "fuzz-smoke": "fuzz",
             "arm-build": "ci-release",
         }.items():
@@ -608,7 +628,8 @@ class CiCoverageTest(unittest.TestCase):
         prefix = (
             "bazel-v1-${{ runner.os }}-${{ runner.arch }}-${{ inputs.cache-scope }}-"
         )
-        self.assertEqual(setup.count(f"key: {prefix}${{{{ github.sha }}}}"), 2)
+        self.assertIn(f"CACHE_KEY: {prefix}${{{{ github.sha }}}}", setup)
+        self.assertEqual(setup.count("key: ${{ steps.disk-cache.outputs.key }}"), 2)
         self.assertEqual(setup.count(f"restore-keys: |\n          {prefix}\n"), 2)
         self.assertIn("inputs.cache-write == 'true'", setup)
         self.assertIn(
@@ -616,13 +637,30 @@ class CiCoverageTest(unittest.TestCase):
         )
         self.assertIn("if: steps.disk-cache.outputs.write == 'true'", setup)
         self.assertIn("if: steps.disk-cache.outputs.write != 'true'", setup)
+        for name in ("clang-tidy", "clang-tidy-fuzz"):
+            job = jobs[name]
+            self.assertIn("uses: actions/cache/save@", job)
+            self.assertIn("key: ${{ steps.setup.outputs.disk-cache-key }}", job)
+            self.assertIn("steps.setup.outputs.disk-cache-hit != 'true'", job)
+            self.assertIn(
+                "github.event.pull_request.head.repo.full_name == github.repository",
+                job,
+            )
+            self.assertLess(
+                job.index("Materialize"), job.index("Save prepared analysis inputs")
+            )
+            self.assertLess(
+                job.index("Save prepared analysis inputs"), job.index("Generate")
+            )
 
     def test_analysis_covers_ordinary_and_fuzz_sources(self) -> None:
         self.assertEqual(analysis_coverage_errors(self.workflow), [])
         for token in (
             "--fuzz-only",
             "--build_tag_filters=fuzz",
-            "//tools:clang_tidy_strict",
+            "--production-config=.clang-tidy-strict",
+            "--aspects=//bazel:analysis_inputs.bzl%analysis_inputs",
+            "--output_groups=clang_tidy_inputs",
         ):
             with self.subTest(token=token):
                 self.assertTrue(

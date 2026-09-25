@@ -5,7 +5,11 @@ package(default_visibility = ["//visibility:private"])
 kwaque_cc_library(
     name = "clocks",
     hdrs = ["clocks.h"],
-    visibility = ["//src/runtime/tests:__pkg__"],
+    visibility = [
+        "//src/broker:__pkg__",
+        "//src/runtime/tests:__pkg__",
+        "//src/storage/tests:__pkg__",
+    ],
     deps = [
         "//src/runtime:time",
         "@seastar",
@@ -16,7 +20,11 @@ kwaque_cc_library(
     name = "timer",
     srcs = ["timer.cc"],
     hdrs = ["timer.h"],
-    visibility = ["//src/runtime/tests:__pkg__"],
+    visibility = [
+        "//src/broker:__pkg__",
+        "//src/runtime/tests:__pkg__",
+        "//src/storage/tests:__pkg__",
+    ],
     deps = [
         ":clocks",
         "//src/base:invariant",

@@ -1,6 +1,8 @@
 #include "src/base/allocation.h"
 #include "src/bytes/fragmented_buffer_builder.h"
 #include "src/codec/staging_cooperative.h"
+#include "src/codec/tests/prepared_abort_source.h"
+#include "src/codec/tests/qualification_profile.h"
 #include "src/model/tests/model_bench_fixture.h"
 #include "src/protocol/batch_frame_codec.h"
 #include "src/protocol/frame_decode_internal.h"
@@ -38,7 +40,7 @@ using bytes::fragmented_buffer_parser;
 using fixture::charge;
 // One MiB stays unavailable for native/frame/fixture costs. No retained large
 // source cache is kept alongside these operation-local inputs.
-constexpr byte_count available{63U << 20U};
+constexpr byte_count available{codec::testing::residual};
 constexpr std::size_t maximum_payload = 16U << 20U;
 
 codec::decode_budget
@@ -391,9 +393,34 @@ byte_count aborting_charge(byte_count request) noexcept {
     return served;
 }
 
+TEST(
+  FrameQualificationTest,
+  AdmissionCancellationPreservesChargeWithoutAllocation) {
+    codec::testing::prepared_abort_source abort;
+    admission_abort = &abort;
+    admission_ordinal = 0;
+    admission_calls = 0;
+    auto reset = seastar::defer([] { admission_abort = nullptr; });
+    const byte_count request{4096};
+    const auto expected = charge(request);
+#if !defined(SEASTAR_DEFAULT_ALLOCATOR)
+    const auto before = seastar::memory::stats().mallocs();
+#endif
+    const auto served = aborting_charge(request);
+#if !defined(SEASTAR_DEFAULT_ALLOCATOR)
+    const auto allocations = seastar::memory::stats().mallocs() - before;
+    EXPECT_EQ(allocations, 0U);
+#endif
+    EXPECT_TRUE(abort.abort_requested());
+    EXPECT_EQ(served, expected);
+    EXPECT_EQ(admission_calls, 1U);
+#if defined(SEASTAR_DEFAULT_ALLOCATOR)
+    GTEST_SKIP() << "semantic cancellation passed; native allocation counters "
+                    "are unavailable";
+#endif
+}
+
 TEST(FrameQualificationTest, CancellationAtEveryAdmissionDrainsAllPublicPaths) {
-    seastar::abort_source warm_abort;
-    warm_abort.request_abort();
     for (unsigned operation = 0; operation < 6; ++operation) {
         const bool assigned = operation >= 4;
         const bool compressed = operation == 3 || operation == 5;
@@ -406,7 +433,7 @@ TEST(FrameQualificationTest, CancellationAtEveryAdmissionDrainsAllPublicPaths) {
         bool completed = false;
         unsigned cancellations = 0;
         for (std::size_t ordinal = 0; ordinal < 4096 && !completed; ++ordinal) {
-            seastar::abort_source abort;
+            codec::testing::prepared_abort_source abort;
             codec::cooperative_work work{codec::limits::defaults(), abort};
             fragmented_buffer_parser input{fixture::fragmented(wire, 67)};
             auto memory = reserve(input, work);
@@ -564,7 +591,7 @@ TEST(
           fixture::fragmented("pre" + fixture::wire(), 1)};
         ASSERT_TRUE(input.push_checkpoint().has_value());
         ASSERT_TRUE(input.skip(byte_count{3}).has_value());
-        seastar::abort_source abort;
+        codec::testing::prepared_abort_source abort;
         codec::cooperative_work work{codec::limits::defaults(), abort};
         auto memory = reserve(input, work);
         decoder_state state{

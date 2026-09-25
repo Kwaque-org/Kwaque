@@ -1,7 +1,8 @@
 #include "src/storage/format_internal.h"
 
 #include "src/bytes/fragmented_buffer_builder.h"
-#include "src/codec/envelope_encode.h"
+#include "src/codec/crc32c_cooperative.h"
+#include "src/codec/envelope.h"
 #include "src/codec/staging_cooperative.h"
 
 #include <seastar/core/deleter.hh>
@@ -29,6 +30,31 @@ codec::result<byte_count> charged(
     return cost;
 }
 } // namespace
+
+codec::result<padded_prefix_cost> plan_padded_prefix(
+  byte_count fixed,
+  const codec::limits& policy,
+  kwaque::bytes::allocation_charge_fn charge,
+  codec::field_context context) {
+    if (!charge || fixed.value() == 0 || fixed.value() > 320)
+        return codec::failure(at(errc::invalid_argument, context));
+    const auto combined = charged(
+      byte_count{codec::envelope_prefix_bytes + fixed.value()},
+      policy,
+      charge,
+      context);
+    const auto header = charged(
+      byte_count{codec::envelope_prefix_bytes}, policy, charge, context);
+    const auto fields = charged(fixed, policy, charge, context);
+    if (!header || !fields) {
+        if (combined) return padded_prefix_cost{*combined, 1};
+        return codec::failure(!header ? header.error() : fields.error());
+    }
+    const auto separate = *header->checked_add(*fields);
+    if (combined && *combined <= separate)
+        return padded_prefix_cost{*combined, 1};
+    return padded_prefix_cost{separate, 2};
+}
 
 seastar::future<codec::result<void>> read_fixed(
   kwaque::bytes::fragmented_buffer_parser& input,
@@ -108,7 +134,7 @@ seastar::future<codec::result<kwaque::bytes::fragmented_buffer>> encode_padded(
   kwaque::bytes::allocation_charge_fn charge,
   codec::field_context context) {
     auto child = std::move(source);
-    kwaque::bytes::fragmented_buffer prefix, padding, body;
+    kwaque::bytes::fragmented_buffer prefix, fixed_owner, padding;
     std::optional<kwaque::bytes::fragmented_buffer_builder> padding_builder;
     std::optional<codec::result<kwaque::bytes::fragmented_buffer>> output;
     std::optional<codec::error> failed;
@@ -142,45 +168,62 @@ seastar::future<codec::result<kwaque::bytes::fragmented_buffer>> encode_padded(
                   cost.error(), context, context.origin);
                 break;
             }
-            byte_count new_backing, new_metadata, padding_backing,
-              padding_metadata;
-            for (const auto size :
-                 {byte_count{fixed.size()}, layout.padding_bytes()}) {
-                if (size.value() == 0) continue;
-                const auto backing = charged(
-                  size, work.policy(), charge, context);
-                const auto descriptors = charged(
-                  byte_count{kwaque::bytes::fragmented_buffer::
-                               fragment_descriptor_size()},
-                  work.policy(),
-                  charge,
-                  context);
-                const auto controls = charged(
-                  byte_count{sizeof(seastar::free_deleter_impl)},
-                  work.policy(),
-                  charge,
-                  context);
-                if (!backing || !descriptors || !controls) {
-                    failed = !backing       ? backing.error()
-                             : !descriptors ? descriptors.error()
-                                            : controls.error();
+            const auto prefix_cost = plan_padded_prefix(
+              byte_count{fixed.size()}, work.policy(), charge, context);
+            if (!prefix_cost) {
+                failed = prefix_cost.error();
+                break;
+            }
+            byte_count new_backing = prefix_cost->backing;
+            byte_count new_metadata;
+            const byte_count prefix_bytes{
+              codec::envelope_prefix_bytes + fixed.size()};
+            const auto owner_descriptor = charged(
+              byte_count{
+                kwaque::bytes::fragmented_buffer::fragment_descriptor_size()},
+              work.policy(),
+              charge,
+              context);
+            const auto owner_control = charged(
+              byte_count{sizeof(seastar::free_deleter_impl)},
+              work.policy(),
+              charge,
+              context);
+            if (!owner_descriptor || !owner_control) {
+                failed = !owner_descriptor ? owner_descriptor.error()
+                                           : owner_control.error();
+                break;
+            }
+            const auto small_owners
+              = prefix_cost->fragments
+                + (layout.padding_bytes().value() != 0 ? 1U : 0U);
+            new_metadata = byte_count{
+              small_owners
+              * (owner_descriptor->value() + owner_control->value())};
+            if (layout.padding_bytes().value() != 0) {
+                const auto pad_backing = charged(
+                  layout.padding_bytes(), work.policy(), charge, context);
+                if (!pad_backing) {
+                    failed = pad_backing.error();
                     break;
                 }
-                // Two owners, each with three charges capped at 128 KiB.
-                new_backing = *new_backing.checked_add(*backing);
-                new_metadata = *new_metadata.checked_add(
-                  byte_count{descriptors->value() + controls->value()});
-                padding_backing = *backing;
-                padding_metadata = byte_count{
-                  descriptors->value() + controls->value()};
-            }
-            if (failed) break;
-            if (layout.padding_bytes().value() == 0) {
-                padding_backing = {};
-                padding_metadata = {};
+                new_backing = *new_backing.checked_add(*pad_backing);
             }
             const auto metadata = cost->descriptors.checked_add(
               cost->share_controls);
+            const auto nodes = child.fragment_count() + small_owners;
+            const auto descriptors = charged(
+              byte_count{
+                nodes
+                * kwaque::bytes::fragmented_buffer::fragment_descriptor_size()},
+              work.policy(),
+              charge,
+              context);
+            if (!descriptors) {
+                failed = descriptors.error();
+                break;
+            }
+            new_metadata = *new_metadata.checked_add(*descriptors);
             const auto bookkeeping = metadata
                                        ? metadata->checked_add(new_metadata)
                                        : std::nullopt;
@@ -212,13 +255,34 @@ seastar::future<codec::result<kwaque::bytes::fragmented_buffer>> encode_padded(
                 failed = ready.error();
                 break;
             }
-            auto copied = kwaque::bytes::fragmented_buffer::copy_of(fixed);
-            if (!copied) {
-                failed = codec::detail::allocation_cost_error(
-                  copied.error(), context, context.origin);
+            // Complete the envelope privately. Hash the exact body in wire
+            // order while its owner remains live; no checksum alias is needed.
+            // Only the published prefix range is initialized and later read.
+            std::array<char, codec::envelope_prefix_bytes + 320> fixed_prefix;
+            std::copy(
+              fixed.begin(),
+              fixed.end(),
+              fixed_prefix.begin() + codec::envelope_prefix_bytes);
+            codec::crc32c checksum;
+            checksum.extend(fixed);
+            const auto child_crc = co_await codec::crc32c_borrowed(
+              child,
+              work,
+              checksum.value(),
+              codec::error{
+                errc::success,
+                context.family,
+                static_cast<std::uint16_t>(codec::envelope_field::body_crc32c),
+                context.origin + 24});
+            if (!child_crc) {
+                failed = child_crc.error();
                 break;
             }
-            prefix = std::move(*copied);
+            if (auto ready = work.poll(anchor); !ready) {
+                failed = ready.error();
+                break;
+            }
+            checksum = codec::crc32c{*child_crc};
             const auto pad = layout.padding_bytes();
             if (pad.value() != 0) {
                 padding_builder.emplace(
@@ -229,6 +293,17 @@ seastar::future<codec::result<kwaque::bytes::fragmented_buffer>> encode_padded(
                     .max_retained_bytes = pad,
                     .max_fragments = 1});
                 padding_builder->reserve_fragments(item_count{1}).value();
+                if (
+                  auto ready = co_await work.admit(
+                    byte_count{128}, item_count{1}, anchor);
+                  !ready) {
+                    failed = ready.error();
+                    break;
+                }
+                if (auto ready = work.poll(anchor); !ready) {
+                    failed = ready.error();
+                    break;
+                }
                 std::array<char, 128> zeros{};
                 while (padding_builder->size() < pad) {
                     const auto count = std::min<std::uint64_t>(
@@ -246,54 +321,110 @@ seastar::future<codec::result<kwaque::bytes::fragmented_buffer>> encode_padded(
                         failed = ready.error();
                         break;
                     }
-                    padding_builder
-                      ->append(std::span<const char>{zeros}.first(count))
-                      .value();
+                    const auto bytes = std::span<const char>{zeros}.first(
+                      count);
+                    padding_builder->append(bytes).value();
+                    checksum.extend(bytes);
                 }
                 if (failed) break;
                 padding = padding_builder->finish().value();
             }
-            auto assembled = co_await codec::assemble_buffer_cooperatively(
-              std::move(prefix),
-              std::move(child),
-              work,
-              layout.body_bytes(),
-              {.retained_input = padding_backing,
-               .payload_bookkeeping = padding_metadata},
-              remaining,
-              charge,
-              context);
-            if (!assembled) {
-                failed = assembled.error();
+            if (
+              auto ready = co_await work.admit(
+                codec::envelope_prefix_work_bytes,
+                codec::envelope_prefix_work_items,
+                anchor);
+              !ready) {
+                failed = ready.error();
                 break;
             }
-            body = std::move(*assembled);
-            if (!padding.empty()) {
-                assembled = co_await codec::assemble_buffer_cooperatively(
-                  std::move(body),
-                  std::move(padding),
-                  work,
-                  layout.body_bytes(),
-                  {},
-                  remaining,
-                  charge,
-                  context);
-                if (!assembled) {
-                    failed = assembled.error();
+            if (auto ready = work.poll(anchor); !ready) {
+                failed = ready.error();
+                break;
+            }
+            auto header = codec::encode_envelope_prefix(
+              {family, layout.body_bytes(), checksum.value(), 0},
+              work.policy(),
+              {layout.body_bytes(), layout.encoded_bytes()},
+              context);
+            if (!header) {
+                failed = header.error();
+                break;
+            }
+            if (
+              auto ready = co_await work.admit(
+                codec::envelope_prefix_work_bytes,
+                codec::envelope_prefix_work_items,
+                anchor);
+              !ready) {
+                failed = ready.error();
+                break;
+            }
+            if (auto ready = work.poll(anchor); !ready) {
+                failed = ready.error();
+                break;
+            }
+            codec::crc32c header_checksum;
+            header_checksum.extend(std::span<const char>{*header});
+            seastar::write_le(header->data() + 28, header_checksum.value());
+            std::copy(header->begin(), header->end(), fixed_prefix.begin());
+            if (
+              auto ready = co_await work.admit(
+                prefix_bytes, item_count{8}, anchor);
+              !ready) {
+                failed = ready.error();
+                break;
+            }
+            if (auto ready = work.poll(anchor); !ready) {
+                failed = ready.error();
+                break;
+            }
+            const auto prefix_view = std::span<const char>{fixed_prefix}.first(
+              prefix_bytes.value());
+            auto copied = kwaque::bytes::fragmented_buffer::copy_of(
+              prefix_cost->fragments == 1
+                ? prefix_view
+                : prefix_view.first(codec::envelope_prefix_bytes));
+            if (!copied) {
+                failed = codec::detail::allocation_cost_error(
+                  copied.error(), context, context.origin);
+                break;
+            }
+            prefix = std::move(*copied);
+            if (prefix_cost->fragments == 2) {
+                copied = kwaque::bytes::fragmented_buffer::copy_of(
+                  prefix_view.subspan(codec::envelope_prefix_bytes));
+                if (!copied) {
+                    failed = codec::detail::allocation_cost_error(
+                      copied.error(), context, context.origin);
                     break;
                 }
-                body = std::move(*assembled);
+                fixed_owner = std::move(*copied);
+                output.emplace(
+                  co_await codec::assemble_buffer_cooperatively(
+                    std::move(prefix),
+                    std::move(fixed_owner),
+                    std::move(child),
+                    std::move(padding),
+                    work,
+                    layout.encoded_bytes(),
+                    {},
+                    remaining,
+                    charge,
+                    context));
+            } else {
+                output.emplace(
+                  co_await codec::assemble_buffer_cooperatively(
+                    std::move(prefix),
+                    std::move(child),
+                    std::move(padding),
+                    work,
+                    layout.encoded_bytes(),
+                    {},
+                    remaining,
+                    charge,
+                    context));
             }
-            output.emplace(
-              co_await codec::encode_envelope(
-                std::move(body),
-                family,
-                work,
-                {layout.body_bytes(), layout.encoded_bytes()},
-                {},
-                remaining,
-                charge,
-                context));
             if (!output->has_value()) failed = output->error();
         } while (false);
     } catch (...) {
@@ -306,7 +437,7 @@ seastar::future<codec::result<kwaque::bytes::fragmented_buffer>> encode_padded(
     // Reset remains valid after a move and releases retained buffers if a
     // child coroutine frame could not be allocated before taking ownership.
     // NOLINTNEXTLINE(bugprone-use-after-move)
-    for (auto* value : {&child, &prefix, &padding, &body}) {
+    for (auto* value : {&child, &prefix, &fixed_owner, &padding}) {
         co_await work.drain_inline(work.byte_quantum(), work.item_quantum());
         *value = kwaque::bytes::fragmented_buffer{};
     }

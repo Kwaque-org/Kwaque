@@ -5493,6 +5493,12 @@ fake_file_system::apply(pending_operation& operation) {
         bool report_full = false;
         if (const auto cap = operation.fault.short_operation_bytes()) {
             length = std::min(length, cap->value());
+            // A zero native completion is failed forward progress, not an
+            // empty model write. Preserve bytes and EOF for the runtime owner
+            // to reject the completion and drain its accepted work.
+            if (length == 0) {
+                return pending_value{byte_count{0}};
+            }
         } else if (
           operation.fault.action() == runtime::fault_action::torn_write) {
             length = operation.fault_a;

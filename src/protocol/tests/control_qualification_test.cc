@@ -4,11 +4,13 @@
 #include "proto/kwaque/common/v1/identity.pb.h"
 #include "proto/kwaque/control/v1/handshake.pb.h"
 #include "proto/kwaque/control/v1/redirect.pb.h"
+#include "src/codec/tests/prepared_abort_source.h"
 #include "src/protocol/control_frame_codec.h"
 #include "src/protocol/control_preflight.h"
 #include "src/protocol/tests/control_test_support.h"
 #include "src/protocol/tests/frame_test_support.h"
 
+#include <seastar/core/memory.hh>
 #include <seastar/core/preempt.hh>
 #include <seastar/util/alloc_failure_injector.hh>
 #include <seastar/util/later.hh>
@@ -303,6 +305,32 @@ byte_count observed_charge(byte_count request) noexcept {
 
 TEST(
   ControlQualificationTest,
+  AdmissionCancellationPreservesChargeWithoutAllocation) {
+    codec::testing::prepared_abort_source abort;
+    const byte_count request{4096};
+    const auto expected = fixture::charge(request);
+    admission_abort = &abort;
+    admission_ordinal = 0;
+    abort_ordinal = 1;
+    undercharge = false;
+    const auto before = seastar::memory::stats().mallocs();
+    const auto actual = observed_charge(request);
+    const auto allocations = seastar::memory::stats().mallocs() - before;
+    admission_abort = nullptr;
+    abort_ordinal = 0;
+    EXPECT_TRUE(abort.abort_requested());
+    EXPECT_EQ(admission_ordinal, 1U);
+    EXPECT_EQ(actual, expected);
+#if defined(SEASTAR_DEFAULT_ALLOCATOR)
+    static_cast<void>(allocations);
+    GTEST_SKIP() << "native allocation counters are unavailable";
+#else
+    EXPECT_EQ(allocations, 0U);
+#endif
+}
+
+TEST(
+  ControlQualificationTest,
   LatePublicationAbortDrainsAndPreservesAnEarlierError) {
     auto value = fixture::read(
       fixture::response(blob(1, std::string(100, 'v'))),
@@ -322,7 +350,7 @@ TEST(
     const auto final_admission = admission_ordinal;
     ASSERT_GT(final_admission, 0U);
     for (const bool earlier_error : {false, true}) {
-        seastar::abort_source abort;
+        codec::testing::prepared_abort_source abort;
         codec::cooperative_work work{codec::limits::defaults(), abort};
         admission_abort = &abort;
         admission_ordinal = 0;

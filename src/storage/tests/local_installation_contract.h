@@ -829,6 +829,10 @@ seastar::future<> maximum_bundle(
             require(
               result.publication.failure.failed() && !result.reference,
               "cross-page duplicate anchor accepted");
+            const auto error = result.publication.failure.error();
+            require(
+              error && error->code() == errc::malformed_data,
+              "ordered stream rejected for an unrelated reason");
             require(
               !take(co_await drive.lifecycle(files.exists(path))),
               "bad ordered stream exposed final");

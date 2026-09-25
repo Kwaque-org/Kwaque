@@ -337,13 +337,16 @@ result<buffer_allocation_cost> fragmented_buffer::slice_allocation_cost_from(
     if (remaining != 0 || add_would_overflow(touched, touched)) {
         return failure(errc::out_of_range);
     }
+    const bool whole = first == 0 && offset == 0 && length == size_;
     const auto descriptors = descriptor_allocation_bytes(
-      touched + touched, sizeof(owned_fragment));
+      whole ? touched : touched + touched, sizeof(owned_fragment));
     if (!descriptors) {
         return failure(descriptors.error());
     }
-    // Slice construction can grow its devector with old and new blocks live.
-    for (unsigned allocation = 0; allocation < 2; ++allocation) {
+    // A whole-buffer share reserves exactly once. Partial slices can grow
+    // their devector with old and new descriptor blocks live together.
+    for (unsigned allocation = 0; allocation < (whole ? 1U : 2U);
+         ++allocation) {
         if (
           auto added = add_allocation_charge(
             cost, cost.descriptors, total, *descriptors, charge);
@@ -371,6 +374,7 @@ fragmented_buffer::share(byte_count offset, byte_count length) {
 
 result<fragmented_buffer> fragmented_buffer::share_from(
   std::size_t first, std::size_t offset, byte_count length) {
+    if (first == 0 && offset == 0 && length == size_) return share();
     fragment_storage shared;
     byte_count retained;
     std::uint64_t skip = offset;

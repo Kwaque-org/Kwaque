@@ -2,6 +2,7 @@
 
 #include "src/storage/encoded_batch.h"
 #include "src/storage/format_context.h"
+#include "src/storage/format_size.h"
 
 namespace kwaque::storage {
 namespace detail {
@@ -44,6 +45,34 @@ struct wal_prepare_expectation final {
     replay_profile profile{replay_profile::v1};
     storage_profile target_profile{storage_profile::v1};
 };
+
+// Independent target and child policy, before assigning any WAL position.
+struct wal_child_expectation final {
+    segment_write_context target;
+    runtime::file_position target_data_start;
+    model::range_routing_epoch routing_epoch;
+    model::batch_decode_expectation batch;
+    replay_profile profile{replay_profile::v1};
+    storage_profile target_profile{storage_profile::v1};
+};
+
+// Shared scalar checks used by preparation and the consuming codec. Exact-byte
+// validation under the supplied batch policy remains separately required.
+[[nodiscard]] codec::result<void> validate_wal_child_context(
+  assigned_batch_info,
+  const wal_child_expectation&,
+  codec::field_context context = {});
+
+// Borrowed scalar/layout preflight, used before reserving a complete group.
+// It does not encode or attest to semantic validation under a narrower policy;
+// validate the exact child separately with encoded_assigned_batch::validate.
+// The consuming encoder repeats these same context/layout leaves.
+[[nodiscard]] codec::result<aligned_envelope_layout> preflight_wal_prepare(
+  const encoded_assigned_batch&,
+  const wal_prepare_expectation&,
+  const codec::limits&,
+  codec::envelope_extent_limits owner_limits,
+  codec::field_context context = {});
 
 // One fully validated PREPARE payload. The exact family-2 child, including its
 // codec and optional extensions, remains owned; outer envelope extensions are

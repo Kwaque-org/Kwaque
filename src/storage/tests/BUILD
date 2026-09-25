@@ -1,5 +1,7 @@
-load("//bazel:build.bzl", "kwaque_cc_library")
-load("//bazel:test.bzl", "kwaque_cc_benchmark", "kwaque_cc_fuzz_test", "kwaque_cc_seastar_gtest", "kwaque_cc_seastar_test", "kwaque_cc_test")
+load("@rules_python//python:defs.bzl", "py_binary", "py_test")
+load("//bazel:build.bzl", "kwaque_cc_binary", "kwaque_cc_library")
+load("//bazel:test.bzl", "kwaque_cc_benchmark", "kwaque_cc_fuzz_test", "kwaque_cc_seastar_gtest", "kwaque_cc_seastar_test", "kwaque_cc_test", "kwaque_py_native_test")
+load("//src/codec/tests:allocation_observer.bzl", "ALLOCATION_OBSERVER_LINKOPTS")
 
 package(default_visibility = ["//visibility:private"])
 
@@ -155,8 +157,12 @@ kwaque_cc_seastar_gtest(
             "//src/storage:encoded_batch",
             "//src/storage:format_context",
             "//src/storage:segment_format",
+            "@crc32c",
             "@lz4//:lz4_frame",
-        ] + (["//src/storage:wal_format"] if name == "wal_format_test" else []) + ([
+        ] + ([
+            "//src/storage:wal_format",
+            "//src/storage:wal_group",
+        ] if name == "wal_format_test" else []) + ([
             "//src/storage:footer_format",
             "//src/storage:page_ref",
             "//src/storage:completed_retry",
@@ -228,6 +234,7 @@ test_suite(
         ":local_paths_test",
         ":local_store_config_test",
         ":local_types_test",
+        ":memory_qualification_test",
         ":range_manifest_decode_test",
         ":range_manifest_format_test",
         ":retry_format_test",
@@ -277,6 +284,7 @@ kwaque_cc_seastar_gtest(
         "//src/storage:page_ref",
         "//src/storage:segment_format",
         "//src/storage:sparse_index_format",
+        "@crc32c",
         "@lz4//:lz4_frame",
     ],
 )
@@ -316,6 +324,7 @@ kwaque_cc_seastar_gtest(
         "//src/storage:page_ref",
         "//src/storage:range_manifest_format",
         "//src/storage:segment_format",
+        "@crc32c",
         "@lz4//:lz4_frame",
     ],
 )
@@ -357,6 +366,7 @@ kwaque_cc_seastar_gtest(
         "//src/storage:range_manifest_format",
         "//src/storage:segment_format",
         "//src/storage:sparse_index_format",
+        "@crc32c",
         "@lz4//:lz4_frame",
     ],
 )
@@ -385,6 +395,7 @@ kwaque_cc_seastar_gtest(
         "//src/codec:error",
         "//src/codec:limits",
         "//src/codec:sha256",
+        "//src/codec/tests:qualification_profile",
         "//src/model:batch",
         "//src/model:batch_codec",
         "//src/model:batch_context",
@@ -399,6 +410,7 @@ kwaque_cc_seastar_gtest(
         "//src/storage:range_manifest_format",
         "//src/storage:segment_format",
         "//src/storage:sparse_index_format",
+        "@crc32c",
         "@lz4//:lz4_frame",
     ],
 )
@@ -451,6 +463,7 @@ kwaque_cc_library(
         "//src/storage:segment_format",
         "//src/storage:sparse_index_format",
         "//src/storage:wal_format",
+        "@crc32c",
         "@lz4//:lz4_frame",
         "@seastar",
     ],
@@ -542,6 +555,7 @@ kwaque_cc_seastar_gtest(
         "//src/codec:integer",
         "//src/codec:limits",
         "//src/codec/tests:codec_bench_reference",
+        "//src/codec/tests:qualification_profile",
         "//src/model:identity",
         "//src/model:position",
         "//src/storage:encoded_batch",
@@ -592,6 +606,7 @@ kwaque_cc_benchmark(
         "//src/codec:limits",
         "//src/codec:sha256_cooperative",
         "//src/codec/tests:codec_bench_reference",
+        "//src/codec/tests:qualification_profile",
         "//src/model:identity",
         "//src/runtime:file_position",
         "//src/storage:completed_retry",
@@ -977,4 +992,430 @@ kwaque_cc_library(
         ":local_reader_contract",
         "@seastar",
     ],
+)
+
+kwaque_cc_binary(
+    name = "memory_qualification_probe",
+    testonly = True,
+    srcs = [
+        "memory_qualification_extent.cc",
+        "memory_qualification_format.cc",
+        "memory_qualification_metadata.cc",
+        "memory_qualification_probe.cc",
+        "memory_qualification_probe.h",
+    ],
+    linkopts = ALLOCATION_OBSERVER_LINKOPTS,
+    deps = [
+        ":storage_large_fixture",
+        ":storage_test_support",
+        "//src/base",
+        "//src/base:error",
+        "//src/bytes:allocation_test_profile",
+        "//src/bytes:fragmented_buffer",
+        "//src/bytes:fragmented_buffer_parser",
+        "//src/codec:cooperative",
+        "//src/codec:digest",
+        "//src/codec:error",
+        "//src/codec:integer",
+        "//src/codec:limits",
+        "//src/codec/tests:allocation_observer",
+        "//src/codec/tests:codec_bench_reference",
+        "//src/codec/tests:memory_qualification_support",
+        "//src/codec/tests:prepared_abort_source",
+        "//src/model:batch_codec",
+        "//src/model:batch_context",
+        "//src/model:batch_identity",
+        "//src/model:position",
+        "//src/runtime:file_position",
+        "//src/storage:completed_retry",
+        "//src/storage:encoded_batch",
+        "//src/storage:footer_format",
+        "//src/storage:format_context",
+        "//src/storage:page_ref",
+        "//src/storage:range_manifest_format",
+        "//src/storage:segment_format",
+        "//src/storage:sparse_index_format",
+        "//src/storage:wal_format",
+        "@boost//:program_options",
+        "@seastar",
+    ],
+)
+
+kwaque_py_native_test(
+    name = "memory_qualification_test",
+    timeout = "long",
+    srcs = ["memory_qualification_test.py"],
+    data = [
+        ":memory_qualification_probe",
+        "//src/codec/tests:memory_qualification_probe",
+    ],
+    tags = [
+        "resources:cpu:1",
+        "resources:memory:256",
+    ],
+    deps = ["//src/codec/tests:memory_qualification_driver"],
+)
+
+kwaque_cc_library(
+    name = "wal_writer_contract",
+    testonly = True,
+    hdrs = ["wal_writer_contract.h"],
+    visibility = [
+        "//src/broker:__pkg__",
+        "//src/simulation/tests:__pkg__",
+    ],
+    deps = [
+        ":local_installation_contract",
+        ":local_store_contract",
+        ":storage_test_support",
+        "//src/base",
+        "//src/base:error",
+        "//src/bytes:allocation_test_profile",
+        "//src/bytes:fragmented_buffer",
+        "//src/codec:cooperative",
+        "//src/codec:integer",
+        "//src/codec:limits",
+        "//src/model:batch_context",
+        "//src/model:batch_identity",
+        "//src/model:epoch",
+        "//src/model:identity",
+        "//src/runtime:file",
+        "//src/runtime:first_failure",
+        "//src/storage:encoded_batch",
+        "//src/storage:local_control",
+        "//src/storage:local_id_allocator",
+        "//src/storage:local_paths",
+        "//src/storage:local_types",
+        "//src/storage:wal_child",
+        "//src/storage:wal_writer",
+        "//src/storage:workload_budget",
+        "@seastar",
+    ],
+)
+
+kwaque_cc_seastar_test(
+    name = "wal_writer_state_test",
+    srcs = ["wal_writer_state_test.cc"],
+    deps = [
+        "//src/base",
+        "//src/base:error",
+        "//src/bytes:allocation_test_profile",
+        "//src/bytes:fragmented_buffer",
+        "//src/codec:limits",
+        "//src/model:position",
+        "//src/resource:resource_manager",
+        "//src/resource:resource_registry",
+        "//src/resource:workload_class",
+        "//src/runtime:error",
+        "//src/runtime:first_failure",
+        "//src/storage:wal_writer_state",
+        "//src/storage:workload_budget",
+    ],
+)
+
+kwaque_cc_library(
+    name = "wal_append_contract",
+    testonly = True,
+    hdrs = ["wal_append_contract.h"],
+    visibility = [
+        "//src/broker:__pkg__",
+        "//src/simulation/tests:__pkg__",
+    ],
+    deps = [
+        ":local_installation_contract",
+        ":local_store_contract",
+        ":storage_test_support",
+        ":wal_writer_contract",
+        "//src/base",
+        "//src/base:error",
+        "//src/codec:cooperative",
+        "//src/codec:limits",
+        "//src/model:epoch",
+        "//src/runtime:file",
+        "//src/runtime:first_failure",
+        "//src/storage:local_control",
+        "//src/storage:local_id_allocator",
+        "//src/storage:local_paths",
+        "//src/storage:wal_group",
+        "//src/storage:wal_writer",
+        "//src/storage:workload_budget",
+        "@seastar",
+    ],
+)
+
+kwaque_cc_library(
+    name = "wal_group_commit_contract",
+    testonly = True,
+    hdrs = ["wal_group_commit_contract.h"],
+    visibility = [
+        "//src/broker:__pkg__",
+        "//src/simulation/tests:__pkg__",
+    ],
+    deps = [
+        ":local_store_contract",
+        ":storage_test_support",
+        ":wal_append_contract",
+        ":wal_writer_contract",
+        "//src/base",
+        "//src/base:error",
+        "//src/codec:cooperative",
+        "//src/runtime:error",
+        "//src/runtime:first_failure",
+        "//src/runtime:time",
+        "//src/runtime/testing:reactor_tasks",
+        "//src/storage:local_store_config",
+        "//src/storage:wal_group",
+        "//src/storage:wal_group_commit",
+        "//src/storage:wal_writer",
+        "//src/storage:workload_budget",
+        "@seastar",
+    ],
+)
+
+kwaque_cc_library(
+    name = "wal_durability_contract",
+    testonly = True,
+    hdrs = ["wal_durability_contract.h"],
+    visibility = [
+        "//src/broker:__pkg__",
+        "//src/simulation/tests:__pkg__",
+    ],
+    deps = [
+        ":local_store_contract",
+        ":storage_test_support",
+        ":wal_append_contract",
+        ":wal_group_commit_contract",
+        ":wal_writer_contract",
+        "//src/base",
+        "//src/base:error",
+        "//src/runtime:first_failure",
+        "//src/runtime:time",
+        "//src/storage:wal_group_commit",
+        "//src/storage:workload_budget",
+        "@seastar",
+    ],
+)
+
+kwaque_cc_library(
+    name = "wal_commit_lifecycle_contract",
+    testonly = True,
+    hdrs = ["wal_commit_lifecycle_contract.h"],
+    visibility = [
+        "//src/broker:__pkg__",
+        "//src/simulation/tests:__pkg__",
+    ],
+    deps = [
+        ":local_store_contract",
+        ":storage_test_support",
+        ":wal_append_contract",
+        ":wal_group_commit_contract",
+        ":wal_writer_contract",
+        "//src/base",
+        "//src/base:error",
+        "//src/runtime:error",
+        "//src/runtime:first_failure",
+        "//src/runtime:time",
+        "//src/storage:wal_group_commit",
+        "//src/storage:workload_budget",
+        "@seastar",
+    ],
+)
+
+kwaque_cc_library(
+    name = "wal_commit_qualification_contract",
+    testonly = True,
+    hdrs = ["wal_commit_qualification_contract.h"],
+    visibility = [
+        "//src/broker:__pkg__",
+        "//src/simulation/tests:__pkg__",
+    ],
+    deps = [
+        ":local_store_contract",
+        ":storage_test_support",
+        ":wal_append_contract",
+        ":wal_group_commit_contract",
+        ":wal_writer_contract",
+        "//src/base",
+        "//src/base:error",
+        "//src/runtime:error",
+        "//src/runtime:first_failure",
+        "//src/runtime:time",
+        "//src/storage:wal_group_commit",
+        "//src/storage:workload_budget",
+        "@seastar",
+    ],
+)
+
+kwaque_cc_library(
+    name = "wal_rotation_contract",
+    testonly = True,
+    hdrs = ["wal_rotation_contract.h"],
+    visibility = [
+        "//src/broker:__pkg__",
+        "//src/simulation/tests:__pkg__",
+    ],
+    deps = [
+        ":local_installation_contract",
+        ":local_store_contract",
+        ":storage_test_support",
+        ":wal_append_contract",
+        ":wal_writer_contract",
+        "//src/base",
+        "//src/base:error",
+        "//src/codec:cooperative",
+        "//src/codec:limits",
+        "//src/model:epoch",
+        "//src/runtime:file",
+        "//src/runtime:first_failure",
+        "//src/storage:local_control",
+        "//src/storage:local_id_allocator",
+        "//src/storage:local_metadata",
+        "//src/storage:local_paths",
+        "//src/storage:local_types",
+        "//src/storage:wal_group",
+        "//src/storage:wal_writer",
+        "//src/storage:workload_budget",
+        "@seastar",
+    ],
+)
+
+kwaque_cc_library(
+    name = "wal_lifecycle_contract",
+    testonly = True,
+    hdrs = ["wal_lifecycle_contract.h"],
+    visibility = [
+        "//src/broker:__pkg__",
+        "//src/simulation/tests:__pkg__",
+    ],
+    deps = [
+        ":local_installation_contract",
+        ":local_store_contract",
+        ":storage_test_support",
+        ":wal_append_contract",
+        ":wal_rotation_contract",
+        ":wal_writer_contract",
+        "//src/base",
+        "//src/base:error",
+        "//src/codec:cooperative",
+        "//src/codec:limits",
+        "//src/model:epoch",
+        "//src/runtime:file",
+        "//src/runtime:first_failure",
+        "//src/storage:local_cleanup",
+        "//src/storage:local_control",
+        "//src/storage:local_discovery",
+        "//src/storage:local_id_allocator",
+        "//src/storage:local_metadata",
+        "//src/storage:local_namespace",
+        "//src/storage:local_paths",
+        "//src/storage:local_types",
+        "//src/storage:wal_group",
+        "//src/storage:wal_inventory",
+        "//src/storage:wal_writer",
+        "//src/storage:workload_budget",
+        "@seastar",
+    ],
+)
+
+kwaque_cc_library(
+    name = "wal_survival_oracle",
+    testonly = True,
+    hdrs = ["wal_survival_oracle.h"],
+    visibility = ["//src/simulation/tests:__pkg__"],
+    deps = [":wal_append_contract"],
+)
+
+kwaque_cc_library(
+    name = "wal_qualification_contract",
+    testonly = True,
+    hdrs = ["wal_qualification_contract.h"],
+    visibility = [
+        "//src/broker:__pkg__",
+        "//src/simulation/tests:__pkg__",
+    ],
+    deps = [
+        ":wal_lifecycle_contract",
+        "//src/storage:wal_writer_state",
+        "@seastar",
+    ],
+)
+
+_WAL_BENCH_DEPS = [
+    ":local_installation_contract",
+    ":local_store_contract",
+    ":storage_large_fixture",
+    ":storage_test_support",
+    ":wal_append_contract",
+    ":wal_writer_contract",
+    "//src/base",
+    "//src/base:error",
+    "//src/bytes:allocation_test_profile",
+    "//src/bytes:fragmented_buffer",
+    "//src/codec:cooperative",
+    "//src/codec:limits",
+    "//src/codec/tests:allocation_observer",
+    "//src/codec:sha256",
+    "//src/codec/tests:codec_bench_reference",
+    "//src/codec/tests:memory_qualification_support",
+    "//src/model:batch_builder",
+    "//src/model:record_codec",
+    "//src/resource:resource_manager",
+    "//src/resource:resource_registry",
+    "//src/resource:workload_class",
+    "//src/runtime:file",
+    "//src/runtime:operation_statistics",
+    "//src/runtime/production:file",
+    "//src/runtime/production:clocks",
+    "//src/runtime/production:timer",
+    "//src/runtime/testing:test_directory",
+    "//src/storage:encoded_batch",
+    "//src/storage:local_paths",
+    "//src/storage:wal_child",
+    "//src/storage:wal_format",
+    "//src/storage:wal_group",
+    "//src/storage:wal_group_commit",
+    "//src/storage:wal_writer",
+    "//src/storage:workload_budget",
+    "@seastar",
+]
+
+kwaque_cc_benchmark(
+    name = "wal_bench",
+    srcs = [
+        "wal_bench.cc",
+        "wal_bench_child.h",
+        "wal_bench_file.h",
+        "wal_commit_bench.cc",
+    ],
+    linkopts = ALLOCATION_OBSERVER_LINKOPTS,
+    memory = "1GiB",
+    deps = _WAL_BENCH_DEPS,
+)
+
+kwaque_cc_benchmark(
+    name = "wal_timing_bench",
+    srcs = [
+        "wal_bench.cc",
+        "wal_bench_child.h",
+        "wal_bench_file.h",
+        "wal_commit_bench.cc",
+    ],
+    local_defines = ["KWAQUE_WAL_TIMING_ONLY"],
+    memory = "1GiB",
+    deps = _WAL_BENCH_DEPS,
+)
+
+py_binary(
+    name = "wal_cohort_report",
+    srcs = ["wal_cohort_report.py"],
+    main = "wal_cohort_report.py",
+)
+
+py_test(
+    name = "wal_cohort_report_test",
+    srcs = [
+        "wal_cohort_report.py",
+        "wal_cohort_report_test.py",
+    ],
+    main = "wal_cohort_report_test.py",
 )

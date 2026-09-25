@@ -213,6 +213,7 @@ def kwaque_cc_benchmark(
         deps = [],
         args = [],
         local_defines = [],
+        linkopts = [],
         cpu = 1,
         memory = "128MiB",
         tags = []):
@@ -235,6 +236,7 @@ def kwaque_cc_benchmark(
         deps = depset(deps + ["@seastar", "@seastar//:benchmark"]).to_list(),
         features = ["layering_check"],
         local_defines = local_defines,
+        linkopts = linkopts,
         tags = _resource_tags(cpu, memory) + ["benchmark"] + tags,
         testonly = True,
     )

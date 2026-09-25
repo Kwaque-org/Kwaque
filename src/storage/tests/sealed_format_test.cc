@@ -4,6 +4,9 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
+#include <bit>
+#include <limits>
 #include <malloc.h>
 
 namespace kwaque::storage {
@@ -213,6 +216,57 @@ TEST(SealedFormatTest, EmptyAndFooterOnlyHashWithoutCreatingRecords) {
         ASSERT_TRUE(complete.has_value());
         EXPECT_EQ(complete->entry_count(), 0U);
     }
+}
+
+TEST(SealedFormatTest, PrefixPackingPreservesSmallAllocationAndWorkLimits) {
+    const auto profile = +[](byte_count request) noexcept {
+        if (request.value() > (std::uint64_t{1} << 62U))
+            return byte_count{std::numeric_limits<std::uint64_t>::max()};
+        return byte_count{
+          2U * std::bit_ceil(std::max(request.value(), std::uint64_t{16}))};
+    };
+    seastar::abort_source abort;
+    codec::cooperative_work setup{codec::limits::defaults(), abort};
+    auto verifier = extent_verifier::make(
+                      history(),
+                      scope(100, 100, 0, 0, 512, 512),
+                      setup.policy(),
+                      extent_layout_kind::initial_append,
+                      {},
+                      extent_integrity::crc32c_and_sha256)
+                      .value();
+    const auto proof = verifier.finish(setup).value();
+    const auto baseline = encode_sealed_footer(
+                            proof,
+                            root_location(),
+                            0,
+                            {},
+                            setup,
+                            budget().operation_remaining,
+                            profile)
+                            .get();
+    ASSERT_TRUE(baseline);
+    auto policy = setup.policy().config();
+    policy.max_allocation_bytes = byte_count{512};
+    policy.max_work_bytes = byte_count{1024};
+    policy.max_work_items = item_count{64};
+    codec::cooperative_work work{codec::limits::make(policy).value(), abort};
+    const auto bounded = encode_sealed_footer(
+                           proof,
+                           root_location(),
+                           0,
+                           {},
+                           work,
+                           budget().operation_remaining,
+                           profile)
+                           .get();
+    ASSERT_TRUE(bounded);
+    EXPECT_EQ(flat(bounded->bytes), flat(baseline->bytes));
+    EXPECT_EQ(bounded->bytes.fragment_at(0)->size(), 32U);
+    EXPECT_EQ(bounded->bytes.fragment_at(1)->size(), 232U);
+    const auto cost = bounded->bytes.allocation_cost(profile);
+    ASSERT_TRUE(cost);
+    EXPECT_LE(cost->largest_allocation, byte_count{512});
 }
 
 TEST(SealedFormatTest, ParsedDigestAndHistoryClaimsNeedIndependentEvidence) {

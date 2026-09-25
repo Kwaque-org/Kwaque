@@ -180,6 +180,47 @@ TEST(
     EXPECT_EQ(result->size(), byte_count{128U * 1024U});
 }
 
+TEST(CooperativeStagingTest, ThreeOwnersTransferInOrderAndRejectAliasedInputs) {
+    seastar::abort_source abort;
+    codec::limits_config config;
+    config.max_work_bytes = byte_count{2};
+    config.max_work_items = item_count{8};
+    codec::cooperative_work work{codec::limits::make(config).value(), abort};
+    auto prefix = text("head"sv), payload = text("payload"sv),
+         suffix = text("tail"sv);
+    auto rejected = codec::assemble_buffer_cooperatively(
+                      std::move(prefix),
+                      std::move(payload),
+                      std::move(prefix),
+                      work,
+                      byte_count{32},
+                      {},
+                      byte_count{1U << 20U},
+                      charge)
+                      .get();
+    EXPECT_FALSE(rejected);
+    // Aliased rvalue arguments reject before consuming any owner.
+    // NOLINTBEGIN(bugprone-use-after-move)
+    EXPECT_TRUE(prefix.content_equals("head"));
+    EXPECT_TRUE(payload.content_equals("payload"));
+    const auto* backing = payload.fragment_at(0)->data();
+    auto result = codec::assemble_buffer_cooperatively(
+                    std::move(prefix),
+                    std::move(payload),
+                    std::move(suffix),
+                    work,
+                    byte_count{15},
+                    {},
+                    byte_count{1U << 20U},
+                    charge)
+                    .get();
+    ASSERT_TRUE(result);
+    EXPECT_TRUE(result->content_equals("headpayloadtail"));
+    EXPECT_EQ(result->fragment_at(1)->data(), backing);
+    EXPECT_TRUE(prefix.empty() && payload.empty() && suffix.empty());
+    // NOLINTEND(bugprone-use-after-move)
+}
+
 TEST(CooperativeStagingTest, MaximumPackingLayoutDoesNotBecomeOneLargeCopy) {
     std::vector<native_fragment> fragments;
     fragments.reserve(1024);

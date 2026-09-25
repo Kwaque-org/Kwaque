@@ -1,5 +1,6 @@
-load("//bazel:build.bzl", "kwaque_cc_library")
-load("//bazel:test.bzl", "kwaque_cc_benchmark", "kwaque_cc_fuzz_test", "kwaque_cc_seastar_gtest", "kwaque_cc_test")
+load("//bazel:build.bzl", "kwaque_cc_binary", "kwaque_cc_library")
+load("//bazel:test.bzl", "kwaque_cc_benchmark", "kwaque_cc_fuzz_test", "kwaque_cc_seastar_gtest", "kwaque_cc_test", "kwaque_py_native_test")
+load("//src/codec/tests:allocation_observer.bzl", "ALLOCATION_OBSERVER_LINKOPTS")
 
 package(default_visibility = ["//visibility:private"])
 
@@ -206,6 +207,7 @@ kwaque_cc_fuzz_test(
                 "//proto/kwaque/control/v1:handshake_cc_proto",
                 "//proto/kwaque/control/v1:redirect_cc_proto",
                 "//src/bytes:fragmented_buffer_parser",
+                "//src/codec/tests:prepared_abort_source",
                 "//src/model:transport_identity",
                 "//src/protocol:control_frame_codec",
                 "//src/protocol:control_preflight",
@@ -329,6 +331,7 @@ kwaque_cc_library(
         "//src/codec:limits",
         "//src/codec:staging_cooperative",
         "//src/codec/tests:envelope_test_fixture",
+        "//src/codec/tests:qualification_profile",
         "//src/model:transport_identity",
         "//src/protocol:frame",
         "//src/protocol:frame_codec",
@@ -387,6 +390,7 @@ test_suite(
         ":frame_header_test",
         ":frame_prefix_test",
         ":frame_qualification_test",
+        ":memory_qualification_test",
     ],
 )
 
@@ -438,6 +442,8 @@ kwaque_cc_seastar_gtest(
         "//src/codec:integer",
         "//src/codec:limits",
         "//src/codec:staging_cooperative",
+        "//src/codec/tests:prepared_abort_source",
+        "//src/codec/tests:qualification_profile",
         "//src/model:batch",
         "//src/model:batch_codec",
         "//src/model:batch_context",
@@ -573,6 +579,7 @@ kwaque_cc_benchmark(
         "//src/codec:limits",
         "//src/codec:sha256",
         "//src/codec/tests:codec_bench_reference",
+        "//src/codec/tests:qualification_profile",
         "//src/model:batch",
         "//src/model:batch_codec",
         "//src/model:batch_context",
@@ -611,4 +618,59 @@ test_suite(
         ":frame_fuzz_cases_test",
         ":frame_prefix_test",
     ],
+)
+
+kwaque_cc_binary(
+    name = "memory_qualification_probe",
+    testonly = True,
+    srcs = [
+        "memory_qualification_control.cc",
+        "memory_qualification_control.h",
+        "memory_qualification_probe.cc",
+    ],
+    linkopts = ALLOCATION_OBSERVER_LINKOPTS,
+    deps = [
+        ":control_fuzz_oracle",
+        ":control_test_support",
+        ":frame_test_support",
+        "//src/base",
+        "//src/base:error",
+        "//src/bytes:allocation_test_profile",
+        "//src/bytes:fragmented_buffer",
+        "//src/bytes:fragmented_buffer_parser",
+        "//src/codec:cooperative",
+        "//src/codec:integer",
+        "//src/codec/tests:allocation_observer",
+        "//src/codec/tests:codec_bench_reference",
+        "//src/codec/tests:memory_qualification_support",
+        "//src/codec/tests:prepared_abort_source",
+        "//src/compression",
+        "//src/model:batch_codec",
+        "//src/model/tests:model_bench_support",
+        "//src/protocol:batch_frame_codec",
+        "//src/protocol:control_codec",
+        "//src/protocol:control_frame_codec",
+        "//src/protocol:control_memory",
+        "//src/protocol:control_schema",
+        "//src/protocol:frame",
+        "//src/protocol:frame_codec",
+        "@boost//:program_options",
+        "@crc32c",
+        "@seastar",
+    ],
+)
+
+kwaque_py_native_test(
+    name = "memory_qualification_test",
+    timeout = "long",
+    srcs = ["memory_qualification_test.py"],
+    data = [
+        ":memory_qualification_probe",
+        "//src/codec/tests:memory_qualification_probe",
+    ],
+    tags = [
+        "resources:cpu:1",
+        "resources:memory:256",
+    ],
+    deps = ["//src/codec/tests:memory_qualification_driver"],
 )

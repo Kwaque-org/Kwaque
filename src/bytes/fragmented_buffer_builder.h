@@ -101,6 +101,13 @@ public:
     // leaves both byte sequences unchanged; success empties the source.
     [[nodiscard]] result<void> append_buffer(fragmented_buffer&& other);
 
+    // Transfer exactly count complete leading fragment owners without copying
+    // payload or creating aliases. Success removes that prefix from source;
+    // rejection/allocation failure leaves both owners unchanged. Descriptor
+    // storage can be reserved once before a caller performs bounded batches.
+    [[nodiscard]] result<void>
+    append_fragments(fragmented_buffer& source, item_count count);
+
     // Guarantees at least `bytes` of contiguous tail capacity, bounded by
     // max_fragment_bytes.
     [[nodiscard]] result<void> reserve(byte_count bytes);

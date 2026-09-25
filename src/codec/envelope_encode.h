@@ -22,7 +22,7 @@ namespace kwaque::codec {
 //
 // other_live and parent_remaining use the same convention as cooperative
 // assembly: they exclude this body's backing/descriptors/share controls, the
-// checksum alias, new header and assembly staging. Include verified native CRC,
+// new header and assembly staging. Include verified native CRC,
 // coroutine-frame and opaque-owner reservations in other_live, or exclude them
 // from parent_remaining once. The writer checks the distinct live stages before
 // allocating; assembly then accounts its inputs itself. Known shared backing

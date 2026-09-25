@@ -252,21 +252,33 @@ jobs:
         with:
           persist-credentials: false
       - uses: ./.github/actions/setup-build
+        id: setup
         with:
-          cache-scope: ci-debug
+          cache-scope: analysis-debug
       - name: Materialize generated analysis inputs
         run: >-
           bazel build --config=ci-debug
           --remote_download_outputs=all
+          --aspects=//bazel:analysis_inputs.bzl%analysis_inputs
+          --output_groups=clang_tidy_inputs
           --build_tag_filters=-fuzz,-manual //...
+      - name: Save prepared analysis inputs
+        if: >-
+          steps.setup.outputs.disk-cache-hit != 'true' &&
+          (github.event_name != 'pull_request' ||
+           github.event.pull_request.head.repo.full_name == github.repository)
+        uses: actions/cache/save@caa296126883cff596d87d8935842f9db880ef25 # 5.1.0
+        with:
+          path: ${{ runner.temp }}/kwaque-bazel-disk
+          key: ${{ steps.setup.outputs.disk-cache-key }}
       - name: Generate compilation database
         run: >-
           bazel run --config=ci-debug --lockfile_mode=error //tools:compile_commands --
           --config=ci-debug
-      - name: Run baseline checks
-        run: bazel run --config=ci-debug --lockfile_mode=error //tools:clang_tidy -- --jobs=2
-      - name: Run strict production checks
-        run: bazel run --config=ci-debug --lockfile_mode=error //tools:clang_tidy_strict -- --jobs=2
+      - name: Run baseline and strict production checks without overlap
+        run: >-
+          bazel run --config=ci-debug --lockfile_mode=error //tools:clang_tidy -- --jobs=2
+          --production-config=.clang-tidy-strict
 
   clang-tidy-fuzz:
     name: Clang tidy for fuzz sources
@@ -280,12 +292,25 @@ jobs:
         with:
           persist-credentials: false
       - uses: ./.github/actions/setup-build
+        id: setup
         with:
-          cache-scope: fuzz
+          cache-scope: analysis-fuzz
       - name: Materialize fuzz analysis inputs
         run: >-
           bazel build --config=ci --config=fuzz
-          --remote_download_outputs=all --build_tag_filters=fuzz //...
+          --remote_download_outputs=all
+          --aspects=//bazel:analysis_inputs.bzl%analysis_inputs
+          --output_groups=clang_tidy_inputs
+          --build_tag_filters=fuzz //...
+      - name: Save prepared analysis inputs
+        if: >-
+          steps.setup.outputs.disk-cache-hit != 'true' &&
+          (github.event_name != 'pull_request' ||
+           github.event.pull_request.head.repo.full_name == github.repository)
+        uses: actions/cache/save@caa296126883cff596d87d8935842f9db880ef25 # 5.1.0
+        with:
+          path: ${{ runner.temp }}/kwaque-bazel-disk
+          key: ${{ steps.setup.outputs.disk-cache-key }}
       - name: Generate the fuzz compilation database
         run: >-
           bazel run --config=ci --config=fuzz --lockfile_mode=error //tools:compile_commands --

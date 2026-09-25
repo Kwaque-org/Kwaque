@@ -24,6 +24,29 @@ static_assert(!std::is_copy_constructible_v<segment_block>);
 static_assert(!std::is_aggregate_v<segment_block>);
 static_assert(std::is_nothrow_move_constructible_v<segment_block>);
 
+// Bounded slow oracle for the accelerated fixture checksum. Large fixtures
+// use the library implementation; this deliberately visits only short inputs.
+std::uint32_t bitwise_crc(std::string_view bytes) {
+    std::uint32_t value = 0xffffffffU;
+    for (char byte : bytes) {
+        value ^= static_cast<unsigned char>(byte);
+        for (unsigned bit = 0; bit < 8; ++bit)
+            value = (value >> 1U) ^ ((value & 1U) ? 0x82f63b78U : 0U);
+    }
+    return value ^ 0xffffffffU;
+}
+
+TEST(SegmentFormatTest, FixtureChecksumMatchesBoundedBitwiseOracle) {
+    std::array<char, 257> bytes{};
+    for (std::size_t i = 0; i < bytes.size(); ++i)
+        bytes[i] = std::bit_cast<char>(static_cast<std::uint8_t>(i));
+    for (std::size_t size = 0; size <= 256; ++size) {
+        const std::string_view input{bytes.data() + 1, size};
+        EXPECT_EQ(crc(input), bitwise_crc(input)) << size;
+        seastar::thread::maybe_yield();
+    }
+}
+
 TEST(SegmentFormatTest, IndependentCrcAndInterconnectedGoldenBytes) {
     EXPECT_EQ(crc(""), 0U);
     EXPECT_EQ(crc("123456789"), 0xe3069283U);
@@ -414,7 +437,12 @@ TEST(
 }
 
 TEST(SegmentFormatTest, ExactFragmentLimitsAndPositionOverflow) {
-    for (const std::uint64_t limit : {225U, 226U}) {
+    const auto separate
+      = charge(byte_count{32}).checked_add(charge(byte_count{120})).value();
+    const std::uint64_t fragments
+      = assigned_wire().size() + (charge(byte_count{152}) <= separate ? 1U : 2U)
+        + 1U;
+    for (const std::uint64_t limit : {fragments - 1U, fragments}) {
         seastar::abort_source abort;
         codec::cooperative_work prepare{codec::limits::defaults(), abort};
         auto bytes = buffer(assigned_wire(), 1);
@@ -433,12 +461,12 @@ TEST(SegmentFormatTest, ExactFragmentLimitsAndPositionOverflow) {
                               budget().operation_remaining,
                               charge)
                               .get();
-        if (limit == 225) {
+        if (limit != fragments) {
             ASSERT_FALSE(result.has_value());
             EXPECT_EQ(result.error().code(), errc::resource_exhausted);
         } else {
             ASSERT_TRUE(result.has_value());
-            EXPECT_EQ(result->bytes().fragment_count(), 226U);
+            EXPECT_EQ(result->bytes().fragment_count(), fragments);
         }
     }
     for (const bool physical : {false, true}) {

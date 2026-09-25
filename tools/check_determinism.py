@@ -248,14 +248,18 @@ class Writer:
 # never the identity of a hash-selected object.
 ALLOWANCES = (
     Allowance(
-        "src/observability/event_codec_test.cc", "host-clock",
+        "src/observability/event_codec_test.cc",
+        "host-clock",
         "const auto preemption_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);",
-        1, "External quota-wait watchdog; it never supplies encoded event time.",
+        1,
+        "External quota-wait watchdog; it never supplies encoded event time.",
     ),
     Allowance(
-        "src/observability/event_codec_test.cc", "host-clock",
+        "src/observability/event_codec_test.cc",
+        "host-clock",
         "while (!seastar::need_preempt() && std::chrono::steady_clock::now() < preemption_deadline) {}",
-        1, "Bounded wait for native preemption before the live-append regression.",
+        1,
+        "Bounded wait for native preemption before the live-append regression.",
     ),
     Allowance(
         "src/simulation/fake_file.h",
@@ -770,50 +774,74 @@ ALLOWANCES += (
 # Exact bounded cursor/crash traversals and already-byte copies.
 ALLOWANCES += (
     Allowance(
-        "src/simulation/fake_file.cc", "unordered-iteration",
-        'for (auto& change : state.pages) {\n            auto& file = std::get<regular_file_state>(\n              find_inode(change.object)->state);\n            if (change.replacement)\n                file.durable_pages.find(change.index)->second.bytes = std::move(\n                  change.replacement);\n            else\n                file.durable_pages.erase(change.index);\n            if (pause()) co_await crash_pause{*this};\n        }',
-        1, 'The staged changes are a chunked_vector in canonical page order; hash maps are accessed only by the recorded index.',
+        "src/simulation/fake_file.cc",
+        "unordered-iteration",
+        "for (auto& change : state.pages) {\n            auto& file = std::get<regular_file_state>(\n              find_inode(change.object)->state);\n            if (change.replacement)\n                file.durable_pages.find(change.index)->second.bytes = std::move(\n                  change.replacement);\n            else\n                file.durable_pages.erase(change.index);\n            if (pause()) co_await crash_pause{*this};\n        }",
+        1,
+        "The staged changes are a chunked_vector in canonical page order; hash maps are accessed only by the recorded index.",
     ),
     Allowance(
-        "src/simulation/fake_file.cc", "unordered-iteration",
-        'while (!file.visible_pages.empty()) {\n                file.visible_pages.erase(file.visible_pages.begin());\n                if (pause()) co_await crash_pause{*this};\n            }',
-        2, 'The volatile map is ordered; each entry is erased once under the closed admission gate, with count-only progress.',
+        "src/simulation/fake_file.cc",
+        "unordered-iteration",
+        "while (!file.visible_pages.empty()) {\n                file.visible_pages.erase(file.visible_pages.begin());\n                if (pause()) co_await crash_pause{*this};\n            }",
+        2,
+        "The volatile map is ordered; each entry is erased once under the closed admission gate, with count-only progress.",
     ),
     Allowance(
-        "src/simulation/fake_file.cc", "unordered-iteration",
-        'for (const auto& change : state.pages) {\n            if (change.inserted)\n                std::get<regular_file_state>(find_inode(change.object)->state)\n                  .durable_pages.erase(change.index);\n            if (pause()) co_await crash_pause{*this};\n        }',
-        1, 'Rollback follows the owned ordered change vector and removes only prepared index-addressed insertions.',
+        "src/simulation/fake_file.cc",
+        "unordered-iteration",
+        "for (const auto& change : state.pages) {\n            if (change.inserted)\n                std::get<regular_file_state>(find_inode(change.object)->state)\n                  .durable_pages.erase(change.index);\n            if (pause()) co_await crash_pause{*this};\n        }",
+        1,
+        "Rollback follows the owned ordered change vector and removes only prepared index-addressed insertions.",
     ),
     Allowance(
-        "src/simulation/fake_file.cc", "unordered-iteration",
-        'while (!open_objects_.empty()) {\n            const auto id = *open_objects_.begin();\n            if (auto* object = find_inode(fake_object_id{id}))\n                object->open_references = 0;\n            open_objects_.erase(id);\n            if (pause()) co_await crash_pause{*this};\n        }',
-        1, 'Commutative generation invalidation: every old reference is cleared once; progress records counts, never hash-selected IDs.',
+        "src/simulation/fake_file.cc",
+        "unordered-iteration",
+        "while (!open_objects_.empty()) {\n            const auto id = *open_objects_.begin();\n            if (auto* object = find_inode(fake_object_id{id}))\n                object->open_references = 0;\n            open_objects_.erase(id);\n            if (pause()) co_await crash_pause{*this};\n        }",
+        1,
+        "Commutative generation invalidation: every old reference is cleared once; progress records counts, never hash-selected IDs.",
     ),
     Allowance(
-        "src/simulation/fake_file.cc", "unordered-iteration",
-        'for (const auto& [id, object] : objects_) {\n        static_cast<void>(object);\n        collection_worklist_.push_back(id);\n        if (pause()) co_await crash_pause{*this};\n    }',
-        1, 'Bounded reclamation worklist only: no selections or digests depend on its order; every removed edge adds exactly one descendant visit.',
+        "src/simulation/fake_file.cc",
+        "unordered-iteration",
+        "for (const auto& [id, object] : objects_) {\n        static_cast<void>(object);\n        collection_worklist_.push_back(id);\n        if (pause()) co_await crash_pause{*this};\n    }",
+        1,
+        "Bounded reclamation worklist only: no selections or digests depend on its order; every removed edge adds exactly one descendant visit.",
     ),
     Allowance(
-        "src/simulation/fake_file.cc", "unordered-iteration",
-        'while (!file.durable_pages.empty()) {\n                file.durable_pages.erase(file.durable_pages.begin());\n                if (pause()) co_await crash_pause{*this};\n            }',
-        1, 'Commutative destruction of an unreachable file; each page contributes one fixed cleanup unit and no content-dependent trace.',
+        "src/simulation/fake_file.cc",
+        "unordered-iteration",
+        "while (!file.durable_pages.empty()) {\n                file.durable_pages.erase(file.durable_pages.begin());\n                if (pause()) co_await crash_pause{*this};\n            }",
+        1,
+        "Commutative destruction of an unreachable file; each page contributes one fixed cleanup unit and no content-dependent trace.",
     ),
     Allowance(
-        'src/simulation/storage_fault_key.h', "native-byte-layout",
-        'std::as_bytes(std::span{digest})', 1, 'SHA-256 output is already 32 canonical byte values; integers were encoded explicitly before hashing.',
+        "src/simulation/storage_fault_key.h",
+        "native-byte-layout",
+        "std::as_bytes(std::span{digest})",
+        1,
+        "SHA-256 output is already 32 canonical byte values; integers were encoded explicitly before hashing.",
     ),
     Allowance(
-        'src/simulation/tests/fake_file_persistence_test.cc', "native-byte-layout",
-        'std::as_bytes(std::span{data.data(), data.size()})', 1, 'Test payload consists only of character bytes, never a native integer representation.',
+        "src/simulation/tests/fake_file_persistence_test.cc",
+        "native-byte-layout",
+        "std::as_bytes(std::span{data.data(), data.size()})",
+        1,
+        "Test payload consists only of character bytes, never a native integer representation.",
     ),
     Allowance(
-        'src/simulation/tests/local_store_test.cc', "native-byte-layout",
-        'std::as_bytes(std::span{bytes.data(), bytes.size()})', 1, 'Fixture input is an already encoded byte string; no native integer representation is copied.',
+        "src/simulation/tests/local_store_test.cc",
+        "native-byte-layout",
+        "std::as_bytes(std::span{bytes.data(), bytes.size()})",
+        1,
+        "Fixture input is an already encoded byte string; no native integer representation is copied.",
     ),
     Allowance(
-        'src/simulation/tests/fake_file_persistence_test.cc', "native-byte-layout",
-        'reinterpret_cast<const char*>(data.data())', 1, 'Reads an existing byte buffer as text for byte-for-byte assertions; no native scalar encoding.',
+        "src/simulation/tests/fake_file_persistence_test.cc",
+        "native-byte-layout",
+        "reinterpret_cast<const char*>(data.data())",
+        1,
+        "Reads an existing byte buffer as text for byte-for-byte assertions; no native scalar encoding.",
     ),
 )
 
@@ -970,7 +998,6 @@ def main() -> int:
         "Determinism source tripwires passed; executable goldens and noise tests are still required"
     )
     return 0
-
 
 
 if __name__ == "__main__":

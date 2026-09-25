@@ -741,13 +741,16 @@ cc_library(
     name = "benchmark",
     testonly = True,
     srcs = [
+        "include/seastar/testing/exchanger.hh",
+        "include/seastar/testing/test_runner.hh",
+        "src/testing/random.cc",
         "tests/perf/linux_perf_event.cc",
         "tests/perf/perf_tests.cc",
     ],
     hdrs = [
         "include/seastar/testing/linux_perf_event.hh",
         "include/seastar/testing/perf_tests.hh",
-        "include/seastar/testing/test_runner.hh",
+        "include/seastar/testing/random.hh",
     ],
     includes = [
         "include",
@@ -756,7 +759,7 @@ cc_library(
         "//visibility:public",
     ],
     deps = [
-        ":testing",
+        ":seastar",
     ],
 )
 

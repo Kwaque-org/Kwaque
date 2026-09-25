@@ -62,19 +62,21 @@ struct workload_reservation_state final : runtime::shard_affine {
       seastar::semaphore_units<> local,
       seastar::semaphore_units<> workload,
       seastar::semaphore_units<> handle,
-      byte_count charged)
+      byte_count charged,
+      byte_count retained)
       : owner(std::move(owner))
       , task(std::move(task))
       , local(std::move(local))
       , workload(std::move(workload))
       , handle(std::move(handle))
-      , charged(charged) {}
+      , charged(charged)
+      , retained(retained) {}
     ~workload_reservation_state() { assert_current(); }
     // Units die before the lease and its semaphores, even after budget
     // teardown.
     seastar::lw_shared_ptr<workload_budget_state> owner;
     seastar::semaphore_units<> task, local, workload, handle;
-    byte_count charged;
+    byte_count charged, retained;
 };
 static_assert(
   sizeof(workload_reservation_state) + 64 <= reservation_allocation_bound);
@@ -109,6 +111,10 @@ workload_reservation workload_reservation::share() const noexcept {
 byte_count workload_reservation::bytes() const noexcept {
     if (state_) state_->assert_current();
     return state_ ? state_->charged : byte_count{};
+}
+byte_count workload_reservation::retained_bytes() const noexcept {
+    if (state_) state_->assert_current();
+    return state_ ? state_->retained : byte_count{};
 }
 
 runtime::result<void>
@@ -213,7 +219,8 @@ workload_budget::try_reserve(byte_count retained) {
       std::move(*local),
       std::move(*workload),
       seastar::semaphore_units<>{},
-      *cost);
+      *cost,
+      retained);
     ++state_->accepted;
     return workload_reservation{std::move(owned)};
 }

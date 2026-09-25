@@ -13,7 +13,7 @@ ENGINE_SCENARIOS = (
     "crc-warm-4096",
     "sha-cold",
 )
-OWNER_SCENARIOS = (
+MODEL_SCENARIOS = (
     "record-materialize",
     "record-materialize-max",
     "record-scan",
@@ -34,10 +34,61 @@ OWNER_SCENARIOS = (
     "lz4-decompress-abort",
     "lz4-decompress-corrupt",
 )
-# These paths allocate only temporary/returned metadata and execution state;
-# all payload backing already exists before observation. Their entire new peak
-# can conservatively be charged to the excluded execution allowance too.
-ALIAS_ONLY = frozenset(
+CHECKPOINT_SCENARIOS = (
+    tuple(
+        f"checkpoint-{owner}-{case}"
+        for owner in ("sorted", "unordered")
+        for case in (
+            "4096",
+            "4097",
+            "count-limit",
+            "object-limit",
+            "allocation-limit",
+            "metadata-pressure",
+            "operation-pressure",
+            "work-limit",
+            "abort",
+            "duplicate",
+        )
+    )
+    + (
+        "checkpoint-unordered-partial",
+        "checkpoint-unordered-free-chunks",
+        "checkpoint-unordered-scratch-limit",
+    )
+    + (
+        "checkpoint-fingerprint-4096",
+        "checkpoint-encode-4096",
+        "checkpoint-encode-operation-pressure",
+        "checkpoint-encode-abort",
+    )
+    + tuple(
+        f"checkpoint-decode-{case}"
+        for case in (
+            "h32",
+            "h41",
+            "h4096",
+            "4097",
+            "count-limit",
+            "object-limit",
+            "byte-limit",
+            "allocation-limit",
+            "metadata-pressure",
+            "operation-pressure",
+            "work-limit",
+            "abort",
+            "duplicate",
+            "corrupt",
+            "wrong-topic",
+        )
+    )
+)
+OWNER_SCENARIOS = MODEL_SCENARIOS + CHECKPOINT_SCENARIOS
+
+# Selected record paths allocate metadata/aliases; checkpoint paths also own
+# bounded serialized bodies and sort/conversion storage. For these owners, the
+# entire new peak can conservatively fit the excluded execution allowance.
+ALL_NEW_EXECUTION = frozenset(
     (
         "record-materialize",
         "record-materialize-max",
@@ -48,7 +99,7 @@ ALIAS_ONLY = frozenset(
         "batch-decode-abort",
         "batch-decode-pressure",
     )
-)
+) | frozenset(CHECKPOINT_SCENARIOS)
 
 
 class MemoryQualificationTest(shared.MemoryQualificationTest):
@@ -69,37 +120,7 @@ class MemoryQualificationTest(shared.MemoryQualificationTest):
         return self.binary_path
 
     def execution_bounds(self, samples: dict) -> list[dict]:
-        initialization = samples["sha-cold"]["peak_upper_bound"] + max(
-            samples[name]["peak_upper_bound"]
-            for name in ("crc-cold-32", "crc-cold-4096")
-        )
-        bounds = []
-        for name in OWNER_SCENARIOS:
-            row = samples[name]
-            # Global peak includes every observed allocation, including newly
-            # copied/expanded payload, C-library scratch and coroutine frames.
-            operation = row["retained_bound"] + row["peak_upper_bound"] + initialization
-            self.assertLessEqual(operation, 64 << 20, name)
-            all_new = name in ALIAS_ONLY
-            observed_execution = row[
-                "peak_upper_bound" if all_new else "critical_peak_upper_bound"
-            ]
-            execution = observed_execution + initialization
-            self.assertLessEqual(execution, row["execution_reservation"], name)
-            bounds.append(
-                {
-                    "scenario": name,
-                    "operation_upper_bound": operation,
-                    "operation_limit": 64 << 20,
-                    "execution_upper_bound": execution,
-                    "execution_basis": (
-                        "all_new_allocations_plus_cold_engines"
-                        if all_new
-                        else "critical_allocations_plus_cold_engines"
-                    ),
-                    "reservation": row["execution_reservation"],
-                }
-            )
+        bounds = self.complete_owner_bounds(samples, OWNER_SCENARIOS, ALL_NEW_EXECUTION)
         self.assertGreater(samples["batch-decode-headers"]["mallocs"], 0)
         return bounds
 
@@ -111,6 +132,7 @@ class ReservationBoundsTest(unittest.TestCase):
                 "mallocs": 1,
                 "peak_upper_bound": 1024,
                 "critical_peak_upper_bound": 256,
+                "critical_observed": True,
                 "retained_bound": 1024,
                 "execution_reservation": 1 << 20,
             }
@@ -133,6 +155,8 @@ class ReservationBoundsTest(unittest.TestCase):
             ("batch-build-max", "critical_peak_upper_bound", 1 << 20),
             ("record-materialize", "peak_upper_bound", 1 << 20),
             ("batch-decode-headers", "mallocs", 0),
+            ("checkpoint-unordered-partial", "peak_upper_bound", 1 << 20),
+            ("checkpoint-encode-4096", "retained_bound", 64 << 20),
         ):
             samples = self.samples()
             samples[name][field] = value

@@ -183,10 +183,15 @@ SEASTAR_TEST_CASE(
           completion_resource_limits{byte_count{UINT64_MAX}, byte_count{16384}},
           completion_resource_limits{byte_count{4096}, byte_count{UINT64_MAX}}};
         for (const auto bounds : invalid) {
+            BOOST_CHECK(!bounds.validate());
             BOOST_CHECK(!completion_resources::make(budget, file, bounds));
             BOOST_CHECK_EQUAL(budget.snapshot().tasks, 0U);
         }
         for (const std::uint64_t scratch_size : {1U, 4096U, 65536U, 131072U}) {
+            BOOST_CHECK(
+              completion_resource_limits{
+                .scratch_bytes = byte_count{scratch_size}}
+                .validate());
             auto made = completion_resources::make(
               budget, file, {.scratch_bytes = byte_count{scratch_size}});
             if (!made) {

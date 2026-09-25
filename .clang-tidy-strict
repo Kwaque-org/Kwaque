@@ -23,7 +23,7 @@ Checks: >-
   readability-container-size-empty,
   readability-redundant-*
 WarningsAsErrors: '*'
-HeaderFilterRegex: '^(src|proto)/'
+HeaderFilterRegex: '^(src|proto|bazel)/'
 ExcludeHeaderFilterRegex: '(^|/)(external|bazel-out)/'
 FormatStyle: file
 CheckOptions:

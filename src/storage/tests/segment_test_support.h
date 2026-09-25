@@ -7,6 +7,8 @@
 #include <seastar/core/abort_source.hh>
 #include <seastar/core/thread.hh>
 
+#include <crc32c/crc32c.h>
+
 #include <algorithm>
 #include <array>
 #include <bit>
@@ -93,13 +95,9 @@ get(std::string_view bytes, std::size_t at, std::size_t size) {
     return value;
 }
 inline std::uint32_t crc(std::string_view bytes) {
-    std::uint32_t value = 0xffffffffU;
-    for (char byte : bytes) {
-        value ^= static_cast<unsigned char>(byte);
-        for (unsigned bit = 0; bit < 8; ++bit)
-            value = (value >> 1U) ^ ((value & 1U) ? 0x82f63b78U : 0U);
-    }
-    return value ^ 0xffffffffU;
+    if (bytes.empty()) return 0;
+    return ::crc32c::Extend(
+      0, reinterpret_cast<const std::uint8_t*>(bytes.data()), bytes.size());
 }
 inline void repair(std::string& wire) {
     const auto h = static_cast<std::size_t>(get(wire, 10, 2));

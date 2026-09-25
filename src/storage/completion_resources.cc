@@ -9,22 +9,28 @@
 
 namespace kwaque::storage {
 
-runtime::result<completion_resources> completion_resources::make(
-  workload_budget& budget,
-  runtime::file& file,
-  completion_resource_limits limits) {
+runtime::result<void> completion_resource_limits::validate() const noexcept {
     const auto reject = [](errc code) {
         return runtime::failure(
           runtime::operation_error{code, runtime::operation_kind::resource});
     };
     if (
-      limits.scratch_bytes.value() == 0
-      || limits.execution_bytes.value() < sizeof(completion_resources))
+      scratch_bytes.value() == 0
+      || execution_bytes.value() < sizeof(completion_resources))
         return reject(errc::invalid_argument);
     if (
-      limits.scratch_bytes.value() > maximum_contiguous_allocation_bytes
-      || limits.execution_bytes.value() > maximum_contiguous_allocation_bytes)
+      scratch_bytes.value() > maximum_contiguous_allocation_bytes
+      || execution_bytes.value() > maximum_contiguous_allocation_bytes)
         return reject(errc::out_of_range);
+    return {};
+}
+
+runtime::result<completion_resources> completion_resources::make(
+  workload_budget& budget,
+  runtime::file& file,
+  completion_resource_limits limits) {
+    if (auto valid = limits.validate(); !valid)
+        return runtime::failure(valid.error());
     const auto geometry = file.geometry();
     if (!geometry) return runtime::failure(geometry.error());
     const auto alignment = std::max<std::uint64_t>(
@@ -34,7 +40,10 @@ runtime::result<completion_resources> completion_resources::make(
     const auto scratch_charge = budget.allocation_charge(byte_count{size});
     if (!scratch_charge) return runtime::failure(scratch_charge.error());
     const auto cost = scratch_charge->checked_add(limits.execution_bytes);
-    if (!cost) return reject(errc::out_of_range);
+    if (!cost)
+        return runtime::failure(
+          runtime::operation_error{
+            errc::out_of_range, runtime::operation_kind::resource});
     auto reservation = budget.try_reserve(*cost);
     if (!reservation) return runtime::failure(reservation.error());
     auto scratch = seastar::temporary_buffer<char>::aligned(

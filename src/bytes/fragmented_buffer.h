@@ -292,8 +292,9 @@ public:
       std::size_t count,
       allocation_charge_fn charge) const noexcept;
 
-    // Charges the touched backing and potential share controls, plus both old
-    // and new child descriptor allocations during bounded slice construction.
+    // Charges touched backing and potential share controls. A whole-buffer
+    // share reserves one descriptor block; partial slices cover old and new
+    // descriptor blocks during bounded growth.
     // It excludes the parent's descriptors. A zero-length slice has zero cost
     // and makes no charge-function calls, even if the parent retains capacity.
     [[nodiscard]] result<buffer_allocation_cost> slice_allocation_cost(

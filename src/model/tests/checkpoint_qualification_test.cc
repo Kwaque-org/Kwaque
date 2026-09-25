@@ -1,5 +1,6 @@
 #include "src/bytes/test_allocation_profile.h"
 #include "src/codec/collection.h"
+#include "src/codec/tests/prepared_abort_source.h"
 #include "src/model/checkpoint_codec.h"
 #include "src/model/fingerprint.h"
 #include "src/model/tests/checkpoint_fuzz_cases.h"
@@ -293,6 +294,33 @@ byte_count aborting_charge(byte_count request) noexcept {
 }
 TEST(
   CheckpointQualificationTest,
+  AdmissionCancellationPreservesChargeWithoutAllocation) {
+    codec::testing::prepared_abort_source abort;
+    admission_abort = &abort;
+    admission_ordinal = 0;
+    admission_calls = 0;
+    auto reset = seastar::defer([] { admission_abort = nullptr; });
+    const byte_count request{4096};
+    const auto expected = charge(request);
+#if !defined(SEASTAR_DEFAULT_ALLOCATOR)
+    const auto before = seastar::memory::stats().mallocs();
+#endif
+    const auto served = aborting_charge(request);
+#if !defined(SEASTAR_DEFAULT_ALLOCATOR)
+    const auto allocations = seastar::memory::stats().mallocs() - before;
+    EXPECT_EQ(allocations, 0U);
+#endif
+    EXPECT_TRUE(abort.abort_requested());
+    EXPECT_EQ(served, expected);
+    EXPECT_EQ(admission_calls, 1U);
+#if defined(SEASTAR_DEFAULT_ALLOCATOR)
+    GTEST_SKIP() << "semantic cancellation passed; native allocation counters "
+                    "are unavailable";
+#endif
+}
+
+TEST(
+  CheckpointQualificationTest,
   CancellationAtAdmissionAndPublicationDrainsOwnedStaging) {
     const auto source = entries(65);
     seastar::abort_source setup_abort;
@@ -306,7 +334,7 @@ TEST(
         bool completed = false;
         std::size_t cancellations = 0;
         for (std::size_t ordinal = 0; ordinal < 512 && !completed; ++ordinal) {
-            seastar::abort_source abort;
+            codec::testing::prepared_abort_source abort;
             codec::cooperative_work work{codec::limits::defaults(), abort};
             auto budget = memory();
             budget.charge = aborting_charge;

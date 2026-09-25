@@ -571,6 +571,8 @@ kwaque_cc_library(
     visibility = [
         "//src/compression/tests:__pkg__",
         "//src/model/tests:__pkg__",
+        "//src/protocol/tests:__pkg__",
+        "//src/storage/tests:__pkg__",
     ],
     deps = ["//src/base"],
 )
@@ -583,6 +585,8 @@ kwaque_cc_library(
     visibility = [
         "//src/broker:__pkg__",
         "//src/model/tests:__pkg__",
+        "//src/protocol/tests:__pkg__",
+        "//src/storage/tests:__pkg__",
     ],
     deps = [
         "@openssl",
@@ -599,7 +603,11 @@ kwaque_cc_binary(
         "memory_qualification_probe.cc",
     ],
     linkopts = ALLOCATION_OBSERVER_LINKOPTS,
-    visibility = ["//src/model/tests:__pkg__"],
+    visibility = [
+        "//src/model/tests:__pkg__",
+        "//src/protocol/tests:__pkg__",
+        "//src/storage/tests:__pkg__",
+    ],
     deps = [
         ":allocation_observer",
         ":codec_bench_reference",
@@ -645,7 +653,11 @@ kwaque_cc_library(
     name = "memory_qualification_support",
     testonly = True,
     hdrs = ["memory_qualification_support.h"],
-    visibility = ["//src/model/tests:__pkg__"],
+    visibility = [
+        "//src/model/tests:__pkg__",
+        "//src/protocol/tests:__pkg__",
+        "//src/storage/tests:__pkg__",
+    ],
     deps = [
         ":allocation_observer",
         ":qualification_profile",
@@ -660,5 +672,21 @@ py_library(
     name = "memory_qualification_driver",
     testonly = True,
     srcs = ["memory_qualification_driver.py"],
-    visibility = ["//src/model/tests:__pkg__"],
+    visibility = [
+        "//src/model/tests:__pkg__",
+        "//src/protocol/tests:__pkg__",
+        "//src/storage/tests:__pkg__",
+    ],
+)
+
+kwaque_cc_library(
+    name = "prepared_abort_source",
+    testonly = True,
+    hdrs = ["prepared_abort_source.h"],
+    visibility = [
+        "//src/model/tests:__pkg__",
+        "//src/protocol/tests:__pkg__",
+        "//src/storage/tests:__pkg__",
+    ],
+    deps = ["@seastar"],
 )

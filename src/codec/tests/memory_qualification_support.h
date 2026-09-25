@@ -20,9 +20,6 @@
 namespace kwaque::codec::testing {
 using bytes::fragmented_buffer;
 using bytes::testing::charge;
-inline constexpr byte_count operation_budget{64U * 1024U * 1024U};
-inline constexpr byte_count residual{
-  operation_budget.value() - execution_reservation.value()};
 
 // Leave room for the system profile's 32-byte slack before capacity rounding.
 // Otherwise each 64-KiB input fragment is charged as 128 KiB, exhausting the
@@ -168,6 +165,27 @@ auto measure(
     report(name, size, retained, observed);
     return std::move(*result);
 }
+// Account for native owners prepared before the main observation, such as a
+// cancellation exception. The caller retains them through that operation and
+// adds this conservative setup peak to its initial-owner reservation.
+template<typename Function>
+byte_count observe_setup(Function prepare) {
+    begin_allocation_observation();
+    try {
+        prepare();
+    } catch (...) {
+        static_cast<void>(end_allocation_observation());
+        throw;
+    }
+    const auto sample = end_allocation_observation();
+    require(
+      !sample.observed || sample.complete, "incomplete setup observation");
+    require(
+      sample.largest_allocation <= kwaque::maximum_contiguous_allocation_bytes,
+      "setup allocation exceeded the contiguous ceiling");
+    return byte_count{sample.peak_upper_bound};
+}
+
 inline byte_count retained_cost(const fragmented_buffer& input) {
     const auto cost = input.allocation_cost(charge).value();
     return cost.backing.checked_add(cost.descriptors)

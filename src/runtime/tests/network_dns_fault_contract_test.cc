@@ -383,6 +383,32 @@ TEST(FaultContractTest, RejectsUnsupportedDecisions) {
     EXPECT_FALSE(short_operation.delay().has_value());
 }
 
+TEST(FaultContractTest, ZeroProgressFaultIsOnlyAFileWriteCompletion) {
+    using namespace kwaque::runtime;
+    for (const auto point :
+         {builtin_fault_point::file_write,
+          builtin_fault_point::file_read,
+          builtin_fault_point::network_read,
+          builtin_fault_point::network_write}) {
+        const auto* descriptor = descriptor_for(point);
+        ASSERT_NE(descriptor, nullptr);
+        const fault_request request{
+          .point = descriptor->id,
+          .occurrence = fault_occurrence::first(),
+          .object = fault_object_key::none()};
+        EXPECT_EQ(
+          validate_fault_decision(
+            request, fault_decision::make_short_operation(kwaque::byte_count{}))
+            .has_value(),
+          point == builtin_fault_point::file_write);
+        EXPECT_TRUE(
+          validate_fault_decision(
+            request,
+            fault_decision::make_short_operation(kwaque::byte_count{1024}))
+            .has_value());
+    }
+}
+
 TEST(FaultContractTest, BuiltinPointTableHasExactLegalActionSets) {
     const auto* timer = kwaque::runtime::descriptor_for(
       kwaque::runtime::builtin_fault_point::timer);

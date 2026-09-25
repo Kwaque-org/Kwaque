@@ -382,6 +382,12 @@ TEST(FragmentedBuffer, WarmShareAllocatesOneDescriptorBlock) {
         auto shared = source->share();
         const auto after = seastar::memory::stats().mallocs();
         EXPECT_EQ(after - before, 1U);
+        const auto before_ranged = seastar::memory::stats().mallocs();
+        auto full_slice = source->share(byte_count{}, source->size());
+        const auto after_ranged = seastar::memory::stats().mallocs();
+        ASSERT_TRUE(full_slice);
+        EXPECT_EQ(after_ranged - before_ranged, 1U);
+        EXPECT_TRUE(full_slice->content_equals(std::string(count, 'x')));
         EXPECT_EQ(shared.fragment_count(), count);
         EXPECT_EQ(shared.retained_bytes(), source->retained_bytes());
         for (std::size_t index = 0; index < count; ++index) {
@@ -1209,6 +1215,76 @@ TEST(BufferBuilder, AppendBufferSplicesAndEmptiesTheSource) {
     EXPECT_EQ(zero_copy->fragment_at(0)->data(), backing);
 }
 
+TEST(BufferBuilder, BoundedFragmentTransferPreservesBackingAndSourceSuffix) {
+    auto source = fragmented({"first", "second", "third"});
+    const auto* first = source.fragment_at(0)->data();
+    const auto* second = source.fragment_at(1)->data();
+    auto alias = source.share();
+    kwaque::bytes::scatter_cursor cursor;
+    ASSERT_TRUE(source.export_scatter(1, byte_count{5}, cursor));
+    fragmented_buffer_builder builder;
+    ASSERT_TRUE(builder.reserve_fragments(item_count{3}));
+    EXPECT_FALSE(builder.append_fragments(source, item_count{4}));
+    EXPECT_TRUE(source.content_equals("firstsecondthird"));
+    ASSERT_TRUE(builder.append_fragments(source, item_count{2}));
+    EXPECT_TRUE(source.content_equals("third"));
+    EXPECT_FALSE(source.export_scatter(1, byte_count{5}, cursor));
+    ASSERT_TRUE(builder.append_fragments(source, item_count{1}));
+    EXPECT_TRUE(source.empty());
+    auto output = builder.finish();
+    ASSERT_TRUE(output);
+    EXPECT_TRUE(output->content_equals("firstsecondthird"));
+    EXPECT_EQ(output->fragment_at(0)->data(), first);
+    EXPECT_EQ(output->fragment_at(1)->data(), second);
+    EXPECT_TRUE(alias.content_equals("firstsecondthird"));
+}
+
+TEST(BufferBuilder, ReservedFragmentTransferNeedsNoNativeAllocation) {
+    auto source = fragmented({"first", "second", "third"});
+    fragmented_buffer_builder builder;
+    ASSERT_TRUE(builder.reserve_fragments(item_count{3}));
+#if !defined(SEASTAR_DEFAULT_ALLOCATOR)
+    const auto before = seastar::memory::stats().mallocs();
+#endif
+    const auto transferred = builder.append_fragments(source, item_count{3});
+    const auto output = builder.finish();
+#if !defined(SEASTAR_DEFAULT_ALLOCATOR)
+    const auto after = seastar::memory::stats().mallocs();
+    EXPECT_EQ(after, before);
+#endif
+    ASSERT_TRUE(transferred);
+    ASSERT_TRUE(output);
+    EXPECT_TRUE(output->content_equals("firstsecondthird"));
+}
+
+TEST(
+  BufferBuilder, BoundedTransferRejectionAndAllocationFailurePreserveOwners) {
+    auto source = fragmented({"first", "second"});
+    fragmented_buffer_builder_config limits;
+    limits.max_fragments = 1;
+    fragmented_buffer_builder limited{limits};
+    EXPECT_FALSE(limited.append_fragments(source, item_count{2}));
+    EXPECT_TRUE(source.content_equals("firstsecond"));
+    EXPECT_TRUE(limited.empty());
+#if defined(SEASTAR_ENABLE_ALLOC_FAILURE_INJECTION)
+    fragmented_buffer_builder builder;
+    auto& injector = seastar::memory::local_failure_injector();
+    injector.fail_after(0);
+    bool failed = false;
+    try {
+        static_cast<void>(builder.append_fragments(source, item_count{2}));
+    } catch (const std::bad_alloc&) {
+        failed = true;
+    }
+    const bool injected = injector.failed();
+    injector.cancel();
+    EXPECT_TRUE(failed && injected);
+    EXPECT_TRUE(builder.empty());
+    EXPECT_TRUE(source.content_equals("firstsecond"));
+    EXPECT_TRUE(builder.append_fragments(source, item_count{2}));
+#endif
+}
+
 TEST(BufferBuilder, SplicePacksOnlyOneBoundedPrefixIntoExistingTail) {
     fragmented_buffer_builder_config config;
     config.initial_fragment_bytes = byte_count{8192};
@@ -1404,6 +1480,17 @@ TEST(FragmentedBuffer, BoundedCostQueriesPreserveWholeAndTrimmedAccounting) {
         return byte_count{requested.value() + 16U};
     };
     auto input = fragmented({"a", "bc", "def"});
+    const auto full_share_cost
+      = input.slice_allocation_cost({}, input.size(), charge).value();
+    auto shared = input.share({}, input.size()).value();
+    EXPECT_EQ(
+      full_share_cost.descriptors, shared.allocation_cost(charge)->descriptors);
+    const auto partial_cost
+      = input.slice_allocation_cost({}, byte_count{5}, charge).value();
+    auto partial = input.share({}, byte_count{5}).value();
+    EXPECT_GE(
+      partial_cost.descriptors, partial.allocation_cost(charge)->descriptors);
+    EXPECT_LT(full_share_cost.descriptors, partial_cost.descriptors);
     const auto whole = input.allocation_cost(charge).value();
     buffer_allocation_cost total;
     for (std::size_t index = 0; index < input.fragment_count(); ++index) {

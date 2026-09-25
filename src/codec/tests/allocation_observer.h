@@ -7,6 +7,8 @@ namespace kwaque::codec::testing {
 // Test-only observation of new native allocations on the calling reactor.
 // Input owners and shared engine state that predate begin() are excluded.
 // Critical allocations include coroutine frames, but are not a frame-size API.
+// Classification is available only with allocation-failure injection compiled
+// in; otherwise its zero counter does not establish a critical-memory bound.
 // Internal frees can bypass executable link wrapping. Their charges remain
 // until pointer reuse proves release, so live/peak values are conservative
 // upper bounds. Every allocation must match the native allocation count.

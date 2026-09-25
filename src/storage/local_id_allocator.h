@@ -74,6 +74,8 @@ public:
     [[nodiscard]] seastar::future<runtime::result<void>> close() {
         assert_current();
         if (closed_) co_return runtime::result<void>{};
+        if (control_.wal_writer_active_)
+            co_return runtime::failure(detail::path_error(errc::queue_full));
         if (closing_)
             co_return runtime::failure(detail::path_error(errc::queue_full));
         closing_ = true;
@@ -84,6 +86,7 @@ public:
     }
 
 private:
+    friend class wal_writer<Backend, Owner>;
     local_id_allocator(
       control_type& control,
       std::uint32_t block_size,

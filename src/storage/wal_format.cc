@@ -64,8 +64,17 @@ codec::result<void> check_id(
         return codec::failure(at(errc::wrong_context, context, field, Offset));
     return {};
 }
+wal_child_expectation child_expectation(const wal_prepare_expectation& e) {
+    return {
+      e.target,
+      e.target_data_start,
+      e.routing_epoch,
+      e.batch,
+      e.profile,
+      e.target_profile};
+}
 codec::result<void> check_expectation(
-  const wal_prepare_expectation& expected, codec::field_context context) {
+  const wal_child_expectation& expected, codec::field_context context) {
     if (
       auto valid = parse_replay_profile(
         static_cast<std::uint16_t>(expected.profile));
@@ -95,6 +104,39 @@ codec::result<void> check_expectation(
                 || expected.batch.original_binding->routing_epoch() != expected.routing_epoch)))
         return codec::failure(at(errc::invalid_argument, context));
     return {};
+}
+codec::result<void> check_expectation(
+  const wal_prepare_expectation& expected, codec::field_context context) {
+    return check_expectation(child_expectation(expected), context);
+}
+codec::result<aligned_envelope_layout> checked_layout(
+  byte_count child_bytes,
+  const wal_prepare_expectation& expected,
+  const codec::limits& policy,
+  codec::envelope_extent_limits owner_limits,
+  codec::field_context context) {
+    if (auto valid = check_expectation(expected, context); !valid)
+        return codec::failure(valid.error());
+    const auto layout = aligned_envelope_layout::make(
+      {byte_count{codec::envelope_prefix_bytes},
+       wal_prepare_fixed_bytes,
+       child_bytes},
+      expected.wal.alignment(),
+      policy,
+      owner_limits);
+    if (!layout)
+        return codec::failure(
+          codec::detail::allocation_cost_error(
+            layout.error(), context, context.origin));
+    if (
+      layout->encoded_bytes().value()
+      > std::numeric_limits<std::uint64_t>::max() - context.origin)
+        return codec::failure(at(errc::invalid_argument, context));
+    if (auto extent = layout->at(expected.wal.position()); !extent)
+        return codec::failure(
+          codec::detail::allocation_cost_error(
+            extent.error(), context, context.origin));
+    return *layout;
 }
 codec::result<void> check_fixed(
   const std::array<char, 136>& fixed,
@@ -179,7 +221,7 @@ codec::result<void> check_fixed(
 
 codec::result<void> check_child(
   assigned_batch_info info,
-  const wal_prepare_expectation& expected,
+  const wal_child_expectation& expected,
   codec::field_context context,
   bool encoding) {
     if (
@@ -199,7 +241,42 @@ codec::result<void> check_child(
           encoding ? 0U : 104U));
     return {};
 }
+codec::result<void> check_child(
+  assigned_batch_info info,
+  const wal_prepare_expectation& expected,
+  codec::field_context context,
+  bool encoding) {
+    return check_child(info, child_expectation(expected), context, encoding);
+}
 } // namespace
+
+codec::result<void> validate_wal_child_context(
+  assigned_batch_info info,
+  const wal_child_expectation& expected,
+  codec::field_context context) {
+    context.family = static_cast<std::uint16_t>(
+      codec::format_family::wal_prepare);
+    if (auto valid = check_expectation(expected, context); !valid) return valid;
+    return check_child(info, expected, context, true);
+}
+
+codec::result<aligned_envelope_layout> preflight_wal_prepare(
+  const encoded_assigned_batch& child,
+  const wal_prepare_expectation& expected,
+  const codec::limits& policy,
+  codec::envelope_extent_limits owner_limits,
+  codec::field_context context) {
+    context.family = static_cast<std::uint16_t>(
+      codec::format_family::wal_prepare);
+    if (child.bytes().empty())
+        return codec::failure(at(errc::invalid_argument, context));
+    auto layout = checked_layout(
+      child.bytes().size(), expected, policy, owner_limits, context);
+    if (!layout) return layout;
+    if (auto valid = check_child(child.info(), expected, context, true); !valid)
+        return codec::failure(valid.error());
+    return layout;
+}
 
 namespace detail {
 class wal_codec final {
@@ -239,31 +316,14 @@ seastar::future<codec::result<fragmented_buffer>> encode_wal_prepare(
                 failed = ready.error();
                 break;
             }
-            if (auto valid = check_expectation(expected, context); !valid) {
-                failed = valid.error();
-                break;
-            }
-            const auto layout = aligned_envelope_layout::make(
-              {byte_count{codec::envelope_prefix_bytes},
-               wal_prepare_fixed_bytes,
-               child->bytes().size()},
-              expected.wal.alignment(),
+            const auto layout = checked_layout(
+              child->bytes().size(),
+              expected,
               work.policy(),
-              limits(work.policy()));
+              limits(work.policy()),
+              context);
             if (!layout) {
-                failed = codec::detail::allocation_cost_error(
-                  layout.error(), context, context.origin);
-                break;
-            }
-            if (
-              layout->encoded_bytes().value()
-              > std::numeric_limits<std::uint64_t>::max() - context.origin) {
-                failed = at(errc::invalid_argument, context);
-                break;
-            }
-            if (auto extent = layout->at(expected.wal.position()); !extent) {
-                failed = codec::detail::allocation_cost_error(
-                  extent.error(), context, context.origin);
+                failed = layout.error();
                 break;
             }
             const auto cost = child->bytes().allocation_cost(charge);

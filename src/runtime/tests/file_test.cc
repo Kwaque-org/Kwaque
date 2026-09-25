@@ -2,6 +2,7 @@
 #include "src/runtime/file_error_internal.h"
 #include "src/runtime/file_test_support.h"
 #include "src/runtime/fragmented_buffer_internal.h"
+#include "src/runtime/testing/reactor_tasks.h"
 
 #include <seastar/core/coroutine.hh>
 #include <seastar/core/deleter.hh>
@@ -48,6 +49,7 @@ struct file_probe final {
     std::exception_ptr write_failure;
     std::exception_ptr close_failure;
     std::optional<seastar::promise<std::size_t>> delayed_write;
+    std::array<std::optional<seastar::promise<std::size_t>>, 64> parked_writes;
     std::optional<seastar::promise<seastar::temporary_buffer<std::uint8_t>>>
       delayed_bulk_read;
     std::vector<io_call> writes;
@@ -75,6 +77,7 @@ struct file_probe final {
     bool fail_flush{false};
     bool fail_allocation{false};
     bool delayed_write_consumed{false};
+    bool park_writes{false};
 };
 
 template<typename T>
@@ -109,6 +112,11 @@ public:
             .size = size,
             .address = reinterpret_cast<std::uintptr_t>(buffer),
           });
+        if (probe_.park_writes) {
+            auto& waiting = probe_.parked_writes.at(probe_.writes.size() - 1);
+            waiting.emplace();
+            return waiting->get_future();
+        }
         if (
           probe_.delayed_write && !probe_.delayed_write_consumed
           && probe_.writes.size() == probe_.delayed_write_index + 1U) {
@@ -1561,6 +1569,38 @@ SEASTAR_TEST_CASE(file_geometry_rejects_unusable_recommendations) {
 }
 
 SEASTAR_TEST_CASE(
+  file_write_allocation_limit_rejects_invalid_or_pinned_changes) {
+    using namespace kwaque;
+    file_probe probe;
+    probe.memory_alignment = 8192;
+    auto owner = make_file(probe);
+    const auto original = owner.geometry();
+    for (const auto maximum : {0U, 4096U, 65535U, 262144U}) {
+        const auto rejected = owner.limit_write_allocation(byte_count{maximum});
+        BOOST_CHECK(!rejected);
+        BOOST_CHECK(owner.geometry() == original);
+    }
+    const auto limited = owner.limit_write_allocation(byte_count{65536});
+    runtime::result<void> pinned;
+    bool pin_admitted = false;
+    {
+        auto pin = owner.try_reserve_metadata();
+        pin_admitted = pin.has_value();
+        pinned = owner.limit_write_allocation(byte_count{32768});
+    }
+    const auto geometry = owner.geometry();
+    const auto closed = co_await owner.close();
+    const auto after_close = owner.limit_write_allocation(byte_count{32768});
+    BOOST_CHECK(limited.has_value() && closed.has_value() && pin_admitted);
+    BOOST_REQUIRE(geometry.has_value());
+    BOOST_CHECK_EQUAL(geometry->append_chunk_bytes().value(), 65536U);
+    BOOST_REQUIRE(!pinned);
+    BOOST_CHECK(pinned.error().code() == errc::queue_full);
+    BOOST_REQUIRE(!after_close);
+    BOOST_CHECK(after_close.error().code() == errc::closed);
+}
+
+SEASTAR_TEST_CASE(
   file_owner_retains_typed_failure_and_cannot_heal_by_flushing) {
     using namespace kwaque::runtime;
     file_probe probe;
@@ -1980,4 +2020,460 @@ SEASTAR_TEST_CASE(
 #if defined(SEASTAR_ENABLE_ALLOC_FAILURE_INJECTION)
     BOOST_CHECK(!injected);
 #endif
+}
+
+namespace {
+using kwaque::runtime::testing::drain_reactor_tasks;
+
+void finish_parked(
+  file_probe& probe,
+  std::size_t index,
+  std::optional<std::size_t> result = std::nullopt,
+  std::exception_ptr failure = {}) {
+    auto& pending = probe.parked_writes.at(index);
+    if (!pending) throw std::runtime_error("missing parked native write");
+    const auto& call = probe.writes.at(index);
+    if (failure) {
+        pending->set_exception(failure);
+    } else {
+        const auto count = result.value_or(call.size);
+        if (count <= call.size) {
+            const auto end = call.position + count;
+            if (probe.storage.size() < end)
+                probe.storage.resize(static_cast<std::size_t>(end), '\0');
+            std::memcpy(
+              probe.storage.data() + call.position,
+              reinterpret_cast<const char*>(call.address),
+              count);
+            probe.size = std::max(probe.size, end);
+        }
+        pending->set_value(count);
+    }
+    pending.reset();
+}
+
+seastar::future<> drain_parked(file_probe& probe, std::size_t keep = SIZE_MAX) {
+    for (;;) {
+        co_await drain_reactor_tasks();
+        std::optional<std::size_t> selected;
+        for (std::size_t i = 0; i < probe.parked_writes.size(); ++i)
+            if (probe.parked_writes[i] && i != keep) selected = i;
+        if (!selected) co_return;
+        finish_parked(probe, *selected);
+    }
+}
+
+kwaque::runtime::file
+pipeline_file(file_probe& probe, kwaque::runtime::file_io_limits limits = {}) {
+    probe.park_writes = true;
+    probe.writes.reserve(64);
+    return kwaque::runtime::file{
+      seastar::file{seastar::make_shared<probe_file_impl>(probe)},
+      limits,
+      {},
+      kwaque::runtime::file_close_policy::checked};
+}
+} // namespace
+
+SEASTAR_TEST_CASE(file_pipeline_honors_reduced_allocation_through_short_write) {
+    using namespace kwaque;
+    file_probe probe;
+    probe.memory_alignment = 8192;
+    probe.write_max_length = 131072;
+    constexpr std::size_t size = 8U * 65536U;
+    probe.storage.resize(size);
+    auto owner = pipeline_file(probe);
+    const auto limited = owner.limit_write_allocation(byte_count{65536});
+    auto moved = std::move(owner);
+    // A subsequent larger request must not undo a previously installed cap.
+    const auto enlarged = moved.limit_write_allocation(byte_count{131072});
+    const auto layout = moved.geometry().value().write_buffers(
+      {}, byte_count{size});
+    auto writing = moved.write({}, staging_data(true, size));
+    co_await drain_reactor_tasks();
+    const auto initial = probe.writes.size();
+    const auto busy = moved.limit_write_allocation(byte_count{32768});
+    finish_parked(probe, 0, 4096);
+    co_await drain_parked(probe);
+    const auto written = co_await std::move(writing);
+    const auto closed = co_await moved.close();
+    BOOST_CHECK(limited.has_value() && enlarged.has_value());
+    BOOST_REQUIRE(!busy);
+    BOOST_CHECK(busy.error().code() == errc::queue_full);
+    BOOST_CHECK_EQUAL(initial, 4U);
+    BOOST_CHECK_EQUAL(layout.allocation_bytes.value(), 65536U);
+    BOOST_CHECK_EQUAL(layout.allocations, 8U);
+    BOOST_REQUIRE(written.has_value());
+    BOOST_CHECK_EQUAL(written->value(), size);
+    BOOST_CHECK(closed.has_value());
+    BOOST_CHECK_EQUAL(probe.writes.size(), 9U);
+    for (const auto& call : probe.writes) {
+        BOOST_CHECK_LE(call.size, 65536U);
+        BOOST_CHECK_EQUAL(call.address % 8192U, 0U);
+    }
+    BOOST_CHECK(
+      std::string_view(probe.storage.data(), size) == staging_contents(size));
+}
+
+SEASTAR_TEST_CASE(file_pipeline_bounds_reversed_completion_and_joined_close) {
+    using namespace kwaque;
+    for (unsigned mode = 0; mode != 4; ++mode) {
+        const bool byte_limited = mode == 1;
+        file_probe probe;
+        probe.write_max_length = mode == 3 ? 98304U : (mode ? 131072U : 16384U);
+        const auto size = 8U * probe.write_max_length;
+        probe.storage.resize(size);
+        runtime::file_io_limits limits;
+        if (mode == 2) {
+            limits.write_concurrency = 8;
+            limits.write_buffer_bytes
+              = runtime::maximum_file_write_buffer_bytes;
+        }
+        if (mode == 3) {
+            limits.write_concurrency = 8;
+            limits.write_buffer_bytes = byte_count{6U * 131072U};
+        }
+        if (byte_limited) {
+            limits.write_concurrency = 8;
+            limits.write_buffer_bytes = byte_count{4U * 131072U};
+        }
+        auto owner = pipeline_file(probe, limits);
+        auto data = staging_data(true, size);
+        const auto expected = staging_contents(size);
+        auto alias = data.share();
+        const auto layout = owner.geometry().value().write_buffers(
+          {}, byte_count{size});
+        auto writing = owner.write({}, std::move(data));
+        co_await drain_reactor_tasks();
+        const auto initial = probe.writes.size();
+        bool distinct = true;
+        for (std::size_t i = 0; i < initial; ++i)
+            for (std::size_t j = i + 1; j < initial; ++j)
+                distinct &= probe.writes[i].address != probe.writes[j].address;
+        auto truncating = owner.truncate(size + 4096U);
+        auto closing = owner.close();
+        co_await drain_parked(probe, 0);
+        const bool held = !writing.available() && !truncating.available()
+                          && !closing.available() && probe.truncates == 0
+                          && probe.closes == 0;
+        finish_parked(probe, 0);
+        const auto written = co_await std::move(writing);
+        const auto truncated = co_await std::move(truncating);
+        const auto closed = co_await std::move(closing);
+        BOOST_CHECK_EQUAL(
+          initial,
+          byte_limited ? 2U : (mode == 2 ? 8U : (mode == 3 ? 3U : 4U)));
+        BOOST_CHECK_EQUAL(layout.allocations, 2U * initial);
+        BOOST_CHECK_LE(
+          layout.allocation_bytes.value() * layout.allocations,
+          limits.write_buffer_bytes.value());
+        BOOST_CHECK(distinct && held);
+        BOOST_REQUIRE(written.has_value());
+        BOOST_CHECK_EQUAL(written->value(), size);
+        BOOST_CHECK(truncated.has_value() && closed.has_value());
+        BOOST_CHECK_EQUAL(probe.writes.size(), 8U);
+        BOOST_CHECK(std::string_view(probe.storage.data(), size) == expected);
+        BOOST_CHECK(alias.content_equals(expected));
+        BOOST_CHECK(runtime::file_test_access::move_is_idle(owner));
+    }
+}
+
+SEASTAR_TEST_CASE(file_pipeline_recovers_short_writes_in_each_slot) {
+    using namespace kwaque;
+    file_probe probe;
+    probe.memory_alignment = 8192;
+    probe.write_max_length = 8192;
+    probe.storage.resize(65536);
+    auto owner = pipeline_file(probe);
+    auto writing = owner.write({}, staging_data(true, 65536));
+    co_await drain_reactor_tasks();
+    const auto initial = probe.writes.size();
+    for (std::size_t i = initial; i != 0; --i) {
+        finish_parked(probe, i - 1, 4096);
+        co_await drain_reactor_tasks();
+    }
+    const auto recovering = probe.writes.size();
+    bool aligned = true;
+    for (std::size_t i = initial; i < recovering; ++i)
+        aligned &= probe.writes[i].address % 8192 == 0
+                   && probe.writes[i].size == 4096;
+    co_await drain_parked(probe);
+    const auto written = co_await std::move(writing);
+    const auto closed = co_await owner.close();
+    BOOST_CHECK_EQUAL(initial, 4U);
+    BOOST_CHECK_EQUAL(recovering, 8U);
+    BOOST_CHECK(aligned);
+    BOOST_REQUIRE(written.has_value());
+    BOOST_CHECK_EQUAL(written->value(), 65536U);
+    BOOST_CHECK(closed.has_value());
+    BOOST_CHECK(
+      std::string_view(probe.storage.data(), probe.storage.size())
+      == staging_contents(65536));
+}
+
+SEASTAR_TEST_CASE(file_pipeline_stops_on_failure_and_joins_remaining_requests) {
+    using namespace kwaque;
+    for (unsigned mode = 0; mode != 4; ++mode) {
+        file_probe probe;
+        probe.write_max_length = 4096;
+        probe.storage.resize(32768);
+        auto owner = pipeline_file(probe);
+        auto writing = owner.write({}, staging_data(true, 32768));
+        co_await drain_reactor_tasks();
+        const auto initial = probe.writes.size();
+        const auto exception = mode == 0
+                                 ? std::make_exception_ptr(std::bad_alloc{})
+                                 : std::make_exception_ptr(
+                                     std::system_error(
+                                       std::make_error_code(
+                                         std::errc::no_space_on_device)));
+        if (mode < 2)
+            finish_parked(probe, 2, std::nullopt, exception);
+        else
+            finish_parked(probe, 2, mode == 2 ? 0U : 8192U);
+        co_await drain_reactor_tasks();
+        finish_parked(
+          probe,
+          3,
+          std::nullopt,
+          std::make_exception_ptr(std::runtime_error("later chunk failure")));
+        probe.close_failure = std::make_exception_ptr(
+          std::runtime_error("later close failure"));
+        auto closing = owner.close();
+        const bool joined = !writing.available() && !closing.available()
+                            && probe.closes == 0;
+        co_await drain_parked(probe);
+        std::optional<runtime::result<byte_count>> written;
+        std::optional<runtime::result<void>> closed;
+        std::exception_ptr write_exception, close_exception;
+        try {
+            written.emplace(co_await std::move(writing));
+        } catch (...) {
+            write_exception = std::current_exception();
+        }
+        try {
+            closed.emplace(co_await std::move(closing));
+        } catch (...) {
+            close_exception = std::current_exception();
+        }
+        BOOST_CHECK_EQUAL(initial, 4U);
+        BOOST_CHECK_EQUAL(probe.writes.size(), initial);
+        BOOST_CHECK(joined);
+        if (mode == 0) {
+            BOOST_CHECK(
+              write_exception == exception && close_exception == exception);
+        } else {
+            BOOST_REQUIRE(written && closed);
+            BOOST_REQUIRE(!written->has_value() && !closed->has_value());
+            BOOST_CHECK(written->error() == closed->error());
+            BOOST_CHECK(
+              written->error().code()
+              == (mode == 1 ? errc::resource_exhausted : errc::io_failure));
+        }
+        BOOST_CHECK_EQUAL(owner.statistics().active, 0U);
+        BOOST_CHECK_EQUAL(probe.closes, 1U);
+    }
+}
+
+SEASTAR_TEST_CASE(
+  file_pipeline_abort_prevents_refill_and_drains_submitted_bytes) {
+    using namespace kwaque;
+    file_probe probe;
+    probe.write_max_length = 4096;
+    probe.storage.resize(32768);
+    auto owner = pipeline_file(probe);
+    auto writing = owner.write({}, staging_data(true, 32768));
+    co_await drain_reactor_tasks();
+    const auto initial = probe.writes.size();
+    owner.request_abort();
+    finish_parked(probe, 0);
+    co_await drain_reactor_tasks();
+    auto closing = owner.close();
+    co_await drain_parked(probe);
+    const auto written = co_await std::move(writing);
+    const auto closed = co_await std::move(closing);
+    BOOST_REQUIRE(!written.has_value());
+    BOOST_CHECK(written.error().code() == errc::aborted);
+    BOOST_CHECK_EQUAL(initial, 4U);
+    BOOST_CHECK_EQUAL(probe.writes.size(), initial);
+    BOOST_CHECK(closed.has_value());
+    BOOST_CHECK_EQUAL(owner.statistics().active, 0U);
+}
+
+SEASTAR_TEST_CASE(file_pipeline_allocation_cuts_join_started_workers) {
+#if defined(SEASTAR_ENABLE_ALLOC_FAILURE_INJECTION)
+    using namespace kwaque;
+    std::size_t cuts = 0, partial_starts = 0;
+    for (std::size_t cut = 0; cut != 32; ++cut) {
+        file_probe probe;
+        probe.write_max_length = 4096;
+        probe.storage.resize(32768);
+        auto owner = pipeline_file(probe);
+        auto data = staging_data(true, 32768);
+        std::optional<seastar::future<runtime::result<byte_count>>> writing;
+        auto& injector = seastar::memory::local_failure_injector();
+        injector.fail_after(cut);
+        try {
+            writing.emplace(owner.write({}, std::move(data)));
+        } catch (...) {
+            injector.cancel();
+            throw;
+        }
+        const bool injected = injector.failed();
+        injector.cancel();
+        cuts += injected;
+        partial_starts += injected && !probe.writes.empty();
+        co_await drain_parked(probe);
+        bool allocation_failed = false;
+        try {
+            const auto written = co_await std::move(*writing);
+            BOOST_CHECK(!injected && written.has_value());
+        } catch (const std::bad_alloc&) {
+            allocation_failed = true;
+        }
+        try {
+            static_cast<void>(co_await owner.close());
+        } catch (const std::bad_alloc&) {
+        }
+        BOOST_CHECK_EQUAL(allocation_failed, injected);
+        BOOST_CHECK_EQUAL(owner.statistics().active, 0U);
+        BOOST_CHECK_EQUAL(probe.closes, 1U);
+    }
+    BOOST_CHECK_GT(cuts, 0U);
+    BOOST_CHECK_GT(partial_starts, 0U);
+#endif
+    co_return;
+}
+
+SEASTAR_TEST_CASE(
+  file_pipeline_allocation_failure_during_refill_joins_the_window) {
+#if defined(SEASTAR_ENABLE_ALLOC_FAILURE_INJECTION)
+    using namespace kwaque;
+    using access = runtime::detail::fragmented_buffer_io_access;
+    file_probe probe;
+    probe.write_max_length = 16384;
+    probe.storage.resize(131072);
+    auto owner = pipeline_file(probe);
+    bytes::fragmented_buffer data;
+    for (unsigned i = 0; i != 4; ++i) {
+        auto block = seastar::temporary_buffer<char>::aligned(4096, 16384);
+        std::memset(block.get_write(), 'd', block.size());
+        const auto appended = access::append_adopted(
+          data, std::move(block), byte_count{16384});
+        BOOST_REQUIRE(appended);
+    }
+    auto tail = staging_data(true, 65536);
+    auto consume = access::consume(tail);
+    while (!tail.empty()) {
+        auto block = consume.take_front();
+        const auto size = byte_count{block.size()};
+        const auto appended = access::append_adopted(
+          data, std::move(block), size);
+        BOOST_REQUIRE(appended);
+    }
+    auto writing = owner.write({}, std::move(data));
+    co_await drain_reactor_tasks();
+    const auto started = probe.writes.size();
+    // All started requests are native-aligned aliases. The first refill needs
+    // a new aligned staging buffer; native completion and co_await allocate no
+    // test-harness storage between arming the injector and that refill.
+    for (std::size_t i = 0; i != started; ++i)
+        finish_parked(probe, i);
+    auto& injector = seastar::memory::local_failure_injector();
+    injector.fail_after(0);
+    bool observed = false;
+    try {
+        static_cast<void>(co_await std::move(writing));
+    } catch (const std::bad_alloc&) {
+        observed = true;
+    }
+    const bool injected = injector.failed();
+    injector.cancel();
+    try {
+        static_cast<void>(co_await owner.close());
+    } catch (const std::bad_alloc&) {
+    }
+    BOOST_CHECK_EQUAL(started, 4U);
+    BOOST_CHECK_EQUAL(probe.writes.size(), started);
+    BOOST_CHECK(injected && observed);
+    BOOST_CHECK_EQUAL(owner.statistics().active, 0U);
+    BOOST_CHECK_EQUAL(probe.closes, 1U);
+#endif
+    co_return;
+}
+
+SEASTAR_TEST_CASE(
+  file_write_admission_detail_covers_the_whole_logical_operation) {
+    using namespace kwaque;
+    using namespace kwaque::runtime;
+    auto pressure = make_file_error(
+      errc::resource_exhausted, file_failure_detail::admission_not_dispatched);
+    BOOST_REQUIRE(pressure.add_context(operation_context_key::limit, 1));
+    const auto native_pressure = std::make_exception_ptr(
+      runtime::detail::file_operation_exception{pressure});
+    // A first-request rejection remains distinguishable and retryable.
+    {
+        file_probe probe;
+        probe.write_failure = native_pressure;
+        file owner{
+          seastar::file{seastar::make_shared<probe_file_impl>(probe)},
+          {},
+          {},
+          file_close_policy::checked};
+        const auto rejected = co_await owner.write({}, aligned_data(4096, 'a'));
+        probe.write_failure = {};
+        const auto retried = co_await owner.write({}, aligned_data(4096, 'b'));
+        const auto closed = co_await owner.close();
+        BOOST_REQUIRE(!rejected);
+        BOOST_CHECK(rejected.error() == pressure);
+        BOOST_CHECK(retried && closed);
+    }
+    // A later request's rejection cannot promise that the logical write had
+    // no effect, for either serial execution or the parallel window.
+    for (const std::uint32_t concurrency : {1U, 4U}) {
+        file_probe probe;
+        probe.write_max_length = 4096;
+        probe.storage.resize(32768);
+        auto owner = pipeline_file(probe, {.write_concurrency = concurrency});
+        auto writing = owner.write({}, staging_data(true, 32768));
+        co_await drain_reactor_tasks();
+        const auto first = probe.writes.size();
+        probe.write_failure = native_pressure;
+        finish_parked(probe, 0);
+        co_await drain_reactor_tasks();
+        co_await drain_parked(probe);
+        const auto written = co_await std::move(writing);
+        const auto flushed = co_await owner.flush();
+        const auto closed = co_await owner.close();
+        BOOST_CHECK_EQUAL(first, concurrency);
+        BOOST_CHECK_EQUAL(probe.writes.size(), first);
+        BOOST_REQUIRE(!written && !flushed && !closed);
+        BOOST_CHECK(written.error().code() == pressure.code());
+        BOOST_CHECK(
+          file_detail(written.error()) == file_failure_detail::unknown);
+        BOOST_CHECK(written.error().context_at(1) == pressure.context_at(1));
+        BOOST_CHECK(
+          written.error() == flushed.error()
+          && written.error() == closed.error());
+        BOOST_CHECK_EQUAL(probe.flushes, 0U);
+    }
+    // Direct short-write recovery has already written a prefix too.
+    {
+        file_probe probe;
+        probe.delayed_write.emplace();
+        file owner{
+          seastar::file{seastar::make_shared<probe_file_impl>(probe)},
+          {},
+          {},
+          file_close_policy::checked};
+        auto writing = owner.write({}, aligned_data(8192, 's'));
+        probe.write_failure = native_pressure;
+        complete_delayed_write(probe, 4096);
+        const auto written = co_await std::move(writing);
+        const auto closed = co_await owner.close();
+        BOOST_REQUIRE(!written && !closed);
+        BOOST_CHECK(
+          file_detail(written.error()) == file_failure_detail::unknown);
+        BOOST_CHECK(written.error() == closed.error());
+    }
 }

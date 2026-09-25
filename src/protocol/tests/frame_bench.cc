@@ -1,5 +1,6 @@
 #include "src/codec/sha256.h"
 #include "src/codec/tests/benchmark_buffer.h"
+#include "src/codec/tests/qualification_profile.h"
 #include "src/model/tests/model_bench_fixture.h"
 #include "src/protocol/batch_frame_codec.h"
 #include "src/protocol/tests/frame_test_support.h"
@@ -359,7 +360,7 @@ private:
     const model::batch_decode_expectation expected_
       = model::bench::expected_context();
     codec::decode_budget memory_{
-      byte_count{63U << 20U}, byte_count{1U << 20U}, capacity_bound};
+      codec::testing::residual, byte_count{1U << 20U}, capacity_bound};
     std::optional<codec::semantic_batch_digest> digest_;
     std::optional<codec::sha256_digest> record_hash_;
 };

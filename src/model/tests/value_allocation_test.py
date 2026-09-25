@@ -10,7 +10,6 @@ import subprocess
 import unittest
 from pathlib import Path
 
-
 SAMPLES = (
     "cold-invalid-id",
     "warm-invalid-id",
@@ -58,7 +57,15 @@ class ValueAllocationTest(unittest.TestCase):
         result = fields(lines[0])
         self.assertEqual(
             set(result),
-            {"allocator", "injection", "optimized", "sanitized", "asan", "ubsan", "abort"},
+            {
+                "allocator",
+                "injection",
+                "optimized",
+                "sanitized",
+                "asan",
+                "ubsan",
+                "abort",
+            },
         )
         self.assertIn(result["allocator"], {"native", "system"})
         for key in set(result) - {"allocator"}:
@@ -157,7 +164,8 @@ class ValueAllocationTest(unittest.TestCase):
         for sample in samples:
             self.assertEqual(sample["memory_observed"], "true" if native else "false")
             self.assertEqual(
-                set(sample), {"name", "memory_observed"} | (COUNTERS if native else set())
+                set(sample),
+                {"name", "memory_observed"} | (COUNTERS if native else set()),
             )
             if native:
                 for name in COUNTERS:
@@ -181,7 +189,9 @@ class ValueAllocationTest(unittest.TestCase):
         evidence["allocation_qualified"] = native
         write_evidence()
         if not native:
-            self.skipTest("value checks passed; system allocation counters are unavailable")
+            self.skipTest(
+                "value checks passed; system allocation counters are unavailable"
+            )
 
 
 if __name__ == "__main__":

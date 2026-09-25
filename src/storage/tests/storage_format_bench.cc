@@ -1,5 +1,6 @@
 #include "src/codec/sha256_cooperative.h"
 #include "src/codec/tests/benchmark_buffer.h"
+#include "src/codec/tests/qualification_profile.h"
 #include "src/storage/format_size.h"
 #include "src/storage/tests/storage_format_fixture.h"
 #include "src/storage/tests/storage_large_fixture.h"
@@ -536,7 +537,7 @@ private:
               .checked_add(capacity_bound(
                 byte_count{pages_.capacity() * sizeof(fragmented_buffer)}))
               .value();
-        remaining_ = byte_count{63U << 20U}.checked_sub(retained).value();
+        remaining_ = codec::testing::residual.checked_sub(retained).value();
         fmt::print(
           "kwaque-storage-fixture-v1 scope={} codec={} bytes={} fragments={} "
           "retries={} pages={} cached_upper={} normalization=operations\n",
@@ -559,7 +560,7 @@ private:
     std::optional<sealed_footer> root_;
     codec::immutable_object_digest root_digest_{{}};
     codec::sha256_digest wire_digest_{};
-    byte_count remaining_{63U << 20U};
+    byte_count remaining_{codec::testing::residual};
     bool reported_{false};
 };
 template<

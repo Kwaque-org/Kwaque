@@ -64,11 +64,14 @@ result<void> validate_fault_decision(
     if (!(**descriptor).permitted_actions.contains(decision.action())) {
         return failure(fault_error(errc::invalid_argument));
     }
+    // File writes must exercise zero native progress through their owner. A
+    // zero short-operation cap remains invalid for reads and network I/O.
     if (
       (decision.action() == fault_action::delay
        && decision.delay()->nanoseconds() == 0)
       || (decision.action() == fault_action::short_operation
-          && decision.short_operation_bytes()->value() == 0)) {
+          && decision.short_operation_bytes()->value() == 0
+          && (**descriptor).point != builtin_fault_point::file_write)) {
         return failure(fault_error(errc::invalid_argument));
     }
     return {};
