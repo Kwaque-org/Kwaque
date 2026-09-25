@@ -1,10 +1,8 @@
 #include "src/codec/framing_internal.h"
 
 #include "src/base/error.h"
-#include "src/base/invariant.h"
 #include "src/codec/transaction.h"
 
-#include <seastar/core/coroutine.hh>
 #include <seastar/core/deleter.hh>
 
 #include <array>
@@ -42,46 +40,6 @@ result<void> admit_usage(
             remaining.error(), context, context.origin));
     }
     return {};
-}
-
-// A slice does not allocate its backing again. Gate the same conservative
-// descriptor request used by slice_allocation_cost, plus native promotion;
-// its aggregate descriptor peak is charged separately to operation usage.
-result<byte_count> admit_alias_allocations(
-  const bytes::buffer_allocation_cost& cost,
-  const limits& policy,
-  bytes::allocation_charge_fn charge,
-  field_context context) {
-    if (cost.fragments.value() == 0) {
-        return byte_count{};
-    }
-    KWAQUE_INVARIANT(
-      invariant_id{"KQ-FRAMING-WRITER-FRAGMENTS"},
-      cost.fragments.value() <= bytes::max_buffer_fragments,
-      "checksum alias exceeds the substrate fragment ceiling");
-    const std::array requests{
-      byte_count{
-        2U * cost.fragments.value()
-        * fragmented_buffer::fragment_descriptor_size()},
-      byte_count{sizeof(seastar::free_deleter_impl)}};
-    std::array<byte_count, requests.size()> served{};
-    for (std::size_t index = 0; index < requests.size(); ++index) {
-        served[index] = charge(requests[index]);
-        if (served[index] < requests[index]) {
-            return codec::failure(
-              encode_error(errc::invalid_argument, context));
-        }
-        if (auto valid = policy.validate_allocation(served[index]); !valid) {
-            return codec::failure(
-              detail::allocation_cost_error(
-                valid.error(), context, context.origin));
-        }
-    }
-    const auto peak = served[0].checked_add(served[0]);
-    if (!peak) {
-        return codec::failure(encode_error(errc::out_of_range, context));
-    }
-    return *peak;
 }
 
 // copy_of(prefix_bytes) uses one native temporary_buffer allocation and one

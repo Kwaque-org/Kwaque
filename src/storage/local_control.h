@@ -8,6 +8,8 @@
 namespace kwaque::storage {
 template<runtime::file_system_backend Backend, local_directory_owner Owner>
 class local_id_allocator;
+template<runtime::file_system_backend Backend, typename Owner>
+class wal_writer;
 struct local_control_snapshot final {
     local_publication_generation generation;
     local_shard_control fields;
@@ -162,7 +164,7 @@ public:
         assert_current();
         KWAQUE_INVARIANT(
           invariant_id{"KQ-CONTROL-DRAINED"},
-          closed_ && !id_allocator_active_,
+          closed_ && !id_allocator_active_ && !wal_writer_active_,
           "control owner destroyed before joined close and allocator release");
     }
     [[nodiscard]] runtime::result<local_control_snapshot> snapshot() const {
@@ -209,6 +211,8 @@ public:
         auto reject = [](runtime::operation_error error) {
             local_publication_outcome result;
             result.failure.observe(error);
+            result.admission_rejected = detail::publication_admission_pressure(
+              error);
             return seastar::make_ready_future<local_publication_outcome>(
               std::move(result));
         };
@@ -233,6 +237,8 @@ public:
     [[nodiscard]] seastar::future<runtime::result<void>> close() {
         assert_current();
         if (closed_) co_return runtime::result<void>{};
+        if (wal_writer_active_)
+            co_return runtime::failure(detail::path_error(errc::queue_full));
         if (closing_)
             co_return runtime::failure(
               runtime::make_file_error(
@@ -251,6 +257,7 @@ public:
 
 private:
     friend class local_id_allocator<Backend, Owner>;
+    friend class wal_writer<Backend, Owner>;
     local_control_owner(
       Backend& files,
       Owner& owner,
@@ -403,6 +410,7 @@ private:
     local_file_publisher<Backend> publisher_;
     seastar::gate operations_;
     bool id_allocator_active_{false};
+    bool wal_writer_active_{false};
     bool busy_{false}, closing_{false}, closed_{false}, fenced_{false};
 };
 } // namespace kwaque::storage

@@ -64,6 +64,30 @@ class FormatFixtureTest(unittest.TestCase):
                     verifier.crc32c(data[cut:], verifier.crc32c(data[:cut])), value
                 )
 
+    def test_crc_packet_known_answer_and_three_part_slicing(self):
+        data = bytes.fromhex(
+            "01c000000000000000000000"
+            "000000001400000000000400"
+            "000000140000001828000000"
+            "000000000200000000000000"
+        )
+        self.assertEqual(verifier.crc32c(data), 0xD9963A56)
+        for first in range(len(data)):
+            for second in range(first + 1, len(data) + 1):
+                crc = 0
+                if first > 0:
+                    crc = verifier.crc32c(data[:first], crc)
+                crc = verifier.crc32c(data[first:second], crc)
+                if second < len(data):
+                    crc = verifier.crc32c(data[second:], crc)
+                self.assertEqual(crc, 0xD9963A56)
+
+    def test_crc_continuation_matches_concatenation(self):
+        self.assertEqual(
+            verifier.crc32c(b"hello world"),
+            verifier.crc32c(b"world", verifier.crc32c(b"hello ")),
+        )
+
     def test_literal_lz4_checksums_use_the_short_native_hash_domain(self):
         self.assertEqual(verifier.xxh32_short(b""), 0x02CC5D05)
         self.assertEqual(verifier.xxh32_short(b"abc"), 0x32D153FF)

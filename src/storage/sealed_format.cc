@@ -346,54 +346,22 @@ seastar::future<codec::result<encoded_sealed_footer>> encode_sealed_footer(
     store<224>(fixed, static_cast<std::uint32_t>(refs.size()));
     store<228>(
       fixed, static_cast<std::uint32_t>(layout->padding_bytes().value()));
-    bytes::fragmented_buffer tail, output;
-    std::optional<codec::immutable_object_digest> digest;
-    std::optional<codec::error> failed;
-    std::exception_ptr exception;
-    try {
-        do {
-            auto entries = co_await detail::encode_entries<48>(
-              refs, detail::write_page_ref, work, remaining, charge, c);
-            if (!entries) {
-                failed = entries.error();
-                break;
-            }
-            tail = std::move(*entries);
-            auto encoded = co_await detail::encode_padded(
-              fixed,
-              std::move(tail),
-              *layout,
-              detail::sealed_family,
-              work,
-              remaining,
-              charge,
-              c);
-            if (!encoded) {
-                failed = encoded.error();
-                break;
-            }
-            output = std::move(*encoded);
-            const auto hash = co_await detail::hash_exact(output, work, c);
-            if (!hash) {
-                failed = hash.error();
-                break;
-            }
-            digest = *hash;
-        } while (false);
-    } catch (...) {
-        exception = std::current_exception();
-    }
-    co_await work.drain_inline(work.byte_quantum(), work.item_quantum());
-    tail = bytes::fragmented_buffer{};
-    if (!failed && !exception) {
-        if (auto ready = work.poll(anchor); !ready) failed = ready.error();
-    }
-    if (failed || exception) {
+    auto output = co_await detail::encode_page_object<48>(
+      fixed,
+      refs,
+      detail::write_page_ref,
+      *layout,
+      detail::sealed_family,
+      work,
+      remaining,
+      charge,
+      c);
+    if (!output) co_return codec::failure(output.error());
+    if (auto ready = work.poll(anchor); !ready) {
         co_await work.drain_inline(work.byte_quantum(), work.item_quantum());
-        output = bytes::fragmented_buffer{};
-        if (exception) std::rethrow_exception(exception);
-        co_return codec::failure(*failed);
+        output->bytes = bytes::fragmented_buffer{};
+        co_return codec::failure(ready.error());
     }
-    co_return encoded_sealed_footer{std::move(output), *digest};
+    co_return encoded_sealed_footer{std::move(output->bytes), output->digest};
 }
 } // namespace kwaque::storage

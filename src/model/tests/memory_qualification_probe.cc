@@ -2,19 +2,23 @@
 #include "src/base/units.h"
 #include "src/bytes/fragmented_buffer.h"
 #include "src/bytes/fragmented_buffer_parser.h"
+#include "src/codec/collection.h"
 #include "src/codec/cooperative.h"
 #include "src/codec/error.h"
 #include "src/codec/tests/allocation_observer.h"
 #include "src/codec/tests/benchmark_buffer.h"
 #include "src/codec/tests/memory_qualification_support.h"
+#include "src/codec/tests/prepared_abort_source.h"
 #include "src/codec/transaction.h"
 #include "src/compression/compression.h"
 #include "src/model/batch_builder.h"
 #include "src/model/batch_codec.h"
 #include "src/model/batch_rewrite.h"
+#include "src/model/checkpoint_codec.h"
 #include "src/model/fingerprint.h"
 #include "src/model/record_codec.h"
 #include "src/model/record_scan.h"
+#include "src/model/tests/checkpoint_test_support.h"
 #include "src/model/tests/model_bench_fixture.h"
 #include "src/runtime/time.h"
 
@@ -24,15 +28,18 @@
 
 #include <boost/program_options.hpp>
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <exception>
 #include <lz4.h>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <string_view>
 #include <utility>
+#include <vector>
 
 namespace {
 namespace codec = kwaque::codec;
@@ -50,22 +57,7 @@ using observation::require;
 using observation::retained_cost;
 constexpr byte_count maximum{8U << 20U};
 
-// Construct cancellation's exception before observation. The native abort
-// source obtains its default exception even when an exception is supplied to
-// request_abort_ex(), so use its explicit customization point.
-class prepared_abort_source final : public seastar::abort_source {
-public:
-    prepared_abort_source()
-      : exception_(
-          std::make_exception_ptr(seastar::abort_requested_exception{})) {}
-
-    std::exception_ptr get_default_exception() const noexcept final {
-        return exception_;
-    }
-
-private:
-    std::exception_ptr exception_;
-};
+using observation::prepared_abort_source;
 
 // The returned charge is unchanged. Only these isolated cancellation cases
 // request abort at a reached accounting boundary, without another task or an
@@ -425,6 +417,299 @@ void lz4_operation(std::string_view scenario) {
       "LZ4 changed payload bytes");
 }
 
+void checkpoint_operation(std::string_view scenario) {
+    namespace fixture = model::testing::checkpoint_fixture;
+    using source_type = seastar::chunked_fifo<model::range_cursor, 16>;
+    const bool unordered = scenario.starts_with("checkpoint-unordered-");
+    const bool sorted = scenario.starts_with("checkpoint-sorted-");
+    const bool cancel = scenario.ends_with("-abort");
+    const bool duplicate = scenario.ends_with("-duplicate");
+    const bool over = scenario.ends_with("-4097");
+    const bool partial = scenario.ends_with("-partial");
+    const bool free_chunks = scenario.ends_with("-free-chunks");
+    const std::uint32_t count = over ? 4097U : 4096U;
+    auto policy = codec::limits_config{};
+    if (scenario.ends_with("-count-limit"))
+        policy.max_checkpoint_cursors = item_count{4095};
+    if (scenario.ends_with("-object-limit"))
+        policy.max_object_entries = item_count{4095};
+    if (scenario.ends_with("-allocation-limit"))
+        policy.max_allocation_bytes = byte_count{1};
+    if (scenario.ends_with("-scratch-limit"))
+        policy.max_scratch_bytes = byte_count{1};
+    if (scenario.ends_with("-work-limit"))
+        policy.max_work_items = item_count{1};
+    std::optional<prepared_abort_source> abort;
+    const auto abort_cost = observation::observe_setup(
+      [&] { abort.emplace(); });
+    codec::cooperative_work work{codec::limits::make(policy).value(), *abort};
+    abort_point point{*abort, 1};
+    const auto charge_of = [](std::uint64_t bytes) {
+        return bench::capacity_bound(byte_count{bytes});
+    };
+    const auto budget_for = [&](
+                              byte_count other,
+                              byte_count held_metadata = byte_count{}) {
+        auto budget = memory(observation::residual.checked_sub(other).value());
+        budget.metadata_remaining
+          = budget.metadata_remaining.checked_sub(held_metadata).value();
+        if (scenario.ends_with("-metadata-pressure"))
+            budget.metadata_remaining = {};
+        if (scenario.ends_with("-operation-pressure"))
+            budget.operation_remaining = {};
+        return budget;
+    };
+    const bool denied = over || scenario.ends_with("-limit")
+                        || scenario.ends_with("-pressure");
+    const auto check_failure = [&](const auto& result) {
+        const auto code = cancel        ? errc::aborted
+                          : free_chunks ? errc::invalid_argument
+                          : duplicate   ? errc::malformed_data
+                                        : errc::resource_exhausted;
+        require(
+          !result && result.error().code() == code,
+          "checkpoint rejection changed category");
+        require(
+          !cancel || point.fired, "checkpoint abort boundary was not reached");
+    };
+    if (sorted || unordered) {
+        if (unordered) {
+            source_type source;
+            if (free_chunks) source.reserve(count + 32U);
+            // A popped leading slot leaves a partial first native chunk without
+            // creating a cached free chunk; reverse order exercises run
+            // merging.
+            if (partial) source.push_back(fixture::numbered(count + 1U));
+            for (std::uint32_t i = count; i != 0; --i)
+                source.push_back(
+                  fixture::numbered(duplicate && i == 1 ? count : i));
+            if (partial) source.pop_front();
+            const auto chunks = (source.size() + 15U) / 16U + 1U
+                                + source.nfree_chunks();
+            const auto held
+              = abort_cost
+                  .checked_add(
+                    byte_count{
+                      chunks
+                      * charge_of(
+                          codec::detail::
+                            collection_chunk_bytes<model::range_cursor, 16>())
+                          .value()})
+                  .value();
+            auto budget = budget_for(
+              abort_cost); // The owning API includes source chunks.
+            codec::result<model::constructed_read_checkpoint> result
+              = codec::failure(codec::error{errc::invalid_argument});
+            {
+                arm_abort armed{cancel ? &point : nullptr};
+                result = measure(scenario, count * 24U, held, [&] {
+                    return model::make_read_checkpoint_from_unordered(
+                             fixture::topic(), std::move(source), budget, work)
+                      .get();
+                });
+            }
+            if (denied || cancel || duplicate || free_chunks)
+                check_failure(result);
+            else {
+                require(
+                  result && result->value.cursors().size() == count,
+                  "unordered checkpoint lost entries");
+                for (std::uint32_t i = 0; i < count; ++i)
+                    require(
+                      result->value.cursors()[i] == fixture::numbered(i + 1U),
+                      "unordered checkpoint changed canonical order");
+            }
+            // Both native moves and pretransfer rejection leave an inspectable
+            // FIFO. Only unsupported cleanup/free chunks retain the donor.
+            // NOLINTBEGIN(bugprone-use-after-move)
+            require(
+              source.size()
+                == (free_chunks || scenario.ends_with("-work-limit") ? count : 0U),
+              "unordered checkpoint donor boundary changed");
+            // NOLINTEND(bugprone-use-after-move)
+            if (result) {
+                const auto retained = charge_of(
+                  result->value.cursor_capacity().value()
+                  * sizeof(model::range_cursor));
+                require(
+                  result->remaining.operation_remaining
+                      == budget.operation_remaining.checked_sub(retained)
+                           .value()
+                    && result->remaining.metadata_remaining
+                         == budget.metadata_remaining.checked_sub(retained)
+                              .value(),
+                  "unordered checkpoint refunded persistent metadata");
+            }
+            return;
+        }
+        std::vector<model::range_cursor> entries;
+        entries.reserve(count);
+        for (std::uint32_t i = 1; i <= count; ++i)
+            entries.push_back(fixture::numbered(i));
+        if (duplicate) entries.back() = entries.front();
+        const auto held = abort_cost
+                            .checked_add(charge_of(
+                              entries.capacity() * sizeof(model::range_cursor)))
+                            .value();
+        auto budget = budget_for(
+          held, charge_of(entries.capacity() * sizeof(model::range_cursor)));
+        const auto result = [&] {
+            arm_abort armed{cancel ? &point : nullptr};
+            return measure(scenario, count * 24U, held, [&] {
+                return model::make_read_checkpoint(
+                         fixture::topic(), entries, budget, work)
+                  .get();
+            });
+        }();
+        if (denied || cancel || duplicate)
+            check_failure(result);
+        else {
+            require(
+              result && std::ranges::equal(result->value.cursors(), entries),
+              "sorted checkpoint changed entries");
+            const auto retained = charge_of(
+              result->value.cursor_capacity().value()
+              * sizeof(model::range_cursor));
+            require(
+              result->remaining.operation_remaining
+                  == budget.operation_remaining.checked_sub(retained).value()
+                && result->remaining.metadata_remaining
+                     == budget.metadata_remaining.checked_sub(retained).value(),
+              "sorted checkpoint residual lost its vector charge");
+        }
+        return;
+    }
+    const std::size_t header = scenario.contains("h4096") ? 4096U
+                               : scenario.contains("h41") ? 41U
+                                                          : 32U;
+    auto wire = fixture::wire(count, header);
+    const auto expected = fixture::digest(
+      std::string_view{wire}.substr(header));
+    auto other
+      = abort_cost.checked_add(charge_of(wire.capacity() + 1U)).value();
+    if (scenario.starts_with("checkpoint-decode-")) {
+        if (duplicate) {
+            wire.replace(header + 44U, 16, wire.substr(header + 20U, 16));
+            fixture::repair(wire, header);
+        }
+        if (scenario.ends_with("-corrupt")) wire.back() ^= 1;
+        auto topic = scenario.ends_with("-wrong-topic")
+                       ? fixture::object<model::topic_id>(2)
+                       : fixture::topic();
+        if (scenario.ends_with("-byte-limit")) {
+            policy.max_checkpoint_bytes = byte_count{wire.size() - 1U};
+        }
+        codec::cooperative_work decode_work{
+          codec::limits::make(policy).value(), *abort};
+        auto source = fixture::fragmented(wire, 128);
+        const auto held = other.checked_add(retained_cost(source)).value();
+        fragmented_buffer_parser input{std::move(source)};
+        input.push_checkpoint().value();
+        // Input admission uses a valid setup policy before applying the tested
+        // narrower codec limit; no source backing is reserved twice.
+        auto budget = codec::reserve_decode_input(
+                        input,
+                        codec::limits::defaults(),
+                        memory(
+                          observation::residual.checked_sub(other).value()))
+                        .value();
+        if (scenario.ends_with("-metadata-pressure"))
+            budget.metadata_remaining = {};
+        if (scenario.ends_with("-operation-pressure"))
+            budget.operation_remaining = {};
+        auto result = [&] {
+            arm_abort armed{cancel ? &point : nullptr};
+            return measure(scenario, wire.size(), held, [&] {
+                return model::decode_read_checkpoint(
+                         input, topic, budget, decode_work)
+                  .get();
+            });
+        }();
+        if (
+          scenario.ends_with("-corrupt")
+          || scenario.ends_with("-wrong-topic")) {
+            require(
+              !result
+                && result.error().code()
+                     == (scenario.ends_with("-corrupt") ? errc::corrupt_data : errc::wrong_context),
+              "checkpoint decode lost integrity/context checks");
+        } else if (denied || cancel || duplicate)
+            check_failure(result);
+        else
+            require(
+              result && input.at_end() && result->fingerprint == expected
+                && fixture::body_from_value(result->value)
+                     == std::string_view{wire}.substr(header),
+              "checkpoint decode changed canonical value");
+        require(
+          input.checkpoint_depth() == 1
+            && (result || input.bytes_consumed() == byte_count{}),
+          "checkpoint decode changed caller marks");
+        if (result) {
+            const auto retained = charge_of(
+              result->value.cursor_capacity().value()
+              * sizeof(model::range_cursor));
+            require(
+              result->remaining.operation_remaining
+                  == budget.operation_remaining.checked_sub(retained).value()
+                && result->remaining.metadata_remaining
+                     == budget.metadata_remaining.checked_sub(retained).value(),
+              "checkpoint decode residual changed");
+        }
+        return;
+    }
+    seastar::abort_source setup_abort;
+    codec::cooperative_work setup{codec::limits::defaults(), setup_abort};
+    auto value = [&] {
+        fragmented_buffer_parser input{fixture::fragmented(wire, 4096)};
+        auto decoded = model::decode_read_checkpoint(
+                         input,
+                         fixture::topic(),
+                         codec::reserve_decode_input(
+                           input,
+                           setup.policy(),
+                           memory(
+                             observation::residual.checked_sub(other).value()))
+                           .value(),
+                         setup)
+                         .get();
+        require(
+          decoded && input.at_end(),
+          "checkpoint fixture did not decode completely");
+        return std::move(decoded->value);
+    }();
+    other = other
+              .checked_add(charge_of(
+                value.cursor_capacity().value() * sizeof(model::range_cursor)))
+              .value();
+    if (scenario == "checkpoint-fingerprint-4096") {
+        const auto result = measure(scenario, wire.size() - header, other, [&] {
+            return model::compute_checkpoint_fingerprint(value, work).get();
+        });
+        require(
+          result && *result == expected, "checkpoint fingerprint changed");
+    } else {
+        const auto result = [&] {
+            arm_abort armed{cancel ? &point : nullptr};
+            return measure(scenario, wire.size(), other, [&] {
+                return model::encode_read_checkpoint(
+                         value,
+                         work,
+                         budget_for(other).operation_remaining,
+                         observed_charge)
+                  .get();
+            });
+        }();
+        if (denied || cancel)
+            check_failure(result);
+        else
+            require(
+              result && result->fingerprint == expected
+                && result->bytes.content_equals(wire),
+              "checkpoint encoding changed bytes");
+    }
+}
+
 int exercise(std::string_view scenario) {
     observation::report_profile();
     std::printf("compiler=%s\n", __clang_version__);
@@ -438,6 +723,8 @@ int exercise(std::string_view scenario) {
         batch_operation(scenario);
     else if (scenario.starts_with("lz4-"))
         lz4_operation(scenario);
+    else if (scenario.starts_with("checkpoint-"))
+        checkpoint_operation(scenario);
     else
         throw std::invalid_argument("unknown memory qualification scenario");
     std::puts("status=ok");

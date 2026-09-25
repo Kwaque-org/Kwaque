@@ -151,6 +151,199 @@ class ClangTidySelectionTest(unittest.TestCase):
                 select_files(entries, requested, production)
 
 
+class PartitionedAnalysisTest(unittest.TestCase):
+    def entries(self, root: Path) -> list[dict]:
+        return [
+            {
+                "directory": str(root),
+                "file": source,
+                "arguments": ["clang", define, "-c", source],
+            }
+            for source, define in (
+                ("src/model/record.cc", "-DPRODUCTION"),
+                ("src/model/record.cc", "-DTEST_VARIANT"),
+                ("src/model/record_test.cc", "-DTEST"),
+            )
+        ]
+
+    def test_partition_keeps_other_compile_variants_of_production_files(self) -> None:
+        entries = self.entries(Path("/workspace"))
+        production = entries[:1]
+        remaining = driver.remaining_commands(entries, production)
+        self.assertEqual(remaining, entries[1:])
+        self.assertEqual(
+            {driver.command_key(entry) for entry in remaining + production},
+            {driver.command_key(entry) for entry in entries},
+        )
+        for stale in (
+            [],
+            [{**production[0], "arguments": ["clang", "-DSTALE"]}],
+            [{**production[0], "directory": "/other-workspace"}],
+        ):
+            with self.subTest(stale=stale), self.assertRaisesRegex(ValueError, "stale"):
+                driver.remaining_commands(entries, stale)
+
+    def test_both_passes_run_and_propagate_failures_without_changing_databases(self):
+        for requested in ([], ["src/model/record.cc"]):
+            for failures in ((7, 0), (0, 9), (0, 0)):
+                with self.subTest(requested=requested, failures=failures):
+                    with tempfile.TemporaryDirectory() as temporary:
+                        root = Path(temporary)
+                        entries = self.entries(root)
+                        database = root / "compile_commands.json"
+                        strict = (
+                            root / driver.PRODUCTION_DATABASE_DIRECTORY / database.name
+                        )
+                        strict.parent.mkdir(parents=True)
+                        database.write_text(json.dumps(entries))
+                        strict.write_text(json.dumps(entries[:1]))
+                        before = (database.read_bytes(), strict.read_bytes())
+                        seen = []
+
+                        def run(command, **kwargs):
+                            path = Path(
+                                next(
+                                    arg[3:] for arg in command if arg.startswith("-p=")
+                                )
+                            )
+                            seen.append(
+                                (
+                                    command,
+                                    json.loads((path / database.name).read_text()),
+                                )
+                            )
+                            self.assertEqual(kwargs["cwd"], root)
+                            return mock.Mock(returncode=failures[len(seen) - 1])
+
+                        with (
+                            mock.patch.object(
+                                driver, "workspace_root", return_value=root
+                            ),
+                            mock.patch.object(
+                                driver,
+                                "production_targets",
+                                return_value={
+                                    "//src/model:record": {"src/model/record.cc"}
+                                },
+                            ),
+                            mock.patch.object(
+                                driver.subprocess, "run", side_effect=run
+                            ),
+                            mock.patch.object(
+                                sys,
+                                "argv",
+                                [
+                                    "clang_tidy",
+                                    "--tool=/tidy",
+                                    "--runner=/runner",
+                                    "--config=.clang-tidy",
+                                    "--production-config=.clang-tidy-strict",
+                                    *requested,
+                                ],
+                            ),
+                        ):
+                            self.assertEqual(driver.main(), failures[0] or failures[1])
+                        self.assertEqual(len(seen), 2)
+                        self.assertEqual(
+                            seen[0][1], entries[1:2] if requested else entries[1:]
+                        )
+                        self.assertEqual(seen[1][1], entries[:1])
+                        self.assertIn(
+                            f"-config-file={root / '.clang-tidy-strict'}", seen[1][0]
+                        )
+                        self.assertEqual(
+                            (database.read_bytes(), strict.read_bytes()), before
+                        )
+
+    def test_production_checks_cover_the_baseline_checks_and_headers(self):
+        root = Path(__file__).resolve().parents[1]
+        ordinary = (root / ".clang-tidy").read_text()
+        strict = (root / ".clang-tidy-strict").read_text()
+
+        def checks(text):
+            section = text.split("Checks: >-\n", 1)[1].split("WarningsAsErrors:", 1)[0]
+            return {value.strip() for value in section.split(",")}
+
+        ordinary_checks, strict_checks = checks(ordinary), checks(strict)
+        self.assertLessEqual(
+            {value for value in ordinary_checks if not value.startswith("-")},
+            strict_checks,
+        )
+        self.assertLessEqual(
+            {value for value in strict_checks if value.startswith("-")},
+            ordinary_checks,
+        )
+        for field in ("HeaderFilterRegex", "ExcludeHeaderFilterRegex"):
+            self.assertEqual(
+                re.search(rf"^{field}:.*$", ordinary, re.MULTILINE)[0],
+                re.search(rf"^{field}:.*$", strict, re.MULTILINE)[0],
+            )
+        self.assertIn("WarningsAsErrors: '*'", strict)
+
+    @unittest.skipUnless(
+        os.environ.get("KWAQUE_TEST_TIDY_RUNNER"),
+        "native runner supplied by the Bazel test target",
+    )
+    def test_native_runner_reads_each_partition_without_repeating_commands(self):
+        runner = driver.resolve_runfile(os.environ["KWAQUE_TEST_TIDY_RUNNER"])
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            entries = self.entries(root)
+            (root / "compile_commands.json").write_text(json.dumps(entries))
+            strict = root / driver.PRODUCTION_DATABASE_DIRECTORY
+            strict.mkdir(parents=True)
+            (strict / "compile_commands.json").write_text(json.dumps(entries[:1]))
+            fake = root / "fake-clang-tidy"
+            write_python_executable(
+                fake,
+                textwrap.dedent("""\
+                import json, pathlib, sys
+                if '-list-checks' in sys.argv:
+                    sys.exit(0)
+                database = pathlib.Path(next(arg[3:] for arg in sys.argv if arg.startswith('-p=')))
+                entries = json.loads((database / 'compile_commands.json').read_text())
+                source = pathlib.Path(sys.argv[-1])
+                with pathlib.Path('observed.jsonl').open('a') as output:
+                    for entry in entries:
+                        if pathlib.Path(entry['directory']) / entry['file'] == source:
+                            output.write(json.dumps([database.name, entry]) + '\\n')
+                """),
+            )
+            for name in (".clang-tidy", ".clang-tidy-strict"):
+                (root / name).write_text("Checks: '*'\n")
+            with (
+                mock.patch.object(driver, "workspace_root", return_value=root),
+                mock.patch.object(
+                    driver,
+                    "production_targets",
+                    return_value={"//src/model:record": {"src/model/record.cc"}},
+                ),
+                mock.patch.object(
+                    sys,
+                    "argv",
+                    [
+                        "clang_tidy",
+                        f"--tool={fake}",
+                        f"--runner={runner}",
+                        "--config=.clang-tidy",
+                        "--production-config=.clang-tidy-strict",
+                    ],
+                ),
+            ):
+                self.assertEqual(driver.main(), 0)
+            observed = [
+                json.loads(line)
+                for line in (root / "observed.jsonl").read_text().splitlines()
+            ]
+            self.assertCountEqual(
+                observed,
+                [
+                    ["production", entries[0]],
+                    *[["ordinary", entry] for entry in entries[1:]],
+                ],
+            )
+
+
 class NativeParallelRunnerTest(unittest.TestCase):
     def test_fixture_handles_long_quoted_interpreter_and_script_paths(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

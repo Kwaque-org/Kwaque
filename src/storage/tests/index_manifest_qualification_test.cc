@@ -1,3 +1,4 @@
+#include "src/codec/tests/qualification_profile.h"
 #include "src/storage/tests/range_manifest_test_support.h"
 #include "src/storage/tests/sparse_index_test_support.h"
 
@@ -34,7 +35,7 @@ codec::decode_budget memory_for(
     const auto available
       = codec::detail::consume_decode_budget(
           work.policy(),
-          {byte_count{63U << 20U}, byte_count{1U << 20U}, charge},
+          {codec::testing::residual, byte_count{1U << 20U}, charge},
           charge(byte_count{wire.capacity() + 1U}),
           metadata,
           {},
@@ -52,7 +53,7 @@ byte_count writer_memory(
       .remaining_operation_bytes(
         {.retained_input = charge(byte_count{wire.capacity() + 1U}),
          .decoded_metadata = metadata},
-        byte_count{63U << 20U})
+        codec::testing::residual)
       .value();
 }
 template<typename Page>

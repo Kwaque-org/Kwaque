@@ -11,6 +11,7 @@
 #include <seastar/util/defer.hh>
 
 #include <algorithm>
+#include <array>
 #include <bit>
 #include <cstdint>
 #include <cstring>
@@ -133,6 +134,19 @@ is_aligned(const void* address, std::uint64_t alignment) noexcept {
       alignment);
 }
 
+std::uint32_t write_window(
+  std::uint64_t length,
+  std::uint64_t chunk,
+  std::uint64_t memory_alignment,
+  std::uint32_t concurrency,
+  byte_count buffer_limit) noexcept {
+    const auto allocation = std::bit_ceil(round_up(chunk, memory_alignment));
+    return static_cast<std::uint32_t>(std::min<std::uint64_t>(
+      {concurrency,
+       1 + (length - 1) / chunk,
+       buffer_limit.value() / (2 * allocation)}));
+}
+
 struct native_bulk_read_request final {
     std::size_t bytes;
     byte_count retained_bytes;
@@ -178,6 +192,32 @@ stage_aligned_write(
 }
 
 } // namespace
+
+file_write_buffer_layout file_geometry::write_buffers(
+  file_position position, byte_count length) const noexcept {
+    if (length.value() == 0) return {byte_count{}, 0};
+    const auto chunk = append_chunk_.value();
+    const auto memory = std::max<std::uint64_t>(memory_.value(), sizeof(void*));
+    const bool aligned = is_aligned(position.value(), write_.value())
+                         && is_aligned(length.value(), write_.value());
+    auto allocation = std::bit_ceil(
+      round_up(std::min(length.value(), chunk), memory));
+    if (!aligned)
+        allocation = std::max(
+          {allocation,
+           read_.value(),
+           write_.value(),
+           overwrite_.value(),
+           memory});
+    const auto count = aligned ? write_window(
+                                   length.value(),
+                                   chunk,
+                                   memory,
+                                   write_concurrency_,
+                                   write_buffer_limit_)
+                               : 1U;
+    return {byte_count{allocation}, 2 * count};
+}
 
 bool file_geometry::supports_disk_alignment(
   byte_count alignment) const noexcept {
@@ -305,12 +345,33 @@ public:
                 self.native_chunk_bytes_ = self.write_alignment_;
             }
 
+            if (
+              !self.size_known_
+              && self.total_bytes_ > self.native_chunk_bytes_) {
+                const auto count = write_window(
+                  self.total_bytes_,
+                  self.native_chunk_bytes_,
+                  self.memory_alignment_,
+                  self.owner_.limits_.write_concurrency,
+                  self.owner_.limits_.write_buffer_bytes);
+                if (count > 1) {
+                    auto outcome = co_await self.write_parallel(source, count);
+                    if (!outcome) co_return failure(outcome.error());
+                    self.metric_.add_completed_bytes(self.total_bytes_);
+                    co_return byte_count{self.total_bytes_};
+                }
+            }
+
             std::uint64_t position = self.initial_position_;
             std::uint64_t remaining = self.total_bytes_;
+            seastar::temporary_buffer<char> staging;
             while (remaining != 0) {
+                if (auto rejected = self.owner_.mutation_rejection(true))
+                    co_return failure(std::move(*rejected));
                 if (
                   !is_aligned(position, self.write_alignment_)
                   || remaining < self.write_alignment_) {
+                    staging = {};
                     const auto written = co_await self.write_partial_block(
                       source, position, remaining);
                     position += written;
@@ -328,8 +389,10 @@ public:
                 if (
                   direct_bytes != 0
                   && is_aligned(front.data(), self.memory_alignment_)) {
+                    staging = {};
                     auto fragment = source.take_front(
                       static_cast<std::size_t>(direct_bytes));
+                    ++self.native_submissions_;
                     const auto written
                       = co_await self.owner_.native_file_.dma_write(
                         position,
@@ -348,7 +411,9 @@ public:
                           fragment.size(),
                           written,
                           self.write_alignment_,
-                          self.memory_alignment_);
+                          self.memory_alignment_,
+                          nullptr,
+                          &self.native_submissions_);
                     }
                     position += direct_bytes;
                     remaining -= direct_bytes;
@@ -358,9 +423,14 @@ public:
 
                 const auto allocation = round_up(
                   transferable, self.memory_alignment_);
-                auto staging = seastar::temporary_buffer<char>::aligned(
-                  static_cast<std::size_t>(self.memory_alignment_),
-                  static_cast<std::size_t>(allocation));
+                // Serialized completion makes the previous staging storage
+                // reusable without retaining another DMA buffer.
+                if (staging.size() < allocation) {
+                    staging = {};
+                    staging = seastar::temporary_buffer<char>::aligned(
+                      static_cast<std::size_t>(self.memory_alignment_),
+                      static_cast<std::size_t>(allocation));
+                }
                 const auto staged = source.copy_front_to(
                   std::span<char>{
                     staging.get_write(),
@@ -370,6 +440,7 @@ public:
                   staged == transferable,
                   "fragmented write ended before its declared size");
                 const auto staged_size = static_cast<std::size_t>(transferable);
+                ++self.native_submissions_;
                 const auto written
                   = co_await self.owner_.native_file_.dma_write(
                     position,
@@ -388,13 +459,16 @@ public:
                       staged_size,
                       written,
                       self.write_alignment_,
-                      self.memory_alignment_);
+                      self.memory_alignment_,
+                      nullptr,
+                      &self.native_submissions_);
                 }
                 position += transferable;
                 remaining -= transferable;
                 self.physical_end_ = std::max(self.physical_end_, position);
             }
 
+            staging = {};
             KWAQUE_INVARIANT(
               file_consumption_invariant,
               self.data_.empty(),
@@ -405,8 +479,9 @@ public:
             self.metric_.add_completed_bytes(self.total_bytes_);
             co_return byte_count{self.total_bytes_};
         } catch (...) {
-            co_return failure(
-              self.owner_.remember_io_failure(std::current_exception()));
+            co_return failure(self.owner_.remember_io_failure(
+              std::current_exception(),
+              self.native_submissions_ > 1 || self.physical_end_ != 0));
         }
     }
 
@@ -425,6 +500,7 @@ public:
         static_cast<void>(data);
         static_cast<void>(serialization);
         const auto size = fragment.size();
+        std::uint64_t submissions = 1;
         try {
             co_await recover_short_write(
               owner,
@@ -433,16 +509,144 @@ public:
               size,
               completed,
               write_alignment,
-              memory_alignment);
+              memory_alignment,
+              nullptr,
+              &submissions);
             metric.add_completed_bytes(static_cast<std::uint64_t>(size));
             co_return byte_count{static_cast<std::uint64_t>(size)};
         } catch (...) {
-            co_return failure(
-              owner.remember_io_failure(std::current_exception()));
+            co_return failure(owner.remember_io_failure(
+              std::current_exception(), completed != 0 || submissions > 1));
         }
     }
 
 private:
+    void remember(first_failure& first, std::exception_ptr error) noexcept {
+        if (first.failed()) return;
+        try {
+            first.observe(owner_.remember_io_failure(
+              std::move(error), native_submissions_ > 1));
+        } catch (...) {
+            first.observe(std::current_exception());
+        }
+    }
+
+    seastar::future<> write_worker(
+      detail::fragmented_buffer_io_access::consumer& source,
+      std::uint64_t& next,
+      std::uint64_t& remaining,
+      first_failure& first) {
+        seastar::temporary_buffer<char> staging;
+        try {
+            while (remaining != 0 && !first.failed()) {
+                if (auto rejected = owner_.mutation_rejection(true)) {
+                    first.observe(std::move(*rejected));
+                    break;
+                }
+                const auto position = next;
+                const auto transferable = round_down(
+                  std::min(remaining, native_chunk_bytes_), write_alignment_);
+                const auto front = source.front();
+                const auto direct_bytes = round_down(
+                  std::min<std::uint64_t>(front.size(), transferable),
+                  write_alignment_);
+                seastar::temporary_buffer<char> direct;
+                const char* data;
+                std::size_t size;
+                if (
+                  direct_bytes && is_aligned(front.data(), memory_alignment_)) {
+                    staging = {};
+                    direct = source.take_front(
+                      static_cast<std::size_t>(direct_bytes));
+                    data = direct.get();
+                    size = direct.size();
+                } else {
+                    const auto allocation = std::bit_ceil(
+                      round_up(transferable, memory_alignment_));
+                    if (staging.size() < allocation) {
+                        staging = {};
+                        staging = seastar::temporary_buffer<char>::aligned(
+                          static_cast<std::size_t>(memory_alignment_),
+                          static_cast<std::size_t>(allocation));
+                    }
+                    size = static_cast<std::size_t>(transferable);
+                    const auto copied = source.copy_front_to(
+                      {staging.get_write(), size});
+                    KWAQUE_INVARIANT(
+                      file_consumption_invariant,
+                      copied == size,
+                      "fragmented write ended before its declared size");
+                    data = staging.get();
+                }
+                // Claim and consume a disjoint range before the first
+                // suspension.
+                next += size;
+                remaining -= size;
+                ++native_submissions_;
+                const auto written = co_await owner_.native_file_.dma_write(
+                  position, data, size, &owner_.io_intent_);
+                if (written == 0 || written > size)
+                    throw detail::file_operation_exception{make_file_error(
+                      errc::io_failure, file_failure_detail::unknown)};
+                if (written != size)
+                    co_await recover_short_write(
+                      owner_,
+                      position,
+                      data,
+                      size,
+                      written,
+                      write_alignment_,
+                      memory_alignment_,
+                      &first,
+                      &native_submissions_);
+            }
+        } catch (...) {
+            remember(first, std::current_exception());
+        }
+    }
+
+    seastar::future<result<void>> write_parallel(
+      detail::fragmented_buffer_io_access::consumer& source,
+      std::uint32_t count) {
+        // Fixed native futures bound both work and join state. No aggregation
+        // allocation is needed after a worker has started native I/O.
+        std::array<
+          std::optional<seastar::future<>>,
+          maximum_file_write_concurrency>
+          workers;
+        first_failure first;
+        auto next = initial_position_;
+        auto remaining = total_bytes_;
+        for (std::uint32_t i = 0; i < count && remaining && !first.failed();
+             ++i) {
+            try {
+                workers[i].emplace(
+                  write_worker(source, next, remaining, first));
+                if (workers[i]->available() && workers[i]->failed()) {
+                    remember(first, workers[i]->get_exception());
+                    workers[i].reset();
+                }
+            } catch (...) {
+                remember(first, std::current_exception());
+            }
+        }
+        for (auto& worker : workers) {
+            if (!worker) continue;
+            try {
+                co_await std::move(*worker);
+            } catch (...) {
+                remember(first, std::current_exception());
+            }
+            worker.reset();
+        }
+        if (auto outcome = first.outcome(); !outcome) co_return outcome;
+        KWAQUE_INVARIANT(
+          file_consumption_invariant,
+          remaining == 0 && data_.empty(),
+          "parallel file write retained bytes after completion");
+        co_return result<void>{};
+    }
+
     [[nodiscard]] static seastar::future<> recover_short_write(
       file& owner,
       std::uint64_t position,
@@ -450,12 +654,17 @@ private:
       std::size_t size,
       std::size_t completed,
       std::uint64_t write_alignment,
-      std::uint64_t memory_alignment) {
+      std::uint64_t memory_alignment,
+      const first_failure* stopped = nullptr,
+      std::uint64_t* submissions = nullptr) {
         if (completed > size) {
             throw detail::file_operation_exception{
               make_file_error(errc::io_failure, file_failure_detail::unknown)};
         }
         while (completed < size) {
+            if (stopped && stopped->failed()) co_return;
+            if (auto rejected = owner.mutation_rejection(true))
+                throw detail::file_operation_exception{std::move(*rejected)};
             const auto current_position
               = position + static_cast<std::uint64_t>(completed);
             const auto remaining = size - completed;
@@ -480,6 +689,7 @@ private:
                 submitted = realigned->get();
             }
 
+            if (submissions) ++*submissions;
             const auto written = co_await owner.native_file_.dma_write(
               current_position, submitted, remaining, &owner.io_intent_);
             if (written == 0 || written > remaining) {
@@ -528,6 +738,7 @@ private:
           file_consumption_invariant,
           copied == count,
           "fragmented write ended during read-modify-write");
+        ++native_submissions_;
         const auto written = co_await owner_.native_file_.dma_write(
           block_start, block.get(), block.size(), &owner_.io_intent_);
         if (written == 0 || written > block.size()) {
@@ -542,7 +753,9 @@ private:
               block.size(),
               written,
               write_alignment_,
-              memory_alignment_);
+              memory_alignment_,
+              nullptr,
+              &native_submissions_);
         }
         physical_end_ = std::max(physical_end_, block_start + rmw_alignment_);
         co_return count;
@@ -561,6 +774,7 @@ private:
     std::uint64_t write_alignment_{0};
     std::uint64_t rmw_alignment_{0};
     std::uint64_t native_chunk_bytes_{0};
+    std::uint64_t native_submissions_{0};
     bool size_known_{false};
 };
 
@@ -661,7 +875,7 @@ result<void> file_io_limits::validate() const noexcept {
     if (
       pending_read_bytes.value() == 0 || pending_reads == 0
       || pending_metadata_operations == 0 || queued_write_bytes.value() == 0
-      || queued_writes == 0) {
+      || queued_writes == 0 || write_concurrency == 0) {
         return failure(file_error(errc::invalid_argument));
     }
     if (
@@ -669,7 +883,10 @@ result<void> file_io_limits::validate() const noexcept {
       || queued_write_bytes > maximum_file_io_bytes
       || pending_reads > maximum_pending_file_reads
       || pending_metadata_operations > maximum_pending_file_metadata_operations
-      || queued_writes > maximum_queued_file_writes) {
+      || queued_writes > maximum_queued_file_writes
+      || write_concurrency > maximum_file_write_concurrency
+      || write_buffer_bytes.value() < 2 * maximum_contiguous_allocation_bytes
+      || write_buffer_bytes > maximum_file_write_buffer_bytes) {
         return failure(file_error(errc::out_of_range));
     }
     return {};
@@ -952,9 +1169,29 @@ operation_error file::remember_error(operation_error error) {
     return first_failure_.error().value_or(error);
 }
 
-operation_error file::remember_io_failure(std::exception_ptr exception) {
+operation_error file::remember_io_failure(
+  std::exception_ptr exception, bool prior_write_possible) {
     try {
-        return remember_error(file_error_from_exception(exception));
+        auto error = file_error_from_exception(exception);
+        if (
+          prior_write_possible
+          && file_detail(error)
+               == file_failure_detail::admission_not_dispatched) {
+            // A native request's rejection cannot describe earlier requests
+            // in the same logical write as undispatched. Retain its code and
+            // other diagnostics without inventing a device failure cause.
+            operation_error aggregate{error.code(), error.operation()};
+            for (std::size_t i = 0; i < error.context_size(); ++i) {
+                auto field = *error.context_at(i);
+                if (field.key == operation_context_key::detail)
+                    field.value = static_cast<std::uint8_t>(
+                      file_failure_detail::unknown);
+                static_cast<void>(
+                  aggregate.add_context(field.key, field.value));
+            }
+            error = std::move(aggregate);
+        }
+        return remember_error(std::move(error));
     } catch (...) {
         if (close_policy_ == file_close_policy::checked)
             first_failure_.observe(exception);
@@ -1423,6 +1660,31 @@ file_state file::state() const {
     return state_;
 }
 
+result<void> file::limit_write_allocation(byte_count maximum) noexcept {
+    owner_.assert_current();
+    if (auto rejected = operation_rejection()) return failure(*rejected);
+    if (!std::has_single_bit(maximum.value()))
+        return failure(file_error(errc::invalid_argument));
+    if (maximum.value() > maximum_contiguous_allocation_bytes)
+        return failure(file_error(errc::out_of_range));
+    if (
+      maximum.value() < std::max(
+        {memory_dma_alignment_,
+         disk_read_dma_alignment_,
+         disk_write_dma_alignment_,
+         disk_overwrite_dma_alignment_}))
+        return failure(file_error(errc::invalid_argument));
+    if (!move_is_idle(*this))
+        return failure(make_file_error(
+          errc::queue_full, file_failure_detail::admission_not_dispatched));
+    native_write_max_length_ = std::min(
+      native_write_max_length_, maximum.value());
+    append_chunk_limit_ = std::max(
+      round_down(native_write_max_length_, disk_write_dma_alignment_),
+      disk_write_dma_alignment_);
+    return {};
+}
+
 result<file_geometry> file::geometry() const noexcept {
     owner_.assert_current();
     if (auto rejected = operation_rejection()) return failure(*rejected);
@@ -1446,7 +1708,9 @@ result<file_geometry> file::geometry() const noexcept {
       byte_count{read_max},
       byte_count{write_max},
       byte_count{append_chunk_limit_},
-      limits_.pending_read_bytes};
+      limits_.pending_read_bytes,
+      limits_.write_concurrency,
+      limits_.write_buffer_bytes};
 }
 
 bool file::abort_requested() const {

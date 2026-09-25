@@ -6,6 +6,7 @@ import os
 import re
 import subprocess
 import sys
+import tempfile
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
@@ -117,6 +118,28 @@ def positive_jobs(value: str) -> int:
     return jobs
 
 
+def command_key(entry: dict) -> tuple:
+    arguments = entry.get("arguments")
+    if (
+        not isinstance(entry.get("file"), str)
+        or not isinstance(entry.get("directory"), str)
+        or not isinstance(arguments, list)
+        or not arguments
+        or not all(isinstance(argument, str) for argument in arguments)
+    ):
+        raise ValueError("compilation database contains an invalid command")
+    return entry["directory"], entry["file"], tuple(arguments)
+
+
+def remaining_commands(entries: list[dict], production: list[dict]) -> list[dict]:
+    """Remove only the exact commands that will receive production checks."""
+    ordinary_keys = {command_key(entry) for entry in entries}
+    production_keys = {command_key(entry) for entry in production}
+    if not production_keys or not production_keys <= ordinary_keys:
+        raise ValueError("production commands are stale; regenerate the database")
+    return [entry for entry in entries if command_key(entry) not in production_keys]
+
+
 def runner_command(
     runner: Path,
     tool: Path,
@@ -158,7 +181,12 @@ def main() -> int:
     parser.add_argument("--tool", required=True)
     parser.add_argument("--runner", required=True)
     parser.add_argument("--config", required=True)
-    parser.add_argument("--production-only", action="store_true")
+    scope = parser.add_mutually_exclusive_group()
+    scope.add_argument("--production-only", action="store_true")
+    scope.add_argument(
+        "--production-config",
+        help="check production commands with this config and other commands once",
+    )
     parser.add_argument(
         "--jobs",
         "-j",
@@ -185,6 +213,44 @@ def main() -> int:
         return 2
 
     entries = json.loads(database.read_text())
+    if arguments.production_config:
+        production_entries = json.loads(
+            (root / PRODUCTION_DATABASE_DIRECTORY / "compile_commands.json").read_text()
+        )
+        # Validate the complete partition before launching either pass. Select
+        # by command, not filename: tests may compile production files differently.
+        ordinary_entries = remaining_commands(entries, production_entries)
+        select_files(
+            production_entries, [], set().union(*production_targets(root).values())
+        )
+        selected = set(select_files(entries, arguments.files, None))
+        result = 0
+        with tempfile.TemporaryDirectory(prefix="kwaque-tidy-") as temporary:
+            for name, commands, config in (
+                ("ordinary", ordinary_entries, arguments.config),
+                ("production", production_entries, arguments.production_config),
+            ):
+                commands = [entry for entry in commands if entry["file"] in selected]
+                if not commands:
+                    continue
+                partition = Path(temporary) / name
+                partition.mkdir()
+                (partition / "compile_commands.json").write_text(json.dumps(commands))
+                command = runner_command(
+                    resolve_runfile(arguments.runner),
+                    resolve_runfile(arguments.tool),
+                    root / config,
+                    partition,
+                    commands,
+                    sorted({entry["file"] for entry in commands}),
+                    arguments.jobs,
+                    arguments.profile,
+                )
+                completed = subprocess.run(command, cwd=root, check=False)
+                # Still report production diagnostics if ordinary checks fail.
+                result = result or completed.returncode
+        return result
+
     selected = select_files(
         entries,
         arguments.files,

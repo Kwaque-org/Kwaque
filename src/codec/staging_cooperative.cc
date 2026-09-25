@@ -6,13 +6,13 @@
 #include "src/codec/transaction.h"
 
 #include <seastar/core/coroutine.hh>
-#include <seastar/coroutine/maybe_yield.hh>
 
+#include <array>
 #include <cstdint>
 #include <exception>
 #include <limits>
-#include <memory>
 #include <optional>
+#include <span>
 #include <utility>
 
 namespace kwaque::codec {
@@ -34,18 +34,8 @@ result<void> add(byte_count& target, byte_count amount, field_context context) {
     return {};
 }
 
-result<byte_count>
-multiply(byte_count amount, std::uint64_t count, field_context context) {
-    if (
-      count != 0
-      && amount.value() > std::numeric_limits<std::uint64_t>::max() / count) {
-        return codec::failure(at(errc::out_of_range, context));
-    }
-    return byte_count{amount.value() * count};
-}
-
-// Both sources are published owners, so assembly transfers whole fragments.
-// Only the preallocated output descriptors and one temporary slice are new.
+// Sources are published owners, so assembly transfers whole fragments.
+// Only the preallocated output descriptors are new.
 result<item_count> admit_assembly_descriptors(
   std::uint64_t nodes,
   const limits& policy,
@@ -62,28 +52,19 @@ result<item_count> admit_assembly_descriptors(
     }
     const byte_count descriptor_request{
       nodes * fragmented_buffer::fragment_descriptor_size()};
-    const byte_count slice_request{
-      2U * fragmented_buffer::fragment_descriptor_size()};
     const auto descriptors = charge(descriptor_request);
-    const auto slice = charge(slice_request);
-    if (descriptors < descriptor_request || slice < slice_request) {
+    if (descriptors < descriptor_request) {
         return codec::failure(at(errc::invalid_argument, context));
     }
-    const auto slice_peak = multiply(slice, 2, context);
-    if (!slice_peak) return codec::failure(slice_peak.error());
-    for (const auto cost : {descriptors, *slice_peak}) {
-        if (auto added = add(live.payload_bookkeeping, cost, context); !added) {
-            return codec::failure(added.error());
-        }
-    }
+    if (
+      auto added = add(live.payload_bookkeeping, descriptors, context); !added)
+        return codec::failure(added.error());
     const auto fits = policy.remaining_operation_bytes(live, parent_remaining);
     if (!fits) {
         return codec::failure(
           detail::allocation_cost_error(fits.error(), context, context.origin));
     }
-    if (
-      descriptors > config.max_allocation_bytes
-      || slice > config.max_allocation_bytes) {
+    if (descriptors > config.max_allocation_bytes) {
         return codec::failure(at(errc::resource_exhausted, context));
     }
     return item_count{nodes};
@@ -96,52 +77,29 @@ seastar::future<result<void>> splice_input(
   field_context context) {
     const auto anchor = at(errc::success, context);
     while (!source.empty()) {
-        const auto fragment = source.fragment_at(0).value();
-        const auto length = static_cast<std::uint64_t>(fragment.size());
-        const auto slice_size = length;
-        auto before_share = co_await work.checkpoint(anchor);
-        if (!before_share) {
-            co_return codec::failure(before_share.error());
-        }
-        if (auto ready = work.poll(anchor); !ready) {
-            co_return codec::failure(ready.error());
-        }
-        auto slice = source.share(byte_count{}, byte_count{slice_size});
-        if (!slice) {
-            co_return codec::failure(
-              detail::allocation_cost_error(
-                slice.error(), context, context.origin));
-        }
-        const auto after_share = co_await work.checkpoint(anchor);
-        if (!after_share) {
-            co_return codec::failure(after_share.error());
-        }
+        const auto count = std::min<std::uint64_t>(
+          source.fragment_count(), work.item_quantum().value() / 8U);
         const auto admitted = co_await work.admit(
-          byte_count{}, item_count{8}, anchor);
+          byte_count{}, item_count{8U * count}, anchor);
         if (!admitted) {
             co_return codec::failure(admitted.error());
         }
         if (auto ready = work.poll(anchor); !ready) {
             co_return codec::failure(ready.error());
         }
-        const auto appended = output.append_buffer(std::move(*slice));
+        const auto appended = output.append_fragments(
+          source, item_count{count});
         if (!appended) {
             co_return codec::failure(
               detail::allocation_cost_error(
                 appended.error(), context, context.origin));
         }
-        const auto trimmed = source.trim_front(byte_count{slice_size});
-        KWAQUE_INVARIANT(
-          invariant_id{"KQ-CODEC-STAGING-TRIM"},
-          trimmed.has_value(),
-          "admitted source slice could not be consumed");
     }
     co_return result<void>{};
 }
 
 seastar::future<result<fragmented_buffer>> assemble_owned(
-  fragmented_buffer& prefix,
-  fragmented_buffer& payload,
+  std::span<fragmented_buffer> inputs,
   std::optional<fragmented_buffer_builder>& output,
   cooperative_work& work,
   byte_count logical_cap,
@@ -161,7 +119,12 @@ seastar::future<result<fragmented_buffer>> assemble_owned(
     if (charge == nullptr) {
         co_return codec::failure(at(errc::invalid_argument, context));
     }
-    const auto total = prefix.size().checked_add(payload.size());
+    std::optional<byte_count> total{byte_count{}};
+    std::size_t fragments = 0;
+    for (const auto& input : inputs) {
+        if (total) total = total->checked_add(input.size());
+        fragments += input.fragment_count();
+    }
     if (
       !total
       || total->value()
@@ -173,7 +136,8 @@ seastar::future<result<fragmented_buffer>> assemble_owned(
     }
     const auto policy = work.policy();
     byte_count input_backing;
-    for (const auto* source : {&prefix, &payload}) {
+    for (const auto& input : inputs) {
+        const auto* source = &input;
         const auto cost = co_await detail::buffer_input_cost(
           *source, work, charge, context);
         if (!cost) {
@@ -219,7 +183,7 @@ seastar::future<result<fragmented_buffer>> assemble_owned(
         co_return codec::failure(at(errc::resource_exhausted, context));
     }
     const auto nodes = admit_assembly_descriptors(
-      prefix.fragment_count() + payload.fragment_count(),
+      fragments,
       policy,
       live,
       input_backing,
@@ -246,9 +210,9 @@ seastar::future<result<fragmented_buffer>> assemble_owned(
       invariant_id{"KQ-CODEC-STAGING-RESERVE"},
       reserved.has_value(),
       "admitted descriptor reservation failed");
-    for (auto* source : {&prefix, &payload}) {
+    for (auto& source : inputs) {
         const auto appended = co_await splice_input(
-          *source, *output, work, context);
+          source, *output, work, context);
         if (!appended) {
             co_return codec::failure(appended.error());
         }
@@ -275,30 +239,33 @@ seastar::future<result<fragmented_buffer>> assemble_owned(
     co_return std::move(*finished);
 }
 
-} // namespace
-
-seastar::future<result<bytes::fragmented_buffer>> assemble_buffer_cooperatively(
-  bytes::fragmented_buffer&& prefix,
-  bytes::fragmented_buffer&& payload,
+template<std::size_t N>
+seastar::future<result<fragmented_buffer>> assemble_inputs(
+  std::array<fragmented_buffer*, N> sources,
   cooperative_work& work,
   byte_count logical_cap,
   operation_usage other_live,
   byte_count parent_remaining,
   bytes::allocation_charge_fn charge,
   field_context context) {
-    if (std::addressof(prefix) == std::addressof(payload)) {
-        co_return codec::failure(at(errc::invalid_argument, context));
-    }
-    auto owned_prefix = std::move(prefix);
-    auto owned_payload = std::move(payload);
+    static_assert(N >= 2 && N <= 4);
+    for (std::size_t i = 0; i < N; ++i)
+        for (std::size_t j = 0; j < i; ++j)
+            if (sources[i] == sources[j])
+                co_return codec::failure(at(errc::invalid_argument, context));
+    // Native initial_suspend is suspend_never: references to caller inputs are
+    // consumed into this frame before any suspension. Frame-allocation failure
+    // precedes these moves and leaves the caller's owners intact.
+    std::array<fragmented_buffer, N> owned;
+    for (std::size_t i = 0; i < N; ++i)
+        owned[i] = std::move(*sources[i]);
     std::optional<fragmented_buffer_builder> output;
     std::optional<result<fragmented_buffer>> produced;
     std::exception_ptr exception;
     try {
         produced.emplace(
           co_await assemble_owned(
-            owned_prefix,
-            owned_payload,
+            owned,
             output,
             work,
             logical_cap,
@@ -321,12 +288,12 @@ seastar::future<result<bytes::fragmented_buffer>> assemble_buffer_cooperatively(
           nonempty ? work.item_quantum() : item_count{1});
         output.reset();
     }
-    for (auto* input : {&owned_prefix, &owned_payload}) {
-        const bool nonempty = !input->empty();
+    for (auto& input : owned) {
+        const bool nonempty = !input.empty();
         co_await work.drain_inline(
           nonempty ? work.byte_quantum() : byte_count{},
           nonempty ? work.item_quantum() : item_count{1});
-        *input = fragmented_buffer{};
+        input = fragmented_buffer{};
     }
     if (exception) {
         std::rethrow_exception(exception);
@@ -343,6 +310,67 @@ seastar::future<result<bytes::fragmented_buffer>> assemble_buffer_cooperatively(
         co_return codec::failure(ready.error());
     }
     co_return std::move(**produced);
+}
+
+} // namespace
+
+seastar::future<result<bytes::fragmented_buffer>> assemble_buffer_cooperatively(
+  bytes::fragmented_buffer&& prefix,
+  bytes::fragmented_buffer&& payload,
+  cooperative_work& work,
+  byte_count logical_cap,
+  operation_usage other_live,
+  byte_count parent_remaining,
+  bytes::allocation_charge_fn charge,
+  field_context context) {
+    return assemble_inputs(
+      std::array{&prefix, &payload},
+      work,
+      logical_cap,
+      other_live,
+      parent_remaining,
+      charge,
+      context);
+}
+
+seastar::future<result<bytes::fragmented_buffer>> assemble_buffer_cooperatively(
+  bytes::fragmented_buffer&& prefix,
+  bytes::fragmented_buffer&& payload,
+  bytes::fragmented_buffer&& suffix,
+  cooperative_work& work,
+  byte_count logical_cap,
+  operation_usage other_live,
+  byte_count parent_remaining,
+  bytes::allocation_charge_fn charge,
+  field_context context) {
+    return assemble_inputs(
+      std::array{&prefix, &payload, &suffix},
+      work,
+      logical_cap,
+      other_live,
+      parent_remaining,
+      charge,
+      context);
+}
+seastar::future<result<bytes::fragmented_buffer>> assemble_buffer_cooperatively(
+  bytes::fragmented_buffer&& prefix,
+  bytes::fragmented_buffer&& fixed,
+  bytes::fragmented_buffer&& payload,
+  bytes::fragmented_buffer&& suffix,
+  cooperative_work& work,
+  byte_count logical_cap,
+  operation_usage other_live,
+  byte_count parent_remaining,
+  bytes::allocation_charge_fn charge,
+  field_context context) {
+    return assemble_inputs(
+      std::array{&prefix, &fixed, &payload, &suffix},
+      work,
+      logical_cap,
+      other_live,
+      parent_remaining,
+      charge,
+      context);
 }
 
 } // namespace kwaque::codec

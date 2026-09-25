@@ -142,6 +142,47 @@ private:
 
 class fake_file_test_access final {
 public:
+    // Inspect the existing dispatch snapshots before the scheduler completes
+    // I/O. No payload copy, completion driver or replacement file owner is
+    // introduced.
+    [[nodiscard]] static runtime::result<std::uint32_t>
+    verify_pending_write_buffers(fake_file_system& filesystem) {
+        filesystem.assert_current();
+        if (filesystem.state_ != fake_file_system_state::open)
+            return runtime::failure(
+              runtime::operation_error{
+                errc::closed, runtime::operation_kind::file});
+        filesystem.pending_.copy_keys(filesystem.pending_ids_);
+        std::uint64_t bytes = 0;
+        std::uint32_t writes = 0;
+        for (const auto id : filesystem.pending_ids_) {
+            const auto& operation = filesystem.pending_.at(id);
+            if (operation.kind != fake_file_system::pending_kind::write)
+                continue;
+            const auto& io = std::get<fake_file_system::native_io_operation>(
+              operation.payload);
+            if (
+              io.snapshot.size() > maximum_contiguous_allocation_bytes
+              || io.snapshot.size() > runtime::maximum_file_write_concurrency
+                                          * maximum_contiguous_allocation_bytes
+                                        - bytes)
+                return runtime::failure(
+                  runtime::operation_error{
+                    errc::resource_exhausted, runtime::operation_kind::file});
+            bytes += io.snapshot.size();
+            if (
+              !io.source
+              || std::mismatch(
+                   io.source, io.source + io.snapshot.size(), io.snapshot.get())
+                     .first
+                   != io.source + io.snapshot.size())
+                return runtime::failure(
+                  runtime::operation_error{
+                    errc::wrong_context, runtime::operation_kind::file});
+            ++writes;
+        }
+        return writes;
+    }
     [[nodiscard]] static std::uint64_t
     submitted(const fake_file_system& filesystem, fake_submission_kind kind) {
         filesystem.assert_current();

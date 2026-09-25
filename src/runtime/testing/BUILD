@@ -73,3 +73,15 @@ py_test(
         "resources:memory:256",
     ],
 )
+
+kwaque_cc_library(
+    name = "reactor_tasks",
+    testonly = True,
+    hdrs = ["reactor_tasks.h"],
+    visibility = [
+        "//src/runtime/tests:__pkg__",
+        "//src/simulation/tests:__pkg__",
+        "//src/storage/tests:__pkg__",
+    ],
+    deps = ["@seastar"],
+)

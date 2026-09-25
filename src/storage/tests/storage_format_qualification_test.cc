@@ -1,4 +1,5 @@
 #include "src/codec/tests/benchmark_buffer.h"
+#include "src/codec/tests/qualification_profile.h"
 #include "src/storage/tests/storage_format_fixture.h"
 #include "src/storage/tests/storage_large_fixture.h"
 
@@ -193,7 +194,7 @@ TEST(
     // expanded records overlap during LZ4 decode. Reserve one MiB for native
     // engines/frames and use the remaining operation allowance for these
     // owners.
-    constexpr byte_count operation_budget{63U << 20U};
+    constexpr byte_count operation_budget{codec::testing::residual};
     for (const bool compressed : {false, true}) {
         SCOPED_TRACE(compressed ? "lz4" : "none");
         seastar::abort_source abort;

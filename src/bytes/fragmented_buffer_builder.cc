@@ -355,6 +355,41 @@ fragmented_buffer_builder::append_buffer(fragmented_buffer&& other) {
     return {};
 }
 
+result<void> fragmented_buffer_builder::append_fragments(
+  fragmented_buffer& source, item_count count) {
+    if (finished_) return failure(errc::closed);
+    if (count.value() > source.fragment_count())
+        return failure(errc::out_of_range);
+    if (count.value() == 0) return {};
+    const auto number = static_cast<std::size_t>(count.value());
+    byte_count logical, backing;
+    for (std::size_t i = 0; i < number; ++i) {
+        const auto& fragment = source.fragments_[i];
+        logical = *logical.checked_add(byte_count{fragment.storage.size()});
+        backing = *backing.checked_add(fragment.retained_bytes);
+    }
+    if (auto valid = ensure_appendable(logical); !valid) return valid;
+    const auto retained = retained_bytes_.checked_add(backing);
+    if (
+      number > config_.max_fragments - fragments_.size() || !retained
+      || *retained > config_.max_retained_bytes)
+        return failure(errc::resource_exhausted);
+    // All fallible preparation precedes consuming a single source descriptor.
+    fragments_.reserve_back(fragments_.size() + number);
+    seal_tail();
+    for (std::size_t i = 0; i < number; ++i) {
+        fragments_.push_back(std::move(source.fragments_.front()));
+        source.fragments_.pop_front();
+    }
+    tail_used_ = fragments_.back().storage.size();
+    size_ = *size_.checked_add(logical);
+    retained_bytes_ = *retained;
+    source.size_ = *source.size_.checked_sub(logical);
+    source.retained_bytes_ = *source.retained_bytes_.checked_sub(backing);
+    source.invalidate_presentation();
+    return {};
+}
+
 result<void> fragmented_buffer_builder::reserve(byte_count bytes) {
     if (finished_) {
         return failure(errc::closed);

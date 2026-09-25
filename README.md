@@ -163,9 +163,12 @@ receive the complete checks. Manual workflow dispatches always run the full CI
 suite, as do changes whose complete Git comparison cannot be established.
 
 CI disk caches are separated by architecture and build configuration. One job
-per configuration writes a commit-specific snapshot; matching analysis and
-golden jobs restore it, falling back to an earlier snapshot for a new commit.
-Ordinary and fuzz clang-tidy jobs run independently of the release build.
+per configuration writes a commit-specific snapshot; matching golden jobs
+restore it, falling back to an earlier snapshot for a new commit. These snapshots
+do not share ongoing compilation between concurrent jobs. Ordinary and fuzz
+clang-tidy jobs use separate caches of compilation prerequisites, saved after
+successful preparation so later analysis failures do not discard the cache.
+Both analysis jobs run independently of the release build.
 The native policy job uses its own configuration and cache. Release jobs execute
 focused runtime and process-policy tests after the ordinary build.
 
@@ -361,23 +364,31 @@ strict analysis selects production sources using Bazel target ownership and
 package boundaries:
 
 ```bash
-bazel build --config=ci-debug --remote_download_outputs=all --build_tag_filters=-fuzz,-manual //...
+bazel build --config=ci-debug --remote_download_outputs=all \
+  --aspects=//bazel:analysis_inputs.bzl%analysis_inputs \
+  --output_groups=clang_tidy_inputs --build_tag_filters=-fuzz,-manual //...
 bazel run --config=ci-debug //tools:compile_commands -- --config=ci-debug
-bazel run --config=ci-debug //tools:clang_tidy
-bazel run --config=ci-debug //tools:clang_tidy_strict
+bazel run --config=ci-debug //tools:clang_tidy -- --production-config=.clang-tidy-strict
 ```
 
 Fuzz-only translation units need the fuzz configuration. CI runs this in a
 separate job, using ordinary checks for the fuzzers and their dependencies:
 
 ```bash
-bazel build --config=ci --config=fuzz --remote_download_outputs=all --build_tag_filters=fuzz //...
+bazel build --config=ci --config=fuzz --remote_download_outputs=all \
+  --aspects=//bazel:analysis_inputs.bzl%analysis_inputs \
+  --output_groups=clang_tidy_inputs --build_tag_filters=fuzz //...
 bazel run --config=ci --config=fuzz //tools:compile_commands -- --fuzz-only --config=ci --config=fuzz
 bazel run --config=ci --config=fuzz //tools:clang_tidy
 ```
 
-The preparation builds use `--remote_download_outputs=all` so cached generated
-headers and other intermediate inputs are present for standalone clang-tidy.
+The preparation builds request C++ compilation prerequisites throughout the
+selected dependency graph, including implementation dependencies and build-tool
+configurations. Code generators and required foreign-library build actions may
+still run; linked tests and benchmarks are not requested merely for analysis.
+`--remote_download_outputs=all` ensures cached generated headers and other
+intermediate inputs are present for standalone clang-tidy. Full compilation and
+link validation remain in the build and test jobs.
 
 The databases remain ignored. Ordinary analysis retains every distinct compile
 variant of a source file; strict analysis uses the production commands in
@@ -386,6 +397,14 @@ the main database while preserving this production subset. Regenerate the debug
 database before returning to strict analysis after switching build configurations.
 The generator adjusts compiler flags for workspace analysis; normal builds
 continue to enforce strict header layering.
+
+The combined command partitions by exact compiler arguments: production commands
+receive strict checks once, and every remaining command receives baseline checks.
+A test variant of a production source remains in the baseline partition. Both
+passes run even if one reports findings, and either failure fails the command.
+The original databases are preserved. Without `--production-config`,
+`//tools:clang_tidy` runs the full baseline scope; `//tools:clang_tidy_strict`
+remains available for a standalone production pass.
 
 Both clang-tidy commands use the parallel runner from the pinned LLVM toolchain,
 with two processes by default. CI keeps this limit to control memory use. Each
@@ -492,6 +511,67 @@ enforces this and runs in continuous integration.
 
 Protocol Buffers encode versioned, low-volume control schemas. They do not
 define Kwaque's native TCP framing or its raw record-batch representation.
+
+The implemented controls are handshake requests and responses, redirects, and
+errors. They carry identities, scoped epochs, capability advertisements and
+bounded destination tokens. Accepting these values does not perform negotiation,
+authenticate a peer, authorize a redirect or resolve an endpoint. Callers supply
+independent expected identities to the [control codec](src/protocol/control_codec.h).
+
+The default control profile permits a 64-KiB payload, eight nesting levels and
+256 tags and packed scalar elements counted together. Capability sets are
+ordered and unique, with at most 16 protocol versions, 32 format entries and
+16 compression IDs.
+Known singular duplicates reject before native parsing; embedded BuildInfo
+retains its informational merge semantics. Explicit presence distinguishes absent
+fields from present zero or empty values. Unknown fields consume the enclosing
+limits and are discarded during owning conversion. Advertised future capabilities
+remain data; unknown peer and error enum values reject. Serialized Protobuf bytes are
+not canonical identities or fingerprints.
+
+Decoding reserves input once, copies the admitted control payload, checks its
+wire profile, and admits fresh generated state and owning conversion storage.
+The default aggregate generated/staging/conversion bound is 1 MiB, and each
+served contiguous allocation must fit 128 KiB. Callers retain reservations for
+other live owners and native execution state, and share one exclusive cooperative
+work account through sequential children. The returned value owns its strings
+and vectors. Temporary cleanup finishes before final cancellation polling and
+publication; failure restores borrowed parser position and marks. The
+[compound frame codec](src/protocol/control_frame_codec.h) commits the outer
+frame only after those checks and cleanup succeed.
+
+The format integration tests carry exact assigned-batch bytes through WAL and
+segment representations, then verify extent, page and target relationships.
+Semantic batch digests retain original identity and ordered record content;
+sparse rewrites carry that digest without reconstructing removed records.
+Exact-object and extent hashes cover stored bytes. Parsed metadata and completed
+page walks do not by themselves establish target integrity, file durability or
+request completion. Those responsibilities belong to their storage owners.
+
+Run the focused control and format checks with the current build profile:
+
+```bash
+bazel test //src/protocol/tests:golden_tests \
+  //src/protocol/tests:memory_qualification_test \
+  //src/model/tests:format_fixture_test \
+  //src/storage/tests:format_fixture_test \
+  //src/storage/tests:format_integration_test \
+  //src/compression/tests:format_fixture_test \
+  //tools:verify_format_fixtures_test --test_output=errors
+```
+
+Memory qualification uses isolated processes and records the effective allocator
+profile, complete observed peaks and retained owner bounds. System-allocator
+runs check semantics but explicitly skip native allocation qualification.
+Critical-allocation classification requires an injection-enabled native build;
+injection need not be armed. Without it, native operation bounds and bounds based
+on all new allocations are still checked. Owners that require the critical
+subset report that bound as unavailable and explicitly skip full qualification.
+Use `ci-debug` for those additional checks; release timing remains a separate
+profile. The protocol benchmarks label preflight, preflight plus native parsing, conversion,
+serialization, complete payload decoding and framed decoding separately; compare
+the same responsibility and include returned-owner cleanup. These checks do not
+measure a socket, a connection, shard RSS or arbitrary caller-owned state.
 
 ## Project documents
 

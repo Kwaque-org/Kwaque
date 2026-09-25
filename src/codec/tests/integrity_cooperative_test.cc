@@ -33,6 +33,7 @@
 #include <optional>
 #include <span>
 #include <stdexcept>
+#include <string>
 #include <string_view>
 #include <utility>
 #include <vector>
@@ -276,6 +277,29 @@ fragmented_buffer abort_on_release(
     return kwaque::bytes::fragmented_buffer_test_access::adopt_fragment(
              std::move(storage), byte_count{size})
       .value();
+}
+
+TEST(IntegrityCooperativeTest, BorrowedCrcLeavesOwnershipAndCleanupWithCaller) {
+    seastar::abort_source abort;
+    bool released = false;
+    auto input = abort_on_release(abort, released, 17);
+    codec::cooperative_work work{policy_with(2, 1), abort};
+    codec::crc32c expected{0x12345678U};
+    expected.extend(std::string(17, 'x'));
+    const auto value
+      = codec::crc32c_borrowed(input, work, 0x12345678U, anchor).get();
+    ASSERT_TRUE(value);
+    EXPECT_EQ(*value, expected.value());
+    EXPECT_EQ(input.size(), byte_count{17});
+    EXPECT_FALSE(released);
+    EXPECT_FALSE(abort.abort_requested());
+    input = fragmented_buffer{};
+    EXPECT_TRUE(released && abort.abort_requested());
+    auto still_owned = fragmented("abc"sv, 1);
+    expect_error(
+      codec::crc32c_borrowed(still_owned, work, 0, anchor).get(),
+      errc::aborted);
+    EXPECT_TRUE(still_owned.content_equals("abc"));
 }
 
 TEST(

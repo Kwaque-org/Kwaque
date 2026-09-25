@@ -233,6 +233,11 @@ private:
             if (rule.action == storage_fault_action::error) {
                 return storage_outcome::io_failure;
             }
+            if (
+              rule.action == storage_fault_action::short_operation
+              && rule.payload == 0) {
+                return storage_outcome::io_failure;
+            }
             if (rule.action == storage_fault_action::crash) {
                 crash();
                 return storage_outcome::aborted;

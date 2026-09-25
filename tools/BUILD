@@ -217,6 +217,7 @@ py_binary(
     ],
     data = [
         "//:.clang-tidy",
+        "//:.clang-tidy-strict",
         "@current_llvm_toolchain_llvm//:bin/run-clang-tidy",
         "@current_llvm_toolchain_llvm//:clang-tidy",
     ],
@@ -304,7 +305,11 @@ py_test(
     name = "run_clang_tidy_test",
     size = "small",
     srcs = ["run_clang_tidy_test.py"],
-    data = ["@current_llvm_toolchain_llvm//:bin/run-clang-tidy"],
+    data = [
+        "//:.clang-tidy",
+        "//:.clang-tidy-strict",
+        "@current_llvm_toolchain_llvm//:bin/run-clang-tidy",
+    ],
     env = {
         "KWAQUE_TEST_TIDY_RUNNER": "$(rlocationpath @current_llvm_toolchain_llvm//:bin/run-clang-tidy)",
     },

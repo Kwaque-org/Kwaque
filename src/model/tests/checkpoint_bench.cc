@@ -1,4 +1,5 @@
 #include "src/codec/tests/benchmark_buffer.h"
+#include "src/codec/tests/qualification_profile.h"
 #include "src/model/checkpoint_codec.h"
 #include "src/model/fingerprint.h"
 #include "src/model/tests/checkpoint_test_support.h"
@@ -209,7 +210,7 @@ private:
     fragmented_buffer wire_;
     std::optional<codec::checkpoint_digest> digest_;
     codec::decode_budget memory_{
-      byte_count{63U << 20U}, byte_count{1U << 20U}, capacity_bound};
+      codec::testing::residual, byte_count{1U << 20U}, capacity_bound};
     bool initialized_{false};
 };
 

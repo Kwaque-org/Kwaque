@@ -13,11 +13,6 @@ namespace kwaque::codec::detail::framing {
 add_charge(byte_count&, byte_count, field_context) noexcept;
 [[nodiscard]] result<void>
 admit_usage(const operation_usage&, const limits&, byte_count, field_context);
-[[nodiscard]] result<byte_count> admit_alias_allocations(
-  const bytes::buffer_allocation_cost&,
-  const limits&,
-  bytes::allocation_charge_fn,
-  field_context);
 [[nodiscard]] result<void> admit_header_owner(
   byte_count prefix_bytes,
   const bytes::buffer_allocation_cost&,

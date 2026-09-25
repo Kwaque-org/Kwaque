@@ -26,7 +26,6 @@ using bytes::fragmented_buffer;
 
 using detail::buffer_input_cost;
 using detail::framing::add_charge;
-using detail::framing::admit_alias_allocations;
 using detail::framing::admit_header_owner;
 using detail::framing::admit_usage;
 using detail::framing::encode_error;
@@ -127,45 +126,13 @@ seastar::future<result<fragmented_buffer>> encode_owned(
     if (auto ready = work.poll(anchor); !ready) {
         co_return codec::failure(ready.error());
     }
-    const auto alias_descriptors = admit_alias_allocations(
-      *body_cost, policy, charge, context);
-    if (!alias_descriptors) {
-        co_return codec::failure(alias_descriptors.error());
-    }
-    auto checksum_live = body_live;
-    // The alias's backing and possible native promotion are already covered
-    // by the original body reservation. Only additional descriptors overlap.
-    if (
-      auto added = add_charge(
-        checksum_live.payload_bookkeeping, *alias_descriptors, context);
-      !added) {
-        co_return codec::failure(added.error());
-    }
-    if (
-      auto admitted = admit_usage(
-        checksum_live, policy, parent_remaining, context);
-      !admitted) {
-        co_return codec::failure(admitted.error());
-    }
-    if (auto ready = co_await work.checkpoint(anchor); !ready) {
-        co_return codec::failure(ready.error());
-    }
-    if (auto ready = work.poll(anchor); !ready) {
-        co_return codec::failure(ready.error());
-    }
-    auto checksum_input = body.share(byte_count{}, body.size());
-    if (!checksum_input) {
-        co_return codec::failure(
-          detail::allocation_cost_error(
-            checksum_input.error(), context, context.origin));
-    }
     const error body_anchor{
       errc::success,
       context.family,
       static_cast<std::uint16_t>(envelope_field::body_crc32c),
       context.origin + 24};
-    const auto body_checksum = co_await crc32c_cooperatively(
-      std::move(*checksum_input), work, 0, body_anchor);
+    const auto body_checksum = co_await crc32c_borrowed(
+      body, work, 0, body_anchor);
     if (!body_checksum) {
         co_return codec::failure(body_checksum.error());
     }
@@ -216,8 +183,8 @@ seastar::future<result<fragmented_buffer>> encode_owned(
             frozen_header.error(), context, context.origin));
     }
     header.emplace(std::move(*frozen_header));
-    // Checksum-only aliases are gone. Assembly admits the actual header/body
-    // input owners and its own output/slice/migration peaks, using the ORIGINAL
+    // Assembly admits the actual header/body
+    // input owners and its pre-reserved output descriptors, using the ORIGINAL
     // parent allowance, not a second debit of the stages already released.
     co_return co_await assemble_buffer_cooperatively(
       std::move(*header),

@@ -56,21 +56,33 @@ inline constexpr byte_count maximum_file_io_bytes{64U * 1024U * 1024U};
 inline constexpr std::uint32_t maximum_pending_file_reads = 96;
 inline constexpr std::uint32_t maximum_pending_file_metadata_operations = 96;
 inline constexpr std::uint32_t maximum_queued_file_writes = 96;
+inline constexpr std::uint32_t maximum_file_write_concurrency = 8;
+inline constexpr byte_count maximum_file_write_buffer_bytes{
+  2 * maximum_file_write_concurrency * maximum_contiguous_allocation_bytes};
 
 struct file_io_limits final {
     // Reads allocate independently, so both their count and requested bytes are
     // bounded before native dispatch. One active write is bounded by
-    // maximum_file_io_bytes; these write limits bound only contenders retained
-    // behind the native serializer.
+    // maximum_file_io_bytes; queued_write_bytes/queued_writes bound contenders
+    // retained behind the native serializer.
     byte_count pending_read_bytes{maximum_file_io_bytes};
     std::uint32_t pending_reads{64};
     std::uint32_t pending_metadata_operations{64};
     byte_count queued_write_bytes{maximum_file_io_bytes};
     std::uint32_t queued_writes{64};
+    // Physical requests within one logically serialized write. Buffer capacity
+    // covers both aligned staging and simultaneous short-write recovery.
+    std::uint32_t write_concurrency{4};
+    byte_count write_buffer_bytes{8 * maximum_contiguous_allocation_bytes};
 
     [[nodiscard]] result<void> validate() const noexcept;
 
     bool operator==(const file_io_limits&) const = default;
+};
+
+struct file_write_buffer_layout final {
+    byte_count allocation_bytes;
+    std::uint32_t allocations;
 };
 
 // An owning snapshot of an open file's DMA requirements. Native maximum
@@ -98,6 +110,16 @@ public:
     [[nodiscard]] byte_count read_operation_limit() const noexcept {
         return read_operation_limit_;
     }
+    [[nodiscard]] std::uint32_t write_concurrency() const noexcept {
+        return write_concurrency_;
+    }
+    [[nodiscard]] byte_count write_buffer_limit() const noexcept {
+        return write_buffer_limit_;
+    }
+    // Conservative scratch layout, excluding input backing and control frames.
+    // Charge every allocation separately through the caller's allocator policy.
+    [[nodiscard]] file_write_buffer_layout
+    write_buffers(file_position position, byte_count length) const noexcept;
     [[nodiscard]] static constexpr byte_count allocation_limit() noexcept {
         return byte_count{maximum_contiguous_allocation_bytes};
     }
@@ -119,7 +141,9 @@ private:
       byte_count read_max,
       byte_count write_max,
       byte_count append_chunk,
-      byte_count read_operation_limit) noexcept
+      byte_count read_operation_limit,
+      std::uint32_t write_concurrency,
+      byte_count write_buffer_limit) noexcept
       : memory_(memory)
       , read_(read)
       , write_(write)
@@ -127,9 +151,13 @@ private:
       , read_max_(read_max)
       , write_max_(write_max)
       , append_chunk_(append_chunk)
-      , read_operation_limit_(read_operation_limit) {}
+      , read_operation_limit_(read_operation_limit)
+      , write_concurrency_(write_concurrency)
+      , write_buffer_limit_(write_buffer_limit) {}
     byte_count memory_, read_, write_, overwrite_, read_max_, write_max_,
       append_chunk_, read_operation_limit_;
+    std::uint32_t write_concurrency_;
+    byte_count write_buffer_limit_;
 };
 
 // Advisory filesystem-wide sample; neither a reservation nor write permission.
@@ -508,6 +536,11 @@ public:
 
     [[nodiscard]] file_state state() const;
     [[nodiscard]] result<file_geometry> geometry() const noexcept;
+    // Tighten write staging/recovery allocations before acquiring operation or
+    // metadata reservations. The power-of-two bound must fit every DMA
+    // alignment. It never enlarges the native chunk or changes read limits.
+    [[nodiscard]] result<void>
+    limit_write_allocation(byte_count maximum) noexcept;
     [[nodiscard]] bool abort_requested() const;
     [[nodiscard]] const file_io_limits& limits() const noexcept {
         owner_.assert_current();
@@ -569,8 +602,8 @@ private:
         return first_failure_.error();
     }
     [[nodiscard]] operation_error remember_error(operation_error error);
-    [[nodiscard]] operation_error
-    remember_io_failure(std::exception_ptr exception);
+    [[nodiscard]] operation_error remember_io_failure(
+      std::exception_ptr exception, bool prior_write_possible = false);
     [[nodiscard]] std::optional<admission_reservation>
     try_acquire_read(byte_count bytes) noexcept;
     [[nodiscard]] std::optional<seastar::semaphore_units<>>

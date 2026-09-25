@@ -793,6 +793,7 @@ kwaque_cc_seastar_gtest(
         "//src/codec:error",
         "//src/codec:integer",
         "//src/codec:limits",
+        "//src/codec/tests:prepared_abort_source",
         "//src/model:checkpoint",
         "//src/model:checkpoint_codec",
         "//src/model:fingerprint",
@@ -817,11 +818,13 @@ kwaque_cc_binary(
     srcs = ["memory_qualification_probe.cc"],
     linkopts = ALLOCATION_OBSERVER_LINKOPTS,
     deps = [
+        ":checkpoint_test_support",
         ":model_bench_support",
         "//src/base",
         "//src/base:error",
         "//src/bytes:fragmented_buffer",
         "//src/bytes:fragmented_buffer_parser",
+        "//src/codec:collection",
         "//src/codec:cooperative",
         "//src/codec:error",
         "//src/codec:integer",
@@ -829,9 +832,11 @@ kwaque_cc_binary(
         "//src/codec/tests:allocation_observer",
         "//src/codec/tests:codec_bench_reference",
         "//src/codec/tests:memory_qualification_support",
+        "//src/codec/tests:prepared_abort_source",
         "//src/compression",
         "//src/model:batch_builder",
         "//src/model:batch_codec",
+        "//src/model:checkpoint_codec",
         "//src/model:fingerprint",
         "//src/model:record_codec",
         "//src/runtime:time",
@@ -843,7 +848,7 @@ kwaque_cc_binary(
 
 kwaque_py_native_test(
     name = "memory_qualification_test",
-    timeout = "moderate",
+    timeout = "long",
     srcs = ["memory_qualification_test.py"],
     data = [
         ":memory_qualification_probe",

@@ -32,6 +32,18 @@ enum class local_publication_disposition : std::uint8_t {
     uncertain,
     durable
 };
+namespace detail {
+inline bool
+publication_admission_pressure(runtime::operation_error error) noexcept {
+    if (
+      error.code() != errc::queue_full
+      && error.code() != errc::resource_exhausted)
+        return false;
+    return error.operation() == runtime::operation_kind::resource
+           || runtime::file_detail(error)
+                == runtime::file_failure_detail::admission_not_dispatched;
+}
+} // namespace detail
 struct local_publication_outcome final {
     local_publication_outcome() = default;
     explicit local_publication_outcome(
@@ -41,6 +53,9 @@ struct local_publication_outcome final {
     local_publication_disposition disposition{
       local_publication_disposition::untouched};
     runtime::first_failure failure;
+    // Explicit pressure at the producer entrance, before starting operations.
+    // The first error alone cannot establish this after native I/O or cleanup.
+    bool admission_rejected{false};
     // Publication may have created a temp that survives/reappears after a
     // crash, including when exclusive open returned an error. A visible unlink
     // alone does not discharge this debt. Collisions are not owned temps.
@@ -138,10 +153,12 @@ public:
           std::move(*final),
           admission,
           std::move(*reservation),
+          *write_backing,
           operations_.hold());
     }
-    // Stream one bounded page at a time into a new immutable file. The named
-    // writer remains alive through the joined call. Its full live buffers,
+    // Stream one page of at most 64 KiB per write into a new immutable file.
+    // The writer joins each write; file_bytes is the complete file extent.
+    // The named writer remains alive through the joined call. Its live buffers,
     // decoder metadata and captures are covered by working_bytes; native
     // write backing, paths, handles and execution are admitted separately.
     // Zero length is intentional for an empty page-only retry bundle.
@@ -186,6 +203,7 @@ public:
           std::move(*final),
           admission,
           std::move(*reservation),
+          *backing,
           operations_.hold());
     }
     [[nodiscard]] seastar::future<runtime::result<void>> close() {
@@ -211,6 +229,8 @@ private:
     reject(runtime::operation_error error) {
         local_publication_outcome result;
         result.failure.observe(error);
+        result.admission_rejected = detail::publication_admission_pressure(
+          error);
         return seastar::make_ready_future<local_publication_outcome>(
           std::move(result));
     }
@@ -256,6 +276,23 @@ private:
         if (!cost) return runtime::failure(cost.error());
         return byte_count{8U * cost->value()};
     }
+    runtime::result<byte_count>
+    write_charge(const runtime::file& file, byte_count size) const {
+        auto geometry = file.geometry();
+        if (!geometry) return runtime::failure(geometry.error());
+        std::uint64_t maximum = 0;
+        // Stream callbacks may write at nonzero/unaligned positions. Cover the
+        // larger of the parallel aligned window and serial boundary recovery.
+        for (auto position : {std::uint64_t{0}, std::uint64_t{1}}) {
+            const auto layout = geometry->write_buffers(
+              runtime::file_position{position}, size);
+            if (!layout.allocations) continue;
+            auto charge = budget_.allocation_charge(layout.allocation_bytes);
+            if (!charge) return runtime::failure(charge.error());
+            maximum = std::max(maximum, charge->value() * layout.allocations);
+        }
+        return byte_count{maximum};
+    }
     struct buffer_writer final {
         bytes::fragmented_buffer payload;
         seastar::future<runtime::result<void>>
@@ -278,6 +315,7 @@ private:
       runtime::file_path final,
       codec::cooperative_work& admission,
       workload_reservation reservation,
+      byte_count write_credit,
       seastar::gate::holder holder) {
         busy_ = true;
         auto idle = seastar::defer([this] noexcept { busy_ = false; });
@@ -289,6 +327,7 @@ private:
         codec::cooperative_work execution{admission.policy(), execution_abort};
         std::optional<typename Backend::directory_cursor_type> parent;
         std::optional<runtime::file> temporary;
+        std::optional<workload_reservation> write_memory;
         std::optional<runtime::file::metadata_reservation> barrier;
         std::optional<runtime::file_path> temp_path;
         bool started = false, owned_temp = false, rename_attempted = false;
@@ -388,6 +427,24 @@ private:
                         output.failure.observe(
                           detail::path_error(errc::resource_exhausted));
                     break;
+                }
+                // Both the single payload and each streamed page are bounded
+                // by 64 KiB. Total file length is not one write's staging size.
+                auto native_memory = write_charge(
+                  *temporary, std::min(size, byte_count{65536}));
+                if (!native_memory) {
+                    output.failure.observe(native_memory);
+                    break;
+                }
+                if (*native_memory > write_credit) {
+                    auto extra = budget_.try_reserve(
+                      byte_count{
+                        native_memory->value() - write_credit.value()});
+                    if (!extra) {
+                        output.failure.observe(extra);
+                        break;
+                    }
+                    write_memory.emplace(std::move(*extra));
                 }
                 auto unit = temporary->try_reserve_metadata();
                 if (!unit) {

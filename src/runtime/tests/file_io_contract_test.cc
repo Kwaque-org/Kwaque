@@ -69,6 +69,23 @@ TEST(FileIoContractTest, ValidatesReadAndWriteBoundsBeforeDispatch) {
 TEST(FileIoContractTest, ValidatesAggregateIoLimits) {
     EXPECT_TRUE(kwaque::runtime::file_io_limits{}.validate().has_value());
     EXPECT_FALSE(
+      kwaque::runtime::file_io_limits{.write_concurrency = 0}.validate());
+    EXPECT_FALSE(
+      kwaque::runtime::file_io_limits{
+        .write_concurrency = kwaque::runtime::maximum_file_write_concurrency
+                             + 1}
+        .validate());
+    EXPECT_FALSE(
+      kwaque::runtime::file_io_limits{
+        .write_buffer_bytes = kwaque::
+          byte_count{2 * kwaque::maximum_contiguous_allocation_bytes - 1}}
+        .validate());
+    EXPECT_FALSE(
+      kwaque::runtime::file_io_limits{
+        .write_buffer_bytes = kwaque::
+          byte_count{kwaque::runtime::maximum_file_write_buffer_bytes.value() + 1}}
+        .validate());
+    EXPECT_FALSE(
       kwaque::runtime::file_io_limits{
         .pending_read_bytes = kwaque::byte_count{}}
         .validate()

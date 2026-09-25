@@ -14,6 +14,7 @@ kwaque_cc_library(
         "//src/compression/tests:__pkg__",
         "//src/model:__pkg__",
         "//src/model/tests:__pkg__",
+        "//src/protocol/tests:__pkg__",
     ],
     deps = [
         ":lz4",

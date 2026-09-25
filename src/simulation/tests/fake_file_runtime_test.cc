@@ -1,6 +1,7 @@
 #include "src/bytes/fragmented_buffer.h"
 #include "src/runtime/file.h"
 #include "src/runtime/testing/contracts/file_system_contract.h"
+#include "src/runtime/testing/reactor_tasks.h"
 #include "src/simulation/event_trace.h"
 #include "src/simulation/fake_file.h"
 #include "src/simulation/fake_file_test_support.h"
@@ -1189,6 +1190,102 @@ SEASTAR_TEST_CASE(fake_short_write_recovers_through_the_runtime_owner) {
     co_await pump_until(environment.events, closing);
     co_await require_ready_success(closing);
     co_return;
+}
+
+SEASTAR_TEST_CASE(fake_zero_write_fails_without_changing_bytes_or_eof) {
+    seastar::chunked_vector<fault_rule> rules;
+    rules.push_back(rule(
+      10,
+      builtin_fault_point::file_write,
+      2,
+      2,
+      fault_decision::make_short_operation(kwaque::byte_count{})));
+    fixture environment{std::move(rules)};
+    fake_file_driver drive{&environment.events};
+    const auto created = co_await drive(
+      environment.files->create_directories(path("/kwaque/data")));
+    BOOST_REQUIRE(created.has_value());
+    auto opened = co_await drive(environment.files->open(
+      path("/kwaque/data/file"),
+      {.access = kwaque::runtime::file_access::read_write,
+       .create = true,
+       .close_policy = kwaque::runtime::file_close_policy::checked}));
+    BOOST_REQUIRE(opened.has_value());
+    auto file = std::move(*opened);
+    const std::string prefix(4096, 'p');
+    const auto initial = co_await drive(
+      file.write(kwaque::runtime::file_position{}, payload(prefix)));
+    const auto written = co_await drive(file.write(
+      kwaque::runtime::file_position{8192}, payload(std::string(4096, 'z'))));
+    const auto size = co_await drive(file.size());
+    const auto read = co_await drive(
+      file.read(kwaque::runtime::file_position{}, kwaque::byte_count{4096}));
+    const auto closed = co_await drive(file.close());
+    BOOST_REQUIRE(initial.has_value());
+    BOOST_REQUIRE(!written.has_value());
+    BOOST_CHECK(written.error().code() == kwaque::errc::io_failure);
+    BOOST_REQUIRE(size.has_value());
+    BOOST_CHECK_EQUAL(*size, prefix.size());
+    BOOST_REQUIRE(read.has_value());
+    BOOST_CHECK(read->data().content_equals(prefix));
+    BOOST_REQUIRE(!closed.has_value());
+    BOOST_CHECK(closed.error() == written.error());
+    unsigned applied = 0;
+    for (const auto& entry : environment.trace.entries()) {
+        if (
+          entry.action == kwaque::simulation::trace_action::fault_evaluated
+          && entry.domain
+               == kwaque::runtime::descriptor_for(
+                    builtin_fault_point::file_write)
+                    ->id.value()
+          && entry.stable_id == 10 && entry.coordinate_a == 2) {
+            ++applied;
+            BOOST_CHECK(
+              entry.kind == kwaque::simulation::trace_event_kind::fault);
+            BOOST_CHECK_EQUAL(
+              entry.result & 0xffU,
+              static_cast<std::uint32_t>(
+                kwaque::runtime::fault_action::short_operation));
+            BOOST_CHECK_EQUAL(entry.result >> 8U, 1U);
+        }
+    }
+    BOOST_CHECK_EQUAL(applied, 1U);
+}
+
+SEASTAR_TEST_CASE(fake_zero_write_matches_independent_model) {
+    const std::vector<storage_fault_rule> canonical_rules{storage_fault_rule{
+      .id = 10,
+      .point = storage_command_kind::write,
+      .first = 2,
+      .last = 2,
+      .action = storage_fault_action::short_operation,
+      .payload = 0}};
+    seastar::chunked_vector<fault_rule> rules;
+    rules.push_back(rule(canonical_rules.front()));
+    fixture environment{std::move(rules)};
+    fake_file_driver drive{&environment.events};
+    const auto created = co_await drive(
+      environment.files->create_directories(path("/kwaque/data")));
+    BOOST_REQUIRE(created.has_value());
+    const auto synced = co_await drive(
+      environment.files->sync_directory(path("/kwaque")));
+    BOOST_REQUIRE(synced.has_value());
+    dense_storage_model model{canonical_rules, seed};
+    for (const auto position : {std::uint16_t{0}, std::uint16_t{8192}}) {
+        const storage_command command{
+          .kind = storage_command_kind::write,
+          .source = 0,
+          .position = position,
+          .length = 4096,
+          .value = static_cast<std::byte>('p')};
+        const auto observed = co_await execute_model_command(
+          environment, command);
+        BOOST_CHECK(
+          observed
+          == (position == 0 ? storage_outcome::success : storage_outcome::io_failure));
+        BOOST_REQUIRE(model.reconcile(command, observed));
+        compare_model_state(*environment.files, model);
+    }
 }
 
 SEASTAR_TEST_CASE(fake_corrupt_write_does_not_mutate_caller_input) {
@@ -3092,4 +3189,143 @@ SEASTAR_TEST_CASE(
     BOOST_CHECK(!outcome.has_value());
     BOOST_CHECK_EQUAL(fake_file_test_access::open_handles(*test.files), 0U);
     BOOST_CHECK_EQUAL(test.files->pending_operations(), 0U);
+}
+
+SEASTAR_TEST_CASE(
+  fake_file_pipeline_preserves_bytes_and_flush_boundary_across_crash) {
+    using namespace kwaque;
+    for (unsigned mode = 0; mode != 3; ++mode) {
+        seastar::chunked_vector<fault_rule> rules;
+        rules.push_back(rule(
+          501,
+          builtin_fault_point::file_write,
+          2,
+          2,
+          mode == 2
+            ? fault_decision::make_drop_completion()
+            : fault_decision::make_delay(runtime::monotonic_duration{50})));
+        fixture environment{
+          std::move(rules),
+          fake_file_system_config{
+            .maximum_pending_operations = 6,
+            .maximum_pending_writes = 4,
+            .native_max_length = 4096}};
+        fake_file_driver drive{&environment.events};
+        BOOST_REQUIRE(
+          co_await drive(
+            environment.files->create_directories(path("/kwaque/data"))));
+        BOOST_REQUIRE(
+          co_await drive(environment.files->sync_directory(path("/kwaque"))));
+        auto opened = co_await drive(environment.files->open(
+          path("/kwaque/data/file"),
+          {.access = runtime::file_access::read_write,
+           .create = true,
+           .close_policy = runtime::file_close_policy::checked}));
+        BOOST_REQUIRE(opened);
+        auto file = std::move(*opened);
+        BOOST_REQUIRE(
+          co_await drive(
+            environment.files->sync_directory(path("/kwaque/data"))));
+        const std::string prefix(4096, 'P');
+        BOOST_REQUIRE(co_await drive(file.write({}, payload(prefix))));
+        BOOST_REQUIRE(co_await drive(file.flush()));
+        std::string body;
+        for (unsigned i = 0; i != 8; ++i)
+            body.append(4096, static_cast<char>('a' + i));
+        const auto before = fake_file_test_access::submitted(
+          *environment.files, fake_submission_kind::write);
+        auto writing = file.write(runtime::file_position{4096}, payload(body));
+        co_await fake_file_test_access::wait_submitted(
+          *environment.files, fake_submission_kind::write, before + 4);
+        const auto pinned = fake_file_test_access::verify_pending_write_buffers(
+          *environment.files);
+        // Advance real fake events until only the first delayed/lost completion
+        // remains. Later physical success must not finish the logical write.
+        bool parked = false;
+        for (unsigned step = 0; step != 64; ++step) {
+            co_await runtime::testing::drain_reactor_tasks();
+            if (
+              fake_file_test_access::submitted(
+                *environment.files, fake_submission_kind::write)
+                == before + 8
+              && environment.files->pending_writes() == 1) {
+                parked = true;
+                break;
+            }
+            if (environment.events.pending_events()) {
+                if (!environment.events.has_ready_events()) {
+                    const auto advanced = environment.events.advance_to_next();
+                    BOOST_REQUIRE(advanced);
+                }
+                const auto stepped = environment.events.step();
+                BOOST_REQUIRE(stepped);
+            }
+        }
+        const bool incomplete = !writing.available();
+        if (mode == 0) {
+            const auto written = co_await drive(std::move(writing));
+            BOOST_REQUIRE(written);
+            BOOST_CHECK_EQUAL(written->value(), body.size());
+            BOOST_REQUIRE(co_await drive(file.flush()));
+            BOOST_REQUIRE(co_await drive(environment.files->crash()));
+        } else {
+            BOOST_REQUIRE(co_await drive(environment.files->crash()));
+            const auto failed = co_await drive(std::move(writing));
+            BOOST_CHECK(!failed);
+        }
+        static_cast<void>(co_await drive(file.close()));
+        auto reopening = co_await drive(environment.files->open(
+          path("/kwaque/data/file"),
+          {.close_policy = runtime::file_close_policy::checked}));
+        BOOST_REQUIRE(reopening);
+        auto reader = std::move(*reopening);
+        const auto bytes = co_await drive(
+          reader.read({}, byte_count{prefix.size() + body.size()}));
+        const auto closed = co_await drive(reader.close());
+        BOOST_CHECK(pinned && *pinned == 4);
+        BOOST_CHECK(parked && incomplete);
+        BOOST_REQUIRE(bytes);
+        BOOST_CHECK(
+          bytes->data().content_equals(mode == 0 ? prefix + body : prefix));
+        BOOST_CHECK(closed);
+        BOOST_CHECK_EQUAL(environment.files->pending_writes(), 0U);
+        BOOST_CHECK_EQUAL(environment.files->pending_operations(), 0U);
+    }
+}
+
+SEASTAR_TEST_CASE(
+  fake_file_pipeline_pressure_preserves_partial_write_uncertainty) {
+    using namespace kwaque;
+    fixture environment{
+      {},
+      fake_file_system_config{
+        .maximum_pending_operations = 6,
+        .maximum_pending_writes = 1,
+        .native_max_length = 4096}};
+    fake_file_driver drive{&environment.events};
+    BOOST_REQUIRE(
+      co_await drive(
+        environment.files->create_directories(path("/kwaque/data"))));
+    auto opened = co_await drive(environment.files->open(
+      path("/kwaque/data/pressure"),
+      {.access = runtime::file_access::read_write,
+       .create = true,
+       .close_policy = runtime::file_close_policy::checked}));
+    BOOST_REQUIRE(opened);
+    auto file = std::move(*opened);
+    const auto written = co_await drive(
+      file.write({}, payload(std::string(8192, 'p'))));
+    const auto read = co_await drive(file.read({}, byte_count{8192}));
+    const auto flushed = co_await drive(file.flush());
+    const auto closed = co_await drive(file.close());
+    BOOST_REQUIRE(!written && !flushed && !closed);
+    BOOST_CHECK(written.error().code() == errc::resource_exhausted);
+    BOOST_CHECK(
+      runtime::file_detail(written.error())
+      == runtime::file_failure_detail::unknown);
+    BOOST_CHECK(
+      written.error() == flushed.error() && written.error() == closed.error());
+    BOOST_REQUIRE(read);
+    BOOST_CHECK(read->data().content_equals(std::string(4096, 'p')));
+    BOOST_CHECK_EQUAL(environment.files->pending_operations(), 0U);
 }

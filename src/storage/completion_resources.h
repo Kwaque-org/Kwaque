@@ -17,6 +17,8 @@ struct completion_resource_limits final {
     // Caller-qualified served memory for retained control/work frames and
     // callbacks, independently of scratch backing and reservation bookkeeping.
     byte_count execution_bytes{16384};
+
+    [[nodiscard]] runtime::result<void> validate() const noexcept;
 };
 
 // Prepare before ordinary admission. The supplied file owner is pinned by the

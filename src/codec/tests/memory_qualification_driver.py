@@ -194,6 +194,42 @@ class MemoryQualificationTest(unittest.TestCase):
             )
         return bounds
 
+    def complete_owner_bounds(
+        self, samples: dict, owners: tuple[str, ...], all_new: frozenset[str]
+    ) -> list[dict]:
+        initialization = samples["sha-cold"]["peak_upper_bound"] + max(
+            samples[name]["peak_upper_bound"]
+            for name in ("crc-cold-32", "crc-cold-4096")
+        )
+        bounds = []
+        for name in owners:
+            row = samples[name]
+            operation = row["retained_bound"] + row["peak_upper_bound"] + initialization
+            self.assertLessEqual(operation, 64 << 20, name)
+            complete_execution = name in all_new
+            if complete_execution:
+                execution = initialization + row["peak_upper_bound"]
+                basis = "all_new_allocations_plus_cold_engines"
+            elif row.get("critical_observed", False):
+                execution = initialization + row["critical_peak_upper_bound"]
+                basis = "critical_allocations_plus_cold_engines"
+            else:
+                execution = None
+                basis = "critical_tracking_unavailable"
+            if execution is not None:
+                self.assertLessEqual(execution, row["execution_reservation"], name)
+            bounds.append(
+                {
+                    "scenario": name,
+                    "operation_upper_bound": operation,
+                    "operation_limit": 64 << 20,
+                    "execution_upper_bound": execution,
+                    "execution_basis": basis,
+                    "reservation": row["execution_reservation"],
+                }
+            )
+        return bounds
+
     def test_native_owner_reservations(self) -> None:
         binary = runfile(self.binary_path)
         output_root = os.environ.get("TEST_UNDECLARED_OUTPUTS_DIR")
@@ -208,6 +244,8 @@ class MemoryQualificationTest(unittest.TestCase):
             "architecture": platform.machine(),
             "complete": False,
             "qualified": False,
+            "operation_qualified": False,
+            "execution_qualified": False,
             "expected_scenarios": list(self.scenarios),
             "binaries": {},
             "observations": [],
@@ -259,6 +297,8 @@ class MemoryQualificationTest(unittest.TestCase):
         save()
         capability = self.profile(probe("capabilities"))
         native = capability["allocator"] == "native"
+        critical_tracking = native and capability["injection"] == "true"
+        evidence["critical_tracking"] = critical_tracking
         samples = {}
         for scenario in self.scenarios:
             output = probe(scenario, native)
@@ -293,19 +333,34 @@ class MemoryQualificationTest(unittest.TestCase):
             )
             self.assertIn("status=ok", output.splitlines())
             for row in measured:
+                row["critical_observed"] = critical_tracking
                 samples[row["scenario"]] = row
                 evidence["observations"].append(row)
             save()
+        execution_qualified = False
         if native:
-            self.assertGreater(
-                samples["observer-control"]["critical_peak_upper_bound"], 0
-            )
+            critical_peak = samples["observer-control"]["critical_peak_upper_bound"]
+            if critical_tracking:
+                self.assertGreater(critical_peak, 0)
+            else:
+                self.assertEqual(critical_peak, 0)
             self.assertEqual(samples["crc-warm-4096"]["mallocs"], 0)
             evidence["execution_bounds"] = self.execution_bounds(samples)
+            execution_qualified = all(
+                row["execution_upper_bound"] is not None
+                for row in evidence["execution_bounds"]
+            )
         evidence["complete"] = True
-        evidence["qualified"] = native
+        evidence["operation_qualified"] = native
+        evidence["execution_qualified"] = execution_qualified
+        evidence["qualified"] = native and execution_qualified
         save()
         if not native:
             self.skipTest(
                 "semantic scenarios completed; native allocation observation is unavailable"
+            )
+        if not execution_qualified:
+            self.skipTest(
+                "native operation bounds checked; critical-subset execution qualification "
+                "requires a native build with allocation-failure injection enabled"
             )

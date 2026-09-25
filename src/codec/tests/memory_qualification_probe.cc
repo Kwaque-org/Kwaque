@@ -109,8 +109,8 @@ std::uint32_t crc(const fragmented_buffer& input) {
 }
 void observer_control(std::unique_ptr<char[]>& startup_owner) {
 #if !defined(SEASTAR_DEFAULT_ALLOCATOR)
-    // Keep two differently classified owners alive together. Calibrate actual
-    // served capacity, not requested byte counts or net retained memory.
+    // Keep ordinary and critical-scope owners alive together. Both contribute
+    // to the served peak; critical classification depends on the build.
     testing::begin_allocation_observation();
     auto* plain = ::operator new(37);
     opaque(plain);
@@ -130,9 +130,15 @@ void observer_control(std::unique_ptr<char[]>& startup_owner) {
     require(
       result.peak_upper_bound == plain_bytes + critical_bytes,
       "observer missed overlapping owners");
+#if defined(SEASTAR_ENABLE_ALLOC_FAILURE_INJECTION)
     require(
       result.critical_peak_upper_bound == critical_bytes,
       "observer missed critical allocation");
+#else
+    require(
+      result.critical_peak_upper_bound == 0,
+      "observer reported unavailable critical classification");
+#endif
     require(
       result.live_upper_bound == 0 && result.allocations == 2
         && result.frees == 2,

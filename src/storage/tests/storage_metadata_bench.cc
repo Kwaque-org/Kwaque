@@ -1,4 +1,5 @@
 #include "src/codec/tests/benchmark_buffer.h"
+#include "src/codec/tests/qualification_profile.h"
 #include "src/storage/tests/storage_metadata_fixture.h"
 
 #include <seastar/core/coroutine.hh>
@@ -439,7 +440,7 @@ private:
     std::optional<complete_block_descriptor> block_;
     codec::immutable_object_digest digest_{{}};
     codec::decode_budget memory_{
-      byte_count{63U << 20U}, byte_count{1U << 20U}, capacity_bound};
+      codec::testing::residual, byte_count{1U << 20U}, capacity_bound};
     bool reported_{false};
 };
 template<

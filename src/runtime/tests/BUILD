@@ -129,6 +129,7 @@ kwaque_cc_seastar_test(
         "//src/runtime:file_error_internal",
         "//src/runtime:file_test_support",
         "//src/runtime:fragmented_buffer_internal",
+        "//src/runtime/testing:reactor_tasks",
     ],
 )
 
