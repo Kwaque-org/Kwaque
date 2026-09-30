@@ -125,6 +125,15 @@ SEASTAR_TEST_CASE(wal_writer_native_group_write_and_captured_barrier) {
       });
 }
 
+SEASTAR_TEST_CASE(wal_writer_native_zero_written_file) {
+    co_await with_wal(
+      0x33,
+      [](auto& files, auto& owner, const auto& spec, auto& budget, auto drive) {
+          return storage::testing::wal_append_contract::zero_written(
+            files, owner, spec, budget, drive);
+      });
+}
+
 SEASTAR_TEST_CASE(wal_writer_native_allocator_rounded_staging) {
     co_await with_wal(
       0x33,

@@ -1,8 +1,8 @@
 #include "src/bytes/test_allocation_profile.h"
-#include "src/codec/sha256.h"
 #include "src/codec/tests/envelope_decode_test_support.h"
 #include "src/codec/tests/format_fixture.h"
 #include "src/codec/tests/format_test_support.h"
+#include "src/codec/xxh3.h"
 #include "src/model/batch_codec.h"
 #include "src/model/checkpoint_codec.h"
 #include "src/model/record_codec.h"
@@ -24,7 +24,7 @@ using codec::testing::envelope_fixture::fragmented;
 
 codec::immutable_object_digest
 exact_digest(const bytes::fragmented_buffer& value) {
-    codec::sha256_hasher hash;
+    codec::xxh3_128_hasher hash;
     for (const auto fragment : value)
         hash.update(fragment.data(), fragment.size());
     return codec::immutable_object_digest{std::move(hash).final()};

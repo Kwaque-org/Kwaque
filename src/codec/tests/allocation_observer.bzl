@@ -3,6 +3,7 @@
 ALLOCATION_OBSERVER_LINKOPTS = select({
     "//bazel:system_allocator": [],
     "//conditions:default": [
+        "-Wl,--wrap=strerror_r",
         "-Wl,--wrap=malloc",
         "-Wl,--wrap=calloc",
         "-Wl,--wrap=realloc",

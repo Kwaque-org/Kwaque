@@ -98,7 +98,8 @@ TEST(RetryQualificationTest, CompleteMaximumSummaryKeepsOnlyOnePage) {
         const auto result = decode_sealed_footer(
                               input,
                               root_location(),
-                              codec::immutable_object_digest{exact_sha(over)},
+                              codec::immutable_object_digest{
+                                exact_digest(over)},
                               reserve(input, work),
                               work)
                               .get();
@@ -179,11 +180,6 @@ TEST(
                     succeeded = pending.get().has_value();
                 }
             } catch (const std::bad_alloc&) {
-            } catch (const std::runtime_error&) {
-                if (!injector.failed()) {
-                    injector.cancel();
-                    throw;
-                }
             } catch (...) {
                 injector.cancel();
                 throw;

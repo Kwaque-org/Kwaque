@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 import re
 from pathlib import Path
@@ -315,6 +314,166 @@ def xxh32_short(data: bytes) -> int:
     return value ^ (value >> 16)
 
 
+_M64 = (1 << 64) - 1
+_P32_1, _P32_2, _P32_3 = 0x9E3779B1, 0x85EBCA77, 0xC2B2AE3D
+_P64_1, _P64_2, _P64_3 = 0x9E3779B185EBCA87, 0xC2B2AE3D27D4EB4F, 0x165667B19E3779F9
+_P64_4, _P64_5 = 0x85EBCA77C2B2AE63, 0x27D4EB2F165667C5
+_XXH3_SECRET = bytes.fromhex(
+    "b8fe6c3923a44bbe7c01812cf721ad1cded46de9839097db7240a4a4b7b3671f"
+    "cb79e64eccc0e578825ad07dccff7221b8084674f743248ee03590e6813a264c"
+    "3c2852bb91c300cb88d0658b1b532ea371644897a20df94e3819ef46a9deacd8"
+    "a8fa763fe39c343ff9dcbbc7c70b4f1d8a51e04bcdb45931c89f7ec9d9787364"
+    "eac5ac8334d3ebc3c581a0fffa1363eb170ddd51b7f0da49d316552629d4689e"
+    "2b16be587d47a1fc8ff8b8d17ad031ce45cb3a8f95160428afd7fbcabb4b407e"
+)
+
+
+def _le64(data: bytes, at: int) -> int:
+    return int.from_bytes(data[at : at + 8], "little")
+
+
+def _le32(data: bytes, at: int) -> int:
+    return int.from_bytes(data[at : at + 4], "little")
+
+
+def _mul128(left: int, right: int) -> tuple[int, int]:
+    product = left * right
+    return product & _M64, product >> 64
+
+
+def _fold64(left: int, right: int) -> int:
+    low, high = _mul128(left, right)
+    return low ^ high
+
+
+def _xxh3_avalanche(value: int) -> int:
+    value ^= value >> 37
+    value = value * 0x165667919E3779F9 & _M64
+    return value ^ (value >> 32)
+
+
+def _xxh64_avalanche(value: int) -> int:
+    value ^= value >> 33
+    value = value * _P64_2 & _M64
+    value ^= value >> 29
+    value = value * _P64_3 & _M64
+    return value ^ (value >> 32)
+
+
+def _mix16(data: bytes, at: int, key: int) -> int:
+    return _fold64(
+        _le64(data, at) ^ _le64(_XXH3_SECRET, key),
+        _le64(data, at + 8) ^ _le64(_XXH3_SECRET, key + 8),
+    )
+
+
+def _mix32(low, high, data, first, second, key):
+    low = (low + _mix16(data, first, key)) & _M64
+    low ^= (_le64(data, second) + _le64(data, second + 8)) & _M64
+    high = (high + _mix16(data, second, key + 16)) & _M64
+    high ^= (_le64(data, first) + _le64(data, first + 8)) & _M64
+    return low, high
+
+
+def _xxh3_long(data: bytes) -> tuple[int, int]:
+    size, secret = len(data), _XXH3_SECRET
+    acc = [_P32_3, _P64_1, _P64_2, _P64_3, _P64_4, _P32_2, _P64_5, _P32_1]
+
+    def stripe(at: int, key: int) -> None:
+        for lane in range(8):
+            value = _le64(data, at + 8 * lane)
+            keyed = value ^ _le64(secret, key + 8 * lane)
+            acc[lane ^ 1] = (acc[lane ^ 1] + value) & _M64
+            acc[lane] = (acc[lane] + (keyed & 0xFFFFFFFF) * (keyed >> 32)) & _M64
+
+    stripes = (len(secret) - 64) // 8
+    block = 64 * stripes
+    blocks = (size - 1) // block
+    for index in range(blocks):
+        for number in range(stripes):
+            stripe(index * block + 64 * number, 8 * number)
+        for lane in range(8):
+            value = acc[lane] ^ (acc[lane] >> 47)
+            value ^= _le64(secret, len(secret) - 64 + 8 * lane)
+            acc[lane] = value * _P32_1 & _M64
+    for number in range(((size - 1) - block * blocks) // 64):
+        stripe(blocks * block + 64 * number, 8 * number)
+    stripe(size - 64, len(secret) - 64 - 7)
+
+    def merge(key: int, start: int) -> int:
+        result = start
+        for index in range(4):
+            result += _fold64(
+                acc[2 * index] ^ _le64(secret, key + 16 * index),
+                acc[2 * index + 1] ^ _le64(secret, key + 16 * index + 8),
+            )
+        return _xxh3_avalanche(result & _M64)
+
+    low = merge(11, size * _P64_1 & _M64)
+    high = merge(len(secret) - 64 - 11, ~(size * _P64_2) & _M64)
+    return low, high
+
+
+def xxh3_128(data: bytes) -> bytes:
+    """XXH3-128 with seed zero and the default secret, in canonical form
+    (high then low 64 bits, big-endian), written from the algorithm's own
+    definition so fixtures never depend on the native implementation."""
+    size, secret = len(data), _XXH3_SECRET
+    if size == 0:
+        low = _xxh64_avalanche(_le64(secret, 64) ^ _le64(secret, 72))
+        high = _xxh64_avalanche(_le64(secret, 80) ^ _le64(secret, 88))
+    elif size <= 3:
+        combined = (
+            (data[0] << 16) | (data[size >> 1] << 24) | data[size - 1] | (size << 8)
+        )
+        swapped = int.from_bytes(combined.to_bytes(4, "little"), "big")
+        rotated = ((swapped << 13) | (swapped >> 19)) & 0xFFFFFFFF
+        low = _xxh64_avalanche(combined ^ (_le32(secret, 0) ^ _le32(secret, 4)))
+        high = _xxh64_avalanche(rotated ^ (_le32(secret, 8) ^ _le32(secret, 12)))
+    elif size <= 8:
+        value = _le32(data, 0) + (_le32(data, size - 4) << 32)
+        keyed = value ^ (_le64(secret, 16) ^ _le64(secret, 24))
+        low, high = _mul128(keyed, _P64_1 + (size << 2))
+        high = (high + (low << 1)) & _M64
+        low ^= high >> 3
+        low ^= low >> 35
+        low = low * 0x9FB21C651E98DF25 & _M64
+        low ^= low >> 28
+        high = _xxh3_avalanche(high)
+    elif size <= 16:
+        first, last = _le64(data, 0), _le64(data, size - 8)
+        low, high = _mul128(
+            first ^ last ^ (_le64(secret, 32) ^ _le64(secret, 40)), _P64_1
+        )
+        low = (low + ((size - 1) << 54)) & _M64
+        last ^= _le64(secret, 48) ^ _le64(secret, 56)
+        high = (high + last + (last & 0xFFFFFFFF) * (_P32_2 - 1)) & _M64
+        low ^= int.from_bytes(high.to_bytes(8, "little"), "big")
+        mixed_low, mixed_high = _mul128(low, _P64_2)
+        mixed_high = (mixed_high + high * _P64_2) & _M64
+        low, high = _xxh3_avalanche(mixed_low), _xxh3_avalanche(mixed_high)
+    elif size <= 240:
+        low, high = size * _P64_1 & _M64, 0
+        if size <= 128:
+            for index in reversed(range((size - 1) // 32 + 1)):
+                low, high = _mix32(
+                    low, high, data, 16 * index, size - 16 * (index + 1), 32 * index
+                )
+        else:
+            for at in range(32, 160, 32):
+                low, high = _mix32(low, high, data, at - 32, at - 16, at - 32)
+            low, high = _xxh3_avalanche(low), _xxh3_avalanche(high)
+            for at in range(160, size + 1, 32):
+                low, high = _mix32(low, high, data, at - 32, at - 16, at - 157)
+            low, high = _mix32(low, high, data, size - 16, size - 32, 103)
+        combined_low = _xxh3_avalanche((low + high) & _M64)
+        high = (low * _P64_1 + high * _P64_4 + size * _P64_2) & _M64
+        low, high = combined_low, (-_xxh3_avalanche(high)) & _M64
+    else:
+        low, high = _xxh3_long(data)
+    return high.to_bytes(8, "big") + low.to_bytes(8, "big")
+
+
 def unique_object(pairs: list[tuple[str, object]]) -> dict:
     result = {}
     for key, value in pairs:
@@ -531,8 +690,8 @@ def validate(document: object, fixtures: dict[str, bytes]) -> None:
         elif check["algorithm"] == "lz4_descriptor":
             actual = bytes([(xxh32_short(value) >> 8) & 0xFF])
         else:
-            require(check["algorithm"] == "sha256", "unknown digest algorithm")
-            actual = hashlib.sha256(value).digest()
+            require(check["algorithm"] == "xxh3_128", "unknown digest algorithm")
+            actual = xxh3_128(value)
         require(actual == octets(check["expected"]), f"digest mismatch: {name}")
         if "stored" in check:
             target = check["stored"]

@@ -114,18 +114,10 @@ kwaque_cc_library(
     hdrs = ["sha256.h"],
     visibility = [
         "//src/codec/tests:__pkg__",
-        "//src/model:__pkg__",
-        "//src/model/tests:__pkg__",
-        "//src/protocol/tests:__pkg__",
         "//src/simulation:__pkg__",
         "//src/simulation/tests:__pkg__",
-        "//src/storage:__pkg__",
-        "//src/storage/tests:__pkg__",
     ],
-    deps = [
-        ":digest",
-        "@openssl",
-    ],
+    deps = ["@openssl"],
 )
 
 kwaque_cc_library(
@@ -176,9 +168,30 @@ kwaque_cc_library(
 )
 
 kwaque_cc_library(
-    name = "sha256_cooperative",
-    srcs = ["sha256_cooperative.cc"],
-    hdrs = ["sha256_cooperative.h"],
+    name = "xxh3",
+    srcs = ["xxh3.cc"],
+    hdrs = ["xxh3.h"],
+    visibility = [
+        "//src/codec/tests:__pkg__",
+        "//src/model:__pkg__",
+        "//src/model/tests:__pkg__",
+        "//src/protocol/tests:__pkg__",
+        "//src/simulation:__pkg__",
+        "//src/simulation/tests:__pkg__",
+        "//src/storage:__pkg__",
+        "//src/storage/tests:__pkg__",
+    ],
+    deps = [
+        ":digest",
+        "//src/base:invariant",
+        "@xxhash",
+    ],
+)
+
+kwaque_cc_library(
+    name = "xxh3_cooperative",
+    srcs = ["xxh3_cooperative.cc"],
+    hdrs = ["xxh3_cooperative.h"],
     visibility = [
         "//src/codec/tests:__pkg__",
         "//src/model:__pkg__",
@@ -190,7 +203,7 @@ kwaque_cc_library(
     ],
     deps = [
         ":cooperative",
-        ":sha256",
+        ":xxh3",
         "//src/base:invariant",
         "//src/bytes:fragmented_buffer",
         "@seastar",

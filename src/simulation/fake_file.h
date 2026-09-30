@@ -471,6 +471,8 @@ private:
     struct open_handle_state final : runtime::shard_affine {
         handle_lifecycle lifecycle{handle_lifecycle::open};
         bool reference_owned{false};
+        // Opened for synchronized data: each completed write is durable.
+        bool synchronous{false};
         std::uint64_t generation{0};
     };
 
@@ -735,6 +737,10 @@ private:
     void commit_truncate(prepared_truncate prepared) noexcept;
     [[nodiscard]] runtime::result<void> flush(const canonical_fake_path& path);
     [[nodiscard]] runtime::result<void> flush(fake_object_id id);
+    // Synchronized-write durability: only the written pages and the size
+    // needed to read them become durable, never other volatile writes.
+    [[nodiscard]] runtime::result<void> flush_written(
+      fake_object_id id, std::uint64_t position, std::uint64_t length);
     void restore_durable_state() noexcept;
     void invalidate_handles() noexcept;
     [[nodiscard]] runtime::result<void> begin_crash(fake_operation_id active);

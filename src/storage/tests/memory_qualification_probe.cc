@@ -16,7 +16,9 @@ int exercise(std::string_view name) {
     std::printf("compiler=%s\n", __clang_version__);
     if (name == "capabilities") return 0;
     q::observation::require_effective_policy();
-    if (name.starts_with("extent-"))
+    if (name.starts_with("segment-owner-"))
+        q::segment_operation(name);
+    else if (name.starts_with("extent-"))
         q::extent_operation(name);
     else if (
       name.starts_with("index-") || name.starts_with("manifest-")
@@ -30,10 +32,6 @@ int exercise(std::string_view name) {
 } // namespace
 
 int main(int argc, char** argv) {
-    if (!kwaque::codec::testing::install_crypto_allocation_observation()) {
-        std::fputs("crypto allocation hooks require a fresh process\n", stderr);
-        return 1;
-    }
     seastar::app_template app;
     app.set_configuration_reader([](boost::program_options::variables_map&) {});
     app.add_options()(

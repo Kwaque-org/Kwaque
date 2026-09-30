@@ -1,4 +1,3 @@
-#include "src/codec/digest.h"
 #include "src/codec/sha256.h"
 
 #include <gtest/gtest.h>
@@ -50,9 +49,6 @@ void expect_digest(const sha256_digest& digest, std::string_view expected) {
     }
     EXPECT_EQ((std::string_view{encoded.data(), encoded.size()}), expected);
 }
-
-constexpr std::array<unsigned char, 7> binary_payload{
-  0x00, 0x01, 0x7f, 0x80, 0xff, 0x00, 0x42};
 
 TEST(CodecSha256Test, KnownMessagesAgreeAtEverySplitIncludingEmptyUpdates) {
     struct vector_case {
@@ -141,39 +137,6 @@ TEST(CodecSha256Test, MillionByteVectorUsesBoundedRepeatedUpdates) {
     expect_digest(
       std::move(hasher).final(),
       "cdc76e5c9914fb9281a1c7e284d73e67f1809a48a497200e046d39ccc7112cd0"sv);
-}
-
-TEST(CodecSha256Test, NamedPrefixesHashExactlyOneTerminatorBeforePayload) {
-    sha256_hasher batch;
-    batch.update(
-      codec::semantic_batch_domain.data(), codec::semantic_batch_domain.size());
-    batch.update(binary_payload.data(), binary_payload.size());
-    expect_digest(
-      std::move(batch).final(),
-      "916187034d64dba2815da3fe7948f9d2fe5d94cdf8d6aa2a8d92e9317da11f47"sv);
-
-    sha256_hasher checkpoint;
-    checkpoint.update(
-      codec::checkpoint_domain.data(), codec::checkpoint_domain.size());
-    checkpoint.update(binary_payload.data(), binary_payload.size());
-    expect_digest(
-      std::move(checkpoint).final(),
-      "8a50bad747737456ec59ae4cf336351aa7849338016f8df9a2f7595bdc13ac4e"sv);
-}
-
-TEST(CodecSha256Test, ObjectAndExtentTagsPreserveTheUnprefixedDigestBytes) {
-    sha256_hasher hasher;
-    hasher.update(binary_payload.data(), binary_payload.size());
-    const auto raw = std::move(hasher).final();
-    const codec::immutable_object_digest object{raw};
-    const codec::extent_digest extent{raw};
-    constexpr std::string_view expected{
-      "8184569834ae09c86f52f84662be23139718c4ac9b489954e4ac6f7e183782fa"};
-    expect_digest(raw, expected);
-    expect_digest(object.bytes(), expected);
-    expect_digest(extent.bytes(), expected);
-    EXPECT_EQ(object.bytes(), raw);
-    EXPECT_EQ(extent.bytes(), raw);
 }
 
 } // namespace

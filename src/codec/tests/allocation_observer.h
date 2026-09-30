@@ -11,7 +11,10 @@ namespace kwaque::codec::testing {
 // in; otherwise its zero counter does not establish a critical-memory bound.
 // Internal frees can bypass executable link wrapping. Their charges remain
 // until pointer reuse proves release, so live/peak values are conservative
-// upper bounds. Every allocation must match the native allocation count.
+// upper bounds. Synchronous libc error-message translation is bounded from its
+// native allocation count and requested-byte total, retaining every charge and
+// assigning it to the critical subset when supported. Every allocation must
+// still match the native allocation count.
 // Frees count only tracked owners; releasing a pre-existing native or system
 // owner cannot subtract from the bound or count as an observed native free.
 struct allocation_observation final {
@@ -26,12 +29,6 @@ struct allocation_observation final {
     std::uint64_t native_allocations{0};
     std::uint64_t native_frees{0};
 };
-
-// Call before any crypto allocation in the isolated probe. Shared-library
-// calls do not pass through executable link wrappers; the native crypto memory
-// hooks route them through the same observer while retaining zero-size rules.
-[[nodiscard]] bool install_crypto_allocation_observation() noexcept;
-[[nodiscard]] std::uint64_t crypto_allocation_calls() noexcept;
 
 // Only one interval on one reactor may use the static observer workspace.
 // Observation allocates nothing. Overflow or missed native allocations make

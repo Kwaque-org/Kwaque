@@ -75,7 +75,7 @@ class CriticalReservationTest(unittest.TestCase):
                 "execution_reservation": 1 << 20,
             }
             for name in (
-                "sha-cold",
+                "xxh3-cold",
                 "crc-cold-32",
                 "crc-cold-4096",
                 "payload",
@@ -105,7 +105,7 @@ class CriticalReservationTest(unittest.TestCase):
             ("payload", "peak_upper_bound", 64 << 20),
             ("payload", "retained_bound", 64 << 20),
             ("metadata", "peak_upper_bound", 1 << 20),
-            ("sha-cold", "peak_upper_bound", 1 << 20),
+            ("xxh3-cold", "peak_upper_bound", 1 << 20),
         ):
             samples = self.samples(False)
             samples[name][field] = value
@@ -134,7 +134,7 @@ class CriticalReservationTest(unittest.TestCase):
                 "crc-cold-32",
                 "crc-cold-4096",
                 "crc-warm-4096",
-                "sha-cold",
+                "xxh3-cold",
                 "payload",
                 "metadata",
             )
@@ -173,12 +173,13 @@ class CriticalReservationTest(unittest.TestCase):
                             "observer-reallocation",
                             "observer-preexisting-free",
                             "observer-conservative-free",
+                            "observer-error-message",
                         ]
                         output += "control missed_allocation_detected=true\n"
                     for name in names:
                         peak = (
                             0
-                            if name == "crc-warm-4096"
+                            if name in {"crc-warm-4096", "xxh3-cold"}
                             else (8 << 20) if name == "payload" else 1024
                         )
                         largest = min(peak, 128 << 10)

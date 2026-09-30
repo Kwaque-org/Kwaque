@@ -31,10 +31,7 @@ namespace {
 using detail::load;
 using detail::page_error;
 using detail::store;
-constexpr codec::sha256_digest empty_sha{
-  0xe3, 0xb0, 0xc4, 0x42, 0x98, 0xfc, 0x1c, 0x14, 0x9a, 0xfb, 0xf4,
-  0xc8, 0x99, 0x6f, 0xb9, 0x24, 0x27, 0xae, 0x41, 0xe4, 0x64, 0x9b,
-  0x93, 0x4c, 0xa4, 0x95, 0x99, 0x1b, 0x78, 0x52, 0xb8, 0x55};
+constexpr auto empty_digest = codec::xxh3_128_empty;
 
 codec::result<void> check_counts(
   std::uint32_t total,
@@ -111,9 +108,11 @@ struct sealed_reader final {
           auto valid = detail::check_boundary(boundary, expected, c, true);
           !valid)
             co_return codec::failure(valid.error());
-        const codec::extent_digest extent_digest{
-          detail::read_digest<188>(fixed)};
-        if (coverage->bytes().empty() && extent_digest.bytes() != empty_sha)
+        const auto stored_digest = detail::read_digest<188>(fixed);
+        if (!stored_digest)
+            co_return codec::failure(page_error(errc::malformed_data, c, 204));
+        const codec::extent_digest extent_digest{*stored_digest};
+        if (coverage->bytes().empty() && extent_digest.bytes() != empty_digest)
             co_return codec::failure(page_error(errc::malformed_data, c, 188));
         const auto total = load<220, std::uint32_t>(fixed);
         const auto count = detail::page_wire(

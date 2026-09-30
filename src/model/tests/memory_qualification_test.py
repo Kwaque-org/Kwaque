@@ -11,7 +11,7 @@ ENGINE_SCENARIOS = (
     "crc-cold-32",
     "crc-cold-4096",
     "crc-warm-4096",
-    "sha-cold",
+    "xxh3-cold",
 )
 MODEL_SCENARIOS = (
     "record-materialize",
@@ -110,7 +110,7 @@ class MemoryQualificationTest(shared.MemoryQualificationTest):
         "reactor-local new-allocation upper bounds plus retained input/cache and "
         "separate cold-engine bounds; execution_basis distinguishes all-new "
         "allocation checks from critical/frame/control-subset checks for paths "
-        "that allocate payload/scratch; OpenSSL automatic configuration disabled; "
+        "that allocate payload/scratch; "
         "not RSS, arbitrary caller/opaque-owner qualification or instrumented timing"
     )
 

@@ -11,7 +11,7 @@ ENGINE_SCENARIOS = (
     "crc-cold-32",
     "crc-cold-4096",
     "crc-warm-4096",
-    "sha-cold",
+    "xxh3-cold",
 )
 FRAME_SCENARIOS = (
     tuple(
@@ -114,7 +114,7 @@ class MemoryQualificationTest(shared.MemoryQualificationTest):
         "and joined temporary cleanup, with returned owners live at observation "
         "end; complete control aggregate also includes supplied owners and cold "
         "engines under 1 MiB; only exact/short/late_abort controls warm a baseline; "
-        "OpenSSL automatic configuration disabled; not socket/connection, RSS "
+        "not socket/connection, RSS "
         "or arbitrary opaque caller qualification and not instrumented timing"
     )
 
@@ -183,7 +183,7 @@ class ReservationBoundsTest(unittest.TestCase):
             ("decode-max-fragmented", "retained_bound", 64 << 20),
             ("prefix-h48", "mallocs", 1),
             ("prefix-h4096", "peak_upper_bound", 1),
-            ("sha-cold", "peak_upper_bound", 1 << 20),
+            ("xxh3-cold", "peak_upper_bound", 1 << 20),
         ):
             with self.subTest(name=name, field=field), self.assertRaises(
                 AssertionError

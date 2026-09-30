@@ -27,8 +27,8 @@ struct batch_probe final {
     std::uint64_t original{0}, retained{0}, headers{0};
     std::int64_t timestamp{0};
     std::uint64_t begin{0}, end{0};
-    codec::sha256_digest digest{};
-    codec::sha256_digest record_digest{};
+    codec::content_digest digest{};
+    codec::content_digest record_digest{};
     bool compressed{false};
     bool canonical{false};
     // Set only after LZ4 header/profile validation, when body expansion fails.
@@ -69,7 +69,7 @@ void put(
 std::string varuint(std::uint64_t value);
 // Small independent native frame fixture; bounded to one native input quantum.
 std::string lz4_records(std::string_view records);
-codec::sha256_digest
+codec::content_digest
 fingerprint(std::string_view fixed, std::string_view records);
 void repair_crc(std::string& wire);
 std::string frame(std::string body, bool assigned, bool extension);

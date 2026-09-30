@@ -253,15 +253,28 @@ TEST(
           fixture::topic(), source, memory(), work);
     });
     exercise([&](codec::cooperative_work& work) {
-        return model::compute_checkpoint_fingerprint(built.value, work);
-    });
-    exercise([&](codec::cooperative_work& work) {
         return model::encode_read_checkpoint(
           built.value, work, memory().operation_remaining, charge);
     });
-    EXPECT_EQ(
-      model::compute_checkpoint_fingerprint(built.value, setup).get().value(),
-      warm);
+    // The fingerprint keeps its hash state inline, so it reaches no injectable
+    // allocation; coroutine frames are critical and are not counted.
+    {
+        seastar::abort_source abort;
+        codec::cooperative_work work{codec::limits::defaults(), abort};
+        auto& injector = seastar::memory::local_failure_injector();
+        const auto before = injector.alloc_count();
+        injector.fail_after(0);
+        const auto fingerprint
+          = model::compute_checkpoint_fingerprint(built.value, work).get();
+        const bool injected = injector.failed();
+        const auto after = injector.alloc_count();
+        injector.cancel();
+        EXPECT_FALSE(injected);
+        EXPECT_EQ(after, before);
+        ASSERT_TRUE(fingerprint);
+        EXPECT_EQ(*fingerprint, warm);
+    }
+    EXPECT_TRUE(std::ranges::equal(source, built.value.cursors()));
 #endif
 }
 

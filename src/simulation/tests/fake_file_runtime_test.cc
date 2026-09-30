@@ -1793,6 +1793,101 @@ SEASTAR_TEST_CASE(fake_crash_restores_only_completed_durable_boundaries) {
     co_return;
 }
 
+// A synchronized handle's completed write is durable with the size needed to
+// read it back, without a flush. Ordinary writes to the same inode stay
+// volatile until their own flush, whichever handle made the other durable.
+SEASTAR_TEST_CASE(fake_synchronous_writes_are_durable_at_completion) {
+    fixture environment;
+    auto rejected = environment.files->open(
+      path("/kwaque/data/file"),
+      {.access = kwaque::runtime::file_access::read_only, .synchronous = true});
+    const auto invalid = co_await std::move(rejected);
+    BOOST_REQUIRE(!invalid.has_value());
+    BOOST_CHECK(invalid.error().code() == kwaque::errc::invalid_argument);
+
+    auto creating = environment.files->create_directories(path("/kwaque/data"));
+    co_await pump_until(environment.events, creating);
+    co_await require_ready_success(creating);
+    auto syncing_root = environment.files->sync_directory(path("/kwaque"));
+    co_await pump_until(environment.events, syncing_root);
+    co_await require_ready_success(syncing_root);
+    auto opening = environment.files->open(
+      path("/kwaque/data/file"),
+      {.access = kwaque::runtime::file_access::read_write, .create = true});
+    co_await pump_until(environment.events, opening);
+    auto opened = co_await std::move(opening);
+    BOOST_REQUIRE(opened.has_value());
+    auto plain = std::move(*opened);
+    auto syncing_directory = environment.files->sync_directory(
+      path("/kwaque/data"));
+    co_await pump_until(environment.events, syncing_directory);
+    co_await require_ready_success(syncing_directory);
+
+    auto initial = plain.write(
+      kwaque::runtime::file_position{0}, payload(std::string(8'192, 'a')));
+    co_await pump_until(environment.events, initial);
+    co_await require_ready_success(initial);
+    auto flushing = plain.flush();
+    co_await pump_until(environment.events, flushing);
+    co_await require_ready_success(flushing);
+
+    auto synchronizing = environment.files->open(
+      path("/kwaque/data/file"),
+      {.access = kwaque::runtime::file_access::read_write,
+       .synchronous = true});
+    co_await pump_until(environment.events, synchronizing);
+    auto synchronized = co_await std::move(synchronizing);
+    BOOST_REQUIRE(synchronized.has_value());
+    auto synchronous = std::move(*synchronized);
+
+    auto overwrite = synchronous.write(
+      kwaque::runtime::file_position{0}, payload(std::string(4'096, 'b')));
+    co_await pump_until(environment.events, overwrite);
+    co_await require_ready_success(overwrite);
+    auto volatile_write = plain.write(
+      kwaque::runtime::file_position{4'096}, payload(std::string(4'096, 'c')));
+    co_await pump_until(environment.events, volatile_write);
+    co_await require_ready_success(volatile_write);
+    auto growing = synchronous.write(
+      kwaque::runtime::file_position{8'192}, payload(std::string(4'096, 'd')));
+    co_await pump_until(environment.events, growing);
+    co_await require_ready_success(growing);
+
+    auto crashing = environment.files->crash();
+    co_await pump_until(environment.events, crashing);
+    co_await require_ready_success(crashing);
+    for (auto* stale : {&plain, &synchronous}) {
+        auto closing = stale->close();
+        co_await require_ready_success(closing);
+    }
+
+    auto reopening = environment.files->open(
+      path("/kwaque/data/file"),
+      {.access = kwaque::runtime::file_access::read_write});
+    co_await pump_until(environment.events, reopening);
+    auto reopened = co_await std::move(reopening);
+    BOOST_REQUIRE(reopened.has_value());
+    auto current = std::move(*reopened);
+    auto sizing = current.size();
+    co_await pump_until(environment.events, sizing);
+    const auto size = co_await std::move(sizing);
+    BOOST_REQUIRE(size.has_value());
+    BOOST_CHECK(*size == 12'288U);
+    auto reading = current.read(
+      kwaque::runtime::file_position{0}, kwaque::byte_count{12'288});
+    co_await pump_until(environment.events, reading);
+    auto observed = co_await std::move(reading);
+    BOOST_REQUIRE(observed.has_value());
+    BOOST_CHECK(observed->data().content_equals(
+      std::string(4'096, 'b') + std::string(4'096, 'a')
+      + std::string(4'096, 'd')));
+    auto closing = current.close();
+    co_await pump_until(environment.events, closing);
+    co_await require_ready_success(closing);
+    BOOST_CHECK(environment.files->pending_operations() == 0U);
+    co_return;
+}
+
 SEASTAR_TEST_CASE(
   fake_crash_drains_bulk_and_scalar_reads_with_intent_cancellation) {
     seastar::chunked_vector<fault_rule> rules;

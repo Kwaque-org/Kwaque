@@ -5,8 +5,13 @@
 
 namespace kwaque::codec {
 
-inline constexpr std::size_t sha256_digest_bytes{32};
-using sha256_digest = std::array<unsigned char, sha256_digest_bytes>;
+// A 128-bit non-cryptographic content identity (XXH3-128, canonical form).
+inline constexpr std::size_t content_digest_bytes{16};
+using content_digest = std::array<unsigned char, content_digest_bytes>;
+// Encoded digests occupy a slot of this size: the content digest followed by
+// zero bytes that decoders reject when set. A wider identity can later use
+// the same slot without moving any field.
+inline constexpr std::size_t digest_slot_bytes{32};
 
 namespace detail {
 
@@ -14,17 +19,17 @@ namespace detail {
 template<typename Domain>
 class digest_value final {
 public:
-    explicit constexpr digest_value(sha256_digest bytes) noexcept
+    explicit constexpr digest_value(content_digest bytes) noexcept
       : bytes_(bytes) {}
 
-    [[nodiscard]] constexpr sha256_digest bytes() const noexcept {
+    [[nodiscard]] constexpr content_digest bytes() const noexcept {
         return bytes_;
     }
 
     bool operator==(const digest_value&) const noexcept = default;
 
 private:
-    sha256_digest bytes_;
+    content_digest bytes_;
 };
 
 struct semantic_batch_digest_tag;

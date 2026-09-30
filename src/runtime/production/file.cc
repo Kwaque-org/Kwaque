@@ -62,6 +62,9 @@ seastar::open_flags native_open_flags(const file_open_options& options) {
     if (options.truncate) {
         flags |= seastar::open_flags::truncate;
     }
+    if (options.synchronous) {
+        flags |= seastar::open_flags::dsync;
+    }
     return flags;
 }
 

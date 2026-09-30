@@ -114,12 +114,15 @@ codec::result<local_footer_reference>
 read_local_footer(const std::array<char, N>& raw, codec::field_context c) {
     if (load<Offset + 14, std::uint16_t>(raw) != 0)
         return codec::failure(page_error(errc::malformed_data, c, Offset + 14));
+    const auto digest = read_digest<Offset + 16>(raw);
+    if (!digest)
+        return codec::failure(page_error(errc::malformed_data, c, Offset + 32));
     return local_wire(
       local_footer_reference::make(
         runtime::file_position{load<Offset, std::uint64_t>(raw)},
         byte_count{load<Offset + 8, std::uint32_t>(raw)},
         load<Offset + 12, std::uint16_t>(raw),
-        codec::immutable_object_digest{read_digest<Offset + 16>(raw)}),
+        codec::immutable_object_digest{*digest}),
       c,
       Offset);
 }

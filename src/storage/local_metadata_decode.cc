@@ -176,10 +176,12 @@ public:
                 auto id = detail::read_id<0, model::wal_incarnation_id>(
                   *raw_head, field);
                 if (!id) co_return codec::failure(id.error());
+                const auto digest = detail::read_digest<16>(*raw_head);
+                if (!digest)
+                    co_return codec::failure(
+                      page_error(errc::malformed_data, field, 32));
                 head = local_wal_head{
-                  *id,
-                  codec::immutable_object_digest{
-                    detail::read_digest<16>(*raw_head)}};
+                  *id, codec::immutable_object_digest{*digest}};
             }
             value_.emplace(
               local_shard_control{
@@ -397,10 +399,14 @@ public:
             if (load<138, std::uint16_t>(*raw) != 0)
                 co_return codec::failure(
                   page_error(errc::malformed_data, c, 138));
+            const auto digest = detail::read_digest<24>(*raw);
+            if (!digest)
+                co_return codec::failure(
+                  page_error(errc::malformed_data, c, 40));
             value_.emplace(
               local_recovery_decision{
                 *cursor,
-                codec::immutable_object_digest{detail::read_digest<24>(*raw)},
+                codec::immutable_object_digest{*digest},
                 *sc,
                 runtime::file_position{load<128, std::uint64_t>(*raw)},
                 static_cast<local_recovery_action>(

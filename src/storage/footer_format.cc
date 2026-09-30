@@ -197,6 +197,12 @@ public:
       model::file_byte_span extent) noexcept {
         return durable_footer{location, boundary, extent};
     }
+    static encoded_durable_footer pair(
+      bytes::fragmented_buffer bytes,
+      durable_footer descriptor,
+      codec::limits policy) noexcept {
+        return encoded_durable_footer{std::move(bytes), descriptor, policy};
+    }
 };
 } // namespace detail
 
@@ -224,7 +230,7 @@ codec::result<void> validate_durable_footer(
     return {};
 }
 
-seastar::future<codec::result<bytes::fragmented_buffer>> encode_durable_footer(
+seastar::future<codec::result<encoded_durable_footer>> encode_durable_footer(
   verified_extent evidence,
   footer_expectation expected,
   codec::cooperative_work& work,
@@ -296,7 +302,7 @@ seastar::future<codec::result<bytes::fragmented_buffer>> encode_durable_footer(
       fixed, static_cast<std::uint32_t>(layout->padding_bytes().value()));
     auto output = co_await detail::encode_padded(
       fixed,
-      bytes::fragmented_buffer{},
+      std::nullopt,
       *layout,
       codec::format_family::durable_boundary_footer,
       work,
@@ -309,7 +315,11 @@ seastar::future<codec::result<bytes::fragmented_buffer>> encode_durable_footer(
         output = bytes::fragmented_buffer{};
         co_return codec::failure(ready.error());
     }
-    co_return std::move(*output);
+    co_return detail::footer_codec::pair(
+      std::move(*output),
+      detail::footer_codec::make(
+        expected, boundary, layout->at(expected.position).value()),
+      work.policy());
 }
 
 namespace {

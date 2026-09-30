@@ -24,4 +24,14 @@ inline byte_count charge(byte_count request) noexcept {
     return byte_count{request.value() <= 16384 ? 2U * rounded : rounded};
 #endif
 }
+
+// Whether charge() models the native allocator. An owner that packs pieces
+// into one allocation only when that is no dearer than the pieces can decide
+// differently under the system model, whose per-allocation slack is smaller.
+inline constexpr bool native_charge_profile =
+#if defined(SEASTAR_DEFAULT_ALLOCATOR)
+  false;
+#else
+  true;
+#endif
 } // namespace kwaque::bytes::testing

@@ -1,6 +1,6 @@
 #include "src/protocol/tests/frame_fuzz_cases.h"
 
-#include "src/codec/sha256.h"
+#include "src/codec/xxh3.h"
 #include "src/protocol/batch_frame_codec.h"
 #include "src/protocol/tests/batch_frame_test_support.h"
 #include "src/protocol/tests/frame_fuzz_oracle.h"
@@ -192,8 +192,8 @@ void check_header(
     require(header.payload_crc32c == oracle::little(wire, 44, 4));
 }
 
-codec::sha256_digest record_digest(const fragmented_buffer& records) {
-    codec::sha256_hasher hash;
+codec::content_digest record_digest(const fragmented_buffer& records) {
+    codec::xxh3_128_hasher hash;
     for (const auto fragment : records) {
         hash.update(fragment.data(), fragment.size());
         seastar::thread::maybe_yield();

@@ -7,6 +7,8 @@
 #include <seastar/core/abort_source.hh>
 #include <seastar/core/coroutine.hh>
 #include <seastar/core/memory.hh>
+#include <seastar/core/preempt.hh>
+#include <seastar/core/thread.hh>
 #include <seastar/coroutine/maybe_yield.hh>
 #include <seastar/util/alloc_failure_injector.hh>
 #include <seastar/util/later.hh>
@@ -150,6 +152,38 @@ TEST(CooperativeWorkTest, OversizedLeavesRejectWithoutCharging) {
       errc::resource_exhausted);
     EXPECT_EQ(work.bytes_remaining(), byte_count{5});
     EXPECT_EQ(work.items_remaining(), item_count{3});
+}
+
+TEST(CooperativeWorkTest, RefillingWithoutPreemptionDoesNotAllocateAFrame) {
+#if defined(SEASTAR_DEBUG) || defined(SEASTAR_DEFAULT_ALLOCATOR)
+    GTEST_SKIP()
+      << "requires native allocation counters and conditional preemption";
+#else
+    seastar::abort_source abort;
+    for (unsigned attempt = 0; attempt != 32; ++attempt) {
+        seastar::yield().get();
+        cooperative_work work{policy_with(8, 4), abort};
+        const auto full
+          = work.admit(byte_count{8}, item_count{4}, anchor).get();
+        ASSERT_TRUE(full);
+        const auto before = seastar::memory::stats().mallocs();
+        const auto preempt_before = seastar::need_preempt();
+        auto admitted = work.admit(byte_count{3}, item_count{1}, anchor);
+        const auto preempt_after = seastar::need_preempt();
+        const auto after = seastar::memory::stats().mallocs();
+        const auto ready = admitted.available();
+        const auto result = admitted.get();
+        ASSERT_TRUE(result);
+        EXPECT_EQ(work.bytes_remaining(), byte_count{5});
+        EXPECT_EQ(work.items_remaining(), item_count{3});
+        if (!preempt_before && !preempt_after) {
+            EXPECT_TRUE(ready);
+            EXPECT_EQ(before, after);
+            return;
+        }
+    }
+    FAIL() << "could not observe an admission without a preemption request";
+#endif
 }
 
 TEST(CooperativeWorkTest, SeparatePassesConsumeSeparateByteWork) {

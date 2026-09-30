@@ -90,7 +90,7 @@ TEST(StorageFuzzCasesTest, MalformedPaddingRejectsAcrossFragmentLayouts) {
                 repair(wire);
                 if (!is_root) refs[0] = fixture.reference(wire, 0);
                 const auto pin = codec::immutable_object_digest{
-                  index::sha(is_root ? wire : fixture.root_wire(refs))};
+                  index::digest_of(is_root ? wire : fixture.root_wire(refs))};
                 for (const std::size_t width : {1U, 7U, 67U, 4096U}) {
                     const auto seen = observe_metadata(
                       fixture, is_root, wire, refs, pin, width);
@@ -138,38 +138,38 @@ TEST(StorageFuzzCasesTest, MetadataIndependentFixedBytesAndExactHashes) {
         std::size_t header;
         const char* page_prefix;
         const char* root_prefix;
-        const char* page_sha;
-        const char* root_sha;
+        const char* page_digest;
+        const char* root_digest;
     };
     const std::array cases{
       golden{
         false,
         32,
-        "4b5142460800010001002000e00100000000000000000000fd5f38732428ec2e",
-        "4b5142460800010001002000e0010000000000000000000052e54739a62e6d4a",
-        "ae94601a4a4681d1e1f177f32e42ff920e7e288a83b451030cfd33cd6bd6d14a",
-        "dfc559fa656bc7e7fbd7adbc968cad3eca40b00d80b501013025ebbd71bafc2b"},
+        "4b5142460800010001002000e001000000000000000000001733694086360e8c",
+        "4b5142460800010001002000e00100000000000000000000ec0bed6cd1805ccd",
+        "9a80b14ad14fb36c79d8e1eb3a0d87f3",
+        "ee2c54a72d47091731a5d53a07015ca4"},
       golden{
         false,
         4096,
-        "4b5142460800020001000010000200000000000000000000c12e805f0e23330d",
-        "4b5142460800020001000010000200000000000000000000a17ff3fab012096c",
-        "527490c660113bb1711522c5032826c0d44dcfe98daac244a3142ae32adf28d1",
-        "79dccef5e2493c2a9cbb384cd4159238ee3712c51626ae183a744ee29591ffb1"},
+        "4b5142460800020001000010000200000000000000000000c504de3d2e65c58f",
+        "4b5142460800020001000010000200000000000000000000263dc9bb5187d5ba",
+        "54b6ad14b069fcb1241158c65bd62e0e",
+        "a488a0539ccc311a37feae0a6bb59f22"},
       golden{
         true,
         32,
-        "4b5142460900010001002000e00100000000000000000000f6e5b572846f19c6",
-        "4b5142460900010001002000e00100000000000000000000f49edaef76a4f2e8",
-        "5728526fec256da3f5abcfc590e1b47adae4001a44f6f5e34fb688b908656a41",
-        "ec87b07c197748f7ea615f29f3750849b4174d179ee957af16ab6a559665b0e5"},
+        "4b5142460900010001002000e001000000000000000000005e00278cadddb35d",
+        "4b5142460900010001002000e001000000000000000000001301aa1f1b36d28d",
+        "130ba44c2114cfea5f3fa1459a818ce9",
+        "e22d2348fb9d55e63531f5d0d758dd13"},
       golden{
         true,
         4096,
-        "4b5142460900020001000010000200000000000000000000b67b1234942cadf1",
-        "4b5142460900020001000010000200000000000000000000524bbc14de238cf5",
-        "5762c0464778bf57acca35629c851893f06b539409f19fff3cc08356c05128e8",
-        "b9d398d12dd5611570649bf8442a60daa3ef492f06279fb0e8a8a8ff4aeba46c"}};
+        "4b51424609000200010000100002000000000000000000003f61df0ad8e29be0",
+        "4b5142460900020001000010000200000000000000000000ae1ed5a4847dc45f",
+        "72995518bf5b15ac5102b99330559db1",
+        "5beefb3d1fc4127bd68edeb030965fff"}};
     for (const auto& known : cases) {
         const metadata_fixture fixture{known.manifest, 2, 1, known.header};
         const auto page = fixture.page_wire(0);
@@ -179,12 +179,12 @@ TEST(StorageFuzzCasesTest, MetadataIndependentFixedBytesAndExactHashes) {
         EXPECT_EQ(root.substr(0, 32), hex(known.root_prefix));
         EXPECT_TRUE(
           std::ranges::equal(
-            std::bit_cast<std::array<char, 32>>(index::sha(page)),
-            hex(known.page_sha)));
+            std::bit_cast<std::array<char, 16>>(index::digest_of(page)),
+            hex(known.page_digest)));
         EXPECT_TRUE(
           std::ranges::equal(
-            std::bit_cast<std::array<char, 32>>(index::sha(root)),
-            hex(known.root_sha)));
+            std::bit_cast<std::array<char, 16>>(index::digest_of(root)),
+            hex(known.root_digest)));
         for (const bool is_root : {false, true}) {
             const auto& wire = is_root ? root : page;
             const auto seen = observe_metadata(
@@ -192,14 +192,14 @@ TEST(StorageFuzzCasesTest, MetadataIndependentFixedBytesAndExactHashes) {
               is_root,
               wire,
               refs,
-              codec::immutable_object_digest{index::sha(root)},
+              codec::immutable_object_digest{index::digest_of(root)},
               7);
             EXPECT_FALSE(seen.error.has_value());
             EXPECT_EQ(seen.consumed.value(), wire.size());
             EXPECT_TRUE(
               std::ranges::equal(
-                std::bit_cast<std::array<char, 32>>(seen.digest),
-                hex(is_root ? known.root_sha : known.page_sha)));
+                std::bit_cast<std::array<char, 16>>(seen.digest),
+                hex(is_root ? known.root_digest : known.page_digest)));
         }
     }
 }
@@ -221,14 +221,14 @@ TEST(
                                      : index::root_wire(
                                          refs, fixture.index_context, 41))
                                 : page;
-            const auto canonical = index::sha(wire);
+            const auto canonical = index::digest_of(wire);
             // A one-byte optional extension is legal. Its opaque contents do
             // not change the decoded body or its independent reconstruction.
             wire[40] = 'x';
             repair(wire);
             if (!is_root) refs[0] = fixture.reference(wire, 0);
             const auto pin = codec::immutable_object_digest{
-              index::sha(is_root ? wire : fixture.root_wire(refs))};
+              index::digest_of(is_root ? wire : fixture.root_wire(refs))};
             const auto seen = observe_metadata(
               fixture, is_root, wire, refs, pin, 7);
             ASSERT_FALSE(seen.error.has_value());
@@ -264,7 +264,8 @@ TEST(StorageFuzzCasesTest, MetadataCompatibilityVersionsRequireReadableBodies) {
                 repair(candidate);
                 if (!is_root) refs[0] = fixture.reference(candidate, 0);
                 const auto digest = codec::immutable_object_digest{
-                  index::sha(is_root ? candidate : fixture.root_wire(refs))};
+                  index::digest_of(
+                    is_root ? candidate : fixture.root_wire(refs))};
                 const auto seen = observe_metadata(
                   fixture, is_root, candidate, refs, digest, 7);
                 EXPECT_EQ(

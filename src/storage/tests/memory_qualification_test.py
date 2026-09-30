@@ -11,7 +11,7 @@ ENGINE_SCENARIOS = (
     "crc-cold-32",
     "crc-cold-4096",
     "crc-warm-4096",
-    "sha-cold",
+    "xxh3-cold",
 )
 GEOMETRIES = tuple(f"h{h}-a{a}" for h in (32, 4096) for a in (512, 65536))
 OWNER_SCENARIOS = (
@@ -77,6 +77,8 @@ OWNER_SCENARIOS = (
         "extent-reuse",
         "extent-failure",
         "extent-close",
+        "segment-owner-completion",
+        "segment-owner-pages",
     )
 )
 # Decoding compressed maximum data creates ordinary expanded payload; the
@@ -98,10 +100,12 @@ class MemoryQualificationTest(shared.MemoryQualificationTest):
     scope = (
         "supplied-byte storage owners; retained input/fixtures/pins plus all new "
         "native allocations and cold-engine bounds; one decoded page at a time; "
-        "continuous extent observation includes SHA state retained between calls; "
+        "continuous extent observation includes verifier state retained between calls; "
         "execution_basis distinguishes all-new peaks from critical subsets on "
-        "compressed payload expansion; OpenSSL automatic configuration disabled; "
-        "not filesystem/recovery qualification, RSS or instrumented timing"
+        "compressed payload expansion; "
+        "segment-owner cases additionally cover create/append/barrier/seal/close and "
+        "paged finalization under pressure, excluding runtime/resource startup; "
+        "not a recovery/performance/RSS qualification"
     )
 
     def probe_path(self, scenario: str) -> str:
@@ -149,7 +153,7 @@ class ReservationBoundsTest(unittest.TestCase):
             ("wal-decode-lz4-a512", "critical_peak_upper_bound", 1 << 20),
             ("retry-page-decode-h4096-a65536", "peak_upper_bound", 1 << 20),
             ("extent-reuse", "peak_upper_bound", 1 << 20),
-            ("sha-cold", "peak_upper_bound", 1 << 20),
+            ("xxh3-cold", "peak_upper_bound", 1 << 20),
         ):
             with self.subTest(name=name, field=field), self.assertRaises(
                 AssertionError

@@ -89,7 +89,7 @@ struct encoded_sealed_footer final {
 };
 
 // Preserves independently supplied original logical coverage when data was
-// removed. Requires finished SHA evidence, not a parsed tuple or bare hash.
+// removed. Requires finished digest evidence, not a parsed tuple or bare hash.
 [[nodiscard]] codec::result<void> validate_sealed_footer(
   const sealed_footer&, const verified_extent&, codec::field_context = {});
 

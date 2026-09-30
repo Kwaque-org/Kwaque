@@ -1,7 +1,7 @@
 #include "src/model/tests/record_fuzz_cases.h"
 
 #include "src/bytes/test_allocation_profile.h"
-#include "src/codec/sha256.h"
+#include "src/codec/xxh3.h"
 #include "src/model/batch_codec.h"
 #include "src/model/batch_rewrite.h"
 #include "src/model/record_codec.h"
@@ -36,8 +36,8 @@ using kwaque::bytes::testing::charge;
 codec::decode_budget memory() {
     return {byte_count{32U << 20U}, byte_count{1U << 20U}, charge};
 }
-codec::sha256_digest record_digest(const fragmented_buffer& value) {
-    codec::sha256_hasher hash;
+codec::content_digest record_digest(const fragmented_buffer& value) {
+    codec::xxh3_128_hasher hash;
     for (const auto fragment : value) {
         hash.update(fragment.data(), fragment.size());
         seastar::thread::maybe_yield();

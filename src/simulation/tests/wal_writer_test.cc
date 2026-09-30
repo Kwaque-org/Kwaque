@@ -1,4 +1,4 @@
-#include "src/codec/sha256.h"
+#include "src/codec/xxh3.h"
 #include "src/runtime/testing/reactor_tasks.h"
 #include "src/simulation/environment.h"
 #include "src/simulation/fake_file_test_support.h"
@@ -465,6 +465,19 @@ SEASTAR_TEST_CASE(wal_writer_fake_group_write_and_captured_barrier) {
           ownership_input owner{specs};
           take(co_await drive.lifecycle(files.create_directories(spec.root)));
           co_await storage::testing::wal_append_contract::exercise(
+            files, owner, spec, budget, drive);
+      });
+}
+SEASTAR_TEST_CASE(wal_writer_fake_zero_written_file) {
+    co_await with_wal_environment(
+      config(), [](auto& env, auto& budget, auto drive) -> seastar::future<> {
+          auto& files = env.file_system();
+          const auto spec = specification(
+            take(runtime::file_path::make("/kwaque/store")), {1, 1});
+          const std::array specs{spec};
+          ownership_input owner{specs};
+          take(co_await drive.lifecycle(files.create_directories(spec.root)));
+          co_await storage::testing::wal_append_contract::zero_written(
             files, owner, spec, budget, drive);
       });
 }
@@ -1612,7 +1625,7 @@ wal_history_step(scheduler& events, seastar::future<T>& pending) {
 
 local_wal_head
 independent_head(model::wal_incarnation_id id, std::string_view bytes) {
-    codec::sha256_hasher hash;
+    codec::xxh3_128_hasher hash;
     hash.update(bytes.data(), bytes.size());
     return {id, codec::immutable_object_digest{std::move(hash).final()}};
 }

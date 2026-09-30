@@ -30,7 +30,7 @@ struct fixture final {
             work.policy(),
             extent_layout_kind::initial_append,
             {},
-            extent_integrity::crc32c_and_sha256)
+            extent_integrity::crc32c_and_digest)
             .value()
             .finish(work)
             .value())
@@ -110,7 +110,7 @@ struct fixture final {
                       ? ix::root_wire(refs, context, h)
                       : mi::expected_root(*manifest_header, refs, a, h);
         root_digest.emplace(
-          codec::immutable_object_digest{exact_sha(root_wire)});
+          codec::immutable_object_digest{exact_digest(root_wire)});
     }
     byte_count held() const {
         auto value

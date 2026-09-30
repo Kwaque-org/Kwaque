@@ -348,7 +348,7 @@ decode_selected_object_publication(
   codec::field_context = {},
   codec::input_boundary = codec::input_boundary::open);
 // The independently selected head supplies its exact header digest; a
-// predecessor cursor supplies identity/position but no SHA. Neither stores a
+// predecessor cursor supplies identity/position but no digest. Neither stores a
 // separate alignment: learn it from the integrity-checked descriptor and verify
 // its complete layout. Owner/incarnation remain independent expectations.
 // No PREPARE coverage, device compatibility or checkpoint proof is established.

@@ -31,7 +31,7 @@ using kwaque::bytes::testing::charge;
 constexpr codec::field_context context{.origin = 71, .family = 10};
 
 codec::decode_budget memory() {
-    // The other half reserves fixtures, small model snapshots, native SHA/CRC
+    // The other half reserves fixtures, small model snapshots, native CRC
     // state and coroutine frames. Each codec call carries its actual residual.
     return {byte_count{32U << 20U}, byte_count{1U << 20U}, charge};
 }

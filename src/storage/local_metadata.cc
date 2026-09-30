@@ -633,6 +633,8 @@ read_local_root(const std::array<char, 60>& raw, codec::field_context c) {
     if (!kind) return codec::failure(kind.error());
     if (!sequence) return codec::failure(sequence.error());
     if (!pages) return codec::failure(pages.error());
+    const auto digest = read_digest<28>(raw);
+    if (!digest) return codec::failure(page_error(errc::malformed_data, c, 44));
     return local_wire(
       local_root_reference::make(
         *kind,
@@ -640,7 +642,7 @@ read_local_root(const std::array<char, 60>& raw, codec::field_context c) {
         runtime::file_position{load<12, std::uint64_t>(raw)},
         byte_count{load<20, std::uint32_t>(raw)},
         *pages,
-        codec::immutable_object_digest{read_digest<28>(raw)}),
+        codec::immutable_object_digest{*digest}),
       c);
 }
 void write_local_root(
@@ -662,13 +664,16 @@ codec::result<local_checkpoint_entry> read_local_checkpoint_entry(
     if (!segment) return codec::failure(segment.error());
     if (load<122, std::uint16_t>(raw) != 0)
         return codec::failure(page_error(errc::malformed_data, c, 122));
+    const auto digest = read_digest<132>(raw);
+    if (!digest)
+        return codec::failure(page_error(errc::malformed_data, c, 148));
     return local_checkpoint_entry{
       *begin,
       *end,
       *segment,
       static_cast<local_checkpoint_disposition>(load<120, std::uint16_t>(raw)),
       load<124, std::uint64_t>(raw),
-      codec::immutable_object_digest{read_digest<132>(raw)}};
+      codec::immutable_object_digest{*digest}};
 }
 void write_local_checkpoint_entry(
   std::array<char, 164>& out, const local_checkpoint_entry& entry) noexcept {

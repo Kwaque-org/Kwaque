@@ -597,13 +597,6 @@ TEST(BatchCompressionTest, AllocationFailuresRollBackTheWholeEnvelope) {
                 result.emplace(decode(input, assigned, budget, work));
             } catch (const std::bad_alloc&) {
                 threw = true;
-            } catch (const std::runtime_error&) {
-                // Native SHA setup reports a failed C allocation by exception.
-                if (!injector.failed()) {
-                    injector.cancel();
-                    throw;
-                }
-                threw = true;
             } catch (...) {
                 injector.cancel();
                 throw;

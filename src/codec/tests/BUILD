@@ -334,11 +334,10 @@ kwaque_cc_fuzz_test(
         "//src/codec:error",
         "//src/codec:integer",
         "//src/codec:limits",
-        "//src/codec:sha256",
-        "//src/codec:sha256_cooperative",
         "//src/codec:staging_cooperative",
+        "//src/codec:xxh3",
+        "//src/codec:xxh3_cooperative",
         "//src/runtime/testing:seastar_fuzz",
-        "@openssl",
         "@seastar",
     ],
 )
@@ -363,8 +362,8 @@ kwaque_cc_seastar_gtest(
         "//src/codec:error",
         "//src/codec:integer",
         "//src/codec:limits",
-        "//src/codec:sha256_cooperative",
         "//src/codec:staging_cooperative",
+        "//src/codec:xxh3_cooperative",
     ],
 )
 
@@ -396,8 +395,8 @@ kwaque_cc_seastar_gtest(
         "//src/codec:digest",
         "//src/codec:error",
         "//src/codec:limits",
-        "//src/codec:sha256",
-        "//src/codec:sha256_cooperative",
+        "//src/codec:xxh3",
+        "//src/codec:xxh3_cooperative",
     ],
 )
 
@@ -458,7 +457,7 @@ kwaque_cc_binary(
     deps = [
         "//src/codec:crc32c",
         "//src/codec:digest",
-        "//src/codec:sha256",
+        "//src/codec:xxh3",
         "@boost//:program_options",
         "@crc32c",
         "@seastar",
@@ -542,9 +541,15 @@ kwaque_cc_seastar_gtest(
 kwaque_cc_test(
     name = "sha256_test",
     srcs = ["sha256_test.cc"],
+    deps = ["//src/codec:sha256"],
+)
+
+kwaque_cc_test(
+    name = "xxh3_test",
+    srcs = ["xxh3_test.cc"],
     deps = [
         "//src/codec:digest",
-        "//src/codec:sha256",
+        "//src/codec:xxh3",
     ],
 )
 
@@ -589,7 +594,7 @@ kwaque_cc_library(
         "//src/storage/tests:__pkg__",
     ],
     deps = [
-        "@openssl",
+        "//src/bytes:allocation_test_profile",
         "@seastar",
     ],
 )
@@ -628,9 +633,9 @@ kwaque_cc_binary(
         "//src/codec:format_registry",
         "//src/codec:integer",
         "//src/codec:limits",
-        "//src/codec:sha256",
-        "//src/codec:sha256_cooperative",
         "//src/codec:staging_cooperative",
+        "//src/codec:xxh3",
+        "//src/codec:xxh3_cooperative",
         "@boost//:program_options",
         "@crc32c",
         "@seastar",

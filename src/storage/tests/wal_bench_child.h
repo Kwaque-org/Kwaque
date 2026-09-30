@@ -21,15 +21,10 @@ inline void initialize() {
         return true;
     }();
     static_cast<void>(profile_reported);
-    if (std::getenv("KWAQUE_WAL_OBSERVE_ALLOCATIONS")) {
 #if defined(KWAQUE_WAL_TIMING_ONLY)
+    if (std::getenv("KWAQUE_WAL_OBSERVE_ALLOCATIONS"))
         throw std::runtime_error("allocation observation requires wal_bench");
-#else
-        static const bool installed
-          = codec::testing::install_crypto_allocation_observation();
-        require(installed, "crypto allocation observation unavailable");
 #endif
-    }
 }
 
 inline seastar::future<encoded_assigned_batch>

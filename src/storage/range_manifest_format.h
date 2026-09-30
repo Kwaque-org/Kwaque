@@ -278,9 +278,9 @@ struct decoded_range_manifest_page final {
     codec::decode_budget remaining;
 };
 
-// Bounded scalar comparison against SHA-bearing evidence for independently
+// Bounded scalar comparison against digest-bearing evidence for independently
 // pinned extent bytes. expected_cluster is enclosing context, absent from MC.
-// Checks the full namespace, segment generation, all spans and exact SHA;
+// Checks the full namespace, segment generation, all spans and exact digest;
 // the evidence carries the data file's own alignment, independent of metadata
 // alignment. No data fetch, persistence or publication is implied. A driver
 // iterating entries must admit this work and retain at most one supplied proof.

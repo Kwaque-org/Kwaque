@@ -1,4 +1,4 @@
-#include "src/codec/sha256_cooperative.h"
+#include "src/codec/xxh3_cooperative.h"
 
 #include "src/base/invariant.h"
 
@@ -14,7 +14,7 @@
 namespace kwaque::codec {
 namespace {
 
-seastar::future<result<sha256_digest>> hash_bytes(
+seastar::future<result<content_digest>> hash_bytes(
   const bytes::fragmented_buffer& input, cooperative_work& work, error anchor) {
     if (auto valid = work.poll(anchor); !valid) {
         co_return codec::failure(valid.error());
@@ -28,7 +28,7 @@ seastar::future<result<sha256_digest>> hash_bytes(
         policy.config().max_retained_bytes);
       !valid) {
         KWAQUE_INVARIANT(
-          invariant_id{"KQ-CODEC-SHA-INPUT"},
+          invariant_id{"KQ-CODEC-XXH3-INPUT"},
           valid.error() == errc::invalid_argument
             || valid.error() == errc::resource_exhausted,
           "input bound check returned an unexpected error");
@@ -48,7 +48,7 @@ seastar::future<result<sha256_digest>> hash_bytes(
     if (auto valid = work.poll(anchor); !valid) {
         co_return codec::failure(valid.error());
     }
-    sha256_hasher hasher;
+    xxh3_128_hasher hasher;
     for (const auto fragment : input) {
         for (std::size_t offset = 0; offset < fragment.size();) {
             const auto size = std::min(
@@ -75,9 +75,9 @@ seastar::future<result<sha256_digest>> hash_bytes(
 
 } // namespace
 
-seastar::future<result<sha256_digest>> sha256_cooperatively(
+seastar::future<result<content_digest>> xxh3_128_cooperatively(
   bytes::fragmented_buffer input, cooperative_work& work, error anchor) {
-    std::optional<result<sha256_digest>> outcome;
+    std::optional<result<content_digest>> outcome;
     std::exception_ptr failure;
     try {
         // The borrowed input belongs to this coroutine; native hash state is
@@ -98,7 +98,7 @@ seastar::future<result<sha256_digest>> sha256_cooperatively(
         std::rethrow_exception(failure);
     }
     KWAQUE_INVARIANT(
-      invariant_id{"KQ-CODEC-SHA-OUTCOME"},
+      invariant_id{"KQ-CODEC-XXH3-OUTCOME"},
       outcome.has_value(),
       "digest completed without a value or exception");
     if (!outcome->has_value()) {

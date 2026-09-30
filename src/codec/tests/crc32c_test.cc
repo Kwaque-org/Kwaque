@@ -137,6 +137,38 @@ TEST(Crc32cTest, EmptyInputsPreserveEveryFinalizedSeed) {
     }
 }
 
+TEST(Crc32cTest, CombiningVerifiedSuffixesMatchesIndependentByteWalk) {
+    const auto data = patterned_bytes<8192>();
+    const auto bytes = std::span<const char>{data};
+    for (const auto seed : seeds) {
+        for (std::size_t split = 0; split <= bytes.size(); split += 32) {
+            checksum combined{comparison_extend(seed, bytes.first(split))};
+            const auto suffix = bytes.subspan(split);
+            combined.extend_checksum(
+              comparison_extend(0, suffix), suffix.size());
+            EXPECT_EQ(combined.value(), comparison_extend(seed, bytes));
+        }
+    }
+    checksum reversed{checksum_of("world"sv)};
+    reversed.extend_checksum(checksum_of("hello "sv), 6);
+    EXPECT_NE(reversed.value(), checksum_of("hello world"sv));
+}
+
+TEST(Crc32cTest, KnownZeroSuffixesMatchIndependentByteWalk) {
+    static constexpr std::array<char, 65536> zeros{};
+    for (const auto seed : seeds) {
+        for (const std::size_t length :
+             {0U, 1U, 127U, 128U, 4095U, 4096U, 65536U}) {
+            checksum combined{seed};
+            combined.extend_zeroes(length);
+            EXPECT_EQ(
+              combined.value(),
+              comparison_extend(
+                seed, std::span<const char>{zeros}.first(length)));
+        }
+    }
+}
+
 TEST(Crc32cTest, EveryHeaderSplitCanResumeFromTheFinalizedValue) {
     const auto data = patterned_bytes<48>();
     for (const std::size_t length : {std::size_t{32}, std::size_t{48}}) {

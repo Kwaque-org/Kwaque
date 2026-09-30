@@ -39,17 +39,16 @@ using kwaque::runtime::wall_time;
 using nullable = std::optional<fragmented_buffer>;
 
 constexpr auto null_record = "\x06\x00\x00\x00\x01\x01\x00"sv;
-constexpr auto golden_sha
-  = "a094509035402abad319ae9b75972a8c3eb583f3c4829c4353c21f92bad9d9a7"sv;
+constexpr auto golden_digest = "cd3dc575dbd5a810a34b7d5d91aea07e"sv;
 // Independent complete envelope: opaque IDs, little-endian fixed fields,
-// SHA-256 of the semantic stream, and both Castagnoli checksums.
+// XXH3-128 of the semantic stream, and both Castagnoli checksums.
 constexpr auto golden_envelope
-  = "4b5142460100010001002000af00000000000000000000009cc9e480c3709e26"
+  = "4b5142460100010001002000af0000000000000000000000d70873b29d6ddefc"
     "0102030405060708090a0b0c0d0e0f1002000000000000000300000000000000"
     "04000000000000002122232425262728292a2b2c2d2e2f304142434445464748"
     "494a4b4c4d4e4f5007000000000000006162636465666768696a6b6c6d6e6f70"
-    "0900000000000000a094509035402abad319ae9b75972a8c3eb583f3c4829c435"
-    "3c21f92bad9d9a7640000000000000001000000010000000000000000000100"
+    "0900000000000000cd3dc575dbd5a810a34b7d5d91aea07e0000000000000000"
+    "0000000000000000640000000000000001000000010000000000000000000100"
     "070000000700000006000000010100"sv;
 
 static_assert(std::is_nothrow_move_constructible_v<model::submitted_batch>);
@@ -194,7 +193,7 @@ TEST(BatchBuilderTest, IndependentSemanticDigestAndCompleteEnvelopeBytes) {
     EXPECT_EQ(batch.context().original_count().value(), 1U);
     EXPECT_EQ(batch.context().original_timestamp_base(), wall_time{100});
     EXPECT_TRUE(batch.records().content_equals(null_record));
-    EXPECT_EQ(digest_hex(batch.fingerprint()), golden_sha);
+    EXPECT_EQ(digest_hex(batch.fingerprint()), golden_digest);
     auto encoded
       = model::encode_submitted_batch(
           std::move(batch), work, memory().operation_remaining, charge)
@@ -316,7 +315,7 @@ TEST(BatchBuilderTest, FingerprintUsesOnePrefixThenRawRecordStream) {
                               context, record_bytes, work)
                               .get();
         ASSERT_TRUE(digest.has_value());
-        EXPECT_EQ(digest_hex(*digest), golden_sha);
+        EXPECT_EQ(digest_hex(*digest), golden_digest);
         EXPECT_TRUE(record_bytes.content_equals(null_record));
     }
 }
@@ -453,7 +452,7 @@ TEST(BatchBuilderTest, ExactStagingBudgetAndOneByteShortAreDistinct) {
             ASSERT_TRUE(result.has_value());
             auto batch = out.finalize(work, exact).get();
             ASSERT_TRUE(batch.has_value());
-            EXPECT_EQ(digest_hex(batch->fingerprint()), golden_sha);
+            EXPECT_EQ(digest_hex(batch->fingerprint()), golden_digest);
         }
     }
 }
@@ -725,7 +724,7 @@ TEST(BatchBuilderTest, ReachedAllocationFailuresDoNotPublishPartialBatches) {
         auto source = null_value();
         seastar::abort_source abort;
         codec::cooperative_work work{codec::limits::defaults(), abort};
-        // Initialize the native SHA provider before sweeping operation-local
+        // Initialize lazily created engines before sweeping operation-local
         // allocations, including when this test runs alone.
         static_cast<void>(one_batch(source, work));
     }
@@ -779,15 +778,6 @@ TEST(BatchBuilderTest, ReachedAllocationFailuresDoNotPublishPartialBatches) {
             } catch (const std::bad_alloc&) {
                 reached = injector.failed();
                 threw = true;
-            } catch (const std::runtime_error&) {
-                // A failed C allocator call returns null. The existing SHA
-                // owner reports native context/setup failure by exception.
-                reached = injector.failed();
-                if (!reached || mode != 1) {
-                    injector.cancel();
-                    throw;
-                }
-                threw = true;
             } catch (...) {
                 injector.cancel();
                 throw;
@@ -796,16 +786,17 @@ TEST(BatchBuilderTest, ReachedAllocationFailuresDoNotPublishPartialBatches) {
             if (threw) {
                 EXPECT_TRUE(reached);
                 failed_once = true;
-            } else if (mode != 1) {
+            } else {
                 EXPECT_FALSE(reached);
             }
-            // A provider may recover an optional failed allocation. Keep
-            // sweeping until one complete call reaches no injection point.
+            // Keep sweeping until one complete call reaches no injection point.
             EXPECT_TRUE(source.key()->content_equals("key"sv));
             EXPECT_EQ(source.logical_delta().value(), 999U);
             out.close(work).get();
         }
-        EXPECT_TRUE(failed_once);
+        // Finalization publishes the already-built records and hashes them
+        // with inline state; only add and encode reach injectable allocations.
+        EXPECT_EQ(failed_once, mode != 1);
         EXPECT_TRUE(succeeded);
     }
 #endif

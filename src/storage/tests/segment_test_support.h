@@ -160,10 +160,9 @@ inline std::string assigned_wire(
     body.replace(80, 16, 16, '\x30');
     put(body, 96, 1, 8);
     const auto digest = hex(
-      sparse
-        ? "1ca1f5939c787dc18baed7e6a9869863589d8164d20bf7511b779f928fab5c64"
-        : "faf92b853fd9029baa6091b240ff60cbd8e82375f8d26d28e65160c5b88b8a02");
-    body.replace(104, 32, digest);
+      sparse ? "f15dbbd772308cd9f94fe5c4e0103dfa"
+             : "4686499c33887149b5dd65ac790cd0c2");
+    body.replace(104, digest.size(), digest);
     const auto raw = hex(
       sparse ? "0600010101000006000303010000" : "06000000010000");
     put(body, 144, sparse ? 5U : 1U, 4);

@@ -1,0 +1,15 @@
+Expose the upstream license for binary-distribution packaging.
+
+--- a/BUILD.bazel
++++ b/BUILD.bazel
+@@ -1,5 +1,10 @@
+ load("@rules_cc//cc:defs.bzl", "cc_binary", "cc_library", "cc_test")
+ 
++exports_files(
++    ["LICENSE"],
++    visibility = ["//visibility:public"],
++)
++
+ cc_library(
+     name = "xxhash",
+     srcs = ["xxhash.c"] + select({

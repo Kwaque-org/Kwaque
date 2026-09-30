@@ -1,3 +1,4 @@
+#include "src/bytes/fragmented_buffer_builder.h"
 #include "src/storage/tests/wal_test_support.h"
 #include "src/storage/wal_group.h"
 
@@ -11,11 +12,14 @@
 #include <concepts>
 #include <exception>
 #include <optional>
+#include <string_view>
 #include <type_traits>
+#include <vector>
 
 namespace kwaque::storage {
 namespace {
 using namespace testing;
+
 using bytes::fragmented_buffer;
 using bytes::fragmented_buffer_parser;
 
@@ -26,12 +30,43 @@ static_assert(std::is_nothrow_move_constructible_v<wal_prepare>);
 static_assert(std::is_nothrow_destructible_v<wal_prepare>);
 static_assert(!std::convertible_to<wal_write_context, segment_write_context>);
 
+TEST(WalFormatTest, FragmentedValidatedChildAndWidePaddingKeepExactCrcBytes) {
+    for (const bool compressed : {false, true}) {
+        for (const std::size_t header_bytes : {32U, 40U, 4096U}) {
+            const auto wire = assigned_wire(compressed, header_bytes);
+            for (const std::size_t width : {7U, 257U}) {
+                for (const auto alignment : {512U, 8192U, 65536U}) {
+                    seastar::abort_source abort;
+                    codec::cooperative_work work{
+                      codec::limits::defaults(), abort};
+                    auto bytes = buffer(wire, width);
+                    const auto memory = reserve(bytes, work);
+                    auto child
+                      = validate_encoded_assigned_batch(
+                          std::move(bytes), batch_expected(), memory, work)
+                          .get()
+                          .value();
+                    const auto expected = wal_expected(alignment, 512);
+                    const auto encoded = encode_wal_prepare(
+                                           std::move(child),
+                                           expected,
+                                           work,
+                                           budget().operation_remaining,
+                                           charge)
+                                           .get();
+                    ASSERT_TRUE(encoded);
+                    EXPECT_EQ(flat(*encoded), wal_wire(wire, expected));
+                }
+            }
+        }
+    }
+}
 TEST(WalFormatTest, IndependentGoldenAndCompletePayload) {
     const auto literal = wal_wire();
     ASSERT_EQ(literal.size(), 512U);
     EXPECT_EQ(
       literal.substr(0, 32),
-      hex("4b5142460500010001002000e001000000000000000000005f808b121ccb119f"));
+      hex("4b5142460500010001002000e00100000000000000000000a3dbc7ea631d6d9f"));
     seastar::abort_source abort;
     codec::cooperative_work work{codec::limits::defaults(), abort};
     auto child = checked_child(work);
@@ -308,10 +343,7 @@ TEST(WalFormatTest, DistinctMultibyteReplayFieldsHaveIndependentOffsets) {
     context.routing_epoch = model::range_routing_epoch::make(routing).value();
     auto child_wire = assigned_wire(false, 4096, true);
     put(child_wire, 4096 + 72, routing, 8);
-    child_wire.replace(
-      4096 + 104,
-      32,
-      hex("5baaf58ba633d6a2903fb34ddef1796b6e9450fe9f6cb1acc2826050b51731c2"));
+    child_wire.replace(4096 + 104, 16, hex("c6f365b544be1cbbd36da0a55a1d9cfb"));
     repair(child_wire);
     const auto literal = wal_wire(child_wire, context, 40);
     seastar::abort_source abort;
@@ -587,12 +619,6 @@ TEST(WalFormatTest, AllocationFailuresJoinOwnersAndRestoreExistingMarks) {
                                   .has_value();
             } catch (const std::bad_alloc&) {
                 threw = true;
-            } catch (const std::runtime_error&) {
-                if (!injector.failed()) {
-                    injector.cancel();
-                    throw;
-                }
-                threw = true;
             } catch (...) {
                 injector.cancel();
                 throw;
@@ -844,41 +870,72 @@ TEST(WalFormatTest, PreflightSharesContextAndGeometryWithoutConsumingTheChild) {
     EXPECT_EQ(
       flat(*encoded), wal_wire(assigned_wire(true, 48, true), expected));
 }
+// The bound plans the child's exact fragments. A child within the builder's
+// copy threshold is packed into one owner when the admitted prefix/padding
+// backing covers it; a larger child keeps its fragments and reaches the
+// planned ceiling exactly. extra = 1 crosses the ceiling in both shapes.
 TEST(WalFormatTest, GroupMemoryBoundCoversTheEncoderAtTheFragmentCeiling) {
-    for (const std::size_t header_bytes : {831U, 832U}) {
-        seastar::abort_source abort;
-        codec::cooperative_work work{codec::limits::defaults(), abort};
-        const auto wire = assigned_wire(false, header_bytes);
-        auto raw = buffer(wire, 1);
-        const auto memory = reserve(raw, work);
-        auto checked = validate_encoded_assigned_batch(
-                         std::move(raw), batch_expected(), memory, work)
-                         .get();
-        ASSERT_TRUE(checked);
-        auto expected = wal_expected(8192, 16384);
-        auto layout = preflight_wal_prepare(
-          *checked,
-          expected,
-          work.policy(),
-          {byte_count{65536}, byte_count{65536}});
-        ASSERT_TRUE(layout);
-        auto bound = kwaque::storage::detail::wal_prepare_memory(
-          *checked, *layout, work.policy(), charge);
-        if (header_bytes == 832) {
-            ASSERT_FALSE(bound);
-            EXPECT_EQ(bound.error().code(), errc::resource_exhausted);
-            continue;
+    for (const bool packed : {true, false}) {
+        for (const std::size_t extra : {0U, 1U}) {
+            seastar::abort_source abort;
+            codec::cooperative_work work{codec::limits::defaults(), abort};
+            const auto wire = assigned_wire(
+              false, packed ? 831U + extra : 4000U);
+            const auto threshold
+              = bytes::fragmented_buffer_builder::pack_copy_threshold.value();
+            ASSERT_EQ(wire.size() <= threshold, packed);
+            auto raw = [&] {
+                if (packed) return buffer(wire, 1);
+                // One-byte fragments before a single remainder fragment.
+                const std::size_t leading = 1021U + extra;
+                std::vector<fragmented_buffer::fragment_type> parts;
+                parts.reserve(leading + 1U);
+                for (const char& byte :
+                     std::string_view{wire}.substr(0, leading))
+                    parts.emplace_back(&byte, 1U);
+                parts.emplace_back(
+                  wire.data() + leading, wire.size() - leading);
+                return fragmented_buffer::copy_from_fragments(parts).value();
+            }();
+            ASSERT_EQ(
+              raw.fragment_count(), packed ? wire.size() : 1022U + extra);
+            const auto memory = reserve(raw, work);
+            auto checked = validate_encoded_assigned_batch(
+                             std::move(raw), batch_expected(), memory, work)
+                             .get();
+            ASSERT_TRUE(checked);
+            auto expected = wal_expected(8192, 16384);
+            auto layout = preflight_wal_prepare(
+              *checked,
+              expected,
+              work.policy(),
+              {byte_count{65536}, byte_count{65536}});
+            ASSERT_TRUE(layout);
+            auto bound = kwaque::storage::detail::wal_prepare_memory(
+              *checked, *layout, work.policy(), charge);
+            if (extra != 0) {
+                ASSERT_FALSE(bound);
+                EXPECT_EQ(bound.error().code(), errc::resource_exhausted);
+                continue;
+            }
+            ASSERT_TRUE(bound);
+            EXPECT_EQ(bound->fragments, item_count{1024});
+            auto encoded = encode_wal_prepare(
+                             std::move(*checked),
+                             expected,
+                             work,
+                             bound->codec_bytes,
+                             charge)
+                             .get();
+            ASSERT_TRUE(encoded);
+            EXPECT_LE(encoded->retained_bytes(), bound->retained);
+            EXPECT_LE(encoded->fragment_count(), bound->fragments.value());
+            if (!packed)
+                EXPECT_EQ(encoded->fragment_count(), 1024U);
+            else if (bytes::testing::native_charge_profile)
+                EXPECT_EQ(encoded->fragment_count(), 1U);
+            EXPECT_EQ(flat(*encoded), wal_wire(wire, expected));
         }
-        ASSERT_TRUE(bound);
-        EXPECT_EQ(bound->fragments, item_count{1024});
-        auto encoded
-          = encode_wal_prepare(
-              std::move(*checked), expected, work, bound->codec_bytes, charge)
-              .get();
-        ASSERT_TRUE(encoded);
-        EXPECT_LE(encoded->retained_bytes(), bound->retained);
-        EXPECT_EQ(encoded->fragment_count(), 1024U);
-        EXPECT_EQ(flat(*encoded), wal_wire(wire, expected));
     }
 }
 } // namespace

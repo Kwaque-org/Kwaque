@@ -4,10 +4,8 @@
 #include "src/storage/tests/footer_test_support.h"
 
 namespace kwaque::storage::testing {
-inline codec::sha256_digest exact_sha(std::string_view bytes) {
-    codec::sha256_hasher hash;
-    hash.update(bytes.data(), bytes.size());
-    return std::move(hash).final();
+inline codec::content_digest exact_digest(std::string_view bytes) {
+    return codec::xxh3_128(bytes.data(), bytes.size());
 }
 inline footer_expectation root_location(
   std::uint8_t segment = 0x30,
@@ -27,7 +25,7 @@ inline completed_retry retry(
     put(assigned, 32 + 32, sequence, 8);
     // Independently assemble the original semantic projection, so distinct
     // requests in the large fixture also have consistent retained digests.
-    codec::sha256_hasher hash;
+    codec::xxh3_128_hasher hash;
     hash.update(
       codec::semantic_batch_domain.data(), codec::semantic_batch_domain.size());
     hash.update(assigned.data() + 32, 104);
@@ -113,12 +111,12 @@ inline page_ref reference(
              first,
              count,
              byte_count{page.size()},
-             codec::immutable_object_digest{exact_sha(page)})
+             codec::immutable_object_digest{exact_digest(page)})
       .value();
 }
 inline std::string sealed_wire(
   boundary_fields fields,
-  codec::sha256_digest digest,
+  codec::content_digest digest,
   std::span<const page_ref> refs = {},
   footer_expectation root = root_location(),
   std::size_t h = 32) {
@@ -143,9 +141,9 @@ inline std::string sealed_wire(
         put(page, 4, ref.first_entry(), 4);
         put(page, 8, ref.entry_count(), 4);
         put(page, 12, ref.encoded_bytes().value(), 4);
-        const auto sha = ref.digest().bytes();
-        for (std::size_t i = 0; i < sha.size(); ++i)
-            page[16 + i] = std::bit_cast<char>(sha[i]);
+        const auto digest = ref.digest().bytes();
+        for (std::size_t i = 0; i < digest.size(); ++i)
+            page[16 + i] = std::bit_cast<char>(digest[i]);
         body += page;
         total += ref.entry_count();
     }
@@ -169,7 +167,7 @@ inline std::string one_root(
       root.history.data_start.value(),
       2U * root.history.data_start.value());
     return sealed_wire(
-      {extent, 1, extent, 0}, exact_sha(data_block()), refs, root, h);
+      {extent, 1, extent, 0}, exact_digest(data_block()), refs, root, h);
 }
 inline sealed_footer pin_root(
   const std::string& wire,
@@ -179,7 +177,7 @@ inline sealed_footer pin_root(
     auto value = decode_sealed_footer(
                    parser,
                    root,
-                   codec::immutable_object_digest{exact_sha(wire)},
+                   codec::immutable_object_digest{exact_digest(wire)},
                    reserve(parser, work),
                    work)
                    .get()
@@ -206,7 +204,7 @@ inline verified_extent hashed_evidence(codec::cooperative_work& work) {
                       work.policy(),
                       extent_layout_kind::initial_append,
                       {},
-                      extent_integrity::crc32c_and_sha256)
+                      extent_integrity::crc32c_and_digest)
                       .value();
     feed_block(verifier, data_block(), work).value();
     return verifier.finish(work).value();

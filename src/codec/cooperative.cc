@@ -69,6 +69,13 @@ cooperative_work::admit(byte_count bytes, item_count items, error anchor) {
         debit(bytes, items);
         return seastar::make_ready_future<result<void>>();
     }
+    // Refilling a quantum need not suspend. Keep the ready checkpoint path
+    // synchronous, as checkpoint() does; the caller still polls after await.
+    if (!seastar::need_preempt()) {
+        reset();
+        debit(bytes, items);
+        return seastar::make_ready_future<result<void>>();
+    }
     return admit_slow(bytes, items, anchor);
 }
 

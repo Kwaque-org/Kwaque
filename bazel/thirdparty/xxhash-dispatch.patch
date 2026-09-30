@@ -1,0 +1,18 @@
+Select the AVX2 kernel at most when dispatching XXH3 at run time.
+
+--- a/BUILD.bazel
++++ b/BUILD.bazel
+@@ -16,7 +16,12 @@
+     include_prefix = "xxhash",
+     includes = [""],
+     local_defines = select({
+-        "@platforms//cpu:x86_64": ["XXHSUM_DISPATCH=1"],
++        "@platforms//cpu:x86_64": [
++            "XXHSUM_DISPATCH=1",
++            # Stop at AVX2: 512-bit multiplies can lower the clock of the
++            # whole core, which a shard-per-core runtime shares.
++            "XXH_DISPATCH_AVX512=0",
++        ],
+         "//conditions:default": [],
+     }),
+     visibility = ["//visibility:public"],

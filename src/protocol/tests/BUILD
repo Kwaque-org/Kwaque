@@ -152,7 +152,6 @@ kwaque_cc_fuzz_test(
     deps = [
         ":control_fuzz_cases",
         "//src/runtime/testing:seastar_fuzz",
-        "@openssl",
         "@seastar",
     ],
 )
@@ -509,7 +508,7 @@ kwaque_cc_library(
         "//src/codec:error",
         "//src/codec:integer",
         "//src/codec:limits",
-        "//src/codec:sha256",
+        "//src/codec:xxh3",
         "//src/model:batch",
         "//src/model:batch_codec",
         "//src/model:batch_context",
@@ -550,7 +549,6 @@ kwaque_cc_fuzz_test(
     deps = [
         ":frame_fuzz_cases",
         "//src/runtime/testing:seastar_fuzz",
-        "@openssl",
         "@seastar",
     ],
 )
@@ -577,7 +575,7 @@ kwaque_cc_benchmark(
         "//src/codec:error",
         "//src/codec:integer",
         "//src/codec:limits",
-        "//src/codec:sha256",
+        "//src/codec:xxh3",
         "//src/codec/tests:codec_bench_reference",
         "//src/codec/tests:qualification_profile",
         "//src/model:batch",

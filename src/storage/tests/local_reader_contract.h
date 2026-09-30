@@ -55,8 +55,7 @@ inline local_root_reference snapshot_ref() {
         runtime::file_position{},
         byte_count{4096},
         page_count::make(1).value(),
-        literal_digest(
-          "9dbc526ee010ac9e12206badf2cf00cef7880702a3492879040f509f77bba73c")));
+        literal_digest("1c622fae3a64d8ba0297f7a5d3647a22")));
 }
 inline local_root_reference sealed_ref() {
     return take(
@@ -66,8 +65,7 @@ inline local_root_reference sealed_ref() {
         runtime::file_position{16384},
         byte_count{4096},
         page_count::make(1).value(),
-        literal_digest(
-          "96975545e00630e51ef3905c0d3694a44801cafd3f2b4875ab926668a374b7ff")));
+        literal_digest("982e762d646470ca20d637b68cbcf8a4")));
 }
 inline local_root_reference index_ref() {
     return take(
@@ -77,8 +75,7 @@ inline local_root_reference index_ref() {
         runtime::file_position{},
         byte_count{4096},
         page_count::make(1).value(),
-        literal_digest(
-          "c51e48c670a584eae798cac6853d4776806f6839b2858287e100427d8816b3e1")));
+        literal_digest("6bb870e77cf82b929664f981e060b034")));
 }
 inline segment_history_context history() {
     return {
@@ -94,8 +91,7 @@ inline local_footer_reference active_boundary() {
         runtime::file_position{12288},
         byte_count{4096},
         6,
-        literal_digest(
-          "1f352213da8c69e284cbc1bfc3355fe31efcb08fa102183422233875318b3e51")));
+        literal_digest("bd77b0a3ed338668713e003a88c3e130")));
 }
 inline local_footer_reference sealed_boundary() {
     return take(
@@ -117,15 +113,14 @@ inline local_object_publication sealed_publication() {
 }
 inline std::array<local_bundle_context, 3>
 contexts(const local_device_spec& spec) {
-    auto index = sparse_index_context::make(
-                   segment(),
-                   scope(100, 102, 0, 2, 4096, 16384),
-                   codec::extent_digest{literal_digest(
-                                          "dd3a755a09e37d0e6235b7dec4edc53d1b59"
-                                          "0a447deee72491a366cf63ce9d9e")
-                                          .bytes()},
-                   alignment(4096))
-                   .value();
+    auto index
+      = sparse_index_context::make(
+          segment(),
+          scope(100, 102, 0, 2, 4096, 16384),
+          codec::extent_digest{
+            literal_digest("f2b1003c9e034dfc8ffa143f02be19ab").bytes()},
+          alignment(4096))
+          .value();
     return {
       index,
       footer_expectation{history(), sealed_ref().position()},
@@ -327,8 +322,7 @@ seastar::future<> root_errors(
         reference.position(),
         reference.bytes(),
         reference.pages(),
-        literal_digest(
-          "0000000000000000000000000000000000000000000000000000000000000000")));
+        literal_digest("00000000000000000000000000000000")));
     auto expected = installation_contract::checkpoint_expectation(spec);
     expected.digest = wrong.digest();
     auto rejected = co_await drive.lifecycle(
@@ -338,7 +332,7 @@ seastar::future<> root_errors(
         take(co_await drive.lifecycle((*rejected)->close()));
         rejected->reset();
     }
-    require(!rejected, "root accepted a wrong external SHA");
+    require(!rejected, "root accepted a wrong external digest");
 }
 template<typename Backend, typename Owner, typename Driver>
 seastar::future<> generation_lifetime(
@@ -546,9 +540,7 @@ inline local_shard_control chain_control() {
       local_deletion_high{80},
       {},
       local_wal_head{
-        wal(9),
-        literal_digest(
-          "4d24e709a20f78d057176c757005e5f3e3b840d8a09ab48368df164b68ae3d1f")}};
+        wal(9), literal_digest("58cac5ef8e807145726b47040f9f0011")}};
 }
 template<typename Backend, typename Owner, typename Driver>
 seastar::future<> wal_chain(
@@ -630,7 +622,7 @@ seastar::future<> wal_chain(
         ids[seen++] = descriptor.incarnation.bytes()[15];
         require(
           entry.head_digest_pinned == (seen == 1),
-          "predecessor SHA pin invented");
+          "predecessor digest pin invented");
         if (seen == 2)
             require(
               entry.sealed_end && entry.sealed_end->value() == 16384,
@@ -732,7 +724,7 @@ seastar::future<> wal_chain(
     co_await put_wal(files, spec, wal(9), cycle, drive);
     auto broken = control;
     broken.wal_head->header_digest = codec::immutable_object_digest{
-      exact_sha(cycle)};
+      exact_digest(cycle)};
     seen = 0;
     auto rejected = co_await drive.lifecycle(walk_local_wal_chain(
       files, owner, spec, 0, broken, {}, false, budget, limits(), work, visit));
@@ -804,7 +796,7 @@ seastar::future<> wal_alignment(
         co_await put_wal(files, spec, wal(9), head, drive);
         auto control = chain_control();
         control.wal_head->header_digest = codec::immutable_object_digest{
-          exact_sha(head)};
+          exact_digest(head)};
 
         // Persist an independent control fixture so startup has to validate
         // both its selected head and the differently aligned older header.
@@ -1099,8 +1091,7 @@ seastar::future<> empty_retry(
         runtime::file_position{4096},
         byte_count{4096},
         page_count::make(0).value(),
-        literal_digest(
-          "7bb455f0a92c8be1ee1ae58801586ee27433bc9e7ed73c8d50a22d3e4cf4e5a3")));
+        literal_digest("6d93f4087752ba9c90cdc90796a30851")));
     footer_expectation expected{
       {sc,
        alignment(4096),

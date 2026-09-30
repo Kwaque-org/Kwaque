@@ -8,8 +8,8 @@
 #include "src/codec/digest.h"
 #include "src/codec/error.h"
 #include "src/codec/limits.h"
-#include "src/codec/sha256.h"
-#include "src/codec/sha256_cooperative.h"
+#include "src/codec/xxh3.h"
+#include "src/codec/xxh3_cooperative.h"
 
 #include <seastar/core/abort_source.hh>
 #include <seastar/core/coroutine.hh>
@@ -48,14 +48,24 @@ using kwaque::item_count;
 using kwaque::bytes::fragmented_buffer;
 
 constexpr codec::error anchor{errc::success, 2, 9, 42};
-constexpr codec::sha256_digest empty_sha{
-  0xe3, 0xb0, 0xc4, 0x42, 0x98, 0xfc, 0x1c, 0x14, 0x9a, 0xfb, 0xf4,
-  0xc8, 0x99, 0x6f, 0xb9, 0x24, 0x27, 0xae, 0x41, 0xe4, 0x64, 0x9b,
-  0x93, 0x4c, 0xa4, 0x95, 0x99, 0x1b, 0x78, 0x52, 0xb8, 0x55};
-constexpr codec::sha256_digest abc_sha{
-  0xba, 0x78, 0x16, 0xbf, 0x8f, 0x01, 0xcf, 0xea, 0x41, 0x41, 0x40,
-  0xde, 0x5d, 0xae, 0x22, 0x23, 0xb0, 0x03, 0x61, 0xa3, 0x96, 0x17,
-  0x7a, 0x9c, 0xb4, 0x10, 0xff, 0x61, 0xf2, 0x00, 0x15, 0xad};
+// XXH3-128 of "abc" in canonical form.
+constexpr codec::content_digest abc_digest{
+  0x06,
+  0xb0,
+  0x5a,
+  0xb6,
+  0x73,
+  0x3a,
+  0x61,
+  0x85,
+  0x78,
+  0xaf,
+  0x5f,
+  0x94,
+  0x89,
+  0x2f,
+  0x39,
+  0x50};
 
 codec::limits policy_with(std::uint64_t bytes, std::uint64_t items) {
     codec::limits_config config;
@@ -91,9 +101,9 @@ TEST(
       = codec::crc32c_cooperatively({}, work, 0x12345678U, anchor).get();
     ASSERT_TRUE(crc.has_value());
     EXPECT_EQ(*crc, 0x12345678U);
-    const auto sha = codec::sha256_cooperatively({}, work, anchor).get();
-    ASSERT_TRUE(sha.has_value());
-    EXPECT_EQ(*sha, empty_sha);
+    const auto digest = codec::xxh3_128_cooperatively({}, work, anchor).get();
+    ASSERT_TRUE(digest.has_value());
+    EXPECT_EQ(*digest, codec::xxh3_128_empty);
     EXPECT_EQ(work.bytes_remaining(), work.byte_quantum());
     EXPECT_EQ(work.items_remaining(), item_count{252});
 }
@@ -104,9 +114,9 @@ TEST(
     codec::cooperative_work work{policy_with(8, 5), abort};
     for (std::uint64_t invocation = 1; invocation <= 20; ++invocation) {
         if (invocation % 2U == 0) {
-            const auto result = codec::sha256_cooperatively({}, work).get();
+            const auto result = codec::xxh3_128_cooperatively({}, work).get();
             ASSERT_TRUE(result.has_value());
-            EXPECT_EQ(*result, empty_sha);
+            EXPECT_EQ(*result, codec::xxh3_128_empty);
         } else {
             const auto result = codec::crc32c_cooperatively({}, work).get();
             ASSERT_TRUE(result.has_value());
@@ -130,10 +140,10 @@ TEST(
     codec::crc32c expected;
     expected.extend("abc"sv);
     EXPECT_EQ(*crc, expected.value());
-    const auto sha
-      = codec::sha256_cooperatively(fragmented("abc"sv, 3), work).get();
-    ASSERT_TRUE(sha.has_value());
-    EXPECT_EQ(*sha, abc_sha);
+    const auto digest
+      = codec::xxh3_128_cooperatively(fragmented("abc"sv, 3), work).get();
+    ASSERT_TRUE(digest.has_value());
+    EXPECT_EQ(*digest, abc_digest);
     EXPECT_EQ(work.bytes_remaining(), byte_count{});
     EXPECT_EQ(work.items_remaining(), item_count{});
 }
@@ -159,9 +169,9 @@ TEST(
         }
         codec::crc32c expected_crc{0x13579bdfU};
         expected_crc.extend(std::span<const char>{bytes});
-        codec::sha256_hasher expected_sha;
-        expected_sha.update(bytes.data(), bytes.size());
-        const auto sha_digest = std::move(expected_sha).final();
+        codec::xxh3_128_hasher expected_hasher;
+        expected_hasher.update(bytes.data(), bytes.size());
+        const auto expected_digest = std::move(expected_hasher).final();
         for (const std::uint64_t quantum : {1U, 31U, 4096U, 65536U}) {
             SCOPED_TRACE(
               ::testing::Message()
@@ -177,15 +187,15 @@ TEST(
             EXPECT_TRUE(crc_input.empty());
             ASSERT_TRUE(crc.has_value());
             EXPECT_EQ(*crc, expected_crc.value());
-            auto sha_input = fragmented(bytes, shape.fragment_bytes);
-            const auto sha = codec::sha256_cooperatively(
-                               std::move(sha_input), work, anchor)
-                               .get();
+            auto digest_input = fragmented(bytes, shape.fragment_bytes);
+            const auto digest = codec::xxh3_128_cooperatively(
+                                  std::move(digest_input), work, anchor)
+                                  .get();
             // The buffer move contract guarantees an empty source.
             // NOLINTNEXTLINE(bugprone-use-after-move)
-            EXPECT_TRUE(sha_input.empty());
-            ASSERT_TRUE(sha.has_value());
-            EXPECT_EQ(*sha, sha_digest);
+            EXPECT_TRUE(digest_input.empty());
+            ASSERT_TRUE(digest.has_value());
+            EXPECT_EQ(*digest, expected_digest);
         }
     }
 }
@@ -193,7 +203,7 @@ TEST(
 TEST(IntegrityCooperativeTest, OwnedSharedSlicesKeepTheirOriginalPresentation) {
     auto original = fragmented("xxabczz"sv, 2);
     auto crc_input = original.share(byte_count{2}, byte_count{3}).value();
-    auto sha_input = original.share(byte_count{2}, byte_count{3}).value();
+    auto digest_input = original.share(byte_count{2}, byte_count{3}).value();
     ASSERT_TRUE(original.trim_front(byte_count{7}).has_value());
     seastar::abort_source abort;
     codec::cooperative_work work{policy_with(1, 1), abort};
@@ -203,15 +213,13 @@ TEST(IntegrityCooperativeTest, OwnedSharedSlicesKeepTheirOriginalPresentation) {
     codec::crc32c expected;
     expected.extend("abc"sv);
     EXPECT_EQ(*crc, expected.value());
-    const auto sha
-      = codec::sha256_cooperatively(std::move(sha_input), work).get();
-    ASSERT_TRUE(sha.has_value());
-    EXPECT_EQ(*sha, abc_sha);
+    const auto digest
+      = codec::xxh3_128_cooperatively(std::move(digest_input), work).get();
+    ASSERT_TRUE(digest.has_value());
+    EXPECT_EQ(*digest, abc_digest);
 }
 
-TEST(
-  IntegrityCooperativeTest,
-  AlreadyRequestedAbortPrecedesWorkAndNativeConstruction) {
+TEST(IntegrityCooperativeTest, AlreadyRequestedAbortPrecedesAnyWork) {
     seastar::abort_source abort;
     codec::cooperative_work work{policy_with(1, 1), abort};
     abort.request_abort_ex(
@@ -221,7 +229,7 @@ TEST(
         .get(),
       errc::aborted);
     expect_error(
-      codec::sha256_cooperatively(fragmented("abc"sv, 1), work, anchor).get(),
+      codec::xxh3_128_cooperatively(fragmented("abc"sv, 1), work, anchor).get(),
       errc::aborted);
     EXPECT_EQ(work.bytes_remaining(), byte_count{});
     EXPECT_EQ(work.items_remaining(), item_count{});
@@ -239,7 +247,7 @@ TEST(
       codec::crc32c_cooperatively(fragmented("ab"sv, 1), work, 0, anchor).get(),
       errc::resource_exhausted);
     expect_error(
-      codec::sha256_cooperatively(fragmented("123456789"sv, 9), work, anchor)
+      codec::xxh3_128_cooperatively(fragmented("123456789"sv, 9), work, anchor)
         .get(),
       errc::resource_exhausted);
     EXPECT_EQ(work.bytes_remaining(), byte_count{});
@@ -251,13 +259,13 @@ TEST(IntegrityCooperativeTest, PublishedSuccessIsNotChangedByALaterAbort) {
     codec::cooperative_work work{codec::limits::defaults(), abort};
     const auto crc
       = codec::crc32c_cooperatively(fragmented("123456789"sv, 9), work).get();
-    const auto sha
-      = codec::sha256_cooperatively(fragmented("abc"sv, 3), work).get();
+    const auto digest
+      = codec::xxh3_128_cooperatively(fragmented("abc"sv, 3), work).get();
     ASSERT_TRUE(crc.has_value());
-    ASSERT_TRUE(sha.has_value());
+    ASSERT_TRUE(digest.has_value());
     abort.request_abort();
     EXPECT_EQ(*crc, 0xe3069283U);
-    EXPECT_EQ(*sha, abc_sha);
+    EXPECT_EQ(*digest, abc_digest);
     EXPECT_FALSE(work.poll().has_value());
 }
 
@@ -305,16 +313,17 @@ TEST(IntegrityCooperativeTest, BorrowedCrcLeavesOwnershipAndCleanupWithCaller) {
 TEST(
   IntegrityCooperativeTest,
   AbortDuringFinalInputReleasePreventsEitherDigestPublication) {
-    for (const bool sha : {false, true}) {
+    for (const bool use_digest : {false, true}) {
         seastar::abort_source abort;
         bool released = false;
         auto input = abort_on_release(abort, released, 1);
         codec::cooperative_work work{codec::limits::defaults(), abort};
         ASSERT_FALSE(released);
         ASSERT_FALSE(abort.abort_requested());
-        if (sha) {
+        if (use_digest) {
             expect_error(
-              codec::sha256_cooperatively(std::move(input), work, anchor).get(),
+              codec::xxh3_128_cooperatively(std::move(input), work, anchor)
+                .get(),
               errc::aborted);
         } else {
             expect_error(
@@ -351,7 +360,7 @@ struct abort_observation {
     bool aborted;
 };
 
-seastar::future<abort_observation> cancel_pending_hash(bool sha) {
+seastar::future<abort_observation> cancel_pending_hash(bool use_digest) {
     std::vector<char> bytes(65536, 'x');
     auto input = fragmented(bytes, bytes.size());
     seastar::abort_source abort;
@@ -374,8 +383,8 @@ seastar::future<abort_observation> cancel_pending_hash(bool sha) {
     bool aborted = false;
     std::exception_ptr failure;
     try {
-        if (sha) {
-            auto completion = codec::sha256_cooperatively(
+        if (use_digest) {
+            auto completion = codec::xxh3_128_cooperatively(
               std::move(input), work, anchor);
             pending = !completion.available();
             const auto result = co_await std::move(completion);
@@ -409,7 +418,7 @@ TEST(IntegrityCooperativeTest, QueuedAbortInterruptsPendingCrcWork) {
     EXPECT_TRUE(observed.aborted);
 }
 
-TEST(IntegrityCooperativeTest, QueuedAbortInterruptsPendingShaWork) {
+TEST(IntegrityCooperativeTest, QueuedAbortInterruptsPendingDigestWork) {
     const auto observed = cancel_pending_hash(true).get();
     EXPECT_TRUE(observed.pending);
     EXPECT_TRUE(observed.observed);

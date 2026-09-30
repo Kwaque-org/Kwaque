@@ -272,6 +272,88 @@ seastar::future<> exercise(
       });
 }
 
+// A zero-written file: every small group is a synchronized write, durable at
+// completion, so neither barriers nor close flush. The range keeps moving
+// ahead of the reservations, frames stay exact and the file ends in zeros.
+template<typename Backend, typename Owner, typename Driver>
+seastar::future<> zero_written(
+  Backend& files,
+  Owner& ownership,
+  const local_device_spec& spec,
+  workload_budget& budget,
+  Driver drive) {
+    constexpr std::uint64_t window = 32768;
+    constexpr unsigned groups = 6;
+    auto config = wal_writer_contract::configuration();
+    config.preallocation_bytes = byte_count{window};
+    config.preallocation_extension_bytes = byte_count{window};
+    config.synchronous_write_bytes = byte_count{16384};
+    std::optional<runtime::file_path> path;
+    std::string expected;
+    std::uint64_t start = 0;
+    co_await with_writer(
+      files,
+      ownership,
+      spec,
+      budget,
+      drive,
+      config,
+      [&](auto& writer, auto& work) -> seastar::future<> {
+          const auto head = *writer.prepared_head();
+          path = take(
+            take(local_paths::make(spec.root)).wal(0, head.incarnation));
+          expected = wal_writer_contract::header_bytes(
+            spec, 0, head.incarnation);
+          start = writer.progress()->reserved.position().value();
+          const auto zeroed = co_await store_contract::read_all_bytes(
+            files, *path, drive);
+          require(
+            zeroed.size() == start + window
+              && zeroed.find_first_not_of('\0', start) == std::string::npos,
+            "preparation did not zero-write the WAL window");
+          std::optional<wal_captured_boundary> last;
+          for (unsigned i = 0; i != groups; ++i) {
+              const std::array records{assigned_wire()};
+              const auto position = writer.progress()->reserved.position();
+              auto group = co_await offer(
+                budget, spec.owner.cluster(), work, records);
+              auto accepted = take(
+                co_await writer.submit(std::move(group), work));
+              auto written = co_await drive.lifecycle(
+                std::move(accepted.written));
+              take(written.failure.outcome());
+              expected += prepare_bytes(
+                records[0], head, spec.owner.cluster(), position.value());
+              last = accepted.boundary;
+          }
+          const auto stats = writer.statistics();
+          require(
+            last->cursor().position().value() > start + window
+              && stats.write_calls == groups
+              && stats.synchronized_writes == groups && stats.extensions != 0
+              && stats.flush_calls == 0,
+            "a group past the window took an ordinary write");
+          auto durable = co_await drive.lifecycle(writer.barrier(*last));
+          take(durable.failure.outcome());
+          require(
+            durable.receipt && writer.progress()->durable == last->cursor()
+              && writer.statistics().flush_calls == 0,
+            "a barrier over synchronized writes flushed");
+          const auto extent = take(
+            co_await drive.lifecycle(writer.inspect_extent()));
+          require(
+            extent.observed_eof.value() > last->cursor().position().value(),
+            "the zero-written range did not stay ahead of the writes");
+      });
+    const auto stored = co_await store_contract::read_all_bytes(
+      files, *path, drive);
+    require(
+      stored.size() > expected.size()
+        && stored.substr(0, expected.size()) == expected
+        && stored.find_first_not_of('\0', expected.size()) == std::string::npos,
+      "zero-written WAL frames are not exact or its tail is not zeros");
+}
+
 template<typename Backend, typename Owner, typename Driver>
 seastar::future<> capacity(
   Backend& files,

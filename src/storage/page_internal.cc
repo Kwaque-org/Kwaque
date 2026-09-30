@@ -50,13 +50,15 @@ read_page_ref(const std::array<char, 48>& fixed, codec::field_context c) {
     const auto ordinal = page_wire(
       page_ordinal::make(load<0, std::uint32_t>(fixed)), c);
     if (!ordinal) return codec::failure(ordinal.error());
+    const auto digest = read_digest<16>(fixed);
+    if (!digest) return codec::failure(page_error(errc::malformed_data, c, 32));
     return page_wire(
       page_ref::make(
         *ordinal,
         load<4, std::uint32_t>(fixed),
         load<8, std::uint32_t>(fixed),
         byte_count{load<12, std::uint32_t>(fixed)},
-        codec::immutable_object_digest{read_digest<16>(fixed)}),
+        codec::immutable_object_digest{*digest}),
       c);
 }
 void write_page_ref(std::array<char, 48>& fixed, const page_ref& ref) noexcept {
@@ -73,7 +75,7 @@ seastar::future<codec::result<codec::immutable_object_digest>> hash_exact(
     const auto anchor = page_error(errc::success, c);
     if (auto ready = work.poll(anchor); !ready)
         co_return codec::failure(ready.error());
-    codec::sha256_hasher hash;
+    codec::xxh3_128_hasher hash;
     for (auto fragment : input) {
         for (std::size_t offset = 0; offset < fragment.size();) {
             const auto n = std::min(
@@ -104,7 +106,7 @@ seastar::future<codec::result<codec::immutable_object_digest>> hash_exact(
         co_return codec::failure(page_error(errc::malformed_data, c));
     if (auto ready = work.poll(anchor); !ready)
         co_return codec::failure(ready.error());
-    codec::sha256_hasher hash;
+    codec::xxh3_128_hasher hash;
     auto left = length.value();
     while (left != 0) {
         const auto fragment = input.peek_current_fragment();

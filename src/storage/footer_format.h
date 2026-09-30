@@ -4,6 +4,7 @@
 #include "src/storage/segment_format.h"
 
 #include <optional>
+#include <utility>
 
 namespace kwaque::storage {
 class extent_verifier;
@@ -48,7 +49,7 @@ public:
     [[nodiscard]] boundary_fields boundary() const noexcept {
         return boundary_;
     }
-    // Present only after finishing a walk that requested exact-byte SHA.
+    // Present only after finishing a walk that requested an exact-byte digest.
     // Prefix checkpoints deliberately carry CRC evidence only.
     [[nodiscard]] std::optional<codec::extent_digest> digest() const noexcept {
         return digest_;
@@ -97,6 +98,44 @@ private:
     model::file_byte_span extent_;
 };
 
+// Immutable encoder-owned bytes and the descriptor that produced them. A
+// verifier can reuse their validation under the same policy and placement;
+// arbitrary bytes still enter through the complete decoder.
+// Extraction empties the byte owner; remaining scalar fields are diagnostic.
+class encoded_durable_footer final {
+public:
+    encoded_durable_footer(const encoded_durable_footer&) = delete;
+    encoded_durable_footer& operator=(const encoded_durable_footer&) = delete;
+    encoded_durable_footer(encoded_durable_footer&&) noexcept = default;
+    encoded_durable_footer&
+    operator=(encoded_durable_footer&&) noexcept = default;
+    [[nodiscard]] const kwaque::bytes::fragmented_buffer&
+    bytes() const& noexcept {
+        return bytes_;
+    }
+    const kwaque::bytes::fragmented_buffer& bytes() const&& = delete;
+    [[nodiscard]] durable_footer descriptor() const noexcept {
+        return descriptor_;
+    }
+    [[nodiscard]] kwaque::bytes::fragmented_buffer release_bytes() && noexcept {
+        return std::exchange(bytes_, kwaque::bytes::fragmented_buffer{});
+    }
+
+private:
+    friend class detail::footer_codec;
+    friend class extent_verifier;
+    encoded_durable_footer(
+      kwaque::bytes::fragmented_buffer bytes,
+      durable_footer descriptor,
+      codec::limits policy) noexcept
+      : bytes_(std::move(bytes))
+      , descriptor_(descriptor)
+      , validated_(policy) {}
+    mutable kwaque::bytes::fragmented_buffer bytes_;
+    durable_footer descriptor_;
+    codec::limits validated_;
+};
+
 enum class footer_field : std::uint16_t {
     fixed_body = 224,
     cluster,
@@ -127,7 +166,7 @@ enum class footer_field : std::uint16_t {
 // reservations and includes new fixed/padding/envelope staging. Work/abort and
 // the verified allocator profile stay alive and exclusive until joined return.
 // Fixed scalar validation requires a 1024-byte / 64-item work quantum.
-[[nodiscard]] seastar::future<codec::result<bytes::fragmented_buffer>>
+[[nodiscard]] seastar::future<codec::result<encoded_durable_footer>>
 encode_durable_footer(
   verified_extent evidence,
   footer_expectation expected,

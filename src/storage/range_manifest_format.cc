@@ -29,10 +29,7 @@ using detail::load;
 using detail::page_error;
 using detail::store;
 constexpr auto manifest_family = codec::format_family::range_manifest;
-constexpr codec::sha256_digest empty_sha{
-  0xe3, 0xb0, 0xc4, 0x42, 0x98, 0xfc, 0x1c, 0x14, 0x9a, 0xfb, 0xf4,
-  0xc8, 0x99, 0x6f, 0xb9, 0x24, 0x27, 0xae, 0x41, 0xe4, 0x64, 0x9b,
-  0x93, 0x4c, 0xa4, 0x95, 0x99, 0x1b, 0x78, 0x52, 0xb8, 0x55};
+constexpr auto empty_digest = codec::xxh3_128_empty;
 
 template<std::size_t N>
 void write_scope(
@@ -141,12 +138,14 @@ codec::result<range_manifest_entry> read_entry(
     if (!generation) return codec::failure(generation.error());
     if (!physical) return codec::failure(physical.error());
     if (!bytes) return codec::failure(bytes.error());
+    const auto digest = detail::read_digest<72>(raw);
+    if (!digest) return codec::failure(page_error(errc::malformed_data, c, 88));
     return detail::page_wire(
       range_manifest_entry::make(
         *segment,
         *generation,
         storage::coverage{*logical, *physical, *bytes},
-        codec::extent_digest{detail::read_digest<72>(raw)}),
+        codec::extent_digest{*digest}),
       c);
 }
 
@@ -486,7 +485,7 @@ result<range_manifest_entry> range_manifest_entry::make(
       || coverage.physical().count().value()
            > coverage.logical().count().value()
       || (!coverage.physical().empty() && coverage.bytes().empty())
-      || (coverage.bytes().empty() && digest.bytes() != empty_sha))
+      || (coverage.bytes().empty() && digest.bytes() != empty_digest))
         return failure(errc::invalid_argument);
     return range_manifest_entry{segment, generation, coverage, digest};
 }

@@ -76,7 +76,7 @@ struct decoded_assigned_batch final {
 // publishes only complete output. This operation never recomputes a different
 // projection.
 //
-// parent_remaining excludes other live inputs, verified SHA/CRC/native/frame
+// parent_remaining excludes other live inputs, verified hash/CRC/native/frame
 // and opaque reservations, but includes this batch's backing/descriptors and
 // all new prefix/assembly/envelope staging. Work and abort remain exclusively
 // alive and unmoved until completion. Cleanup is joined before final polling.
@@ -125,7 +125,7 @@ encode_assigned_batch(
 
 // Decode exactly one envelope. Integrity and family precede body parsing; all
 // fixed fields, counts, records, timestamps and final bytes are checked before
-// publication. Submitted and dense assigned data recompute the original SHA.
+// publication. Submitted and dense assigned data recompute the original digest.
 // Sparse assigned data validates current bytes/context and carries its digest,
 // including an independently supplied fingerprint expectation when present.
 // Returned model values retain known body semantics, not optional envelope
@@ -134,7 +134,7 @@ encode_assigned_batch(
 //
 // Reserve this parent's backing/descriptors/promotion ONCE before entry using
 // reserve_decode_input. memory is the residual after that reservation and
-// verified SHA/CRC/native/frame/callback/opaque and other live costs. Each
+// verified hash/CRC/native/frame/callback/opaque and other live costs. Each
 // alias is admitted before allocation. remaining reserves only the returned
 // record-region metadata and any newly expanded backing; temporary body/record
 // and expanded-parser aliases are gone before the envelope commits. LZ4 output

@@ -45,8 +45,7 @@ constexpr std::string_view golden_hex
   = "4b5142460a0001000100200044000000000000000000000078ce1b7198351fbd"
     "0102030405060708090a0b0c0d0e0f10020000002122232425262728292a2b2c2d2e2f30"
     "08070605040302018182838485868788898a8b8c8d8e8f90ffffffffffffffff";
-constexpr std::string_view fingerprint_hex
-  = "89085e78bbc8c7f8c80a9ea8ff68c3d74ab2e44d4b7955fdc943866ae8348075";
+constexpr std::string_view fingerprint_hex = "08df46cf827f17692f3f98f4a13b5986";
 
 static_assert(!std::is_default_constructible_v<model::range_cursor>);
 static_assert(!std::is_default_constructible_v<model::read_checkpoint>);

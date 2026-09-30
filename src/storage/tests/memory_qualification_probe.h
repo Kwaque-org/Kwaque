@@ -44,4 +44,5 @@ inline std::uint64_t alignment_bytes(std::string_view name) {
 void format_operation(std::string_view);
 void metadata_operation(std::string_view);
 void extent_operation(std::string_view);
+void segment_operation(std::string_view);
 } // namespace kwaque::storage::qualification

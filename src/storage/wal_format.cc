@@ -299,7 +299,6 @@ seastar::future<codec::result<fragmented_buffer>> encode_wal_prepare(
   codec::field_context context) {
     std::optional<encoded_assigned_batch> child{
       std::in_place, std::move(source)};
-    fragmented_buffer payload;
     std::optional<codec::result<fragmented_buffer>> output;
     std::optional<codec::error> failed;
     std::exception_ptr exception;
@@ -400,11 +399,10 @@ seastar::future<codec::result<fragmented_buffer>> encode_wal_prepare(
             store<132>(
               fixed,
               static_cast<std::uint32_t>(layout->padding_bytes().value()));
-            payload = std::move(*child).release_bytes();
             output.emplace(
               co_await detail::encode_padded(
                 fixed,
-                std::move(payload),
+                std::move(child),
                 *layout,
                 codec::format_family::wal_prepare,
                 work,
@@ -418,8 +416,6 @@ seastar::future<codec::result<fragmented_buffer>> encode_wal_prepare(
     }
     co_await work.drain_inline(work.byte_quantum(), work.item_quantum());
     child.reset();
-    co_await work.drain_inline(work.byte_quantum(), work.item_quantum());
-    payload = fragmented_buffer{};
     if (!failed && !exception) {
         if (auto ready = work.poll(anchor); !ready) failed = ready.error();
     }

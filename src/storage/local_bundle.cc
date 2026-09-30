@@ -28,16 +28,26 @@ seastar::future<runtime::result<local_bundle>> local_bundle::make(
   bytes::fragmented_buffer bytes,
   workload_budget& budget,
   local_store_io_limits limits,
-  codec::cooperative_work& work) {
+  codec::cooperative_work& work,
+  std::optional<workload_reservation> prepared) {
     if (auto valid = limits.validate(); !valid)
         co_return runtime::failure(valid.error());
     if (bytes.size() != reference.bytes() || bytes.fragment_count() > 1024)
         co_return runtime::failure(detail::path_error(errc::wrong_context));
-    auto held = budget.try_reserve_buffer(
-      bytes,
-      byte_count{
-        limits.operation_bytes.value() + limits.execution_bytes.value()
-        + 32768});
+    const auto additional = byte_count{
+      limits.operation_bytes.value() + limits.execution_bytes.value() + 32768};
+    auto held = [&]() -> runtime::result<workload_reservation> {
+        if (!prepared) return budget.try_reserve_buffer(bytes, additional);
+        if (!budget.owns(*prepared) || !prepared->exclusive())
+            return runtime::failure(detail::path_error(errc::wrong_context));
+        auto backing = budget.buffer_charge(bytes);
+        if (!backing) return runtime::failure(backing.error());
+        auto required = backing->checked_add(additional);
+        if (!required || *required > prepared->retained_bytes())
+            return runtime::failure(
+              detail::path_error(errc::resource_exhausted));
+        return std::move(*prepared);
+    }();
     if (!held) co_return runtime::failure(held.error());
     bytes::fragmented_buffer_parser input{bytes.share()};
     auto memory = detail::metadata_file_budget(input, limits, work);

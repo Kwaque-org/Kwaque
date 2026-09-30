@@ -1,6 +1,6 @@
 #include "src/model/tests/checkpoint_test_support.h"
 
-#include "src/codec/sha256.h"
+#include "src/codec/xxh3.h"
 
 #include <crc32c/crc32c.h>
 
@@ -86,7 +86,7 @@ std::string body_from_value(const read_checkpoint& value) {
 codec::checkpoint_digest digest(std::string_view body) {
     // One terminating zero byte, independently specified in this projection.
     constexpr auto domain = std::to_array("KQ/CHECKPOINT/1");
-    codec::sha256_hasher hash;
+    codec::xxh3_128_hasher hash;
     hash.update(domain.data(), domain.size());
     hash.update(body.data(), body.size());
     return codec::checkpoint_digest{std::move(hash).final()};

@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import copy
-import hashlib
 import json
 import tempfile
 import unittest
@@ -95,6 +94,32 @@ class FormatFixtureTest(unittest.TestCase):
         self.assertEqual((verifier.xxh32_short(header) >> 8) & 255, 0x74)
         with self.assertRaises(verifier.FixtureError):
             verifier.xxh32_short(bytes(16))
+
+    def test_content_identity_matches_published_xxh3_128_vectors(self):
+        # xxHash's seed-zero sanity vectors: a generated buffer, digests
+        # written high 64 bits then low.
+        buffer, generator = bytearray(), 2654435761
+        for _ in range(2367):
+            buffer.append(generator >> 56)
+            generator = generator * 11400714785074694797 & ((1 << 64) - 1)
+        for size, expected in (
+            (0, "99aa06d3014798d86001c324468d497f"),
+            (1, "a6cd5e9392000f6ac44bdff4074eecdb"),
+            (6, "082afe0b8162d12a3e7039bdda43cfc6"),
+            (12, "6e3efd8fc7802b18061a192713f69ad9"),
+            (24, "0ce966e4678d37611e7044d28b1b901d"),
+            (48, "a002ac4e5478227ef942219aed80f67b"),
+            (81, "4952f58181ab00425e8bafb9f95fb803"),
+            (222, "337e09641b948717f1aebd597cec6b3a"),
+            (403, "1b6de21e332dd73dcdeb804d65c6dea4"),
+            (512, "18d2d110dcc9bca1617e49599013cb6b"),
+            (2048, "f736557fd47073a5dd59e2c3a5f038e0"),
+            (2240, "ccb134fbfa7ce49d6e73a90539cf2948"),
+            (2367, "e89c0f6ff369b427cb37aeb9e5d361ed"),
+        ):
+            with self.subTest(size=size):
+                digest = verifier.xxh3_128(bytes(buffer[:size]))
+                self.assertEqual(digest.hex(), expected)
 
     def test_every_fixture_detects_byte_corruption(self):
         for name, wire in self.fixtures.items():
@@ -274,19 +299,19 @@ class FormatFixtureTest(unittest.TestCase):
                 ):
                     verifier.verify(path / "manifest.json")
 
-    def test_sha_domain_terminator_and_exact_objects_differ(self):
+    def test_digest_domain_terminator_and_exact_objects_differ(self):
         body = self.fixtures["checkpoint"][32:]
         self.assertEqual(
-            hashlib.sha256(b"KQ/CHECKPOINT/1\0" + body).digest(),
+            verifier.xxh3_128(b"KQ/CHECKPOINT/1\0" + body),
             self.fixtures["checkpoint_digest"],
         )
         self.assertNotEqual(
-            hashlib.sha256(b"KQ/CHECKPOINT/1" + body).digest(),
+            verifier.xxh3_128(b"KQ/CHECKPOINT/1" + body),
             self.fixtures["checkpoint_digest"],
         )
         self.assertNotEqual(
-            hashlib.sha256(self.fixtures["checkpoint"]).digest(),
-            hashlib.sha256(self.fixtures["checkpoint_extended"]).digest(),
+            verifier.xxh3_128(self.fixtures["checkpoint"]),
+            verifier.xxh3_128(self.fixtures["checkpoint_extended"]),
         )
 
 

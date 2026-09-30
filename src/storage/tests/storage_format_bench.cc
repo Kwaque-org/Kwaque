@@ -1,6 +1,6 @@
-#include "src/codec/sha256_cooperative.h"
 #include "src/codec/tests/benchmark_buffer.h"
 #include "src/codec/tests/qualification_profile.h"
+#include "src/codec/xxh3_cooperative.h"
 #include "src/storage/format_size.h"
 #include "src/storage/tests/storage_format_fixture.h"
 #include "src/storage/tests/storage_large_fixture.h"
@@ -105,6 +105,9 @@ const fragmented_buffer& output_bytes(const fragmented_buffer& value) {
 const fragmented_buffer& output_bytes(const segment_block& value) {
     return value.bytes();
 }
+const fragmented_buffer& output_bytes(const encoded_durable_footer& value) {
+    return value.bytes();
+}
 const fragmented_buffer& output_bytes(const encoded_retry_page& value) {
     return value.bytes;
 }
@@ -148,7 +151,7 @@ public:
         } else if constexpr (Op == operation::exact_hash) {
             auto input = wire_.share();
             perf_tests::start_measuring_time();
-            const auto result = co_await codec::sha256_cooperatively(
+            const auto result = co_await codec::xxh3_128_cooperatively(
               std::move(input), work);
             perf_tests::do_not_optimize(result);
             perf_tests::stop_measuring_time();
@@ -173,7 +176,7 @@ public:
                               work.policy(),
                               extent_layout_kind::initial_append,
                               {},
-                              extent_integrity::crc32c_and_sha256)
+                              extent_integrity::crc32c_and_digest)
                               .value();
             (co_await verifier.add_block(
                std::move(input), source_->block_context.batch, memory, work))
@@ -456,7 +459,7 @@ private:
                           work.policy(),
                           extent_layout_kind::initial_append,
                           {},
-                          extent_integrity::crc32c_and_sha256)
+                          extent_integrity::crc32c_and_digest)
                           .value();
         (co_await verifier.add_block(
            std::move(input), testing::batch_expected(), memory, work))
@@ -484,7 +487,7 @@ private:
               source_->sealed_context);
         }
         root_digest_ = codec::immutable_object_digest{
-          testing::exact_sha(source_->root)};
+          testing::exact_digest(source_->root)};
         {
             fragmented_buffer_parser root_input{
               co_await layout(source_->root, work)};
@@ -500,8 +503,9 @@ private:
                              .value();
             root_.emplace(std::move(decoded.value));
         }
-        wire_digest_
-          = (co_await codec::sha256_cooperatively(wire_.share(), work)).value();
+        wire_digest_ = (co_await codec::xxh3_128_cooperatively(
+                          wire_.share(), work))
+                         .value();
         // Drop temporary fixture strings; charge every cached buffer, vector
         // and conservatively counted alias. One MiB remains excluded for
         // native engines, inline owners and coroutine frames.
@@ -559,7 +563,7 @@ private:
     std::optional<verified_extent> proof_;
     std::optional<sealed_footer> root_;
     codec::immutable_object_digest root_digest_{{}};
-    codec::sha256_digest wire_digest_{};
+    codec::content_digest wire_digest_{};
     byte_count remaining_{codec::testing::residual};
     bool reported_{false};
 };

@@ -1,6 +1,6 @@
-#include "src/codec/sha256.h"
 #include "src/codec/tests/benchmark_buffer.h"
 #include "src/codec/tests/qualification_profile.h"
+#include "src/codec/xxh3.h"
 #include "src/model/tests/model_bench_fixture.h"
 #include "src/protocol/batch_frame_codec.h"
 #include "src/protocol/tests/frame_test_support.h"
@@ -40,9 +40,9 @@ enum class shape {
     sparse
 };
 
-seastar::future<codec::sha256_digest>
+seastar::future<codec::content_digest>
 hash_records(const fragmented_buffer& records, codec::cooperative_work& work) {
-    codec::sha256_hasher hash;
+    codec::xxh3_128_hasher hash;
     for (auto fragment : records) {
         for (std::size_t offset = 0; offset < fragment.size();) {
             const auto n = std::min<std::size_t>(
@@ -362,7 +362,7 @@ private:
     codec::decode_budget memory_{
       codec::testing::residual, byte_count{1U << 20U}, capacity_bound};
     std::optional<codec::semantic_batch_digest> digest_;
-    std::optional<codec::sha256_digest> record_hash_;
+    std::optional<codec::content_digest> record_hash_;
 };
 
 template<

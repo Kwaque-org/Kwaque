@@ -26,13 +26,16 @@ public:
     local_bundle& operator=(local_bundle&&) noexcept = delete;
     local_bundle(const local_bundle&) = delete;
     local_bundle& operator=(const local_bundle&) = delete;
+    // A prepared grant exclusively transfers this budget's buffer/working
+    // allowance. It is validated before use and needs no open admission.
     [[nodiscard]] static seastar::future<runtime::result<local_bundle>> make(
       local_root_reference,
       local_bundle_context,
       bytes::fragmented_buffer root,
       workload_budget&,
       local_store_io_limits,
-      codec::cooperative_work&);
+      codec::cooperative_work&,
+      std::optional<workload_reservation> prepared = std::nullopt);
     [[nodiscard]] const local_bundle_root& root() const& noexcept {
         return root_;
     }
@@ -121,6 +124,8 @@ struct local_bundle_publication final {
 // establishes data/ footer or checkpoint-evidence readiness before this
 // immutable file is exposed. The configured namespace was initialized already;
 // segment/object parent creation belongs to its descriptor/publication owner.
+// A prepared publisher must match the exact target and remains caller-owned
+// through joined close. Its reserved working set includes the streamed page.
 template<
   runtime::file_system_backend Backend,
   local_directory_owner Owner,
@@ -138,13 +143,38 @@ seastar::future<local_bundle_publication> publish_local_bundle(
   Source source,
   Dependencies dependencies,
   workload_budget& budget,
-  codec::cooperative_work& work) {
+  codec::cooperative_work& work,
+  local_file_publisher<Backend>* prepared = nullptr) {
     static_assert(sizeof(Source) + sizeof(Dependencies) <= 8192);
     local_bundle_publication output;
     auto path = bundle.path(spec, shard);
     if (!path) {
         output.publication.failure.observe(path);
         co_return output;
+    }
+    const auto split = path->value().rfind('/');
+    const auto parent
+      = runtime::file_path::make(path->value().substr(0, split)).value();
+    const auto name
+      = runtime::file_name::make(path->value().substr(split + 1)).value();
+    const auto generation = local_publication_generation::make(
+                              bundle.reference().sequence().value())
+                              .value();
+    const local_publication_target target{
+      spec.shard_owner(shard).value(),
+      spec.root,
+      parent,
+      name,
+      runtime::file_rename_policy::no_replace,
+      {}};
+    if (prepared) {
+        auto valid = prepared->validate_prepared_target(target);
+        if (!valid) {
+            output.publication.failure.observe(valid);
+            output.publication.admission_rejected
+              = detail::publication_admission_pressure(valid.error());
+            co_return output;
+        }
     }
     auto valid = co_await ownership.validate(spec);
     if (!valid) {
@@ -161,23 +191,9 @@ seastar::future<local_bundle_publication> publish_local_bundle(
         output.publication.failure.observe(valid);
         co_return output;
     }
-    const auto split = path->value().rfind('/');
-    const auto parent
-      = runtime::file_path::make(path->value().substr(0, split)).value();
-    const auto name
-      = runtime::file_name::make(path->value().substr(split + 1)).value();
-    const auto generation = local_publication_generation::make(
-                              bundle.reference().sequence().value())
-                              .value();
-    local_file_publisher<Backend> publisher{
-      files,
-      budget,
-      {spec.shard_owner(shard).value(),
-       spec.root,
-       parent,
-       name,
-       runtime::file_rename_policy::no_replace,
-       {}}};
+    std::optional<local_file_publisher<Backend>> owned;
+    if (!prepared) owned.emplace(files, budget, target);
+    auto& publisher = prepared ? *prepared : *owned;
     // Named callback/captures remain in this frame across every suspension.
     auto writer = [&bundle, &source](
                     runtime::file& file, codec::cooperative_work& execution)
@@ -236,10 +252,12 @@ seastar::future<local_bundle_publication> publish_local_bundle(
     } catch (...) {
         output.publication.failure.observe(std::current_exception());
     }
-    try {
-        output.publication.failure.observe(co_await publisher.close());
-    } catch (...) {
-        output.publication.failure.observe(std::current_exception());
+    if (owned) {
+        try {
+            output.publication.failure.observe(co_await publisher.close());
+        } catch (...) {
+            output.publication.failure.observe(std::current_exception());
+        }
     }
     if (
       !output.publication.failure.failed()

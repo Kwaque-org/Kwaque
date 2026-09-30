@@ -15,7 +15,7 @@ namespace {
 using namespace testing;
 using bytes::fragmented_buffer_parser;
 codec::immutable_object_digest digest(std::uint8_t byte = 0x61) {
-    codec::sha256_digest bytes{};
+    codec::content_digest bytes{};
     bytes.fill(byte);
     return codec::immutable_object_digest{bytes};
 }
@@ -267,7 +267,7 @@ TEST(LocalMetadataTest, EveryTypedBodyRoundTripsAndKeepsOwningResiduals) {
         const auto wire = flat(encoded->bytes);
         EXPECT_EQ(get(wire, 4, 2), 11U);
         EXPECT_EQ(get(wire, 32, 2), static_cast<unsigned>(test.kind));
-        EXPECT_EQ(encoded->digest.bytes(), exact_sha(wire));
+        EXPECT_EQ(encoded->digest.bytes(), exact_digest(wire));
         const auto expectation = expected(
           header, test.payload, encoded->digest, encoded->bytes.size());
         fragmented_buffer_parser input{buffer(wire, 67)};
@@ -308,7 +308,7 @@ TEST(LocalMetadataTest, WalDiscoveryUsesStoredGeometryWithIndependentPins) {
         for (const auto predecessor : {false, true}) {
             for (const auto h : {32U, 4096U}) {
                 const auto wire = independent_wal(a, predecessor, h);
-                const codec::immutable_object_digest pin{exact_sha(wire)};
+                const codec::immutable_object_digest pin{exact_digest(wire)};
                 for (const auto pinned : {false, true}) {
                     seastar::abort_source abort;
                     codec::cooperative_work work{
@@ -430,7 +430,7 @@ TEST(LocalMetadataTest, StoredWalGeometryRejectsDamageAndKeepsParentMarks) {
         input.rollback().value();
     }
     const auto original = independent_wal(8192);
-    const codec::immutable_object_digest pin{exact_sha(original)};
+    const codec::immutable_object_digest pin{exact_digest(original)};
     auto changed = original;
     put(changed, 140, 33554432, 8); // Valid different capacity, repaired CRC.
     repair(changed);
@@ -645,7 +645,7 @@ TEST(
     EXPECT_EQ(result.error().code(), errc::corrupt_data);
     EXPECT_EQ(input.bytes_consumed().value(), 0U);
     EXPECT_EQ(input.checkpoint_depth(), 0U);
-    e.digest = codec::immutable_object_digest{exact_sha(wire)};
+    e.digest = codec::immutable_object_digest{exact_digest(wire)};
     result = decode_local_metadata(input, e, reserve(input, work), work).get();
     EXPECT_TRUE(result);
     EXPECT_TRUE(input.at_end());
@@ -664,7 +664,7 @@ TEST(LocalMetadataTest, RetryLeafBytesAndPreviousFullKeyAreSharedAcrossPages) {
           local_metadata_kind::completed_retry_page, payload, 40);
         seastar::abort_source abort;
         codec::cooperative_work work{codec::limits::defaults(), abort};
-        auto hash = codec::immutable_object_digest{exact_sha(wire)};
+        auto hash = codec::immutable_object_digest{exact_digest(wire)};
         local_metadata_expectation e{
           record_header(local_metadata_kind::completed_retry_page, 40),
           alignment(4096),
@@ -767,14 +767,14 @@ TEST(LocalMetadataTest, BoundaryEvidenceMatchesIndependentFields) {
         put(fields, 88, 8192, 8);
         put(fields, 96, 4096, 4);
         put(fields, 100, 6, 2);
-        fields.replace(104, 32, 32, '\x61');
+        fields.replace(104, 16, 16, '\x61');
         put_coverage(fields, 136, covered);
         put(fields, 184, with_retry ? 1U : 0U, 1);
         if (with_retry) {
             put(fields, 188, 5, 2);
             put(fields, 192, 40, 8);
             put(fields, 208, 4096, 4);
-            fields.replace(216, 32, 32, '\x61');
+            fields.replace(216, 16, 16, '\x61');
         }
         const auto wire = independent_record(
           local_metadata_kind::boundary_evidence, std::move(fields), 51);
@@ -792,14 +792,14 @@ TEST(LocalMetadataTest, BoundaryEvidenceMatchesIndependentFields) {
               .get();
         ASSERT_TRUE(encoded);
         EXPECT_EQ(flat(encoded->bytes), wire);
-        EXPECT_EQ(encoded->digest.bytes(), exact_sha(wire));
+        EXPECT_EQ(encoded->digest.bytes(), exact_digest(wire));
         fragmented_buffer_parser input{buffer(wire, 67)};
         auto decoded = decode_local_metadata(
                          input,
                          expected(
                            header,
                            payload,
-                           codec::immutable_object_digest{exact_sha(wire)},
+                           codec::immutable_object_digest{exact_digest(wire)},
                            byte_count{wire.size()}),
                          reserve(input, work),
                          work)
@@ -899,7 +899,7 @@ TEST(LocalMetadataTest, MaximumRetryPageIsBoundedAndImpossibleCountRejects) {
     auto bad = wire;
     put(bad, 192, 409, 4);
     repair(bad);
-    e.digest = codec::immutable_object_digest{exact_sha(bad)};
+    e.digest = codec::immutable_object_digest{exact_digest(bad)};
     e.page
       = page_ref::make(
           page_ordinal::make(0).value(), 0, 409, *e.encoded_bytes, *e.digest)

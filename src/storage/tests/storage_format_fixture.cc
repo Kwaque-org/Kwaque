@@ -44,7 +44,7 @@ storage_fixture::storage_fixture(
     for (std::uint32_t i = 0; i < retry_count; ++i)
         entries.push_back(testing::retry(i));
     if (sparse) {
-        codec::sha256_digest original_digest{};
+        codec::content_digest original_digest{};
         for (std::size_t i = 0; i < original_digest.size(); ++i)
             original_digest[i] = static_cast<unsigned char>(
               child[inner_header + 104 + i]);
@@ -59,7 +59,7 @@ storage_fixture::storage_fixture(
     page = retry_page_wire(entries, sealed_context, 0, 0, outer_header);
     const std::array refs{reference(page, 0, 0, retry_count)};
     root = sealed_wire(
-      fields, exact_sha(block), refs, sealed_context, outer_header);
+      fields, exact_digest(block), refs, sealed_context, outer_header);
     switch (kind) {
     case storage_case::header:
         wire = header_wire(header, outer_header);
@@ -191,7 +191,7 @@ storage_observation observe_storage(
                               input,
                               fixture.sealed_context,
                               codec::immutable_object_digest{
-                                exact_sha(fixture.root)},
+                                exact_digest(fixture.root)},
                               memory,
                               work,
                               c,

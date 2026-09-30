@@ -7,7 +7,7 @@ import json
 import math
 from pathlib import Path
 
-PREFIX = "wal_cohort_v1 "
+PREFIX = "wal_cohort_v2 "
 PROFILE_KEYS = ("allocator", "injection", "optimized", "asan", "ubsan", "oom_abort")
 WAL_ALIGNMENT = 8192
 
@@ -54,6 +54,44 @@ def cohort_keys(row: dict) -> list[tuple[int, int]]:
     )
 
 
+def zero_written(row: dict) -> bool:
+    return row.get("zero_written", False)
+
+
+def durable_times(row: dict, keys: list[tuple[int, int]]) -> dict:
+    """When each cohort became durable. Without a zero-written window every
+    cohort has its own covering flush. With one, a synchronized write is durable
+    when it completes and an ordinary write when the first flush that began
+    after it completed ends; a cohort is durable once every write overlapping
+    its bytes is."""
+    flushes = row["flush_times"]
+    if not zero_written(row):
+        return dict(zip(keys, (end for _, end in flushes), strict=True))
+    result = {}
+    begin = WAL_ALIGNMENT
+    for file, covering in keys:
+        if file != 0:
+            raise ValueError("zero-written measurements cover one WAL file")
+        durable = None
+        for position, length, _, end, synchronized in row["write_times"]:
+            if position + length <= begin or position >= covering:
+                continue
+            if synchronized:
+                point = end
+            else:
+                point = next(
+                    (f_end for f_begin, f_end in flushes if f_begin >= end), None
+                )
+                if point is None:
+                    raise ValueError("ordinary write was never covered by a flush")
+            durable = point if durable is None else max(durable, point)
+        if durable is None:
+            raise ValueError("cohort has no measured write")
+        result[(file, covering)] = durable
+        begin = covering
+    return result
+
+
 def validate(row: dict) -> None:
     requests = row["requests"]
     if not 0 < row["offered"] <= 128 or len(requests) != row["offered"]:
@@ -62,8 +100,8 @@ def validate(row: dict) -> None:
         raise ValueError("accepted count disagrees with request observations")
     if (
         row["elapsed_ns"] <= 0
-        or len(row["sha256"]) != 64
-        or any(c not in "0123456789abcdef" for c in row["sha256"])
+        or len(row["digest"]) != 32
+        or any(c not in "0123456789abcdef" for c in row["digest"])
     ):
         raise ValueError("missing duration or byte identity")
     if any(k not in row["build_profile"] for k in PROFILE_KEYS):
@@ -166,11 +204,34 @@ def validate(row: dict) -> None:
     if any(r["covering_end"] < r["end"] for r in requests if r["accepted"]):
         raise ValueError("receipt does not cover its request")
     keys = cohort_keys(row)
-    if len(keys) != row["flushes"]:
+    # A zero-written cohort flushes only if one of its writes was ordinary.
+    if (
+        row["flushes"] > len(keys)
+        if zero_written(row)
+        else len(keys) != row["flushes"]
+    ):
         raise ValueError("physical barrier count disagrees with completed cohorts")
+    if zero_written(row) and not row["timing_only"]:
+        writes = row.get("write_times")
+        if (
+            not isinstance(writes, list)
+            or any(
+                not isinstance(w, list)
+                or len(w) != 5
+                or any(type(v) is not int or v < 0 for v in w[:4])
+                or type(w[4]) is not bool
+                or w[3] < w[2]
+                or w[0] < WAL_ALIGNMENT
+                for w in writes
+            )
+            or sum(w[1] for w in writes) != row["encoded_bytes"]
+        ):
+            raise ValueError("incomplete zero-written write measurements")
     if not row["timing_only"]:
         flushes = row["flush_times"]
-        if len(flushes) != len(keys) or any(end < begin for begin, end in flushes):
+        if len(flushes) != row["flushes"] or any(
+            end < begin for begin, end in flushes
+        ):
             raise ValueError("incomplete flush timing")
         if (
             any(
@@ -181,13 +242,15 @@ def validate(row: dict) -> None:
             or row["flush_service_ns"] > row["elapsed_ns"]
         ):
             raise ValueError("invalid flush interval accounting")
-        terminal = dict(zip(keys, (end for _, end in flushes), strict=True))
+        terminal = durable_times(row, keys)
         if mode == "requests" and any(
             r["terminal"] < terminal[(r["file"], r["covering_end"])]
             for r in requests
             if r["accepted"] and not r["timeout"]
         ):
-            raise ValueError("notification preceded its covering physical flush")
+            raise ValueError(
+                "notification preceded its covering physical flush or synchronized write"
+            )
 
 
 def percentile(values: list[int], quantile: float) -> int | None:
@@ -222,9 +285,7 @@ def summarize(rows: list[dict]) -> dict:
     for row in rows:
         if row["timing_only"] or not request_timing:
             continue
-        endings = dict(
-            zip(cohort_keys(row), (f[1] for f in row["flush_times"]), strict=True)
-        )
+        endings = durable_times(row, cohort_keys(row))
         notifications.extend(
             r["terminal"] - endings[(r["file"], r["covering_end"])]
             for r in row["requests"]
@@ -344,7 +405,7 @@ def pair_signature(row: dict) -> tuple:
         "child_bytes",
         "child_fragments",
         "delay_ns",
-        "sha256",
+        "digest",
         "encoded_bytes",
         "offered",
         "flushes",
@@ -363,6 +424,8 @@ def pair_signature(row: dict) -> tuple:
         (r["file"], r["end"], r["covering_end"]) for r in row["requests"]
     )
     return tuple(row[k] for k in keys) + (
+        zero_written(row),
+        row.get("zero_written_extent"),
         boundaries,
         tuple(sorted(row["build_profile"].items())),
         observation(row),
@@ -424,6 +487,7 @@ def main() -> None:
                 )
             )
             key += (
+                zero_written(row),
                 tuple(sorted(row["build_profile"].items())),
                 observation(row),
                 tuple(row.get("affinity_cpus", [])),

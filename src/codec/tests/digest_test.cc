@@ -15,7 +15,7 @@
 namespace {
 
 namespace codec = kwaque::codec;
-using codec::sha256_digest;
+using codec::content_digest;
 
 template<typename Left, typename Right>
 concept equal_expression = requires(Left left, Right right) { left == right; };
@@ -29,23 +29,23 @@ template<typename Value, typename... Peers>
 consteval bool digest_contract(std::tuple<Peers...>*) {
     constexpr auto occurrences
       = (std::size_t{std::same_as<Value, Peers>} + ...);
-    return occurrences == 1U && sizeof(Value) == 32
+    return occurrences == 1U && sizeof(Value) == 16
            && std::is_standard_layout_v<Value>
            && std::is_trivially_copyable_v<Value>
            && std::is_nothrow_copy_constructible_v<Value>
            && std::is_nothrow_move_constructible_v<Value>
            && std::is_nothrow_destructible_v<Value>
            && !std::default_initializable<Value> && !std::is_aggregate_v<Value>
-           && std::constructible_from<Value, sha256_digest>
-           && !std::convertible_to<sha256_digest, Value>
-           && !std::convertible_to<Value, sha256_digest>
-           && !equal_expression<Value, sha256_digest>
+           && std::constructible_from<Value, content_digest>
+           && !std::convertible_to<content_digest, Value>
+           && !std::convertible_to<Value, content_digest>
+           && !equal_expression<Value, content_digest>
            && !std::constructible_from<Value, std::span<const unsigned char>>
            && std::same_as<
              decltype(std::declval<const Value&>().bytes()),
-             sha256_digest>
+             content_digest>
            && std::
-             same_as<decltype(std::declval<Value&&>().bytes()), sha256_digest>
+             same_as<decltype(std::declval<Value&&>().bytes()), content_digest>
            && noexcept(std::declval<const Value&>().bytes())
            && ((equal_expression<Value, Peers> == std::same_as<Value, Peers>) && ...)
            && (!order_expression<Value, Peers> && ...)
@@ -63,11 +63,13 @@ consteval bool all_contracts(std::tuple<Values...>* types) {
     return (digest_contract<Values>(types) && ...);
 }
 
-static_assert(codec::sha256_digest_bytes == 32);
-static_assert(std::same_as<sha256_digest, std::array<unsigned char, 32>>);
+static_assert(codec::content_digest_bytes == 16);
+static_assert(std::same_as<content_digest, std::array<unsigned char, 16>>);
+static_assert(codec::digest_slot_bytes == 32);
+static_assert(codec::digest_slot_bytes >= codec::content_digest_bytes);
 static_assert(all_contracts(static_cast<digest_types*>(nullptr)));
 static_assert(
-  codec::semantic_batch_digest{sha256_digest{}}.bytes() == sha256_digest{});
+  codec::semantic_batch_digest{content_digest{}}.bytes() == content_digest{});
 static_assert(codec::semantic_batch_domain.size() == 11);
 static_assert(codec::checkpoint_domain.size() == 16);
 
@@ -82,18 +84,18 @@ using tested_digests = ::testing::Types<
 TYPED_TEST_SUITE(DigestValueTest, tested_digests);
 
 TYPED_TEST(DigestValueTest, ZeroIsAValueAndAbsenceIsSeparate) {
-    const TypeParam zero{sha256_digest{}};
-    EXPECT_EQ(zero.bytes(), sha256_digest{});
+    const TypeParam zero{content_digest{}};
+    EXPECT_EQ(zero.bytes(), content_digest{});
     std::optional<TypeParam> absent;
     EXPECT_FALSE(absent.has_value());
-    absent.emplace(sha256_digest{});
+    absent.emplace(content_digest{});
     ASSERT_TRUE(absent.has_value());
     EXPECT_EQ(*absent, zero);
 }
 
 TYPED_TEST(
   DigestValueTest, SnapshotsOwnAllOctetsAcrossSourceAndValueLifetimes) {
-    sha256_digest bytes{};
+    content_digest bytes{};
     for (std::size_t index = 0; index < bytes.size(); ++index) {
         bytes[index] = static_cast<unsigned char>(index);
     }
@@ -109,11 +111,11 @@ TYPED_TEST(
 }
 
 TYPED_TEST(DigestValueTest, EqualityUsesEveryOctet) {
-    const TypeParam zero{sha256_digest{}};
-    EXPECT_EQ(zero, TypeParam{sha256_digest{}});
-    for (std::size_t index = 0; index < 32; ++index) {
+    const TypeParam zero{content_digest{}};
+    EXPECT_EQ(zero, TypeParam{content_digest{}});
+    for (std::size_t index = 0; index < content_digest{}.size(); ++index) {
         for (const auto octet : {0x01U, 0x80U, 0xffU}) {
-            sha256_digest changed{};
+            content_digest changed{};
             changed[index] = static_cast<unsigned char>(octet);
             const TypeParam other{changed};
             EXPECT_NE(other, zero) << index;

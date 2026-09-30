@@ -1,6 +1,6 @@
 #include "src/model/fingerprint.h"
 
-#include "src/codec/sha256.h"
+#include "src/codec/xxh3.h"
 #include "src/model/batch_wire.h"
 
 #include <seastar/core/coroutine.hh>
@@ -72,7 +72,7 @@ compute_submitted_fingerprint(
           prefix, context.original_timestamp_base().unix_nanoseconds());
         detail::batch_store<123>(
           prefix, static_cast<std::uint32_t>(context.original_count().value()));
-        codec::sha256_hasher hasher;
+        codec::xxh3_128_hasher hasher;
         hasher.update(prefix.data(), prefix.size());
         for (const auto fragment : records) {
             for (std::size_t offset = 0; offset < fragment.size();) {
@@ -93,7 +93,7 @@ compute_submitted_fingerprint(
         if (auto ready = work.poll(anchor); !ready)
             co_return codec::failure(ready.error());
         digest.emplace(std::move(hasher).final());
-    } // Native SHA state is destroyed before the final poll and publication.
+    } // Native hash state is destroyed before the final poll and publication.
     if (auto ready = work.poll(anchor); !ready)
         co_return codec::failure(ready.error());
     co_return *digest;
