@@ -161,7 +161,7 @@ TEST(StorageQualificationTest, ThreeGroupsIncludeEachEarlierFooterExactlyOnce) {
                       work.policy(),
                       extent_layout_kind::initial_append,
                       {},
-                      extent_integrity::crc32c_and_sha256)
+                      extent_integrity::crc32c_and_digest)
                       .value();
     std::string supplied;
     for (std::uint64_t group = 0; group < 3; ++group) {
@@ -183,7 +183,7 @@ TEST(StorageQualificationTest, ThreeGroupsIncludeEachEarlierFooterExactlyOnce) {
     EXPECT_EQ(proof.boundary().block_count, 3U);
     EXPECT_EQ(proof.boundary().last_block, scope(102, 103, 2, 3, 2560, 3072));
     EXPECT_EQ(proof.boundary().data_crc32c, crc(supplied));
-    EXPECT_EQ(proof.digest()->bytes(), exact_sha(supplied));
+    EXPECT_EQ(proof.digest()->bytes(), exact_digest(supplied));
 }
 
 TEST(

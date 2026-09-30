@@ -47,7 +47,7 @@ def parse_measurement(output: str) -> dict[str, str | int | bool]:
     if fields["backend"] not in {
         "google_configured",
         "abseil_selected",
-        "openssl_sha256",
+        "xxh3_128",
     }:
         raise ValueError("unknown measured backend")
     result: dict[str, str | int | bool] = {
@@ -117,8 +117,8 @@ class MeasurementParserTest(unittest.TestCase):
                 self.assertEqual(len(recorded["measurements"]), len(invoked))
                 self.assertEqual(capabilities, {"allocator": "system"})
                 invoked.append(scenario)
-                if scenario == "measure-sha":
-                    backend, length = "openssl_sha256", "3"
+                if scenario == "measure-xxh3":
+                    backend, length = "xxh3_128", "4096"
                 else:
                     _, name, length = scenario.split("-")
                     backend = {
@@ -150,7 +150,7 @@ class MeasurementParserTest(unittest.TestCase):
 
     def test_system_allocator_does_not_report_unobserved_memory_as_zero(self) -> None:
         result = parse_measurement(
-            "measurement backend=openssl_sha256 bytes=3 nanoseconds=42 memory_observed=false"
+            "measurement backend=xxh3_128 bytes=4096 nanoseconds=42 memory_observed=false"
         )
         self.assertFalse(result["memory_observed"])
         self.assertNotIn("requested_bytes", result)
@@ -294,10 +294,10 @@ class IntegrityColdTest(unittest.TestCase):
     def test_cold_crc_4096_bytes(self) -> None:
         self.check_cold_crc(4096)
 
-    def test_cold_sha_abc(self) -> None:
-        result = self.actual_probe("sha-abc", self.capabilities())
+    def test_cold_xxh3_4096_bytes(self) -> None:
+        result = self.actual_probe("xxh3-4096", self.capabilities())
         self.assertEqual(result.returncode, 0, result.stdout)
-        self.assertIn("phase=cold-sha input=abc status=ok", result.stdout)
+        self.assertIn("phase=cold-xxh3 bytes=4096 status=ok", result.stdout)
 
     def test_first_use_measurements_use_separate_fresh_processes(self) -> None:
         capabilities = self.capabilities()
@@ -308,7 +308,7 @@ class IntegrityColdTest(unittest.TestCase):
                 ("abseil", "abseil_selected"),
             )
             for length in (32, 48, 65, 4096)
-        ] + [("measure-sha", "openssl_sha256", 3)]
+        ] + [("measure-xxh3", "xxh3_128", 4096)]
         records = []
         output_root = os.environ.get("TEST_UNDECLARED_OUTPUTS_DIR")
         directory = Path(output_root) if output_root else None

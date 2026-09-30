@@ -229,6 +229,18 @@ pkg_files(
 )
 
 pkg_files(
+    name = "xxhash_license",
+    srcs = ["@xxhash//:LICENSE"],
+    attributes = pkg_attributes(
+        gid = 0,
+        mode = "0644",
+        uid = 0,
+    ),
+    prefix = "licenses/xxhash",
+    strip_prefix = strip_prefix.files_only(),
+)
+
+pkg_files(
     name = "yaml_cpp_license",
     srcs = ["@yaml-cpp//:LICENSE"],
     attributes = pkg_attributes(
@@ -258,6 +270,7 @@ _PACKAGE_SRCS = [
     ":runtime_library_files",
     ":seastar_license",
     ":unordered_dense_license",
+    ":xxhash_license",
     ":yaml_cpp_license",
 ]
 

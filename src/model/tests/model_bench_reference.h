@@ -3,7 +3,7 @@
 #include "src/model/record_codec.h"
 
 namespace kwaque::model::bench {
-// Equal entry boundaries. Full readers share the model's complete body/SHA
+// Equal entry boundaries. Full readers share the model's complete body/digest
 // validation, while checked framing uses native scalar loads and the configured
 // comparison CRC engine. Ownership, admission, cleanup and wire grammar match.
 result<record_sizes> checked_size(const record&, const codec::limits&);

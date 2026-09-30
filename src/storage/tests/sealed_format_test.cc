@@ -23,7 +23,7 @@ TEST(SealedFormatTest, IndependentGoldenAndExternalRootPin) {
     const auto wire = one_root(refs);
     EXPECT_EQ(
       wire.substr(0, 32),
-      hex("4b5142460700010001002000e0010000000000000000000088e209138d5f87e6"));
+      hex("4b5142460700010001002000e00100000000000000000000c4b1d20685258410"));
     const auto evidence = hashed_evidence(work);
     const auto encoded = encode_sealed_footer(
                            evidence,
@@ -36,14 +36,14 @@ TEST(SealedFormatTest, IndependentGoldenAndExternalRootPin) {
                            .get();
     ASSERT_TRUE(encoded.has_value());
     EXPECT_EQ(flat(encoded->bytes), wire);
-    EXPECT_EQ(encoded->digest.bytes(), exact_sha(wire));
+    EXPECT_EQ(encoded->digest.bytes(), exact_digest(wire));
     fragmented_buffer_parser input{buffer("prefix" + wire + "suffix", 7)};
     input.skip(byte_count{6}).value();
     input.push_checkpoint().value();
     const auto decoded = decode_sealed_footer(
                            input,
                            root_location(),
-                           codec::immutable_object_digest{exact_sha(wire)},
+                           codec::immutable_object_digest{exact_digest(wire)},
                            reserve(input, work),
                            work)
                            .get();
@@ -64,7 +64,8 @@ TEST(SealedFormatTest, IndependentGoldenAndExternalRootPin) {
     EXPECT_FALSE(validate_sealed_footer(decoded->value, single_evidence(work)));
 }
 
-TEST(SealedFormatTest, ShaCoversInterleavedFootersOnceAndNoBytesOutsideExtent) {
+TEST(
+  SealedFormatTest, DigestCoversInterleavedFootersOnceAndNoBytesOutsideExtent) {
     seastar::abort_source abort;
     codec::cooperative_work work{codec::limits::defaults(), abort};
     auto verifier = extent_verifier::make(
@@ -73,7 +74,7 @@ TEST(SealedFormatTest, ShaCoversInterleavedFootersOnceAndNoBytesOutsideExtent) {
                       work.policy(),
                       extent_layout_kind::initial_append,
                       {},
-                      extent_integrity::crc32c_and_sha256)
+                      extent_integrity::crc32c_and_digest)
                       .value();
     const auto first = data_block();
     ASSERT_TRUE(feed_block(verifier, first, work));
@@ -90,8 +91,9 @@ TEST(SealedFormatTest, ShaCoversInterleavedFootersOnceAndNoBytesOutsideExtent) {
     ASSERT_TRUE(feed_block(moved, second, work));
     const auto evidence = moved.finish(work).value();
     ASSERT_TRUE(evidence.digest());
-    EXPECT_EQ(evidence.digest()->bytes(), exact_sha(first + footer + second));
-    EXPECT_NE(evidence.digest()->bytes(), exact_sha(first + second));
+    EXPECT_EQ(
+      evidence.digest()->bytes(), exact_digest(first + footer + second));
+    EXPECT_NE(evidence.digest()->bytes(), exact_digest(first + second));
     EXPECT_EQ(evidence.boundary().data_crc32c, crc(first + footer + second));
     const footer_expectation location{history(), runtime::file_position{2560}};
     const auto encoded
@@ -104,7 +106,7 @@ TEST(SealedFormatTest, ShaCoversInterleavedFootersOnceAndNoBytesOutsideExtent) {
     EXPECT_EQ(root.coverage().bytes().end().value(), 2048U);
     EXPECT_NE(
       evidence.digest()->bytes(),
-      exact_sha(first + footer + second + flat(encoded->bytes)));
+      exact_digest(first + footer + second + flat(encoded->bytes)));
 }
 
 TEST(SealedFormatTest, RemovedDataPreservesOriginalCoverageAndCompletedResult) {
@@ -120,7 +122,7 @@ TEST(SealedFormatTest, RemovedDataPreservesOriginalCoverageAndCompletedResult) {
                           work.policy(),
                           extent_layout_kind::rewrite,
                           {},
-                          extent_integrity::crc32c_and_sha256)
+                          extent_integrity::crc32c_and_digest)
                           .value();
         std::string supplied;
         if (!all_removed) {
@@ -128,7 +130,7 @@ TEST(SealedFormatTest, RemovedDataPreservesOriginalCoverageAndCompletedResult) {
             ASSERT_TRUE(feed_block(verifier, supplied, work));
         }
         const auto evidence = verifier.finish(work).value();
-        EXPECT_EQ(evidence.digest()->bytes(), exact_sha(supplied));
+        EXPECT_EQ(evidence.digest()->bytes(), exact_digest(supplied));
         const auto location = root_location(0x80, 2);
         const std::array entries{retry()};
         const auto page = encode_retry_page(
@@ -180,10 +182,10 @@ TEST(SealedFormatTest, EmptyAndFooterOnlyHashWithoutCreatingRecords) {
                       work.policy(),
                       extent_layout_kind::initial_append,
                       {},
-                      extent_integrity::crc32c_and_sha256)
+                      extent_integrity::crc32c_and_digest)
                       .value();
     const auto empty = verifier.finish(work).value();
-    EXPECT_EQ(empty.digest()->bytes(), exact_sha(""));
+    EXPECT_EQ(empty.digest()->bytes(), exact_digest(""));
     const auto prior = footer_wire(
       empty.boundary(), {history(), runtime::file_position{512}});
     auto only = extent_verifier::make(
@@ -192,12 +194,12 @@ TEST(SealedFormatTest, EmptyAndFooterOnlyHashWithoutCreatingRecords) {
                   work.policy(),
                   extent_layout_kind::rewrite,
                   {},
-                  extent_integrity::crc32c_and_sha256)
+                  extent_integrity::crc32c_and_digest)
                   .value();
     ASSERT_TRUE(feed_footer(only, prior, work, empty));
     const auto evidence = only.finish(work).value();
     EXPECT_EQ(evidence.boundary().block_count, 0U);
-    EXPECT_EQ(evidence.digest()->bytes(), exact_sha(prior));
+    EXPECT_EQ(evidence.digest()->bytes(), exact_digest(prior));
     for (const auto& proof : {empty, evidence}) {
         const auto output = encode_sealed_footer(
                               proof,
@@ -233,7 +235,7 @@ TEST(SealedFormatTest, PrefixPackingPreservesSmallAllocationAndWorkLimits) {
                       setup.policy(),
                       extent_layout_kind::initial_append,
                       {},
-                      extent_integrity::crc32c_and_sha256)
+                      extent_integrity::crc32c_and_digest)
                       .value();
     const auto proof = verifier.finish(setup).value();
     const auto baseline = encode_sealed_footer(
@@ -294,7 +296,7 @@ TEST(SealedFormatTest, ParsedDigestAndHistoryClaimsNeedIndependentEvidence) {
                             input,
                             root_location(),
                             codec::immutable_object_digest{
-                              exact_sha(one_root())},
+                              exact_digest(one_root())},
                             reserve(input, work),
                             work)
                             .get();
@@ -318,7 +320,7 @@ TEST(
                                   input,
                                   root_location(),
                                   codec::immutable_object_digest{
-                                    exact_sha(wire)},
+                                    exact_digest(wire)},
                                   memory,
                                   work,
                                   {},
@@ -352,7 +354,7 @@ TEST(
         EXPECT_FALSE(decode_sealed_footer(
                        input,
                        root_location(),
-                       codec::immutable_object_digest{exact_sha(wrong)},
+                       codec::immutable_object_digest{exact_digest(wrong)},
                        reserve(input, work),
                        work)
                        .get());
@@ -378,7 +380,7 @@ TEST(SealedFormatTest, ReferenceCountsLengthsAndIndicesAreCheckedAtTheRoot) {
         EXPECT_FALSE(decode_sealed_footer(
                        input,
                        root_location(),
-                       codec::immutable_object_digest{exact_sha(wrong)},
+                       codec::immutable_object_digest{exact_digest(wrong)},
                        reserve(input, work),
                        work)
                        .get());
@@ -431,7 +433,8 @@ TEST(SealedFormatTest, ExtensionsMaximumPageRefsAndDiagnosticEnd) {
         const auto decoded = decode_sealed_footer(
                                input,
                                root_location(),
-                               codec::immutable_object_digest{exact_sha(wire)},
+                               codec::immutable_object_digest{
+                                 exact_digest(wire)},
                                memory,
                                work,
                                c)
@@ -486,7 +489,7 @@ TEST(
     const std::array refs{reference(page)};
     const auto wire = sealed_wire(
       {extent, 2, last, 0},
-      exact_sha("supplied extent digest"),
+      exact_digest("supplied extent digest"),
       refs,
       location);
     const auto root = pin_root(wire, work, location);
@@ -500,14 +503,14 @@ TEST(
     EXPECT_EQ(root.last_block(), last);
     EXPECT_EQ(root.block_count(), 2U);
     EXPECT_EQ(
-      root.extent_digest().bytes(), exact_sha("supplied extent digest"));
+      root.extent_digest().bytes(), exact_digest("supplied extent digest"));
     fragmented_buffer_parser input{buffer(wire)};
     auto memory = reserve(input, work);
     memory.metadata_remaining = {};
     const auto rejected = decode_sealed_footer(
                             input,
                             location,
-                            codec::immutable_object_digest{exact_sha(wire)},
+                            codec::immutable_object_digest{exact_digest(wire)},
                             memory,
                             work)
                             .get();
@@ -528,7 +531,8 @@ TEST(SealedFormatTest, EmptyRetryRootReturnsTheOriginalMetadataAllowance) {
         const auto result = decode_sealed_footer(
                               input,
                               root_location(),
-                              codec::immutable_object_digest{exact_sha(wire)},
+                              codec::immutable_object_digest{
+                                exact_digest(wire)},
                               memory,
                               work)
                               .get();
@@ -562,7 +566,8 @@ TEST(SealedFormatTest, AllocationFailuresRestoreRootOrDiscardWriterStaging) {
             input.skip(byte_count{1}).value();
             input.push_checkpoint().value();
             const auto memory = reserve(input, work);
-            const auto digest = codec::immutable_object_digest{exact_sha(wire)};
+            const auto digest = codec::immutable_object_digest{
+              exact_digest(wire)};
             auto& injector = seastar::memory::local_failure_injector();
             bool succeeded = false;
             injector.fail_after(ordinal);
@@ -584,11 +589,6 @@ TEST(SealedFormatTest, AllocationFailuresRestoreRootOrDiscardWriterStaging) {
                                   .get()
                                   .has_value();
             } catch (const std::bad_alloc&) {
-            } catch (const std::runtime_error&) {
-                if (!injector.failed()) {
-                    injector.cancel();
-                    throw;
-                }
             } catch (...) {
                 injector.cancel();
                 throw;

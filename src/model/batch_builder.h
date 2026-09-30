@@ -24,11 +24,11 @@ namespace kwaque::model {
 // Each operation uses the same policy/allocator profile and exclusive live
 // work/abort owner. The builder and borrowed record remain alive and unmoved
 // until completion. parent_remaining excludes caller-owned input, verified
-// native SHA/frame/opaque reservations and other live allocations, but INCLUDES
-// this builder's entire staging allowance. Staging costs are checked again on
-// each call, never given a fresh child budget. Returned byte reservations live
-// until their owners are freed. Synchronous destruction requires
-// caller-bounded native/opaque cleanup; close() is available for
+// native hash/frame/opaque reservations and other live allocations, but
+// INCLUDES this builder's entire staging allowance. Staging costs are checked
+// again on each call, never given a fresh child budget. Returned byte
+// reservations live until their owners are freed. Synchronous destruction
+// requires caller-bounded native/opaque cleanup; close() is available for
 // joined cleanup.
 class batch_builder final {
 public:

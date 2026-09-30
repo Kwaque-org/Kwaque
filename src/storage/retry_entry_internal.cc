@@ -53,13 +53,11 @@ codec::result<completed_retry> read_retry_entry(
     const auto binding = model::producer_stream_binding::make(
                            *topic, *range, *routing, *segment, *generation)
                            .value();
+    const auto digest = detail::read_digest<40>(raw);
+    if (!digest) return codec::failure(page_error(errc::malformed_data, c, 56));
     return detail::page_wire(
       completed_retry::make(
-        id,
-        codec::semantic_batch_digest{detail::read_digest<40>(raw)},
-        binding,
-        *logical,
-        *ack),
+        id, codec::semantic_batch_digest{*digest}, binding, *logical, *ack),
       c);
 }
 void write_retry_entry(

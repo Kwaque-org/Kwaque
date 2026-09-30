@@ -354,6 +354,11 @@ struct file_open_options final {
     bool truncate{false};
     std::uint16_t permissions{0600U};
     file_close_policy close_policy{file_close_policy::legacy};
+    // Each completed write is durable, with the metadata needed to read it
+    // back; flush has nothing left to do. Writes that allocate blocks or grow
+    // the file pay for that metadata on every write, so pair this with space
+    // that was already written.
+    bool synchronous{false};
 
     [[nodiscard]] result<void> validate() const noexcept;
 
@@ -528,6 +533,16 @@ public:
     }
     [[nodiscard]] seastar::future<result<void>> flush();
     [[nodiscard]] seastar::future<result<void>> truncate(std::uint64_t size);
+    // Layout hint for [position, position + length) beyond the current end,
+    // without changing the file size, so later writes there land in
+    // contiguous extents. The native primitive zeroes any overlapped content,
+    // so a range starting before the current end is rejected; writes on this
+    // handle are serialized, and other handles must not be extending the file.
+    // Success is not reserved space: a filesystem or device without the
+    // primitive does nothing and still succeeds. Other failures are mutation
+    // failures, as for truncate.
+    [[nodiscard]] seastar::future<result<void>>
+    allocate(file_position position, byte_count length);
     [[nodiscard]] seastar::future<result<std::uint64_t>> size();
     // Checked close drains accepted work without initiating abort. There is one
     // closing caller; concurrent checked close rejects with queue_full. After
@@ -541,6 +556,19 @@ public:
     // alignment. It never enlarges the native chunk or changes read limits.
     [[nodiscard]] result<void>
     limit_write_allocation(byte_count maximum) noexcept;
+    // Narrow the existing physical write window while idle. This never raises
+    // concurrency or changes read/metadata admission.
+    [[nodiscard]] result<void>
+    limit_write_concurrency(std::uint32_t maximum) noexcept;
+    // Let up to `maximum` writes run at once when each is one aligned native
+    // request no longer than the append chunk: such a write never reads the
+    // size or rewrites neighbouring bytes. Any other write, truncate, allocate
+    // and close still runs alone, after the writes in flight, in arrival
+    // order. Concurrent writes must not overlap. Together they never exceed
+    // the physical window or its buffer bytes. Only while idle; narrowing the
+    // window later narrows this too.
+    [[nodiscard]] result<void>
+    allow_concurrent_writes(std::uint32_t maximum) noexcept;
     [[nodiscard]] bool abort_requested() const;
     [[nodiscard]] const file_io_limits& limits() const noexcept {
         owner_.assert_current();
@@ -619,7 +647,8 @@ private:
     [[nodiscard]] seastar::future<result<byte_count>> write_general(
       file_position position,
       bytes::fragmented_buffer&& data,
-      std::optional<seastar::semaphore_units<>> serialization);
+      std::optional<seastar::semaphore_units<>> serialization,
+      std::size_t units);
     [[nodiscard]] seastar::future<result<file_read_result>> read_chunked(
       file_position position,
       byte_count maximum_bytes,
@@ -641,7 +670,10 @@ private:
     seastar::semaphore metadata_operation_units_;
     seastar::semaphore queued_write_operation_units_;
     seastar::semaphore queued_write_byte_units_;
+    // One unit per concurrent single-request write; every other mutation
+    // takes all of them.
     seastar::semaphore write_serialization_{1};
+    std::size_t write_slots_{1};
     std::uint64_t memory_dma_alignment_;
     std::uint64_t disk_read_dma_alignment_;
     std::uint64_t disk_write_dma_alignment_;
@@ -656,9 +688,6 @@ private:
     bool moved_from_{false};
 };
 
-// Preallocation is intentionally absent. A future optional hint must exclude
-// existing/reserved/in-flight ranges and reconcile EOF separately. A successful
-// hint cannot imply reserved capacity, preserved overlap or durable contents.
 // remove_file unlinks a non-directory entry, including a symlink.
 // remove_directory requires an empty directory. A kind mismatch rejects
 // without removing the target; durability still requires directory sync.

@@ -186,6 +186,17 @@ TEST(FileContractTest, ValidatesOpenOptionCombinations) {
     invalid.access = kwaque::runtime::file_access::read_only;
     EXPECT_FALSE(invalid.validate().has_value());
 
+    // Synchronized data applies to writes only.
+    kwaque::runtime::file_open_options synchronized{
+      .access = kwaque::runtime::file_access::write_only,
+      .synchronous = true,
+    };
+    EXPECT_TRUE(synchronized.validate().has_value());
+    synchronized.access = kwaque::runtime::file_access::read_write;
+    EXPECT_TRUE(synchronized.validate().has_value());
+    synchronized.access = kwaque::runtime::file_access::read_only;
+    EXPECT_FALSE(synchronized.validate().has_value());
+
     invalid = valid;
     invalid.permissions = 01000U;
     EXPECT_FALSE(invalid.validate().has_value());

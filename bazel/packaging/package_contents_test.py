@@ -37,6 +37,7 @@ class PackageContentsTest(unittest.TestCase):
             f"{root}/licenses/seastar/LICENSE",
             f"{root}/licenses/seastar/NOTICE",
             f"{root}/licenses/unordered_dense/LICENSE",
+            f"{root}/licenses/xxhash/LICENSE",
             f"{root}/licenses/yaml-cpp/LICENSE",
         }
 

@@ -116,6 +116,11 @@ byte_count workload_reservation::retained_bytes() const noexcept {
     if (state_) state_->assert_current();
     return state_ ? state_->retained : byte_count{};
 }
+bool workload_reservation::exclusive() const noexcept {
+    if (!state_) return false;
+    state_->assert_current();
+    return state_.use_count() == 1;
+}
 
 runtime::result<void>
 workload_reservation::try_acquire_handles(std::uint32_t count) {
@@ -133,6 +138,31 @@ workload_reservation::try_acquire_handles(std::uint32_t count) {
     auto units = seastar::try_get_units(owner.handles, count);
     if (!units) return reject(errc::queue_full);
     state_->handle = std::move(*units);
+    return {};
+}
+runtime::result<void>
+workload_reservation::adopt(workload_reservation&& other) {
+    if (!state_ || !other.state_)
+        return runtime::failure(budget_error(errc::closed));
+    state_->assert_current();
+    other.state_->assert_current();
+    auto& from = *other.state_;
+    if (
+      state_ == other.state_ || state_->owner != from.owner || !exclusive()
+      || !other.exclusive() || from.handle.count() != 0)
+        return runtime::failure(budget_error(errc::invalid_argument));
+    // The other state's control allocation is freed below, so only its
+    // requested allowance stays charged.
+    const auto overhead = from.charged.value() - from.retained.value();
+    from.local.return_units(overhead);
+    from.workload.return_units(overhead);
+    state_->local.adopt(std::move(from.local));
+    state_->workload.adopt(std::move(from.workload));
+    state_->charged = byte_count{
+      state_->charged.value() + from.retained.value()};
+    state_->retained = byte_count{
+      state_->retained.value() + from.retained.value()};
+    other.state_ = nullptr;
     return {};
 }
 
@@ -193,6 +223,26 @@ workload_budget_snapshot workload_budget::snapshot() const noexcept {
       .accepted = state_->accepted,
       .rejected = state_->rejected};
 }
+workload_budget_limits workload_budget::limits() const noexcept {
+    assert_current();
+    return state_->limits;
+}
+bool workload_budget::owns(
+  const workload_reservation& reservation) const noexcept {
+    assert_current();
+    if (reservation.state_) reservation.state_->assert_current();
+    return reservation.state_ && reservation.state_->owner == state_;
+}
+runtime::result<byte_count>
+workload_budget::reservation_charge(byte_count retained) const {
+    assert_current();
+    const auto overhead = state_->charge(
+      byte_count{reservation_allocation_bound});
+    const auto cost = retained.checked_add(overhead);
+    if (!cost || *cost > state_->limits.bytes)
+        return runtime::failure(budget_error(errc::out_of_range));
+    return *cost;
+}
 runtime::result<workload_reservation>
 workload_budget::try_reserve(byte_count retained) {
     assert_current();
@@ -201,11 +251,8 @@ workload_budget::try_reserve(byte_count retained) {
         return runtime::failure(budget_error(code));
     };
     if (state_->closed) return reject(errc::closed);
-    const auto overhead = state_->charge(
-      byte_count{reservation_allocation_bound});
-    const auto cost = retained.checked_add(overhead);
-    if (!cost || *cost > state_->limits.bytes)
-        return reject(errc::out_of_range);
+    const auto cost = reservation_charge(retained);
+    if (!cost) return reject(cost.error().code());
     auto task = seastar::try_get_units(state_->tasks, 1);
     if (!task) return reject(errc::queue_full);
     auto local = seastar::try_get_units(state_->local_bytes, cost->value());
@@ -224,22 +271,32 @@ workload_budget::try_reserve(byte_count retained) {
     ++state_->accepted;
     return workload_reservation{std::move(owned)};
 }
-runtime::result<workload_reservation> workload_budget::try_reserve_buffer(
-  const bytes::fragmented_buffer& buffer, byte_count additional) {
+runtime::result<byte_count>
+workload_budget::buffer_charge(const bytes::fragmented_buffer& buffer) const {
     assert_current();
     auto cost = buffer.allocation_cost(state_->charge);
     if (!cost) {
-        ++state_->rejected;
         return runtime::failure(buffer_cost_error(cost.error()));
     }
     if (
       cost->largest_allocation.value() > maximum_contiguous_allocation_bytes) {
-        ++state_->rejected;
         return runtime::failure(budget_error(errc::out_of_range));
     }
     auto total = cost->backing.checked_add(cost->descriptors);
     if (total) total = total->checked_add(cost->share_controls);
-    if (total) total = total->checked_add(additional);
+    if (!total) {
+        return runtime::failure(budget_error(errc::out_of_range));
+    }
+    return *total;
+}
+runtime::result<workload_reservation> workload_budget::try_reserve_buffer(
+  const bytes::fragmented_buffer& buffer, byte_count additional) {
+    auto backing = buffer_charge(buffer);
+    if (!backing) {
+        ++state_->rejected;
+        return runtime::failure(backing.error());
+    }
+    auto total = backing->checked_add(additional);
     if (!total) {
         ++state_->rejected;
         return runtime::failure(budget_error(errc::out_of_range));

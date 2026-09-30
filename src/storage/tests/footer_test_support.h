@@ -1,6 +1,6 @@
 #pragma once
 
-#include "src/codec/sha256.h"
+#include "src/codec/xxh3.h"
 #include "src/storage/extent_verifier.h"
 #include "src/storage/tests/segment_test_support.h"
 
@@ -48,7 +48,7 @@ inline std::string data_block(
         // Distinct original requests, with an independently assembled semantic
         // projection. Placement itself remains outside that projection.
         put(child, 32 + 32, logical - 100U, 8);
-        codec::sha256_hasher hash;
+        codec::xxh3_128_hasher hash;
         hash.update(
           codec::semantic_batch_domain.data(),
           codec::semantic_batch_domain.size());

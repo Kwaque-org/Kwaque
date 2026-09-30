@@ -143,7 +143,7 @@ TEST(LocalDiscoveryContractTest, SelectedVersionDoesNotIgnoreExplicitPins) {
       true};
     ASSERT_TRUE(validate_discovery_expectation(spec, path, expected));
     expected.record.digest = codec::immutable_object_digest{
-      codec::sha256_digest{}};
+      codec::content_digest{}};
     expected.record.encoded_bytes = byte_count{4096};
     auto rejected = validate_discovery_expectation(spec, path, expected);
     ASSERT_FALSE(rejected);

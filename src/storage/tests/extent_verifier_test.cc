@@ -1,4 +1,6 @@
 #include "src/bytes/fragmented_buffer_test_support.h"
+#include "src/codec/xxh3.h"
+#include "src/model/record_scan.h"
 #include "src/storage/tests/footer_test_support.h"
 
 #include <seastar/core/preempt.hh>
@@ -278,7 +280,7 @@ TEST(
                           work.policy(),
                           extent_layout_kind::initial_append,
                           {},
-                          extent_integrity::crc32c_and_sha256)
+                          extent_integrity::crc32c_and_digest)
                           .value();
         auto input = buffer(data_block(), 1);
         auto memory = reserve(input, work);
@@ -321,7 +323,7 @@ TEST(ExtentVerifierTest, AllocationFailuresCloseEvenAfterAValidPrefix) {
                           work.policy(),
                           extent_layout_kind::initial_append,
                           {},
-                          extent_integrity::crc32c_and_sha256)
+                          extent_integrity::crc32c_and_digest)
                           .value();
         ASSERT_TRUE(feed_block(verifier, data_block(), work));
         auto bytes = buffer(data_block(101, 1, 1024, false, 0x30, 1, true));
@@ -336,12 +338,6 @@ TEST(ExtentVerifierTest, AllocationFailuresCloseEvenAfterAValidPrefix) {
                           .get()
                           .has_value();
         } catch (const std::bad_alloc&) {
-            threw = true;
-        } catch (const std::runtime_error&) {
-            if (!injector.failed()) {
-                injector.cancel();
-                throw;
-            }
             threw = true;
         } catch (...) {
             injector.cancel();
@@ -377,7 +373,7 @@ TEST(
                       work.policy(),
                       extent_layout_kind::initial_append,
                       {},
-                      extent_integrity::crc32c_and_sha256)
+                      extent_integrity::crc32c_and_digest)
                       .value();
     const auto wire = data_block();
     bool released = false;
@@ -419,24 +415,614 @@ TEST(
           work.policy(),
           extent_layout_kind::initial_append,
           {},
-          extent_integrity::crc32c_and_sha256)
+          extent_integrity::crc32c_and_digest)
           .value();
-    codec::sha256_hasher expected_sha;
+    codec::xxh3_128_hasher expected_hasher;
     for (std::uint64_t i = 0; i < objects; ++i) {
         const auto wire = data_block(
           100 + i, i, (i + 1) * width, false, 0x30, 1, false, width);
         ASSERT_EQ(wire.size(), width);
-        expected_sha.update(wire.data(), wire.size());
+        expected_hasher.update(wire.data(), wire.size());
         ASSERT_TRUE(feed_block(verifier, wire, work, width));
         seastar::thread::maybe_yield();
     }
     const auto proof = verifier.finish(work).value();
     EXPECT_EQ(proof.boundary().block_count, objects);
     ASSERT_TRUE(proof.digest());
-    EXPECT_EQ(proof.digest()->bytes(), std::move(expected_sha).final());
+    EXPECT_EQ(proof.digest()->bytes(), std::move(expected_hasher).final());
     EXPECT_GT(
       proof.boundary().coverage.bytes().size(),
       work.policy().config().max_operation_bytes);
 }
+
+TEST(ExtentVerifierTest, FragmentAndWorkBoundariesKeepTheCompleteDigest) {
+    // Raw block validation scans records, whose fixed layout needs this much
+    // work in one quantum. A smaller quantum rejects before any digest input.
+    constexpr std::uint64_t minimum = 4U * sizeof(model::record_layout);
+    for (const auto quantum : {minimum - 1U, minimum, std::uint64_t{65536}}) {
+        for (const auto width : {17U, 257U, 1023U, 1024U, 1025U, 4096U}) {
+            seastar::abort_source abort;
+            auto config = codec::limits::defaults().config();
+            config.max_work_bytes = byte_count{quantum};
+            codec::cooperative_work work{
+              codec::limits::make(config).value(), abort};
+            const auto h = history(0x30, 1, 8192);
+            auto verifier = extent_verifier::make(
+                              h,
+                              scope(100, 101, 0, 1, 8192, 16384),
+                              work.policy(),
+                              extent_layout_kind::initial_append,
+                              {},
+                              extent_integrity::crc32c_and_digest)
+                              .value();
+            const auto wire = data_block(
+              100, 0, 8192, false, 0x30, 1, false, 8192);
+            codec::xxh3_128_hasher expected;
+            expected.update(wire.data(), wire.size());
+            const auto fed = feed_block(verifier, wire, work, width);
+            if (quantum < minimum) {
+                ASSERT_FALSE(fed);
+                EXPECT_EQ(fed.error().code(), errc::resource_exhausted);
+                EXPECT_TRUE(verifier.closed());
+                continue;
+            }
+            ASSERT_TRUE(fed);
+            const auto proof = verifier.finish(work).value();
+            ASSERT_TRUE(proof.digest());
+            EXPECT_EQ(proof.digest()->bytes(), std::move(expected).final());
+            EXPECT_EQ(proof.boundary().data_crc32c, crc(wire));
+        }
+    }
+}
+
+TEST(
+  ExtentVerifierTest, TypedAndRawBlocksProduceTheSameIndependentCrcAndDigest) {
+    for (const bool compressed : {false, true}) {
+        for (const std::size_t header : {32U, 4096U}) {
+            seastar::abort_source abort;
+            codec::cooperative_work work{codec::limits::defaults(), abort};
+            const auto wire = block_wire(
+              assigned_wire(compressed, header), block_expected(), header);
+            fragmented_buffer_parser input{buffer(wire)};
+            auto block = decode_segment_block(
+                           input, block_expected(), reserve(input, work), work)
+                           .get()
+                           .value();
+            const auto expected = block.value.descriptor().coverage();
+            auto typed = extent_verifier::make(
+                           history(),
+                           expected,
+                           work.policy(),
+                           extent_layout_kind::initial_append,
+                           {},
+                           extent_integrity::crc32c_and_digest)
+                           .value();
+            auto raw = extent_verifier::make(
+                         history(),
+                         expected,
+                         work.policy(),
+                         extent_layout_kind::initial_append,
+                         {},
+                         extent_integrity::crc32c_and_digest)
+                         .value();
+            // The qualified path has no parser/alias metadata allocation. The
+            // source remains separately admitted; hash state is inline.
+            const codec::decode_budget no_temporaries{{}, {}, charge};
+            const auto accepted
+              = typed
+                  .add_block(
+                    block.value, batch_expected(), no_temporaries, work)
+                  .get();
+            ASSERT_TRUE(accepted);
+            ASSERT_TRUE(feed_block(raw, wire, work));
+            const auto a = typed.finish(work).value();
+            const auto b = raw.finish(work).value();
+            EXPECT_EQ(a.boundary(), b.boundary());
+            EXPECT_EQ(a.boundary().data_crc32c, crc(wire));
+            codec::xxh3_128_hasher hasher;
+            hasher.update(wire.data(), wire.size());
+            ASSERT_TRUE(a.digest());
+            EXPECT_EQ(a.digest()->bytes(), std::move(hasher).final());
+            EXPECT_EQ(a.digest(), b.digest());
+            EXPECT_EQ(flat(block.value.bytes()), wire);
+        }
+    }
+}
+
+TEST(ExtentVerifierTest, DeferredDigestMatchesTheEagerWalkOverExactBytes) {
+    seastar::abort_source abort;
+    codec::cooperative_work work{codec::limits::defaults(), abort};
+    const auto wire = block_wire(
+      assigned_wire(false, 32), block_expected(), 32);
+    fragmented_buffer_parser input{buffer(wire)};
+    const auto expected = decode_segment_block(
+                            input, block_expected(), reserve(input, work), work)
+                            .get()
+                            .value()
+                            .value.descriptor()
+                            .coverage();
+    const auto make = [&](extent_integrity integrity) {
+        return extent_verifier::make(
+                 history(),
+                 expected,
+                 work.policy(),
+                 extent_layout_kind::initial_append,
+                 {},
+                 integrity)
+          .value();
+    };
+    constexpr auto deferred = extent_integrity::crc32c_and_deferred_digest;
+    auto eager = make(extent_integrity::crc32c_and_digest);
+    ASSERT_TRUE(feed_block(eager, wire, work));
+    const auto reference = eager.finish(work).value();
+
+    // The digest may trail the CRC walk, in any split, and catch up later.
+    // One aligned block can be a single sector, so split inside it.
+    ASSERT_GE(wire.size(), 2U);
+    const auto half = wire.size() / 2;
+    auto verifier = make(deferred);
+    auto digest = verifier.deferred_digest().value();
+    ASSERT_TRUE(feed_block(verifier, wire, work));
+    ASSERT_TRUE(digest.add(buffer(wire.substr(0, half)), work).get());
+    ASSERT_TRUE(digest.add(buffer(wire.substr(half), 67), work).get());
+    EXPECT_EQ(digest.end(), expected.bytes().end());
+    const auto proof = verifier.finish(work, std::move(digest)).value();
+    EXPECT_EQ(proof.boundary(), reference.boundary());
+    ASSERT_TRUE(proof.digest());
+    EXPECT_EQ(proof.digest(), reference.digest());
+
+    {
+        // Deferred evidence has no digest without its walk.
+        auto missing = make(deferred);
+        ASSERT_TRUE(feed_block(missing, wire, work));
+        EXPECT_FALSE(missing.finish(work));
+        EXPECT_TRUE(missing.closed());
+    }
+    {
+        auto trailing = make(deferred);
+        auto walk = trailing.deferred_digest().value();
+        ASSERT_TRUE(feed_block(trailing, wire, work));
+        ASSERT_TRUE(walk.add(buffer(wire.substr(0, half)), work).get());
+        EXPECT_FALSE(trailing.finish(work, std::move(walk)));
+        EXPECT_TRUE(trailing.closed());
+    }
+    {
+        // Same length, other bytes: the walk's CRC exposes the substitution.
+        auto substituted = make(deferred);
+        auto walk = substituted.deferred_digest().value();
+        ASSERT_TRUE(feed_block(substituted, wire, work));
+        auto changed = wire;
+        changed.back() = static_cast<char>(changed.back() ^ 1);
+        ASSERT_TRUE(walk.add(buffer(changed), work).get());
+        EXPECT_FALSE(substituted.finish(work, std::move(walk)));
+    }
+    {
+        auto twice = make(deferred);
+        ASSERT_TRUE(twice.deferred_digest());
+        EXPECT_FALSE(twice.deferred_digest());
+        EXPECT_TRUE(twice.closed());
+        auto late = make(deferred);
+        ASSERT_TRUE(feed_block(late, wire, work));
+        EXPECT_FALSE(late.deferred_digest());
+        auto eager_only = make(extent_integrity::crc32c_and_digest);
+        EXPECT_FALSE(eager_only.deferred_digest());
+    }
+    {
+        auto aborted = make(deferred);
+        auto walk = aborted.deferred_digest().value();
+        seastar::abort_source stop;
+        codec::cooperative_work stopped{codec::limits::defaults(), stop};
+        stop.request_abort();
+        EXPECT_FALSE(walk.add(buffer(wire), stopped).get());
+        EXPECT_TRUE(walk.closed());
+        EXPECT_FALSE(walk.add(buffer(wire), work).get());
+    }
+}
+
+TEST(
+  ExtentVerifierTest, TypedBlocksRevalidateChangedPolicyAndPreserveTheOwner) {
+    seastar::abort_source abort;
+    codec::cooperative_work original{codec::limits::defaults(), abort};
+    auto block = encode_segment_block(
+                   checked_child(original, true),
+                   block_expected(),
+                   original,
+                   budget().operation_remaining,
+                   charge)
+                   .get()
+                   .value();
+    const auto wire = flat(block.bytes());
+    for (const bool too_narrow : {false, true}) {
+        auto config = original.policy().config();
+        config.max_record_bytes = byte_count{too_narrow ? 1U : 65536U};
+        codec::cooperative_work work{
+          codec::limits::make(config).value(), abort};
+        auto verifier = extent_verifier::make(
+                          history(),
+                          block.descriptor().coverage(),
+                          work.policy())
+                          .value();
+        const auto accepted
+          = verifier.add_block(block, batch_expected(), budget(), work).get();
+        if (too_narrow) {
+            EXPECT_FALSE(accepted);
+            EXPECT_TRUE(verifier.closed());
+        } else {
+            ASSERT_TRUE(accepted);
+            EXPECT_EQ(
+              verifier.finish(work).value().boundary().data_crc32c, crc(wire));
+        }
+        EXPECT_EQ(flat(block.bytes()), wire);
+    }
+    auto config = original.policy().config();
+    config.max_record_bytes = byte_count{65536};
+    codec::cooperative_work work{codec::limits::make(config).value(), abort};
+    auto verifier = extent_verifier::make(
+                      history(), block.descriptor().coverage(), work.policy())
+                      .value();
+    const auto rejected
+      = verifier.add_block(block, batch_expected(), {{}, {}, charge}, work)
+          .get();
+    ASSERT_FALSE(rejected);
+    EXPECT_EQ(rejected.error().code(), errc::resource_exhausted);
+    EXPECT_TRUE(verifier.closed());
+}
+
+TEST(
+  ExtentVerifierTest,
+  TypedBlocksRejectWrongIdentityPlacementExtractionAndAbort) {
+    for (unsigned mode = 0; mode != 5; ++mode) {
+        seastar::abort_source abort;
+        codec::cooperative_work work{codec::limits::defaults(), abort};
+        auto block = encode_segment_block(
+                       checked_child(work),
+                       block_expected(),
+                       work,
+                       budget().operation_remaining,
+                       charge)
+                       .get()
+                       .value();
+        auto expected = batch_expected();
+        auto context = history();
+        auto bounds = block.descriptor().coverage();
+        if (mode == 0) expected.topic = id<model::topic_id>(0x99);
+        if (mode == 1) context = history(0x99);
+        if (mode == 2) bounds = scope(100, 101, 0, 1, 1024, 1536);
+        bytes::fragmented_buffer extracted;
+        if (mode == 3) extracted = std::move(block).release_bytes();
+        auto verifier
+          = extent_verifier::make(context, bounds, work.policy()).value();
+        if (mode == 4) abort.request_abort();
+        // Extraction deliberately leaves readable scalar metadata but no bytes.
+        // NOLINTNEXTLINE(bugprone-use-after-move)
+        const auto rejected
+          = verifier.add_block(block, expected, budget(), work).get();
+        EXPECT_FALSE(rejected);
+        EXPECT_TRUE(verifier.closed());
+    }
+}
+
+TEST(
+  ExtentVerifierTest,
+  GrowingGroupsMatchFiniteCrcAndDigestIncludingTheirFooters) {
+    seastar::abort_source abort;
+    codec::cooperative_work work{codec::limits::defaults(), abort};
+    auto growing = extent_verifier::make(
+                     history(),
+                     scope(100, 100, 0, 0, 512, 512),
+                     work.policy(),
+                     extent_layout_kind::initial_append,
+                     {},
+                     extent_integrity::crc32c_and_digest)
+                     .value();
+    auto finite = extent_verifier::make(
+                    history(),
+                    scope(100, 102, 0, 2, 512, 2560),
+                    work.policy(),
+                    extent_layout_kind::initial_append,
+                    {},
+                    extent_integrity::crc32c_and_digest)
+                    .value();
+    ASSERT_TRUE(growing.extend_expected(scope(100, 100, 0, 0, 512, 512), work));
+    EXPECT_FALSE(growing.checkpoint(work).value().digest());
+    std::string all;
+    for (std::uint64_t group = 0; group != 2; ++group) {
+        const auto begin = 512 + group * 1024;
+        const auto expected = scope(
+          100, 101 + group, 0, 1 + group, 512, begin + 1024);
+        ASSERT_TRUE(growing.extend_expected(expected, work));
+        const auto block = data_block(
+          100 + group, group, begin, false, 0x30, 1, group != 0);
+        ASSERT_TRUE(feed_block(growing, block, work));
+        ASSERT_TRUE(feed_block(finite, block, work));
+        all += block;
+        const auto prefix = growing.checkpoint(work).value();
+        EXPECT_EQ(
+          prefix.boundary(), finite.checkpoint(work).value().boundary());
+        EXPECT_EQ(prefix.boundary().data_crc32c, crc(all));
+        const auto footer = footer_wire(
+          prefix.boundary(), {history(), runtime::file_position{begin + 512}});
+        ASSERT_TRUE(feed_footer(growing, footer, work, prefix));
+        ASSERT_TRUE(feed_footer(finite, footer, work, prefix));
+        all += footer;
+        const auto after = growing.checkpoint(work).value();
+        EXPECT_EQ(after.boundary().block_count, group + 1);
+        EXPECT_EQ(after.boundary().data_crc32c, crc(all));
+        ASSERT_TRUE(growing.extend_expected(expected, work));
+        EXPECT_EQ(
+          growing.checkpoint(work).value().boundary(), after.boundary());
+    }
+    const auto a = growing.finish(work).value();
+    const auto b = finite.finish(work).value();
+    EXPECT_EQ(a.boundary(), b.boundary());
+    EXPECT_EQ(a.digest(), b.digest());
+    codec::xxh3_128_hasher hasher;
+    hasher.update(all.data(), all.size());
+    ASSERT_TRUE(a.digest());
+    EXPECT_EQ(a.digest()->bytes(), std::move(hasher).final());
+}
+
+TEST(
+  ExtentVerifierTest,
+  GrowthPermitsEqualAndFooterOnlyBoundsWithoutResettingHistory) {
+    seastar::abort_source abort;
+    codec::cooperative_work work{codec::limits::defaults(), abort};
+    auto walk = extent_verifier::make(
+                  history(), scope(100, 101, 0, 1, 512, 1024), work.policy())
+                  .value();
+    const auto block = data_block();
+    ASSERT_TRUE(feed_block(walk, block, work));
+    const auto prefix = walk.checkpoint(work).value();
+    ASSERT_TRUE(walk.extend_expected(prefix.boundary().coverage, work));
+    ASSERT_TRUE(walk.extend_expected(scope(100, 101, 0, 1, 512, 1536), work));
+    const auto footer = footer_wire(
+      prefix.boundary(), {history(), runtime::file_position{1024}});
+    ASSERT_TRUE(feed_footer(walk, footer, work, prefix));
+    const auto final = walk.finish(work).value();
+    EXPECT_EQ(final.boundary().block_count, 1U);
+    EXPECT_EQ(
+      final.boundary().coverage.logical(),
+      prefix.boundary().coverage.logical());
+    EXPECT_EQ(
+      final.boundary().coverage.physical(),
+      prefix.boundary().coverage.physical());
+    EXPECT_EQ(final.boundary().data_crc32c, crc(block + footer));
+    EXPECT_FALSE(walk.extend_expected(final.boundary().coverage, work));
+}
+
+TEST(
+  ExtentVerifierTest,
+  InvalidOrIncompleteGrowthClosesWithoutPublishingAnotherPrefix) {
+    for (unsigned mode = 0; mode != 13; ++mode) {
+        SCOPED_TRACE(mode);
+        seastar::abort_source abort;
+        codec::cooperative_work work{codec::limits::defaults(), abort};
+        auto walk = extent_verifier::make(
+                      history(),
+                      scope(100, 101, 0, 1, 512, 1024),
+                      work.policy(),
+                      mode == 8 ? extent_layout_kind::rewrite
+                                : extent_layout_kind::initial_append)
+                      .value();
+        if (mode != 7 && mode != 12)
+            ASSERT_TRUE(feed_block(walk, data_block(), work));
+        auto next = scope(100, 102, 0, 2, 512, 1536);
+        if (mode == 0) next = scope(99, 102, 0, 3, 512, 1536);
+        if (mode == 1) next = scope(100, 102, 1, 3, 512, 1536);
+        if (mode == 2) next = scope(100, 102, 0, 2, 0, 1536);
+        if (mode == 3) next = scope(100, 100, 0, 0, 512, 1536);
+        if (mode == 4) next = scope(100, 101, 0, 1, 512, 512);
+        if (mode == 5) next = scope(100, 102, 0, 2, 512, 1537);
+        if (mode == 6) next = scope(100, 103, 0, 2, 512, 1536);
+        if (mode == 9) next = scope(100, 102, 0, 2, 512, 1024);
+        if (mode == 10) abort.request_abort();
+        if (mode == 12) next = scope(100, 101, 0, 1, 512, 1024);
+        auto narrower = work.policy().config();
+        narrower.max_record_bytes = byte_count{65536};
+        codec::cooperative_work other{
+          codec::limits::make(narrower).value(), abort};
+        const auto rejected = walk.extend_expected(
+          next, mode == 11 ? other : work);
+        ASSERT_FALSE(rejected);
+        EXPECT_EQ(
+          rejected.error().code(),
+          mode == 10 ? errc::aborted : errc::invalid_argument);
+        EXPECT_TRUE(walk.closed());
+        EXPECT_FALSE(walk.checkpoint(work));
+    }
+}
+
+TEST(ExtentVerifierTest, GrowthDuringAnActiveAddCannotDestroyItsHashState) {
+    seastar::abort_source abort;
+    codec::cooperative_work work{codec::limits::defaults(), abort};
+    auto walk = extent_verifier::make(
+                  history(),
+                  scope(100, 101, 0, 1, 512, 1024),
+                  work.policy(),
+                  extent_layout_kind::initial_append,
+                  {},
+                  extent_integrity::crc32c_and_digest)
+                  .value();
+    auto source = buffer(data_block(), 1);
+    auto memory = reserve(source, work);
+    const auto deadline = std::chrono::steady_clock::now()
+                          + std::chrono::seconds{2};
+    while (!seastar::need_preempt()
+           && std::chrono::steady_clock::now() < deadline) {
+    }
+    ASSERT_TRUE(seastar::need_preempt());
+    auto adding = walk.add_block(
+      std::move(source), batch_expected(), memory, work);
+    const bool pending = !adding.available();
+    const auto grown = walk.extend_expected(
+      scope(100, 102, 0, 2, 512, 1536), work);
+    const bool kept_open = !walk.closed();
+    const auto added = adding.get();
+    ASSERT_TRUE(pending);
+    EXPECT_FALSE(grown);
+    EXPECT_TRUE(kept_open);
+    ASSERT_TRUE(added);
+    EXPECT_TRUE(walk.finish(work));
+}
+
+TEST(ExtentVerifierTest, GrowingToTheTerminalLogicalEndDoesNotOverflow) {
+    seastar::abort_source abort;
+    codec::cooperative_work work{codec::limits::defaults(), abort};
+    auto h = history();
+    h.logical_origin = model::range_logical_end{UINT64_MAX - 1};
+    auto walk = extent_verifier::make(
+                  h,
+                  scope(UINT64_MAX - 1, UINT64_MAX - 1, 0, 0, 512, 512),
+                  work.policy())
+                  .value();
+    auto child = assigned_wire();
+    put(child, 32 + 168, UINT64_MAX - 1, 8);
+    put(child, 32 + 176, UINT64_MAX, 8);
+    repair(child);
+    const auto wire = block_wire(child);
+    ASSERT_TRUE(walk.extend_expected(
+      scope(UINT64_MAX - 1, UINT64_MAX, 0, 1, 512, 1024), work));
+    ASSERT_TRUE(feed_block(walk, wire, work));
+    const auto result = walk.finish(work).value();
+    EXPECT_EQ(result.boundary().coverage.logical().end().value(), UINT64_MAX);
+    EXPECT_EQ(result.boundary().coverage.physical().end().value(), 1U);
+}
+
+TEST(
+  ExtentVerifierTest, TypedFooterReusesValidationAndMatchesIndependentBytes) {
+    for (const auto integrity :
+         {extent_integrity::crc32c, extent_integrity::crc32c_and_digest}) {
+        seastar::abort_source abort;
+        codec::cooperative_work work{codec::limits::defaults(), abort};
+        auto typed = extent_verifier::make(
+                       history(),
+                       scope(100, 100, 0, 0, 512, 1024),
+                       work.policy(),
+                       extent_layout_kind::initial_append,
+                       {},
+                       integrity)
+                       .value();
+        auto raw = extent_verifier::make(
+                     history(),
+                     scope(100, 100, 0, 0, 512, 1024),
+                     work.policy(),
+                     extent_layout_kind::initial_append,
+                     {},
+                     integrity)
+                     .value();
+        const auto prefix = typed.checkpoint(work).value();
+        auto footer = encode_durable_footer(
+                        prefix,
+                        {history(), runtime::file_position{512}},
+                        work,
+                        budget().operation_remaining,
+                        charge)
+                        .get()
+                        .value();
+        const auto wire = footer_wire(
+          prefix.boundary(), footer.descriptor().location());
+        EXPECT_EQ(flat(footer.bytes()), wire);
+        // No parser descriptors or alias promotion can fit this budget.
+        const codec::decode_budget no_temporaries{{}, {}, charge};
+        const auto accepted
+          = typed.add_footer(footer, no_temporaries, work, prefix).get();
+        ASSERT_TRUE(accepted);
+        auto raw_bytes = buffer(wire, 1);
+        const auto raw_memory = reserve(raw_bytes, work);
+        const auto decoded
+          = raw.add_footer(std::move(raw_bytes), raw_memory, work, prefix)
+              .get();
+        ASSERT_TRUE(decoded);
+        const auto a = typed.finish(work).value();
+        const auto b = raw.finish(work).value();
+        EXPECT_EQ(a.boundary(), b.boundary());
+        EXPECT_EQ(a.boundary().data_crc32c, crc(wire));
+        EXPECT_EQ(a.digest(), b.digest());
+        EXPECT_EQ(flat(footer.bytes()), wire);
+        if (a.digest()) {
+            codec::xxh3_128_hasher hasher;
+            hasher.update(wire.data(), wire.size());
+            EXPECT_EQ(a.digest()->bytes(), std::move(hasher).final());
+        }
+    }
+}
+
+TEST(ExtentVerifierTest, TypedFooterCannotBypassPlacementPolicyOrCancellation) {
+    for (int mode = 0; mode != 6; ++mode) {
+        seastar::abort_source abort;
+        codec::cooperative_work original{codec::limits::defaults(), abort};
+        auto empty = extent_verifier::make(
+                       history(),
+                       scope(100, 100, 0, 0, 512, 512),
+                       original.policy())
+                       .value();
+        const auto prefix = empty.finish(original).value();
+        auto footer = encode_durable_footer(
+                        prefix,
+                        {history(), runtime::file_position{512}},
+                        original,
+                        budget().operation_remaining,
+                        charge)
+                        .get()
+                        .value();
+        auto config = original.policy().config();
+        if (mode == 0 || mode == 1) config.max_record_bytes = byte_count{65536};
+        codec::cooperative_work work{
+          codec::limits::make(config).value(), abort};
+        auto h = mode == 2 ? history(0x99) : history();
+        const auto start = mode == 5 ? 1024U : 512U;
+        auto walk = extent_verifier::make(
+                      h,
+                      scope(100, 100, 0, 0, start, start + 512),
+                      work.policy())
+                      .value();
+        bytes::fragmented_buffer extracted;
+        if (mode == 3) extracted = std::move(footer).release_bytes();
+        if (mode == 4) abort.request_abort();
+        const auto memory = mode == 0 ? codec::decode_budget{{}, {}, charge}
+                                      : budget();
+        // Extraction empties only the byte owner, leaving diagnostic metadata.
+        // NOLINTBEGIN(bugprone-use-after-move)
+        const auto accepted
+          = walk.add_footer(footer, memory, work, prefix).get();
+        EXPECT_EQ(accepted.has_value(), mode == 1);
+        if (!accepted) EXPECT_TRUE(walk.closed());
+        if (mode != 3) EXPECT_FALSE(footer.bytes().empty());
+        // NOLINTEND(bugprone-use-after-move)
+    }
+}
+
+TEST(ExtentVerifierTest, TypedFooterStillChecksTheActualHistoryCrc) {
+    seastar::abort_source abort;
+    codec::cooperative_work work{codec::limits::defaults(), abort};
+    auto walk = extent_verifier::make(
+                  history(), scope(100, 101, 0, 1, 512, 1536), work.policy())
+                  .value();
+    ASSERT_TRUE(feed_block(walk, data_block(), work));
+    const auto prefix = walk.checkpoint(work).value();
+    auto other = extent_verifier::make(
+                   history(), scope(100, 101, 0, 1, 512, 1024), work.policy())
+                   .value();
+    ASSERT_TRUE(
+      feed_block(other, data_block(100, 0, 512, false, 0x30, 1, true), work));
+    const auto different = other.finish(work).value();
+    ASSERT_NE(prefix.boundary().data_crc32c, different.boundary().data_crc32c);
+    auto footer = encode_durable_footer(
+                    different,
+                    {history(), runtime::file_position{1024}},
+                    work,
+                    budget().operation_remaining,
+                    charge)
+                    .get()
+                    .value();
+    const codec::decode_budget no_temporaries{{}, {}, charge};
+    const auto rejected
+      = walk.add_footer(footer, no_temporaries, work, prefix).get();
+    ASSERT_FALSE(rejected);
+    EXPECT_EQ(rejected.error().code(), errc::corrupt_data);
+    EXPECT_TRUE(walk.closed());
+    EXPECT_FALSE(footer.bytes().empty());
+}
+
 } // namespace
 } // namespace kwaque::storage

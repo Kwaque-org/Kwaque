@@ -283,7 +283,8 @@ public:
     [[nodiscard]] static seastar::future<result<byte_count>> run(
       writer self,
       std::optional<seastar::semaphore_units<>> serialization,
-      std::optional<admission_reservation> queued) {
+      std::optional<admission_reservation> queued,
+      std::size_t units) {
         static_assert(
           std::numeric_limits<std::size_t>::digits
           >= std::numeric_limits<std::uint64_t>::digits);
@@ -292,7 +293,8 @@ public:
             if (!serialization) {
                 serialization.emplace(
                   co_await seastar::coroutine::without_preemption_check(
-                    seastar::get_units(self.owner_.write_serialization_, 1)));
+                    seastar::get_units(
+                      self.owner_.write_serialization_, units)));
             }
             queued.reset();
             static_cast<void>(*serialization);
@@ -386,8 +388,10 @@ public:
                 const auto direct_bytes = round_down(
                   std::min<std::uint64_t>(front.size(), transferable),
                   self.write_alignment_);
+                // Borrow a complete request directly. Smaller aligned pieces
+                // share one staging buffer instead of multiplying DMA calls.
                 if (
-                  direct_bytes != 0
+                  direct_bytes == transferable
                   && is_aligned(front.data(), self.memory_alignment_)) {
                     staging = {};
                     auto fragment = source.take_front(
@@ -554,7 +558,8 @@ private:
                 const char* data;
                 std::size_t size;
                 if (
-                  direct_bytes && is_aligned(front.data(), memory_alignment_)) {
+                  direct_bytes == transferable
+                  && is_aligned(front.data(), memory_alignment_)) {
                     staging = {};
                     direct = source.take_front(
                       static_cast<std::size_t>(direct_bytes));
@@ -846,7 +851,9 @@ result<void> file_open_options::validate() const noexcept {
     if (
       access_value > static_cast<std::uint8_t>(file_access::read_write)
       || (exclusive && !create)
-      || (truncate && access == file_access::read_only) || permissions > 0777U
+      || (truncate && access == file_access::read_only)
+      || (synchronous && access == file_access::read_only)
+      || permissions > 0777U
       || static_cast<std::uint8_t>(close_policy)
            > static_cast<std::uint8_t>(file_close_policy::checked)) {
         return failure(file_error(errc::invalid_argument));
@@ -941,7 +948,7 @@ file::file(
 bool file::move_is_idle(const file& other) noexcept {
     return other.operations_.get_count() == 0
            && other.state_ != file_state::closing
-           && other.write_serialization_.current() == 1
+           && other.write_serialization_.current() == other.write_slots_
            && other.write_serialization_.waiters() == 0
            && other.read_operation_units_.current()
                 == other.limits_.pending_reads
@@ -979,6 +986,7 @@ file::file(file&& other) noexcept
       std::move(other.queued_write_operation_units_))
   , queued_write_byte_units_(std::move(other.queued_write_byte_units_))
   , write_serialization_(std::move(other.write_serialization_))
+  , write_slots_(other.write_slots_)
   , memory_dma_alignment_(other.memory_dma_alignment_)
   , disk_read_dma_alignment_(other.disk_read_dma_alignment_)
   , disk_write_dma_alignment_(other.disk_write_dma_alignment_)
@@ -1001,7 +1009,7 @@ file::~file() {
       file_stopped_invariant,
       moved_from_
         || (state_ == file_state::closed && operations_.get_count() == 0
-            && write_serialization_.current() == 1
+            && write_serialization_.current() == write_slots_
             && write_serialization_.waiters() == 0
             && read_operation_units_.current() == limits_.pending_reads
             && read_byte_units_.current()
@@ -1346,12 +1354,16 @@ file::write_validated(file_position position, bytes::fragmented_buffer&& data) {
         const auto front_fragment = *data.begin();
         const bool aligned_front = is_aligned(
           front_fragment.data(), memory_alignment);
-        auto serialization = seastar::try_get_units(write_serialization_, 1);
-        if (
-          serialization && is_aligned(position.value(), append_alignment)
-          && is_aligned(data_size, append_alignment)
-          && data_size <= append_chunk_limit_
-          && (has_one_fragment || front_fragment.size() < append_alignment || !aligned_front)) {
+        // One aligned native request needs neither the size nor neighbouring
+        // bytes, so it may share the serializer with other such writes.
+        const bool single_request = is_aligned(
+                                      position.value(), append_alignment)
+                                    && is_aligned(data_size, append_alignment)
+                                    && data_size <= append_chunk_limit_;
+        const auto units = single_request ? std::size_t{1} : write_slots_;
+        auto serialization = seastar::try_get_units(
+          write_serialization_, units);
+        if (serialization && single_request) {
             seastar::gate::holder holder;
             if (close_policy_ == file_close_policy::checked) {
                 holder = seastar::gate::holder{operations_};
@@ -1448,7 +1460,7 @@ file::write_validated(file_position position, bytes::fragmented_buffer&& data) {
               });
         }
         return write_general(
-          position, std::move(data), std::move(serialization));
+          position, std::move(data), std::move(serialization), units);
     } catch (...) {
         return seastar::futurize_invoke(
           [this, exception = std::current_exception()] -> result<byte_count> {
@@ -1460,7 +1472,8 @@ file::write_validated(file_position position, bytes::fragmented_buffer&& data) {
 seastar::future<result<byte_count>> file::write_general(
   file_position position,
   bytes::fragmented_buffer&& data,
-  std::optional<seastar::semaphore_units<>> serialization) {
+  std::optional<seastar::semaphore_units<>> serialization,
+  std::size_t units) {
     std::optional<admission_reservation> queued;
     if (!serialization) {
         queued = try_acquire_queued_write(data.retained_bytes());
@@ -1486,7 +1499,8 @@ seastar::future<result<byte_count>> file::write_general(
         std::move(*holder),
         std::move(metric)},
       std::move(serialization),
-      std::move(queued));
+      std::move(queued),
+      units);
 }
 
 seastar::future<result<void>> file::truncate(std::uint64_t size) {
@@ -1495,7 +1509,8 @@ seastar::future<result<void>> file::truncate(std::uint64_t size) {
         statistics_->reject();
         co_return failure(std::move(*rejected));
     }
-    auto serialization = seastar::try_get_units(write_serialization_, 1);
+    auto serialization = seastar::try_get_units(
+      write_serialization_, write_slots_);
     std::optional<admission_reservation> queued;
     if (!serialization) {
         queued = try_acquire_queued_write(byte_count{});
@@ -1515,7 +1530,7 @@ seastar::future<result<void>> file::truncate(std::uint64_t size) {
         if (!serialization) {
             serialization.emplace(
               co_await seastar::coroutine::without_preemption_check(
-                seastar::get_units(write_serialization_, 1)));
+                seastar::get_units(write_serialization_, write_slots_)));
         }
         queued.reset();
         static_cast<void>(*serialization);
@@ -1523,6 +1538,61 @@ seastar::future<result<void>> file::truncate(std::uint64_t size) {
             co_return failure(std::move(*rejected));
         }
         co_await native_file_.truncate(size);
+        co_return result<void>{};
+    } catch (...) {
+        co_return failure(remember_io_failure(std::current_exception()));
+    }
+}
+
+seastar::future<result<void>>
+file::allocate(file_position position, byte_count length) {
+    owner_.assert_current();
+    if (length.value() == 0 || !position.checked_add(length)) {
+        statistics_->reject();
+        co_return failure(file_error(errc::invalid_argument));
+    }
+    if (auto rejected = mutation_rejection()) {
+        statistics_->reject();
+        co_return failure(std::move(*rejected));
+    }
+    auto serialization = seastar::try_get_units(
+      write_serialization_, write_slots_);
+    std::optional<admission_reservation> queued;
+    if (!serialization) {
+        queued = try_acquire_queued_write(byte_count{});
+        if (!queued) {
+            statistics_->reject();
+            co_return failure(make_file_error(
+              errc::queue_full, file_failure_detail::admission_not_dispatched));
+        }
+    }
+    auto holder = operations_.try_hold();
+    KWAQUE_INVARIANT(
+      file_gate_invariant,
+      holder.has_value(),
+      "open file rejected operation gate entry");
+    [[maybe_unused]] auto metric = statistics_->accept();
+    try {
+        if (!serialization) {
+            serialization.emplace(
+              co_await seastar::coroutine::without_preemption_check(
+                seastar::get_units(write_serialization_, write_slots_)));
+        }
+        queued.reset();
+        static_cast<void>(*serialization);
+        if (auto rejected = mutation_rejection(true)) {
+            co_return failure(std::move(*rejected));
+        }
+        // Never let the zeroing primitive reach existing bytes.
+        if (position.value() < co_await native_file_.size()) {
+            co_return failure(file_error(errc::invalid_argument));
+        }
+        try {
+            co_await native_file_.allocate(position.value(), length.value());
+        } catch (const std::system_error& error) {
+            // Advisory hint, as the native filesystem layer treats it.
+            if (error.code() != std::errc::operation_not_supported) throw;
+        }
         co_return result<void>{};
     } catch (...) {
         co_return failure(remember_io_failure(std::current_exception()));
@@ -1618,7 +1688,8 @@ seastar::future<result<void>> file::close_checked_once() {
     co_await operations_.close();
     // Checked direct writes retain the gate through short-write recovery too.
     // Draining it leaves the serializer free without allocating a close waiter.
-    auto serialization = seastar::try_get_units(write_serialization_, 1);
+    auto serialization = seastar::try_get_units(
+      write_serialization_, write_slots_);
     KWAQUE_INVARIANT(
       file_gate_invariant,
       serialization.has_value(),
@@ -1644,7 +1715,7 @@ seastar::future<result<void>> file::close_once() {
     try {
         auto serialization
           = co_await seastar::coroutine::without_preemption_check(
-            seastar::get_units(write_serialization_, 1));
+            seastar::get_units(write_serialization_, write_slots_));
         static_cast<void>(serialization);
         co_await native_file_.close();
         co_return result<void>{};
@@ -1682,6 +1753,45 @@ result<void> file::limit_write_allocation(byte_count maximum) noexcept {
     append_chunk_limit_ = std::max(
       round_down(native_write_max_length_, disk_write_dma_alignment_),
       disk_write_dma_alignment_);
+    return {};
+}
+
+result<void> file::limit_write_concurrency(std::uint32_t maximum) noexcept {
+    owner_.assert_current();
+    if (auto rejected = operation_rejection()) return failure(*rejected);
+    if (maximum == 0) return failure(file_error(errc::invalid_argument));
+    if (maximum > maximum_file_write_concurrency)
+        return failure(file_error(errc::out_of_range));
+    if (!move_is_idle(*this))
+        return failure(make_file_error(
+          errc::queue_full, file_failure_detail::admission_not_dispatched));
+    limits_.write_concurrency = std::min(limits_.write_concurrency, maximum);
+    if (write_slots_ > limits_.write_concurrency) {
+        write_serialization_.consume(write_slots_ - limits_.write_concurrency);
+        write_slots_ = limits_.write_concurrency;
+    }
+    return {};
+}
+
+result<void> file::allow_concurrent_writes(std::uint32_t maximum) noexcept {
+    owner_.assert_current();
+    if (auto rejected = operation_rejection()) return failure(*rejected);
+    if (maximum == 0) return failure(file_error(errc::invalid_argument));
+    // Each such write is one request staged in at most one chunk, with the
+    // same short-write recovery reserve as a windowed write.
+    if (
+      maximum > limits_.write_concurrency
+      || std::uint64_t{maximum} * 2 * std::bit_ceil(append_chunk_limit_)
+           > limits_.write_buffer_bytes.value())
+        return failure(file_error(errc::out_of_range));
+    if (!move_is_idle(*this))
+        return failure(make_file_error(
+          errc::queue_full, file_failure_detail::admission_not_dispatched));
+    if (maximum > write_slots_)
+        write_serialization_.signal(maximum - write_slots_);
+    else
+        write_serialization_.consume(write_slots_ - maximum);
+    write_slots_ = maximum;
     return {};
 }
 

@@ -30,6 +30,19 @@ public:
           absl::crc32c_t{value_}, std::string_view{data.data(), data.size()}));
     }
 
+    // Append an already checked suffix without reading its bytes again. Both
+    // CRCs use finalized values; the suffix length must describe those bytes.
+    void extend_checksum(value_type suffix, std::size_t length) {
+        value_ = static_cast<value_type>(absl::ConcatCrc32c(
+          absl::crc32c_t{value_}, absl::crc32c_t{suffix}, length));
+    }
+
+    // Advance over known zero padding without scanning a temporary zero buffer.
+    void extend_zeroes(std::size_t length) {
+        value_ = static_cast<value_type>(
+          absl::ExtendCrc32cByZeroes(absl::crc32c_t{value_}, length));
+    }
+
     // An implicit character-array span would also include its terminator.
     template<std::size_t N>
     void extend(const char (&literal)[N]) = delete;

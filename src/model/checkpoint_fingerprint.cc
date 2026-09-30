@@ -1,4 +1,4 @@
-#include "src/codec/sha256.h"
+#include "src/codec/xxh3.h"
 #include "src/model/checkpoint_wire.h"
 #include "src/model/fingerprint.h"
 
@@ -32,7 +32,7 @@ compute_checkpoint_fingerprint(
         co_return codec::failure(ready.error());
     std::optional<codec::checkpoint_digest> digest;
     {
-        codec::sha256_hasher hasher;
+        codec::xxh3_128_hasher hasher;
         hasher.update(
           codec::checkpoint_domain.data(), codec::checkpoint_domain.size());
         const auto prefix = detail::encode_checkpoint_prefix(

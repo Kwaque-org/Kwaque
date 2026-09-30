@@ -57,6 +57,8 @@ struct file_probe final {
     std::vector<std::size_t> bulk_read_sizes;
     std::vector<std::size_t> bulk_read_allocations;
     std::vector<std::uintptr_t> bulk_read_addresses;
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> allocations;
+    std::exception_ptr allocate_failure;
     std::vector<char> storage;
     std::uint64_t size{0};
     std::uintptr_t bulk_read_address{0};
@@ -235,8 +237,12 @@ public:
         return unexpected_file_call<seastar::future<>>();
     }
 
-    seastar::future<> allocate(std::uint64_t, std::uint64_t) final {
-        return unexpected_file_call<seastar::future<>>();
+    seastar::future<>
+    allocate(std::uint64_t position, std::uint64_t length) final {
+        probe_.allocations.emplace_back(position, length);
+        if (probe_.allocate_failure)
+            return seastar::make_exception_future<>(probe_.allocate_failure);
+        return seastar::make_ready_future<>();
     }
 
     seastar::future<std::uint64_t> size() final {
@@ -600,6 +606,54 @@ SEASTAR_TEST_CASE(file_owner_supports_typed_metadata_operations) {
     BOOST_CHECK_EQUAL(probe.closes, 1U);
 }
 
+SEASTAR_TEST_CASE(
+  file_allocate_reserves_without_resizing_or_requiring_support) {
+    file_probe probe;
+    auto owner = make_file(probe);
+
+    const auto reserved = co_await owner.allocate(
+      kwaque::runtime::file_position{4096}, kwaque::byte_count{8192});
+    const auto empty = co_await owner.allocate(
+      kwaque::runtime::file_position{4096}, kwaque::byte_count{});
+    probe.allocate_failure = std::make_exception_ptr(
+      std::system_error(
+        std::make_error_code(std::errc::operation_not_supported)));
+    const auto unsupported = co_await owner.allocate(
+      kwaque::runtime::file_position{12288}, kwaque::byte_count{4096});
+    const auto observed_size = co_await owner.size();
+    probe.allocate_failure = {};
+    const auto grown = co_await owner.truncate(8192);
+    // Existing bytes are never offered to the zeroing native primitive.
+    const auto overlapping = co_await owner.allocate(
+      kwaque::runtime::file_position{4096}, kwaque::byte_count{8192});
+    const auto beyond = co_await owner.allocate(
+      kwaque::runtime::file_position{8192}, kwaque::byte_count{4096});
+    probe.allocate_failure = std::make_exception_ptr(
+      std::system_error(std::make_error_code(std::errc::no_space_on_device)));
+    const auto full = co_await owner.allocate(
+      kwaque::runtime::file_position{16384}, kwaque::byte_count{4096});
+    static_cast<void>(co_await owner.close());
+
+    BOOST_REQUIRE(reserved.has_value());
+    BOOST_REQUIRE(!empty.has_value());
+    BOOST_CHECK(empty.error().code() == kwaque::errc::invalid_argument);
+    BOOST_REQUIRE(unsupported.has_value());
+    BOOST_REQUIRE(observed_size.has_value());
+    BOOST_CHECK_EQUAL(*observed_size, 0U);
+    BOOST_REQUIRE(grown.has_value());
+    BOOST_REQUIRE(!overlapping.has_value());
+    BOOST_CHECK(overlapping.error().code() == kwaque::errc::invalid_argument);
+    BOOST_REQUIRE(beyond.has_value());
+    BOOST_CHECK(!full.has_value());
+    // The overlapping request never reached the native primitive.
+    BOOST_REQUIRE_EQUAL(probe.allocations.size(), 4U);
+    BOOST_CHECK_EQUAL(probe.allocations[0].first, 4096U);
+    BOOST_CHECK_EQUAL(probe.allocations[0].second, 8192U);
+    BOOST_CHECK_EQUAL(probe.allocations[2].first, 8192U);
+    BOOST_CHECK_EQUAL(probe.allocations[2].second, 4096U);
+    BOOST_CHECK_EQUAL(probe.truncates, 1U);
+}
+
 SEASTAR_TEST_CASE(file_read_adopts_exact_native_bulk_without_payload_copy) {
     file_probe probe;
     probe.storage.assign(4096, 'r');
@@ -853,9 +907,12 @@ SEASTAR_TEST_CASE(file_write_coalesces_fragment_batch_without_native_iovecs) {
     BOOST_REQUIRE(close_result.has_value());
 }
 
+// An aligned fragment that fills a complete native request is written from its
+// own storage. Smaller aligned pieces share staging; see the coalescing case.
 SEASTAR_TEST_CASE(file_aligned_fragments_keep_independent_native_dma_storage) {
     using access = kwaque::runtime::detail::fragmented_buffer_io_access;
     file_probe probe;
+    probe.write_max_length = 4096;
     probe.storage.assign(4096, 'p');
     probe.size = probe.storage.size();
     auto owner = make_file(probe);
@@ -1575,24 +1632,38 @@ SEASTAR_TEST_CASE(
     probe.memory_alignment = 8192;
     auto owner = make_file(probe);
     const auto original = owner.geometry();
+    for (const auto maximum : {0U, 9U}) {
+        const auto rejected = owner.limit_write_concurrency(maximum);
+        BOOST_CHECK(!rejected);
+        BOOST_CHECK(owner.geometry() == original);
+    }
     for (const auto maximum : {0U, 4096U, 65535U, 262144U}) {
         const auto rejected = owner.limit_write_allocation(byte_count{maximum});
         BOOST_CHECK(!rejected);
         BOOST_CHECK(owner.geometry() == original);
     }
     const auto limited = owner.limit_write_allocation(byte_count{65536});
+    const auto window = owner.limit_write_concurrency(1);
     runtime::result<void> pinned;
+    runtime::result<void> pinned_window;
     bool pin_admitted = false;
     {
         auto pin = owner.try_reserve_metadata();
         pin_admitted = pin.has_value();
         pinned = owner.limit_write_allocation(byte_count{32768});
+        pinned_window = owner.limit_write_concurrency(1);
     }
     const auto geometry = owner.geometry();
     const auto closed = co_await owner.close();
     const auto after_close = owner.limit_write_allocation(byte_count{32768});
+    const auto closed_window = owner.limit_write_concurrency(1);
+    BOOST_CHECK(window.has_value());
+    BOOST_REQUIRE(!pinned_window && !closed_window);
+    BOOST_CHECK(pinned_window.error().code() == errc::queue_full);
+    BOOST_CHECK(closed_window.error().code() == errc::closed);
     BOOST_CHECK(limited.has_value() && closed.has_value() && pin_admitted);
     BOOST_REQUIRE(geometry.has_value());
+    BOOST_CHECK_EQUAL(geometry->write_concurrency(), 1U);
     BOOST_CHECK_EQUAL(geometry->append_chunk_bytes().value(), 65536U);
     BOOST_REQUIRE(!pinned);
     BOOST_CHECK(pinned.error().code() == errc::queue_full);
@@ -2075,44 +2146,100 @@ pipeline_file(file_probe& probe, kwaque::runtime::file_io_limits limits = {}) {
 }
 } // namespace
 
+SEASTAR_TEST_CASE(
+  file_write_coalesces_aligned_fragments_into_bounded_requests) {
+    using namespace kwaque;
+    using access = runtime::detail::fragmented_buffer_io_access;
+    for (const auto concurrency : {1U, 4U}) {
+        for (const auto fragments : {3U, 16U}) {
+            file_probe probe;
+            probe.write_max_length = 16384;
+            const auto size = fragments * 4096U;
+            probe.storage.resize(size);
+            auto limits = runtime::file_io_limits{};
+            limits.write_concurrency = concurrency;
+            auto owner = pipeline_file(probe, limits);
+            bytes::fragmented_buffer data;
+            std::string expected;
+            expected.reserve(size);
+            for (unsigned i = 0; i != fragments; ++i) {
+                const auto value = static_cast<char>('a' + i);
+                auto part = seastar::temporary_buffer<char>::aligned(
+                  4096, 4096);
+                std::memset(part.get_write(), value, part.size());
+                const auto appended = access::append_adopted(
+                  data, std::move(part), byte_count{4096});
+                BOOST_REQUIRE(appended);
+                expected.append(4096, value);
+            }
+            auto writing = owner.write({}, std::move(data));
+            co_await drain_parked(probe);
+            const auto written = co_await std::move(writing);
+            const auto closed = co_await owner.close();
+            BOOST_REQUIRE(written.has_value());
+            BOOST_REQUIRE(closed.has_value());
+            BOOST_CHECK_EQUAL(written->value(), size);
+            BOOST_CHECK_EQUAL(probe.writes.size(), (size + 16383U) / 16384U);
+            for (const auto& call : probe.writes) {
+                BOOST_CHECK_EQUAL(call.position % 4096U, 0U);
+                BOOST_CHECK_EQUAL(call.address % 4096U, 0U);
+                BOOST_CHECK_LE(call.size, 16384U);
+            }
+            BOOST_CHECK(
+              std::string_view(probe.storage.data(), probe.storage.size())
+              == expected);
+        }
+    }
+}
+
 SEASTAR_TEST_CASE(file_pipeline_honors_reduced_allocation_through_short_write) {
     using namespace kwaque;
-    file_probe probe;
-    probe.memory_alignment = 8192;
-    probe.write_max_length = 131072;
-    constexpr std::size_t size = 8U * 65536U;
-    probe.storage.resize(size);
-    auto owner = pipeline_file(probe);
-    const auto limited = owner.limit_write_allocation(byte_count{65536});
-    auto moved = std::move(owner);
-    // A subsequent larger request must not undo a previously installed cap.
-    const auto enlarged = moved.limit_write_allocation(byte_count{131072});
-    const auto layout = moved.geometry().value().write_buffers(
-      {}, byte_count{size});
-    auto writing = moved.write({}, staging_data(true, size));
-    co_await drain_reactor_tasks();
-    const auto initial = probe.writes.size();
-    const auto busy = moved.limit_write_allocation(byte_count{32768});
-    finish_parked(probe, 0, 4096);
-    co_await drain_parked(probe);
-    const auto written = co_await std::move(writing);
-    const auto closed = co_await moved.close();
-    BOOST_CHECK(limited.has_value() && enlarged.has_value());
-    BOOST_REQUIRE(!busy);
-    BOOST_CHECK(busy.error().code() == errc::queue_full);
-    BOOST_CHECK_EQUAL(initial, 4U);
-    BOOST_CHECK_EQUAL(layout.allocation_bytes.value(), 65536U);
-    BOOST_CHECK_EQUAL(layout.allocations, 8U);
-    BOOST_REQUIRE(written.has_value());
-    BOOST_CHECK_EQUAL(written->value(), size);
-    BOOST_CHECK(closed.has_value());
-    BOOST_CHECK_EQUAL(probe.writes.size(), 9U);
-    for (const auto& call : probe.writes) {
-        BOOST_CHECK_LE(call.size, 65536U);
-        BOOST_CHECK_EQUAL(call.address % 8192U, 0U);
+    for (auto concurrency : {1U, 4U}) {
+        file_probe probe;
+        probe.memory_alignment = 8192;
+        probe.write_max_length = 131072;
+        constexpr std::size_t size = 8U * 65536U;
+        probe.storage.resize(size);
+        auto owner = pipeline_file(probe);
+        const auto limited = owner.limit_write_allocation(byte_count{65536});
+        const auto window = owner.limit_write_concurrency(concurrency);
+        auto moved = std::move(owner);
+        // A subsequent larger request must not undo a previously installed cap.
+        const auto enlarged = moved.limit_write_allocation(byte_count{131072});
+        const auto expanded_window = moved.limit_write_concurrency(4);
+        const auto layout = moved.geometry().value().write_buffers(
+          {}, byte_count{size});
+        auto writing = moved.write({}, staging_data(true, size));
+        co_await drain_reactor_tasks();
+        const auto initial = probe.writes.size();
+        const auto busy = moved.limit_write_allocation(byte_count{32768});
+        const auto busy_window = moved.limit_write_concurrency(1);
+        finish_parked(probe, 0, 4096);
+        co_await drain_parked(probe);
+        const auto written = co_await std::move(writing);
+        const auto closed = co_await moved.close();
+        BOOST_CHECK(
+          limited.has_value() && enlarged.has_value() && window.has_value()
+          && expanded_window.has_value());
+        BOOST_REQUIRE(!busy_window);
+        BOOST_CHECK(busy_window.error().code() == errc::queue_full);
+        BOOST_REQUIRE(!busy);
+        BOOST_CHECK(busy.error().code() == errc::queue_full);
+        BOOST_CHECK_EQUAL(initial, concurrency);
+        BOOST_CHECK_EQUAL(layout.allocation_bytes.value(), 65536U);
+        BOOST_CHECK_EQUAL(layout.allocations, 2U * concurrency);
+        BOOST_REQUIRE(written.has_value());
+        BOOST_CHECK_EQUAL(written->value(), size);
+        BOOST_CHECK(closed.has_value());
+        BOOST_CHECK_EQUAL(probe.writes.size(), 9U);
+        for (const auto& call : probe.writes) {
+            BOOST_CHECK_LE(call.size, 65536U);
+            BOOST_CHECK_EQUAL(call.address % 8192U, 0U);
+        }
+        BOOST_CHECK(
+          std::string_view(probe.storage.data(), size)
+          == staging_contents(size));
     }
-    BOOST_CHECK(
-      std::string_view(probe.storage.data(), size) == staging_contents(size));
 }
 
 SEASTAR_TEST_CASE(file_pipeline_bounds_reversed_completion_and_joined_close) {
@@ -2475,5 +2602,101 @@ SEASTAR_TEST_CASE(
         BOOST_CHECK(
           file_detail(written.error()) == file_failure_detail::unknown);
         BOOST_CHECK(written.error() == closed.error());
+    }
+}
+
+SEASTAR_TEST_CASE(
+  file_single_request_writes_share_the_serializer_when_allowed) {
+    using namespace kwaque;
+    {
+        file_probe probe;
+        auto owner = pipeline_file(
+          probe,
+          {.write_concurrency = 4, .write_buffer_bytes = byte_count{262144}});
+        const auto zero = owner.allow_concurrent_writes(0);
+        const auto wide = owner.allow_concurrent_writes(5);
+        // Two chunk-sized writes and their recovery exceed these buffers.
+        const auto staged = owner.allow_concurrent_writes(2);
+        const auto narrowed = owner.limit_write_allocation(byte_count{65536});
+        const auto fits = owner.allow_concurrent_writes(2);
+        const auto closed = co_await owner.close();
+        const auto after_close = owner.allow_concurrent_writes(1);
+        BOOST_REQUIRE(!zero && !wide && !staged && !after_close);
+        BOOST_CHECK(zero.error().code() == errc::invalid_argument);
+        BOOST_CHECK(wide.error().code() == errc::out_of_range);
+        BOOST_CHECK(staged.error().code() == errc::out_of_range);
+        BOOST_CHECK(after_close.error().code() == errc::closed);
+        BOOST_CHECK(narrowed && fits && closed);
+    }
+    {
+        file_probe probe;
+        probe.write_max_length = 16384;
+        auto owner = pipeline_file(probe);
+        probe.storage.assign(32768, 'p');
+        probe.size = probe.storage.size();
+        const auto allowed = owner.allow_concurrent_writes(4);
+        std::vector<seastar::future<runtime::result<byte_count>>> writing;
+        for (std::size_t i = 0; i < 4; ++i)
+            writing.push_back(owner.write(
+              runtime::file_position{i * 4096U},
+              aligned_data(4096, static_cast<char>('a' + i))));
+        co_await drain_reactor_tasks();
+        const auto shared = probe.writes.size();
+        const auto busy = owner.allow_concurrent_writes(1);
+        // Exclusive work waits for every write in flight; a later
+        // single-request write keeps its arrival order behind it.
+        auto truncating = owner.truncate(24576);
+        auto later = owner.write(
+          runtime::file_position{16384}, aligned_data(4096, 'e'));
+        co_await drain_reactor_tasks();
+        const bool waited = probe.writes.size() == shared
+                            && probe.truncates == 0;
+        for (std::size_t i = shared; i-- > 0;)
+            finish_parked(probe, i);
+        co_await drain_reactor_tasks();
+        const bool ordered = probe.truncates == 1
+                             && probe.writes.size() == shared + 1;
+        co_await drain_parked(probe);
+        bool written = true;
+        for (auto& pending : writing) {
+            const auto result = co_await std::move(pending);
+            written = written && result && result->value() == 4096U;
+        }
+        const auto truncated = co_await std::move(truncating);
+        const auto last = co_await std::move(later);
+        const auto closed = co_await owner.close();
+        BOOST_CHECK(allowed.has_value());
+        BOOST_CHECK_EQUAL(shared, 4U);
+        BOOST_REQUIRE(!busy);
+        BOOST_CHECK(busy.error().code() == errc::queue_full);
+        BOOST_CHECK(waited);
+        BOOST_CHECK(ordered);
+        BOOST_CHECK(written && truncated && last && closed);
+        BOOST_CHECK(
+          std::string_view(probe.storage.data(), probe.storage.size())
+          == std::string(4096, 'a') + std::string(4096, 'b')
+               + std::string(4096, 'c') + std::string(4096, 'd')
+               + std::string(4096, 'e') + std::string(4096, 'p'));
+    }
+    // Narrowing the physical window narrows the shared writes too.
+    {
+        file_probe probe;
+        auto owner = pipeline_file(probe);
+        const auto allowed = owner.allow_concurrent_writes(4);
+        const auto narrowed = owner.limit_write_concurrency(2);
+        std::vector<seastar::future<runtime::result<byte_count>>> writing;
+        for (std::size_t i = 0; i < 3; ++i)
+            writing.push_back(owner.write(
+              runtime::file_position{i * 4096U}, aligned_data(4096, 'n')));
+        co_await drain_reactor_tasks();
+        const auto shared = probe.writes.size();
+        co_await drain_parked(probe);
+        bool written = true;
+        for (auto& pending : writing)
+            written = written && (co_await std::move(pending)).has_value();
+        const auto closed = co_await owner.close();
+        BOOST_CHECK(allowed && narrowed && written && closed);
+        BOOST_CHECK_EQUAL(shared, 2U);
+        BOOST_CHECK_EQUAL(probe.writes.size(), 3U);
     }
 }

@@ -186,13 +186,13 @@
           "name": "body_crc32c",
           "offset": 24,
           "width": 4,
-          "le": 2930454827
+          "le": 3704459552
         },
         {
           "name": "header_crc32c",
           "offset": 28,
           "width": 4,
-          "le": 2812764735
+          "le": 3349010277
         },
         {
           "name": "body",
@@ -278,7 +278,20 @@
               "name": "semantic_fingerprint",
               "offset": 104,
               "width": 32,
-              "hex": "faf92b853fd9029baa6091b240ff60cbd8e82375f8d26d28e65160c5b88b8a02"
+              "fields": [
+                {
+                  "name": "digest",
+                  "offset": 0,
+                  "width": 16,
+                  "hex": "4686499c33887149b5dd65ac790cd0c2"
+                },
+                {
+                  "name": "reserved",
+                  "offset": 16,
+                  "width": 16,
+                  "zero": true
+                }
+              ]
             },
             {
               "name": "timestamp_base",
@@ -347,13 +360,13 @@
     {
       "name": "batch_digest",
       "path": "batch_digest.hex",
-      "size": 32,
+      "size": 16,
       "fields": [
         {
-          "name": "sha256",
+          "name": "digest",
           "offset": 0,
-          "width": 32,
-          "hex": "faf92b853fd9029baa6091b240ff60cbd8e82375f8d26d28e65160c5b88b8a02"
+          "width": 16,
+          "hex": "4686499c33887149b5dd65ac790cd0c2"
         }
       ]
     },
@@ -408,13 +421,13 @@
           "name": "body_crc32c",
           "offset": 24,
           "width": 4,
-          "le": 3606038752
+          "le": 3554421650
         },
         {
           "name": "header_crc32c",
           "offset": 28,
           "width": 4,
-          "le": 1538969501
+          "le": 4179841490
         },
         {
           "name": "body",
@@ -500,7 +513,20 @@
               "name": "semantic_fingerprint",
               "offset": 104,
               "width": 32,
-              "hex": "faf92b853fd9029baa6091b240ff60cbd8e82375f8d26d28e65160c5b88b8a02"
+              "fields": [
+                {
+                  "name": "digest",
+                  "offset": 0,
+                  "width": 16,
+                  "hex": "4686499c33887149b5dd65ac790cd0c2"
+                },
+                {
+                  "name": "reserved",
+                  "offset": 16,
+                  "width": 16,
+                  "zero": true
+                }
+              ]
             },
             {
               "name": "timestamp_base",
@@ -629,13 +655,13 @@
           "name": "body_crc32c",
           "offset": 24,
           "width": 4,
-          "le": 4197044584
+          "le": 436292605
         },
         {
           "name": "header_crc32c",
           "offset": 28,
           "width": 4,
-          "le": 962979325
+          "le": 2978271681
         },
         {
           "name": "body",
@@ -721,7 +747,20 @@
               "name": "semantic_fingerprint",
               "offset": 104,
               "width": 32,
-              "hex": "1ca1f5939c787dc18baed7e6a9869863589d8164d20bf7511b779f928fab5c64"
+              "fields": [
+                {
+                  "name": "digest",
+                  "offset": 0,
+                  "width": 16,
+                  "hex": "f15dbbd772308cd9f94fe5c4e0103dfa"
+                },
+                {
+                  "name": "reserved",
+                  "offset": 16,
+                  "width": 16,
+                  "zero": true
+                }
+              ]
             },
             {
               "name": "timestamp_base",
@@ -1096,13 +1135,13 @@
           "name": "body_crc32c",
           "offset": 24,
           "width": 4,
-          "le": 1984691835
+          "le": 2721342947
         },
         {
           "name": "header_crc32c",
           "offset": 28,
           "width": 4,
-          "le": 802502107
+          "le": 3651349491
         },
         {
           "name": "body",
@@ -1207,13 +1246,13 @@
     {
       "name": "extent_digest",
       "path": "extent_digest.hex",
-      "size": 32,
+      "size": 16,
       "fields": [
         {
-          "name": "sha256",
+          "name": "digest",
           "offset": 0,
-          "width": 32,
-          "hex": "4bacf574184ef2d1218c77affe027f49ade8655632c335a34e093bc2bc9913ef"
+          "width": 16,
+          "hex": "b5170d709f98a2a2408e46cb36609266"
         }
       ]
     },
@@ -1268,13 +1307,13 @@
           "name": "body_crc32c",
           "offset": 24,
           "width": 4,
-          "le": 311132255
+          "le": 3938966435
         },
         {
           "name": "header_crc32c",
           "offset": 28,
           "width": 4,
-          "le": 2668743452
+          "le": 2674728291
         },
         {
           "name": "body",
@@ -1445,13 +1484,13 @@
           "name": "body_crc32c",
           "offset": 24,
           "width": 4,
-          "le": 1569560526
+          "le": 938825383
         },
         {
           "name": "header_crc32c",
           "offset": 28,
           "width": 4,
-          "le": 923758758
+          "le": 2123689153
         },
         {
           "name": "body",
@@ -1609,7 +1648,7 @@
               "name": "data_crc32c",
               "offset": 184,
               "width": 4,
-              "le": 270303200
+              "le": 1355053293
             },
             {
               "name": "padding_bytes",
@@ -1678,13 +1717,13 @@
           "name": "body_crc32c",
           "offset": 24,
           "width": 4,
-          "le": 3259066529
+          "le": 2990541419
         },
         {
           "name": "header_crc32c",
           "offset": 28,
           "width": 4,
-          "le": 185015207
+          "le": 776253441
         },
         {
           "name": "body",
@@ -1810,7 +1849,20 @@
                   "name": "submitted_digest",
                   "offset": 40,
                   "width": 32,
-                  "fixture": "batch_digest"
+                  "fields": [
+                    {
+                      "name": "digest",
+                      "offset": 0,
+                      "width": 16,
+                      "fixture": "batch_digest"
+                    },
+                    {
+                      "name": "reserved",
+                      "offset": 16,
+                      "width": 16,
+                      "zero": true
+                    }
+                  ]
                 },
                 {
                   "name": "original_binding",
@@ -1930,13 +1982,13 @@
           "name": "body_crc32c",
           "offset": 24,
           "width": 4,
-          "le": 319414920
+          "le": 114471364
         },
         {
           "name": "header_crc32c",
           "offset": 28,
           "width": 4,
-          "le": 3867631501
+          "le": 277095813
         },
         {
           "name": "body",
@@ -2106,7 +2158,20 @@
               "name": "extent_digest",
               "offset": 188,
               "width": 32,
-              "fixture": "extent_digest"
+              "fields": [
+                {
+                  "name": "digest",
+                  "offset": 0,
+                  "width": 16,
+                  "fixture": "extent_digest"
+                },
+                {
+                  "name": "reserved",
+                  "offset": 16,
+                  "width": 16,
+                  "zero": true
+                }
+              ]
             },
             {
               "name": "retry_count",
@@ -2156,10 +2221,23 @@
                   "le": 512
                 },
                 {
-                  "name": "sha256",
+                  "name": "digest",
                   "offset": 16,
                   "width": 32,
-                  "hex": "aaeebc8455f2e54711a569bde4951538dfe2a2fd24688562360530ce161e3906"
+                  "fields": [
+                    {
+                      "name": "digest",
+                      "offset": 0,
+                      "width": 16,
+                      "hex": "8144f51c3344bc7ab765ce00c5bfc8eb"
+                    },
+                    {
+                      "name": "reserved",
+                      "offset": 16,
+                      "width": 16,
+                      "zero": true
+                    }
+                  ]
                 }
               ]
             },
@@ -2224,13 +2302,13 @@
           "name": "body_crc32c",
           "offset": 24,
           "width": 4,
-          "le": 1732774874
+          "le": 3211643176
         },
         {
           "name": "header_crc32c",
           "offset": 28,
           "width": 4,
-          "le": 3189953167
+          "le": 527816439
         },
         {
           "name": "body",
@@ -2333,7 +2411,20 @@
               "name": "extent_digest",
               "offset": 124,
               "width": 32,
-              "fixture": "extent_digest"
+              "fields": [
+                {
+                  "name": "digest",
+                  "offset": 0,
+                  "width": 16,
+                  "fixture": "extent_digest"
+                },
+                {
+                  "name": "reserved",
+                  "offset": 16,
+                  "width": 16,
+                  "zero": true
+                }
+              ]
             },
             {
               "name": "ordinal",
@@ -2432,13 +2523,13 @@
           "name": "body_crc32c",
           "offset": 24,
           "width": 4,
-          "le": 594354744
+          "le": 3456010107
         },
         {
           "name": "header_crc32c",
           "offset": 28,
           "width": 4,
-          "le": 453762261
+          "le": 544921648
         },
         {
           "name": "body",
@@ -2541,7 +2632,20 @@
               "name": "extent_digest",
               "offset": 124,
               "width": 32,
-              "fixture": "extent_digest"
+              "fields": [
+                {
+                  "name": "digest",
+                  "offset": 0,
+                  "width": 16,
+                  "fixture": "extent_digest"
+                },
+                {
+                  "name": "reserved",
+                  "offset": 16,
+                  "width": 16,
+                  "zero": true
+                }
+              ]
             },
             {
               "name": "entry_count",
@@ -2591,10 +2695,23 @@
                   "le": 512
                 },
                 {
-                  "name": "sha256",
+                  "name": "digest",
                   "offset": 16,
                   "width": 32,
-                  "hex": "c9eb30df3b1d1c9d573e037d0acd5558758548cd971b1db4f8f5de744c290e09"
+                  "fields": [
+                    {
+                      "name": "digest",
+                      "offset": 0,
+                      "width": 16,
+                      "hex": "3aa5147bb3d7ec547a59c2e96ab3d960"
+                    },
+                    {
+                      "name": "reserved",
+                      "offset": 16,
+                      "width": 16,
+                      "zero": true
+                    }
+                  ]
                 }
               ]
             },
@@ -2659,13 +2776,13 @@
           "name": "body_crc32c",
           "offset": 24,
           "width": 4,
-          "le": 4052171630
+          "le": 2353956663
         },
         {
           "name": "header_crc32c",
           "offset": 28,
           "width": 4,
-          "le": 2767816044
+          "le": 2918812390
         },
         {
           "name": "body",
@@ -2801,7 +2918,20 @@
                   "name": "extent_digest",
                   "offset": 72,
                   "width": 32,
-                  "fixture": "extent_digest"
+                  "fields": [
+                    {
+                      "name": "digest",
+                      "offset": 0,
+                      "width": 16,
+                      "fixture": "extent_digest"
+                    },
+                    {
+                      "name": "reserved",
+                      "offset": 16,
+                      "width": 16,
+                      "zero": true
+                    }
+                  ]
                 }
               ]
             },
@@ -2866,13 +2996,13 @@
           "name": "body_crc32c",
           "offset": 24,
           "width": 4,
-          "le": 899054443
+          "le": 1400243541
         },
         {
           "name": "header_crc32c",
           "offset": 28,
           "width": 4,
-          "le": 551888697
+          "le": 2480368703
         },
         {
           "name": "body",
@@ -2975,10 +3105,23 @@
                   "le": 512
                 },
                 {
-                  "name": "sha256",
+                  "name": "digest",
                   "offset": 16,
                   "width": 32,
-                  "hex": "5a9f913d499a5b7893e3c10973b322345d49891ffd20da68c2329c212ce94a85"
+                  "fields": [
+                    {
+                      "name": "digest",
+                      "offset": 0,
+                      "width": 16,
+                      "hex": "34fa0ef4319f50a4a01ffcfc6809b916"
+                    },
+                    {
+                      "name": "reserved",
+                      "offset": 16,
+                      "width": 16,
+                      "zero": true
+                    }
+                  ]
                 }
               ]
             },
@@ -3255,13 +3398,13 @@
     {
       "name": "checkpoint_digest",
       "path": "checkpoint_digest.hex",
-      "size": 32,
+      "size": 16,
       "fields": [
         {
-          "name": "sha256",
+          "name": "digest",
           "offset": 0,
-          "width": 32,
-          "hex": "17accedcac8b0257accbfd9f5e864705f9137c4d0d5730e6e0a7967138d15223"
+          "width": 16,
+          "hex": "c5b8bcb766a5a6380481503c994ed9d1"
         }
       ]
     },
@@ -4823,13 +4966,13 @@
           "name": "header_crc32c",
           "offset": 40,
           "width": 4,
-          "le": 2051999320
+          "le": 3724362963
         },
         {
           "name": "payload_crc32c",
           "offset": 44,
           "width": 4,
-          "le": 566137582
+          "le": 2301329288
         },
         {
           "name": "payload",
@@ -4902,13 +5045,13 @@
           "name": "header_crc32c",
           "offset": 40,
           "width": 4,
-          "le": 791230452
+          "le": 1364038823
         },
         {
           "name": "payload_crc32c",
           "offset": 44,
           "width": 4,
-          "le": 4259881747
+          "le": 530266865
         },
         {
           "name": "payload",
@@ -4932,7 +5075,7 @@
           ]
         }
       ],
-      "expected": "2b31abae",
+      "expected": "2091cddc",
       "stored": {
         "fixture": "submitted",
         "offset": 24
@@ -4956,7 +5099,7 @@
           ]
         }
       ],
-      "expected": "3f62a7a7",
+      "expected": "65d79dc7",
       "stored": {
         "fixture": "submitted",
         "offset": 28
@@ -4964,7 +5107,7 @@
     },
     {
       "name": "submitted_semantic",
-      "algorithm": "sha256",
+      "algorithm": "xxh3_128",
       "parts": [
         {
           "hex": "4b512f42415443482f3100"
@@ -4991,7 +5134,7 @@
           ]
         }
       ],
-      "expected": "faf92b853fd9029baa6091b240ff60cbd8e82375f8d26d28e65160c5b88b8a02",
+      "expected": "4686499c33887149b5dd65ac790cd0c2",
       "stored": {
         "fixture": "submitted",
         "offset": 136
@@ -5009,7 +5152,7 @@
           ]
         }
       ],
-      "expected": "e0c8efd6",
+      "expected": "922bdcd3",
       "stored": {
         "fixture": "assigned_dense",
         "offset": 24
@@ -5033,7 +5176,7 @@
           ]
         }
       ],
-      "expected": "9dcfba5b",
+      "expected": "d25123f9",
       "stored": {
         "fixture": "assigned_dense",
         "offset": 28
@@ -5041,7 +5184,7 @@
     },
     {
       "name": "assigned_dense_semantic",
-      "algorithm": "sha256",
+      "algorithm": "xxh3_128",
       "parts": [
         {
           "hex": "4b512f42415443482f3100"
@@ -5068,7 +5211,7 @@
           ]
         }
       ],
-      "expected": "faf92b853fd9029baa6091b240ff60cbd8e82375f8d26d28e65160c5b88b8a02",
+      "expected": "4686499c33887149b5dd65ac790cd0c2",
       "stored": {
         "fixture": "assigned_dense",
         "offset": 136
@@ -5086,7 +5229,7 @@
           ]
         }
       ],
-      "expected": "68d129fa",
+      "expected": "fd4b011a",
       "stored": {
         "fixture": "assigned_sparse",
         "offset": 24
@@ -5110,7 +5253,7 @@
           ]
         }
       ],
-      "expected": "fde56539",
+      "expected": "c1d184b1",
       "stored": {
         "fixture": "assigned_sparse",
         "offset": 28
@@ -5118,7 +5261,7 @@
     },
     {
       "name": "assigned_sparse_semantic",
-      "algorithm": "sha256",
+      "algorithm": "xxh3_128",
       "parts": [
         {
           "hex": "4b512f42415443482f3100"
@@ -5141,7 +5284,7 @@
           "hex": "0600000001000006000101010000060014020100000600030301000006000204010000"
         }
       ],
-      "expected": "1ca1f5939c787dc18baed7e6a9869863589d8164d20bf7511b779f928fab5c64",
+      "expected": "f15dbbd772308cd9f94fe5c4e0103dfa",
       "stored": {
         "fixture": "assigned_sparse",
         "offset": 136
@@ -5201,7 +5344,7 @@
           ]
         }
       ],
-      "expected": "7bfe4b76",
+      "expected": "e36534a2",
       "stored": {
         "fixture": "segment_block",
         "offset": 24
@@ -5225,7 +5368,7 @@
           ]
         }
       ],
-      "expected": "db35d52f",
+      "expected": "f32ba3d9",
       "stored": {
         "fixture": "segment_block",
         "offset": 28
@@ -5233,7 +5376,7 @@
     },
     {
       "name": "extent_digest",
-      "algorithm": "sha256",
+      "algorithm": "xxh3_128",
       "parts": [
         {
           "fixture": "segment_block",
@@ -5243,7 +5386,7 @@
           ]
         }
       ],
-      "expected": "4bacf574184ef2d1218c77affe027f49ade8655632c335a34e093bc2bc9913ef",
+      "expected": "b5170d709f98a2a2408e46cb36609266",
       "stored": {
         "fixture": "extent_digest",
         "offset": 0
@@ -5261,7 +5404,7 @@
           ]
         }
       ],
-      "expected": "5f808b12",
+      "expected": "a3dbc7ea",
       "stored": {
         "fixture": "wal_prepare",
         "offset": 24
@@ -5285,7 +5428,7 @@
           ]
         }
       ],
-      "expected": "1ccb119f",
+      "expected": "631d6d9f",
       "stored": {
         "fixture": "wal_prepare",
         "offset": 28
@@ -5303,7 +5446,7 @@
           ]
         }
       ],
-      "expected": "ce978d5d",
+      "expected": "a756f537",
       "stored": {
         "fixture": "durable_footer",
         "offset": 24
@@ -5327,7 +5470,7 @@
           ]
         }
       ],
-      "expected": "a6700f37",
+      "expected": "c1ec947e",
       "stored": {
         "fixture": "durable_footer",
         "offset": 28
@@ -5345,7 +5488,7 @@
           ]
         }
       ],
-      "expected": "e07f1c10",
+      "expected": "ed78c450",
       "stored": {
         "fixture": "durable_footer",
         "offset": 216
@@ -5363,7 +5506,7 @@
           ]
         }
       ],
-      "expected": "a16841c2",
+      "expected": "6b0a40b2",
       "stored": {
         "fixture": "retry_page",
         "offset": 24
@@ -5387,7 +5530,7 @@
           ]
         }
       ],
-      "expected": "a71b070b",
+      "expected": "01b0442e",
       "stored": {
         "fixture": "retry_page",
         "offset": 28
@@ -5405,7 +5548,7 @@
           ]
         }
       ],
-      "expected": "88e20913",
+      "expected": "c4b1d206",
       "stored": {
         "fixture": "sealed_footer",
         "offset": 24
@@ -5429,7 +5572,7 @@
           ]
         }
       ],
-      "expected": "8d5f87e6",
+      "expected": "85258410",
       "stored": {
         "fixture": "sealed_footer",
         "offset": 28
@@ -5437,7 +5580,7 @@
     },
     {
       "name": "sealed_extent",
-      "algorithm": "sha256",
+      "algorithm": "xxh3_128",
       "parts": [
         {
           "fixture": "segment_block",
@@ -5447,7 +5590,7 @@
           ]
         }
       ],
-      "expected": "4bacf574184ef2d1218c77affe027f49ade8655632c335a34e093bc2bc9913ef",
+      "expected": "b5170d709f98a2a2408e46cb36609266",
       "stored": {
         "fixture": "sealed_footer",
         "offset": 220
@@ -5455,7 +5598,7 @@
     },
     {
       "name": "retry_page_ref",
-      "algorithm": "sha256",
+      "algorithm": "xxh3_128",
       "parts": [
         {
           "fixture": "retry_page",
@@ -5465,7 +5608,7 @@
           ]
         }
       ],
-      "expected": "aaeebc8455f2e54711a569bde4951538dfe2a2fd24688562360530ce161e3906",
+      "expected": "8144f51c3344bc7ab765ce00c5bfc8eb",
       "stored": {
         "fixture": "sealed_footer",
         "offset": 280
@@ -5483,7 +5626,7 @@
           ]
         }
       ],
-      "expected": "da0b4867",
+      "expected": "28c96dbf",
       "stored": {
         "fixture": "index_page",
         "offset": 24
@@ -5507,7 +5650,7 @@
           ]
         }
       ],
-      "expected": "8fd222be",
+      "expected": "f7d6751f",
       "stored": {
         "fixture": "index_page",
         "offset": 28
@@ -5525,7 +5668,7 @@
           ]
         }
       ],
-      "expected": "38226d23",
+      "expected": "7b87fecd",
       "stored": {
         "fixture": "index_root",
         "offset": 24
@@ -5549,7 +5692,7 @@
           ]
         }
       ],
-      "expected": "d5dc0b1b",
+      "expected": "30d87a20",
       "stored": {
         "fixture": "index_root",
         "offset": 28
@@ -5557,7 +5700,7 @@
     },
     {
       "name": "index_page_ref",
-      "algorithm": "sha256",
+      "algorithm": "xxh3_128",
       "parts": [
         {
           "fixture": "index_page",
@@ -5567,7 +5710,7 @@
           ]
         }
       ],
-      "expected": "c9eb30df3b1d1c9d573e037d0acd5558758548cd971b1db4f8f5de744c290e09",
+      "expected": "3aa5147bb3d7ec547a59c2e96ab3d960",
       "stored": {
         "fixture": "index_root",
         "offset": 216
@@ -5585,7 +5728,7 @@
           ]
         }
       ],
-      "expected": "6e3b87f1",
+      "expected": "37874e8c",
       "stored": {
         "fixture": "manifest_page",
         "offset": 24
@@ -5609,7 +5752,7 @@
           ]
         }
       ],
-      "expected": "6c85f9a4",
+      "expected": "e68af9ad",
       "stored": {
         "fixture": "manifest_page",
         "offset": 28
@@ -5627,7 +5770,7 @@
           ]
         }
       ],
-      "expected": "6b7b9635",
+      "expected": "55057653",
       "stored": {
         "fixture": "manifest_root",
         "offset": 24
@@ -5651,7 +5794,7 @@
           ]
         }
       ],
-      "expected": "3927e520",
+      "expected": "3f6cd793",
       "stored": {
         "fixture": "manifest_root",
         "offset": 28
@@ -5659,7 +5802,7 @@
     },
     {
       "name": "manifest_page_ref",
-      "algorithm": "sha256",
+      "algorithm": "xxh3_128",
       "parts": [
         {
           "fixture": "manifest_page",
@@ -5669,7 +5812,7 @@
           ]
         }
       ],
-      "expected": "5a9f913d499a5b7893e3c10973b322345d49891ffd20da68c2329c212ce94a85",
+      "expected": "34fa0ef4319f50a4a01ffcfc6809b916",
       "stored": {
         "fixture": "manifest_root",
         "offset": 136
@@ -5761,7 +5904,7 @@
     },
     {
       "name": "checkpoint_semantic",
-      "algorithm": "sha256",
+      "algorithm": "xxh3_128",
       "parts": [
         {
           "hex": "4b512f434845434b504f494e542f3100"
@@ -5774,7 +5917,7 @@
           ]
         }
       ],
-      "expected": "17accedcac8b0257accbfd9f5e864705f9137c4d0d5730e6e0a7967138d15223",
+      "expected": "c5b8bcb766a5a6380481503c994ed9d1",
       "stored": {
         "fixture": "checkpoint_digest",
         "offset": 0
@@ -5782,7 +5925,7 @@
     },
     {
       "name": "extended_checkpoint_semantic",
-      "algorithm": "sha256",
+      "algorithm": "xxh3_128",
       "parts": [
         {
           "hex": "4b512f434845434b504f494e542f3100"
@@ -5795,7 +5938,7 @@
           ]
         }
       ],
-      "expected": "17accedcac8b0257accbfd9f5e864705f9137c4d0d5730e6e0a7967138d15223"
+      "expected": "c5b8bcb766a5a6380481503c994ed9d1"
     },
     {
       "name": "frame_request_header_crc",
@@ -5983,7 +6126,7 @@
           ]
         }
       ],
-      "expected": "58064f7a",
+      "expected": "d344fddd",
       "stored": {
         "fixture": "frame_submitted",
         "offset": 40
@@ -6001,7 +6144,7 @@
           ]
         }
       ],
-      "expected": "ee92be21",
+      "expected": "887f2b89",
       "stored": {
         "fixture": "frame_submitted",
         "offset": 44
@@ -6025,7 +6168,7 @@
           ]
         }
       ],
-      "expected": "f437292f",
+      "expected": "a7944d51",
       "stored": {
         "fixture": "frame_assigned",
         "offset": 40
@@ -6043,7 +6186,7 @@
           ]
         }
       ],
-      "expected": "13a3e8fd",
+      "expected": "f13a9b1f",
       "stored": {
         "fixture": "frame_assigned",
         "offset": 44
@@ -6105,7 +6248,7 @@
     },
     {
       "name": "record_exact",
-      "algorithm": "sha256",
+      "algorithm": "xxh3_128",
       "parts": [
         {
           "fixture": "record",
@@ -6115,11 +6258,11 @@
           ]
         }
       ],
-      "expected": "270f88251667190a1af167bef57a8c3ed38305303cd7ddbbc95e6af633496132"
+      "expected": "3abf96edb55444be9b974f96e39c5c10"
     },
     {
       "name": "record_rich_exact",
-      "algorithm": "sha256",
+      "algorithm": "xxh3_128",
       "parts": [
         {
           "fixture": "record_rich",
@@ -6129,11 +6272,11 @@
           ]
         }
       ],
-      "expected": "b0712b1f0bfa573c2b93f636cdf9743adf7c0b287aa6c8f940e6a2ddbc091500"
+      "expected": "4c657f34e796770752d45db92c073adc"
     },
     {
       "name": "submitted_exact",
-      "algorithm": "sha256",
+      "algorithm": "xxh3_128",
       "parts": [
         {
           "fixture": "submitted",
@@ -6143,25 +6286,25 @@
           ]
         }
       ],
-      "expected": "4663cf388b075c1497a469cc1ae73bec5cbf16d2eb084c055f9b1cfbc5fb689d"
+      "expected": "26c2505079bc87a068c980f1a1b90da2"
     },
     {
       "name": "batch_digest_exact",
-      "algorithm": "sha256",
+      "algorithm": "xxh3_128",
       "parts": [
         {
           "fixture": "batch_digest",
           "range": [
             0,
-            32
+            16
           ]
         }
       ],
-      "expected": "35ad1ede79c850c03b4f7c20c1c109c2a177297c73671d2421bbdcfaef45b910"
+      "expected": "8e6f88a11acfecc5f7f351dffcc194db"
     },
     {
       "name": "assigned_dense_exact",
-      "algorithm": "sha256",
+      "algorithm": "xxh3_128",
       "parts": [
         {
           "fixture": "assigned_dense",
@@ -6171,11 +6314,11 @@
           ]
         }
       ],
-      "expected": "16fdc5c6b7f93b3fea2ffcd1213b94f371e7150295720422c7b270f38d176648"
+      "expected": "a6263b5a1d504ff590533e290744e623"
     },
     {
       "name": "assigned_sparse_exact",
-      "algorithm": "sha256",
+      "algorithm": "xxh3_128",
       "parts": [
         {
           "fixture": "assigned_sparse",
@@ -6185,11 +6328,11 @@
           ]
         }
       ],
-      "expected": "f89c8e721c9a2d0864d3d8d7ae2b56166876bc5a8e23684c2950ccd1ae14dee1"
+      "expected": "4958e1d888eceefa174b034eba914ebd"
     },
     {
       "name": "segment_header_exact",
-      "algorithm": "sha256",
+      "algorithm": "xxh3_128",
       "parts": [
         {
           "fixture": "segment_header",
@@ -6199,11 +6342,11 @@
           ]
         }
       ],
-      "expected": "5a1c2543f7505095bb28dee8109313b8ed6fa97dea0a6deebd745e0c8bdf042f"
+      "expected": "4941e295cb4b69aa0c23f3507c57dcab"
     },
     {
       "name": "segment_block_exact",
-      "algorithm": "sha256",
+      "algorithm": "xxh3_128",
       "parts": [
         {
           "fixture": "segment_block",
@@ -6213,25 +6356,25 @@
           ]
         }
       ],
-      "expected": "4bacf574184ef2d1218c77affe027f49ade8655632c335a34e093bc2bc9913ef"
+      "expected": "b5170d709f98a2a2408e46cb36609266"
     },
     {
       "name": "extent_digest_exact",
-      "algorithm": "sha256",
+      "algorithm": "xxh3_128",
       "parts": [
         {
           "fixture": "extent_digest",
           "range": [
             0,
-            32
+            16
           ]
         }
       ],
-      "expected": "d9edb23a5e762253ebf9d4c26c0513deb730733a325e2288d4078c788e235c12"
+      "expected": "65293b1d5b4f90ddf5991e1260ba9e05"
     },
     {
       "name": "wal_prepare_exact",
-      "algorithm": "sha256",
+      "algorithm": "xxh3_128",
       "parts": [
         {
           "fixture": "wal_prepare",
@@ -6241,11 +6384,11 @@
           ]
         }
       ],
-      "expected": "69acf69f724db5c084b6e61eb542d477a35d0ebac909a60bc268dcd917f2111e"
+      "expected": "995e0701833e8800bd7afb165df9a5a6"
     },
     {
       "name": "durable_footer_exact",
-      "algorithm": "sha256",
+      "algorithm": "xxh3_128",
       "parts": [
         {
           "fixture": "durable_footer",
@@ -6255,11 +6398,11 @@
           ]
         }
       ],
-      "expected": "b6e47026e37cbf4194c1fd3b07cd600dbe94463483fd70d4c65b92d2e54bd871"
+      "expected": "d1234899cdc8ab288d0e41505b340098"
     },
     {
       "name": "retry_page_exact",
-      "algorithm": "sha256",
+      "algorithm": "xxh3_128",
       "parts": [
         {
           "fixture": "retry_page",
@@ -6269,11 +6412,11 @@
           ]
         }
       ],
-      "expected": "aaeebc8455f2e54711a569bde4951538dfe2a2fd24688562360530ce161e3906"
+      "expected": "8144f51c3344bc7ab765ce00c5bfc8eb"
     },
     {
       "name": "sealed_footer_exact",
-      "algorithm": "sha256",
+      "algorithm": "xxh3_128",
       "parts": [
         {
           "fixture": "sealed_footer",
@@ -6283,11 +6426,11 @@
           ]
         }
       ],
-      "expected": "a1d588f7e7a438275637741d8bffacf07bac8875e4bbd62c01a5655d07deb6cd"
+      "expected": "e6d5f28df63d35b03818701f7c6f16eb"
     },
     {
       "name": "index_page_exact",
-      "algorithm": "sha256",
+      "algorithm": "xxh3_128",
       "parts": [
         {
           "fixture": "index_page",
@@ -6297,11 +6440,11 @@
           ]
         }
       ],
-      "expected": "c9eb30df3b1d1c9d573e037d0acd5558758548cd971b1db4f8f5de744c290e09"
+      "expected": "3aa5147bb3d7ec547a59c2e96ab3d960"
     },
     {
       "name": "index_root_exact",
-      "algorithm": "sha256",
+      "algorithm": "xxh3_128",
       "parts": [
         {
           "fixture": "index_root",
@@ -6311,11 +6454,11 @@
           ]
         }
       ],
-      "expected": "c058e4cb85e4ebfb5bab318b04cf3ae1b452ef49eefc7d8fe3ecb346dcc58240"
+      "expected": "a3e1baf8ae5bae500f97ea4e373ca7d8"
     },
     {
       "name": "manifest_page_exact",
-      "algorithm": "sha256",
+      "algorithm": "xxh3_128",
       "parts": [
         {
           "fixture": "manifest_page",
@@ -6325,11 +6468,11 @@
           ]
         }
       ],
-      "expected": "5a9f913d499a5b7893e3c10973b322345d49891ffd20da68c2329c212ce94a85"
+      "expected": "34fa0ef4319f50a4a01ffcfc6809b916"
     },
     {
       "name": "manifest_root_exact",
-      "algorithm": "sha256",
+      "algorithm": "xxh3_128",
       "parts": [
         {
           "fixture": "manifest_root",
@@ -6339,11 +6482,11 @@
           ]
         }
       ],
-      "expected": "73fc3f506e66c2d5e00f99ab0daf05afe208f92d495e2b394b325f733526c1b0"
+      "expected": "178baf83a33f142f1c38e974043bfabf"
     },
     {
       "name": "checkpoint_exact",
-      "algorithm": "sha256",
+      "algorithm": "xxh3_128",
       "parts": [
         {
           "fixture": "checkpoint",
@@ -6353,11 +6496,11 @@
           ]
         }
       ],
-      "expected": "3e78a12ba19878b27d35bb966eb96720361920befb3deaf5c4e18987f6e18fd9"
+      "expected": "dede4068a28ac459bf2017c0b36734b8"
     },
     {
       "name": "checkpoint_extended_exact",
-      "algorithm": "sha256",
+      "algorithm": "xxh3_128",
       "parts": [
         {
           "fixture": "checkpoint_extended",
@@ -6367,25 +6510,25 @@
           ]
         }
       ],
-      "expected": "b9460367e4dc3d444ed297bb967b70660d6acf2b9fe8936cdfb7fb0de23aa524"
+      "expected": "d2c5249a05e8e33405c1ce0939a30978"
     },
     {
       "name": "checkpoint_digest_exact",
-      "algorithm": "sha256",
+      "algorithm": "xxh3_128",
       "parts": [
         {
           "fixture": "checkpoint_digest",
           "range": [
             0,
-            32
+            16
           ]
         }
       ],
-      "expected": "249737cfdaf112e1cd923eda8d3c0eedd8278e62ec0bc60c60e822531c52d760"
+      "expected": "45e1c8bc800f5dbf71cc3e8193313f1a"
     },
     {
       "name": "lz4_raw_abc_exact",
-      "algorithm": "sha256",
+      "algorithm": "xxh3_128",
       "parts": [
         {
           "fixture": "lz4_raw_abc",
@@ -6395,11 +6538,11 @@
           ]
         }
       ],
-      "expected": "1c9031389fddefa6e4b0b0892be4e5372a9a74022dd4c481f24a9ed4fe70c426"
+      "expected": "97b1204b12c0b3b7e82a0894c2783db0"
     },
     {
       "name": "control_request_exact",
-      "algorithm": "sha256",
+      "algorithm": "xxh3_128",
       "parts": [
         {
           "fixture": "control_request",
@@ -6409,11 +6552,11 @@
           ]
         }
       ],
-      "expected": "993bb77b0fc06153aef44b2cbb60cafb4818dd06f7ad6a3798b6cb1ca8da9f63"
+      "expected": "7d7d52a8331ec7c0b3ce7449f65fd840"
     },
     {
       "name": "control_response_exact",
-      "algorithm": "sha256",
+      "algorithm": "xxh3_128",
       "parts": [
         {
           "fixture": "control_response",
@@ -6423,11 +6566,11 @@
           ]
         }
       ],
-      "expected": "e6fb74856f3b0f0951d178aaad93d3c325f50f5968bca7241bd537a667c4bb17"
+      "expected": "2b3ae0a0f786d7d0e754a986c0e3e7d9"
     },
     {
       "name": "control_redirect_exact",
-      "algorithm": "sha256",
+      "algorithm": "xxh3_128",
       "parts": [
         {
           "fixture": "control_redirect",
@@ -6437,11 +6580,11 @@
           ]
         }
       ],
-      "expected": "9dca5884f8cc92a73391811b6af281fa13221aa0a91949ae8399a34cf5e20763"
+      "expected": "955dfb59a0b7dca26aa956e46ccc36bf"
     },
     {
       "name": "control_error_exact",
-      "algorithm": "sha256",
+      "algorithm": "xxh3_128",
       "parts": [
         {
           "fixture": "control_error",
@@ -6451,11 +6594,11 @@
           ]
         }
       ],
-      "expected": "4de9abddf21de33739cabce5c67ab3e8c70086274c6d65e8434ec56cb47379d3"
+      "expected": "faa6f0e068eaa0c14c684138dafbb550"
     },
     {
       "name": "frame_request_exact",
-      "algorithm": "sha256",
+      "algorithm": "xxh3_128",
       "parts": [
         {
           "fixture": "frame_request",
@@ -6465,11 +6608,11 @@
           ]
         }
       ],
-      "expected": "a5213be271000a588813ebc799e9a6ff91c75fcd5897e5ade24b85954161f330"
+      "expected": "fe1b8d52b467460530c8d0eb421e7a52"
     },
     {
       "name": "frame_response_exact",
-      "algorithm": "sha256",
+      "algorithm": "xxh3_128",
       "parts": [
         {
           "fixture": "frame_response",
@@ -6479,11 +6622,11 @@
           ]
         }
       ],
-      "expected": "35df7d6a5bd71556f098cfb0413d4e80ccc6cbefbda2360d27596741c35c6ecb"
+      "expected": "ec1e15f111434850b79f4fd40a43276e"
     },
     {
       "name": "frame_redirect_exact",
-      "algorithm": "sha256",
+      "algorithm": "xxh3_128",
       "parts": [
         {
           "fixture": "frame_redirect",
@@ -6493,11 +6636,11 @@
           ]
         }
       ],
-      "expected": "ef5365750a509449efd5bdec55d9fb21a654263f19f7968c404ed51c714a7b6f"
+      "expected": "ffd658fa29025ca860cb3be4db5759af"
     },
     {
       "name": "frame_error_exact",
-      "algorithm": "sha256",
+      "algorithm": "xxh3_128",
       "parts": [
         {
           "fixture": "frame_error",
@@ -6507,11 +6650,11 @@
           ]
         }
       ],
-      "expected": "e3eb881c8133d607370cd0edac8db8703df46a0ab7ddb8d3950470d0eeb7e9c5"
+      "expected": "560b03c6515b6b23e45895cc3f8dbe61"
     },
     {
       "name": "frame_submitted_exact",
-      "algorithm": "sha256",
+      "algorithm": "xxh3_128",
       "parts": [
         {
           "fixture": "frame_submitted",
@@ -6521,11 +6664,11 @@
           ]
         }
       ],
-      "expected": "22dea873dd83481ff5536d4c1535298a24b3de403fd968b048590f49b4e4e062"
+      "expected": "9ed7952fa5859b7d4ff9a5c3e35f0309"
     },
     {
       "name": "frame_assigned_exact",
-      "algorithm": "sha256",
+      "algorithm": "xxh3_128",
       "parts": [
         {
           "fixture": "frame_assigned",
@@ -6535,7 +6678,7 @@
           ]
         }
       ],
-      "expected": "24883a0a75232cae2f2b3ed4de72396c17995b909ee6c682d4aa5f590592c526"
+      "expected": "f356792ca556900f34c4f1cab5276563"
     }
   ]
 }

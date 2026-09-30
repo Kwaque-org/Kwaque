@@ -37,7 +37,7 @@ metadata_fixture::metadata_fixture(
           total(count, page_count),
           position_base,
           position_base + std::uint64_t{total(count, page_count)} * a),
-        codec::extent_digest{index::sha(count == 0 ? "" : "extent")},
+        codec::extent_digest{index::digest_of(count == 0 ? "" : "extent")},
         alignment)
         .value())
   , manifest_header(
@@ -187,7 +187,7 @@ storage_observation observe_metadata(
         require(
           std::string_view{encoded}.substr(header)
           == candidate.substr(header, length - header));
-        seen.digest = index::sha(encoded);
+        seen.digest = index::digest_of(encoded);
     };
     if (fixture.is_manifest) {
         if (is_root) {

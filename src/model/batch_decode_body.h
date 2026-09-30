@@ -8,7 +8,8 @@ namespace kwaque::model::detail {
 // admitted the parent and body alias, and owns final cleanup/poll/commit.
 // original is the pre-body-alias residual; remaining excludes that alias.
 // Returned residuals become usable only after the envelope's temporary owners
-// are destroyed. These helpers validate the entire model body, including SHA
+// are destroyed. These helpers validate the entire model body, including the
+// digest
 // when original content is present; they do not certify envelope bytes alone.
 seastar::future<codec::result<decoded_submitted_batch>> decode_submitted_body(
   bytes::fragmented_buffer_parser& input,

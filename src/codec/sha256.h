@@ -1,13 +1,17 @@
 #ifndef KWAQUE_SRC_CODEC_SHA256_H_
 #define KWAQUE_SRC_CODEC_SHA256_H_
 
-#include "src/codec/digest.h"
-
+#include <array>
 #include <cstddef>
 
 struct evp_md_ctx_st;
 
 namespace kwaque::codec {
+
+// SHA-256 serves the simulation's specified digests (trace configuration,
+// bandwidth allocation and fault keys). Format content identities use XXH3.
+inline constexpr std::size_t sha256_digest_bytes{32};
+using sha256_digest = std::array<unsigned char, sha256_digest_bytes>;
 
 class sha256_hasher final {
 public:

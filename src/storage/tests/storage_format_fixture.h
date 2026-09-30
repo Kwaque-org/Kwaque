@@ -37,7 +37,7 @@ struct storage_observation final {
     std::array<std::uint64_t, 6> facts{};
     std::uint32_t blocks{0};
     std::uint32_t checksum{0};
-    codec::sha256_digest digest{};
+    codec::content_digest digest{};
     bool operator==(const storage_observation&) const noexcept = default;
 };
 

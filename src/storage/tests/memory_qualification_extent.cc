@@ -19,12 +19,13 @@ void extent_operation(std::string_view name) {
                           work.policy(),
                           extent_layout_kind::initial_append,
                           {},
-                          extent_integrity::crc32c_and_sha256)
+                          extent_integrity::crc32c_and_digest)
                           .value();
         const auto proof = measure(
           name, 0, {}, [&] { return verifier.finish(work); });
         require(
-          proof && proof->digest() && proof->digest()->bytes() == exact_sha("")
+          proof && proof->digest()
+            && proof->digest()->bytes() == exact_digest("")
             && proof->boundary().block_count == 0 && verifier.closed(),
           "empty extent changed evidence");
         return;
@@ -54,7 +55,7 @@ void extent_operation(std::string_view name) {
       {history(), runtime::file_position{2048}});
     wires[4] = data_block(102, 2, 2560);
     const auto all = prefix + wires[3] + wires[4];
-    const auto expected = exact_sha(all);
+    const auto expected = exact_digest(all);
     const auto expected_crc = crc(all);
     if (failure) wires[2].back() ^= 1;
     std::array<fragmented_buffer, 5> inputs;
@@ -72,13 +73,12 @@ void extent_operation(std::string_view name) {
                       work.policy(),
                       extent_layout_kind::initial_append,
                       {},
-                      extent_integrity::crc32c_and_sha256)
+                      extent_integrity::crc32c_and_digest)
                       .value();
     const auto outcome = measure(name, all.size(), held, [&] {
-        // One continuous interval includes initial SHA allocation, its retained
-        // lifetime across calls, finalization and failure/explicit-close
-        // cleanup. Resetting observation between add() calls would lose that
-        // owner.
+        // One continuous interval includes the verifier's retained state
+        // across calls, finalization and failure/explicit-close cleanup.
+        // Resetting observation between add() calls would lose that owner.
         for (std::size_t i = 0; i < inputs.size(); ++i) {
             const auto result
               = i % 2 == 0

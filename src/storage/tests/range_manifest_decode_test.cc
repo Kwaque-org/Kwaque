@@ -47,7 +47,7 @@ codec::result<decoded_range_manifest_root> read_root(
              header.context(),
              header.logical_span(),
              a,
-             codec::immutable_object_digest{manifest_sha(wire)},
+             codec::immutable_object_digest{manifest_digest(wire)},
              *memory,
              work,
              c,
@@ -67,24 +67,20 @@ TEST(
             const std::array refs{manifest_page_reference(page, page_header())};
             const auto wire = expected_root(root_header(), refs, a, h);
             if (h == 4096) {
-                const auto page_sha = a == 512
-                                        ? "1964992b58213a7c142787e67b23313daf08"
-                                          "b57f35c7ec9731e6b32f1677e859"
-                                        : "5aea561dd1ab8b3d0d5fb2a0663945e845ba"
-                                          "0457b054fbc1306e0e0a30920d8b";
-                const auto root_sha = a == 512
-                                        ? "02edfaac9cc818f1c157dea288fd9198a92d"
-                                          "fd63ae384c79f3b825c027d103eb"
-                                        : "f1970901b082fa2323e40fe970febfd87ac3"
-                                          "2c1be9a1a02694904c5331bc122f";
+                const auto page_digest = a == 512
+                                           ? "615a118372111e003ffe5380984fddd3"
+                                           : "619c4baddda1ca68188cba605d2db713";
+                const auto root_digest = a == 512
+                                           ? "a7faf9e989bef7e86a39d21bae8fa423"
+                                           : "d9bddc8c812ccfcca572986d807f067d";
                 EXPECT_TRUE(
                   std::ranges::equal(
-                    std::bit_cast<std::array<char, 32>>(manifest_sha(page)),
-                    hex(page_sha)));
+                    std::bit_cast<std::array<char, 16>>(manifest_digest(page)),
+                    hex(page_digest)));
                 EXPECT_TRUE(
                   std::ranges::equal(
-                    std::bit_cast<std::array<char, 32>>(manifest_sha(wire)),
-                    hex(root_sha)));
+                    std::bit_cast<std::array<char, 16>>(manifest_digest(wire)),
+                    hex(root_digest)));
             }
             for (const std::size_t width : {67U, 1024U}) {
                 fragmented_buffer_parser input{buffer("p" + wire + "s", width)};
@@ -175,7 +171,7 @@ TEST(
           UINT64_MAX,
           UINT64_MAX - 1024U,
           UINT64_MAX),
-        codec::extent_digest{manifest_sha("wide")})
+        codec::extent_digest{manifest_digest("wide")})
         .value()};
     const auto bytes = expected_page(header, entries);
     const std::array refs{manifest_page_reference(bytes, header)};
@@ -294,7 +290,7 @@ TEST(
         mc(),
         logical(100, 105),
         alignment(),
-        codec::immutable_object_digest{manifest_sha("different root")},
+        codec::immutable_object_digest{manifest_digest("different root")},
         reserve(wrong_root, work),
         work)
         .get(),
@@ -310,9 +306,9 @@ TEST(
             0,
             2,
             byte_count{wrong_length ? 1024U : 512U},
-            wrong_length
-              ? refs[0].digest()
-              : codec::immutable_object_digest{manifest_sha("different page")})
+            wrong_length ? refs[0].digest()
+                         : codec::immutable_object_digest{manifest_digest(
+                             "different page")})
             .value()};
         const auto root = pin(
           expected_root(root_header(), changed), root_header(), work);
@@ -370,7 +366,8 @@ TEST(
             EXPECT_EQ(input.bytes_consumed().value(), 0U);
         }
     }
-    // Repaired CRC and independently repinned SHA cannot hide invalid geometry.
+    // Repaired CRC and independently repinned digest cannot hide invalid
+    // geometry.
     const std::array bad_entries{
       mutation{92, 8, 99},
       mutation{92, 8, 102},
@@ -716,11 +713,6 @@ TEST(
                     succeeded = pending.get().has_value();
                 }
             } catch (const std::bad_alloc&) {
-            } catch (const std::runtime_error&) {
-                if (!injector.failed()) {
-                    injector.cancel();
-                    throw;
-                }
             } catch (...) {
                 injector.cancel();
                 throw;
@@ -803,7 +795,7 @@ verified_extent supplied_extent(unsigned kind, codec::cooperative_work& work) {
                           sparse ? extent_layout_kind::rewrite
                                  : extent_layout_kind::initial_append,
                           {},
-                          extent_integrity::crc32c_and_sha256)
+                          extent_integrity::crc32c_and_digest)
                           .value();
         feed_block(verifier, bytes, work).value();
         return verifier.finish(work).value();
@@ -815,7 +807,7 @@ verified_extent supplied_extent(unsigned kind, codec::cooperative_work& work) {
                           work.policy(),
                           extent_layout_kind::rewrite,
                           {},
-                          extent_integrity::crc32c_and_sha256)
+                          extent_integrity::crc32c_and_digest)
                           .value();
         return verifier.finish(work).value();
     }
@@ -828,7 +820,7 @@ verified_extent supplied_extent(unsigned kind, codec::cooperative_work& work) {
                       work.policy(),
                       extent_layout_kind::rewrite,
                       {},
-                      extent_integrity::crc32c_and_sha256)
+                      extent_integrity::crc32c_and_digest)
                       .value();
     feed_footer(verifier, footer, work, previous).value();
     return verifier.finish(work).value();
@@ -1072,7 +1064,7 @@ TEST(
                          work.policy(),
                          extent_layout_kind::initial_append,
                          {},
-                         extent_integrity::crc32c_and_sha256)
+                         extent_integrity::crc32c_and_digest)
                          .value();
     ASSERT_TRUE(feed_block(
       replacement, data_block(100, 0, 512, false, 0x30, 1, true), work));

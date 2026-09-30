@@ -481,6 +481,7 @@ kwaque_cc_seastar_test(
     name = "local_installation_test",
     srcs = ["local_installation_test.cc"],
     data = ["//src/storage/tests:local_metadata_fixture_data"],
+    memory = "256MiB",
     deps = [
         ":pid_file",
         ":storage_directories",
@@ -490,10 +491,13 @@ kwaque_cc_seastar_test(
         "//src/resource:resource_registry",
         "//src/resource:workload_class",
         "//src/runtime:file",
+        "//src/runtime/production:clocks",
         "//src/runtime/production:file",
         "//src/runtime/testing:test_directory",
         "//src/storage:workload_budget",
         "//src/storage/tests:local_installation_contract",
+        "//src/storage/tests:segment_qualification_contract",
+        "//src/storage/tests:segment_writer_contract",
     ],
 )
 

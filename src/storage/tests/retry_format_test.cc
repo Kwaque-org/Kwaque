@@ -84,7 +84,7 @@ TEST(RetryFormatTest, IndependentGoldenPreservesExactCompletedResult) {
     const auto wire = retry_page_wire(entries);
     EXPECT_EQ(
       wire.substr(0, 32),
-      hex("4b5142460700010001002000e00100000000000000000000a16841c2a71b070b"));
+      hex("4b5142460700010001002000e001000000000000000000006b0a40b201b0442e"));
     const auto encoded = encode_retry_page(
                            entries,
                            root_location(),

@@ -187,9 +187,15 @@ codec::result<fixed_fields<Assigned>> parse_fixed(
       batch_field::topic,
       40);
     if (!binding) return codec::failure(binding.error());
-    codec::sha256_digest digest_bytes{};
+    // The digest slot is the content digest and then reserved zero bytes.
+    codec::content_digest digest_bytes{};
     for (std::size_t i = 0; i < digest_bytes.size(); ++i)
         digest_bytes[i] = static_cast<unsigned char>(fixed[104 + i]);
+    for (auto i = codec::content_digest_bytes; i < codec::digest_slot_bytes;
+         ++i)
+        if (fixed[104 + i] != 0)
+            return codec::failure(
+              at(errc::malformed_data, context, batch_field::fingerprint, 120));
     const codec::semantic_batch_digest digest{digest_bytes};
     if (expected.fingerprint && digest != *expected.fingerprint)
         return codec::failure(

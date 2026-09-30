@@ -33,7 +33,7 @@ def measurement():
         "target_members": 2,
         "target_bytes": 65536,
         "group_capacity": 8,
-        "sha256": "b" * 64,
+        "digest": "b" * 32,
         "encoded_bytes": 16384,
         "offered": 2,
         "accepted": 2,
@@ -223,7 +223,7 @@ class ReportTest(unittest.TestCase):
     def test_fixed_pairs_reject_changed_contracts(self):
         original = measurement()
         for key, value in [
-            ("sha256", "c" * 64),
+            ("digest", "c" * 32),
             ("preallocated", False),
             ("device", 2),
             ("foreground_probe", True),
@@ -256,6 +256,75 @@ class ReportTest(unittest.TestCase):
         row["offered"] = 3
         with self.assertRaisesRegex(ValueError, "offered"):
             validate(row)
+
+    def test_zero_written_cohorts_are_durable_at_their_writes(self):
+        row = measurement()
+        row.update(
+            zero_written=True,
+            zero_written_extent=2097152,
+            flushes=0,
+            flush_times=[],
+            flush_service_ns=0,
+            write_times=[[8192, 16384, 20, 50, True]],
+        )
+        validate(row)
+        self.assertEqual(summarize([row])["notification_p99_ns"], 45)
+        row["requests"][0]["terminal"] = 49
+        with self.assertRaisesRegex(ValueError, "notification"):
+            validate(row)
+        row = measurement()
+        row.update(
+            zero_written=True,
+            zero_written_extent=2097152,
+            flush_times=[[55, 70]],
+            flush_service_ns=15,
+            write_times=[[8192, 16384, 20, 50, False]],
+        )
+        validate(row)
+        row["requests"][0]["terminal"] = 65
+        with self.assertRaisesRegex(ValueError, "notification"):
+            validate(row)
+        row["requests"][0]["terminal"] = 80
+        row.update(flush_times=[[45, 70]], flush_service_ns=25)
+        with self.assertRaisesRegex(ValueError, "never covered by a flush"):
+            validate(row)
+
+    def test_zero_written_rows_bound_flushes_and_bytes(self):
+        row = measurement()
+        row.update(
+            zero_written=True,
+            zero_written_extent=2097152,
+            flushes=2,
+            flush_times=[[30, 60], [60, 70]],
+            flush_service_ns=40,
+            write_times=[[8192, 16384, 20, 25, False]],
+        )
+        with self.assertRaisesRegex(ValueError, "barrier count"):
+            validate(row)
+        row.update(
+            flushes=0,
+            flush_times=[],
+            flush_service_ns=0,
+            write_times=[[8192, 8192, 20, 25, True]],
+        )
+        with self.assertRaisesRegex(ValueError, "zero-written write"):
+            validate(row)
+        row["write_times"] = [[8192, 16384, 20, 25, 1]]
+        with self.assertRaisesRegex(ValueError, "zero-written write"):
+            validate(row)
+
+    def test_zero_written_rows_never_pair_with_flushed_rows(self):
+        original = measurement()
+        original["comparison_id"] = "c" * 64
+        changed = copy.deepcopy(original)
+        changed.update(
+            zero_written=True,
+            zero_written_extent=2097152,
+            write_times=[[8192, 16384, 20, 25, False]],
+        )
+        validate(changed)
+        with self.assertRaisesRegex(ValueError, "comparison changed"):
+            compare([original], [changed])
 
     def test_omitted_and_timed_out_requests_remain_in_denominator(self):
         row = measurement()

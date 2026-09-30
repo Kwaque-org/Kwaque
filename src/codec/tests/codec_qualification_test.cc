@@ -11,10 +11,10 @@
 #include "src/codec/envelope_decode.h"
 #include "src/codec/error.h"
 #include "src/codec/limits.h"
-#include "src/codec/sha256_cooperative.h"
 #include "src/codec/staging_cooperative.h"
 #include "src/codec/tests/envelope_decode_test_support.h"
 #include "src/codec/transaction.h"
+#include "src/codec/xxh3_cooperative.h"
 
 #include <seastar/core/abort_source.hh>
 #include <seastar/core/chunked_fifo.hh>
@@ -115,21 +115,34 @@ TEST(CodecQualificationTest, LargestFragmentComposesWithBothIntegrityPasses) {
     // NOLINTEND(bugprone-use-after-move)
     ASSERT_EQ(assembled->size(), byte_count{131076});
     auto crc_input = assembled->share();
-    auto sha_input = assembled->share();
+    auto digest_input = assembled->share();
     assembled = fragmented_buffer{};
     const auto crc = codec::crc32c_cooperatively(
                        std::move(crc_input), work, 0x2468ace0U)
                        .get();
-    const auto sha
-      = codec::sha256_cooperatively(std::move(sha_input), work).get();
+    const auto digest
+      = codec::xxh3_128_cooperatively(std::move(digest_input), work).get();
     ASSERT_TRUE(crc.has_value());
     EXPECT_EQ(*crc, 0xef65f5f5U);
-    constexpr codec::sha256_digest expected{
-      0x9f, 0x65, 0xb6, 0xeb, 0xa1, 0x97, 0x68, 0xd4, 0xa5, 0xc2, 0x9a,
-      0x75, 0xde, 0xff, 0xaf, 0x26, 0xc6, 0xf3, 0x70, 0x7f, 0xbd, 0xe3,
-      0x38, 0xe6, 0x27, 0xb8, 0x37, 0x32, 0x2d, 0x7b, 0xf0, 0x1d};
-    ASSERT_TRUE(sha.has_value());
-    EXPECT_EQ(*sha, expected);
+    constexpr codec::content_digest expected{
+      0xee,
+      0x97,
+      0x38,
+      0xf2,
+      0x07,
+      0x5b,
+      0xc0,
+      0x63,
+      0xbf,
+      0xc9,
+      0x1c,
+      0xc0,
+      0xe4,
+      0x59,
+      0x57,
+      0x53};
+    ASSERT_TRUE(digest.has_value());
+    EXPECT_EQ(*digest, expected);
 }
 
 struct releases final {

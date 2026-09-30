@@ -27,7 +27,7 @@ void extent_case(const std::array<std::uint8_t, 8>& control) {
                           work.policy(),
                           extent_layout_kind::initial_append,
                           {},
-                          extent_integrity::crc32c_and_sha256)
+                          extent_integrity::crc32c_and_digest)
                           .value();
         const auto first = data_block(100, 0, 512, false, 0x30, 1, compressed);
         const auto second = data_block(
@@ -71,7 +71,7 @@ void extent_case(const std::array<std::uint8_t, 8>& control) {
         require(
           evidence.boundary().data_crc32c == crc(first + middle + second));
         require(
-          evidence.digest()->bytes() == exact_sha(first + middle + second));
+          evidence.digest()->bytes() == exact_digest(first + middle + second));
         require(evidence.boundary().block_count == 2 && verifier.closed());
     }
 }

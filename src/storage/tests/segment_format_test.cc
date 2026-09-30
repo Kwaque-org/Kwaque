@@ -54,13 +54,13 @@ TEST(SegmentFormatTest, IndependentCrcAndInterconnectedGoldenBytes) {
     EXPECT_EQ(crc(std::string(32, '\xff')), 0x62a8ab43U);
     EXPECT_EQ(
       assigned_wire().substr(0, 32),
-      hex("4b5142460200010001002000bf0000000000000000000000e0c8efd69dcfba5b"));
+      hex("4b5142460200010001002000bf0000000000000000000000922bdcd3d25123f9"));
     EXPECT_EQ(
       header_wire().substr(0, 32),
       hex("4b5142460300010001002000e001000000000000000000003d7d385d496f3b42"));
     EXPECT_EQ(
       block_wire().substr(0, 32),
-      hex("4b5142460400010001002000e001000000000000000000007bfe4b76db35d52f"));
+      hex("4b5142460400010001002000e00100000000000000000000e36534a2f32ba3d9"));
     seastar::abort_source abort;
     codec::cooperative_work work{codec::limits::defaults(), abort};
     auto encoded_header
@@ -305,6 +305,45 @@ TEST(SegmentFormatTest, ExactChildBytesAndOuterExtensionsSurviveAllOwners) {
                 EXPECT_EQ(
                   result.value.descriptor().batch().verification,
                   model::batch_fingerprint_verification::recomputed);
+            }
+        }
+    }
+}
+
+TEST(
+  SegmentFormatTest, FragmentedValidatedChildAndWidePaddingKeepExactCrcBytes) {
+    for (const bool compressed : {false, true}) {
+        for (const std::size_t header_bytes : {32U, 40U, 4096U}) {
+            const auto wire = assigned_wire(compressed, header_bytes);
+            for (const std::size_t width : {7U, 257U}) {
+                for (const auto alignment : {512U, 8192U, 65536U}) {
+                    seastar::abort_source abort;
+                    codec::cooperative_work work{
+                      codec::limits::defaults(), abort};
+                    auto bytes = buffer(wire, width);
+                    const auto memory = reserve(bytes, work);
+                    auto child
+                      = validate_encoded_assigned_batch(
+                          std::move(bytes), batch_expected(), memory, work)
+                          .get()
+                          .value();
+                    const auto expected = block_expected(
+                      0x30, 1, alignment, 0, alignment);
+                    const auto encoded = encode_segment_block(
+                                           std::move(child),
+                                           expected,
+                                           work,
+                                           budget().operation_remaining,
+                                           charge)
+                                           .get();
+                    ASSERT_TRUE(encoded);
+                    EXPECT_EQ(
+                      flat(encoded->bytes()), block_wire(wire, expected));
+                    if (
+                      bytes::testing::native_charge_profile
+                      && header_bytes <= 40 && alignment >= 8192)
+                        EXPECT_EQ(encoded->bytes().fragment_count(), 1U);
+                }
             }
         }
     }
@@ -555,12 +594,6 @@ TEST(SegmentFormatTest, AllocationFailureRestoresCursorAndMarks) {
                                   .get()
                                   .has_value();
             } catch (const std::bad_alloc&) {
-                threw = true;
-            } catch (const std::runtime_error&) {
-                if (!injector.failed()) {
-                    injector.cancel();
-                    throw;
-                }
                 threw = true;
             } catch (...) {
                 injector.cancel();

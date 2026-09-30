@@ -1,8 +1,11 @@
 #include "src/broker/storage_directories.h"
 #include "src/resource/resource_registry.h"
+#include "src/runtime/production/clocks.h"
 #include "src/runtime/production/file.h"
 #include "src/runtime/testing/test_directory.h"
 #include "src/storage/tests/local_installation_contract.h"
+#include "src/storage/tests/segment_qualification_contract.h"
+#include "src/storage/tests/segment_writer_contract.h"
 
 #include <seastar/core/memory.hh>
 #include <seastar/core/preempt.hh>
@@ -25,7 +28,12 @@ struct native_driver final {
     }
 };
 template<typename Func>
-seastar::future<> with_installation(std::uint8_t device, Func function) {
+seastar::future<> with_installation(
+  std::uint8_t device,
+  Func function,
+  byte_count budget_bytes = byte_count{8U * 1024U * 1024U},
+  resource::workload_class classification = resource::workload_class::metadata,
+  std::uint32_t budget_tasks = 16) {
     auto config = resource::resource_config::from_total_memory(
                     byte_count{seastar::memory::stats().total_memory()})
                     .value();
@@ -38,8 +46,12 @@ seastar::future<> with_installation(std::uint8_t device, Func function) {
         co_await seastar::tmp_dir::do_with(
           runtime::testing::test_directory_template(),
           seastar::coroutine::lambda(
-            [&manager, &function, device](
-              seastar::tmp_dir& directory) -> seastar::future<> {
+            [&manager,
+             &function,
+             device,
+             budget_bytes,
+             classification,
+             budget_tasks](seastar::tmp_dir& directory) -> seastar::future<> {
                 const auto root = directory.get_path() / "store";
                 co_await seastar::recursive_touch_directory(root.string());
                 const auto status = co_await seastar::file_stat(
@@ -54,10 +66,8 @@ seastar::future<> with_installation(std::uint8_t device, Func function) {
                   co_await broker::storage_directories::acquire(specs));
                 runtime::production::file_system files;
                 storage::workload_budget budget{
-                  manager.acquire_workload(resource::workload_class::metadata),
-                  {.tasks = 16,
-                   .bytes = byte_count{8U * 1024U * 1024U},
-                   .handles = 32},
+                  manager.acquire_workload(classification),
+                  {.tasks = budget_tasks, .bytes = budget_bytes, .handles = 32},
                   bytes::testing::charge};
                 co_await function(
                   files, *ownership, spec, budget, native_driver{});
@@ -139,4 +149,415 @@ SEASTAR_TEST_CASE(local_installation_native_maximum_bundle) {
           return storage::testing::installation_contract::maximum_bundle(
             files, owner, spec, budget, drive);
       });
+}
+
+SEASTAR_TEST_CASE(segment_writer_native_creation) {
+    co_await with_installation(
+      68,
+      [](auto& files, auto& owner, const auto& spec, auto& budget, auto drive) {
+          return storage::testing::segment_writer_contract::creation<
+            runtime::production::monotonic_clock>(
+            files, owner, spec, budget, drive);
+      },
+      byte_count{18U * 1024U * 1024U},
+      resource::workload_class::foreground_protocol);
+}
+
+SEASTAR_TEST_CASE(segment_writer_native_admission) {
+    co_await with_installation(
+      68,
+      [](auto& files, auto& owner, const auto& spec, auto& budget, auto drive) {
+          return storage::testing::segment_writer_contract::admission<
+            runtime::production::monotonic_clock>(
+            files, owner, spec, budget, drive);
+      },
+      byte_count{18U * 1024U * 1024U},
+      resource::workload_class::foreground_protocol);
+}
+
+SEASTAR_TEST_CASE(segment_writer_native_reserved_publication) {
+    co_await with_installation(
+      68,
+      [](auto& files, auto& owner, const auto& spec, auto& budget, auto drive) {
+          return storage::testing::segment_writer_contract::
+            reserved_publication(files, owner, spec, budget, drive);
+      },
+      byte_count{18U * 1024U * 1024U},
+      resource::workload_class::foreground_protocol);
+}
+
+SEASTAR_TEST_CASE(segment_writer_native_execution) {
+    co_await with_installation(
+      68,
+      [](auto& files, auto& owner, const auto& spec, auto& budget, auto drive) {
+          return storage::testing::segment_writer_contract::execution<
+            runtime::production::monotonic_clock>(
+            files, owner, spec, budget, drive);
+      },
+      byte_count{48U * 1024U * 1024U},
+      resource::workload_class::foreground_protocol,
+      64);
+}
+
+SEASTAR_TEST_CASE(segment_writer_native_barriers) {
+    co_await with_installation(
+      68,
+      [](auto& files, auto& owner, const auto& spec, auto& budget, auto drive) {
+          return storage::testing::segment_writer_contract::execution<
+            runtime::production::monotonic_clock>(
+            files, owner, spec, budget, drive, true);
+      },
+      byte_count{48U * 1024U * 1024U},
+      resource::workload_class::foreground_protocol,
+      64);
+}
+
+SEASTAR_TEST_CASE(segment_writer_native_grouped_execution) {
+    co_await with_installation(
+      68,
+      [](auto& files, auto& owner, const auto& spec, auto& budget, auto drive) {
+          return storage::testing::segment_writer_contract::grouped_execution<
+            runtime::production::monotonic_clock>(
+            files, owner, spec, budget, drive);
+      },
+      byte_count{48U * 1024U * 1024U},
+      resource::workload_class::foreground_protocol,
+      64);
+}
+
+SEASTAR_TEST_CASE(segment_writer_native_preallocated_execution) {
+    co_await with_installation(
+      68,
+      [](auto& files, auto& owner, const auto& spec, auto& budget, auto drive) {
+          return storage::testing::segment_writer_contract::
+            preallocated_execution<runtime::production::monotonic_clock>(
+              files, owner, spec, budget, drive);
+      },
+      byte_count{48U * 1024U * 1024U},
+      resource::workload_class::foreground_protocol,
+      64);
+}
+
+SEASTAR_TEST_CASE(segment_writer_native_concurrent_execution) {
+    co_await with_installation(
+      68,
+      [](auto& files, auto& owner, const auto& spec, auto& budget, auto drive) {
+          return storage::testing::segment_writer_contract::
+            concurrent_execution<runtime::production::monotonic_clock>(
+              files, owner, spec, budget, drive);
+      },
+      byte_count{48U * 1024U * 1024U},
+      resource::workload_class::foreground_protocol,
+      64);
+}
+
+SEASTAR_TEST_CASE(segment_writer_native_extended_execution) {
+    co_await with_installation(
+      68,
+      [](auto& files, auto& owner, const auto& spec, auto& budget, auto drive) {
+          return storage::testing::segment_writer_contract::extended_execution<
+            runtime::production::monotonic_clock>(
+            files, owner, spec, budget, drive);
+      },
+      byte_count{48U * 1024U * 1024U},
+      resource::workload_class::foreground_protocol,
+      64);
+}
+
+SEASTAR_TEST_CASE(segment_writer_native_abandoned_group) {
+    co_await with_installation(
+      68,
+      [](auto& files, auto& owner, const auto& spec, auto& budget, auto drive) {
+          return storage::testing::segment_writer_contract::abandoned_group<
+            runtime::production::monotonic_clock>(
+            files, owner, spec, budget, drive);
+      },
+      byte_count{48U * 1024U * 1024U},
+      resource::workload_class::foreground_protocol,
+      64);
+}
+
+SEASTAR_TEST_CASE(segment_writer_native_close_preserves_borrowed_blocks) {
+    co_await with_installation(
+      68,
+      [](auto& files, auto& owner, const auto& spec, auto& budget, auto drive) {
+          return storage::testing::segment_writer_contract::abandoned_group<
+            runtime::production::monotonic_clock>(
+            files, owner, spec, budget, drive, true);
+      },
+      byte_count{48U * 1024U * 1024U},
+      resource::workload_class::foreground_protocol,
+      64);
+}
+
+SEASTAR_TEST_CASE(segment_writer_native_seal) {
+    co_await with_installation(
+      68,
+      [](auto& files, auto& owner, const auto& spec, auto& budget, auto drive) {
+          return storage::testing::segment_writer_contract::seal_lifecycle<
+            runtime::production::monotonic_clock>(
+            files, owner, spec, budget, drive);
+      },
+      byte_count{48U * 1024U * 1024U},
+      resource::workload_class::foreground_protocol,
+      64);
+}
+
+SEASTAR_TEST_CASE(segment_writer_native_empty_seal) {
+    co_await with_installation(
+      68,
+      [](auto& files, auto& owner, const auto& spec, auto& budget, auto drive) {
+          return storage::testing::segment_writer_contract::seal_lifecycle<
+            runtime::production::monotonic_clock>(
+            files, owner, spec, budget, drive, true);
+      },
+      byte_count{48U * 1024U * 1024U},
+      resource::workload_class::foreground_protocol,
+      64);
+}
+
+SEASTAR_TEST_CASE(segment_writer_native_reserved_seal) {
+    co_await with_installation(
+      68,
+      [](auto& files, auto& owner, const auto& spec, auto& budget, auto drive) {
+          return storage::testing::segment_writer_contract::seal_lifecycle<
+            runtime::production::monotonic_clock>(
+            files, owner, spec, budget, drive, false, true);
+      },
+      byte_count{48U * 1024U * 1024U},
+      resource::workload_class::foreground_protocol,
+      64);
+}
+
+SEASTAR_TEST_CASE(segment_writer_native_changed_seal_source) {
+    co_await with_installation(
+      68,
+      [](auto& files, auto& owner, const auto& spec, auto& budget, auto drive) {
+          return storage::testing::segment_writer_contract::seal_lifecycle<
+            runtime::production::monotonic_clock>(
+            files, owner, spec, budget, drive, false, false, true);
+      },
+      byte_count{48U * 1024U * 1024U},
+      resource::workload_class::foreground_protocol,
+      64);
+}
+
+SEASTAR_TEST_CASE(segment_writer_native_immutable_empty_initial) {
+    co_await with_installation(
+      68,
+      [](auto& files, auto& owner, const auto& spec, auto& budget, auto drive) {
+          return storage::testing::segment_writer_contract::immutable_import<
+            runtime::production::monotonic_clock>(
+            files,
+            owner,
+            spec,
+            budget,
+            drive,
+            storage::testing::segment_writer_contract::immutable_import_kind::
+              empty_initial);
+      },
+      byte_count{48U * 1024U * 1024U},
+      resource::workload_class::foreground_protocol,
+      64);
+}
+
+SEASTAR_TEST_CASE(segment_writer_native_immutable_sparse_rewrite) {
+    co_await with_installation(
+      68,
+      [](auto& files, auto& owner, const auto& spec, auto& budget, auto drive) {
+          return storage::testing::segment_writer_contract::immutable_import<
+            runtime::production::monotonic_clock>(
+            files,
+            owner,
+            spec,
+            budget,
+            drive,
+            storage::testing::segment_writer_contract::immutable_import_kind::
+              sparse_rewrite);
+      },
+      byte_count{48U * 1024U * 1024U},
+      resource::workload_class::foreground_protocol,
+      64);
+}
+
+SEASTAR_TEST_CASE(segment_writer_native_immutable_dense_relocation) {
+    co_await with_installation(
+      68,
+      [](auto& files, auto& owner, const auto& spec, auto& budget, auto drive) {
+          return storage::testing::segment_writer_contract::immutable_import<
+            runtime::production::monotonic_clock>(
+            files,
+            owner,
+            spec,
+            budget,
+            drive,
+            storage::testing::segment_writer_contract::immutable_import_kind::
+              dense_relocation);
+      },
+      byte_count{48U * 1024U * 1024U},
+      resource::workload_class::foreground_protocol,
+      64);
+}
+
+SEASTAR_TEST_CASE(segment_writer_native_immutable_removed_terminal) {
+    co_await with_installation(
+      68,
+      [](auto& files, auto& owner, const auto& spec, auto& budget, auto drive) {
+          return storage::testing::segment_writer_contract::immutable_import<
+            runtime::production::monotonic_clock>(
+            files,
+            owner,
+            spec,
+            budget,
+            drive,
+            storage::testing::segment_writer_contract::immutable_import_kind::
+              removed_terminal);
+      },
+      byte_count{48U * 1024U * 1024U},
+      resource::workload_class::foreground_protocol,
+      64);
+}
+
+SEASTAR_TEST_CASE(segment_writer_native_immutable_empty_terminal) {
+    co_await with_installation(
+      68,
+      [](auto& files, auto& owner, const auto& spec, auto& budget, auto drive) {
+          return storage::testing::segment_writer_contract::immutable_import<
+            runtime::production::monotonic_clock>(
+            files,
+            owner,
+            spec,
+            budget,
+            drive,
+            storage::testing::segment_writer_contract::immutable_import_kind::
+              empty_terminal);
+      },
+      byte_count{48U * 1024U * 1024U},
+      resource::workload_class::foreground_protocol,
+      64);
+}
+
+SEASTAR_TEST_CASE(segment_writer_native_unresolved_seal) {
+    co_await with_installation(
+      68,
+      [](auto& files, auto& owner, const auto& spec, auto& budget, auto drive) {
+          return storage::testing::segment_writer_contract::seal_lifecycle<
+            runtime::production::monotonic_clock>(
+            files, owner, spec, budget, drive, false, false, false, true);
+      },
+      byte_count{48U * 1024U * 1024U},
+      resource::workload_class::foreground_protocol,
+      64);
+}
+
+SEASTAR_TEST_CASE(segment_writer_native_age) {
+    co_await with_installation(
+      68,
+      [](auto& files, auto& owner, const auto& spec, auto& budget, auto drive) {
+          return storage::testing::segment_qualification_contract::
+            age_boundaries(files, owner, spec, budget, drive, false);
+      },
+      byte_count{48U * 1024U * 1024U},
+      resource::workload_class::foreground_protocol,
+      64);
+}
+
+SEASTAR_TEST_CASE(segment_writer_native_age_overflow_restart) {
+    co_await with_installation(
+      68,
+      [](auto& files, auto& owner, const auto& spec, auto& budget, auto drive) {
+          return storage::testing::segment_qualification_contract::
+            age_boundaries(files, owner, spec, budget, drive, true);
+      },
+      byte_count{48U * 1024U * 1024U},
+      resource::workload_class::foreground_protocol,
+      64);
+}
+
+SEASTAR_TEST_CASE(segment_writer_native_completion_pressure) {
+    co_await with_installation(
+      68,
+      [](auto& files, auto& owner, const auto& spec, auto& budget, auto drive) {
+          return storage::testing::segment_qualification_contract::
+            reserved_completion<runtime::production::monotonic_clock>(
+              files, owner, spec, budget, drive);
+      },
+      byte_count{48U * 1024U * 1024U},
+      resource::workload_class::foreground_protocol,
+      64);
+}
+
+SEASTAR_TEST_CASE(segment_writer_native_freeze_allocation_cuts) {
+    for (std::size_t cut = 0; cut < 16; ++cut) {
+        co_await with_installation(
+          68,
+          [cut](
+            auto& files,
+            auto& owner,
+            const auto& spec,
+            auto& budget,
+            auto drive) {
+              return storage::testing::segment_qualification_contract::
+                freeze_allocation_cut<runtime::production::monotonic_clock>(
+                  files, owner, spec, budget, drive, cut);
+          },
+          byte_count{48U * 1024U * 1024U},
+          resource::workload_class::foreground_protocol,
+          64);
+    }
+}
+
+SEASTAR_TEST_CASE(segment_writer_native_close_preflight) {
+    co_await with_installation(
+      68,
+      [](auto& files, auto& owner, const auto& spec, auto& budget, auto drive) {
+          return storage::testing::segment_qualification_contract::
+            close_entered_preflight<runtime::production::monotonic_clock>(
+              files, owner, spec, budget, drive, false);
+      },
+      byte_count{48U * 1024U * 1024U},
+      resource::workload_class::foreground_protocol,
+      64);
+}
+
+SEASTAR_TEST_CASE(segment_writer_native_seal_preflight) {
+    co_await with_installation(
+      68,
+      [](auto& files, auto& owner, const auto& spec, auto& budget, auto drive) {
+          return storage::testing::segment_qualification_contract::
+            close_entered_preflight<runtime::production::monotonic_clock>(
+              files, owner, spec, budget, drive, true);
+      },
+      byte_count{48U * 1024U * 1024U},
+      resource::workload_class::foreground_protocol,
+      64);
+}
+
+SEASTAR_TEST_CASE(
+  segment_writer_native_preallocated_paged_seal_and_retained_results) {
+    co_await with_installation(
+      68,
+      [](auto& files, auto& owner, const auto& spec, auto& budget, auto drive) {
+          return storage::testing::segment_qualification_contract::
+            paged_seal_and_retained_results<
+              runtime::production::monotonic_clock>(
+              files, owner, spec, budget, drive, true);
+      },
+      byte_count{48U * 1024U * 1024U},
+      resource::workload_class::foreground_protocol,
+      64);
+}
+
+SEASTAR_TEST_CASE(segment_writer_native_paged_seal_and_retained_results) {
+    co_await with_installation(
+      68,
+      [](auto& files, auto& owner, const auto& spec, auto& budget, auto drive) {
+          return storage::testing::segment_qualification_contract::
+            paged_seal_and_retained_results<
+              runtime::production::monotonic_clock>(
+              files, owner, spec, budget, drive);
+      },
+      byte_count{48U * 1024U * 1024U},
+      resource::workload_class::foreground_protocol,
+      64);
 }

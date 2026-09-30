@@ -217,7 +217,7 @@ TEST(BatchFrameCodecTest, WrongFrameKindFamilyAndExpectedContextNeverCommit) {
       fixture::fragmented(frame(batch_wire(true, true, true), true), 7)};
     expectation = expected();
     expectation.fingerprint = codec::semantic_batch_digest{
-      codec::sha256_digest{}};
+      codec::content_digest{}};
     expect_error(
       assigned(wrong_digest, work, expectation), errc::wrong_context);
     EXPECT_EQ(wrong_digest.bytes_consumed(), byte_count{});
@@ -357,16 +357,14 @@ TEST(
 #if !defined(SEASTAR_ENABLE_ALLOC_FAILURE_INJECTION)
     GTEST_SKIP() << "allocation failure injection is disabled";
 #else
-    // Fixture construction initializes providers before injection. Fresh SHA
-    // contexts still allocate on each decode and report failure through the
-    // native hash exception channel, not necessarily std::bad_alloc.
+    // Content digests keep their state inline, so the fingerprint allocates
+    // nothing natively: every injected failure surfaces as std::bad_alloc.
     const auto wire = frame(batch_wire(false));
     static_cast<void>(kwaque::error_category());
     codec::crc32c warm;
     const std::array<char, 65> warm_bytes{};
     warm.extend(warm_bytes);
     unsigned failures = 0;
-    unsigned hash_failures = 0;
     bool completed = false;
     for (std::uint64_t ordinal = 0; ordinal < 512; ++ordinal) {
         fragmented_buffer_parser input{fixture::fragmented("pre" + wire, 7)};
@@ -392,13 +390,6 @@ TEST(
                 .get());
         } catch (const std::bad_alloc&) {
             allocation_failed = true;
-        } catch (const std::runtime_error&) {
-            if (!injector.failed()) {
-                injector.cancel();
-                throw;
-            }
-            ++hash_failures;
-            allocation_failed = true;
         } catch (...) {
             injector.cancel();
             throw;
@@ -423,7 +414,6 @@ TEST(
         }
     }
     EXPECT_GT(failures, 0U);
-    EXPECT_GT(hash_failures, 0U);
     EXPECT_TRUE(completed);
 #endif
 }

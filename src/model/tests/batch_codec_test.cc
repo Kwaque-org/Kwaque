@@ -1,5 +1,4 @@
 #include "src/bytes/fragmented_buffer_parser.h"
-#include "src/codec/sha256.h"
 #include "src/model/batch_builder.h"
 #include "src/model/batch_codec.h"
 #include "src/model/batch_rewrite.h"
@@ -47,38 +46,38 @@ using delta = model::range_logical_count;
 using nullable = std::optional<fragmented_buffer>;
 
 constexpr auto submitted_envelope
-  = "4b5142460100010001002000af00000000000000000000009cc9e480c3709e26"
+  = "4b5142460100010001002000af0000000000000000000000d70873b29d6ddefc"
     "0102030405060708090a0b0c0d0e0f1002000000000000000300000000000000"
     "04000000000000002122232425262728292a2b2c2d2e2f304142434445464748"
     "494a4b4c4d4e4f5007000000000000006162636465666768696a6b6c6d6e6f70"
-    "0900000000000000a094509035402abad319ae9b75972a8c3eb583f3c4829c435"
-    "3c21f92bad9d9a7640000000000000001000000010000000000000000000100"
+    "0900000000000000cd3dc575dbd5a810a34b7d5d91aea07e0000000000000000"
+    "0000000000000000640000000000000001000000010000000000000000000100"
     "070000000700000006000000010100"sv;
 constexpr auto dense_envelope
-  = "4b5142460200010001002000db0000000000000000000000c5342bd5689c9ed7"
+  = "4b5142460200010001002000db000000000000000000000073ee3a153cadea22"
     "0102030405060708090a0b0c0d0e0f1002000000000000000300000000000000"
     "04000000000000002122232425262728292a2b2c2d2e2f304142434445464748"
     "494a4b4c4d4e4f5007000000000000006162636465666768696a6b6c6d6e6f70"
-    "0900000000000000629cb7e9505f05b8ae49fe6ba38ea0ad5146c22f973fc119"
-    "5b2da4fe00869ce3640000000000000005000000050000000000000000000100"
-    "23000000230000006400000000000000690000000000000006000000010100"
-    "06000101010100060014020101000600030301010006000204010100"sv;
+    "09000000000000004a4d0de2dc0aa1afde920a41dcedfe470000000000000000"
+    "0000000000000000640000000000000005000000050000000000000000000100"
+    "2300000023000000640000000000000069000000000000000600000001010006"
+    "000101010100060014020101000600030301010006000204010100"sv;
 constexpr auto sparse_envelope
-  = "4b5142460200010001002000c6000000000000000000000051a3849d4be31590"
+  = "4b5142460200010001002000c60000000000000000000000bd697adc59b00b90"
     "0102030405060708090a0b0c0d0e0f1002000000000000000300000000000000"
     "04000000000000002122232425262728292a2b2c2d2e2f304142434445464748"
     "494a4b4c4d4e4f5007000000000000006162636465666768696a6b6c6d6e6f70"
-    "0900000000000000629cb7e9505f05b8ae49fe6ba38ea0ad5146c22f973fc119"
-    "5b2da4fe00869ce3640000000000000005000000020000000000000000000100"
-    "0e0000000e0000006400000000000000690000000000000006000101010100"
-    "06000303010100"sv;
+    "09000000000000004a4d0de2dc0aa1afde920a41dcedfe470000000000000000"
+    "0000000000000000640000000000000005000000020000000000000000000100"
+    "0e0000000e000000640000000000000069000000000000000600010101010006"
+    "000303010100"sv;
 constexpr auto rich_envelope
-  = "4b5142460100010001002000b5000000000000000000000056a0b5ece928823a"
+  = "4b5142460100010001002000b50000000000000000000000d4381a302b63a337"
     "0102030405060708090a0b0c0d0e0f1002000000000000000300000000000000"
     "04000000000000002122232425262728292a2b2c2d2e2f304142434445464748"
     "494a4b4c4d4e4f5007000000000000006162636465666768696a6b6c6d6e6f70"
-    "0900000000000000256fc3357a0312ef7310b95fa1039b5f93dfbd296645eed3"
-    "df76f1cd11444ec0640000000000000001000000010000000200000000000100"
+    "09000000000000005839262062bdfb7e9b974fe0e02d6f550000000000000000"
+    "0000000000000000640000000000000001000000010000000200000000000100"
     "0d0000000d0000000c000000026b0102000101ff00"sv;
 
 static_assert(
@@ -469,7 +468,7 @@ TEST(BatchCodecTest, EverySuppliedOriginalIdentityAndBindingFieldIsCompared) {
         auto expectation = expected();
         expectation.id = identity();
         expectation.original_binding = binding();
-        codec::sha256_digest digest{};
+        codec::content_digest digest{};
         const auto original = unhex(sparse_envelope);
         for (std::size_t i = 0; i < digest.size(); ++i)
             digest[i] = static_cast<unsigned char>(original[32 + 104 + i]);
@@ -728,7 +727,7 @@ TEST(BatchCodecTest, SparseDigestIsCarriedAndNeverReplacedByHashOfSurvivors) {
                      input, expected(), reserve(input), work)
                      .get()
                      .value();
-    EXPECT_EQ(decoded.value.fingerprint().bytes(), codec::sha256_digest{});
+    EXPECT_EQ(decoded.value.fingerprint().bytes(), codec::content_digest{});
     EXPECT_EQ(
       decoded.fingerprint_verification,
       model::batch_fingerprint_verification::carried);
@@ -737,7 +736,7 @@ TEST(BatchCodecTest, SparseDigestIsCarriedAndNeverReplacedByHashOfSurvivors) {
                        std::move(decoded.value), keep, memory(), work)
                        .get()
                        .value();
-    EXPECT_EQ(rewritten.fingerprint().bytes(), codec::sha256_digest{});
+    EXPECT_EQ(rewritten.fingerprint().bytes(), codec::content_digest{});
     EXPECT_EQ(rewritten.context().logical_span().end().value(), 105U);
     auto full = unhex(dense_envelope);
     std::fill_n(full.begin() + 32 + 104, 32, '\0');
@@ -1028,17 +1027,11 @@ TEST(BatchCodecTest, QueuedCancellationJoinsDecodeAndPreservesCallerMarks) {
     input.rollback().value();
 }
 
-TEST(
-  BatchCodecTest,
-  ReachedAllocationAndNativeHashFailuresPreserveEnclosingInput) {
+TEST(BatchCodecTest, ReachedAllocationFailuresPreserveEnclosingInput) {
 #if !defined(SEASTAR_ENABLE_ALLOC_FAILURE_INJECTION)
     GTEST_SKIP() << "ordinary allocation injection is disabled";
 #else
     static_cast<void>(kwaque::error_category());
-    {
-        codec::sha256_hasher warm;
-        static_cast<void>(std::move(warm).final());
-    }
     for (int kind = 0; kind < 3; ++kind) {
         bool failed_once = false, succeeded = false;
         for (std::uint64_t ordinal = 0; ordinal < 256 && !succeeded;
@@ -1065,13 +1058,6 @@ TEST(
                 succeeded = !reached;
             } catch (const std::bad_alloc&) {
                 reached = injector.failed();
-                threw = true;
-            } catch (const std::runtime_error&) {
-                reached = injector.failed();
-                if (!reached || kind == 2) {
-                    injector.cancel();
-                    throw;
-                }
                 threw = true;
             } catch (...) {
                 injector.cancel();

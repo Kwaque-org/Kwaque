@@ -11,14 +11,14 @@
 #include "src/codec/digest.h"
 #include "src/codec/envelope.h"
 #include "src/codec/envelope_encode.h"
-#include "src/codec/sha256.h"
-#include "src/codec/sha256_cooperative.h"
 #include "src/codec/staging_cooperative.h"
 #include "src/codec/tests/allocation_observer.h"
 #include "src/codec/tests/envelope_bench_fixture.h"
 #include "src/codec/tests/memory_qualification_support.h"
 #include "src/codec/tests/qualification_profile.h"
 #include "src/codec/transaction.h"
+#include "src/codec/xxh3.h"
+#include "src/codec/xxh3_cooperative.h"
 
 #include <seastar/core/abort_source.hh>
 #include <seastar/core/app-template.hh>
@@ -35,6 +35,7 @@
 #include <algorithm>
 #include <array>
 #include <bit>
+#include <cerrno>
 #include <cinttypes>
 #include <cstddef>
 #include <cstdint>
@@ -48,6 +49,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <system_error>
 #include <utility>
 #include <vector>
 
@@ -199,12 +201,34 @@ void observer_control(std::unique_ptr<char[]>& startup_owner) {
         && retained.live_upper_bound == conservative_size,
       "unwrapped free was not conservatively retained");
 
+    // Keep both exception messages alive across repeated libc translation.
+    // Coverage must not depend on warming a particular error or locale cache.
+    std::optional<std::system_error> missing, exists;
     testing::begin_allocation_observation();
+    missing.emplace(ENOENT, std::system_category());
+    exists.emplace(EEXIST, std::system_category());
+    const auto messages = testing::end_allocation_observation();
+    report("observer-error-message", 0, {}, messages);
+    require(
+      messages.complete && messages.allocations > 0
+        && messages.allocations == messages.native_allocations
+        && messages.live_upper_bound > 0
+        && missing->code() == std::error_code(ENOENT, std::system_category())
+        && exists->code() == std::error_code(EEXIST, std::system_category())
+        && std::string_view{missing->what()}.contains(missing->code().message())
+        && std::string_view{exists->what()}.contains(exists->code().message()),
+      "system-error translation changed semantics or escaped observation");
+    missing.reset();
+    exists.reset();
+
+    testing::begin_allocation_observation();
+    missing.emplace(ENOENT, std::system_category());
     auto* missed = __real_malloc(61);
     if (!missed) std::abort();
     opaque(missed);
     __real_free(missed);
     const auto incomplete = testing::end_allocation_observation();
+    missing.reset();
     require(
       incomplete.observed && !incomplete.complete,
       "observer silently missed a native allocation");
@@ -215,32 +239,27 @@ void observer_control(std::unique_ptr<char[]>& startup_owner) {
 #endif
 }
 
-constexpr std::array<codec::sha256_digest, 8> expected_hashes{{
-  {0xe3, 0xb0, 0xc4, 0x42, 0x98, 0xfc, 0x1c, 0x14, 0x9a, 0xfb, 0xf4,
-   0xc8, 0x99, 0x6f, 0xb9, 0x24, 0x27, 0xae, 0x41, 0xe4, 0x64, 0x9b,
-   0x93, 0x4c, 0xa4, 0x95, 0x99, 0x1b, 0x78, 0x52, 0xb8, 0x55},
-  {0x6e, 0x34, 0x0b, 0x9c, 0xff, 0xb3, 0x7a, 0x98, 0x9c, 0xa5, 0x44,
-   0xe6, 0xbb, 0x78, 0x0a, 0x2c, 0x78, 0x90, 0x1d, 0x3f, 0xb3, 0x37,
-   0x38, 0x76, 0x85, 0x11, 0xa3, 0x06, 0x17, 0xaf, 0xa0, 0x1d},
-  {0xae, 0x4b, 0x32, 0x80, 0xe5, 0x6e, 0x2f, 0xaf, 0x83, 0xf4, 0x14,
-   0xa6, 0xe3, 0xda, 0xbe, 0x9d, 0x5f, 0xbe, 0x18, 0x97, 0x65, 0x44,
-   0xc0, 0x5f, 0xed, 0x12, 0x1a, 0xcc, 0xb8, 0x5b, 0x53, 0xfc},
-  {0x46, 0x3e, 0xb2, 0x8e, 0x72, 0xf8, 0x2e, 0x0a, 0x96, 0xc0, 0xa4,
-   0xcc, 0x53, 0x69, 0x0c, 0x57, 0x12, 0x81, 0x13, 0x1f, 0x67, 0x2a,
-   0xa2, 0x29, 0xe0, 0xd4, 0x5a, 0xe5, 0x9b, 0x59, 0x8b, 0x59},
-  {0xda, 0x2a, 0xe4, 0xd6, 0xb3, 0x67, 0x48, 0xf2, 0xa3, 0x18, 0xf2,
-   0x3e, 0x7a, 0xb1, 0xdf, 0xdf, 0x45, 0xac, 0xdc, 0x9d, 0x04, 0x9b,
-   0xd8, 0x0e, 0x59, 0xde, 0x82, 0xa6, 0x08, 0x95, 0xf5, 0x62},
-  {0xfd, 0xea, 0xb9, 0xac, 0xf3, 0x71, 0x03, 0x62, 0xbd, 0x26, 0x58,
-   0xcd, 0xc9, 0xa2, 0x9e, 0x8f, 0x9c, 0x75, 0x7f, 0xcf, 0x98, 0x11,
-   0x60, 0x3a, 0x8c, 0x44, 0x7c, 0xd1, 0xd9, 0x15, 0x11, 0x08},
-  {0x4b, 0xfd, 0x2c, 0x8b, 0x6f, 0x1e, 0xec, 0x7a, 0x2a, 0xfe, 0xb4,
-   0x8b, 0x93, 0x4e, 0xe4, 0xb2, 0x69, 0x41, 0x82, 0x02, 0x7e, 0x6d,
-   0x0f, 0xc0, 0x75, 0x07, 0x4f, 0x2f, 0xab, 0xb3, 0x17, 0x81},
-  {0xc8, 0xf5, 0xd0, 0x34, 0x1d, 0x54, 0xd9, 0x51, 0xa7, 0x1b, 0x13,
-   0x6e, 0x6e, 0x2a, 0xfc, 0xb1, 0x4d, 0x11, 0xed, 0x84, 0x89, 0xa7,
-   0xae, 0x12, 0x6a, 0x8f, 0xee, 0x0d, 0xf6, 0xec, 0xf1, 0x93},
-}};
+// XXH3-128 of the first hash_sizes[i] probe bytes, in canonical form.
+constexpr std::array<std::string_view, 8> expected_xxh3{
+  "99aa06d3014798d86001c324468d497f",
+  "a6cd5e9392000f6ac44bdff4074eecdb",
+  "e3b55f57945a17cf5f4299fc161c9cbb",
+  "d7420506a37184c24d27405399d46ba6",
+  "9e4390d2170659904a1730efd65eb655",
+  "9c6e140a465545e590c1971ddb04ce74",
+  "ebedf05eeadc28f11aee64a1615de88f",
+  "03916578969f7a66eb4b7c3707879151",
+};
+bool matches(const codec::content_digest& digest, std::string_view expected) {
+    constexpr std::string_view digits{"0123456789abcdef"};
+    if (expected.size() != 2 * digest.size()) return false;
+    for (std::size_t i = 0; i < digest.size(); ++i)
+        if (
+          expected[2 * i] != digits[digest[i] >> 4U]
+          || expected[2 * i + 1] != digits[digest[i] & 15U])
+            return false;
+    return true;
+}
 
 void engines(std::string_view scenario) {
     std::array<char, 4096> input{};
@@ -267,44 +286,30 @@ void engines(std::string_view scenario) {
           "CRC observation changed the result");
         return;
     }
-    if (scenario == "sha-cold")
+    // The first XXH3 use in this process, or a churn of fresh hashers.
+    const auto churn = scenario == "xxh3-churn";
+    const auto answers = measure(scenario, churn ? 4096U : 3U, {}, [&] {
+        std::array<codec::content_digest, 8> result{};
+        for (unsigned round = 0; round < (churn ? 16U : 1U); ++round) {
+            for (std::size_t i = 0; i < (churn ? hash_sizes.size() : 1U); ++i) {
+                codec::xxh3_128_hasher hasher;
+                hasher.update(input.data(), churn ? hash_sizes[i] : 3U);
+                result[i] = std::move(hasher).final();
+                opaque(result[i]);
+            }
+        }
+        return result;
+    });
+    for (std::size_t i = 0; i < (churn ? answers.size() : 1U); ++i)
         require(
-          testing::crypto_allocation_calls() == 0,
-          "cold SHA was preceded by crypto initialization");
-    if (scenario == "sha-warm" || scenario == "sha-churn") {
-        codec::sha256_hasher warm;
-        warm.update(input.data(), 3);
-        static_cast<void>(std::move(warm).final());
-    }
-    const auto answers = measure(
-      scenario, scenario == "sha-churn" ? 4096U : 3U, {}, [&] {
-          std::array<codec::sha256_digest, 8> result{};
-          const auto rounds = scenario == "sha-churn" ? 16U : 1U;
-          for (unsigned round = 0; round < rounds; ++round) {
-              for (std::size_t i = 0;
-                   i < (scenario == "sha-churn" ? hash_sizes.size() : 1U);
-                   ++i) {
-                  codec::sha256_hasher hasher;
-                  hasher.update(
-                    input.data(), scenario == "sha-churn" ? hash_sizes[i] : 3U);
-                  result[i] = std::move(hasher).final();
-                  opaque(result[i]);
-              }
-          }
-          return result;
-      });
-    if (scenario == "sha-churn")
-        require(answers == expected_hashes, "SHA churn mismatch");
-    else
-        require(
-          answers[0] == expected_hashes[2],
-          "SHA observation changed the result");
+          matches(answers[i], expected_xxh3[churn ? i : 2]),
+          "XXH3 observation changed the result");
 }
-void sha_owner() {
+void xxh3_owner() {
     auto input = make_body(1024U * 1024U);
     const auto retained = retained_cost(input);
     const auto expected_digest = [&] {
-        codec::sha256_hasher hasher;
+        codec::xxh3_128_hasher hasher;
         for (const auto part : input) {
             hasher.update(part.data(), part.size());
             seastar::thread::maybe_yield();
@@ -313,10 +318,10 @@ void sha_owner() {
     }();
     seastar::abort_source abort;
     codec::cooperative_work work{codec::limits::defaults(), abort};
-    const auto result = measure("sha-owner", 1024U * 1024U, retained, [&] {
-        return codec::sha256_cooperatively(std::move(input), work).get();
+    const auto result = measure("xxh3-owner", 1024U * 1024U, retained, [&] {
+        return codec::xxh3_128_cooperatively(std::move(input), work).get();
     });
-    require(result && *result == expected_digest, "SHA owner changed bytes");
+    require(result && *result == expected_digest, "XXH3 owner changed bytes");
 }
 void envelope(std::string_view scenario) {
     const std::size_t size = scenario.ends_with("max") ? 16U * 1024U * 1024U
@@ -507,8 +512,7 @@ int exercise(
     else if (
       scenario == "crc-cold-32" || scenario == "crc-cold-4096"
       || scenario == "crc-warm-4096" || scenario == "google-cold-4096"
-      || scenario == "sha-cold" || scenario == "sha-warm"
-      || scenario == "sha-churn")
+      || scenario == "xxh3-cold" || scenario == "xxh3-churn")
         engines(scenario);
     else if (
       scenario == "encode-small" || scenario == "encode-max"
@@ -516,8 +520,8 @@ int exercise(
       || scenario == "decode-max" || scenario == "decode-invalid"
       || scenario == "decode-abort" || scenario == "decode-pressure")
         envelope(scenario);
-    else if (scenario == "sha-owner")
-        sha_owner();
+    else if (scenario == "xxh3-owner")
+        xxh3_owner();
     else if (scenario == "staging-fragments")
         staging();
     else if (scenario == "collection-8192" || scenario == "collection-pressure")
@@ -530,13 +534,6 @@ int exercise(
 } // namespace
 
 int main(int argc, char** argv) {
-    if (!testing::install_crypto_allocation_observation()) {
-        std::fputs(
-          "crypto allocation hooks require a fresh process before "
-          "initialization\n",
-          stderr);
-        return 1;
-    }
     // Retain a system-allocated owner for the pre-existing-release control.
     auto startup_owner = std::make_unique<char[]>(61);
     opaque(startup_owner);

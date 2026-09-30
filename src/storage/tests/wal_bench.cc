@@ -297,6 +297,7 @@ struct wal_bench {
                               }
                               if (preallocate)
                                   co_await files.prepare_extent(extent);
+                              co_await files.register_io_class(budget);
                               foreground_turns = 0;
                               const auto retained = budget.snapshot().bytes;
                               const auto tasks = seastar::engine()

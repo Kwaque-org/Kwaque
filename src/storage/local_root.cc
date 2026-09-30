@@ -75,7 +75,7 @@ seastar::future<runtime::result<void>> validate_local_root_page(
     if (bytes.size() != ref.encoded_bytes())
         co_return runtime::failure(path_error(errc::wrong_context));
     // Caller reserves the original input and a full decoder/share budget
-    // independently. Do not linearize or derive the expected SHA from input.
+    // independently. Do not linearize or derive the expected digest from input.
     bytes::fragmented_buffer_parser input{bytes.share()};
     auto memory = metadata_file_budget(input, bundle.limits(), work);
     if (!memory) co_return runtime::failure(path_error(memory.error().code()));

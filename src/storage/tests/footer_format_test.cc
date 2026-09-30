@@ -15,6 +15,9 @@ static_assert(!std::default_initializable<verified_extent>);
 static_assert(!std::is_aggregate_v<verified_extent>);
 static_assert(!std::default_initializable<durable_footer>);
 static_assert(!std::is_aggregate_v<durable_footer>);
+static_assert(!std::default_initializable<encoded_durable_footer>);
+static_assert(!std::is_aggregate_v<encoded_durable_footer>);
+static_assert(!std::copy_constructible<encoded_durable_footer>);
 static_assert(!std::constructible_from<
               verified_extent,
               segment_history_context,
@@ -33,13 +36,15 @@ TEST(FooterFormatTest, IndependentGoldenAndEvidenceBackedEncoding) {
       expected);
     EXPECT_EQ(
       literal.substr(0, 32),
-      hex("4b5142460600010001002000e0010000000000000000000049be8a18fff66e8b"));
+      hex("4b5142460600010001002000e00100000000000000000000207ff272986af5c2"));
     const auto output
       = encode_durable_footer(
           evidence, expected, work, budget().operation_remaining, charge)
           .get();
     ASSERT_TRUE(output.has_value());
-    EXPECT_EQ(flat(*output), literal);
+    EXPECT_EQ(flat(output->bytes()), literal);
+    if (bytes::testing::native_charge_profile)
+        EXPECT_EQ(output->bytes().fragment_count(), 1U);
     fragmented_buffer_parser input{buffer("p" + literal + "s", 7)};
     input.skip(byte_count{1}).value();
     input.push_checkpoint().value();
@@ -47,6 +52,8 @@ TEST(FooterFormatTest, IndependentGoldenAndEvidenceBackedEncoding) {
                            input, expected, reserve(input, work), work)
                            .get();
     ASSERT_TRUE(decoded.has_value());
+    EXPECT_EQ(output->descriptor().boundary(), decoded->boundary());
+    EXPECT_EQ(output->descriptor().encoded_extent(), decoded->encoded_extent());
     EXPECT_TRUE(validate_durable_footer(*decoded, evidence));
     EXPECT_EQ(decoded->location().history, history());
     EXPECT_EQ(decoded->location().position.value(), 1024U);
@@ -76,7 +83,7 @@ TEST(FooterFormatTest, EmptyTerminalBoundaryAndFooterOnlyHistory) {
                            charge)
                            .get();
     ASSERT_TRUE(encoded.has_value());
-    EXPECT_EQ(flat(*encoded), literal);
+    EXPECT_EQ(flat(encoded->bytes()), literal);
     EXPECT_EQ(evidence.boundary().data_crc32c, 0U);
     EXPECT_FALSE(evidence.boundary().last_block.has_value());
     auto only = extent_verifier::make(
@@ -316,7 +323,7 @@ TEST(FooterFormatTest, DistinctWideFieldsAndTerminalRecordEnds) {
                            .get();
     ASSERT_TRUE(encoded.has_value());
     EXPECT_EQ(
-      flat(*encoded),
+      flat(encoded->bytes()),
       footer_wire(
         evidence.boundary(), {history(), runtime::file_position{1024}}));
 }
@@ -338,7 +345,8 @@ TEST(
               evidence, location, work, budget().operation_remaining, charge)
               .get();
         ASSERT_TRUE(output.has_value());
-        EXPECT_EQ(flat(*output), footer_wire(evidence.boundary(), location));
+        EXPECT_EQ(
+          flat(output->bytes()), footer_wire(evidence.boundary(), location));
     }
     const footer_expectation location{history(), runtime::file_position{512}};
     const boundary_fields empty{

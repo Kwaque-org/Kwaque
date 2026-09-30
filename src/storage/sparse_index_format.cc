@@ -27,10 +27,7 @@ using detail::load;
 using detail::page_error;
 using detail::store;
 constexpr auto index_family = codec::format_family::sparse_index;
-constexpr codec::sha256_digest empty_sha{
-  0xe3, 0xb0, 0xc4, 0x42, 0x98, 0xfc, 0x1c, 0x14, 0x9a, 0xfb, 0xf4,
-  0xc8, 0x99, 0x6f, 0xb9, 0x24, 0x27, 0xae, 0x41, 0xe4, 0x64, 0x9b,
-  0x93, 0x4c, 0xa4, 0x95, 0x99, 0x1b, 0x78, 0x52, 0xb8, 0x55};
+constexpr auto empty_digest = codec::xxh3_128_empty;
 
 template<typename Span>
 bool contains_span(Span outer, Span inner) noexcept {
@@ -86,7 +83,10 @@ codec::result<void> read_scope(
     if (!coverage) return codec::failure(coverage.error());
     if (*coverage != expected.coverage())
         return codec::failure(page_error(errc::wrong_context, c, 76));
-    if (detail::read_digest<124>(fixed) != expected.digest().bytes())
+    const auto digest = detail::read_digest<124>(fixed);
+    if (!digest)
+        return codec::failure(page_error(errc::malformed_data, c, 140));
+    if (*digest != expected.digest().bytes())
         return codec::failure(page_error(errc::wrong_context, c, 124));
     return {};
 }
@@ -413,7 +413,7 @@ result<sparse_index_context> sparse_index_context::make(
       || coverage.physical().count().value()
            > coverage.logical().count().value()
       || (!coverage.physical().empty() && coverage.bytes().empty())
-      || (coverage.bytes().empty() && digest.bytes() != empty_sha))
+      || (coverage.bytes().empty() && digest.bytes() != empty_digest))
         return failure(errc::invalid_argument);
     return sparse_index_context{segment, coverage, digest, alignment, profile};
 }

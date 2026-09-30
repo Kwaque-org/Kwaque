@@ -196,7 +196,7 @@ void object_case(
             repin = true;
             break;
         }
-        case 15: // Valid CRCs with an independently incorrect SHA pin.
+        case 15: // Valid CRCs with an independently incorrect digest pin.
             break;
         case 16: {
             // Unknown mandatory extension; h=32 has the mandatory feature word.
@@ -224,18 +224,18 @@ void object_case(
             known_reject = true;
             break;
         }
-    auto digest = codec::immutable_object_digest{index::sha(root_wire)};
+    auto digest = codec::immutable_object_digest{index::digest_of(root_wire)};
     if (repin) {
         const auto exact = envelope_bytes(wire);
         if (root)
-            digest = codec::immutable_object_digest{index::sha(exact)};
+            digest = codec::immutable_object_digest{index::digest_of(exact)};
         else
             refs[0] = page_ref::make(
                         refs[0].ordinal(),
                         0,
                         fixture.entries,
                         refs[0].encoded_bytes(),
-                        codec::immutable_object_digest{index::sha(exact)})
+                        codec::immutable_object_digest{index::digest_of(exact)})
                         .value();
     }
     if (!raw && mutation == 15) {
@@ -271,7 +271,8 @@ void object_case(
                 known_reject = true;
             }
         } else {
-            digest = codec::immutable_object_digest{index::sha("wrong root")};
+            digest = codec::immutable_object_digest{
+              index::digest_of("wrong root")};
             known_reject = true;
         }
     }
@@ -450,11 +451,11 @@ void supplied_extent_case(const std::array<std::uint8_t, 8>& control) {
                           extent_layout_kind::initial_append,
                           {},
                           mode == 7 ? extent_integrity::crc32c
-                                    : extent_integrity::crc32c_and_sha256)
+                                    : extent_integrity::crc32c_and_digest)
                           .value();
         require(feed_block(verifier, data, work, width).has_value());
         const auto proof = verifier.finish(work).value();
-        auto digest = index::sha(data);
+        auto digest = index::digest_of(data);
         if (mode == 1) digest[0] ^= 1U;
         const auto declared = scope(
           100,

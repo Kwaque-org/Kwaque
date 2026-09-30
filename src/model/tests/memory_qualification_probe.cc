@@ -733,13 +733,6 @@ int exercise(std::string_view scenario) {
 } // namespace
 
 int main(int argc, char** argv) {
-    if (!observation::install_crypto_allocation_observation()) {
-        std::fputs(
-          "crypto allocation hooks require a fresh process before "
-          "initialization\n",
-          stderr);
-        return 1;
-    }
     seastar::app_template app;
     app.set_configuration_reader([](boost::program_options::variables_map&) {});
     app.add_options()(

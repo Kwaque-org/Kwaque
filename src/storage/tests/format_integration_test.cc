@@ -65,7 +65,8 @@ codec::semantic_batch_digest original_digest(std::uint64_t sequence) {
     put(prefix, 107, 9, 8);
     put(prefix, 115, 100, 8);
     put(prefix, 123, 5, 4);
-    return codec::semantic_batch_digest{exact_sha(prefix + original_records())};
+    return codec::semantic_batch_digest{
+      exact_digest(prefix + original_records())};
 }
 model::batch_decode_expectation original_expected(std::uint64_t sequence) {
     return {
@@ -377,7 +378,7 @@ void verify_manifest(
                        .get()
                        .value();
     const auto pin = codec::immutable_object_digest{
-      exact_sha(flat(root_wire.bytes))};
+      exact_digest(flat(root_wire.bytes))};
     EXPECT_EQ(root_wire.digest, pin);
     fragmented_buffer_parser input{std::move(root_wire.bytes)};
     auto root = decode_range_manifest_root(
@@ -443,7 +444,7 @@ void verify_metadata(
                          .value();
         pages[i] = flat(encoded.bytes);
         refs.push_back(encoded.reference);
-        EXPECT_EQ(refs[i].digest().bytes(), exact_sha(pages[i]));
+        EXPECT_EQ(refs[i].digest().bytes(), exact_digest(pages[i]));
     }
     {
         auto encoded = encode_sparse_index_root(
@@ -456,7 +457,7 @@ void verify_metadata(
                          .get()
                          .value();
         const auto root_pin = codec::immutable_object_digest{
-          exact_sha(flat(encoded.bytes))};
+          exact_digest(flat(encoded.bytes))};
         EXPECT_EQ(encoded.digest, root_pin);
         fragmented_buffer_parser input{std::move(encoded.bytes)};
         auto root = decode_sparse_index_root(
@@ -592,7 +593,8 @@ TEST(
                                 operation_budget().operation_remaining,
                                 charge)
                                 .get()
-                                .value();
+                                .value()
+                                .release_bytes();
                 const auto middle_wire = flat(middle);
                 const auto second_location = location(
                   h,
@@ -616,7 +618,7 @@ TEST(
                                 sparse ? extent_layout_kind::rewrite
                                        : extent_layout_kind::initial_append,
                                 {},
-                                extent_integrity::crc32c_and_sha256)
+                                extent_integrity::crc32c_and_digest)
                                 .value();
                 const auto add_data = [&](std::size_t i) {
                     auto bytes = buffer(blocks[i], width);
@@ -647,7 +649,7 @@ TEST(
                 ASSERT_TRUE(evidence.digest());
                 EXPECT_EQ(
                   evidence.digest()->bytes(),
-                  exact_sha(blocks[0] + middle_wire + blocks[1]));
+                  exact_digest(blocks[0] + middle_wire + blocks[1]));
                 const footer_expectation footer_location{
                   h, coverage.bytes().end()};
                 auto final = encode_durable_footer(
@@ -658,7 +660,8 @@ TEST(
                                charge)
                                .get()
                                .value();
-                fragmented_buffer_parser footer_input{std::move(final)};
+                fragmented_buffer_parser footer_input{
+                  std::move(final).release_bytes()};
                 const auto footer = decode_durable_footer(
                                       footer_input,
                                       footer_location,
@@ -681,7 +684,7 @@ TEST(
                                      .get()
                                      .value();
                 const auto sealed_pin = codec::immutable_object_digest{
-                  exact_sha(flat(sealed_wire.bytes))};
+                  exact_digest(flat(sealed_wire.bytes))};
                 EXPECT_EQ(sealed_wire.digest, sealed_pin);
                 fragmented_buffer_parser sealed_input{
                   std::move(sealed_wire.bytes)};
@@ -779,7 +782,7 @@ TEST(FormatIntegrationTest, FullRemovalRetainsOnlyCoverageAndCompletedResults) {
                         work.policy(),
                         extent_layout_kind::rewrite,
                         {},
-                        extent_integrity::crc32c_and_sha256)
+                        extent_integrity::crc32c_and_digest)
                         .value();
         const auto evidence = extent.finish(work).value();
         EXPECT_EQ(evidence.boundary().coverage, coverage);
@@ -790,7 +793,7 @@ TEST(FormatIntegrationTest, FullRemovalRetainsOnlyCoverageAndCompletedResults) {
         EXPECT_FALSE(evidence.boundary().last_block);
         EXPECT_EQ(evidence.boundary().data_crc32c, 0U);
         ASSERT_TRUE(evidence.digest());
-        EXPECT_EQ(evidence.digest()->bytes(), exact_sha(""));
+        EXPECT_EQ(evidence.digest()->bytes(), exact_digest(""));
 
         const footer_expectation root_location{h, coverage.bytes().end()};
         std::vector<page_ref> refs;
@@ -808,7 +811,8 @@ TEST(FormatIntegrationTest, FullRemovalRetainsOnlyCoverageAndCompletedResults) {
                              .get()
                              .value();
             pages[i] = flat(encoded.bytes);
-            EXPECT_EQ(encoded.reference.digest().bytes(), exact_sha(pages[i]));
+            EXPECT_EQ(
+              encoded.reference.digest().bytes(), exact_digest(pages[i]));
             refs.push_back(encoded.reference);
         }
         {
@@ -823,7 +827,7 @@ TEST(FormatIntegrationTest, FullRemovalRetainsOnlyCoverageAndCompletedResults) {
                              .get()
                              .value();
             const codec::immutable_object_digest pin{
-              exact_sha(flat(encoded.bytes))};
+              exact_digest(flat(encoded.bytes))};
             EXPECT_EQ(encoded.digest, pin);
             fragmented_buffer_parser input{std::move(encoded.bytes)};
             const auto root
@@ -877,7 +881,7 @@ TEST(FormatIntegrationTest, FullRemovalRetainsOnlyCoverageAndCompletedResults) {
                              .get()
                              .value();
             const codec::immutable_object_digest pin{
-              exact_sha(flat(encoded.bytes))};
+              exact_digest(flat(encoded.bytes))};
             EXPECT_EQ(encoded.digest, pin);
             fragmented_buffer_parser input{std::move(encoded.bytes)};
             const auto root
@@ -900,7 +904,7 @@ TEST(FormatIntegrationTest, FullRemovalRetainsOnlyCoverageAndCompletedResults) {
 TEST(
   FormatIntegrationTest,
   SemanticDigestExcludesCompressionAndPhysicalPlacement) {
-    std::optional<codec::sha256_digest> baseline;
+    std::optional<codec::content_digest> baseline;
     for (const unsigned mode : {0U, 1U, 2U, 3U}) {
         for (const std::size_t width : {7U, 67U}) {
             SCOPED_TRACE(
@@ -943,7 +947,7 @@ TEST(
                               work.policy(),
                               extent_layout_kind::rewrite,
                               {},
-                              extent_integrity::crc32c_and_sha256)
+                              extent_integrity::crc32c_and_digest)
                               .value();
             auto stored = buffer(wire, width);
             const auto memory = reserve_current(stored, work);
@@ -953,7 +957,7 @@ TEST(
               .value();
             const auto evidence = verifier.finish(work).value();
             ASSERT_TRUE(evidence.digest());
-            const auto exact = exact_sha(wire);
+            const auto exact = exact_digest(wire);
             EXPECT_EQ(evidence.digest()->bytes(), exact);
             if (!baseline) baseline = exact;
             if (mode == 0)

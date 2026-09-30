@@ -242,8 +242,12 @@ public:
         return complete_block_descriptor{context, physical, bytes, child};
     }
     static segment_block pair(
-      fragmented_buffer bytes, complete_block_descriptor descriptor) noexcept {
-        return segment_block{std::move(bytes), descriptor};
+      fragmented_buffer bytes,
+      complete_block_descriptor descriptor,
+      segment_block_expectation placement,
+      codec::limits validated) noexcept {
+        return segment_block{
+          std::move(bytes), descriptor, std::move(placement), validated};
     }
 };
 } // namespace detail
@@ -321,7 +325,7 @@ seastar::future<codec::result<fragmented_buffer>> encode_segment_header(
       fixed, static_cast<std::uint32_t>(layout->padding_bytes().value()));
     auto output = co_await detail::encode_padded(
       fixed,
-      fragmented_buffer{},
+      std::nullopt,
       *layout,
       codec::format_family::segment_header,
       work,
@@ -614,7 +618,6 @@ seastar::future<codec::result<segment_block>> encode_segment_block(
   codec::field_context context) {
     std::optional<encoded_assigned_batch> child{
       std::in_place, std::move(source)};
-    fragmented_buffer payload;
     context.family = static_cast<std::uint16_t>(
       codec::format_family::segment_batch_block);
     const auto anchor = at(errc::success, context);
@@ -722,11 +725,10 @@ seastar::future<codec::result<segment_block>> encode_segment_block(
             store<116>(
               fixed,
               static_cast<std::uint32_t>(layout->padding_bytes().value()));
-            payload = std::move(*child).release_bytes();
             encoded.emplace(
               co_await detail::encode_padded(
                 fixed,
-                std::move(payload),
+                std::move(child),
                 *layout,
                 codec::format_family::segment_batch_block,
                 work,
@@ -746,8 +748,6 @@ seastar::future<codec::result<segment_block>> encode_segment_block(
     }
     co_await work.drain_inline(work.byte_quantum(), work.item_quantum());
     child.reset();
-    co_await work.drain_inline(work.byte_quantum(), work.item_quantum());
-    payload = fragmented_buffer{};
     if (!failed && !exception) {
         if (auto ready = work.poll(anchor); !ready) failed = ready.error();
     }
@@ -761,7 +761,8 @@ seastar::future<codec::result<segment_block>> encode_segment_block(
       invariant_id{"KQ-SEGMENT-BLOCK-ENCODE"},
       encoded && encoded->has_value() && descriptor,
       "block encoding completed without an owning pair");
-    co_return detail::segment_codec::pair(std::move(**encoded), *descriptor);
+    co_return detail::segment_codec::pair(
+      std::move(**encoded), *descriptor, expected, work.policy());
 }
 
 seastar::future<codec::result<decoded_segment_block>> decode_segment_block(
@@ -801,7 +802,7 @@ seastar::future<codec::result<decoded_segment_block>> decode_segment_block(
             block_limits(work.policy()),
             memory,
             work,
-            block_reader{std::move(expected), *start},
+            block_reader{expected, *start},
             context,
             boundary));
         length = *input.bytes_consumed().checked_sub(initial);
@@ -841,6 +842,8 @@ seastar::future<codec::result<decoded_segment_block>> decode_segment_block(
       advanced.has_value(),
       "validated block could not advance");
     co_return decoded_segment_block{
-      detail::segment_codec::pair(std::move(*bytes), **descriptor), *retained};
+      detail::segment_codec::pair(
+        std::move(*bytes), **descriptor, expected, work.policy()),
+      *retained};
 }
 } // namespace kwaque::storage

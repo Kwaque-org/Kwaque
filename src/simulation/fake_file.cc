@@ -680,10 +680,21 @@ public:
             nullptr,
             intent,
             generation_)
-          .then([](runtime::result<pending_value> outcome) {
+          .then([owner = owner_, object = object_, handle = handle_, position](
+                  runtime::result<pending_value> outcome) {
               auto value = native_value(std::move(outcome));
-              return static_cast<std::size_t>(
-                std::get<byte_count>(value).value());
+              const auto written = std::get<byte_count>(value).value();
+              // Durability is promised only once the completion is returned;
+              // a crash before this point loses the write, as natively.
+              if (
+                handle->synchronous && written != 0
+                && handle->generation == owner->generation_) {
+                  auto synced = owner->flush_written(object, position, written);
+                  if (!synced)
+                      throw runtime::detail::file_operation_exception{
+                        synced.error()};
+              }
+              return static_cast<std::size_t>(written);
           });
     }
 
@@ -3121,6 +3132,78 @@ runtime::result<void> fake_file_system::flush(fake_object_id id) {
     return {};
 }
 
+runtime::result<void> fake_file_system::flush_written(
+  fake_object_id id, std::uint64_t position, std::uint64_t length) {
+    assert_current();
+    if (length == 0) {
+        return {};
+    }
+    if (length > std::numeric_limits<std::uint64_t>::max() - position) {
+        return runtime::failure(file_error(errc::out_of_range));
+    }
+    auto* object = find_inode(id);
+    if (object == nullptr) {
+        return runtime::failure(file_error(errc::not_found));
+    }
+    if (object->kind != fake_file_kind::regular) {
+        return runtime::failure(file_error(errc::is_a_directory));
+    }
+    auto& file = std::get<regular_file_state>(object->state);
+    // A pending truncation commits with the metadata that makes this data
+    // readable, so keep the complete model consistent instead.
+    if (file.cleared_from_page) {
+        return flush(id);
+    }
+    const auto first_page = position / fake_file_page_bytes;
+    const auto final_page = (position + length - 1U) / fake_file_page_bytes;
+    seastar::chunked_vector<std::uint64_t> inserted_pages;
+    try {
+        for (auto page_index = first_page; page_index <= final_page;
+             ++page_index) {
+            const auto visible = file.visible_pages.find(page_index);
+            if (
+              visible == file.visible_pages.end()
+              || file.durable_pages.contains(page_index)) {
+                continue;
+            }
+            const auto [inserted_position, inserted]
+              = file.durable_pages.try_emplace(
+                page_index, page_state{.bytes = visible->second.bytes});
+            static_cast<void>(inserted_position);
+            KWAQUE_INVARIANT(
+              fake_storage_transaction_invariant,
+              inserted,
+              "new durable page was already present");
+            try {
+                inserted_pages.push_back(page_index);
+            } catch (...) {
+                file.durable_pages.erase(page_index);
+                throw;
+            }
+        }
+    } catch (...) {
+        for (const auto page_index : inserted_pages) {
+            file.durable_pages.erase(page_index);
+        }
+        throw;
+    }
+    for (auto page_index = first_page; page_index <= final_page; ++page_index) {
+        const auto visible = file.visible_pages.find(page_index);
+        if (visible == file.visible_pages.end()) {
+            continue;
+        }
+        file.durable_pages.find(page_index)->second.bytes
+          = visible->second.bytes;
+        file.visible_pages.erase(visible);
+    }
+    file.durable_size = std::max(
+      file.durable_size, std::min(file.visible_size, position + length));
+    if (file.visible_pages.empty() && file.durable_size == file.visible_size) {
+        clear_dirty(*object);
+    }
+    return {};
+}
+
 runtime::result<void>
 fake_file_system::prepare_selective_crash(fake_operation_id active) {
     if (crash_ || crash_epoch_ == UINT64_MAX)
@@ -4877,6 +4960,7 @@ fake_file_system::apply_open(metadata_operation& metadata, bool& open_slot) {
     // because its lifecycle requires an explicit close once constructed.
     runtime::operation_statistics_owner statistics;
     auto handle = seastar::make_lw_shared<open_handle_state>();
+    handle->synchronous = metadata.open_options.synchronous;
     seastar::file native{seastar::make_shared<native_file_impl>(
       *this, id, metadata.open_options.access, generation_, handle)};
 

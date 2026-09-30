@@ -360,7 +360,7 @@ struct fixture_pages final {
 };
 inline codec::immutable_object_digest literal_digest(std::string_view literal) {
     const auto raw = hex(literal);
-    codec::sha256_digest digest{};
+    codec::content_digest digest{};
     for (std::size_t i = 0; i < digest.size(); ++i)
         digest[i] = static_cast<std::uint8_t>(raw[i]);
     return codec::immutable_object_digest{digest};
@@ -379,9 +379,7 @@ inline local_root_reference checkpoint_reference() {
              runtime::file_position{},
              byte_count{4096},
              page_count::make(1).value(),
-             literal_digest(
-               "f810eed678e3846621b3de70a679f55db8679e3c8862a1ec13138c2901479f1"
-               "6"))
+             literal_digest("31418feff68a7d139678667989f61e4d"))
       .value();
 }
 inline local_metadata_expectation
@@ -470,16 +468,14 @@ seastar::future<> checkpoint_bundle(
              + local_fixture::read("checkpoint_page"),
       "root/page offsets differ");
     auto wrong = checkpoint_reference();
-    wrong
-      = local_root_reference::make(
-          wrong.kind(),
-          wrong.sequence(),
-          wrong.position(),
-          wrong.bytes(),
-          wrong.pages(),
-          literal_digest(
-            "0000000000000000000000000000000000000000000000000000000000000000"))
-          .value();
+    wrong = local_root_reference::make(
+              wrong.kind(),
+              wrong.sequence(),
+              wrong.position(),
+              wrong.bytes(),
+              wrong.pages(),
+              literal_digest("00000000000000000000000000000000"))
+              .value();
     auto context = checkpoint_expectation(spec);
     context.digest = wrong.digest();
     auto rejected = co_await local_bundle::make(
@@ -541,20 +537,16 @@ seastar::future<> segment_bundles(
             byte_count{4096},
             page_count::make(1).value(),
             literal_digest(
-              is_index ? "c51e48c670a584eae798cac6853d4776806f6839b2858287e1004"
-                         "27d8816b3e1"
-                       : "9dbc526ee010ac9e12206badf2cf00cef7880702a3492879040f5"
-                         "09f77bba73c")));
-        const auto index_context = sparse_index_context::make(
-                                     segment(),
-                                     scope(100, 102, 0, 2, 4096, 16384),
-                                     codec::extent_digest{
-                                       literal_digest(
-                                         "dd3a755a09e37d0e6235b7dec4edc53d1b590"
-                                         "a447deee72491a366cf63ce9d9e")
-                                         .bytes()},
-                                     alignment(4096))
-                                     .value();
+              is_index ? "6bb870e77cf82b929664f981e060b034"
+                       : "1c622fae3a64d8ba0297f7a5d3647a22")));
+        const auto index_context
+          = sparse_index_context::make(
+              segment(),
+              scope(100, 102, 0, 2, 4096, 16384),
+              codec::extent_digest{
+                literal_digest("f2b1003c9e034dfc8ffa143f02be19ab").bytes()},
+              alignment(4096))
+              .value();
         local_metadata_expectation local{
           local_metadata_header::make(
             local_metadata_kind::completed_retry_root,
@@ -614,9 +606,7 @@ seastar::future<> segment_bundles(
             runtime::file_position{16384},
             byte_count{4096},
             page_count::make(1).value(),
-            literal_digest(
-              "96975545e00630e51ef3905c0d3694a44801cafd3f2b4875ab926668a374b7f"
-              "f")));
+            literal_digest("982e762d646470ca20d637b68cbcf8a4")));
         footer_expectation context{
           {segment(),
            alignment(4096),
@@ -703,8 +693,7 @@ seastar::future<> segment_bundles(
         runtime::file_position{4096},
         byte_count{4096},
         page_count::make(0).value(),
-        literal_digest(
-          "7bb455f0a92c8be1ee1ae58801586ee27433bc9e7ed73c8d50a22d3e4cf4e5a3")));
+        literal_digest("6d93f4087752ba9c90cdc90796a30851")));
     auto bundle = take(
       co_await local_bundle::make(
         ref,
@@ -780,7 +769,7 @@ seastar::future<> maximum_bundle(
                            segment(),
                            scope(100, 356, 0, 256, 4096, 257U * 4096U),
                            codec::extent_digest{
-                             exact_sha("bounded fixture extent")},
+                             exact_digest("bounded fixture extent")},
                            alignment(4096))
                            .value();
     // Every page is independently framed; no production encoder creates its
@@ -804,7 +793,7 @@ seastar::future<> maximum_bundle(
             runtime::file_position{},
             byte_count{root.size()},
             page_count::make(source.count).value(),
-            codec::immutable_object_digest{exact_sha(root)}));
+            codec::immutable_object_digest{exact_digest(root)}));
         auto bundle = take(
           co_await local_bundle::make(
             ref,

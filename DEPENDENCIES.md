@@ -21,6 +21,12 @@ The Abseil pin carries a Clang 23 compatibility patch that replaces deprecated
 available, retaining the existing fallback for older compilers. This preserves
 lifetime diagnostics without suppressing warnings or changing runtime behavior.
 
+The xxHash module carries two build patches. The first caps its x86-64
+run-time kernel selection at AVX2: 512-bit kernels can lower the clock of the
+whole core, which a shard-per-core runtime shares. The second exports the
+license file for the distribution. Neither changes any digest; the published
+vectors in `//src/codec/tests:xxh3_test` fix the output.
+
 The Seastar archive at this baseline has SHA-256
 `5918f72ec59c159a8d2fe36870e7d30c6e61426fde766d7dd6853fa7f9871f7f`.
 The archive is the Seastar fork maintained by Redpanda, selected as part of a

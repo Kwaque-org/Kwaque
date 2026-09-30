@@ -13,8 +13,8 @@ namespace kwaque::model {
 // sparse survivors cannot be substituted. The checked builder supplies these
 // preconditions, or an input owner must finish full record-region validation.
 // Borrowed input/work/abort stay alive, immutable and exclusive until
-// completion. Caller reserves input backing/descriptors and verified SHA
-// provider/context, frame and opaque-owner costs before entry. One SHA context
+// completion. Caller reserves input backing/descriptors and the native hash
+// state, frame and opaque-owner costs before entry. One hash state
 // hashes the fixed 127-byte prefix followed by the record bytes, including
 // every size prefix.
 [[nodiscard]] seastar::future<codec::result<codec::semantic_batch_digest>>
@@ -33,8 +33,9 @@ compute_submitted_fingerprint(
 
 // Domain plus TopicID, fixed u32 count and canonical (RangeID, next-u64)
 // entries. No envelope fields enter the projection. value/work/abort stay alive
-// and unchanged through completion; caller reserves input, native SHA and frame
-// costs. Native SHA state ends before the final abort poll and publication.
+// and unchanged through completion; caller reserves input, native hash and
+// frame costs. Native hash state ends before the final abort poll and
+// publication.
 // Each fixed projection leaf needs at least 256 work bytes and 16 items.
 [[nodiscard]] seastar::future<codec::result<codec::checkpoint_digest>>
 compute_checkpoint_fingerprint(

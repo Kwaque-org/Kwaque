@@ -24,7 +24,7 @@ Id literal_id(std::string_view s) {
 }
 codec::immutable_object_digest literal_digest(std::string_view s) {
     const auto bytes = hex(s);
-    codec::sha256_digest value{};
+    codec::content_digest value{};
     if (bytes.size() != value.size())
         throw std::runtime_error("invalid digest literal");
     for (std::size_t i = 0; i < value.size(); ++i)
@@ -80,7 +80,7 @@ TEST(LocalMetadataFixtureTest, IndependentFieldsPinsAndMalformedVerdicts) {
         SCOPED_TRACE(test.name);
         const auto wire = local_fixture::read(test.name);
         ASSERT_EQ(wire.size(), test.bytes);
-        EXPECT_EQ(exact_sha(wire), literal_digest(test.digest).bytes());
+        EXPECT_EQ(exact_digest(wire), literal_digest(test.digest).bytes());
         for (const std::size_t width : {67U, 4096U}) {
             seastar::abort_source abort;
             codec::cooperative_work work{codec::limits::defaults(), abort};
@@ -177,7 +177,7 @@ TEST(
               decoded->value.payload());
             const auto footer = local_fixture::read("footer_a");
             EXPECT_NE(proof.footer.family(), get(footer, 4, 2));
-            EXPECT_EQ(proof.footer.digest().bytes(), exact_sha(footer));
+            EXPECT_EQ(proof.footer.digest().bytes(), exact_digest(footer));
         } else {
             const auto& root = std::get<local_completed_retry_root>(
               decoded->value.payload());

@@ -1,9 +1,11 @@
 #pragma once
 
 #include "src/runtime/production/file.h"
+#include "src/storage/workload_budget.h"
 
 #include <seastar/core/seastar.hh>
 #include <seastar/core/shared_ptr.hh>
+#include <seastar/core/with_scheduling_group.hh>
 #include <seastar/testing/perf_tests.hh>
 #include <seastar/util/defer.hh>
 
@@ -25,6 +27,12 @@ inline std::uint64_t measurement_time() noexcept {
 struct flush_measurement final {
     std::uint64_t begin{0}, end{0};
 };
+// One measured native write. A write through a handle opened for
+// synchronized writes is durable when it completes.
+struct write_measurement final {
+    std::uint64_t position{0}, length{0}, begin{0}, end{0};
+    bool synchronized{false};
+};
 struct io_sample final {
     bool measuring{false}, noop{false};
     std::uint64_t calls{0}, bytes{0}, flushes{0}, active{0}, depth{0};
@@ -36,6 +44,10 @@ struct io_sample final {
     std::uint64_t write_busy_ns{0}, write_max_service_ns{0},
       write_busy_start{0};
     std::array<flush_measurement, 128> flush_times{};
+    // Recorded only when sized before measurement; overflow is reported.
+    std::vector<write_measurement> write_times;
+    std::size_t writes_recorded{0};
+    bool write_times_overflowed{false};
 };
 // The decorator observes the actual native boundary. Namespace, header reads,
 // default native geometry and checked close remain the real file
@@ -43,10 +55,15 @@ struct io_sample final {
 // cannot certify disk durability. Both compared owners use this same decorator.
 class observed_file final : public seastar::file_impl {
 public:
-    observed_file(seastar::file native, io_sample& sample, std::uint64_t size)
+    observed_file(
+      seastar::file native,
+      io_sample& sample,
+      std::uint64_t size,
+      bool synchronized)
       : file_(std::move(native))
       , sample_(sample)
-      , logical_size_(size) {
+      , logical_size_(size)
+      , synchronized_(synchronized) {
         _memory_dma_alignment = static_cast<unsigned>(
           file_.memory_dma_alignment());
         _disk_read_dma_alignment = static_cast<unsigned>(
@@ -86,6 +103,11 @@ public:
                   sample_.write_max_service_ns, duration);
                 if (sample_.active == 0)
                     sample_.write_busy_ns += ended - sample_.write_busy_start;
+                if (sample_.writes_recorded < sample_.write_times.size())
+                    sample_.write_times[sample_.writes_recorded++] = {
+                      pos, len, started, ended, synchronized_};
+                else if (!sample_.write_times.empty())
+                    sample_.write_times_overflowed = true;
             }
         });
         if (sample_.noop) {
@@ -166,6 +188,7 @@ private:
     seastar::file file_;
     io_sample& sample_;
     std::uint64_t logical_size_{0};
+    bool synchronized_{false};
 };
 
 class file_system final {
@@ -183,6 +206,19 @@ public:
         co_await native_.truncate(size);
         co_await native_.flush();
     }
+    // Seastar creates a scheduling group's I/O class, and registers its
+    // metrics, on that group's first read or write. The writer writes from
+    // its workload group, so create that class before an interval starts:
+    // the one-time registration is setup, not measured work.
+    seastar::future<> register_io_class(const workload_budget& budget) {
+        return seastar::with_scheduling_group(
+          budget.scheduling_group(), [this] {
+              return native_
+                .dma_read_bulk<std::uint8_t>(
+                  0, native_.disk_read_dma_alignment())
+                .discard_result();
+          });
+    }
     seastar::future<runtime::result<runtime::file>>
     open(runtime::file_path path, runtime::file_open_options options) {
         // Only the writer's existing-file, read/write reopen is observed.
@@ -196,14 +232,18 @@ public:
         seastar::file_open_options native_options;
         native_options.durable = true;
         auto native = co_await seastar::open_file_dma(
-          path.value(), seastar::open_flags::rw, native_options);
+          path.value(),
+          options.synchronous
+            ? seastar::open_flags::rw | seastar::open_flags::dsync
+            : seastar::open_flags::rw,
+          native_options);
         std::exception_ptr failure;
         try {
             const auto size = co_await native.size();
             native_ = native;
             auto measured
               = observe_io_ ? seastar::file{seastar::make_shared<observed_file>(
-                                native, sample, size)}
+                                native, sample, size, options.synchronous)}
                             : native;
             co_return runtime::file{
               std::move(measured),

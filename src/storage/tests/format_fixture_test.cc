@@ -20,7 +20,7 @@ verified_extent fixture_extent(codec::cooperative_work& work) {
                       work.policy(),
                       extent_layout_kind::initial_append,
                       {},
-                      extent_integrity::crc32c_and_sha256)
+                      extent_integrity::crc32c_and_digest)
                       .value();
     feed_block(verifier, fixture::read("segment_block"), work).value();
     return verifier.finish(work).value();
@@ -114,7 +114,7 @@ TEST(
                          charge)
                          .get();
         ASSERT_TRUE(encoded.has_value());
-        EXPECT_TRUE(encoded->content_equals(wire));
+        EXPECT_TRUE(encoded->bytes().content_equals(wire));
     }
     const auto wire = fixture::read("sealed_footer");
     auto root = pin_root(wire, work);
@@ -327,7 +327,7 @@ TEST(
     const auto plain = fixture::read("segment_block");
     const auto extended = block_wire(child, block_expected(), 41);
     ASSERT_EQ(plain.size(), extended.size());
-    EXPECT_NE(exact_sha(plain), exact_sha(extended));
+    EXPECT_NE(exact_digest(plain), exact_digest(extended));
     for (const auto& wire : {plain, extended}) {
         for (const std::size_t width : {1U, 67U}) {
             seastar::abort_source abort;
@@ -338,7 +338,7 @@ TEST(
                               work.policy(),
                               extent_layout_kind::initial_append,
                               {},
-                              extent_integrity::crc32c_and_sha256)
+                              extent_integrity::crc32c_and_digest)
                               .value();
             auto stored = buffer(wire, width);
             const auto cost = stored.allocation_cost(charge).value();
@@ -358,7 +358,7 @@ TEST(
               verifier.add_block(std::move(stored), expected, memory, work)
                 .get());
             const auto evidence = verifier.finish(work).value();
-            EXPECT_EQ(evidence.digest()->bytes(), exact_sha(wire));
+            EXPECT_EQ(evidence.digest()->bytes(), exact_digest(wire));
             EXPECT_EQ(evidence.boundary().block_count, 1U);
             EXPECT_EQ(
               evidence.boundary().coverage, scope(100, 101, 0, 1, 512, 1024));

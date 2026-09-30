@@ -54,15 +54,22 @@ void scalar_operation(std::string_view name) {
                                 : footer_wire(evidence.boundary(), expected, h);
     const auto fixture = held_string(wire);
     if (encode) {
-        const auto result = measure(name, wire.size(), fixture, [&] {
-            return is_header
-                     ? encode_segment_header(
-                         value, work, available(fixture), charge)
-                         .get()
-                     : encode_durable_footer(
-                         evidence, expected, work, available(fixture), charge)
-                         .get();
-        });
+        const auto result = measure(
+          name,
+          wire.size(),
+          fixture,
+          [&] -> codec::result<bytes::fragmented_buffer> {
+              if (is_header)
+                  return encode_segment_header(
+                           value, work, available(fixture), charge)
+                    .get();
+              auto encoded
+                = encode_durable_footer(
+                    evidence, expected, work, available(fixture), charge)
+                    .get();
+              if (!encoded) return codec::failure(encoded.error());
+              return std::move(*encoded).release_bytes();
+          });
         require(
           result && result->content_equals(wire),
           "scalar encoding changed bytes");

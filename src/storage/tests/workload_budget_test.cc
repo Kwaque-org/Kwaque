@@ -565,3 +565,90 @@ SEASTAR_TEST_CASE(
         co_return;
     });
 }
+
+SEASTAR_TEST_CASE(
+  storage_prepared_grants_preserve_budget_and_exclusive_ownership) {
+    co_await with_budget([](auto& manager) -> seastar::future<> {
+        workload_budget first{
+          manager.acquire_workload(workload), limits(), bytes::testing::charge};
+        workload_budget second{
+          manager.acquire_workload(workload), limits(), bytes::testing::charge};
+        auto held = first.try_reserve(byte_count{4096});
+        BOOST_REQUIRE(held.has_value());
+        BOOST_CHECK(first.owns(*held));
+        BOOST_CHECK(!second.owns(*held));
+        BOOST_CHECK(held->exclusive());
+        {
+            auto alias = held->share();
+            BOOST_CHECK(first.owns(alias));
+            BOOST_CHECK(!held->exclusive());
+            BOOST_CHECK(!alias.exclusive());
+        }
+        BOOST_CHECK(held->exclusive());
+        first.close_admission();
+        const auto before = first.snapshot();
+        const auto cost = first.reservation_charge(byte_count{4096});
+        BOOST_REQUIRE(cost.has_value());
+        BOOST_CHECK(*cost == held->bytes());
+        BOOST_CHECK_EQUAL(first.snapshot().accepted, before.accepted);
+        BOOST_CHECK_EQUAL(first.snapshot().rejected, before.rejected);
+        BOOST_CHECK_EQUAL(first.snapshot().bytes, before.bytes);
+        BOOST_CHECK(!first.try_reserve(byte_count{1}));
+        co_return;
+    });
+}
+
+SEASTAR_TEST_CASE(storage_adopted_grants_keep_one_task_and_their_allowance) {
+    co_await with_budget([](auto& manager) -> seastar::future<> {
+        workload_budget first{
+          manager.acquire_workload(workload), limits(), bytes::testing::charge};
+        workload_budget second{
+          manager.acquire_workload(workload), limits(), bytes::testing::charge};
+        {
+            auto total = first.try_reserve(byte_count{4096});
+            BOOST_REQUIRE(total.has_value());
+            // Twice the task limit: each adopted grant returns its task unit
+            // and control charge, keeping only its requested allowance.
+            for (int i = 0; i != 8; ++i) {
+                auto grant = first.try_reserve(byte_count{1024});
+                BOOST_REQUIRE(grant.has_value());
+                BOOST_REQUIRE(total->adopt(std::move(*grant)).has_value());
+                BOOST_CHECK_EQUAL(first.snapshot().tasks, 1U);
+            }
+            const auto merged = first.reservation_charge(
+              byte_count{4096 + 8 * 1024});
+            BOOST_REQUIRE(merged.has_value());
+            BOOST_CHECK(total->bytes() == *merged);
+            BOOST_CHECK(total->retained_bytes() == byte_count{4096 + 8 * 1024});
+            BOOST_CHECK_EQUAL(first.snapshot().bytes, merged->value());
+
+            auto foreign = second.try_reserve(byte_count{1024});
+            auto own = first.try_reserve(byte_count{1024});
+            BOOST_REQUIRE(foreign.has_value() && own.has_value());
+            const auto before = first.snapshot();
+            // NOLINTBEGIN(bugprone-use-after-move)
+            BOOST_CHECK(!total->adopt(std::move(*foreign)));
+            BOOST_CHECK(foreign->exclusive());
+            BOOST_CHECK(!total->adopt(std::move(*total)));
+            {
+                auto alias = own->share();
+                BOOST_CHECK(!total->adopt(std::move(*own)));
+            }
+            {
+                auto alias = total->share();
+                BOOST_CHECK(!total->adopt(std::move(*own)));
+            }
+            BOOST_REQUIRE(own->try_acquire_handles(1).has_value());
+            BOOST_CHECK(!total->adopt(std::move(*own)));
+            BOOST_CHECK(own->exclusive() && total->exclusive());
+            // NOLINTEND(bugprone-use-after-move)
+            BOOST_CHECK_EQUAL(first.snapshot().tasks, before.tasks);
+            BOOST_CHECK_EQUAL(first.snapshot().bytes, before.bytes);
+            BOOST_CHECK(total->bytes() == *merged);
+        }
+        BOOST_CHECK_EQUAL(first.snapshot().tasks, 0U);
+        BOOST_CHECK_EQUAL(first.snapshot().bytes, 0U);
+        BOOST_CHECK_EQUAL(first.snapshot().handles, 0U);
+        co_return;
+    });
+}

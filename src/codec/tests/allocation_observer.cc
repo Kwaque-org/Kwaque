@@ -1,13 +1,12 @@
 #include "src/codec/tests/allocation_observer.h"
 
+#include "src/bytes/test_allocation_profile.h"
+
 #include <seastar/core/memory.hh>
 #include <seastar/util/critical_alloc_section.hh>
 
-#include <openssl/crypto.h>
-
 #include <algorithm>
 #include <array>
-#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
@@ -33,7 +32,6 @@ struct slot {
 // Loader-initialized test workspace, outside every sampled operation. It is
 // never allocated in a codec frame or charged as production working memory.
 std::array<slot, 16384> slots;
-std::atomic<std::uint64_t> crypto_calls{0};
 thread_local bool active = false;
 thread_local unsigned nesting = 0;
 allocation_observation observation;
@@ -66,6 +64,17 @@ void add(std::uint64_t& value, std::uint64_t bytes) noexcept {
     value += bytes;
 }
 void erase(void* pointer) noexcept;
+void retain(
+  std::uint64_t bytes, bool critical, std::uint64_t largest) noexcept {
+    add(observation.live_upper_bound, bytes);
+    if (critical) add(critical_live, bytes);
+    observation.peak_upper_bound = std::max(
+      observation.peak_upper_bound, observation.live_upper_bound);
+    observation.critical_peak_upper_bound = std::max(
+      observation.critical_peak_upper_bound, critical_live);
+    observation.largest_allocation = std::max(
+      observation.largest_allocation, largest);
+}
 void insert(void* pointer, bool critical) noexcept {
     auto* cell = find(pointer, true);
     if (!cell) {
@@ -82,14 +91,7 @@ void insert(void* pointer, bool critical) noexcept {
     }
     const auto size = ::malloc_usable_size(pointer);
     *cell = slot{pointer, size, critical};
-    add(observation.live_upper_bound, size);
-    if (critical) add(critical_live, size);
-    observation.peak_upper_bound = std::max(
-      observation.peak_upper_bound, observation.live_upper_bound);
-    observation.critical_peak_upper_bound = std::max(
-      observation.critical_peak_upper_bound, critical_live);
-    observation.largest_allocation = std::max<std::uint64_t>(
-      observation.largest_allocation, size);
+    retain(size, critical, size);
 }
 void erase(void* pointer) noexcept {
     if (auto* cell = find(pointer, false)) {
@@ -172,37 +174,62 @@ private:
     bool outer_;
     bool critical_;
 };
-#endif
 
-bool install_crypto_allocation_observation() noexcept {
-#if defined(SEASTAR_DEFAULT_ALLOCATOR)
-    return true;
+// Error-message translation allocates inside libc, beyond executable link
+// wrappers. This synchronous call cannot yield. Count its native allocations
+// and bound every one by the charge for the entire requested-byte delta; retain
+// all charges until end(). This overestimates both overlap and largest size,
+// without excluding translation or tolerating unobserved allocations elsewhere.
+class strerror_observation final {
+public:
+    strerror_observation() noexcept {
+        if (active && nesting == 0) before_.emplace(seastar::memory::stats());
+        ++nesting;
+    }
+    ~strerror_observation() {
+        --nesting;
+        if (!before_) return;
+        const auto after = seastar::memory::stats();
+        if (
+          after.mallocs() < before_->mallocs()
+          || after.total_bytes_allocated() < before_->total_bytes_allocated()
+          || after.failed_allocations() != before_->failed_allocations()
+          || after.foreign_mallocs() != before_->foreign_mallocs()
+          || after.fallback_allocations() != before_->fallback_allocations()) {
+            overflow = true;
+            return;
+        }
+        const auto count = after.mallocs() - before_->mallocs();
+        const auto requested = after.total_bytes_allocated()
+                               - before_->total_bytes_allocated();
+        if (count == 0 && requested == 0) return;
+        if (count == 0 || requested == 0) {
+            overflow = true;
+            return;
+        }
+        const auto largest
+          = bytes::testing::charge(byte_count{requested}).value();
+        if (largest > std::numeric_limits<std::uint64_t>::max() / count) {
+            overflow = true;
+            return;
+        }
+        add(observation.allocations, count);
+        // The opaque call cannot classify individual owners. Conservatively
+        // charge all of them to the critical subset when it is supported.
+#if defined(SEASTAR_ENABLE_ALLOC_FAILURE_INJECTION)
+        constexpr bool critical = true;
 #else
-    return CRYPTO_set_mem_functions(
-             [](std::size_t size, const char*, int) -> void* {
-                 crypto_calls.fetch_add(1, std::memory_order_relaxed);
-                 return size == 0 ? nullptr : __wrap_malloc(size);
-             },
-             [](void* pointer, std::size_t size, const char*, int) -> void* {
-                 crypto_calls.fetch_add(1, std::memory_order_relaxed);
-                 if (size == 0) {
-                     __wrap_free(pointer);
-                     return nullptr;
-                 }
-                 return __wrap_realloc(pointer, size);
-             },
-             [](void* pointer, const char*, int) { __wrap_free(pointer); })
-           == 1;
+        constexpr bool critical = false;
 #endif
-}
+        retain(count * largest, critical, largest);
+    }
+    strerror_observation(const strerror_observation&) = delete;
+    strerror_observation& operator=(const strerror_observation&) = delete;
 
-std::uint64_t crypto_allocation_calls() noexcept {
-#if defined(SEASTAR_DEFAULT_ALLOCATOR)
-    return 0;
-#else
-    return crypto_calls.load(std::memory_order_relaxed);
+private:
+    std::optional<seastar::memory::statistics> before_;
+};
 #endif
-}
 
 void begin_allocation_observation() noexcept {
 #if !defined(SEASTAR_DEFAULT_ALLOCATOR)
@@ -241,6 +268,14 @@ allocation_observation end_allocation_observation() noexcept {
 
 #if !defined(SEASTAR_DEFAULT_ALLOCATOR)
 using kwaque::codec::testing::allocation_call;
+
+extern "C" char*
+__real_strerror_r(int error, char* buffer, std::size_t length) noexcept;
+extern "C" char*
+__wrap_strerror_r(int error, char* buffer, std::size_t length) noexcept {
+    kwaque::codec::testing::strerror_observation scope;
+    return __real_strerror_r(error, buffer, length);
+}
 
 extern "C" void* __real_malloc(std::size_t size) noexcept;
 extern "C" void* __wrap_malloc(std::size_t size) noexcept {

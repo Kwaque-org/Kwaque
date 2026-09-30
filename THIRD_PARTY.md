@@ -35,6 +35,7 @@ embedded source file is authoritative.
 | `rules_foreign_cc` | 0.15.1 | https://github.com/bazel-contrib/rules_foreign_cc | Apache-2.0 | Build only | Hermetic builds for native libraries without Bazel metadata |
 | `rules_pkg` | 1.0.1 | https://github.com/bazelbuild/rules_pkg | Apache-2.0 | Build only | Distribution packages |
 | `rules_python` | 1.7.0 | https://github.com/bazelbuild/rules_python | Apache-2.0 | Build only | Repository tooling and test scripts |
+| xxHash (`xxhash`) | 0.8.3.bcr.1 | https://github.com/Cyan4973/xxHash | BSD-2-Clause | Static link input; license bundled | Non-cryptographic 128-bit content identities (XXH3-128); x86-64 dispatch capped at AVX2 |
 | yaml-cpp | 0.8.0 | https://github.com/jbeder/yaml-cpp | MIT | Static link input; license bundled | Broker configuration parsing |
 | Seastar | `a6ac2ff6190a4a9dce5059991355703e1073d11f` | Pinned archive declared by the build; the Seastar fork maintained by Redpanda, upstream project https://github.com/scylladb/seastar | Apache-2.0 | Static link input; license and notice bundled | Sharded asynchronous runtime |
 | c-ares | 1.34.7 | https://github.com/c-ares/c-ares | MIT | Static link input; license bundled | Asynchronous DNS for Seastar |

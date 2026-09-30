@@ -24,7 +24,7 @@ namespace mi = testing::manifest;
 namespace ix = testing::index;
 
 // All sequential children spend the same operation reservation. Reserve one
-// MiB for native SHA state, frames and fixed owners before admitting any input.
+// MiB for hash state, frames and fixed owners before admitting any input.
 // Fixture strings are payload; fixture/decoded vectors are metadata. No input
 // backing is charged again as an alias, and no full-object entry vector exists.
 codec::decode_budget memory_for(
@@ -170,7 +170,7 @@ void qualify_index(std::size_t h, std::uint64_t a, bool underfilled) {
         auto decoded = decode_sparse_index_root(
                          input,
                          context,
-                         codec::immutable_object_digest{ix::sha(wire)},
+                         codec::immutable_object_digest{ix::digest_of(wire)},
                          memory,
                          work)
                          .get()
@@ -275,7 +275,8 @@ void qualify_manifest(std::size_t h, std::uint64_t a, bool underfilled) {
                          mi::mc(),
                          rh.logical_span(),
                          alignment(a),
-                         codec::immutable_object_digest{mi::manifest_sha(wire)},
+                         codec::immutable_object_digest{
+                           mi::manifest_digest(wire)},
                          memory,
                          work)
                          .get()

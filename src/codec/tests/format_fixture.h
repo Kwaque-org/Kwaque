@@ -44,10 +44,11 @@ inline std::string read(std::string_view name) {
     return result;
 }
 
-inline std::array<unsigned char, 32> digest(std::string_view name) {
+// A content digest fixture holds exactly the 16-byte digest value.
+inline std::array<unsigned char, 16> digest(std::string_view name) {
     const auto wire = read(name);
-    if (wire.size() != 32) throw std::runtime_error("invalid digest fixture");
-    std::array<unsigned char, 32> result{};
+    if (wire.size() != 16) throw std::runtime_error("invalid digest fixture");
+    std::array<unsigned char, 16> result{};
     for (std::size_t i = 0; i < result.size(); ++i)
         result[i] = static_cast<unsigned char>(wire[i]);
     return result;

@@ -305,7 +305,7 @@ private:
                               work.policy(),
                               extent_layout_kind::initial_append,
                               {},
-                              extent_integrity::crc32c_and_sha256)
+                              extent_integrity::crc32c_and_digest)
                               .value();
             (co_await verifier.add_block(
                std::move(bytes), testing::batch_expected(), memory, work))
@@ -338,7 +338,8 @@ private:
             pages_.push_back(co_await layout(wire, work));
         }
         const auto wire = source_->root_wire(refs);
-        digest_ = codec::immutable_object_digest{testing::index::sha(wire)};
+        digest_ = codec::immutable_object_digest{
+          testing::index::digest_of(wire)};
         root_wire_ = co_await layout(wire, work);
         {
             fragmented_buffer_parser input{root_wire_.share()};

@@ -203,9 +203,10 @@ public:
       = bytes::max_buffer_fragments) const noexcept;
 
 private:
-    // Each chunk allocation is conservatively admitted with its first node;
-    // retained chunks are disabled, so node charges cover every live chunk.
-    seastar::chunked_fifo<wal_write_descriptor::pointer, 16> inflight_;
+    // Each chunk allocation is conservatively admitted with its first node.
+    // The queue empties at every idle point and keeps that one emptied chunk
+    // for reuse; the owning writer's startup reservation charges it.
+    seastar::chunked_fifo<wal_write_descriptor::pointer, 16, 1> inflight_;
     runtime::owner_shard owner_;
     std::uint32_t maximum_;
     byte_count maximum_bytes_, bytes_{}, retained_{};

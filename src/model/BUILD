@@ -253,7 +253,7 @@ kwaque_cc_library(
     implementation_deps = [
         ":batch_wire",
         ":checkpoint_wire",
-        "//src/codec:sha256",
+        "//src/codec:xxh3",
     ],
     visibility = [
         "//src/model/tests:__pkg__",

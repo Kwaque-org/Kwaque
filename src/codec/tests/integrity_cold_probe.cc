@@ -1,6 +1,6 @@
 #include "src/codec/crc32c.h"
 #include "src/codec/digest.h"
-#include "src/codec/sha256.h"
+#include "src/codec/xxh3.h"
 
 #include <seastar/core/app-template.hh>
 #include <seastar/core/memory.hh>
@@ -108,16 +108,35 @@ int cold_crc(std::size_t length, std::uint32_t expected) {
     return 0;
 }
 
-int cold_sha() {
-    constexpr kwaque::codec::sha256_digest expected{
-      0xba, 0x78, 0x16, 0xbf, 0x8f, 0x01, 0xcf, 0xea, 0x41, 0x41, 0x40,
-      0xde, 0x5d, 0xae, 0x22, 0x23, 0xb0, 0x03, 0x61, 0xa3, 0x96, 0x17,
-      0x7a, 0x9c, 0xb4, 0x10, 0xff, 0x61, 0xf2, 0x00, 0x15, 0xad};
-    kwaque::codec::sha256_hasher hasher;
-    hasher.update("abc", 3);
-    require(
-      std::move(hasher).final() == expected, "cold SHA known answer mismatch");
-    std::puts("phase=cold-sha input=abc status=ok");
+// Production content identities stream through a heap-held state and, on
+// x86-64, a kernel selected while the program loads.
+constexpr kwaque::codec::content_digest xxh3_4096{
+  0x03,
+  0x91,
+  0x65,
+  0x78,
+  0x96,
+  0x9f,
+  0x7a,
+  0x66,
+  0xeb,
+  0x4b,
+  0x7c,
+  0x37,
+  0x07,
+  0x87,
+  0x91,
+  0x51};
+
+kwaque::codec::content_digest xxh3_input() {
+    kwaque::codec::xxh3_128_hasher hasher;
+    hasher.update(input.data(), input.size());
+    return std::move(hasher).final();
+}
+
+int cold_xxh3() {
+    require(xxh3_input() == xxh3_4096, "cold XXH3 known answer mismatch");
+    std::puts("phase=cold-xxh3 bytes=4096 status=ok");
     return 0;
 }
 
@@ -224,20 +243,11 @@ int measure_crc(bool google, std::size_t length, std::uint32_t expected) {
       validate);
 }
 
-int measure_sha() {
-    constexpr kwaque::codec::sha256_digest expected{
-      0xba, 0x78, 0x16, 0xbf, 0x8f, 0x01, 0xcf, 0xea, 0x41, 0x41, 0x40,
-      0xde, 0x5d, 0xae, 0x22, 0x23, 0xb0, 0x03, 0x61, 0xa3, 0x96, 0x17,
-      0x7a, 0x9c, 0xb4, 0x10, 0xff, 0x61, 0xf2, 0x00, 0x15, 0xad};
+int measure_xxh3() {
     return measure_first_use(
-      "openssl_sha256",
-      3,
-      [] {
-          kwaque::codec::sha256_hasher hasher;
-          hasher.update("abc", 3);
-          return std::move(hasher).final();
-      },
-      [expected](const auto& result) { return result == expected; });
+      "xxh3_128", input.size(), xxh3_input, [](const auto& result) {
+          return result == xxh3_4096;
+      });
 }
 
 int warm_crc() {
@@ -323,8 +333,8 @@ int exercise(std::string_view scenario) {
         return 0;
     }
     require_effective_policy();
-    if (scenario == "measure-sha") {
-        return measure_sha();
+    if (scenario == "measure-xxh3") {
+        return measure_xxh3();
     }
     for (const auto& [length, expected] :
          {std::pair{32U, 0x46dd794eU},
@@ -352,8 +362,8 @@ int exercise(std::string_view scenario) {
     if (scenario == "crc-4096") {
         return cold_crc(4096, 0x9c71fe32U);
     }
-    if (scenario == "sha-abc") {
-        return cold_sha();
+    if (scenario == "xxh3-4096") {
+        return cold_xxh3();
     }
     if (scenario == "crc-warm") {
         return warm_crc();

@@ -1,4 +1,4 @@
-#include "src/codec/sha256.h"
+#include "src/codec/xxh3.h"
 #include "src/resource/resource_registry.h"
 #include "src/runtime/production/clocks.h"
 #include "src/runtime/production/timer.h"
@@ -109,8 +109,8 @@ struct commit_driver final {
         return future;
     }
 };
-std::array<char, 65> hex_digest(codec::sha256_digest digest) {
-    std::array<char, 65> result{};
+std::array<char, 33> hex_digest(codec::content_digest digest) {
+    std::array<char, 33> result{};
     constexpr char digits[] = "0123456789abcdef";
     for (std::size_t i = 0; i != digest.size(); ++i) {
         result[2 * i] = digits[digest[i] >> 4U];
@@ -158,6 +158,19 @@ struct wal_commit_bench {
         require(
           !preallocate || Profile != arrival_profile::rotation,
           "rotation uses growing files");
+        // The writer zero-writes a window covering every measured write before
+        // measurement and makes small cohorts durable by synchronized writes,
+        // so a cohort needs no flush unless one of its writes was ordinary.
+        // It replaces the fallocated setup extent for this owner.
+        const bool zero_written = std::getenv("KWAQUE_WAL_ZERO_WRITTEN")
+                                  != nullptr;
+        require(
+          !zero_written || Profile != arrival_profile::rotation,
+          "rotation uses growing files");
+        constexpr std::uint64_t zero_window = std::min<std::uint64_t>(
+          128U << 20U,
+          ((8192 + count * (Size + 65536) + (2U << 20U) - 1) / (2U << 20U))
+            * (2U << 20U));
         const bool foreground_probe = std::getenv("KWAQUE_WAL_FOREGROUND_PROBE")
                                       != nullptr;
         const auto configuration = resource::resource_config::from_total_memory(
@@ -195,6 +208,9 @@ struct wal_commit_bench {
                       charge};
                     auto writer_config = wal_writer_contract::configuration();
                     writer_config.capacity_bytes = byte_count{128U << 20U};
+                    if (zero_written)
+                        writer_config.preallocation_bytes = byte_count{
+                          zero_window};
                     writer_config.children.working_bytes = byte_count{
                       16U << 20U};
                     co_await wal_append_contract::with_writer(
@@ -262,6 +278,9 @@ struct wal_commit_bench {
                                 + (2U << 20U) - 1)
                                / (2U << 20U))
                               * (2U << 20U);
+                          require(
+                            !zero_written || setup_extent <= zero_window,
+                            "zero-written window does not cover the workload");
                           std::array<std::optional<wal_group>, count> offers;
                           std::array<std::optional<workload_reservation>, count>
                             preparation;
@@ -395,8 +414,11 @@ struct wal_commit_bench {
                                       take(groups->template start<clock>(
                                         batching));
                               }
-                              if (preallocate)
+                              if (preallocate && !zero_written)
                                   co_await files.prepare_extent(setup_extent);
+                              if (zero_written && !timing_only)
+                                  files.sample.write_times.resize(4096);
+                              co_await files.register_io_class(budget);
                               const auto before_allocations
                                 = seastar::memory::stats().mallocs();
                               const auto before_tasks = seastar::engine()
@@ -727,7 +749,7 @@ struct wal_commit_bench {
                             seastar::get_current_cpuset() == affinity,
                             "benchmark CPU affinity changed during execution");
                           const auto stats = writer.statistics();
-                          if (preallocate) {
+                          if (preallocate && !zero_written) {
                               std::uint64_t final_extent = 8192;
                               for (const auto& request : requests)
                                   if (request.accepted)
@@ -744,8 +766,22 @@ struct wal_commit_bench {
                           if constexpr (fixed)
                               require(
                                 accepted_count == count
-                                  && stats.flush_calls == count / window,
+                                  && (zero_written
+                                        ? stats.flush_calls <= count / window
+                                        : stats.flush_calls == count / window),
                                 "fixed pair changed work or barrier count");
+                          // Only an ordinary write needs a flush: all-
+                          // synchronized work flushes never.
+                          require(
+                            !zero_written
+                              || (stats.synchronized_writes <= stats.write_calls
+                                  && (stats.synchronized_writes
+                                        != stats.write_calls
+                                      || stats.flush_calls == 0)),
+                            "zero-written flush rule broken");
+                          require(
+                            !files.sample.write_times_overflowed,
+                            "write measurement exceeded its bound");
                           require(
                             stats.accepted_groups == accepted_count,
                             "offered work accounting lost an accepted group");
@@ -763,7 +799,7 @@ struct wal_commit_bench {
                                        <= maximum_contiguous_allocation_bytes,
                                 "allocation observation incomplete or exceeded "
                                 "contiguous ceiling");
-                          codec::sha256_hasher expected_hash, actual_hash;
+                          codec::xxh3_128_hasher expected_hash, actual_hash;
                           std::optional<std::ofstream> fixture, layout;
                           if (
                             const char* destination = std::getenv(
@@ -882,16 +918,17 @@ struct wal_commit_bench {
                               == hex_digest(std::move(actual_hash).final()),
                             "benchmark byte digest mismatch");
                           std::printf(
-                            "wal_cohort_v1 "
+                            "wal_cohort_v2 "
                             "{\"owner\":\"%s\",\"case\":\"%s\",\"observation\":"
                             "\"%s\",\"size\":%zu,"
                             "\"fragmented\":%s,\"delay_ns\":%" PRIu64
                             ",\"timing_only\":%s,\"preallocated\":%s,"
+                            "\"zero_written\":%s,"
                             "\"foreground_probe\":%s,\"offered\":%zu,"
                             "\"accepted\":%zu,\"elapsed_ns\":%" PRIu64
                             ",\"encoded_bytes\":%" PRIu64
                             ",\"child_bytes\":%" PRIu64
-                            ",\"child_fragments\":%zu,\"sha256\":\"%s\","
+                            ",\"child_fragments\":%zu,\"digest\":\"%s\","
                             "\"flushes\":%" PRIu64 ",\"native_calls\":%" PRIu64
                             ",\"allocations\":%" PRIu64 ",\"tasks\":%" PRIu64
                             ",\"sampled_retained_admission\":%" PRIu64
@@ -910,6 +947,7 @@ struct wal_commit_bench {
                             Delay,
                             timing_only ? "true" : "false",
                             preallocate ? "true" : "false",
+                            zero_written ? "true" : "false",
                             foreground_probe ? "true" : "false",
                             count,
                             accepted_count,
@@ -975,7 +1013,7 @@ struct wal_commit_bench {
                             "\"target_bytes\":%" PRIu64
                             ",\"group_capacity\":%u,\"native_depth\":%" PRIu64
                             ",\"logical_writes\":%" PRIu64 ",\"flush_times\":[",
-                            preallocate ? setup_extent : 0,
+                            preallocate || zero_written ? setup_extent : 0,
                             static_cast<std::uint64_t>(status.device_id),
                             comparison,
                             cfg.target_members,
@@ -991,7 +1029,29 @@ struct wal_commit_bench {
                                     i ? "," : "",
                                     files.sample.flush_times[i].begin,
                                     files.sample.flush_times[i].end);
-                          std::printf("],\"affinity_cpus\":[");
+                          std::printf("]");
+                          if (zero_written && !timing_only) {
+                              std::printf(
+                                ",\"zero_written_extent\":%" PRIu64
+                                ",\"write_times\":[",
+                                zero_window);
+                              for (std::size_t i = 0;
+                                   i != files.sample.writes_recorded;
+                                   ++i) {
+                                  const auto& w = files.sample.write_times[i];
+                                  std::printf(
+                                    "%s[%" PRIu64 ",%" PRIu64 ",%" PRIu64
+                                    ",%" PRIu64 ",%s]",
+                                    i ? "," : "",
+                                    w.position,
+                                    w.length,
+                                    w.begin,
+                                    w.end,
+                                    w.synchronized ? "true" : "false");
+                              }
+                              std::printf("]");
+                          }
+                          std::printf(",\"affinity_cpus\":[");
                           bool first_cpu = true;
                           for (auto cpu : affinity) {
                               std::printf("%s%u", first_cpu ? "" : ",", cpu);

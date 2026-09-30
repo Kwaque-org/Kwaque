@@ -133,13 +133,26 @@ public:
 
 private:
     friend class detail::segment_codec;
+    friend class extent_verifier;
     segment_block(
       kwaque::bytes::fragmented_buffer bytes,
-      complete_block_descriptor descriptor) noexcept
+      complete_block_descriptor descriptor,
+      segment_block_expectation placement,
+      codec::limits validated) noexcept
       : bytes_(std::move(bytes))
-      , descriptor_(descriptor) {}
-    kwaque::bytes::fragmented_buffer bytes_;
+      , descriptor_(descriptor)
+      , alignment_(placement.location.alignment())
+      , data_start_(placement.data_start)
+      , profile_(placement.profile)
+      , validated_(validated) {}
+    // Decode fallback may promote sharing controls while the bytes themselves
+    // remain immutable. The verifier borrows this owner exclusively.
+    mutable kwaque::bytes::fragmented_buffer bytes_;
     complete_block_descriptor descriptor_;
+    storage_alignment alignment_;
+    runtime::file_position data_start_;
+    storage_profile profile_;
+    codec::limits validated_;
 };
 
 struct decoded_segment_block final {

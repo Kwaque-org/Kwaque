@@ -5,25 +5,21 @@
 #include "src/codec/collection.h"
 #include "src/codec/cooperative.h"
 #include "src/codec/crc32c_cooperative.h"
-#include "src/codec/digest.h"
 #include "src/codec/error.h"
 #include "src/codec/integer.h"
 #include "src/codec/limits.h"
-#include "src/codec/sha256.h"
-#include "src/codec/sha256_cooperative.h"
 #include "src/codec/staging_cooperative.h"
 #include "src/codec/tests/envelope_fuzz_cases.h"
 #include "src/codec/transaction.h"
+#include "src/codec/xxh3.h"
+#include "src/codec/xxh3_cooperative.h"
 #include "src/runtime/testing/seastar_fuzz.h"
 
 #include <seastar/core/abort_source.hh>
 #include <seastar/core/chunked_fifo.hh>
 #include <seastar/core/future.hh>
 #include <seastar/core/temporary_buffer.hh>
-#include <seastar/util/defer.hh>
 #include <seastar/util/later.hh>
-
-#include <openssl/crypto.h>
 
 #include <algorithm>
 #include <array>
@@ -164,11 +160,10 @@ void require_abort(const auto& result) {
 void hashes(const script& input) {
     const auto seed = 0x9e3779b9U ^ input.control[4];
     const auto crc_expected = reference_crc(input.payload, seed);
-    codec::sha256_hasher reference;
-    reference.update(input.payload.data(), input.payload.size());
-    const auto sha_expected = std::move(reference).final();
+    const auto digest_expected = codec::xxh3_128(
+      input.payload.data(), input.payload.size());
     auto crc_input = fragmented(input.payload, input.control[5]);
-    auto sha_input = fragmented(
+    auto digest_input = fragmented(
       input.payload, static_cast<std::uint8_t>(input.control[5] ^ 0xffU));
     seastar::abort_source abort;
     codec::cooperative_work work{
@@ -183,12 +178,12 @@ void hashes(const script& input) {
         auto crc = codec::crc32c_cooperatively(
                      std::move(crc_input), work, seed, anchor)
                      .get();
-        auto sha = codec::sha256_cooperatively(
-                     std::move(sha_input), work, anchor)
-                     .get();
-        return std::pair{std::move(crc), std::move(sha)};
+        auto digest = codec::xxh3_128_cooperatively(
+                        std::move(digest_input), work, anchor)
+                        .get();
+        return std::pair{std::move(crc), std::move(digest)};
     });
-    require(crc_input.empty() && sha_input.empty());
+    require(crc_input.empty() && digest_input.empty());
     if (results.first) {
         require(!input.initially_aborted() && *results.first == crc_expected);
     } else {
@@ -196,7 +191,8 @@ void hashes(const script& input) {
         require_abort(results.first);
     }
     if (results.second) {
-        require(!input.initially_aborted() && *results.second == sha_expected);
+        require(
+          !input.initially_aborted() && *results.second == digest_expected);
     } else {
         require(abort.abort_requested());
         require_abort(results.second);
@@ -467,10 +463,7 @@ LLVMFuzzerTestOneInput(const std::uint8_t* data, std::size_t size) {
     for (std::size_t index = 0; index < size; ++index) {
         owned[index] = std::bit_cast<char>(data[index]);
     }
-    kwaque::runtime::testing::run_fuzz_input([owned = std::move(owned)] {
-        // Release this worker's crypto state before process-wide cleanup runs.
-        auto cleanup = seastar::defer([] noexcept { OPENSSL_thread_stop(); });
-        exercise(owned);
-    });
+    kwaque::runtime::testing::run_fuzz_input(
+      [owned = std::move(owned)] { exercise(owned); });
     return 0;
 }

@@ -7,6 +7,7 @@
 #include "src/storage/wal_child.h"
 #include "src/storage/wal_inventory.h"
 #include "src/storage/wal_writer_state.h"
+#include "src/storage/zero_fill.h"
 
 #include <seastar/core/condition-variable.hh>
 #include <seastar/core/with_scheduling_group.hh>
@@ -18,8 +19,25 @@ namespace kwaque::storage {
 enum class wal_start_intent : std::uint8_t { known_unactivated };
 struct wal_writer_config final {
     storage_alignment alignment;
-    // Logical bound only. Files grow through writes; no preallocation or reuse.
+    // Logical bound. Without preallocation, files grow through writes; no
+    // file is reused.
     byte_count capacity_bytes;
+    // Preparing a file writes zeros this far past its header (capped by the
+    // capacity) and makes them durable once. Writes inside the zero-written
+    // range overwrite allocated blocks inside the file size, so their
+    // durability needs no allocation metadata. The file then ends in zeros
+    // past its last frame, which never decode as a frame. Zero disables it.
+    byte_count preallocation_bytes{};
+    // Keeps the zero-written range ahead of the reservations: whenever less
+    // than this remains past the reserved end, zero-write this much more in
+    // the background. Writes past its start wait for it. Nonzero requires
+    // preallocation.
+    byte_count preallocation_extension_bytes{};
+    // A gathered write no larger than this, wholly inside the zero-written
+    // range, uses a second handle opened for synchronized writes: its
+    // completion is durable, so a barrier covering only such writes needs no
+    // flush. Larger writes use the ordinary handle and the barrier's flush.
+    byte_count synchronous_write_bytes{byte_count{1U << 20U}};
     replay_profile profile{replay_profile::v1};
     std::uint32_t maximum_descriptors{64};
     byte_count maximum_pending_bytes{runtime::maximum_file_io_bytes};
@@ -29,6 +47,8 @@ struct wal_writer_config final {
 struct wal_writer_statistics final {
     std::uint64_t accepted_groups{0}, encoded_groups{0}, write_calls{0},
       gathered_groups{0}, flush_calls{0}, rotations{0};
+    // Writes durable at completion, and background zero-written extensions.
+    std::uint64_t synchronized_writes{0}, extensions{0};
 };
 
 // A size observation is neither an allocation guarantee nor a complete end.
@@ -59,6 +79,12 @@ class wal_writer final : public runtime::shard_affine {
         std::optional<completion_resources> completion;
         std::optional<local_file_publisher<Backend>> publisher;
         local_publication_outcome header_publication, head_publication;
+        // Synchronized-write handle for [zero_begin, zeroed_end); extensions
+        // begin at or after issued_end. A flush is needed only after an
+        // ordinary write completed since the last flush began.
+        std::optional<runtime::file> sync;
+        std::uint64_t zero_begin{0}, zeroed_end{0}, issued_end{0};
+        std::uint64_t plain_writes{0}, flushed_plain_writes{0};
         bool ancestors_ready{false}, verified{false}, ready{false};
         bool retryable{false}, abandoned{false};
     };
@@ -90,7 +116,12 @@ public:
           || config.maximum_pending_bytes > runtime::maximum_file_io_bytes
           || config.capacity_bytes <= config.alignment.bytes()
           || config.capacity_bytes.value() % config.alignment.bytes().value()
-               != 0)
+               != 0
+          || config.preallocation_bytes > config.capacity_bytes
+          || config.preallocation_extension_bytes > config.capacity_bytes
+          || (config.preallocation_extension_bytes.value() != 0
+              && config.preallocation_bytes.value() == 0)
+          || config.synchronous_write_bytes > runtime::maximum_file_io_bytes)
             return runtime::failure(detail::path_error(errc::invalid_argument));
         if (
           auto profile = parse_replay_profile(
@@ -127,6 +158,9 @@ public:
           byte_count{runtime::maximum_file_path_bytes + 1});
         auto token = budget.allocation_charge(
           byte_count{sizeof(wal_captured_boundary::lifetime) + 64});
+        // The write queue's one emptied chunk kept for reuse.
+        auto chunk = budget.allocation_charge(
+          byte_count{16 * sizeof(detail::wal_write_descriptor::pointer) + 64});
         // Select the largest power-of-two chunk whose allocator-served charge
         // fits the ceiling. Install this bound on each file before activation;
         // reserving a smaller amount alone would not bound native staging.
@@ -143,13 +177,30 @@ public:
         if (!instance) return runtime::failure(instance.error());
         if (!path) return runtime::failure(path.error());
         if (!token) return runtime::failure(token.error());
+        if (!chunk) return runtime::failure(chunk.error());
         if (!staging) return runtime::failure(staging.error());
         if (!gather) return runtime::failure(gather.error());
+        // A zero-written file also owns a synchronized-write handle with its
+        // own staging window, and the retained zero chunk and its lists. The
+        // chunk uses the same qualified size as staging; writes repeat it.
+        const std::uint64_t handles = config.preallocation_bytes.value() != 0
+                                        ? 2
+                                        : 1;
+        std::uint64_t zero = 0;
+        if (handles == 2) {
+            auto lists = budget.allocation_charge(
+              byte_count{
+                2 * detail::zero_write_chunks
+                * bytes::fragmented_buffer::fragment_descriptor_size()});
+            if (!lists) return runtime::failure(lists.error());
+            zero = staging->value() + lists->value();
+        }
         auto held = budget.try_reserve(
           byte_count{
-            instance->value() + 16 * path->value() + 65536
-            + 2 * runtime::maximum_file_write_concurrency * staging->value()
-            + gather->value()});
+            instance->value() + 16 * path->value() + chunk->value() + 65536
+            + handles * 2 * runtime::maximum_file_write_concurrency
+                * staging->value()
+            + gather->value() + zero});
         if (!held) return runtime::failure(held.error());
         auto token_held = budget.try_reserve(*token);
         if (!token_held) return runtime::failure(token_held.error());
@@ -575,14 +626,16 @@ private:
             first_.observe(std::current_exception());
         }
         if (
-          current_file().file || current_file().publisher
-          || successor_file().file || successor_file().publisher) {
+          current_file().file || current_file().sync || current_file().publisher
+          || successor_file().file || successor_file().sync
+          || successor_file().publisher) {
             // A close-frame allocation failure precedes native close. Keep
             // ownership for a later joined attempt; never destroy an open file.
             closing_ = false;
             co_return first_.outcome();
         }
         rotation_.reset();
+        zero_ = {};
         shutdown_subscription_ = std::nullopt;
         control_.wal_writer_active_ = false;
         closed_ = true;
@@ -877,7 +930,14 @@ private:
     }
     seastar::future<> dispatch() {
         dispatcher_started_.set_value();
-        while (!dispatcher_stopping_ || !inflight_.empty()) {
+        while (!dispatcher_stopping_ || !inflight_.empty() || extension_) {
+            if (extension_ && extension_->available()) {
+                extension_->get();
+                extension_.reset();
+                changed_.broadcast();
+                continue;
+            }
+            maybe_extend();
             if (
               inflight_.empty()
               || inflight_.front()->state()
@@ -923,6 +983,25 @@ private:
             const auto count = prefix.groups, fragments = prefix.fragments;
             const auto logical = prefix.logical, retained = prefix.retained;
             const auto position = inflight_.front()->extent().begin();
+            // Small writes inside the zero-written range are pure overwrites:
+            // synchronized completion makes them durable without a flush.
+            // Anything else needs the barrier's, and waits for an extension
+            // that may be zero-writing its range.
+            auto& slot = current_file();
+            const auto end = position.value() + logical.value();
+            const bool synchronous = slot.sync
+                                     && logical
+                                          <= config_.synchronous_write_bytes
+                                     && position.value() >= slot.zero_begin
+                                     && end <= slot.zeroed_end;
+            if (!synchronous && extending_) {
+                // No further extension starts until this write is issued.
+                plain_waiting_ = true;
+                co_await changed_.when();
+                continue;
+            }
+            plain_waiting_ = false;
+            slot.issued_end = std::max(slot.issued_end, end);
             std::size_t index = 0;
             for (const auto& node : inflight_) {
                 if (index == count) break;
@@ -985,12 +1064,19 @@ private:
                     if (!failed.failed()) {
                         ++statistics_.write_calls;
                         statistics_.gathered_groups += count - 1;
-                        auto written = co_await current_file().file->write(
-                          position, std::move(data));
+                        auto written = co_await (
+                                         synchronous ? *slot.sync : *slot.file)
+                                         .write(position, std::move(data));
                         failed.observe(written);
                         if (written && *written != logical)
                             failed.observe(
                               detail::path_error(errc::io_failure));
+                        if (!failed.failed()) {
+                            if (synchronous)
+                                ++statistics_.synchronized_writes;
+                            else
+                                ++slot.plain_writes;
+                        }
                     }
                 } else if (!failed.failed())
                     failed = first_;
@@ -1025,10 +1111,19 @@ private:
             if (
               !first_.failed()
               && positions_->durable.position() < cut.cursor_.position()) {
-                ++statistics_.flush_calls;
-                first_.observe(
-                  co_await current_file().file->flush(
-                    current_file().completion->metadata()));
+                auto& slot = current_file();
+                // Synchronized writes were durable when they completed. A
+                // flush covers every ordinary write completed before it began,
+                // so a zero-written file flushes only if one completed since.
+                const auto covered = slot.plain_writes;
+                if (!slot.sync || covered != slot.flushed_plain_writes) {
+                    ++statistics_.flush_calls;
+                    first_.observe(
+                      co_await slot.file->flush(slot.completion->metadata()));
+                    if (!first_.failed())
+                        slot.flushed_plain_writes = std::max(
+                          slot.flushed_plain_writes, covered);
+                }
                 if (!first_.failed()) check_selected_head();
                 if (!first_.failed()) positions_->durable = cut.cursor_;
             }
@@ -1112,6 +1207,15 @@ private:
             }
         }
         if (slot.completion) slot.completion->release_metadata();
+        if (slot.sync) {
+            try {
+                first_.observe(co_await slot.sync->close());
+            } catch (...) {
+                first_.observe(std::current_exception());
+            }
+            if (slot.sync->state() == runtime::file_state::closed)
+                slot.sync.reset();
+        }
         if (slot.file) {
             try {
                 first_.observe(co_await slot.file->close());
@@ -1122,7 +1226,8 @@ private:
                 slot.file.reset();
         }
         if (!slot.file) slot.completion.reset();
-        if (!slot.file && !slot.publisher) slot.preparation.reset();
+        if (!slot.file && !slot.sync && !slot.publisher)
+            slot.preparation.reset();
     }
     static bool admission_pressure(runtime::operation_error error) noexcept {
         return detail::publication_admission_pressure(error);
@@ -1174,7 +1279,8 @@ private:
                 slot.retryable = admission_pressure(held.error());
                 co_return runtime::failure(held.error());
             }
-            auto handles = held->try_acquire_handles(1);
+            auto handles = held->try_acquire_handles(
+              config_.preallocation_bytes.value() != 0 ? 2U : 1U);
             if (!handles) {
                 slot.retryable = admission_pressure(handles.error());
                 co_return runtime::failure(handles.error());
@@ -1330,6 +1436,16 @@ private:
             }
             slot.completion.emplace(std::move(*completion));
         }
+        if (stop_preparation(slot))
+            co_return runtime::failure(detail::path_error(errc::closed));
+        if (config_.preallocation_bytes.value() != 0 && !slot.sync) {
+            checked = co_await preallocate(slot, work);
+            if (!checked) {
+                slot.retryable = admission_pressure(checked.error())
+                                 && slot.zeroed_end == 0;
+                co_return checked;
+            }
+        }
         slot.preparation.reset();
         slot.ready = true;
         co_return runtime::result<void>{};
@@ -1337,7 +1453,7 @@ private:
     static void clear_slot(file_slot& slot) {
         KWAQUE_INVARIANT(
           invariant_id{"KQ-WAL-SLOT-CLOSED"},
-          !slot.file && !slot.completion && !slot.publisher,
+          !slot.file && !slot.sync && !slot.completion && !slot.publisher,
           "reusing WAL slot before joined close");
         slot.preparation.reset();
         slot.path.reset();
@@ -1345,6 +1461,8 @@ private:
         slot.head.reset();
         slot.header_publication = local_publication_outcome{};
         slot.head_publication = local_publication_outcome{};
+        slot.zero_begin = slot.zeroed_end = slot.issued_end = 0;
+        slot.plain_writes = slot.flushed_plain_writes = 0;
         slot.ancestors_ready = slot.verified = slot.ready = slot.retryable
           = slot.abandoned = false;
     }
@@ -1394,6 +1512,9 @@ private:
                     rotation_->barrier.emplace(std::move(*durable.receipt));
                 }
                 if (!rotation_->old_closed) {
+                    // No extension starts while a rotation is pending.
+                    while (extending_)
+                        co_await changed_.when();
                     co_await close_file();
                     if (first_.failed()) break;
                     rotation_->old_closed = true;
@@ -1624,6 +1745,120 @@ private:
         co_return runtime::result<void>{};
     }
 
+    // Zero-writes [data start, window end) of a prepared file through its
+    // ordinary handle and makes it durable once, then opens its
+    // synchronized-write handle. A retry resumes after completed zeroing.
+    seastar::future<runtime::result<void>>
+    preallocate(file_slot& slot, codec::cooperative_work& work) {
+        const auto alignment = config_.alignment.bytes().value();
+        const auto start = slot.descriptor->data_start.value();
+        const auto limit = config_.capacity_bytes.value();
+        if (slot.zeroed_end == 0) {
+            if (start >= limit) co_return runtime::result<void>{};
+            const auto window
+              = std::min(config_.preallocation_bytes.value(), limit - start)
+                / alignment * alignment;
+            if (window == 0) co_return runtime::result<void>{};
+            if (zero_.empty())
+                zero_ = detail::make_zero_chunk(write_allocation_);
+            // Reserve the whole range first, then zero-write it: otherwise
+            // the zero writes fragment the file into many small extents.
+            auto reserved = co_await slot.file->allocate(
+              runtime::file_position{start}, byte_count{window});
+            if (!reserved) co_return reserved;
+            auto zeroed = co_await detail::zero_fill(
+              *slot.file, zero_, start, start + window, work);
+            if (!zeroed) co_return zeroed;
+            auto synced = co_await slot.file->flush(
+              slot.completion->metadata());
+            if (!synced) co_return synced;
+            slot.zero_begin = start;
+            slot.zeroed_end = start + window;
+        }
+        auto opened = co_await control_.files_.open(
+          *slot.path,
+          {.access = runtime::file_access::read_write,
+           .close_policy = runtime::file_close_policy::checked,
+           .synchronous = true});
+        if (!opened) co_return runtime::failure(opened.error());
+        slot.sync.emplace(std::move(*opened));
+        if (
+          auto limited = slot.sync->limit_write_allocation(write_allocation_);
+          !limited)
+            co_return runtime::failure(limited.error());
+        co_return runtime::result<void>{};
+    }
+
+    // Starts zero-writing the next extension of the current file when its
+    // zero-written range no longer reaches far enough past the reservations.
+    // It begins after every write already issued, so it never overwrites
+    // frames; ordinary writes wait for it.
+    void maybe_extend() noexcept {
+        const auto step = config_.preallocation_extension_bytes.value();
+        if (
+          step == 0 || extension_ || extending_ || plain_waiting_ || rotation_
+          || !positions_ || dispatcher_stopping_ || admission_stopped_
+          || first_.failed())
+            return;
+        auto& slot = current_file();
+        if (!slot.sync || !slot.file) return;
+        const auto alignment = config_.alignment.bytes().value();
+        const auto limit = config_.capacity_bytes.value();
+        const auto reserved = positions_->reserved.position().value();
+        if (slot.zeroed_end > reserved && slot.zeroed_end - reserved >= step)
+            return;
+        const auto begin = std::max(slot.zeroed_end, slot.issued_end);
+        if (begin >= limit) return;
+        const auto length = std::max(step / alignment, std::uint64_t{1})
+                            * alignment;
+        const auto end = std::min(limit, begin + std::min(length, limit));
+        extending_ = true;
+        try {
+            extension_.emplace(extend_window(slot, begin, end));
+        } catch (...) {
+            // Only speed depends on the extension; try again later.
+            extending_ = false;
+        }
+    }
+
+    // Zero-writes [begin, end), makes it durable and only then admits
+    // synchronized writes there. Durability of the zeros is only for speed:
+    // a synchronized write makes its own blocks durable either way.
+    seastar::future<>
+    extend_window(file_slot& slot, std::uint64_t begin, std::uint64_t end) {
+        seastar::abort_source abort;
+        codec::cooperative_work work{codec::limits::defaults(), abort};
+        runtime::first_failure failed;
+        try {
+            failed.observe(
+              co_await detail::zero_fill(*slot.file, zero_, begin, end, work));
+            // Each handle sizes the file once, when opened, and resizes it
+            // to the end of any write it believes extends the file. Set the
+            // synchronized handle's size to the new end first, while no
+            // write is past it, so it never cuts what this handle wrote.
+            if (!failed.failed())
+                failed.observe(co_await slot.sync->truncate(end));
+            if (!failed.failed()) {
+                auto synced = co_await slot.file->flush();
+                if (!synced && synced.error().code() != errc::queue_full)
+                    failed.observe(synced);
+            }
+        } catch (...) {
+            failed.observe(std::current_exception());
+        }
+        if (failed.exception())
+            first_.observe(failed.exception());
+        else if (failed.error())
+            first_.observe(*failed.error());
+        else {
+            if (begin > slot.zeroed_end) slot.zero_begin = begin;
+            slot.zeroed_end = end;
+            ++statistics_.extensions;
+        }
+        extending_ = false;
+        changed_.broadcast();
+    }
+
     workload_reservation held_;
     control_type& control_;
     allocator_type& ids_;
@@ -1645,6 +1880,11 @@ private:
     seastar::condition_variable changed_;
     seastar::promise<> dispatcher_started_;
     std::optional<seastar::future<>> dispatcher_;
+    // Background extension of the current file's zero-written range, joined
+    // by the dispatcher; it holds the ordinary-write slot while running.
+    std::optional<seastar::future<>> extension_;
+    bool extending_{false}, plain_waiting_{false};
+    bytes::fragmented_buffer zero_;
     seastar::gate operations_;
     bool started_{false}, active_{false}, preflight_busy_{false};
     bool closing_{false}, closed_{false}, operations_closed_{false};

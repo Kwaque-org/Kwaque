@@ -177,5 +177,24 @@ TEST(
         EXPECT_TRUE(input.empty());
     }
 }
+
+TEST(EncodedBatchTest, StaleBodyChecksumCannotCertifyAnImmutableChild) {
+    for (const bool compressed : {false, true}) {
+        for (const std::size_t header : {32U, 40U, 4096U}) {
+            auto wire = assigned_wire(compressed, header);
+            wire.back() = static_cast<char>(wire.back() ^ 1);
+            seastar::abort_source abort;
+            codec::cooperative_work work{codec::limits::defaults(), abort};
+            auto bytes = buffer(wire, 7);
+            const auto memory = reserve(bytes, work);
+            const auto result
+              = validate_encoded_assigned_batch(
+                  std::move(bytes), batch_expected(), memory, work)
+                  .get();
+            ASSERT_FALSE(result);
+            EXPECT_EQ(result.error().code(), errc::corrupt_data);
+        }
+    }
+}
 } // namespace
 } // namespace kwaque::storage

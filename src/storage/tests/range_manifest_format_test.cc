@@ -1,4 +1,3 @@
-#include "src/codec/sha256.h"
 #include "src/storage/range_manifest_format.h"
 #include "src/storage/tests/range_manifest_test_support.h"
 #include "src/storage/tests/segment_test_support.h"
@@ -70,13 +69,13 @@ TEST(RangeManifestFormatTest, EntriesKeepNonAffineAndEmptyPhysicalExtents) {
     EXPECT_EQ(empty.coverage().logical().count().value(), 3U);
     EXPECT_TRUE(empty.coverage().physical().empty());
     EXPECT_TRUE(empty.coverage().bytes().empty());
-    EXPECT_EQ(empty.digest().bytes(), manifest_sha(""));
+    EXPECT_EQ(empty.digest().bytes(), manifest_digest(""));
     EXPECT_TRUE(
       range_manifest_entry::make(
         data.segment(),
         data.generation(),
         data.coverage(),
-        codec::extent_digest{codec::sha256_digest{}}));
+        codec::extent_digest{codec::content_digest{}}));
     EXPECT_TRUE(
       range_manifest_entry::make(
         data.segment(),
@@ -88,7 +87,7 @@ TEST(RangeManifestFormatTest, EntriesKeepNonAffineAndEmptyPhysicalExtents) {
         data.segment(),
         data.generation(),
         extent_scope(100, 105, 0, 0, 512, 1024),
-        codec::extent_digest{manifest_sha("footer")}));
+        codec::extent_digest{manifest_digest("footer")}));
     EXPECT_FALSE(
       range_manifest_entry::make(
         {}, data.generation(), data.coverage(), data.digest()));
@@ -100,7 +99,7 @@ TEST(RangeManifestFormatTest, EntriesKeepNonAffineAndEmptyPhysicalExtents) {
         data.segment(),
         data.generation(),
         extent_scope(100, 100, 0, 0, 512, 512),
-        codec::extent_digest{manifest_sha("")}));
+        codec::extent_digest{manifest_digest("")}));
     EXPECT_FALSE(
       range_manifest_entry::make(
         data.segment(),
@@ -112,7 +111,7 @@ TEST(RangeManifestFormatTest, EntriesKeepNonAffineAndEmptyPhysicalExtents) {
         data.segment(),
         data.generation(),
         extent_scope(100, 101, 0, 1, 512, 512),
-        codec::extent_digest{manifest_sha("")}));
+        codec::extent_digest{manifest_digest("")}));
     EXPECT_FALSE(
       range_manifest_entry::make(
         data.segment(), data.generation(), empty.coverage(), data.digest()));
@@ -195,12 +194,11 @@ TEST(RangeManifestFormatTest, IndependentGoldenRootAndPagePreserveEveryField) {
     const auto wire = expected_page(header, entries);
     EXPECT_EQ(
       wire.substr(0, 32),
-      hex("4b5142460900010001002000e00100000000000000000000a977229837a46df4"));
+      hex("4b5142460900010001002000e0010000000000000000000046f253c392dc68c6"));
     EXPECT_TRUE(
       std::ranges::equal(
-        std::bit_cast<std::array<char, 32>>(manifest_sha(wire)),
-        hex(
-          "7544c47d396d88f4c8b85cbca97026cebfd5c927ff99eda4eaf87bfffe428264")));
+        std::bit_cast<std::array<char, 16>>(manifest_digest(wire)),
+        hex("3817de09f6e1549f9f4488c63b08b58e")));
     EXPECT_EQ(flat(page->bytes), wire);
     EXPECT_EQ(page->reference, manifest_page_reference(wire, header));
     EXPECT_EQ(header.context(), mc());
@@ -221,14 +219,13 @@ TEST(RangeManifestFormatTest, IndependentGoldenRootAndPagePreserveEveryField) {
     const auto root_wire = expected_root(root_header(), refs);
     EXPECT_EQ(
       root_wire.substr(0, 32),
-      hex("4b5142460900010001002000e00100000000000000000000f698e1853f3c9287"));
+      hex("4b5142460900010001002000e0010000000000000000000001699720e60fbd13"));
     EXPECT_TRUE(
       std::ranges::equal(
-        std::bit_cast<std::array<char, 32>>(manifest_sha(root_wire)),
-        hex(
-          "258a17860ce5238753a07825729bc9504ee41e747a369395da7c0ca0dfe4f416")));
+        std::bit_cast<std::array<char, 16>>(manifest_digest(root_wire)),
+        hex("70c7860502b7b86966fead2dd0b2f899")));
     EXPECT_EQ(flat(root->bytes), root_wire);
-    EXPECT_EQ(root->digest.bytes(), manifest_sha(root_wire));
+    EXPECT_EQ(root->digest.bytes(), manifest_digest(root_wire));
 }
 
 TEST(RangeManifestFormatTest, MetadataAlignmentDoesNotRewriteExtentLocations) {
@@ -294,7 +291,7 @@ TEST(
                           UINT64_MAX,
                           (std::uint64_t{1} << 48U),
                           (std::uint64_t{1} << 48U) + 512),
-                        codec::extent_digest{manifest_sha("wide")})
+                        codec::extent_digest{manifest_digest("wide")})
                         .value();
     const std::array entries{wide};
     const auto header = page_header(
@@ -420,7 +417,7 @@ TEST(
 TEST(RangeManifestFormatTest, RootRequiresExactReferenceTopologyAndTotals) {
     seastar::abort_source abort;
     codec::cooperative_work work{codec::limits::defaults(), abort};
-    const auto digest = codec::immutable_object_digest{manifest_sha("page")};
+    const auto digest = codec::immutable_object_digest{manifest_digest("page")};
     const auto first
       = page_ref::make(
           page_ordinal::make(0).value(), 0, 1, byte_count{512}, digest)
@@ -571,7 +568,7 @@ TEST(RangeManifestFormatTest, MaximumRootPageCountAndDiagnosticEnd) {
             i,
             1,
             byte_count{512},
-            codec::immutable_object_digest{manifest_sha("page")})
+            codec::immutable_object_digest{manifest_digest("page")})
             .value());
     const auto header = root_header(256, 256, mc(), 100, 356);
     const auto wire = expected_root(header, refs);
@@ -773,11 +770,6 @@ TEST(
                                   .get()
                                   .has_value();
             } catch (const std::bad_alloc&) {
-            } catch (const std::runtime_error&) {
-                if (!injector.failed()) {
-                    injector.cancel();
-                    throw;
-                }
             } catch (...) {
                 injector.cancel();
                 throw;

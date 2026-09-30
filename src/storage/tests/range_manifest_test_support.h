@@ -5,10 +5,8 @@
 
 namespace kwaque::storage::testing::manifest {
 using bytes::fragmented_buffer_parser;
-inline codec::sha256_digest manifest_sha(std::string_view bytes) {
-    codec::sha256_hasher hash;
-    hash.update(bytes.data(), bytes.size());
-    return std::move(hash).final();
+inline codec::content_digest manifest_digest(std::string_view bytes) {
+    return codec::xxh3_128(bytes.data(), bytes.size());
 }
 inline manifest_context
 mc(std::uint8_t manifest = 0x60, std::uint64_t generation = 3) {
@@ -57,7 +55,7 @@ inline range_manifest_entry item(
                empty ? 10U : end - begin,
                empty ? 4096U : 512U,
                empty ? 4096U : 1536U),
-             codec::extent_digest{manifest_sha(empty ? "" : "data")})
+             codec::extent_digest{manifest_digest(empty ? "" : "data")})
       .value();
 }
 inline auto items() {
@@ -152,7 +150,7 @@ inline page_ref manifest_page_reference(
              header.first_entry(),
              header.entry_count(),
              byte_count{bytes.size()},
-             codec::immutable_object_digest{manifest_sha(bytes)})
+             codec::immutable_object_digest{manifest_digest(bytes)})
       .value();
 }
 inline std::string expected_root(
@@ -187,7 +185,7 @@ inline range_manifest_root pin(
                      header.context(),
                      header.logical_span(),
                      a,
-                     codec::immutable_object_digest{manifest_sha(wire)},
+                     codec::immutable_object_digest{manifest_digest(wire)},
                      reserve(input, work),
                      work)
                      .get()

@@ -49,7 +49,7 @@ codec::result<decoded_sparse_index_root> read_root(
     return decode_sparse_index_root(
              input,
              context,
-             codec::immutable_object_digest{sha(wire)},
+             codec::immutable_object_digest{digest_of(wire)},
              reserve(input, work, c),
              work,
              c,
@@ -63,48 +63,48 @@ TEST(
     const auto empty = target(0);
     EXPECT_TRUE(empty.coverage().logical().empty());
     EXPECT_TRUE(empty.coverage().physical().empty());
-    EXPECT_EQ(empty.digest().bytes(), sha(""));
+    EXPECT_EQ(empty.digest().bytes(), digest_of(""));
     EXPECT_TRUE(
       sparse_index_context::make(
         sc(),
         scope(100, 200, 0, 0, 512, 512),
-        codec::extent_digest{sha("")},
+        codec::extent_digest{digest_of("")},
         alignment()));
     EXPECT_TRUE(
       sparse_index_context::make(
         sc(),
         scope(UINT64_MAX, UINT64_MAX, UINT64_MAX, UINT64_MAX, 512, 1024),
-        codec::extent_digest{sha("footer")},
+        codec::extent_digest{digest_of("footer")},
         alignment()));
     EXPECT_FALSE(
       sparse_index_context::make(
         sc(),
         scope(100, 101, 0, 2, 512, 1024),
-        codec::extent_digest{sha("x")},
+        codec::extent_digest{digest_of("x")},
         alignment()));
     EXPECT_FALSE(
       sparse_index_context::make(
         sc(),
         scope(100, 101, 0, 1, 512, 512),
-        codec::extent_digest{sha("")},
+        codec::extent_digest{digest_of("")},
         alignment()));
     EXPECT_FALSE(
       sparse_index_context::make(
         sc(),
         scope(100, 100, 0, 0, 512, 512),
-        codec::extent_digest{sha("x")},
+        codec::extent_digest{digest_of("x")},
         alignment()));
     EXPECT_FALSE(
       sparse_index_context::make(
         sc(),
         scope(100, 101, 0, 1, 513, 1024),
-        codec::extent_digest{sha("x")},
+        codec::extent_digest{digest_of("x")},
         alignment()));
     EXPECT_FALSE(
       sparse_index_context::make(
         sc(),
         scope(100, 101, 0, 1, 512, 1025),
-        codec::extent_digest{sha("x")},
+        codec::extent_digest{digest_of("x")},
         alignment()));
     EXPECT_FALSE(
       sparse_index_context::make(
@@ -132,20 +132,18 @@ TEST(SparseIndexFormatTest, IndependentRootAndPageBytesKeepEveryField) {
     const auto wire = root_wire(refs, context);
     EXPECT_EQ(
       page.substr(0, 32),
-      hex("4b5142460800010001002000e0010000000000000000000066de9383930fb69a"));
+      hex("4b5142460800010001002000e001000000000000000000008cb2c2b031115438"));
     EXPECT_EQ(
       wire.substr(0, 32),
-      hex("4b5142460800010001002000e00100000000000000000000aa083091116fb5e3"));
+      hex("4b5142460800010001002000e001000000000000000000008b8244350c498aa0"));
     EXPECT_TRUE(
       std::ranges::equal(
-        std::bit_cast<std::array<char, 32>>(sha(page)),
-        hex(
-          "d193ec3713f5c1a9610caf9a461c84c0b4cfc140f76d030939969e8db6ebfd46")));
+        std::bit_cast<std::array<char, 16>>(digest_of(page)),
+        hex("639f520e5757f0684f63533d2cf5e8a7")));
     EXPECT_TRUE(
       std::ranges::equal(
-        std::bit_cast<std::array<char, 32>>(sha(wire)),
-        hex(
-          "ff1ea42cf2fdaa9de71045ed07cfe2e01f1781893e1af0cf41a38dfa9f775aac")));
+        std::bit_cast<std::array<char, 16>>(digest_of(wire)),
+        hex("4141ef84a656419ebc437de276295207")));
     const auto encoded_page = encode_sparse_index_page(
                                 entries,
                                 context,
@@ -164,7 +162,7 @@ TEST(SparseIndexFormatTest, IndependentRootAndPageBytesKeepEveryField) {
           .get();
     ASSERT_TRUE(encoded_root.has_value());
     EXPECT_EQ(flat(encoded_root->bytes), wire);
-    EXPECT_EQ(encoded_root->digest.bytes(), sha(wire));
+    EXPECT_EQ(encoded_root->digest.bytes(), digest_of(wire));
     for (const std::size_t width : {1U, 7U, 67U, 512U}) {
         fragmented_buffer_parser input{buffer("p" + wire + "suffix", width)};
         input.skip(byte_count{1}).value();
@@ -277,7 +275,7 @@ TEST(SparseIndexFormatTest, AbsoluteColumnsAndGenerationDoNotNarrowAt32Bits) {
                              UINT64_MAX,
                              base,
                              base + 1536),
-                           codec::extent_digest{sha("wide")},
+                           codec::extent_digest{digest_of("wide")},
                            alignment())
                            .value();
     const std::array entries{
@@ -309,25 +307,57 @@ TEST(SparseIndexFormatTest, AbsoluteColumnsAndGenerationDoNotNarrowAt32Bits) {
     EXPECT_TRUE(std::ranges::equal(got->value.entries(), entries));
 }
 
+TEST(
+  SparseIndexFormatTest, RawEntriesBeginningWithEnvelopeMagicAreHashedAsData) {
+    seastar::abort_source abort;
+    codec::cooperative_work work{codec::limits::defaults(), abort};
+    // The first raw index key spells KQBF in little-endian order. It is not
+    // an envelope and must not acquire cached-checksum treatment from its
+    // bytes.
+    constexpr std::uint64_t first = 0x4642514b;
+    const auto context = sparse_index_context::make(
+                           sc(),
+                           scope(first, first + 4, 0, 4, 512, 1536),
+                           codec::extent_digest{digest_of("extent")},
+                           alignment())
+                           .value();
+    const std::array entries{entry(first, 512), entry(first + 2, 1024)};
+    const auto expected = page_wire(entries, context);
+    ASSERT_EQ(
+      expected.substr(32 + sparse_index_page_fixed_bytes.value(), 4), "KQBF");
+    const auto encoded = encode_sparse_index_page(
+                           entries,
+                           context,
+                           page_ordinal::make(0).value(),
+                           0,
+                           work,
+                           budget().operation_remaining,
+                           charge)
+                           .get();
+    ASSERT_TRUE(encoded);
+    EXPECT_EQ(flat(encoded->bytes), expected);
+    EXPECT_EQ(encoded->reference.digest().bytes(), digest_of(expected));
+}
+
 TEST(SparseIndexFormatTest, EmptyAndRemovedExtentsNeedNoSyntheticAnchor) {
     for (const auto& context :
          {target(0),
           sparse_index_context::make(
             sc(),
             scope(100, 200, 0, 0, 512, 512),
-            codec::extent_digest{sha("")},
+            codec::extent_digest{digest_of("")},
             alignment())
             .value(),
           sparse_index_context::make(
             sc(),
             scope(100, 200, 0, 0, 512, 1024),
-            codec::extent_digest{sha("footer")},
+            codec::extent_digest{digest_of("footer")},
             alignment())
             .value(),
           sparse_index_context::make(
             sc(),
             scope(UINT64_MAX, UINT64_MAX, UINT64_MAX, UINT64_MAX, 512, 512),
-            codec::extent_digest{sha("")},
+            codec::extent_digest{digest_of("")},
             alignment())
             .value()}) {
         seastar::abort_source abort;
@@ -384,7 +414,7 @@ TEST(
                            location.location.segment(),
                            scope(
                              90, 110, 5, 7, 512, 1024U + block.size() + 512U),
-                           codec::extent_digest{sha(block)},
+                           codec::extent_digest{digest_of(block)},
                            alignment())
                            .value();
     EXPECT_TRUE(
@@ -429,7 +459,7 @@ TEST(SparseIndexFormatTest, ExtentEvidenceChecksBytesSeparatelyFromMetadata) {
                       work.policy(),
                       extent_layout_kind::initial_append,
                       {},
-                      extent_integrity::crc32c_and_sha256)
+                      extent_integrity::crc32c_and_digest)
                       .value();
     ASSERT_TRUE(feed_block(verifier, data_block(), work));
     const auto evidence = verifier.finish(work).value();
@@ -477,7 +507,7 @@ TEST(
     const auto context = sparse_index_context::make(
                            sc(),
                            scope(100, 101, 0, 1, 1024, 2048),
-                           codec::extent_digest{sha(wire)},
+                           codec::extent_digest{digest_of(wire)},
                            alignment(1024))
                            .value();
     error(
@@ -493,7 +523,7 @@ TEST(
                   work.policy(),
                   extent_layout_kind::rewrite,
                   {},
-                  extent_integrity::crc32c_and_sha256)
+                  extent_integrity::crc32c_and_digest)
                   .value();
     ASSERT_TRUE(feed_block(walk, sparse, work));
     const auto evidence = walk.finish(work).value();
@@ -507,7 +537,7 @@ TEST(
         0,
         2,
         byte_count{512},
-        codec::immutable_object_digest{sha("unverified page")})
+        codec::immutable_object_digest{digest_of("unverified page")})
         .value()};
     const auto root = pin(root_wire(refs, indexed), indexed, work);
     error(validate_sparse_index_extent(root, evidence), errc::malformed_data);
@@ -714,7 +744,7 @@ TEST(
         .get(),
       errc::corrupt_data);
     EXPECT_EQ(altered.bytes_consumed().value(), 0U);
-    auto wrong_digest = sha(wire);
+    auto wrong_digest = digest_of(wire);
     wrong_digest[0] ^= 1U;
     fragmented_buffer_parser input{buffer(wire)};
     error(
@@ -1015,7 +1045,7 @@ TEST(SparseIndexFormatTest, RootFitsMaximumPageCountAndEmptyPageIsRejected) {
             i,
             1,
             byte_count{512},
-            codec::immutable_object_digest{sha("page")})
+            codec::immutable_object_digest{digest_of("page")})
             .value());
     const auto encoded
       = encode_sparse_index_root(
@@ -1163,7 +1193,7 @@ TEST(
     const std::array refs{page_reference(page, 2)};
     const auto wire = root_wire(refs);
     const auto context = target();
-    const codec::immutable_object_digest digest{sha(wire)};
+    const codec::immutable_object_digest digest{digest_of(wire)};
     const auto root = pin(wire, context, setup);
     for (const unsigned operation : {0U, 1U, 2U, 3U}) {
         std::size_t failures = 0;
@@ -1214,11 +1244,6 @@ TEST(
                                   .has_value();
                 }
             } catch (const std::bad_alloc&) {
-            } catch (const std::runtime_error&) {
-                if (!injector.failed()) {
-                    injector.cancel();
-                    throw;
-                }
             } catch (...) {
                 injector.cancel();
                 throw;

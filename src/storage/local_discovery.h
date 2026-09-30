@@ -191,8 +191,8 @@ discover_local_records(
 
 struct local_wal_chain_entry final {
     const local_loaded_metadata& record;
-    // Only the first header has an exact external SHA in shard_control. Earlier
-    // links are contextual CRC-checked headers selected by predecessor
+    // Only the first header has an exact external digest in shard_control.
+    // Earlier links are contextual CRC-checked headers selected by predecessor
     // identity.
     bool head_digest_pinned;
     std::optional<runtime::file_position> sealed_end;

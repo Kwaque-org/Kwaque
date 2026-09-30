@@ -87,7 +87,7 @@ TEST(LocalTypesTest, RootAndFooterKindsKeepDifferentPlacementRules) {
     const auto sequence = local_object_sequence::make(1).value();
     const auto pages = page_count::make(0).value();
     const auto alignment = storage_alignment::make(byte_count{4096}).value();
-    codec::immutable_object_digest hash{codec::sha256_digest{}};
+    codec::immutable_object_digest hash{codec::content_digest{}};
     EXPECT_FALSE(
       local_root_reference::make(
         local_root_kind::sealed_retry,

@@ -1,6 +1,6 @@
 #include "src/model/tests/record_fuzz_oracle.h"
 
-#include "src/codec/sha256.h"
+#include "src/codec/xxh3.h"
 
 #include <seastar/core/thread.hh>
 
@@ -71,7 +71,7 @@ struct oracle_view {
         result.length = std::min(count, length - at);
         return result;
     }
-    void hash_into(codec::sha256_hasher& hash) const {
+    void hash_into(codec::xxh3_128_hasher& hash) const {
         for (std::size_t at = 0; at < length;) {
             const auto position = offset + at;
             const auto count = std::min(
@@ -284,9 +284,9 @@ std::string lz4_records(std::string_view records) {
     result.resize(size);
     return result;
 }
-codec::sha256_digest
+codec::content_digest
 fingerprint(std::string_view fixed, std::string_view records) {
-    codec::sha256_hasher hash;
+    codec::xxh3_128_hasher hash;
     hash.update(
       codec::semantic_batch_domain.data(), codec::semantic_batch_domain.size());
     hash.update(fixed.data(), 104);
@@ -477,6 +477,10 @@ batch_probe probe_batch(
         return {.error = errc::wrong_context};
     if (little(body, 72, 8) == 0 || nil(body, 80) || little(body, 96, 8) == 0)
         return {.error = errc::malformed_data};
+    // The digest slot's reserved bytes follow the 16-byte content digest.
+    for (auto i = codec::content_digest_bytes; i < codec::digest_slot_bytes;
+         ++i)
+        if (body[104 + i] != 0) return {.error = errc::malformed_data};
     batch_probe result;
     result.timestamp = std::bit_cast<std::int64_t>(little(body, 136, 8));
     result.original = little(body, 144, 4);
@@ -545,12 +549,12 @@ batch_probe probe_batch(
     for (std::size_t i = 0; i < result.digest.size(); ++i)
         result.digest[i] = static_cast<unsigned char>(body[104 + i]);
     if (encoding == 1) {
-        codec::sha256_hasher raw_hash;
+        codec::xxh3_128_hasher raw_hash;
         records.hash_into(raw_hash);
         result.record_digest = std::move(raw_hash).final();
     }
     if (result.retained == result.original) {
-        codec::sha256_hasher semantic;
+        codec::xxh3_128_hasher semantic;
         semantic.update(
           codec::semantic_batch_domain.data(),
           codec::semantic_batch_domain.size());

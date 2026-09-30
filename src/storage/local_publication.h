@@ -62,6 +62,9 @@ struct local_publication_outcome final {
     // Only externally reconciled ownership authorizes later cleanup.
     std::optional<runtime::file_name> temporary;
     bool temporary_may_exist{false};
+    [[nodiscard]] byte_count charged_bytes() const noexcept {
+        return reservation_ ? reservation_->bytes() : byte_count{};
+    }
 
 private:
     template<runtime::file_system_backend Backend>
@@ -80,6 +83,7 @@ struct local_publication_target final {
     // Independently observed current generation, under exclusive namespace
     // ownership. No current value means create, which requires no-replace.
     std::optional<local_publication_generation> current;
+    bool operator==(const local_publication_target&) const = default;
 };
 struct local_publication_request final {
     local_store_context owner;
@@ -123,6 +127,68 @@ public:
           "publisher destroyed before joined close");
     }
 
+    // Reserve before accepting work that must later publish. The namespace
+    // owner keeps this parent stable until joined close. In addition to memory
+    // and handle credits, retain the backend's actual directory-cursor slot.
+    // A returned outcome keeps the allowance occupied until it is released;
+    // later publications cannot multiply retained metadata using one grant.
+    [[nodiscard]] seastar::future<runtime::result<void>>
+    prepare(byte_count working_bytes, codec::cooperative_work& admission) {
+        assert_current();
+        if (closing_ || closed_ || fenced_)
+            co_return runtime::failure(detail::path_error(errc::closed));
+        if (busy_ || prepared_)
+            co_return runtime::failure(detail::path_error(errc::queue_full));
+        if (
+          limits_.maximum_bytes.value() == 0
+          || limits_.maximum_bytes > byte_count{65536}
+          || limits_.execution_bytes.value() == 0
+          || limits_.execution_bytes
+               > byte_count{maximum_contiguous_allocation_bytes}
+          || working_bytes < byte_count{65536}
+          || working_bytes > byte_count{4U * 1024U * 1024U})
+            co_return runtime::failure(
+              detail::path_error(errc::invalid_argument));
+        auto paths = path_charge();
+        if (!paths) co_return runtime::failure(paths.error());
+        auto allocation = byte_count{maximum_contiguous_allocation_bytes};
+        while (!budget_.allocation_charge(allocation) && allocation.value() > 1)
+            allocation = byte_count{allocation.value() / 2};
+        if (!budget_.allocation_charge(allocation))
+            co_return runtime::failure(
+              detail::path_error(errc::resource_exhausted));
+        // The cold publication path installs a single physical write slot.
+        // Its staging plus short-write recovery can each use one maximum
+        // served allocation, independently of a temporary's native geometry.
+        const byte_count write_credit{2 * maximum_contiguous_allocation_bytes};
+        auto held = budget_.try_reserve(
+          byte_count{
+            working_bytes.value() + limits_.execution_bytes.value()
+            + write_credit.value() + paths->value()});
+        if (!held) co_return runtime::failure(held.error());
+        if (auto handles = held->try_acquire_handles(2); !handles)
+            co_return runtime::failure(handles.error());
+        auto holder = operations_.hold();
+        busy_ = true;
+        auto idle = seastar::defer([this] noexcept { busy_ = false; });
+        auto inspected = co_await inspect_local_path(
+          files_,
+          target_.root,
+          target_.parent,
+          runtime::file_kind::directory,
+          admission);
+        if (!inspected) co_return inspected;
+        auto parent = co_await files_.open_directory(
+          target_.parent, runtime::file_close_policy::checked);
+        if (!parent) co_return runtime::failure(parent.error());
+        prepared_parent_.emplace(std::move(*parent));
+        prepared_.emplace(std::move(*held));
+        prepared_working_ = working_bytes;
+        prepared_write_credit_ = write_credit;
+        prepared_write_allocation_ = allocation;
+        co_return runtime::result<void>{};
+    }
+
     [[nodiscard]] seastar::future<local_publication_outcome> publish(
       local_publication_request request,
       bytes::fragmented_buffer payload,
@@ -137,14 +203,18 @@ public:
         auto paths = path_charge();
         if (!write_backing) return reject(write_backing.error());
         if (!paths) return reject(paths.error());
-        auto reservation = budget_.try_reserve_buffer(
-          payload,
-          byte_count{
-            limits_.execution_bytes.value() + write_backing->value()
-            + paths->value()});
+        auto reservation = prepared_
+                             ? prepared_buffer(payload)
+                             : budget_.try_reserve_buffer(
+                                 payload,
+                                 byte_count{
+                                   limits_.execution_bytes.value()
+                                   + write_backing->value() + paths->value()});
         if (!reservation) return reject(reservation.error());
-        if (auto handles = reservation->try_acquire_handles(2); !handles)
-            return reject(handles.error());
+        if (!prepared_) {
+            if (auto handles = reservation->try_acquire_handles(2); !handles)
+                return reject(handles.error());
+        }
         const auto size = payload.size();
         return publish_owned(
           request,
@@ -153,7 +223,7 @@ public:
           std::move(*final),
           admission,
           std::move(*reservation),
-          *write_backing,
+          prepared_ ? prepared_write_credit_ : *write_backing,
           operations_.hold());
     }
     // Stream one page of at most 64 KiB per write into a new immutable file.
@@ -189,13 +259,18 @@ public:
         auto paths = path_charge();
         if (!backing) return reject(backing.error());
         if (!paths) return reject(paths.error());
-        auto reservation = budget_.try_reserve(
-          byte_count{
-            working_bytes.value() + limits_.execution_bytes.value()
-            + backing->value() + paths->value()});
+        auto reservation = prepared_
+                             ? prepared_reservation(working_bytes)
+                             : budget_.try_reserve(
+                                 byte_count{
+                                   working_bytes.value()
+                                   + limits_.execution_bytes.value()
+                                   + backing->value() + paths->value()});
         if (!reservation) return reject(reservation.error());
-        if (auto handles = reservation->try_acquire_handles(2); !handles)
-            return reject(handles.error());
+        if (!prepared_) {
+            if (auto handles = reservation->try_acquire_handles(2); !handles)
+                return reject(handles.error());
+        }
         return publish_owned(
           request,
           std::move(writer),
@@ -203,12 +278,12 @@ public:
           std::move(*final),
           admission,
           std::move(*reservation),
-          *backing,
+          prepared_ ? prepared_write_credit_ : *backing,
           operations_.hold());
     }
     [[nodiscard]] seastar::future<runtime::result<void>> close() {
         assert_current();
-        if (closed_) co_return runtime::result<void>{};
+        if (closed_) co_return close_failure_.outcome();
         if (closing_)
             co_return runtime::failure(
               runtime::make_file_error(
@@ -216,15 +291,56 @@ public:
                 runtime::file_failure_detail::admission_not_dispatched));
         closing_ = true;
         co_await operations_.close();
+        if (prepared_parent_) {
+            try {
+                close_failure_.observe(co_await prepared_parent_->close());
+            } catch (...) {
+                close_failure_.observe(std::current_exception());
+            }
+            prepared_parent_.reset();
+        }
+        prepared_.reset();
         closed_ = true;
-        co_return runtime::result<void>{};
+        co_return close_failure_.outcome();
     }
     [[nodiscard]] bool fenced() const noexcept {
         assert_current();
         return fenced_;
     }
+    [[nodiscard]] runtime::result<void>
+    validate_prepared_target(const local_publication_target& target) const {
+        assert_current();
+        if (closed_ || closing_ || fenced_)
+            return runtime::failure(detail::path_error(errc::closed));
+        if (!prepared_ || target_ != target)
+            return runtime::failure(detail::path_error(errc::wrong_context));
+        if (busy_ || !prepared_->exclusive())
+            return runtime::failure(
+              runtime::make_file_error(
+                errc::queue_full,
+                runtime::file_failure_detail::admission_not_dispatched));
+        return {};
+    }
+    [[nodiscard]] byte_count prepared_bytes() const noexcept {
+        assert_current();
+        return prepared_ ? prepared_->bytes() : byte_count{};
+    }
 
 private:
+    runtime::result<workload_reservation>
+    prepared_reservation(byte_count working) {
+        if (working > prepared_working_)
+            return runtime::failure(
+              detail::path_error(errc::resource_exhausted));
+        return prepared_->share();
+    }
+    runtime::result<workload_reservation>
+    prepared_buffer(const bytes::fragmented_buffer& payload) {
+        // Same served-allocation accounting as the ordinary buffer entrance.
+        auto cost = budget_.buffer_charge(payload);
+        if (!cost) return runtime::failure(cost.error());
+        return prepared_reservation(*cost);
+    }
     static seastar::future<local_publication_outcome>
     reject(runtime::operation_error error) {
         local_publication_outcome result;
@@ -239,7 +355,9 @@ private:
         assert_current();
         if (closing_ || closed_ || fenced_)
             return runtime::failure(detail::path_error(errc::closed));
-        if (busy_)
+        // A prior returned outcome may still own diagnostics backed by this
+        // grant. Sharing it again would fund unrelated retained owners twice.
+        if (busy_ || (prepared_ && !prepared_->exclusive()))
             return runtime::failure(
               runtime::make_file_error(
                 errc::queue_full,
@@ -354,13 +472,15 @@ private:
                     output.failure.observe(inspected);
                     break;
                 }
-                auto directory = co_await files_.open_directory(
-                  target_.parent, runtime::file_close_policy::checked);
-                if (!directory) {
-                    output.failure.observe(directory);
-                    break;
+                if (!prepared_parent_) {
+                    auto directory = co_await files_.open_directory(
+                      target_.parent, runtime::file_close_policy::checked);
+                    if (!directory) {
+                        output.failure.observe(directory);
+                        break;
+                    }
+                    parent.emplace(std::move(*directory));
                 }
-                parent.emplace(std::move(*directory));
                 output.stage = local_publication_stage::parent_open;
                 for (std::uint8_t attempt = 0; attempt != 64; ++attempt) {
                     auto room = co_await execution.admit(
@@ -430,6 +550,19 @@ private:
                 }
                 // Both the single payload and each streamed page are bounded
                 // by 64 KiB. Total file length is not one write's staging size.
+                if (prepared_) {
+                    auto limited = temporary->limit_write_allocation(
+                      prepared_write_allocation_);
+                    if (!limited) {
+                        output.failure.observe(limited);
+                        break;
+                    }
+                    limited = temporary->limit_write_concurrency(1);
+                    if (!limited) {
+                        output.failure.observe(limited);
+                        break;
+                    }
+                }
                 auto native_memory = write_charge(
                   *temporary, std::min(size, byte_count{65536}));
                 if (!native_memory) {
@@ -437,6 +570,11 @@ private:
                     break;
                 }
                 if (*native_memory > write_credit) {
+                    if (prepared_) {
+                        output.failure.observe(
+                          detail::path_error(errc::resource_exhausted));
+                        break;
+                    }
                     auto extra = budget_.try_reserve(
                       byte_count{
                         native_memory->value() - write_credit.value()});
@@ -498,7 +636,8 @@ private:
                     break;
                 }
                 output.stage = local_publication_stage::renamed;
-                synced = co_await parent->sync();
+                synced = co_await (
+                  prepared_parent_ ? prepared_parent_->sync() : parent->sync());
                 if (!synced) {
                     output.failure.observe(synced);
                     break;
@@ -545,6 +684,11 @@ private:
     workload_budget& budget_;
     local_publication_target target_;
     local_publication_limits limits_;
+    std::optional<workload_reservation> prepared_;
+    std::optional<typename Backend::directory_cursor_type> prepared_parent_;
+    byte_count prepared_working_{};
+    byte_count prepared_write_credit_{}, prepared_write_allocation_{};
+    runtime::first_failure close_failure_;
     seastar::gate operations_;
     bool busy_{false}, closing_{false}, closed_{false}, fenced_{false};
 };

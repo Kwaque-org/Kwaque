@@ -1,5 +1,5 @@
-#include "src/codec/sha256.h"
 #include "src/codec/tests/qualification_profile.h"
+#include "src/codec/xxh3.h"
 #include "src/model/tests/model_bench_fixture.h"
 
 #include <seastar/core/abort_source.hh>
@@ -20,8 +20,8 @@ using codec::bench::payload_pattern;
 
 // The caller keeps its immutable batch alive and unmoved until this completes.
 // Verification borrows the bytes without promoting their ownership or copying
-// the record region. Native SHA state is gone before the final abort poll.
-seastar::future<codec::sha256_digest>
+// the record region.
+seastar::future<codec::content_digest>
 hash_records(const fragmented_buffer& records, codec::cooperative_work& work) {
     work.poll().value();
     work.policy()
@@ -33,25 +33,20 @@ hash_records(const fragmented_buffer& records, codec::cooperative_work& work) {
       .value();
     (co_await work.checkpoint()).value();
     work.poll().value();
-    std::optional<codec::sha256_digest> digest;
-    {
-        codec::sha256_hasher hasher;
-        for (const auto fragment : records) {
-            for (std::size_t offset = 0; offset < fragment.size();) {
-                const auto size = std::min(
-                  fragment.size() - offset,
-                  static_cast<std::size_t>(work.byte_quantum().value()));
-                (co_await work.admit(byte_count{size}, item_count{1})).value();
-                work.poll().value();
-                hasher.update(fragment.data() + offset, size);
-                offset += size;
-            }
+    codec::xxh3_128_hasher hasher;
+    for (const auto fragment : records) {
+        for (std::size_t offset = 0; offset < fragment.size();) {
+            const auto size = std::min(
+              fragment.size() - offset,
+              static_cast<std::size_t>(work.byte_quantum().value()));
+            (co_await work.admit(byte_count{size}, item_count{1})).value();
+            work.poll().value();
+            hasher.update(fragment.data() + offset, size);
+            offset += size;
         }
-        work.poll().value();
-        digest.emplace(std::move(hasher).final());
     }
     work.poll().value();
-    co_return *digest;
+    co_return std::move(hasher).final();
 }
 
 class compressed_measurements {
@@ -108,7 +103,8 @@ public:
             perf_tests::stop_measuring_time();
             require(result.has_value(), "compressed batch encode failed");
             report_output(*result);
-            // Independent full decode checks grammar, both CRCs and dense SHA.
+            // Independent full decode checks grammar, both CRCs and the dense
+            // digest.
             bytes::fragmented_buffer_parser verify{result->share()};
             const auto verify_budget = codec::reserve_decode_input(
                                          verify, work.policy(), memory())
@@ -258,7 +254,7 @@ private:
     payload_pattern pattern_;
     fragmented_buffer wire_;
     std::optional<codec::semantic_batch_digest> digest_;
-    std::optional<codec::sha256_digest> retained_digest_;
+    std::optional<codec::content_digest> retained_digest_;
     byte_count expanded_;
     byte_count remaining_{
       (64U << 20U) - codec::testing::execution_reservation.value()};

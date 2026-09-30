@@ -5,10 +5,8 @@
 
 namespace kwaque::storage::testing::index {
 using bytes::fragmented_buffer_parser;
-inline codec::sha256_digest sha(std::string_view wire) {
-    codec::sha256_hasher hash;
-    hash.update(wire.data(), wire.size());
-    return std::move(hash).final();
+inline codec::content_digest digest_of(std::string_view wire) {
+    return codec::xxh3_128(wire.data(), wire.size());
 }
 inline sparse_index_context
 target(std::uint32_t records = 3, std::uint64_t a = 512) {
@@ -23,7 +21,7 @@ target(std::uint32_t records = 3, std::uint64_t a = 512) {
                records,
                a,
                (static_cast<std::uint64_t>(records) + 1U) * a),
-             codec::extent_digest{sha(records == 0 ? "" : "extent")},
+             codec::extent_digest{digest_of(records == 0 ? "" : "extent")},
              alignment(a))
       .value();
 }
@@ -84,7 +82,7 @@ inline page_ref page_reference(
              first,
              count,
              byte_count{wire.size()},
-             codec::immutable_object_digest{sha(wire)})
+             codec::immutable_object_digest{digest_of(wire)})
       .value();
 }
 inline std::string root_wire(
@@ -117,7 +115,7 @@ inline sparse_index_root pin(
     auto decoded = decode_sparse_index_root(
                      input,
                      context,
-                     codec::immutable_object_digest{sha(wire)},
+                     codec::immutable_object_digest{digest_of(wire)},
                      reserve(input, work),
                      work)
                      .get()

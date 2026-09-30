@@ -10,21 +10,15 @@ import subprocess
 import unittest
 from pathlib import Path
 
-# Qualify cold engine initialization without loading host configuration or
-# configured providers. Configuration-file I/O can allocate inside libc,
-# outside the crypto callbacks and executable linker wrappers.
-PROBE_ENVIRONMENT = {"OPENSSL_CONF": ""}
-
 SCENARIOS = (
     "observer-control",
     "crc-cold-32",
     "crc-cold-4096",
     "crc-warm-4096",
     "google-cold-4096",
-    "sha-cold",
-    "sha-warm",
-    "sha-churn",
-    "sha-owner",
+    "xxh3-cold",
+    "xxh3-churn",
+    "xxh3-owner",
     "encode-small",
     "encode-max",
     "encode-abort",
@@ -120,9 +114,7 @@ class MemoryQualificationTest(unittest.TestCase):
     scenarios = SCENARIOS
     scope = (
         "new reactor-local native allocations; initial input and shared engine state "
-        "are accounted separately; OpenSSL automatic configuration disabled, "
-        "excluding host configuration and configured providers; not RSS or "
-        "instrumented timing"
+        "are accounted separately; not RSS or instrumented timing"
     )
 
     def probe_path(self, scenario: str) -> str:
@@ -169,13 +161,13 @@ class MemoryQualificationTest(unittest.TestCase):
             samples[name]["peak_upper_bound"]
             for name in ("crc-cold-32", "crc-cold-4096")
         )
-        sha_initialization = samples["sha-cold"]["peak_upper_bound"]
+        xxh3_initialization = samples["xxh3-cold"]["peak_upper_bound"]
         bounds = []
         for name, row in samples.items():
             if name.startswith(("encode-", "decode-")) or name == "staging-fragments":
                 initialization = crc_initialization
-            elif name in {"sha-warm", "sha-churn", "sha-owner"}:
-                initialization = sha_initialization
+            elif name in {"xxh3-churn", "xxh3-owner"}:
+                initialization = xxh3_initialization
             elif name.startswith("collection-"):
                 initialization = 0
             else:
@@ -197,7 +189,8 @@ class MemoryQualificationTest(unittest.TestCase):
     def complete_owner_bounds(
         self, samples: dict, owners: tuple[str, ...], all_new: frozenset[str]
     ) -> list[dict]:
-        initialization = samples["sha-cold"]["peak_upper_bound"] + max(
+        # Owners hash content identities with XXH3 and checksum with CRC32C.
+        initialization = samples["xxh3-cold"]["peak_upper_bound"] + max(
             samples[name]["peak_upper_bound"]
             for name in ("crc-cold-32", "crc-cold-4096")
         )
@@ -250,7 +243,6 @@ class MemoryQualificationTest(unittest.TestCase):
             "binaries": {},
             "observations": [],
             "invocations": [],
-            "environment_overrides": PROBE_ENVIRONMENT,
             "scope": self.scope,
         }
 
@@ -282,7 +274,6 @@ class MemoryQualificationTest(unittest.TestCase):
             save()
             outcome = subprocess.run(
                 command,
-                env={**os.environ, **PROBE_ENVIRONMENT},
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
                 text=True,
@@ -323,6 +314,7 @@ class MemoryQualificationTest(unittest.TestCase):
                         "observer-reallocation",
                         "observer-preexisting-free",
                         "observer-conservative-free",
+                        "observer-error-message",
                     ]
                 )
                 self.assertIn(
@@ -345,6 +337,10 @@ class MemoryQualificationTest(unittest.TestCase):
             else:
                 self.assertEqual(critical_peak, 0)
             self.assertEqual(samples["crc-warm-4096"]["mallocs"], 0)
+            # XXH3 state lives in each hasher: first use and churn never allocate.
+            for name in ("xxh3-cold", "xxh3-churn"):
+                if name in samples:
+                    self.assertEqual(samples[name]["mallocs"], 0, name)
             evidence["execution_bounds"] = self.execution_bounds(samples)
             execution_qualified = all(
                 row["execution_upper_bound"] is not None

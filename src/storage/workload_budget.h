@@ -43,10 +43,18 @@ public:
     // Requested storage allowance, excluding this reservation's own control
     // allocation. Only this amount can cover a transferred payload.
     [[nodiscard]] byte_count retained_bytes() const noexcept;
+    // Required when transferring an allowance to fund new independent work.
+    // share() is for the continuing lifetime of the same already charged owner.
+    [[nodiscard]] bool exclusive() const noexcept;
     // Acquire after the caller pins its object, before obtaining an I/O slot.
     // No wait or new allocation; failure leaves the existing reservation owned.
     [[nodiscard]] runtime::result<void>
     try_acquire_handles(std::uint32_t count);
+    // Moves another exclusive reservation of the same budget into this
+    // exclusive one. Only its requested allowance moves; its task unit and
+    // control charge return with its state. No wait or new allocation;
+    // rejection leaves both unchanged. Handle credits are not merged.
+    [[nodiscard]] runtime::result<void> adopt(workload_reservation&& other);
 
 private:
     friend class workload_budget;
@@ -74,6 +82,12 @@ public:
     try_reserve(byte_count retained);
     [[nodiscard]] runtime::result<byte_count>
     allocation_charge(byte_count requested) const noexcept;
+    [[nodiscard]] runtime::result<byte_count>
+    buffer_charge(const bytes::fragmented_buffer&) const;
+    [[nodiscard]] runtime::result<byte_count>
+    reservation_charge(byte_count retained) const;
+    [[nodiscard]] workload_budget_limits limits() const noexcept;
+    [[nodiscard]] bool owns(const workload_reservation&) const noexcept;
     [[nodiscard]] runtime::result<workload_reservation> try_reserve_buffer(
       const bytes::fragmented_buffer& buffer, byte_count additional = {});
     // New alias descriptor/control storage must be admitted separately before

@@ -1,14 +1,18 @@
 #pragma once
 
 #include "src/bytes/fragmented_buffer_builder.h"
-#include "src/codec/sha256.h"
+#include "src/codec/digest.h"
+#include "src/codec/xxh3.h"
 #include "src/storage/format_internal.h"
 #include "src/storage/page_ref.h"
 
 #include <seastar/core/deleter.hh>
 
+#include <algorithm>
+#include <array>
 #include <exception>
 #include <limits>
+#include <optional>
 #include <vector>
 
 namespace kwaque::storage::detail {
@@ -111,10 +115,16 @@ void write_coverage(std::array<char, N>& out, coverage c) noexcept {
     store<Offset + 32>(out, c.bytes().begin().value());
     store<Offset + 40>(out, c.bytes().end().value());
 }
+// A digest slot holds the content digest and then reserved zero bytes. A slot
+// whose reserved bytes are set is malformed and yields no digest.
 template<std::size_t Offset, std::size_t N>
-codec::sha256_digest read_digest(const std::array<char, N>& fixed) noexcept {
-    static_assert(Offset + codec::sha256_digest_bytes <= N);
-    codec::sha256_digest out{};
+std::optional<codec::content_digest>
+read_digest(const std::array<char, N>& fixed) noexcept {
+    static_assert(Offset + codec::digest_slot_bytes <= N);
+    for (auto i = codec::content_digest_bytes; i < codec::digest_slot_bytes;
+         ++i)
+        if (fixed[Offset + i] != 0) return std::nullopt;
+    codec::content_digest out{};
     for (std::size_t i = 0; i < out.size(); ++i)
         out[i] = static_cast<unsigned char>(fixed[Offset + i]);
     return out;
@@ -122,8 +132,12 @@ codec::sha256_digest read_digest(const std::array<char, N>& fixed) noexcept {
 template<std::size_t Offset, std::size_t N, typename Digest>
 void write_digest(std::array<char, N>& out, Digest digest) noexcept {
     const auto raw = digest.bytes();
-    static_assert(Offset + codec::sha256_digest_bytes <= N);
+    static_assert(Offset + codec::digest_slot_bytes <= N);
     std::copy(raw.begin(), raw.end(), out.begin() + Offset);
+    std::fill(
+      out.begin() + Offset + raw.size(),
+      out.begin() + Offset + codec::digest_slot_bytes,
+      char{0});
 }
 
 [[nodiscard]] codec::result<void> check_subkind(

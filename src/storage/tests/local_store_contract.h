@@ -73,6 +73,36 @@ read_bytes(Backend& files, const runtime::file_path& path, Driver drive) {
     take(failed.outcome());
     co_return result;
 }
+// Reads a whole file of any length in bounded requests; read_bytes returns
+// at most its first 64 KiB.
+template<runtime::file_system_backend Backend, typename Driver>
+seastar::future<std::string>
+read_all_bytes(Backend& files, const runtime::file_path& path, Driver drive) {
+    auto file = take(
+      co_await drive.lifecycle(files.open(
+        path, {.close_policy = runtime::file_close_policy::checked})));
+    runtime::first_failure failed;
+    std::string result;
+    try {
+        for (;;) {
+            auto read = take(
+              co_await drive.lifecycle(file.read(
+                runtime::file_position{result.size()}, byte_count{65536})));
+            const auto chunk = kwaque::storage::testing::flat(read.data());
+            result += chunk;
+            if (read.eof() || chunk.empty()) break;
+        }
+    } catch (...) {
+        failed.observe(std::current_exception());
+    }
+    try {
+        failed.observe(co_await drive.lifecycle(file.close()));
+    } catch (...) {
+        failed.observe(std::current_exception());
+    }
+    take(failed.outcome());
+    co_return result;
+}
 template<runtime::file_system_backend Backend, typename Driver>
 seastar::future<> write_bytes(
   Backend& files,
@@ -88,14 +118,17 @@ seastar::future<> write_bytes(
          .close_policy = runtime::file_close_policy::checked})));
     runtime::first_failure failed;
     try {
-        auto written = co_await drive.lifecycle(file.write(
-          runtime::file_position{},
-          kwaque::bytes::fragmented_buffer::copy_of(
-            std::span<const char>{bytes})
-            .value()));
-        failed.observe(written);
-        if (written)
-            require(written->value() == bytes.size(), "fixture short write");
+        if (!bytes.empty()) {
+            auto written = co_await drive.lifecycle(file.write(
+              runtime::file_position{},
+              kwaque::bytes::fragmented_buffer::copy_of(
+                std::span<const char>{bytes})
+                .value()));
+            failed.observe(written);
+            if (written)
+                require(
+                  written->value() == bytes.size(), "fixture short write");
+        }
         if (!failed.failed())
             failed.observe(co_await drive.lifecycle(file.flush()));
     } catch (...) {

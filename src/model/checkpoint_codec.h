@@ -71,7 +71,7 @@ make_read_checkpoint_from_unordered(
   codec::field_context context = {});
 
 // Borrows a stable checked value. parent_remaining excludes that owner and
-// verified SHA/CRC/frame/native costs; new body/envelope staging is admitted
+// verified hash/CRC/frame/native costs; new body/envelope staging is admitted
 // here. The writer emits an extension-free envelope with a fixed u32 count.
 // Fingerprint covers the domain and canonical body only. Cleanup and final
 // abort polling precede publication; rejection preserves the input value.
@@ -94,10 +94,10 @@ seastar::future<codec::result<encoded_read_checkpoint>> encode_read_checkpoint(
 // One parent transaction: integrity, exact fixed-u32 body, independent topic
 // expectation, strict key order and semantic fingerprint all precede commit.
 // Caller first reserves the input once with reserve_decode_input. memory is
-// its residual after verified frame/native SHA/CRC costs and other live owners.
-// Returned residuals retain only the cursor vector; parent backing and share
-// promotion remain reserved by the caller even after a failed decode.
-// The parser, work and abort source stay alive and exclusive through the call.
+// its residual after verified frame/native hash/CRC costs and other live
+// owners. Returned residuals retain only the cursor vector; parent backing and
+// share promotion remain reserved by the caller even after a failed decode. The
+// parser, work and abort source stay alive and exclusive through the call.
 // Fixed wire leaves need at least 256 work bytes and 64 items.
 [[nodiscard]] seastar::future<codec::result<decoded_read_checkpoint>>
 decode_read_checkpoint(

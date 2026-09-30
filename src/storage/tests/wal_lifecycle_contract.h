@@ -94,7 +94,7 @@ seastar::future<> inventory(
                            == descriptor.data_start.value()
                       && entry.record.file_bytes
                            > descriptor.data_start.value(),
-                    "chain did not start at the selected SHA pin");
+                    "chain did not start at the selected digest pin");
               else
                   require(
                     !entry.head_digest_pinned
