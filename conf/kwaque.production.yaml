@@ -1,0 +1,18 @@
+# Production example. Log levels are set with the --default-log-level and
+# --logger-log-level command-line options.
+kwaque:
+  schema_version: 1
+  # Must be absolute outside developer mode; a service manager usually starts
+  # the broker in "/".
+  data_directory: "/var/lib/kwaque"
+  admin:
+    # The admin API has no authentication or TLS; keep it on loopback.
+    address: "127.0.0.1"
+    port: 9644
+  developer_mode: false
+  # Startup refuses after this many consecutive unclean exits. Clean
+  # shutdown, a configuration change, or an hour without a start resets it.
+  crash_loop_limit: 5
+  # When enabled, .kwaque_data_dir must already exist in data_directory, so
+  # an unmounted filesystem is not mistaken for an empty data directory.
+  storage_strict_data_init: false

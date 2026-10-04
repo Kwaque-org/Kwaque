@@ -457,9 +457,8 @@ template<typename Entry, std::size_t ChunkEntries>
 
 [[nodiscard]] inline result<byte_count> collection_multiply(
   byte_count value, std::uint64_t count, error anchor) noexcept {
-    if (
-      count != 0
-      && value.value() > std::numeric_limits<std::uint64_t>::max() / count) {
+    const auto product = value.checked_mul(count);
+    if (!product) {
         return codec::failure(
           error{
             errc::out_of_range,
@@ -467,7 +466,7 @@ template<typename Entry, std::size_t ChunkEntries>
             anchor.field(),
             anchor.byte_offset()});
     }
-    return byte_count{value.value() * count};
+    return *product;
 }
 
 // Deterministic admission calculation, separate from run/merge ownership.
@@ -675,7 +674,7 @@ canonicalize_unordered(
         }
         if (!failed && count != 0) {
             run_size = std::min(
-              {count, std::uint64_t{64}, std::uint64_t{8192 / sizeof(Entry)}});
+              {count, std::uint64_t{64}, std::uint64_t{8_KiB / sizeof(Entry)}});
             while (run_size != 0) {
                 const auto probe_work = co_await work.admit(
                   byte_count{}, item_count{1}, anchor);

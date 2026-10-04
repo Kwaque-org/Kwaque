@@ -1,5 +1,6 @@
 #include "src/compression/tests/compression_fuzz_cases.h"
 
+#include "src/base/units.h"
 #include "src/compression/tests/lz4_test_support.h"
 
 #include <seastar/core/abort_source.hh>
@@ -91,7 +92,7 @@ codec::decode_budget reserve(const bytes::fragmented_buffer& input) {
     // Keep 1 MiB for the bounded script, oracle, and coroutine/test owners.
     return codec::detail::consume_decode_budget(
              codec::limits::defaults(),
-             {byte_count{63U << 20U}, byte_count{1U << 20U}, charge},
+             {byte_count{63_MiB}, byte_count{1_MiB}, charge},
              cost.backing,
              cost.descriptors.checked_add(cost.share_controls).value(),
              {},
@@ -187,7 +188,7 @@ void exercise_compression_case(std::span<const std::uint8_t> script) {
               .get()
         : mode == 1
           ? compress_lz4(
-              std::move(input), byte_count{131072}, work, memory, anchor)
+              std::move(input), byte_count{128_KiB}, work, memory, anchor)
               .get()
           : decompress_lz4(
               std::move(input), byte_count{expected}, work, memory, anchor)

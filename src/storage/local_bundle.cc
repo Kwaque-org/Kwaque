@@ -1,5 +1,7 @@
 #include "src/storage/local_bundle.h"
 
+#include "src/base/units.h"
+
 namespace kwaque::storage {
 namespace {
 std::span<const page_ref> root_pages(const local_bundle_root& root) {
@@ -35,7 +37,7 @@ seastar::future<runtime::result<local_bundle>> local_bundle::make(
     if (bytes.size() != reference.bytes() || bytes.fragment_count() > 1024)
         co_return runtime::failure(detail::path_error(errc::wrong_context));
     const auto additional = byte_count{
-      limits.operation_bytes.value() + limits.execution_bytes.value() + 32768};
+      limits.operation_bytes.value() + limits.execution_bytes.value() + 32_KiB};
     auto held = [&]() -> runtime::result<workload_reservation> {
         if (!prepared) return budget.try_reserve_buffer(bytes, additional);
         if (!budget.owns(*prepared) || !prepared->exclusive())

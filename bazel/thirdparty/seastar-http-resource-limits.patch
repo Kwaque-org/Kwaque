@@ -55,19 +55,33 @@ diff --git a/include/seastar/core/metrics_api.hh b/include/seastar/core/metrics_
  
      void dirty() {
          _dirty = true;
-@@ -559,7 +574,7 @@
+@@ -559,7 +574,13 @@
  const value_map& get_value_map(int handle = default_handle());
  using values_reference = shared_ptr<values_copy>;
  
 -foreign_ptr<values_reference> get_values(int handle = default_handle());
 +foreign_ptr<values_reference> get_values(int handle = default_handle(), std::optional<snapshot_limits> limits = std::nullopt);
++
++// One bounded snapshot may exist per shard at a time. The overload above takes
++// this shard's slot without waiting; callers that queue for it acquire the
++// units themselves and pass them to the overload below.
++semaphore& snapshot_admission() noexcept;
++foreign_ptr<values_reference> get_values(int handle, const snapshot_limits& limits, semaphore_units<> admission);
  
  shared_ptr<impl> get_local_impl(int handle = default_handle());
  
 diff --git a/include/seastar/core/prometheus.hh b/include/seastar/core/prometheus.hh
 --- a/include/seastar/core/prometheus.hh
 +++ b/include/seastar/core/prometheus.hh
-@@ -56,6 +56,11 @@
+@@ -25,6 +25,7 @@
+ #include <seastar/core/metrics.hh>
+ #include <seastar/core/metrics_api.hh>
+ #include <seastar/util/std-compat.hh>
++#include <chrono>
+ #include <optional>
+ 
+ struct prometheus_test_fixture;
+@@ -56,6 +57,15 @@
      sstring prefix = "seastar"; //!< a prefix that will be added to metric names
      bool allow_protobuf = false; // protobuf support is experimental and off by default
      int handle = metrics::default_handle(); //!< Handle that specifies which metric implementation to query
@@ -76,6 +90,10 @@ diff --git a/include/seastar/core/prometheus.hh b/include/seastar/core/prometheu
 +    size_t max_format_bytes = 64 * 1024;
 +    size_t max_response_bytes = 4 * 1024 * 1024;
 +    size_t max_aggregate_bytes = 64 * 1024;
++    // A bounded scrape queues this long for each source shard's snapshot slot
++    // before its body fails. Slots are taken in shard order, so concurrent
++    // scrapes serialize instead of failing after the response status.
++    std::chrono::milliseconds snapshot_wait_timeout{15000};
      sstring route = "/metrics"; //!< Name of the route on which to expose the metrics
  };
  
@@ -111,14 +129,15 @@ diff --git a/include/seastar/http/httpd.hh b/include/seastar/http/httpd.hh
      http_server& _server;
      connected_socket _fd;
      std::optional<session_dn> _tls_dn;
-@@ -76,13 +90,15 @@
+@@ -76,13 +90,16 @@
      // null element marks eof
      queue<std::unique_ptr<http::reply>> _replies { 10 };
      bool _done = false;
-+    timer<> _header_deadline{[this] { _done = true; shutdown(); }};
-+    timer<> _exchange_deadline{[this] { _done = true; shutdown(); }};
++    timer<> _header_deadline{[this] { on_deadline(); }};
++    timer<> _exchange_deadline{[this] { on_deadline(); }};
      const bool _tls;
      int _listener_idx;
++    void on_deadline();
  public:
 -    connection(http_server& server, connected_socket&& fd, bool tls, int listener_idx)
 +    connection(http_server& server, connected_socket&& fd, bool tls, int listener_idx, connected_socket_input_stream_config input_config = {})
@@ -129,7 +148,7 @@ diff --git a/include/seastar/http/httpd.hh b/include/seastar/http/httpd.hh
              , _write_buf(_fd.output())
              , _client_addr(_fd.remote_address())
              , _server_addr(_fd.local_address())
-@@ -91,10 +107,10 @@
+@@ -91,10 +108,10 @@
          on_new_connection();
      }
      connection(http_server& server, connected_socket&& fd,
@@ -142,7 +161,16 @@ diff --git a/include/seastar/http/httpd.hh b/include/seastar/http/httpd.hh
              , _write_buf(_fd.output())
              , _client_addr(std::move(client_addr))
              , _server_addr(std::move(server_addr))
-@@ -144,6 +160,8 @@
+@@ -134,6 +151,8 @@
+     uint64_t _read_errors = 0;
+     uint64_t _respond_errors = 0;
+     uint64_t _tls_handshake_errors = 0;
++    uint64_t _rejected_connections = 0;
++    uint64_t _deadline_terminations = 0;
+     shared_ptr<seastar::tls::server_credentials> _credentials;
+     sstring _date = http_date();
+     timer<> _date_format_timer { [this] {_date = http_date();} };
+@@ -144,6 +163,8 @@
      gate _task_gate;
      std::optional<net::keepalive_params> _keepalive_params;
      std::optional<scheduling_group> _request_scheduling_group;
@@ -151,17 +179,24 @@ diff --git a/include/seastar/http/httpd.hh b/include/seastar/http/httpd.hh
  public:
      routes _routes;
      using connection = seastar::httpd::connection;
-@@ -151,6 +169,9 @@
-     explicit http_server(const sstring& name) : _stats(*this, name) {
+@@ -152,6 +173,9 @@
          _date_format_timer.arm_periodic(1s);
      }
-+
+ 
 +    // Configure before listen(). Units are held through connection destruction.
 +    void set_request_limits(request_limits limits);
- 
++
      void set_keepalive_parameters(std::optional<net::keepalive_params> params) {
          _keepalive_params = std::move(params);
-@@ -209,7 +230,7 @@
+     }
+@@ -204,12 +228,14 @@
+     uint64_t read_errors() const;
+     uint64_t reply_errors() const;
+     uint64_t tls_handshake_errors() const;
++    uint64_t rejected_connections() const noexcept { return _rejected_connections; }
++    uint64_t deadline_terminations() const noexcept { return _deadline_terminations; }
+     // Write the current date in the specific "preferred format" defined in
+     // RFC 7231, Section 7.1.1.1.
      static sstring http_date();
  private:
      future<> do_accept_one(int which, bool with_tls);
@@ -170,7 +205,7 @@ diff --git a/include/seastar/http/httpd.hh b/include/seastar/http/httpd.hh
      boost::intrusive::list<connection> _connections;
      friend class seastar::httpd::connection;
      friend class http_server_tester;
-@@ -217,6 +238,12 @@
+@@ -217,6 +243,12 @@
  
  class http_server_tester {
  public:
@@ -195,7 +230,7 @@ diff --git a/src/core/metrics.cc b/src/core/metrics.cc
  #include <regex>
  #include <random>
  #include <variant>
-@@ -503,17 +505,135 @@
+@@ -503,23 +505,173 @@
      return get_local_impl(handle)->get_value_map();
  }
  
@@ -225,9 +260,12 @@ diff --git a/src/core/metrics.cc b/src/core/metrics.cc
 +
 +} // namespace
 +
-+foreign_ptr<values_reference> get_values(int handle, std::optional<snapshot_limits> limits) {
-+    static thread_local semaphore snapshot_slot{1};
-+    semaphore_units<> admission;
++semaphore& snapshot_admission() noexcept {
++    static thread_local semaphore slot{1};
++    return slot;
++}
++
++static foreign_ptr<values_reference> copy_values(int handle, const std::optional<snapshot_limits>& limits, semaphore_units<> admission) {
 +    auto impl = get_local_impl(handle);
 +    size_t remaining_values = limits ? limits->value_bytes : 0;
 +    const auto charge_value = [&](size_t bytes) {
@@ -239,11 +277,6 @@ diff --git a/src/core/metrics.cc b/src/core/metrics.cc
 +        }
 +    };
 +    if (limits) {
-+        auto units = try_get_units(snapshot_slot, 1);
-+        if (!units) {
-+            throw std::runtime_error("metrics snapshot capacity exhausted");
-+        }
-+        admission = std::move(*units);
 +        const auto& registry = impl->get_value_map();
 +        size_t remaining_series = limits->series;
 +        size_t remaining_metadata = limits->metadata_bytes;
@@ -264,16 +297,28 @@ diff --git a/src/core/metrics.cc b/src/core/metrics.cc
 +        charge(512);
 +        charge(2 * registry.size() * (sizeof(metric_family_metadata) + sizeof(std::deque<metric_function>)));
 +        for (const auto& [name, family] : registry) {
++            // Snapshots copy only enabled series, and omit a family that has
++            // none (update_metrics_if_needed). Disabled series, such as the
++            // per-peer smp queue metrics, must not consume snapshot capacity.
++            size_t enabled = 0;
++            for (const auto& [labels, metric] : family) {
++                if (metric && metric->is_enabled()) {
++                    ++enabled;
++                }
++            }
++            if (!enabled) {
++                continue;
++            }
 +            if (name.size() > 4096 || family.info().d.str().size() > 4096
 +                    || family.info().inherit_type.size() > 4096) {
 +                throw std::length_error("metrics family string limit exceeded");
 +            }
-+            charge(snapshot_deque_bytes<metric_series_metadata>(family.size()));
-+            charge(snapshot_deque_bytes<metric_function>(family.size()));
++            charge(snapshot_deque_bytes<metric_series_metadata>(enabled));
++            charge(snapshot_deque_bytes<metric_function>(enabled));
 +            charge(snapshot_string_bytes(family.info().inherit_type.size()));
 +            charge(snapshot_string_bytes(name.size()));
 +            charge(snapshot_string_bytes(family.info().d.str().size()));
-+            charge_value(snapshot_deque_bytes<metric_value>(family.size()));
++            charge_value(snapshot_deque_bytes<metric_value>(enabled));
 +            if (family.info().aggregate_labels.size() > 16) {
 +                throw std::length_error("metrics aggregate label limit exceeded");
 +            }
@@ -284,6 +329,9 @@ diff --git a/src/core/metrics.cc b/src/core/metrics.cc
 +                charge(snapshot_string_bytes(label.size()) + 64);
 +            }
 +            for (const auto& [labels, metric] : family) {
++                if (!metric || !metric->is_enabled()) {
++                    continue;
++                }
 +                if (!remaining_series) {
 +                    throw std::length_error("metrics series limit exceeded");
 +                }
@@ -339,7 +387,32 @@ diff --git a/src/core/metrics.cc b/src/core/metrics.cc
          }
          mv.emplace_back(std::move(values));
      }
-@@ -596,11 +716,22 @@
+     return res_ref;
+ }
+ 
++foreign_ptr<values_reference> get_values(int handle, std::optional<snapshot_limits> limits) {
++    semaphore_units<> admission;
++    if (limits) {
++        auto units = try_get_units(snapshot_admission(), 1);
++        if (!units) {
++            throw std::runtime_error("metrics snapshot capacity exhausted");
++        }
++        admission = std::move(*units);
++    }
++    return copy_values(handle, limits, std::move(admission));
++}
++
++foreign_ptr<values_reference> get_values(int handle, const snapshot_limits& limits, semaphore_units<> admission) {
++    if (admission.count() != 1) {
++        throw std::invalid_argument("metrics snapshot requires one admission unit");
++    }
++    return copy_values(handle, limits, std::move(admission));
++}
++
+ 
+ escaped_string shard() {
+     return escaped_string{to_sstring(this_shard_id())};
+@@ -596,11 +748,22 @@
                                    family_info.aggregate_labels);
  }
  
@@ -363,7 +436,7 @@ diff --git a/src/core/metrics.cc b/src/core/metrics.cc
  
          auto mt_ref = ::seastar::make_shared<metric_metadata>();
          auto &mt = *(mt_ref.get());
-@@ -626,14 +757,15 @@
+@@ -626,14 +789,15 @@
          // Maybe we didn't use all the original size
          _current_metrics.resize(i);
          _metadata = mt_ref;
@@ -537,7 +610,7 @@ diff --git a/src/core/prometheus.cc b/src/core/prometheus.cc
              _buf->append(c);
          }
  
-@@ -561,15 +570,26 @@
+@@ -561,15 +570,36 @@
      /** @} */
  };
  
@@ -551,26 +624,37 @@ diff --git a/src/core/prometheus.cc b/src/core/prometheus.cc
 -        return smp::submit_to(cpu, [handle] {
 -            return mi::get_values(handle);
 -        }).then([&vec, cpu] (auto res) {
-+    // Bounded mode permits only one outstanding cross-shard dispatch. A busy
-+    // source rejects without waiting while other source snapshots are held.
-+    auto collect = [&ctx, &vec](unsigned cpu) {
-+        return smp::submit_to(cpu, [handle = ctx.handle, limits = ctx.snapshot_bounds] {
-+            return mi::get_values(handle, limits);
-+        }).then([&vec, cpu](auto res) {
-             vec[cpu] = std::move(res);
-         });
--    });
-+    };
+-            vec[cpu] = std::move(res);
 +    if (ctx.snapshot_bounds) {
++        // Bounded mode permits only one outstanding cross-shard dispatch and
++        // one snapshot per source shard. A scrape queues for each source slot
++        // in shard order, holding earlier slots until its body is written, so
++        // concurrent scrapes cannot deadlock and none fails after its status.
++        auto collect = [&ctx, &vec](unsigned cpu) {
++            return smp::submit_to(cpu, [handle = ctx.handle, limits = *ctx.snapshot_bounds, timeout = ctx.snapshot_wait_timeout] {
++                return get_units(mi::snapshot_admission(), 1, timeout).then([handle, limits](semaphore_units<> admission) {
++                    return mi::get_values(handle, limits, std::move(admission));
++                });
++            }).then([&vec, cpu](auto res) {
++                vec[cpu] = std::move(res);
++            });
++        };
 +        auto shards = std::views::iota(0u, this_smp_shard_count());
 +        co_await do_for_each(shards, collect);
 +    } else {
-+        co_await parallel_for_each(std::views::iota(0u, this_smp_shard_count()), collect);
++        co_await parallel_for_each(std::views::iota(0u, this_smp_shard_count()), [handle = ctx.handle, &vec](unsigned cpu) {
++            return smp::submit_to(cpu, [handle] {
++                return mi::get_values(handle);
++            }).then([&vec, cpu](auto res) {
++                vec[cpu] = std::move(res);
++            });
+         });
+-    });
 +    }
  }
  
  /*!
-@@ -838,7 +858,7 @@
+@@ -838,7 +868,7 @@
      std::string_view name, value;
  };
  
@@ -579,7 +663,7 @@ diff --git a/src/core/prometheus.cc b/src/core/prometheus.cc
  
      auto write_one = [&] (auto v, std::string_view suffix) {
          write_series(buf, name, labels, ctx, v, suffix);
-@@ -854,7 +874,7 @@
+@@ -854,7 +884,7 @@
      write_series(buf, name, labels, ctx, h.sample_count, "_bucket", extra_label{"le", "+Inf"} );
  }
  
@@ -588,7 +672,7 @@ diff --git a/src/core/prometheus.cc b/src/core/prometheus.cc
  
      auto write_one = [&] (auto v, std::string_view suffix) {
          write_series(buf, name, labels, ctx, v, suffix);
-@@ -873,7 +893,7 @@
+@@ -873,7 +903,7 @@
      }
  }
  
@@ -597,7 +681,7 @@ diff --git a/src/core/prometheus.cc b/src/core/prometheus.cc
      try {
          fmt::format_to(s.back_insert_begin(), FMT_COMPILE("{}\n"), value);
      } catch (const std::range_error& e) {
-@@ -916,6 +936,14 @@
+@@ -916,6 +946,14 @@
      const config& ctx;
      const metric_family_range m;
      const write_body_args args;
@@ -612,7 +696,7 @@ diff --git a/src/core/prometheus.cc b/src/core/prometheus.cc
  
      future<> write_text_representation();
      future<> write_protobuf_representation();
-@@ -923,8 +951,11 @@
+@@ -923,8 +961,11 @@
  
  future<> write_context::write_text_representation() {
      return seastar::async([this] {
@@ -625,7 +709,7 @@ diff --git a/src/core/prometheus.cc b/src/core/prometheus.cc
              if (!args.family_filter(metric_family.name())) {
                  continue;
              }
-@@ -932,8 +963,12 @@
+@@ -932,8 +973,12 @@
              bool found = false;
              metric_aggregate_by_labels aggregated_values(metric_family.metadata().aggregate_labels);
              bool should_aggregate = args.enable_aggregation && !metric_family.metadata().aggregate_labels.empty();
@@ -639,7 +723,7 @@ diff --git a/src/core/prometheus.cc b/src/core/prometheus.cc
                  if ((value_info.should_skip_when_empty() && value.is_empty()) || !args.filter(value_info.labels())) {
                      return;
                  }
-@@ -945,7 +980,11 @@
+@@ -945,7 +990,11 @@
                      found = true;
                  }
                  if (should_aggregate) {
@@ -652,7 +736,7 @@ diff --git a/src/core/prometheus.cc b/src/core/prometheus.cc
                  } else if (value.type() == mi::data_type::SUMMARY) {
                      write_summary(s, ctx, name, value.get_histogram(), value_info.labels());
                  } else if (value.type() == mi::data_type::HISTOGRAM) {
-@@ -954,6 +993,7 @@
+@@ -954,6 +1003,7 @@
                      write_name_and_labels(s, name, "", value_info.labels(), ctx);
                      write_value_as_string(s, value);
                  }
@@ -660,7 +744,7 @@ diff --git a/src/core/prometheus.cc b/src/core/prometheus.cc
                  out.write(s.data(), s.size()).get();
                  thread::maybe_yield();
              });
-@@ -969,6 +1009,7 @@
+@@ -969,6 +1019,7 @@
                          write_name_and_labels(s, name, "", labels, ctx);
                          write_value_as_string(s, value);
                      }
@@ -668,7 +752,7 @@ diff --git a/src/core/prometheus.cc b/src/core/prometheus.cc
                      out.write(s.data(), s.size()).get();
                      thread::maybe_yield();
                  }
-@@ -1084,6 +1125,14 @@
+@@ -1084,6 +1135,14 @@
  
      future<std::unique_ptr<http::reply>> handle(const sstring& path,
          std::unique_ptr<http::request> req, std::unique_ptr<http::reply> rep) override {
@@ -683,7 +767,7 @@ diff --git a/src/core/prometheus.cc b/src/core/prometheus.cc
          // Build name filters from all __name__ query parameters
          std::vector<details::name_filter> name_filters;
          for (auto name : req->get_query_param_array("__name__")) {
-@@ -1093,9 +1142,9 @@
+@@ -1093,9 +1152,9 @@
              }
          }
          write_body_args args{
@@ -695,7 +779,7 @@ diff --git a/src/core/prometheus.cc b/src/core/prometheus.cc
              .show_help = req->get_query_param("__help__") != "false",
              .enable_aggregation = req->get_query_param("__aggregate__") != "false"
          };
-@@ -1110,18 +1159,41 @@
+@@ -1110,18 +1169,41 @@
      future<> write_body(write_body_args args, output_stream<char>&& out_stream) {
          auto s = std::move(out_stream);
          metrics_families_per_shard families;
@@ -760,9 +844,27 @@ diff --git a/src/http/httpd.cc b/src/http/httpd.cc
  #include <algorithm>
  #include <bitset>
  #include <cctype>
-@@ -135,6 +136,11 @@
+@@ -69,7 +70,9 @@
+             sm::make_counter("read_errors", [&server] { return server.read_errors(); }, sm::description("The total number of errors while reading http requests"), labels),
+             sm::make_counter("reply_errors", [&server] { return server.reply_errors(); }, sm::description("The total number of errors while replying to http"), labels),
+             sm::make_counter("requests_served", [&server] { return server.requests_served(); }, sm::description("The total number of http requests served"), labels),
+-            sm::make_counter("tls_handshake_errors", [&server] { return server.tls_handshake_errors(); }, sm::description("The total number of TLS handshake failures"), labels)
++            sm::make_counter("tls_handshake_errors", [&server] { return server.tls_handshake_errors(); }, sm::description("The total number of TLS handshake failures"), labels),
++            sm::make_counter("connections_rejected", [&server] { return server.rejected_connections(); }, sm::description("The total number of connections closed at accept because the connection limit was reached"), labels),
++            sm::make_counter("deadline_terminations", [&server] { return server.deadline_terminations(); }, sm::description("The total number of connections closed by a header or exchange deadline"), labels)
+     });
  }
  
+@@ -134,7 +137,18 @@
+     _server._connections.erase(_server._connections.iterator_to(*this));
+ }
+ 
++void connection::on_deadline() {
++    ++_server._deadline_terminations;
++    _done = true;
++    shutdown();
++}
++
  void connection::on_new_connection() {
 +    if (_server._request_limits) {
 +        const auto& limits = *_server._request_limits;
@@ -772,7 +874,7 @@ diff --git a/src/http/httpd.cc b/src/http/httpd.cc
      ++_server._total_connections;
      ++_server._current_connections;
      _fd.set_nodelay(true);
-@@ -205,7 +211,12 @@
+@@ -205,7 +219,12 @@
  
  future<> connection::read_one() {
      _parser.init();
@@ -786,12 +888,10 @@ diff --git a/src/http/httpd.cc b/src/http/httpd.cc
          if (_parser.eof()) {
              _done = true;
              return make_ready_future<>();
-@@ -229,6 +240,18 @@
-             }
-             generate_error_reply_and_close(std::move(req), http::reply::status_type::bad_request, "Can't parse the request");
+@@ -231,6 +250,18 @@
              return make_ready_future<>();
-+        }
-+
+         }
+ 
 +        if (_server._request_limits) {
 +            const auto length = req->_headers.find("Content-Length");
 +            const bool has_body = req->_headers.contains("Transfer-Encoding")
@@ -802,10 +902,12 @@ diff --git a/src/http/httpd.cc b/src/http/httpd.cc
 +                        "Request bodies are not supported");
 +                return make_ready_future<>();
 +            }
-         }
- 
++        }
++
          size_t content_length_limit = _server.get_content_length_limit();
-@@ -366,7 +389,7 @@
+         sstring length_header = req->get_header("Content-Length");
+         req->content_length = strtol(length_header.c_str(), nullptr, 10);
+@@ -366,7 +397,7 @@
      auto resp = std::make_unique<http::reply>();
      resp->set_version(req->_version);
      set_headers(*resp);
@@ -814,12 +916,10 @@ diff --git a/src/http/httpd.cc b/src/http/httpd.cc
      set_header_connection(*resp, keep_alive);
  
      sstring url = req->parse_query_param();
-@@ -422,6 +445,17 @@
-     } else {
-         _date_format_timer.cancel();
+@@ -424,6 +455,17 @@
      }
-+}
-+
+ }
+ 
 +void http_server::set_request_limits(request_limits limits) {
 +    if (!_listeners.empty() || _current_connections || !limits.connections
 +            || !limits.request_line_bytes || !limits.header_bytes || !limits.header_count
@@ -829,10 +929,12 @@ diff --git a/src/http/httpd.cc b/src/http/httpd.cc
 +    }
 +    _request_limits = limits;
 +    _connection_slots.emplace(limits.connections);
- }
- 
++}
++
  void http_server::set_request_scheduling_group(scheduling_group sg) {
-@@ -501,6 +535,16 @@
+     _request_scheduling_group = sg;
+ }
+@@ -501,6 +543,17 @@
  
  future<> http_server::do_accept_one(int which, bool tls) {
      auto ar = co_await _listeners[which].accept();
@@ -840,6 +942,7 @@ diff --git a/src/http/httpd.cc b/src/http/httpd.cc
 +    if (_connection_slots) {
 +        auto admitted = try_get_units(*_connection_slots, 1);
 +        if (!admitted) {
++            ++_rejected_connections;
 +            ar.connection.shutdown_input();
 +            ar.connection.shutdown_output();
 +            co_return;
@@ -849,7 +952,7 @@ diff --git a/src/http/httpd.cc b/src/http/httpd.cc
      if (_keepalive_params) {
          ar.connection.set_keepalive(true);
          ar.connection.set_keepalive_parameters(_keepalive_params.value());
-@@ -510,18 +554,24 @@
+@@ -510,18 +563,24 @@
      // lambda would be destroyed while its frame is still running.
      (void)try_with_gate(_task_gate,
              [this, conn_fd = std::move(ar.connection),

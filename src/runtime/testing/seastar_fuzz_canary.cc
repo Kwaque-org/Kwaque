@@ -19,6 +19,13 @@ void require(bool condition) {
     }
 }
 
+std::string reactor_backend_argument() {
+    // The test macros export the reactor backend selected for this build.
+    const char* backend = std::getenv("KWAQUE_REACTOR_BACKEND");
+    return std::string{"--reactor-backend="}
+           + (backend != nullptr ? backend : "epoll");
+}
+
 void configure_native_runner(bool fail_startup) {
     // The native runner owns only pointers to these arguments until lazy
     // startup. Keep them alive through every bridge call and finalization.
@@ -26,7 +33,7 @@ void configure_native_runner(bool fail_startup) {
       "kwaque-fuzz-canary",
       "--smp=1",
       "--memory=128MiB",
-      "--reactor-backend=epoll",
+      reactor_backend_argument(),
       "--overprovisioned",
       "--random-seed=1",
       "--invalid-canary-option",

@@ -456,6 +456,46 @@ constexpr std::array descriptors{
     metric_value_kind::gauge,
     metric_label_domain::none,
     true},
+  metric_descriptor{
+    metric_id::broker_process_readiness,
+    "broker",
+    "process_readiness",
+    "Whether the broker is ready for traffic",
+    metric_value_kind::gauge,
+    metric_label_domain::none,
+    true},
+  metric_descriptor{
+    metric_id::broker_draining,
+    "broker",
+    "draining",
+    "Whether the broker is draining before shutdown",
+    metric_value_kind::gauge,
+    metric_label_domain::none,
+    true},
+  metric_descriptor{
+    metric_id::broker_shards,
+    "broker",
+    "shards",
+    "Configured reactor shard count",
+    metric_value_kind::gauge,
+    metric_label_domain::none,
+    true},
+  metric_descriptor{
+    metric_id::broker_startup_duration_seconds,
+    "broker",
+    "startup_duration_seconds",
+    "Time from application start to readiness",
+    metric_value_kind::gauge,
+    metric_label_domain::none,
+    true},
+  metric_descriptor{
+    metric_id::broker_start_time_seconds,
+    "broker",
+    "start_time_seconds",
+    "Broker process start time in seconds since the Unix epoch",
+    metric_value_kind::gauge,
+    metric_label_domain::none,
+    true},
 };
 
 [[nodiscard]] consteval bool valid_name(std::string_view name) {

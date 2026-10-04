@@ -17,6 +17,7 @@ exports_files([
     "seastar-metrics-registration-exception-safety.patch",
     "seastar-scheduling-group-rollback.patch",
     "seastar-spinlock-include.patch",
+    "seastar-task-queue-shuffle-seed.patch",
     "unordered-dense-exception-safety.patch",
     "unordered_dense.BUILD",
 ])

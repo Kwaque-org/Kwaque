@@ -1,3 +1,4 @@
+#include "src/base/units.h"
 #include "src/storage/local_cleanup.h"
 
 #include <gtest/gtest.h>
@@ -25,7 +26,7 @@ local_metadata_claims wal_claims() {
         .value(),
       {},
       local_wal_high{}.checked_advance(1)->incarnation().value(),
-      byte_count{4096},
+      byte_count{4_KiB},
       storage_alignment::make(byte_count{4096}).value()};
 }
 local_namespace_entry entry(local_entry_kind kind) {
@@ -62,13 +63,13 @@ TEST(
     auto path = entry(local_entry_kind::wal);
     local_discovered_record wal{path};
     wal.claims = wal_claims();
-    wal.file_bytes = 8192;
+    wal.file_bytes = 8_KiB;
     EXPECT_EQ(
       classify_local_cleanup(
         wal, {local_reference_status::absent, false, false, true})
         .classification,
       local_cleanup_class::recovery_required);
-    wal.file_bytes = 4096;
+    wal.file_bytes = 4_KiB;
     EXPECT_EQ(
       classify_local_cleanup(wal, {}).classification,
       local_cleanup_class::unresolved);
@@ -144,7 +145,7 @@ TEST(LocalDiscoveryContractTest, SelectedVersionDoesNotIgnoreExplicitPins) {
     ASSERT_TRUE(validate_discovery_expectation(spec, path, expected));
     expected.record.digest = codec::immutable_object_digest{
       codec::content_digest{}};
-    expected.record.encoded_bytes = byte_count{4096};
+    expected.record.encoded_bytes = byte_count{4_KiB};
     auto rejected = validate_discovery_expectation(spec, path, expected);
     ASSERT_FALSE(rejected);
     EXPECT_EQ(rejected.error().code(), errc::invalid_argument);

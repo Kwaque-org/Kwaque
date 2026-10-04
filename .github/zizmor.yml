@@ -1,0 +1,5 @@
+rules:
+  # The `$/` self-repository syntax is not accepted by actionlint yet, which
+  # also checks these workflows. Local actions keep the workspace-relative form.
+  self-repository:
+    disable: true

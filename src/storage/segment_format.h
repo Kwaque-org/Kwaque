@@ -130,6 +130,8 @@ public:
     [[nodiscard]] kwaque::bytes::fragmented_buffer release_bytes() && noexcept {
         return std::exchange(bytes_, kwaque::bytes::fragmented_buffer{});
     }
+    // The exact child envelope these validated bytes carry, sharing them.
+    [[nodiscard]] result<kwaque::bytes::fragmented_buffer> child() const;
 
 private:
     friend class detail::segment_codec;

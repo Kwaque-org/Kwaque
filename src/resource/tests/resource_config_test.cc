@@ -72,11 +72,11 @@ TEST(resource_config_test, rejects_memory_below_the_viable_minimum) {
       resource_config::from_total_memory(
         byte_count{minimum}, byte_count{minimum - 14})
         .has_value());
-    expect_fully_accounted(minimum, 8ULL * 1024ULL * 1024ULL);
+    expect_fully_accounted(minimum, 8_MiB);
 }
 
 TEST(resource_config_test, checked_partition_never_exceeds_supplied_memory) {
-    constexpr std::uint64_t mebibyte = 1024ULL * 1024ULL;
+    constexpr std::uint64_t mebibyte = 1_MiB;
     const std::array<std::uint64_t, 8> boundary_values{
       64ULL * mebibyte,
       64ULL * mebibyte + 1,
@@ -98,7 +98,7 @@ TEST(resource_config_test, checked_partition_never_exceeds_supplied_memory) {
 }
 
 TEST(resource_config_test, production_floor_includes_explicit_reservations) {
-    constexpr std::uint64_t mebibyte = 1024ULL * 1024ULL;
+    constexpr std::uint64_t mebibyte = 1_MiB;
     const memory_reservations reservations{
       .reactor_headroom = resource_config::default_reactor_headroom(),
       .admin_memory = byte_count{2ULL * mebibyte}};
@@ -134,7 +134,7 @@ TEST(
   resource_config_test, explicit_development_capacity_keeps_its_small_floor) {
     const memory_reservations reservations{
       .reactor_headroom = resource_config::default_reactor_headroom(),
-      .admin_memory = byte_count{2ULL * 1024ULL * 1024ULL}};
+      .admin_memory = byte_count{2_MiB}};
     const auto minimum = resource_config::minimum_total_memory();
     const auto development = resource_config::from_total_memory(
       minimum, reservations);
@@ -148,7 +148,7 @@ TEST(
 TEST(
   resource_config_test,
   disjoint_reservations_never_overflow_or_overlap_shares) {
-    constexpr std::uint64_t mebibyte = 1024ULL * 1024ULL;
+    constexpr std::uint64_t mebibyte = 1_MiB;
     constexpr auto maximum = std::numeric_limits<std::uint64_t>::max();
     const auto excessive_floor = resource_config::from_production_memory(
       byte_count{maximum},
@@ -200,7 +200,7 @@ TEST(
 
 TEST(
   resource_config_test, shared_partition_fits_every_unequal_native_capacity) {
-    constexpr std::uint64_t mebibyte = 1024ULL * 1024ULL;
+    constexpr std::uint64_t mebibyte = 1_MiB;
     const std::array capacities{
       byte_count{256ULL * mebibyte},
       byte_count{130ULL * mebibyte},

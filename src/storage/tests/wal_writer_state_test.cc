@@ -1,3 +1,4 @@
+#include "src/base/units.h"
 #include "src/bytes/test_allocation_profile.h"
 #include "src/resource/resource_registry.h"
 #include "src/storage/wal_writer_state.h"
@@ -40,7 +41,10 @@ auto extent(std::uint64_t begin) {
 }
 auto descriptor(workload_budget& budget, std::uint64_t begin) {
     return kwaque::storage::detail::wal_write_descriptor::make(
-             budget, extent(begin), codec::limits::defaults(), byte_count{4096})
+             budget,
+             extent(begin),
+             codec::limits::defaults(),
+             byte_count{4_KiB})
       .value();
 }
 void encoded(
@@ -60,11 +64,11 @@ SEASTAR_TEST_CASE(wal_descriptors_keep_execution_and_retire_only_the_front) {
     co_await with_budget([](auto& manager) -> seastar::future<> {
         workload_budget budget{
           manager.acquire_workload(workload),
-          {.tasks = 16, .bytes = byte_count{1U << 20U}, .handles = 1},
+          {.tasks = 16, .bytes = byte_count{1_MiB}, .handles = 1},
           bytes::testing::charge};
         {
             kwaque::storage::detail::wal_descriptor_queue queue{
-              2, byte_count{8192}};
+              2, byte_count{8_KiB}};
             auto first = descriptor(budget, 8192);
             auto second = descriptor(budget, 12288);
             BOOST_REQUIRE(queue.push(first));
@@ -79,7 +83,7 @@ SEASTAR_TEST_CASE(wal_descriptors_keep_execution_and_retire_only_the_front) {
             BOOST_CHECK(rejected.error().code() == errc::queue_full);
             encoded(*second, budget, 'b');
             second->dispatch();
-            second->complete(byte_count{4096});
+            second->complete(byte_count{4_KiB});
             BOOST_CHECK(!queue.retire_front());
             BOOST_CHECK(!pending.available());
             BOOST_CHECK(!second->execution_abort().abort_requested());
@@ -89,7 +93,7 @@ SEASTAR_TEST_CASE(wal_descriptors_keep_execution_and_retire_only_the_front) {
             auto execute =
               [](auto node, seastar::future<> wait) -> seastar::future<> {
                 co_await std::move(wait);
-                node->complete(byte_count{4096});
+                node->complete(byte_count{4_KiB});
             }(first, release.get_future());
             first = {};
             BOOST_CHECK(!execute.available());
@@ -111,7 +115,7 @@ SEASTAR_TEST_CASE(wal_descriptors_keep_execution_and_retire_only_the_front) {
             BOOST_REQUIRE(queue.push(ready));
             encoded(*ready, budget, 'c');
             ready->dispatch();
-            ready->complete(byte_count{4096});
+            ready->complete(byte_count{4_KiB});
             BOOST_REQUIRE(queue.retire_front());
             auto observed = ready->observe();
             BOOST_CHECK(observed.available());
@@ -127,11 +131,11 @@ SEASTAR_TEST_CASE(wal_descriptors_preserve_short_write_and_exception_failures) {
     co_await with_budget([](auto& manager) -> seastar::future<> {
         workload_budget budget{
           manager.acquire_workload(workload),
-          {.tasks = 16, .bytes = byte_count{1U << 20U}, .handles = 1},
+          {.tasks = 16, .bytes = byte_count{1_MiB}, .handles = 1},
           bytes::testing::charge};
         for (bool exceptional : {false, true}) {
             kwaque::storage::detail::wal_descriptor_queue queue{
-              1, byte_count{4096}};
+              1, byte_count{4_KiB}};
             auto node = descriptor(budget, 8192);
             BOOST_REQUIRE(queue.push(node));
             auto completion = node->observe();
@@ -162,11 +166,11 @@ SEASTAR_TEST_CASE(wal_gather_selects_only_a_bounded_adjacent_ready_prefix) {
     co_await with_budget([](auto& manager) {
         workload_budget budget{
           manager.acquire_workload(workload),
-          {.tasks = 16, .bytes = byte_count{1U << 20U}, .handles = 1},
+          {.tasks = 16, .bytes = byte_count{1_MiB}, .handles = 1},
           bytes::testing::charge};
         {
             kwaque::storage::detail::wal_descriptor_queue queue{
-              2, byte_count{8192}};
+              2, byte_count{8_KiB}};
             auto first = descriptor(budget, 8192),
                  second = descriptor(budget, 12288);
             BOOST_REQUIRE(queue.push(first));
@@ -175,17 +179,17 @@ SEASTAR_TEST_CASE(wal_gather_selects_only_a_bounded_adjacent_ready_prefix) {
             BOOST_CHECK_EQUAL(queue.ready_prefix().groups, 0U);
             encoded(*first, budget, 'a');
             BOOST_CHECK_EQUAL(queue.ready_prefix().groups, 2U);
-            BOOST_CHECK_EQUAL(queue.ready_prefix(byte_count{4096}).groups, 1U);
+            BOOST_CHECK_EQUAL(queue.ready_prefix(byte_count{4_KiB}).groups, 1U);
             BOOST_CHECK_EQUAL(
-              queue.ready_prefix(byte_count{8192}, 1).groups, 1U);
+              queue.ready_prefix(byte_count{8_KiB}, 1).groups, 1U);
             BOOST_CHECK_EQUAL(queue.ready_prefix(byte_count{4095}).groups, 0U);
             first->dispatch();
             BOOST_CHECK_EQUAL(queue.ready_prefix().groups, 0U);
-            first->complete(byte_count{4096});
+            first->complete(byte_count{4_KiB});
             BOOST_REQUIRE(queue.retire_front());
             BOOST_CHECK_EQUAL(queue.ready_prefix().groups, 1U);
             second->dispatch();
-            second->complete(byte_count{4096});
+            second->complete(byte_count{4_KiB});
             BOOST_REQUIRE(queue.retire_front());
         }
         BOOST_CHECK_EQUAL(budget.snapshot().tasks, 0U);
@@ -197,7 +201,7 @@ SEASTAR_TEST_CASE(wal_descriptor_construction_failure_leaves_no_admission) {
     co_await with_budget([](auto& manager) -> seastar::future<> {
         workload_budget budget{
           manager.acquire_workload(workload),
-          {.tasks = 8, .bytes = byte_count{1U << 20U}, .handles = 1},
+          {.tasks = 8, .bytes = byte_count{1_MiB}, .handles = 1},
           bytes::testing::charge};
         for (std::size_t at = 0; at != 8; ++at) {
             auto& injector = seastar::memory::local_failure_injector();
@@ -225,11 +229,11 @@ SEASTAR_TEST_CASE(wal_failed_descriptor_link_has_no_queue_effect_or_observer) {
     co_await with_budget([](auto& manager) -> seastar::future<> {
         workload_budget budget{
           manager.acquire_workload(workload),
-          {.tasks = 8, .bytes = byte_count{1U << 20U}, .handles = 1},
+          {.tasks = 8, .bytes = byte_count{1_MiB}, .handles = 1},
           bytes::testing::charge};
         {
             kwaque::storage::detail::wal_descriptor_queue queue{
-              1, byte_count{4096}};
+              1, byte_count{4_KiB}};
             auto node = descriptor(budget, 8192);
             const auto before = budget.snapshot();
             auto& injector = seastar::memory::local_failure_injector();
@@ -250,7 +254,7 @@ SEASTAR_TEST_CASE(wal_failed_descriptor_link_has_no_queue_effect_or_observer) {
             auto observed = node->observe();
             encoded(*node, budget, 'x');
             node->dispatch();
-            node->complete(byte_count{4096});
+            node->complete(byte_count{4_KiB});
             BOOST_REQUIRE(queue.retire_front());
             auto result = co_await std::move(observed);
             BOOST_CHECK(!result.failure.failed());

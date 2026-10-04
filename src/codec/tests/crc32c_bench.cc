@@ -33,7 +33,7 @@
 namespace kwaque::codec::bench {
 namespace {
 
-constexpr std::size_t bytes_per_run = 4U * 1024U * 1024U;
+constexpr std::size_t bytes_per_run = 4_MiB;
 constexpr std::uint32_t seed = 0;
 
 // Keep the same input-memory barrier on both sides; consuming the result alone
@@ -323,7 +323,7 @@ private:
 
 template<std::size_t Size, std::size_t FragmentSize>
 class cooperative_crc_fixture {
-    static_assert(Size > 0 && Size <= 32U * 1024U * 1024U);
+    static_assert(Size > 0 && Size <= 32_MiB);
     static_assert(
       FragmentSize > 0 && FragmentSize <= maximum_contiguous_allocation_bytes);
     static_assert(

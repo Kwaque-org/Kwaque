@@ -68,6 +68,9 @@ py_test(
         "//:ci_setup",
         "//:ci_workflow",
         "//:fuzz_workflow",
+        "//:nightly_workflow",
+        "//:reactor_backend_workflow",
+        "//:release_workflow",
     ],
     main = "check_ci_coverage_test.py",
 )
@@ -102,6 +105,13 @@ py_binary(
     name = "check_bazel_package_cycles",
     srcs = ["check_bazel_package_cycles.py"],
     main = "check_bazel_package_cycles.py",
+    visibility = ["//visibility:public"],
+)
+
+py_binary(
+    name = "check_package_licenses",
+    srcs = ["check_package_licenses.py"],
+    main = "check_package_licenses.py",
     visibility = ["//visibility:public"],
 )
 
@@ -309,12 +319,24 @@ py_test(
         "//:.clang-tidy",
         "//:.clang-tidy-strict",
         "@current_llvm_toolchain_llvm//:bin/run-clang-tidy",
+        "@current_llvm_toolchain_llvm//:clang-tidy",
     ],
     env = {
+        "KWAQUE_TEST_CLANG_TIDY": "$(rlocationpath @current_llvm_toolchain_llvm//:clang-tidy)",
         "KWAQUE_TEST_TIDY_RUNNER": "$(rlocationpath @current_llvm_toolchain_llvm//:bin/run-clang-tidy)",
     },
     main = "run_clang_tidy_test.py",
     deps = [":clang_tidy_lib"],
+)
+
+py_test(
+    name = "check_package_licenses_test",
+    size = "small",
+    srcs = [
+        "check_package_licenses.py",
+        "check_package_licenses_test.py",
+    ],
+    main = "check_package_licenses_test.py",
 )
 
 py_test(
@@ -334,7 +356,28 @@ py_test(
         "cpp_format.py",
         "cpp_format_test.py",
     ],
+    data = [
+        "//:.clang-format",
+        "@current_llvm_toolchain_llvm//:clang-format",
+    ],
+    env = {
+        "KWAQUE_TEST_CLANG_FORMAT": "$(rlocationpath @current_llvm_toolchain_llvm//:clang-format)",
+    },
     main = "cpp_format_test.py",
+)
+
+py_test(
+    name = "run_buildifier_test",
+    size = "small",
+    srcs = [
+        "run_buildifier.py",
+        "run_buildifier_test.py",
+    ],
+    data = ["@buildifier_prebuilt//:buildifier"],
+    env = {
+        "KWAQUE_TEST_BUILDIFIER": "$(rlocationpath @buildifier_prebuilt//:buildifier)",
+    },
+    main = "run_buildifier_test.py",
 )
 
 py_test(

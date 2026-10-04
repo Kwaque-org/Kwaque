@@ -1,3 +1,4 @@
+#include "src/base/units.h"
 #include "src/broker/storage_directories.h"
 #include "src/observability/event_identity.h"
 #include "src/resource/resource_registry.h"
@@ -71,9 +72,7 @@ with_wal(std::uint8_t device, Func function, std::uint32_t tasks = 32) {
                 runtime::production::file_system files;
                 storage::workload_budget budget{
                   manager.acquire_workload(resource::workload_class::metadata),
-                  {.tasks = tasks,
-                   .bytes = byte_count{16U * 1024U * 1024U},
-                   .handles = 32},
+                  {.tasks = tasks, .bytes = byte_count{16_MiB}, .handles = 32},
                   bytes::testing::charge};
                 if constexpr (requires {
                                   function(
@@ -153,12 +152,10 @@ SEASTAR_TEST_CASE(wal_writer_native_allocator_rounded_staging) {
           };
           storage::workload_budget budget{
             manager.acquire_workload(resource::workload_class::metadata),
-            {.tasks = 32,
-             .bytes = byte_count{16U * 1024U * 1024U},
-             .handles = 32},
+            {.tasks = 32, .bytes = byte_count{16_MiB}, .handles = 32},
             charge};
-          BOOST_CHECK(!budget.allocation_charge(byte_count{131072}));
-          BOOST_CHECK(budget.allocation_charge(byte_count{65536}).has_value());
+          BOOST_CHECK(!budget.allocation_charge(byte_count{128_KiB}));
+          BOOST_CHECK(budget.allocation_charge(byte_count{64_KiB}).has_value());
           co_await storage::testing::wal_append_contract::exercise(
             files, owner, spec, budget, drive);
           BOOST_CHECK_EQUAL(budget.snapshot().bytes, 0U);
@@ -609,9 +606,7 @@ SEASTAR_TEST_CASE(wal_group_commit_native_lifecycle_environment_abort) {
                     storage::workload_budget budget{
                       env.resource_manager().acquire_workload(
                         resource::workload_class::metadata),
-                      {.tasks = 32,
-                       .bytes = byte_count{16U * 1024U * 1024U},
-                       .handles = 32},
+                      {.tasks = 32, .bytes = byte_count{16_MiB}, .handles = 32},
                       bytes::testing::charge};
                     auto& files = env.file_system();
                     auto& timer = env.timer();

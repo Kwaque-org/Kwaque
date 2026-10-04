@@ -13,60 +13,85 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  campaign-targets:
+    name: Select campaign targets
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    outputs:
+      targets: ${{ steps.query.outputs.targets }}
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/setup-build
+      - name: Query targets tagged for scheduled campaigns
+        id: query
+        # The tag is the campaign membership; no list is maintained here.
+        run: |
+          set -o pipefail
+          targets="$(bazel query --output=label \
+            'attr(tags, "\bfuzz-campaign\b", tests(//...))' |
+            python3 -c 'import json, sys; print(json.dumps(sys.stdin.read().split()))')"
+          if [[ "${targets}" == "[]" ]]; then
+            echo "no fuzz-campaign targets were found" >&2
+            exit 1
+          fi
+          echo "targets=${targets}" >> "${GITHUB_OUTPUT}"
+
   fuzz-campaign:
-    name: ASan and UBSan (${{ matrix.name }})
+    name: ASan and UBSan (${{ matrix.target }})
+    needs: campaign-targets
     runs-on: ubuntu-24.04
     timeout-minutes: 90
     strategy:
       fail-fast: false
       max-parallel: 4
       matrix:
-        include:
-          - name: scheduler_fuzz
-            target: //src/simulation/tests:scheduler_fuzz
-          - name: fault_schedule_fuzz
-            target: //src/simulation/tests:fault_schedule_fuzz
-          - name: fake_file_fuzz
-            target: //src/simulation/tests:fake_file_fuzz
-          - name: fake_network_fuzz
-            target: //src/simulation/tests:fake_network_fuzz
-          - name: codec_fuzz
-            target: //src/codec/tests:codec_fuzz
-          - name: codec_cooperative_fuzz
-            target: //src/codec/tests:codec_cooperative_fuzz
-          - name: compression_fuzz
-            target: //src/compression/tests:compression_fuzz
-          - name: record_fuzz
-            target: //src/model/tests:record_fuzz
-          - name: checkpoint_fuzz
-            target: //src/model/tests:checkpoint_fuzz
-          - name: storage_format_fuzz
-            target: //src/storage/tests:storage_format_fuzz
-          - name: frame_fuzz
-            target: //src/protocol/tests:frame_fuzz
-          - name: control_fuzz
-            target: //src/protocol/tests:control_fuzz
+        target: ${{ fromJSON(needs.campaign-targets.outputs.targets) }}
     steps:
       - name: Check out source
-        uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # 6.0.1
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - uses: ./.github/actions/setup-build
+      - name: Name the target's corpus
+        id: corpus
+        env:
+          FUZZ_TARGET: ${{ matrix.target }}
+        run: |
+          echo "key=fuzz-corpus-$(printf '%s' "${FUZZ_TARGET}" | tr -c 'A-Za-z0-9_-' '_')" >> "${GITHUB_OUTPUT}"
+          echo "directory=${RUNNER_TEMP}/fuzz-corpus" >> "${GITHUB_OUTPUT}"
+      # Each campaign continues from the corpus the previous ones grew instead
+      # of starting again from the checked-in seeds.
+      - name: Restore the corpus from earlier campaigns
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
-          cache-scope: fuzz
+          path: ${{ steps.corpus.outputs.directory }}
+          key: ${{ steps.corpus.outputs.key }}-${{ github.run_id }}
+          restore-keys: ${{ steps.corpus.outputs.key }}-
       - name: Run a bounded fuzz campaign
         id: tests
         env:
           FUZZ_TARGET: ${{ matrix.target }}
+          CORPUS: ${{ steps.corpus.outputs.directory }}
         run: >-
           bazel test --config=ci --config=fuzz
           --test_output=all --test_timeout=720
           --test_env=KWAQUE_FUZZ_MINIMIZE_SECONDS=30
+          --test_env=KWAQUE_FUZZ_CORPUS_DIR="${CORPUS}"
+          --sandbox_writable_path="${CORPUS}"
           --test_arg=-max_total_time=600
           --test_arg=-timeout=15
           "${FUZZ_TARGET}"
+      - name: Keep the grown corpus
+        if: always() && (steps.tests.outcome == 'success' || steps.tests.outcome == 'failure')
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ steps.corpus.outputs.directory }}
+          key: ${{ steps.corpus.outputs.key }}-${{ github.run_id }}
       - name: Retain failed test diagnostics
         if: failure() && steps.tests.outcome == 'failure'
         uses: ./.github/actions/retain-logs
         with:
-          name: fuzz-${{ matrix.name }}-${{ github.run_attempt }}
+          name: fuzz-${{ strategy.job-index }}-${{ github.run_attempt }}

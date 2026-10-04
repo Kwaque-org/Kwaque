@@ -2,6 +2,7 @@
 
 #include "src/base/error.h"
 #include "src/base/result.h"
+#include "src/base/units.h"
 
 #include <algorithm>
 #include <array>
@@ -19,7 +20,7 @@ result<void> validate_keyspace_coverage(
 
     std::array<const keyspace_interval*, max_unordered_keyspace_intervals>
       scratch{};
-    static_assert(sizeof(scratch) <= 8U * 1024U);
+    static_assert(sizeof(scratch) <= 8_KiB);
     auto sorted = std::span{scratch}.first(intervals.size());
     for (std::size_t index = 0; index < intervals.size(); ++index) {
         sorted[index] = &intervals[index];

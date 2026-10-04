@@ -1,3 +1,4 @@
+#include "src/base/units.h"
 #include "src/storage/format_size.h"
 
 #include <gtest/gtest.h>
@@ -15,14 +16,16 @@ namespace storage = kwaque::storage;
 using kwaque::byte_count;
 using kwaque::errc;
 using kwaque::runtime::file_position;
+using kwaque::literals::operator""_KiB;
+using kwaque::literals::operator""_MiB;
 using storage::aligned_envelope_layout;
 using storage::storage_alignment;
 constexpr auto maximum = std::numeric_limits<std::uint64_t>::max();
-constexpr std::uint64_t body_cap = 16U << 20U;
+constexpr std::uint64_t body_cap = 16_MiB;
 constexpr codec::envelope_extent_limits ordinary{
   byte_count{body_cap}, byte_count{body_cap + 4096}};
 constexpr codec::envelope_extent_limits page{
-  byte_count{65536}, byte_count{65536}};
+  byte_count{64_KiB}, byte_count{64_KiB}};
 static_assert(!std::default_initializable<aligned_envelope_layout>);
 static_assert(!std::is_aggregate_v<aligned_envelope_layout>);
 static_assert(std::is_trivially_copyable_v<aligned_envelope_layout>);
@@ -146,7 +149,7 @@ TEST(StorageSizeTest, RetryPageCapacityCountsHeaderExtensionsAndAlignment) {
         const auto multiple = std::uint64_t{1} << shift;
         EXPECT_EQ(
           layout(32, 100, 408U * 160U, multiple, page).value().encoded_bytes(),
-          byte_count{65536});
+          byte_count{64_KiB});
         expect_error(
           layout(32, 100, 409U * 160U, multiple, page),
           errc::resource_exhausted);
@@ -154,7 +157,7 @@ TEST(StorageSizeTest, RetryPageCapacityCountsHeaderExtensionsAndAlignment) {
           layout(4096, 100, 383U * 160U, multiple, page)
             .value()
             .encoded_bytes(),
-          byte_count{65536});
+          byte_count{64_KiB});
         expect_error(
           layout(4096, 100, 384U * 160U, multiple, page),
           errc::resource_exhausted);
@@ -173,7 +176,7 @@ TEST(StorageSizeTest, LargestChildFitsAndOneAdditionalByteFails) {
                      {ordinary,
                       page,
                       codec::envelope_extent_limits{
-                        byte_count{8192}, byte_count{7000}}}) {
+                        byte_count{8_KiB}, byte_count{7000}}}) {
                     const auto max_child = storage::max_child_bytes(
                       byte_count{header},
                       byte_count{fixed},
@@ -315,7 +318,7 @@ TEST(
         bytes[position] = '\0';
     }
     auto config = codec::limits_config{};
-    config.max_work_bytes = byte_count{32768};
+    config.max_work_bytes = byte_count{32_KiB};
     const auto narrowed = codec::limits::make(config).value();
     bytes.back() = '\x01';
     expect_error(

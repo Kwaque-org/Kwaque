@@ -1,5 +1,6 @@
 #pragma once
 
+#include "src/base/units.h"
 #include "src/storage/tests/wal_group_commit_contract.h"
 
 namespace kwaque::storage::testing::wal_durability_contract {
@@ -176,13 +177,16 @@ seastar::future<> retained_pressure(
                   budget, spec.owner.cluster(), work, records);
                 auto rejected = co_await groups.template submit<Clock>(
                   writer, std::move(extra), work);
+                // Local admission rejection preserves the offered group.
+                // NOLINTBEGIN(bugprone-use-after-move)
                 require(
                   !rejected && rejected.error().code() == errc::queue_full
                     && extra.size() == 1,
                   "stalled downstream work bypassed shared group admission");
+                // NOLINTEND(bugprone-use-after-move)
                 std::array<std::optional<workload_reservation>, 32> pressure;
                 for (auto& held : pressure) {
-                    auto next = budget.try_reserve(byte_count{4096});
+                    auto next = budget.try_reserve(byte_count{4_KiB});
                     if (!next) break;
                     held.emplace(std::move(*next));
                 }
@@ -402,6 +406,8 @@ seastar::future<> result_allocation_cuts(
                     } catch (const std::bad_alloc&) {
                         caught = true;
                     }
+                    // A failed registration preserves the offered group.
+                    // NOLINTBEGIN(bugprone-use-after-move)
                     require(
                       injected && caught && input.size() == 1
                         && writer.progress()->reserved == accepted
@@ -410,6 +416,7 @@ seastar::future<> result_allocation_cuts(
                         && budget.snapshot().bytes == before.bytes,
                       "result/promise allocation failure escaped preacceptance "
                       "rollback");
+                    // NOLINTEND(bugprone-use-after-move)
                 }
                 auto input = co_await wal_append_contract::offer(
                   budget, spec.owner.cluster(), work, records);
@@ -479,7 +486,7 @@ seastar::future<> stale_capture(
           const auto old_end = stale->boundary();
           take(
             co_await drive.lifecycle(
-              writer.rotate(take(writer.capture()), byte_count{8192}, work)));
+              writer.rotate(take(writer.capture()), byte_count{8_KiB}, work)));
           const auto flushes = writer.statistics().flush_calls;
           auto old_barrier = co_await writer.barrier(old_end);
           require(

@@ -578,6 +578,8 @@ public:
 
     contract_backend_common() { lifetime_.activate(); }
 
+    // Destruction cannot wait. A lifetime that handed out leases completes
+    // its close asynchronously, so its owner awaits lifetime().close() first.
     ~contract_backend_common() {
         lifetime_.close().get();
         dns_.stop().get();

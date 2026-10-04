@@ -121,6 +121,7 @@ kwaque_cc_seastar_gtest(
         ] + (["footer_test_support.h"] if name in [
             "footer_format_test",
             "extent_verifier_test",
+            "recovery_test",
             "retry_format_test",
             "sealed_format_test",
             "retry_qualification_test",
@@ -128,7 +129,10 @@ kwaque_cc_seastar_gtest(
             "retry_format_test",
             "sealed_format_test",
             "retry_qualification_test",
-        ] else []) + (["wal_test_support.h"] if name == "wal_format_test" else []),
+        ] else []) + (["wal_test_support.h"] if name in [
+            "recovery_test",
+            "wal_format_test",
+        ] else []),
         memory = "256MiB",
         deps = [
             "//src/base",
@@ -161,6 +165,9 @@ kwaque_cc_seastar_gtest(
             "//src/storage:wal_format",
             "//src/storage:wal_group",
         ] if name == "wal_format_test" else []) + ([
+            "//src/storage:recovery",
+            "//src/storage:wal_format",
+        ] if name == "recovery_test" else []) + ([
             "//src/storage:footer_format",
             "//src/storage:page_ref",
             "//src/storage:completed_retry",
@@ -168,6 +175,7 @@ kwaque_cc_seastar_gtest(
         ] if name in [
             "footer_format_test",
             "extent_verifier_test",
+            "recovery_test",
             "retry_format_test",
             "sealed_format_test",
             "retry_qualification_test",
@@ -180,6 +188,7 @@ kwaque_cc_seastar_gtest(
         "sealed_format_test",
         "retry_qualification_test",
         "footer_format_test",
+        "recovery_test",
         "segment_format_test",
         "segment_relocation_test",
         "wal_format_test",
@@ -572,6 +581,7 @@ kwaque_cc_fuzz_test(
     ],
     corpus = glob(["testdata/storage_format_fuzz_corpus/*.bin"]),
     tags = [
+        "fuzz-campaign",
         "resources:cpu:1",
         "resources:memory:1024",
     ],
@@ -589,6 +599,7 @@ kwaque_cc_benchmark(
         "storage_metadata_bench.cc",
     ],
     memory = "384MiB",
+    native_allocator_only = True,
     deps = [
         ":storage_large_fixture",
         ":storage_test_support",
@@ -915,6 +926,72 @@ kwaque_cc_library(
 )
 
 kwaque_cc_library(
+    name = "wal_scan_contract",
+    testonly = True,
+    hdrs = ["wal_scan_contract.h"],
+    visibility = [
+        "//src/broker:__pkg__",
+        "//src/simulation/tests:__pkg__",
+    ],
+    deps = [
+        ":local_reader_contract",
+        "//src/base",
+        "//src/storage:storage_scan",
+        "@seastar",
+    ],
+)
+
+kwaque_cc_library(
+    name = "segment_scan_contract",
+    testonly = True,
+    hdrs = ["segment_scan_contract.h"],
+    visibility = [
+        "//src/broker:__pkg__",
+        "//src/simulation/tests:__pkg__",
+    ],
+    deps = [
+        ":storage_test_support",
+        ":wal_scan_contract",
+        "//src/base",
+        "//src/storage:recovery",
+        "//src/storage:storage_scan",
+        "@seastar",
+    ],
+)
+
+kwaque_cc_library(
+    name = "recovery_contract",
+    testonly = True,
+    hdrs = ["recovery_contract.h"],
+    visibility = [
+        "//src/broker:__pkg__",
+        "//src/simulation/tests:__pkg__",
+    ],
+    deps = [
+        ":segment_scan_contract",
+        ":storage_test_support",
+        "//src/storage:recovery",
+        "@seastar",
+    ],
+)
+
+kwaque_cc_library(
+    name = "recovery_successor_contract",
+    testonly = True,
+    hdrs = ["recovery_successor_contract.h"],
+    visibility = [
+        "//src/broker:__pkg__",
+        "//src/simulation/tests:__pkg__",
+    ],
+    deps = [
+        ":local_append_contract",
+        "//src/base",
+        "//src/storage:recovery",
+        "@seastar",
+    ],
+)
+
+kwaque_cc_library(
     name = "local_reader_contract",
     testonly = True,
     hdrs = ["local_reader_contract.h"],
@@ -984,6 +1061,7 @@ kwaque_cc_library(
     ],
     deps = [
         ":local_reader_contract",
+        "//src/base",
         "@seastar",
     ],
 )
@@ -1340,6 +1418,7 @@ kwaque_cc_library(
     ],
     deps = [
         ":wal_lifecycle_contract",
+        "//src/base",
         "//src/storage:wal_writer_state",
         "@seastar",
     ],
@@ -1473,6 +1552,44 @@ kwaque_cc_seastar_test(
         "//src/codec:limits",
         "//src/storage:encoded_batch",
         "//src/storage:segment_writer_state",
+    ],
+)
+
+kwaque_cc_library(
+    name = "local_append_contract",
+    testonly = True,
+    hdrs = ["local_append_contract.h"],
+    visibility = [
+        "//src/broker:__pkg__",
+        "//src/simulation/tests:__pkg__",
+    ],
+    deps = [
+        ":local_installation_contract",
+        ":local_store_contract",
+        ":segment_writer_contract",
+        ":storage_test_support",
+        ":wal_writer_contract",
+        "//src/base",
+        "//src/base:error",
+        "//src/codec:cooperative",
+        "//src/codec:digest",
+        "//src/codec:xxh3",
+        "//src/model:epoch",
+        "//src/runtime:file",
+        "//src/runtime:first_failure",
+        "//src/runtime:time",
+        "//src/storage:encoded_batch",
+        "//src/storage:format_context",
+        "//src/storage:local_append",
+        "//src/storage:local_control",
+        "//src/storage:local_id_allocator",
+        "//src/storage:local_paths",
+        "//src/storage:segment_writer",
+        "//src/storage:segment_writer_state",
+        "//src/storage:wal_group_commit",
+        "//src/storage:wal_writer",
+        "//src/storage:workload_budget",
+        "@seastar",
     ],
 )
 
@@ -1628,6 +1745,7 @@ kwaque_cc_benchmark(
         "//conditions:default": ["-Wl,--wrap=XXH3_128bits_update"],
     }),
     memory = "1GiB",
+    native_allocator_only = True,
     deps = _SEGMENT_BENCH_DEPS + [":segment_bench_observer"],
 )
 
@@ -1636,6 +1754,7 @@ kwaque_cc_benchmark(
     srcs = ["segment_bench.cc"],
     local_defines = ["KWAQUE_SEGMENT_TIMING_ONLY"],
     memory = "1GiB",
+    native_allocator_only = True,
     deps = _SEGMENT_BENCH_DEPS,
 )
 
@@ -1656,4 +1775,163 @@ py_test(
         "wal_cohort_report.py",
     ],
     main = "segment_bench_report_test.py",
+)
+
+kwaque_cc_library(
+    name = "local_storage_bench_file",
+    testonly = True,
+    hdrs = ["local_storage_bench_file.h"],
+    deps = [
+        ":wal_bench_file",
+        "//src/runtime:file",
+        "//src/runtime:operation_statistics",
+        "//src/runtime/production:file",
+        "@seastar",
+    ],
+)
+
+_LOCAL_STORAGE_BENCH_DEPS = [
+    ":local_installation_contract",
+    ":local_storage_bench_file",
+    ":local_store_contract",
+    ":segment_bench_fixture",
+    ":segment_writer_contract",
+    ":storage_test_support",
+    ":wal_writer_contract",
+    "//src/base",
+    "//src/base:error",
+    "//src/bytes:allocation_test_profile",
+    "//src/codec:cooperative",
+    "//src/codec:xxh3",
+    "//src/codec/tests:allocation_observer",
+    "//src/codec/tests:codec_bench_reference",
+    "//src/codec/tests:memory_qualification_support",
+    "//src/resource:resource_manager",
+    "//src/resource:resource_registry",
+    "//src/resource:workload_class",
+    "//src/runtime:file",
+    "//src/runtime:first_failure",
+    "//src/runtime/production:clocks",
+    "//src/runtime/production:timer",
+    "//src/runtime/testing:test_directory",
+    "//src/storage:local_append",
+    "//src/storage:local_paths",
+    "//src/storage:segment_writer",
+    "//src/storage:segment_writer_state",
+    "//src/storage:wal_child",
+    "//src/storage:wal_format",
+    "//src/storage:wal_group",
+    "//src/storage:wal_group_commit",
+    "//src/storage:wal_writer",
+    "//src/storage:workload_budget",
+    "@seastar",
+]
+
+kwaque_cc_benchmark(
+    name = "local_storage_bench",
+    srcs = ["local_storage_bench.cc"],
+    linkopts = ALLOCATION_OBSERVER_LINKOPTS,
+    memory = "1GiB",
+    deps = _LOCAL_STORAGE_BENCH_DEPS,
+)
+
+kwaque_cc_benchmark(
+    name = "local_storage_timing_bench",
+    srcs = ["local_storage_bench.cc"],
+    local_defines = ["KWAQUE_LOCAL_STORAGE_TIMING_ONLY"],
+    memory = "1GiB",
+    deps = _LOCAL_STORAGE_BENCH_DEPS,
+)
+
+py_binary(
+    name = "local_storage_bench_report",
+    srcs = [
+        "local_storage_bench_report.py",
+        "wal_cohort_report.py",
+    ],
+    main = "local_storage_bench_report.py",
+)
+
+py_test(
+    name = "local_storage_bench_report_test",
+    srcs = [
+        "local_storage_bench_report.py",
+        "local_storage_bench_report_test.py",
+        "wal_cohort_report.py",
+    ],
+    main = "local_storage_bench_report_test.py",
+)
+
+_STORAGE_RECOVERY_BENCH_DEPS = [
+    ":local_installation_contract",
+    ":local_storage_bench_file",
+    ":local_store_contract",
+    ":segment_bench_fixture",
+    ":segment_bench_observer_api",
+    ":segment_writer_contract",
+    ":storage_test_support",
+    ":wal_writer_contract",
+    "//src/base",
+    "//src/bytes:allocation_test_profile",
+    "//src/codec:cooperative",
+    "//src/codec/tests:allocation_observer",
+    "//src/codec/tests:memory_qualification_support",
+    "//src/resource:resource_manager",
+    "//src/resource:resource_registry",
+    "//src/resource:workload_class",
+    "//src/runtime:file",
+    "//src/runtime:first_failure",
+    "//src/runtime/production:clocks",
+    "//src/runtime/production:timer",
+    "//src/runtime/testing:test_directory",
+    "//src/storage:local_append",
+    "//src/storage:local_paths",
+    "//src/storage:recovery",
+    "//src/storage:segment_format",
+    "//src/storage:segment_writer",
+    "//src/storage:wal_group_commit",
+    "//src/storage:wal_writer",
+    "//src/storage:workload_budget",
+    "@seastar",
+]
+
+kwaque_cc_benchmark(
+    name = "storage_recovery_bench",
+    srcs = ["storage_recovery_bench.cc"],
+    linkopts = ALLOCATION_OBSERVER_LINKOPTS + [
+        "-Wl,--wrap=LZ4F_decompress",
+        "-Wl,--wrap=_ZN4absl12lts_2026052612crc_internal20ExtendCrc32cInternalENS0_8crc32c_tENSt3__117basic_string_viewIcNS3_11char_traitsIcEEEE",
+    ] + select({
+        "@platforms//cpu:x86_64": ["-Wl,--wrap=XXH3_128bits_update_dispatch"],
+        "//conditions:default": ["-Wl,--wrap=XXH3_128bits_update"],
+    }),
+    memory = "1GiB",
+    deps = _STORAGE_RECOVERY_BENCH_DEPS + [":segment_bench_observer"],
+)
+
+kwaque_cc_benchmark(
+    name = "storage_recovery_timing_bench",
+    srcs = ["storage_recovery_bench.cc"],
+    local_defines = ["KWAQUE_STORAGE_RECOVERY_TIMING_ONLY"],
+    memory = "1GiB",
+    deps = _STORAGE_RECOVERY_BENCH_DEPS,
+)
+
+py_binary(
+    name = "storage_recovery_bench_report",
+    srcs = [
+        "storage_recovery_bench_report.py",
+        "wal_cohort_report.py",
+    ],
+    main = "storage_recovery_bench_report.py",
+)
+
+py_test(
+    name = "storage_recovery_bench_report_test",
+    srcs = [
+        "storage_recovery_bench_report.py",
+        "storage_recovery_bench_report_test.py",
+        "wal_cohort_report.py",
+    ],
+    main = "storage_recovery_bench_report_test.py",
 )

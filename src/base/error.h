@@ -1,5 +1,6 @@
 #pragma once
 
+#include <optional>
 #include <system_error>
 #include <type_traits>
 
@@ -35,8 +36,16 @@ enum class errc {
     unsupported_format = 26,
 };
 
+// The highest code. Codes are stable serialized values: append new codes after
+// it and move this marker, never renumber.
+inline constexpr errc errc_last = errc::unsupported_format;
+
 [[nodiscard]] const std::error_category& error_category() noexcept;
 [[nodiscard]] std::error_code make_error_code(errc error) noexcept;
+// The Kwaque code an error carries, or nothing for another category or an
+// out-of-range value.
+[[nodiscard]] std::optional<errc>
+to_errc(const std::error_code& error) noexcept;
 
 } // namespace kwaque
 

@@ -6,6 +6,11 @@ load("//bazel:test.bzl", "kwaque_cc_seastar_gtest", "kwaque_cc_seastar_test", "k
 package(default_visibility = ["//visibility:private"])
 
 kwaque_cc_library(
+    name = "exit_code",
+    hdrs = ["exit_code.h"],
+)
+
+kwaque_cc_library(
     name = "startup_policy",
     srcs = ["startup_policy.cc"],
     hdrs = ["startup_policy.h"],
@@ -37,6 +42,7 @@ kwaque_cc_library(
     hdrs = ["crash_limiter.h"],
     deps = [
         ":startup_policy",
+        "//src/base",
         "//src/base:logging",
         "@crc32c",
         "@seastar",
@@ -48,6 +54,7 @@ kwaque_cc_library(
     srcs = ["crash_recorder_writer.cc"],
     hdrs = ["crash_recorder_writer.h"],
     deps = [
+        "//src/base",
         "@crc32c",
         "@seastar",
     ],
@@ -59,6 +66,7 @@ kwaque_cc_library(
     hdrs = ["crash_recorder.h"],
     deps = [
         ":crash_recorder_writer",
+        "//src/base",
         "//src/base:build_info",
         "@seastar",
     ],
@@ -90,16 +98,66 @@ kwaque_cc_library(
 )
 
 kwaque_cc_library(
+    name = "service_manager",
+    srcs = ["service_manager.cc"],
+    hdrs = ["service_manager.h"],
+)
+
+kwaque_cc_library(
     name = "host_checks",
     srcs = ["host_checks.cc"],
     hdrs = ["host_checks.h"],
-    deps = ["@seastar"],
+    deps = [
+        "//src/base",
+        "@seastar",
+    ],
 )
 
 kwaque_cc_seastar_test(
     name = "host_checks_test",
     srcs = ["host_checks_test.cc"],
-    deps = [":host_checks"],
+    deps = [
+        ":host_checks",
+        "//src/base",
+    ],
+)
+
+kwaque_cc_test(
+    name = "service_manager_test",
+    srcs = ["service_manager_test.cc"],
+    deps = [":service_manager"],
+)
+
+py_test(
+    name = "host_checks_documentation_test",
+    size = "small",
+    srcs = ["host_checks_documentation_test.py"],
+    args = [
+        "$(rootpath host_checks.cc)",
+        "$(rootpath //:README.md)",
+    ],
+    data = [
+        "host_checks.cc",
+        "//:README.md",
+    ],
+    main = "host_checks_documentation_test.py",
+)
+
+py_test(
+    name = "service_unit_test",
+    size = "small",
+    srcs = ["service_unit_test.py"],
+    args = [
+        "$(rootpath //conf:kwaque.service)",
+        "$(rootpath exit_code.h)",
+        "$(rootpath host_checks.h)",
+    ],
+    data = [
+        "exit_code.h",
+        "host_checks.h",
+        "//conf:kwaque.service",
+    ],
+    main = "service_unit_test.py",
 )
 
 kwaque_cc_library(
@@ -114,9 +172,11 @@ kwaque_cc_library(
         ":crash_limiter",
         ":crash_recorder",
         ":data_directory",
+        ":exit_code",
         ":host_checks",
         ":pid_file",
         ":service_lifecycle",
+        ":service_manager",
         ":shutdown_watchdog",
         ":startup_policy",
         "//src/admin:admin_limits",
@@ -144,6 +204,7 @@ kwaque_cc_library(
     visibility = ["//visibility:public"],
     deps = [
         ":application_internal",
+        ":exit_code",
         ":startup_policy",
         "//src/base:build_info",
         "@boost//:program_options",
@@ -159,6 +220,7 @@ kwaque_cc_library(
         ":application_internal",
         ":startup_policy",
         "//src/config:bootstrap_config",
+        "@seastar",
     ],
 )
 
@@ -175,6 +237,7 @@ kwaque_launcher(
     srcs = [
         "cpu_features.c",
         "cpu_features.h",
+        "exit_code.h",
         "launcher.c",
     ],
     data = [":kwaque_native"],
@@ -187,13 +250,13 @@ kwaque_launcher(
     srcs = [
         "cpu_features.h",
         "cpu_features_fixture.c",
+        "exit_code.h",
         "launcher.c",
     ],
 )
 
-py_test(
+kwaque_py_native_test(
     name = "launcher_test",
-    size = "small",
     srcs = ["launcher_test.py"],
     args = [
         "$(rootpath :launcher_fixture)",
@@ -239,6 +302,11 @@ kwaque_py_native_test(
     timeout = "moderate",
     srcs = ["failure_policy_test.py"],
     data = [":failure_policy_probe"],
+    tags = [
+        "resources:cpu:2",
+        "resources:memory:128",
+        "stress",
+    ],
 )
 
 kwaque_cc_seastar_test(
@@ -246,6 +314,7 @@ kwaque_cc_seastar_test(
     srcs = ["startup_configuration_test.cc"],
     cpu = 2,
     memory = "256MiB",
+    tags = ["stress"],
     deps = [
         ":application_internal",
         ":application_test_support",
@@ -264,6 +333,7 @@ kwaque_cc_test(
 kwaque_cc_test(
     name = "pid_file_test",
     srcs = ["pid_file_test.cc"],
+    tags = ["stress"],
     deps = [":pid_file"],
 )
 
@@ -273,10 +343,13 @@ kwaque_cc_seastar_test(
     srcs = ["broker_headroom_test.cc"],
     cpu = 1,
     memory = "192MiB",
+    # A saturated broker must serve a full scrape within a wall-clock deadline.
+    tags = ["exclusive"],
     deps = [
         ":application_internal",
         ":application_test_support",
         "//src/admin:admin_limits",
+        "//src/base",
         "//src/config:bootstrap_config",
         "//src/resource:resource_config",
         "//src/resource:resource_manager",
@@ -291,11 +364,13 @@ kwaque_cc_seastar_test(
     srcs = ["application_lifecycle_test.cc"],
     cpu = 1,
     memory = "128MiB",
+    tags = ["stress"],
     deps = [
         ":application",
         ":application_internal",
         ":application_test_support",
         ":service_lifecycle",
+        "//src/base",
     ],
 )
 
@@ -305,6 +380,7 @@ kwaque_cc_seastar_test(
     cpu = 2,
     memory = "256MiB",
     deps = [
+        "//src/admin:admin_limits",
         "//src/admin:admin_server",
         "//src/base",
         "//src/base:metric_schema",
@@ -323,18 +399,16 @@ kwaque_cc_seastar_test(
     deps = [":data_directory"],
 )
 
-py_test(
+kwaque_py_native_test(
     name = "version_cli_test",
-    size = "small",
     srcs = ["version_cli_test.py"],
     args = ["$(rootpath :kwaque)"],
     data = [":kwaque"],
     main = "version_cli_test.py",
 )
 
-py_test(
+kwaque_py_native_test(
     name = "config_cli_test",
-    size = "small",
     timeout = "moderate",
     srcs = ["config_cli_test.py"],
     args = [
@@ -353,11 +427,13 @@ py_test(
         "resources:cpu:4",
         "resources:memory:384",
     ],
+    deps = ["//tests/smoke:broker_test_support"],
 )
 
 kwaque_cc_seastar_test(
     name = "shutdown_watchdog_test",
     srcs = ["shutdown_watchdog_test.cc"],
+    tags = ["stress"],
     deps = [
         ":service_lifecycle",
         ":shutdown_watchdog",
@@ -367,9 +443,11 @@ kwaque_cc_seastar_test(
 kwaque_cc_seastar_test(
     name = "crash_limiter_test",
     srcs = ["crash_limiter_test.cc"],
+    tags = ["stress"],
     deps = [
         ":crash_limiter",
         ":startup_policy",
+        "//src/base",
         "@crc32c",
     ],
 )
@@ -386,9 +464,11 @@ kwaque_cc_test(
 kwaque_cc_seastar_test(
     name = "crash_recorder_test",
     srcs = ["crash_recorder_test.cc"],
+    tags = ["stress"],
     deps = [
         ":crash_recorder",
         ":crash_recorder_writer",
+        "//src/base",
         "@crc32c",
     ],
 )
@@ -398,10 +478,12 @@ kwaque_cc_seastar_test(
     srcs = ["application_shutdown_test.cc"],
     cpu = 2,
     memory = "384MiB",
+    tags = ["stress"],
     deps = [
         ":application_internal",
         ":application_test_support",
         ":pid_file",
+        "//src/base",
         "//src/runtime/production:environment",
     ],
 )
@@ -414,6 +496,7 @@ kwaque_cc_seastar_test(
     deps = [
         ":application_internal",
         ":application_test_support",
+        "//src/base",
         "//src/runtime:cross_shard",
         "//src/runtime/production:environment",
         "//src/runtime/testing:test_directory",
@@ -428,6 +511,7 @@ kwaque_cc_binary(
     deps = [
         ":crash_recorder",
         ":startup_policy",
+        "//src/base",
         "//src/base:invariant",
         "@boost//:program_options",
         "@seastar",
@@ -440,6 +524,7 @@ kwaque_py_native_test(
     srcs = ["crash_recorder_test.py"],
     data = [":crash_recorder_probe"],
     main = "crash_recorder_test.py",
+    tags = ["stress"],
 )
 
 kwaque_cc_library(
@@ -502,7 +587,32 @@ kwaque_cc_seastar_test(
 )
 
 kwaque_cc_seastar_test(
+    name = "local_append_test",
+    timeout = "moderate",
+    srcs = ["local_append_test.cc"],
+    data = ["//src/storage/tests:local_metadata_fixture_data"],
+    memory = "256MiB",
+    deps = [
+        ":storage_directories",
+        "//src/base",
+        "//src/base:error",
+        "//src/resource:resource_manager",
+        "//src/resource:resource_registry",
+        "//src/resource:workload_class",
+        "//src/runtime:file",
+        "//src/runtime/production:clocks",
+        "//src/runtime/production:file",
+        "//src/runtime/production:timer",
+        "//src/runtime/testing:test_directory",
+        "//src/storage:workload_budget",
+        "//src/storage/tests:local_append_contract",
+        "//src/storage/tests:recovery_successor_contract",
+    ],
+)
+
+kwaque_cc_seastar_test(
     name = "local_reader_test",
+    timeout = "moderate",
     srcs = ["local_reader_test.cc"],
     data = ["//src/storage/tests:local_metadata_fixture_data"],
     deps = [
@@ -514,10 +624,14 @@ kwaque_cc_seastar_test(
         "//src/resource:resource_registry",
         "//src/resource:workload_class",
         "//src/runtime:file",
+        "//src/runtime/production:clocks",
         "//src/runtime/production:file",
         "//src/runtime/testing:test_directory",
         "//src/storage:workload_budget",
         "//src/storage/tests:local_reader_contract",
+        "//src/storage/tests:recovery_contract",
+        "//src/storage/tests:segment_scan_contract",
+        "//src/storage/tests:wal_scan_contract",
     ],
 )
 

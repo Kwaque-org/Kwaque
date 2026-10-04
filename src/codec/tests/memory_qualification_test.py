@@ -109,8 +109,9 @@ class CriticalReservationTest(unittest.TestCase):
         ):
             samples = self.samples(False)
             samples[name][field] = value
-            with self.subTest(name=name, field=field), self.assertRaises(
-                AssertionError
+            with (
+                self.subTest(name=name, field=field),
+                self.assertRaises(AssertionError),
             ):
                 self.bounds(samples)
 
@@ -145,9 +146,10 @@ class CriticalReservationTest(unittest.TestCase):
                 )
 
         for tracked in (False, True):
-            with self.subTest(
-                tracked=tracked
-            ), tempfile.TemporaryDirectory() as directory:
+            with (
+                self.subTest(tracked=tracked),
+                tempfile.TemporaryDirectory() as directory,
+            ):
                 binary = Path(directory) / "mock-probe"
                 binary.write_bytes(b"never executed")
                 harness = OwnerHarness()
@@ -180,7 +182,9 @@ class CriticalReservationTest(unittest.TestCase):
                         peak = (
                             0
                             if name in {"crc-warm-4096", "xxh3-cold"}
-                            else (8 << 20) if name == "payload" else 1024
+                            else (8 << 20)
+                            if name == "payload"
+                            else 1024
                         )
                         largest = min(peak, 128 << 10)
                         allocations = peak // largest if largest else 0
@@ -194,13 +198,16 @@ class CriticalReservationTest(unittest.TestCase):
                         )
                     return SimpleNamespace(returncode=0, stdout=output + "status=ok\n")
 
-                with patch.dict(
-                    shared.os.environ,
-                    {"TEST_UNDECLARED_OUTPUTS_DIR": directory},
-                    clear=True,
-                ), patch.object(
-                    shared.subprocess, "run", side_effect=native_output
-                ) as invoked:
+                with (
+                    patch.dict(
+                        shared.os.environ,
+                        {"TEST_UNDECLARED_OUTPUTS_DIR": directory},
+                        clear=True,
+                    ),
+                    patch.object(
+                        shared.subprocess, "run", side_effect=native_output
+                    ) as invoked,
+                ):
                     if tracked:
                         harness.test_native_owner_reservations()
                     else:

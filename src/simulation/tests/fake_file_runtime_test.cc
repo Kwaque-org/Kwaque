@@ -1,3 +1,4 @@
+#include "src/base/units.h"
 #include "src/bytes/fragmented_buffer.h"
 #include "src/runtime/file.h"
 #include "src/runtime/testing/contracts/file_system_contract.h"
@@ -32,6 +33,8 @@
 #include <vector>
 
 namespace {
+using kwaque::literals::operator""_KiB;
+using kwaque::literals::operator""_MiB;
 
 struct fake_file_driver {
     kwaque::simulation::scheduler* events;
@@ -45,6 +48,7 @@ struct fake_file_driver {
 using kwaque::runtime::builtin_fault_point;
 using kwaque::runtime::fault_decision;
 using kwaque::runtime::fault_occurrence;
+using kwaque::runtime::testing::drain_reactor_tasks;
 using kwaque::simulation::event_trace;
 using kwaque::simulation::fake_file_system;
 using kwaque::simulation::fake_file_system_config;
@@ -754,6 +758,9 @@ SEASTAR_TEST_CASE(
     BOOST_CHECK(!first.available());
     const auto trace_size = environment.trace.entries().size();
     auto second = environment.files->exists(path("/kwaque/second"));
+    // The rejection is decided at submission. Only its delivery is a reactor
+    // task, which draining runs without stepping the scheduler.
+    co_await drain_reactor_tasks();
     BOOST_CHECK(second.available());
     const auto rejected = co_await std::move(second);
     BOOST_REQUIRE(!rejected.has_value());
@@ -962,8 +969,16 @@ SEASTAR_TEST_CASE(fake_delayed_writes_follow_scheduler_completion_order) {
     auto second_handle = co_await std::move(open_two);
     BOOST_REQUIRE(second_handle.has_value());
 
+    const auto writes_before = fake_file_test_access::submitted(
+      *environment.files, fake_submission_kind::write);
     auto first = first_handle->write(
       kwaque::runtime::file_position{0}, payload("first"));
+    // An unaligned write reads the size before its native write. The first
+    // native write takes the delayed occurrence before the second one starts.
+    auto first_submitted = fake_file_test_access::wait_submitted(
+      *environment.files, fake_submission_kind::write, writes_before + 1U);
+    co_await pump_until(environment.events, first_submitted);
+    co_await std::move(first_submitted);
     auto second = second_handle->write(
       kwaque::runtime::file_position{0}, payload("later"));
     co_await pump_until(environment.events, second);
@@ -1682,6 +1697,7 @@ SEASTAR_TEST_CASE(fake_crash_fences_new_admission_until_apply) {
 
     const auto pending_before = environment.files->pending_operations();
     auto rejected = environment.files->exists(path("/kwaque/during-crash"));
+    co_await drain_reactor_tasks();
     BOOST_REQUIRE(rejected.available());
     const auto rejection = co_await std::move(rejected);
     BOOST_REQUIRE(!rejection.has_value());
@@ -2153,6 +2169,7 @@ SEASTAR_TEST_CASE(fake_crash_trace_reservation_saturation_is_transactional) {
     const auto before = fake_file_test_access::snapshot(*environment.files);
     BOOST_REQUIRE(before.has_value());
     auto crashing = environment.files->crash();
+    co_await drain_reactor_tasks();
     BOOST_REQUIRE(crashing.available());
     const auto rejected = co_await std::move(crashing);
     BOOST_REQUIRE(!rejected.has_value());
@@ -2410,6 +2427,7 @@ SEASTAR_TEST_CASE(
 
     auto admitted = environment.files->exists(path("/kwaque/missing"));
     auto saturated = environment.files->exists(path("/kwaque/other"));
+    co_await drain_reactor_tasks();
     BOOST_REQUIRE(saturated.available());
     const auto rejected = co_await std::move(saturated);
     BOOST_REQUIRE(!rejected.has_value());
@@ -2475,6 +2493,7 @@ SEASTAR_TEST_CASE(
     BOOST_CHECK(after.open_handles == 0U);
 
     auto rejected = environment.files->exists(path("/kwaque/data/file"));
+    co_await drain_reactor_tasks();
     BOOST_REQUIRE(rejected.available());
     const auto closed = co_await std::move(rejected);
     BOOST_REQUIRE(!closed.has_value());
@@ -2826,8 +2845,8 @@ SEASTAR_TEST_CASE(fake_partial_resize_apply_uses_only_prepared_storage) {
 SEASTAR_TEST_CASE(fake_space_samples_are_scheduled_owned_and_independent) {
     fake_file_system_config config;
     config.space_override = kwaque::runtime::file_system_space::make(
-                              kwaque::byte_count{1048576},
-                              kwaque::byte_count{4096},
+                              kwaque::byte_count{1_MiB},
+                              kwaque::byte_count{4_KiB},
                               kwaque::byte_count{0},
                               true)
                               .value();
@@ -2886,7 +2905,7 @@ SEASTAR_TEST_CASE(fake_space_samples_are_scheduled_owned_and_independent) {
 
 SEASTAR_TEST_CASE(fake_space_default_tracks_capacity_without_mutating_files) {
     fake_file_system_config config;
-    config.logical_capacity = kwaque::byte_count{8192};
+    config.logical_capacity = kwaque::byte_count{8_KiB};
     fixture environment{{}, config};
     auto opening = environment.files->open(
       path("/kwaque/data"),
@@ -2973,7 +2992,7 @@ SEASTAR_TEST_CASE(
             .entries = 1,
             .encoded_bytes = kwaque::simulation::canonical_header_encoded_size
                              + kwaque::simulation::canonical_entry_encoded_size,
-            .line_bytes = 1024})
+            .line_bytes = 1_KiB})
           .value();
     fixture constrained{{}, {}, make_scheduler_limits(), tiny};
     const auto pristine = fake_file_test_access::snapshot(*constrained.files);
@@ -3247,7 +3266,7 @@ SEASTAR_TEST_CASE(
       {.entries = 1,
        .encoded_bytes = kwaque::simulation::canonical_header_encoded_size
                         + kwaque::simulation::canonical_entry_encoded_size,
-       .line_bytes = 1024});
+       .line_bytes = 1_KiB});
     BOOST_REQUIRE(tiny.has_value());
     fixture constrained{{}, {}, make_scheduler_limits(), *tiny};
     const auto pristine = fake_file_test_access::snapshot(*constrained.files);
@@ -3304,7 +3323,7 @@ SEASTAR_TEST_CASE(
           fake_file_system_config{
             .maximum_pending_operations = 6,
             .maximum_pending_writes = 4,
-            .native_max_length = 4096}};
+            .native_max_length = 4_KiB}};
         fake_file_driver drive{&environment.events};
         BOOST_REQUIRE(
           co_await drive(
@@ -3396,7 +3415,7 @@ SEASTAR_TEST_CASE(
       fake_file_system_config{
         .maximum_pending_operations = 6,
         .maximum_pending_writes = 1,
-        .native_max_length = 4096}};
+        .native_max_length = 4_KiB}};
     fake_file_driver drive{&environment.events};
     BOOST_REQUIRE(
       co_await drive(
@@ -3410,7 +3429,7 @@ SEASTAR_TEST_CASE(
     auto file = std::move(*opened);
     const auto written = co_await drive(
       file.write({}, payload(std::string(8192, 'p'))));
-    const auto read = co_await drive(file.read({}, byte_count{8192}));
+    const auto read = co_await drive(file.read({}, byte_count{8_KiB}));
     const auto flushed = co_await drive(file.flush());
     const auto closed = co_await drive(file.close());
     BOOST_REQUIRE(!written && !flushed && !closed);

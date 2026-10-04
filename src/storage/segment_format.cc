@@ -1,5 +1,6 @@
 #include "src/storage/segment_format.h"
 
+#include "src/base/units.h"
 #include "src/storage/format_internal.h"
 
 #include <exception>
@@ -24,7 +25,7 @@ codec::error at(
       context.origin + offset};
 }
 constexpr codec::envelope_extent_limits header_limits{
-  byte_count{65536}, byte_count{65536}};
+  byte_count{64_KiB}, byte_count{64_KiB}};
 codec::envelope_extent_limits block_limits(const codec::limits& policy) {
     const auto config = policy.config();
     return {
@@ -251,6 +252,35 @@ public:
     }
 };
 } // namespace detail
+
+result<fragmented_buffer> segment_block::child() const {
+    // Copies `output.size()` bytes at `offset` out of the validated envelope.
+    const auto read = [this](std::size_t offset, std::span<char> output) {
+        std::size_t at = 0, copied = 0;
+        for (auto fragment : bytes_) {
+            if (copied == output.size()) break;
+            const auto end = at + fragment.size();
+            if (end > offset + copied) {
+                const auto from = offset + copied - at;
+                const auto count = std::min(
+                  fragment.size() - from, output.size() - copied);
+                std::copy_n(
+                  fragment.data() + from, count, output.data() + copied);
+                copied += count;
+            }
+            at = end;
+        }
+        return copied == output.size();
+    };
+    std::array<char, codec::envelope_prefix_bytes> prefix{};
+    std::array<char, 4> length{};
+    if (!read(0, prefix)) return failure(errc::invariant_violation);
+    const auto header = load<10, std::uint16_t>(prefix);
+    if (!read(header + 112U, length)) return failure(errc::invariant_violation);
+    return bytes_.share(
+      byte_count{header + segment_block_fixed_bytes.value()},
+      byte_count{load<0, std::uint32_t>(length)});
+}
 
 result<segment_header> segment_header::make(
   segment_context context,

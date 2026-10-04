@@ -1,6 +1,7 @@
 #include "src/broker/crash_limiter.h"
 
 #include "src/base/logging.h"
+#include "src/base/units.h"
 
 #include <seastar/core/coroutine.hh>
 #include <seastar/core/file.hh>
@@ -27,7 +28,7 @@ namespace {
 constexpr std::string_view tracker_name{".kwaque-crash-loop"};
 constexpr std::string_view metadata_header{"kwaque-crash-loop-v1\n"};
 constexpr std::size_t metadata_limit = 160;
-constexpr std::size_t io_alignment_limit = 128U * 1024U;
+constexpr std::size_t io_alignment_limit = 128_KiB;
 constexpr std::uint64_t reset_milliseconds = 60U * 60U * 1000U;
 static_assert(
   metadata_header.size() + 20 + 1 + 20 + 1 + 64 + 1 + 8 + 1 <= metadata_limit);
@@ -298,7 +299,7 @@ seastar::future<> crash_limiter::start(
     co_await seastar::with_file(
       open_tracker(path_, created),
       [this, &configuration, &abort, &created, limit](
-        seastar::file& file) -> seastar::future<> {
+        this auto, seastar::file& file) -> seastar::future<> {
           const auto previous = co_await read_metadata(file, abort, created);
           const auto now = clock_();
           if (now < 0) {

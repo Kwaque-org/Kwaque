@@ -1,3 +1,4 @@
+#include "src/base/units.h"
 #include "src/bytes/fragmented_buffer_parser.h"
 #include "src/model/batch_builder.h"
 #include "src/model/batch_codec.h"
@@ -42,6 +43,8 @@ using kwaque::item_count;
 using kwaque::bytes::fragmented_buffer;
 using kwaque::bytes::fragmented_buffer_parser;
 using kwaque::runtime::wall_time;
+using kwaque::literals::operator""_KiB;
+using kwaque::literals::operator""_MiB;
 using delta = model::range_logical_count;
 using nullable = std::optional<fragmented_buffer>;
 
@@ -96,7 +99,7 @@ byte_count charge(byte_count request) noexcept {
 codec::decode_budget memory() {
     // Other live fixtures and verified native/frame reservations use the
     // unclaimed half of the operation ceiling; these charges are not RSS.
-    return {byte_count{32U << 20U}, byte_count{1U << 20U}, charge};
+    return {byte_count{32_MiB}, byte_count{1_MiB}, charge};
 }
 template<typename Id>
 Id object(std::uint8_t first) {
@@ -134,7 +137,7 @@ std::string unhex(std::string_view hex) {
           static_cast<char>(16 * digit(hex[i]) + digit(hex[i + 1])));
     return out;
 }
-fragmented_buffer bytes(std::string_view raw, std::size_t width = 65536) {
+fragmented_buffer bytes(std::string_view raw, std::size_t width = 64_KiB) {
     std::vector<seastar::temporary_buffer<char>> parts;
     for (std::size_t i = 0; i < raw.size(); i += width) {
         auto piece = raw.substr(i, width);
@@ -576,7 +579,7 @@ TEST(
                 store(raw, 32 + 160, 0, 4);
                 store(raw, 32 + 164, 0, 4);
             }
-            if (mode == 9) store(raw, 32 + 164, (8U << 20U) + 1U, 4);
+            if (mode == 9) store(raw, 32 + 164, 8_MiB + 1U, 4);
             repair(raw);
             rejected(
               raw,
@@ -977,7 +980,7 @@ TEST(
             fragmented_buffer_parser input{
               built_envelope(work, assigned, maximum)};
             auto budget = reserve(input);
-            budget.metadata_remaining = byte_count{128U << 10U};
+            budget.metadata_remaining = byte_count{128_KiB};
             ASSERT_TRUE(decode_status(input, assigned, expected(), budget, work)
                           .has_value());
             EXPECT_TRUE(input.at_end());

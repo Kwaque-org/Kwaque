@@ -1,5 +1,6 @@
 #pragma once
 
+#include "src/base/units.h"
 #include "src/storage/local_namespace.h"
 #include "src/storage/local_segment.h"
 
@@ -45,7 +46,7 @@ discover_local_records(
   Resolver resolve,
   Visitor visit,
   local_discovery_limits bounds = {}) {
-    static_assert(sizeof(Resolver) + sizeof(Visitor) <= 8192);
+    static_assert(sizeof(Resolver) + sizeof(Visitor) <= 8_KiB);
     auto inspect = [&](const local_namespace_entry& entry)
       -> seastar::future<runtime::result<bool>> {
         local_discovered_record observation{entry};
@@ -218,7 +219,7 @@ seastar::future<runtime::result<local_inventory_progress>> walk_local_wal_chain(
   codec::cooperative_work& work,
   Visitor visit,
   local_discovery_limits bounds = {}) {
-    static_assert(sizeof(Visitor) <= 4096);
+    static_assert(sizeof(Visitor) <= 4_KiB);
     if (auto valid = validate_local_device_spec(spec); !valid)
         co_return runtime::failure(valid.error());
     if (auto valid = limits.validate(); !valid)
@@ -231,7 +232,7 @@ seastar::future<runtime::result<local_inventory_progress>> walk_local_wal_chain(
     if (auto ready = work.poll(); !ready)
         co_return runtime::failure(detail::path_error(ready.error().code()));
     auto held = budget.try_reserve(
-      byte_count{limits.execution_bytes.value() + 16384});
+      byte_count{limits.execution_bytes.value() + 16_KiB});
     if (!held) co_return runtime::failure(held.error());
     auto valid = co_await ownership.validate(spec);
     if (!valid) co_return runtime::failure(valid.error());
@@ -343,7 +344,7 @@ seastar::future<runtime::result<local_located_segment>> resolve_local_segment(
     if (auto valid = limits.validate(); !valid)
         co_return runtime::failure(valid.error());
     auto held = budget.try_reserve(
-      byte_count{limits.execution_bytes.value() + 16384});
+      byte_count{limits.execution_bytes.value() + 16_KiB});
     if (!held) co_return runtime::failure(held.error());
     for (const auto& spec : devices) {
         if (!spec.shard_owner(shard))

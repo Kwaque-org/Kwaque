@@ -1,5 +1,6 @@
 #pragma once
 
+#include "src/base/units.h"
 #include "src/storage/tests/wal_lifecycle_contract.h"
 #include "src/storage/wal_writer_state.h"
 
@@ -83,7 +84,7 @@ seastar::future<> pinned_headers(
                       repair(damaged);
                   }
                   if (kind == 3) {
-                      put(damaged, 140, 2U * 1048576U, 8);
+                      put(damaged, 140, 2_MiB, 8);
                       repair(damaged);
                   }
                   co_await store_contract::write_bytes(
@@ -115,7 +116,7 @@ seastar::future<> bounded_admission(
     config.maximum_descriptors = 1;
     // The queue caps both logical bytes and retained backing. One 8-KiB
     // envelope needs room for allocator-rounded padding and child storage.
-    config.maximum_pending_bytes = byte_count{32768};
+    config.maximum_pending_bytes = byte_count{32_KiB};
     co_await wal_append_contract::with_writer(
       files,
       owner,

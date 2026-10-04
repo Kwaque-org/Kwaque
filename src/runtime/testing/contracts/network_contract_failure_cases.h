@@ -1,6 +1,7 @@
 #ifndef KWAQUE_SRC_RUNTIME_TESTING_CONTRACTS_NETWORK_CONTRACT_FAILURE_CASES_H_
 #define KWAQUE_SRC_RUNTIME_TESTING_CONTRACTS_NETWORK_CONTRACT_FAILURE_CASES_H_
 
+#include "src/base/units.h"
 #include "src/runtime/testing/contracts/network_contract.h"
 
 #include <exception>
@@ -59,7 +60,7 @@ seastar::future<> network_cleanup_failure_body(
   seastar::promise<>* parked) {
     using namespace network_contract_detail;
     const network_connection_limits limits{
-      .pending_write_bytes = byte_count{2U * 1024U * 1024U},
+      .pending_write_bytes = byte_count{2_MiB},
       .pending_writes = 2,
     };
     owner.listeners[0].start(backend.listen(
@@ -120,8 +121,8 @@ seastar::future<> network_cleanup_failure_body(
     }
     auto& server = owner.servers[0].get();
     if (selected == network_cleanup_case::writes_pending) {
-        owner.writes[0].emplace(server.write(
-          repeated_bytes(1024U * 1024U, 'x'), owner.write_aborts[0]));
+        owner.writes[0].emplace(
+          server.write(repeated_bytes(1_MiB, 'x'), owner.write_aborts[0]));
         owner.writes[1].emplace(
           server.write(make_bytes("q"), owner.write_aborts[1]));
         require(

@@ -16,7 +16,7 @@ int main() {
     int exit_code = 1;
     kwaque::runtime::testing::run_fuzz_input([&] {
         // Release this worker's crypto state before process-wide cleanup runs.
-        auto cleanup = seastar::defer([] { OPENSSL_thread_stop(); });
+        auto cleanup = seastar::defer([] noexcept { OPENSSL_thread_stop(); });
         auto reproduction = kwaque::simulation::testing::read_fuzz_reproduction(
           std::cin);
         if (!reproduction) {

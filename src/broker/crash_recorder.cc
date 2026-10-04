@@ -1,6 +1,7 @@
 #include "src/broker/crash_recorder.h"
 
 #include "src/base/build_info.h"
+#include "src/base/units.h"
 
 #include <seastar/core/coroutine.hh>
 #include <seastar/core/file.hh>
@@ -218,7 +219,7 @@ seastar::future<std::int64_t> report_timestamp(
           || opened.st_dev != status.device_id) {
             throw std::runtime_error("crash report changed during enumeration");
         }
-        constexpr std::size_t alignment_limit = 128U * 1024U;
+        constexpr std::size_t alignment_limit = 128_KiB;
         if (
           file.disk_read_dma_alignment() > alignment_limit
           || file.memory_dma_alignment() > alignment_limit) {
@@ -345,7 +346,8 @@ seastar::future<> crash_recorder::start(
         throw std::logic_error("crash recorder already started");
     }
     directory_ = data_directory / "crash_reports";
-    co_await seastar::recursive_touch_directory(directory_.native());
+    co_await seastar::recursive_touch_directory(
+      directory_.native(), seastar::file_permissions::user_permissions);
     abort.check();
     co_await seastar::sync_directory(data_directory.native());
     abort.check();

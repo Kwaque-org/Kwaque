@@ -72,7 +72,9 @@ RULES = (
             r"\(\s*(?:(?:std\s*)?::\s*)?(?:rand|srand|random|srandom)\s*\)\s*\(|"
             r"\b(?:static|thread_local)\s+[^;={}()]{0,80}\b"
             r"(?:deterministic_random|sequential_random_source|keyed_random_source|random_engine)"
-            r"\s+\w+\s*(?:[={;])"
+            r"\s+\w+\s*(?:[={;])|"
+            # The native test runner's engine is seeded per run, not per test.
+            r"\blocal_random_engine\b"
         ),
         "use explicit fixture-owned integer random streams with stable coordinates",
     ),
@@ -247,6 +249,13 @@ class Writer:
 # and handle invalidation are commutative. Cleanup progress exposes only counts,
 # never the identity of a hash-selected object.
 ALLOWANCES = (
+    Allowance(
+        "src/runtime/tests/runtime_contract_bench.cc",
+        "random-source",
+        "std::seed_seq sequence{",
+        1,
+        "The comparison engine is built from the benchmark's explicit seed, not a host source.",
+    ),
     Allowance(
         "src/observability/event_codec_test.cc",
         "host-clock",
@@ -846,6 +855,20 @@ ALLOWANCES += (
 )
 
 
+TEST_RULES = ("random-source",)
+
+
+def is_test_source(path: Path) -> bool:
+    """Tests anywhere must draw randomness from explicit seeded owners."""
+    if path.suffix not in SOURCE_SUFFIXES:
+        return False
+    return (
+        "tests" in path.parts
+        or "testing" in path.parts
+        or path.name.endswith(("_test.cc", "_test.h"))
+    )
+
+
 def is_deterministic_source(path: Path) -> bool:
     if path.suffix not in SOURCE_SUFFIXES:
         return False
@@ -906,15 +929,32 @@ def scan(
     writers: tuple[Writer, ...] = WRITERS,
 ) -> list[str]:
     violations: list[str] = []
+    candidates = [
+        path
+        for base in ("src", "bazel")
+        for path in sorted((root / base).rglob("*"))
+        if path.is_file()
+    ]
+    deterministic = {
+        path.relative_to(root).as_posix()
+        for path in candidates
+        if is_deterministic_source(path.relative_to(root))
+    }
     sources = {
         path.relative_to(root).as_posix(): path.read_text(encoding="utf-8")
-        for path in sorted((root / "src").rglob("*"))
-        if path.is_file() and is_deterministic_source(path.relative_to(root))
+        for path in candidates
+        if path.relative_to(root).as_posix() in deterministic
+        or is_test_source(path.relative_to(root))
     }
     prepared = {name: masked_code(source) for name, source in sources.items()}
     rules = RULES + (
-        hash_iteration_rule(hash_names([code for code, _ in prepared.values()])),
+        hash_iteration_rule(
+            hash_names(
+                [code for name, (code, _) in prepared.items() if name in deterministic]
+            )
+        ),
     )
+    test_rules = tuple(rule for rule in rules if rule.name in TEST_RULES)
     approved: dict[tuple[str, str], list[tuple[int, int]]] = {}
     rule_names = {rule.name for rule in rules}
     for allowance in allowances:
@@ -955,7 +995,7 @@ def scan(
             continue
         approved.setdefault((allowance.path, allowance.rule), []).extend(spans)
     for name, (code, offsets) in prepared.items():
-        for rule in rules:
+        for rule in rules if name in deterministic else test_rules:
             spans = approved.get((name, rule.name), ())
             for match in rule.pattern.finditer(code):
                 if any(
@@ -965,7 +1005,7 @@ def scan(
                     continue
                 line = line_number(sources[name], offsets[match.start()])
                 violations.append(f"{name}:{line}: {rule.name}: {rule.remediation}")
-        for match in global_random_matches(code):
+        for match in global_random_matches(code) if name in deterministic else ():
             line = line_number(sources[name], offsets[match.start()])
             violations.append(
                 f"{name}:{line}: global-random: keep random sources in explicit per-fixture owners"

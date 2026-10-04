@@ -1,3 +1,4 @@
+#include "src/base/units.h"
 #include "src/storage/local_metadata_internal.h"
 
 #include <algorithm>
@@ -170,7 +171,7 @@ seastar::future<codec::result<void>> validate_local_payload(
     const auto anchor = page_error(errc::success, c);
     if (
       auto ready = co_await work.admit(
-        byte_count{1024}, item_count{64}, anchor);
+        byte_count{1_KiB}, item_count{64}, anchor);
       !ready)
         co_return codec::failure(ready.error());
     if (auto ready = work.poll(anchor); !ready)
@@ -288,7 +289,7 @@ seastar::future<codec::result<void>> validate_local_payload(
         for (const auto& root : value->roots) {
             if (
               auto ready = co_await work.admit(
-                byte_count{1024}, item_count{64}, anchor);
+                byte_count{1_KiB}, item_count{64}, anchor);
               !ready)
                 co_return codec::failure(ready.error());
             if (auto ready = work.poll(anchor); !ready)
@@ -331,7 +332,7 @@ seastar::future<codec::result<void>> validate_local_payload(
         for (const auto& object : value->objects) {
             if (
               auto ready = co_await work.admit(
-                byte_count{1024}, item_count{64}, anchor);
+                byte_count{1_KiB}, item_count{64}, anchor);
               !ready)
                 co_return codec::failure(ready.error());
             if (auto ready = work.poll(anchor); !ready)
@@ -349,7 +350,7 @@ seastar::future<codec::result<void>> validate_local_payload(
       const auto* value = std::get_if<local_recovery_decision>(&payload)) {
         if (
           auto code = scalar_code(
-            static_cast<std::uint16_t>(value->action), 3, c);
+            static_cast<std::uint16_t>(value->action), 4, c);
           !code)
             co_return code;
         if (
@@ -425,7 +426,7 @@ seastar::future<codec::result<void>> validate_local_payload(
         for (const auto& ref : pages) {
             if (
               auto ready = co_await work.admit(
-                byte_count{1024}, item_count{64}, anchor);
+                byte_count{1_KiB}, item_count{64}, anchor);
               !ready)
                 co_return codec::failure(ready.error());
             if (auto ready = work.poll(anchor); !ready)
@@ -472,7 +473,7 @@ seastar::future<codec::result<void>> validate_local_payload(
         for (std::size_t i = 0; i < count; ++i) {
             if (
               auto ready = co_await work.admit(
-                byte_count{1024}, item_count{64}, anchor);
+                byte_count{1_KiB}, item_count{64}, anchor);
               !ready)
                 co_return codec::failure(ready.error());
             if (auto ready = work.poll(anchor); !ready)

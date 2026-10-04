@@ -164,17 +164,42 @@ if option("-fail"):
         self.assertEqual(len(list(self.work.glob("*/corpus"))), 2)
         self.assertEqual(len(list(self.outputs.glob("*/campaign.log"))), 2)
 
+    def test_a_kept_corpus_carries_inputs_into_the_next_campaign(self) -> None:
+        kept = self.root / "kept-corpus"
+        with mock.patch.dict(os.environ, {"KWAQUE_FUZZ_CORPUS_DIR": str(kept)}):
+            self.assertEqual(self.run_wrapper(), 0)
+            (kept / "new-input").rename(kept / "earlier-input")
+            self.assertEqual(self.run_wrapper(), 0)
+        self.assertEqual(
+            {path.name for path in kept.iterdir()},
+            {"000-seed", "earlier-input", "new-input"},
+        )
+        self.assertEqual(list(self.work.glob("*/corpus")), [])
+
+    def test_a_relative_kept_corpus_is_rejected(self) -> None:
+        with mock.patch.dict(os.environ, {"KWAQUE_FUZZ_CORPUS_DIR": "corpus"}):
+            with self.assertRaises(ValueError):
+                self.run_wrapper()
+
     def test_limits_reject_unbounded_or_oversized_campaigns(self) -> None:
         for argument in (
             "-max_total_time=0",
             "-max_total_time=601",
             "-timeout=0",
             "-timeout=61",
-            "-max_len=16385",
+            f"-max_len={wrapper.MAXIMUM_INPUT_BYTES + 1}",
             "-max_len=0",
         ):
             with self.subTest(argument=argument), self.assertRaises(ValueError):
                 self.run_wrapper(argument)
+        # A target may bound its input above the default, up to the ceiling:
+        # the configuration fuzzer runs one byte past its 64 KiB input cap.
+        self.assertEqual(
+            wrapper.positive_limit(
+                ["-max_len=65537"], "max_len", 4096, wrapper.MAXIMUM_INPUT_BYTES
+            ),
+            65537,
+        )
         self.assertEqual(
             wrapper.positive_limit(
                 ["-max_total_time=2", "-max_total_time=600"], "max_total_time", 2, 600

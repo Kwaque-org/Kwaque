@@ -1,3 +1,4 @@
+#include "src/base/units.h"
 #include "src/broker/crash_recorder.h"
 #include "src/broker/crash_recorder_writer.h"
 
@@ -39,6 +40,7 @@ public:
 } // namespace kwaque::broker
 
 namespace {
+using kwaque::literals::operator""_TiB;
 
 thread_local unsigned directory_sync_calls = 0;
 thread_local std::optional<seastar::future<>> directory_sync_result;
@@ -303,11 +305,11 @@ SEASTAR_TEST_CASE(crash_recorder_skips_oversized_report_reads) {
     std::filesystem::create_directories(report_directory);
     const auto report = report_directory / "oversized.crash";
     std::ofstream(report).close();
-    std::filesystem::resize_file(report, 1ULL << 40U);
+    std::filesystem::resize_file(report, 1_TiB);
     seastar::abort_source abort;
     kwaque::broker::crash_recorder recorder;
     co_await recorder.start(directory.path(), abort, false);
-    BOOST_CHECK_EQUAL(std::filesystem::file_size(report), 1ULL << 40U);
+    BOOST_CHECK_EQUAL(std::filesystem::file_size(report), 1_TiB);
     co_await recorder.stop();
 }
 

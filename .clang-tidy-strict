@@ -1,32 +1,64 @@
 ---
+# Production sources: the ordinary checks plus the ones below. Every enabled
+# check is an error, and families outside the static analyzer are listed check
+# by check.
 Checks: >-
   -*,
   clang-analyzer-core.*,
+  clang-analyzer-cplusplus.*,
   clang-analyzer-deadcode.*,
+  clang-analyzer-optin.cplusplus.*,
   clang-analyzer-security.*,
   clang-analyzer-unix.*,
   bugprone-assert-side-effect,
   bugprone-assignment-in-if-condition,
   bugprone-dangling-handle,
+  bugprone-move-forwarding-reference,
   bugprone-sizeof-container,
   bugprone-stringview-nullptr,
   bugprone-suspicious-string-compare,
+  bugprone-unused-local-non-trivial-variable,
+  bugprone-unused-return-value,
   bugprone-use-after-move,
+  cppcoreguidelines-avoid-capturing-lambda-coroutines,
   misc-unused-alias-decls,
   misc-unused-using-decls,
   modernize-loop-convert,
   modernize-redundant-void-arg,
   modernize-use-nullptr,
   modernize-use-override,
+  performance-implicit-conversion-in-loop,
+  performance-move-const-arg,
   performance-no-automatic-move,
-  portability-*,
+  performance-trivially-destructible,
+  performance-unnecessary-copy-initialization,
+  portability-no-assembler,
+  portability-restrict-system-includes,
+  portability-simd-intrinsics,
+  portability-std-allocator-const,
+  portability-template-virtual-member-function,
   readability-container-size-empty,
-  readability-redundant-*
+  readability-redundant-control-flow,
+  readability-redundant-declaration,
+  readability-redundant-preprocessor,
+  readability-redundant-smartptr-get,
+  readability-redundant-string-cstr,
+  readability-redundant-string-init
 WarningsAsErrors: '*'
-HeaderFilterRegex: '^(src|proto|bazel)/'
+HeaderFilterRegex: '.*'
 ExcludeHeaderFilterRegex: '(^|/)(external|bazel-out)/'
 FormatStyle: file
 CheckOptions:
+  # Its default return types include std::expected, behind every result alias.
+  # A deliberate discard is written as a cast to void.
+  bugprone-unused-return-value.AllowCastToVoid: true
+  # The defaults plus Seastar futures: a future that is stored and never
+  # awaited is a lost operation.
+  bugprone-unused-local-non-trivial-variable.IncludeTypes: '::std::.*mutex;::std::future;::std::basic_string;::std::basic_regex;::std::basic_istringstream;::std::basic_stringstream;::std::bitset;::std::filesystem::path;::seastar::future'
+  # A capturing coroutine lambda is safe when it takes its closure by value
+  # (`this auto`): the captures then live in the coroutine frame.
+  cppcoreguidelines-avoid-capturing-lambda-coroutines.AllowExplicitObjectParameters: true
   modernize-loop-convert.MaxCopySize: 16
   modernize-loop-convert.MinConfidence: reasonable
+  performance-move-const-arg.CheckTriviallyCopyableMove: false
 ...

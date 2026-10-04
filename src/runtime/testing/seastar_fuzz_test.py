@@ -10,6 +10,8 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from bazel.native_test_environment import normalized_environment
+
 
 def disable_core_dumps() -> None:
     resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
@@ -20,7 +22,7 @@ class SeastarFuzzBridgeTest(unittest.TestCase):
         with tempfile.TemporaryDirectory(
             prefix="fuzz-bridge-", dir=os.environ["TEST_TMPDIR"]
         ) as directory:
-            environment = dict(os.environ)
+            environment = normalized_environment()
             environment["TMPDIR"] = directory
             environment["LLVM_PROFILE_FILE"] = str(
                 Path(directory) / "canary-%p.profraw"

@@ -59,7 +59,7 @@ public:
         if (
           first_entry > maximum_object_entries
           || entry_count > maximum_object_entries - first_entry
-          || encoded_bytes.value() > 65536)
+          || encoded_bytes.value() > 64_KiB)
             return failure(errc::resource_exhausted);
         return page_ref{
           ordinal, first_entry, entry_count, encoded_bytes, digest};

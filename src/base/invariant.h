@@ -1,5 +1,7 @@
 #pragma once
 
+#include "src/base/units.h"
+
 #include <array>
 #include <cstddef>
 #include <source_location>
@@ -45,7 +47,7 @@ private:
 
 inline constexpr std::size_t max_invariant_expression_size = 128;
 inline constexpr std::size_t max_invariant_context_size = 160;
-inline constexpr std::size_t max_invariant_diagnostic_size = 2048;
+inline constexpr std::size_t max_invariant_diagnostic_size = 2_KiB;
 
 // Formats without allocating, then emits to inherited stderr and aborts.
 // Emission is best effort and may block according to the descriptor's kernel

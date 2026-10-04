@@ -1,3 +1,4 @@
+#include "src/base/units.h"
 #include "src/storage/segment_writer_state.h"
 #include "src/storage/tests/local_installation_contract.h"
 #include "src/storage/tests/segment_test_support.h"
@@ -25,7 +26,7 @@ local_segment_descriptor descriptor() {
       storage_profile::v1,
       1,
       local_layout_kind::initial,
-      byte_count{1U << 20U},
+      byte_count{1_MiB},
       runtime::monotonic_duration{1'000'000}};
 }
 seastar::future<encoded_assigned_batch> child(
@@ -64,7 +65,7 @@ SEASTAR_TEST_CASE(
                   work.policy(),
                   charge,
                   alignment(4096),
-                  byte_count{262144})
+                  byte_count{256_KiB})
                   .value();
     BOOST_REQUIRE(plan.decision == segment_capacity_decision::fits);
     BOOST_CHECK_EQUAL(plan.blocks.value(), 4608U);
@@ -78,7 +79,7 @@ SEASTAR_TEST_CASE(
     BOOST_CHECK_EQUAL(plan.end->logical.value(), 101U);
     BOOST_CHECK_EQUAL(plan.end->physical.value(), 1U);
     BOOST_CHECK_EQUAL(plan.end->bytes.value(), 5632U);
-    description.maximum_data_bytes = byte_count{6144};
+    description.maximum_data_bytes = byte_count{6_KiB};
     const auto exact = plan_segment_capacity(
                          description,
                          runtime::file_position{512},
@@ -88,7 +89,7 @@ SEASTAR_TEST_CASE(
                          work.policy(),
                          charge,
                          alignment(4096),
-                         byte_count{262144})
+                         byte_count{256_KiB})
                          .value();
     BOOST_CHECK(exact.decision == segment_capacity_decision::fits);
     description.maximum_data_bytes = byte_count{6143};
@@ -101,10 +102,10 @@ SEASTAR_TEST_CASE(
                               work.policy(),
                               charge,
                               alignment(4096),
-                              byte_count{262144})
+                              byte_count{256_KiB})
                               .value();
     BOOST_CHECK(impossible.decision == segment_capacity_decision::impossible);
-    description.maximum_data_bytes = byte_count{6144};
+    description.maximum_data_bytes = byte_count{6_KiB};
     auto with_footer = empty;
     with_footer.bytes = runtime::file_position{1024};
     with_footer.footers = 1;
@@ -117,7 +118,7 @@ SEASTAR_TEST_CASE(
                         work.policy(),
                         charge,
                         alignment(4096),
-                        byte_count{262144})
+                        byte_count{256_KiB})
                         .value();
     BOOST_CHECK(roll.decision == segment_capacity_decision::roll_required);
 }
@@ -140,7 +141,7 @@ SEASTAR_TEST_CASE(
       work.policy(),
       charge,
       alignment(4096),
-      byte_count{262144});
+      byte_count{256_KiB});
     BOOST_REQUIRE(!relocated);
     BOOST_CHECK(relocated.error().code() == errc::invalid_argument);
     segment_admission_limits limits;
@@ -156,7 +157,7 @@ SEASTAR_TEST_CASE(
                   work.policy(),
                   charge,
                   alignment(4096),
-                  byte_count{262144})
+                  byte_count{256_KiB})
                   .value();
     BOOST_CHECK(plan.decision == segment_capacity_decision::roll_required);
     full = empty;
@@ -170,7 +171,7 @@ SEASTAR_TEST_CASE(
              work.policy(),
              charge,
              alignment(4096),
-             byte_count{262144})
+             byte_count{256_KiB})
              .value();
     BOOST_CHECK(plan.decision == segment_capacity_decision::roll_required);
     full = empty;
@@ -184,7 +185,7 @@ SEASTAR_TEST_CASE(
              work.policy(),
              charge,
              alignment(4096),
-             byte_count{262144})
+             byte_count{256_KiB})
              .value();
     BOOST_CHECK(plan.decision == segment_capacity_decision::roll_required);
     limits.metadata_bytes = byte_count{1};
@@ -197,7 +198,7 @@ SEASTAR_TEST_CASE(
              work.policy(),
              charge,
              alignment(4096),
-             byte_count{262144})
+             byte_count{256_KiB})
              .value();
     BOOST_CHECK(plan.decision == segment_capacity_decision::impossible);
     auto config = work.policy().config();
@@ -212,7 +213,7 @@ SEASTAR_TEST_CASE(
              narrow,
              charge,
              alignment(4096),
-             byte_count{262144})
+             byte_count{256_KiB})
              .value();
     BOOST_CHECK(plan.decision == segment_capacity_decision::impossible);
 }
@@ -224,7 +225,7 @@ SEASTAR_TEST_CASE(segment_capacity_honors_page_count_and_terminal_logical_end) {
     auto description = descriptor();
     segment_admission_limits limits;
     limits.maximum_retry_pages = 1;
-    limits.metadata_bytes = byte_count{1U << 20U};
+    limits.metadata_bytes = byte_count{1_MiB};
     const segment_writer_position current{
       model::range_logical_end{508},
       model::segment_relative_end{408},
@@ -241,7 +242,7 @@ SEASTAR_TEST_CASE(segment_capacity_honors_page_count_and_terminal_logical_end) {
                         work.policy(),
                         charge,
                         alignment(4096),
-                        byte_count{262144})
+                        byte_count{256_KiB})
                         .value();
     BOOST_CHECK(full.decision == segment_capacity_decision::roll_required);
     limits.maximum_retry_pages = 2;
@@ -254,7 +255,7 @@ SEASTAR_TEST_CASE(segment_capacity_honors_page_count_and_terminal_logical_end) {
                         work.policy(),
                         charge,
                         alignment(4096),
-                        byte_count{262144})
+                        byte_count{256_KiB})
                         .value();
     BOOST_CHECK(fits.decision == segment_capacity_decision::fits);
     BOOST_CHECK_EQUAL(fits.retry_pages, 2U);
@@ -271,7 +272,7 @@ SEASTAR_TEST_CASE(segment_capacity_honors_page_count_and_terminal_logical_end) {
                        work.policy(),
                        charge,
                        alignment(4096),
-                       byte_count{262144})
+                       byte_count{256_KiB})
                        .value();
     BOOST_REQUIRE(end.decision == segment_capacity_decision::fits);
     BOOST_CHECK_EQUAL(end.end->logical.value(), UINT64_MAX);
@@ -285,7 +286,7 @@ SEASTAR_TEST_CASE(
     const std::array input{co_await child(work, false, 508)};
     const auto description = descriptor();
     segment_admission_limits limits;
-    limits.metadata_bytes = byte_count{1U << 20U};
+    limits.metadata_bytes = byte_count{1_MiB};
     const segment_writer_position current{
       model::range_logical_end{508},
       model::segment_relative_end{408},
@@ -302,7 +303,7 @@ SEASTAR_TEST_CASE(
                         work.policy(),
                         charge,
                         alignment(4096),
-                        byte_count{262144})
+                        byte_count{256_KiB})
                         .value();
     const auto narrow = plan_segment_capacity(
                           description,
@@ -313,7 +314,7 @@ SEASTAR_TEST_CASE(
                           work.policy(),
                           charge,
                           alignment(4096),
-                          byte_count{65536})
+                          byte_count{64_KiB})
                           .value();
     BOOST_REQUIRE(wide.decision == segment_capacity_decision::fits);
     BOOST_REQUIRE(narrow.decision == segment_capacity_decision::fits);
@@ -328,7 +329,7 @@ SEASTAR_TEST_CASE(
                               work.policy(),
                               charge,
                               alignment(4096),
-                              byte_count{4096})
+                              byte_count{4_KiB})
                               .value();
     BOOST_CHECK(impossible.decision == segment_capacity_decision::impossible);
 }
@@ -337,9 +338,9 @@ SEASTAR_TEST_CASE(segment_capacity_full_summary_and_ref_memory_intersections) {
     seastar::abort_source abort;
     codec::cooperative_work work{codec::limits::defaults(), abort};
     auto description = descriptor();
-    description.maximum_data_bytes = byte_count{128U << 20U};
+    description.maximum_data_bytes = byte_count{128_MiB};
     segment_admission_limits limits;
-    limits.metadata_bytes = byte_count{1U << 20U};
+    limits.metadata_bytes = byte_count{1_MiB};
     const segment_writer_position current{
       model::range_logical_end{100 + maximum_object_entries - 1},
       model::segment_relative_end{maximum_object_entries - 1},
@@ -358,7 +359,7 @@ SEASTAR_TEST_CASE(segment_capacity_full_summary_and_ref_memory_intersections) {
       work.policy(),
       charge,
       alignment(4096),
-      byte_count{262144});
+      byte_count{256_KiB});
     BOOST_REQUIRE(full.has_value());
     BOOST_REQUIRE(full->decision == segment_capacity_decision::fits);
     BOOST_REQUIRE(full->end.has_value());
@@ -378,10 +379,10 @@ SEASTAR_TEST_CASE(segment_capacity_full_summary_and_ref_memory_intersections) {
       work.policy(),
       charge,
       alignment(4096),
-      byte_count{262144});
+      byte_count{256_KiB});
     BOOST_REQUIRE(over.has_value());
     BOOST_CHECK(over->decision == segment_capacity_decision::roll_required);
-    limits.metadata_bytes = byte_count{8192};
+    limits.metadata_bytes = byte_count{8_KiB};
     const auto refs = plan_segment_capacity(
       description,
       runtime::file_position{512},
@@ -391,10 +392,10 @@ SEASTAR_TEST_CASE(segment_capacity_full_summary_and_ref_memory_intersections) {
       work.policy(),
       charge,
       alignment(4096),
-      byte_count{262144});
+      byte_count{256_KiB});
     BOOST_REQUIRE(refs.has_value());
     BOOST_CHECK(refs->decision == segment_capacity_decision::roll_required);
-    limits.metadata_bytes = byte_count{1U << 20U};
+    limits.metadata_bytes = byte_count{1_MiB};
     limits.maximum_retry_pages = 1;
     const auto pages = plan_segment_capacity(
       description,
@@ -405,7 +406,7 @@ SEASTAR_TEST_CASE(segment_capacity_full_summary_and_ref_memory_intersections) {
       work.policy(),
       charge,
       alignment(4096),
-      byte_count{262144});
+      byte_count{256_KiB});
     BOOST_REQUIRE(pages.has_value());
     BOOST_CHECK(pages->decision == segment_capacity_decision::roll_required);
 }

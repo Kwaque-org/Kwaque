@@ -10,6 +10,9 @@ import subprocess
 import unittest
 from pathlib import Path
 
+# The test macros export the reactor backend selected for this build.
+REACTOR_BACKEND = os.environ.get("KWAQUE_REACTOR_BACKEND", "epoll")
+
 SAMPLES = (
     "cold-invalid-id",
     "warm-invalid-id",
@@ -114,7 +117,7 @@ class ValueAllocationTest(unittest.TestCase):
         def run_probe(label: str, *options: str) -> subprocess.CompletedProcess[str]:
             command = [
                 str(binary),
-                "--reactor-backend=epoll",
+                f"--reactor-backend={REACTOR_BACKEND}",
                 "--smp=1",
                 "--memory=64MiB",
                 "--overprovisioned",

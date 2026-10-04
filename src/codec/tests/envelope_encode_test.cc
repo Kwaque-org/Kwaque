@@ -43,6 +43,8 @@
 #include <vector>
 
 namespace {
+using kwaque::literals::operator""_KiB;
+using kwaque::literals::operator""_MiB;
 
 namespace codec = kwaque::codec;
 namespace fixture = codec::testing::envelope_fixture;
@@ -55,10 +57,10 @@ using native_fragment = seastar::temporary_buffer<char>;
 using namespace std::literals;
 
 constexpr codec::field_context context{.origin = 71, .family = 7, .field = 91};
-constexpr byte_count parent_budget{32U * 1024U * 1024U};
+constexpr byte_count parent_budget{32_MiB};
 constexpr codec::envelope_extent_limits owner_limits{
-  .max_body_bytes = byte_count{16U * 1024U * 1024U},
-  .max_encoded_bytes = byte_count{32U * 1024U * 1024U}};
+  .max_body_bytes = byte_count{16_MiB},
+  .max_encoded_bytes = byte_count{32_MiB}};
 
 // The other half of the operation allowance remains unavailable to these
 // fixtures for native CRC/frame/opaque owners. These tests inspect byte-owner
@@ -363,7 +365,7 @@ TEST(EnvelopeEncodeTest, ExistingUsageAndParentRemainderStayCharged) {
         work,
         owner_limits,
         parent_budget,
-        {.decoded_metadata = byte_count{1024U * 1024U + 1U}}),
+        {.decoded_metadata = byte_count{1_MiB + 1U}}),
       errc::resource_exhausted);
     expect_error(
       encode(
@@ -371,7 +373,7 @@ TEST(EnvelopeEncodeTest, ExistingUsageAndParentRemainderStayCharged) {
         work,
         owner_limits,
         parent_budget,
-        {.scratch = byte_count{1024U * 1024U + 1U}}),
+        {.scratch = byte_count{1_MiB + 1U}}),
       errc::resource_exhausted);
 }
 
@@ -380,9 +382,9 @@ TEST(EnvelopeEncodeTest, SmallVisibleBodyDoesNotHideRetainedBacking) {
     auto body = text(storage);
     ASSERT_TRUE(body.trim_front(byte_count{32767}).has_value());
     ASSERT_EQ(body.size(), byte_count{1});
-    ASSERT_EQ(body.retained_bytes(), byte_count{32768});
+    ASSERT_EQ(body.retained_bytes(), byte_count{32_KiB});
     codec::limits_config config;
-    config.max_retained_bytes = byte_count{4096};
+    config.max_retained_bytes = byte_count{4_KiB};
     seastar::abort_source abort;
     codec::cooperative_work work{codec::limits::make(config).value(), abort};
     expect_error(encode(std::move(body), work), errc::resource_exhausted);
@@ -451,11 +453,11 @@ TEST(EnvelopeEncodeTest, NewAllocationCapDoesNotRejectPreexistingLargeBacking) {
     auto body = fragmented_buffer::copy_from_fragment(storage).value();
     storage = native_fragment{};
     const auto* original = body.fragment_at(0)->data();
-    ASSERT_EQ(body.retained_bytes(), byte_count{65536});
-    ASSERT_EQ(charge(body.retained_bytes()), byte_count{131072});
+    ASSERT_EQ(body.retained_bytes(), byte_count{64_KiB});
+    ASSERT_EQ(charge(body.retained_bytes()), byte_count{128_KiB});
 
     codec::limits_config config;
-    config.max_allocation_bytes = byte_count{4096};
+    config.max_allocation_bytes = byte_count{4_KiB};
     seastar::abort_source abort;
     codec::cooperative_work work{codec::limits::make(config).value(), abort};
     const auto encoded = encode(std::move(body), work);

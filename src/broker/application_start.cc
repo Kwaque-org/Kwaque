@@ -5,7 +5,9 @@
 #include "src/base/units.h"
 #include "src/broker/application_internal.h"
 #include "src/broker/data_directory.h"
+#include "src/broker/exit_code.h"
 #include "src/broker/host_checks.h"
+#include "src/broker/service_manager.h"
 #include "src/observability/event_identity.h"
 #include "src/resource/resource_config.h"
 #include "src/runtime/production/random.h"
@@ -16,6 +18,8 @@
 #include <seastar/core/memory.hh>
 #include <seastar/core/reactor.hh>
 #include <seastar/core/smp.hh>
+
+#include <sys/utsname.h>
 
 #include <array>
 #include <chrono>
@@ -64,18 +68,28 @@ production_event_identity(std::uint64_t run_nonce) noexcept {
 
 seastar::future<byte_count> application_state::observe_minimum_shard_memory() {
     log::broker().info("build {}", build_info::version_line());
+    // Native I/O behavior, such as NOWAIT and io_uring support, depends on the
+    // running kernel.
+    struct ::utsname host{};
+    if (::uname(&host) == 0) {
+        log::broker().info(
+          "host kernel={} nodename={} machine={}",
+          host.release,
+          host.nodename,
+          host.machine);
+    }
     const unsigned shard_count = seastar::this_smp_shard_count();
     KWAQUE_INVARIANT(
       invariant_id{"KQ-BROKER-REACTOR-SHARDS"},
       shard_count != 0,
       "running reactor has no shards");
     if (shard_count > admin::max_scrape_shards) {
-        throw std::invalid_argument(
+        throw configuration_error(
           "configured shard count exceeds the bounded admin scrape limit");
     }
 #if defined(SEASTAR_DEFAULT_ALLOCATOR)
     if (!configuration_->diagnostic_memory_per_shard_bytes) {
-        throw std::invalid_argument(
+        throw configuration_error(
           "system-allocator diagnostic broker requires "
           "diagnostic_memory_per_shard_bytes");
     }
@@ -133,6 +147,7 @@ seastar::future<> application_state::start_data_directory() {
 
 seastar::future<> application_state::check_host(
   const seastar::app_template::seastar_options* runtime_options) {
+    raise_descriptor_limit(log::broker());
     const bool configured_io
       = runtime_options != nullptr
         && (runtime_options->smp_opts.io_properties || runtime_options->smp_opts.io_properties_file);
@@ -277,7 +292,7 @@ int application_state::execute(
   const boost::program_options::variables_map& options,
   const seastar::app_template::seastar_options& runtime_options) {
     capture_or_assert_owner();
-    int exit_code = 1;
+    int exit_code = KWAQUE_EXIT_FAILURE;
     startup_started_at_ = std::chrono::steady_clock::now();
     try {
         initialize_stop_signal();
@@ -286,16 +301,32 @@ int application_state::execute(
         validate_broker_profile(*configuration_);
         construct_services();
         start_services(runtime_options).get();
+        if (!notify_service_manager("READY=1")) {
+            log::broker().warn(
+              "cannot report readiness to the service manager");
+        }
         stop_signal_->wait().get();
         log::broker().info("shutdown requested");
+        if (!notify_service_manager("STOPPING=1")) {
+            log::broker().warn("cannot report shutdown to the service manager");
+        }
         shutdown().get();
         log::broker().info("shutdown complete");
-        return 0;
+        return KWAQUE_EXIT_SUCCESS;
     } catch (const seastar::abort_requested_exception&) {
         log::broker().info("startup interrupted; rolling back");
         if (!fully_started_ && !shutdown_failed_) {
-            exit_code = 0;
+            exit_code = KWAQUE_EXIT_SUCCESS;
         }
+    } catch (const configuration_error& error) {
+        log::broker().error("broker failure: {}", error.what());
+        exit_code = KWAQUE_EXIT_NOT_CONFIGURED;
+    } catch (const pid_file_locked& error) {
+        log::broker().error("broker failure: {}", error.what());
+        exit_code = KWAQUE_EXIT_DATA_DIRECTORY_IN_USE;
+    } catch (const crash_loop_limit_reached& error) {
+        log::broker().error("broker failure: {}", error.what());
+        exit_code = KWAQUE_EXIT_CRASH_LOOP;
     } catch (const std::exception& error) {
         log::broker().error("broker failure: {}", error.what());
     } catch (...) {
@@ -306,10 +337,10 @@ int application_state::execute(
         shutdown().get();
     } catch (const std::exception& error) {
         log::broker().error("broker shutdown failure: {}", error.what());
-        exit_code = 1;
+        exit_code = KWAQUE_EXIT_FAILURE;
     } catch (...) {
         log::broker().error("broker shutdown failure: unknown exception");
-        exit_code = 1;
+        exit_code = KWAQUE_EXIT_FAILURE;
     }
     return exit_code;
 }

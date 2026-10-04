@@ -1,6 +1,5 @@
 #pragma once
 
-#include "src/base/compiler.h"
 #include "src/base/invariant.h"
 #include "src/base/units.h"
 #include "src/resource/resource_registry.h"
@@ -71,7 +70,7 @@ private:
       seastar::gate::holder lifetime) noexcept;
     void assert_live() const {
         owner_.assert_current();
-        if (KWAQUE_UNLIKELY(manager_ == nullptr)) {
+        if (manager_ == nullptr) [[unlikely]] {
             throw std::logic_error("workload handle has been moved from");
         }
     }

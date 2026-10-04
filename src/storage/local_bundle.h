@@ -1,5 +1,6 @@
 #pragma once
 
+#include "src/base/units.h"
 #include "src/storage/local_metadata_file.h"
 #include "src/storage/local_publication.h"
 #include "src/storage/retry_format.h"
@@ -145,7 +146,7 @@ seastar::future<local_bundle_publication> publish_local_bundle(
   workload_budget& budget,
   codec::cooperative_work& work,
   local_file_publisher<Backend>* prepared = nullptr) {
-    static_assert(sizeof(Source) + sizeof(Dependencies) <= 8192);
+    static_assert(sizeof(Source) + sizeof(Dependencies) <= 8_KiB);
     local_bundle_publication output;
     auto path = bundle.path(spec, shard);
     if (!path) {
@@ -195,8 +196,9 @@ seastar::future<local_bundle_publication> publish_local_bundle(
     if (!prepared) owned.emplace(files, budget, target);
     auto& publisher = prepared ? *prepared : *owned;
     // Named callback/captures remain in this frame across every suspension.
-    auto writer = [&bundle, &source](
-                    runtime::file& file, codec::cooperative_work& execution)
+    auto writer =
+      [&bundle, &source](
+        this auto, runtime::file& file, codec::cooperative_work& execution)
       -> seastar::future<runtime::result<void>> {
         local_bundle_verifier verifier{bundle, execution.policy()};
         auto position = runtime::file_position{

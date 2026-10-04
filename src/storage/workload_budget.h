@@ -1,6 +1,7 @@
 #ifndef KWAQUE_SRC_STORAGE_WORKLOAD_BUDGET_H_
 #define KWAQUE_SRC_STORAGE_WORKLOAD_BUDGET_H_
 
+#include "src/base/units.h"
 #include "src/bytes/fragmented_buffer.h"
 #include "src/resource/resource_manager.h"
 #include "src/runtime/error.h"
@@ -15,7 +16,7 @@ namespace kwaque::storage {
 
 struct workload_budget_limits final {
     std::uint32_t tasks{64};
-    byte_count bytes{64U * 1024U * 1024U};
+    byte_count bytes{64_MiB};
     std::uint32_t handles{64};
 };
 

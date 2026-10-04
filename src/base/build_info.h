@@ -6,6 +6,9 @@
 namespace kwaque::build_info {
 
 [[nodiscard]] std::string_view version() noexcept;
+// Whether workspace status replaced the defaults. Unstamped builds report the
+// revision "unknown", a clean tree and timestamp 0.
+[[nodiscard]] bool stamped() noexcept;
 [[nodiscard]] std::string_view git_revision() noexcept;
 [[nodiscard]] bool git_dirty() noexcept;
 [[nodiscard]] std::string_view build_timestamp() noexcept;

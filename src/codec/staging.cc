@@ -47,12 +47,11 @@ add_charge(byte_count& total, byte_count cost, field_context context) noexcept {
 
 result<byte_count> multiply_charge(
   byte_count cost, std::uint64_t count, field_context context) noexcept {
-    if (
-      count != 0
-      && cost.value() > std::numeric_limits<std::uint64_t>::max() / count) {
+    const auto product = cost.checked_mul(count);
+    if (!product) {
         return codec::failure(staging_error(errc::out_of_range, context));
     }
-    return byte_count{cost.value() * count};
+    return *product;
 }
 
 } // namespace
@@ -77,8 +76,7 @@ result<bytes::fragmented_buffer> assemble_buffer(
         return codec::failure(staging_error(errc::invalid_argument, context));
     }
     const auto config = policy.config();
-    const auto work_bytes = std::min(
-      config.max_work_bytes.value(), std::uint64_t{65536});
+    const auto work_bytes = std::min(config.max_work_bytes.value(), 64_KiB);
     const auto work_items = std::min(
       config.max_work_items.value(), std::uint64_t{256});
     const auto fragments = static_cast<std::uint64_t>(payload.fragment_count());

@@ -1,4 +1,5 @@
 #include "src/base/allocation.h"
+#include "src/base/units.h"
 #include "src/resource/resource_registry.h"
 #include "src/runtime/cross_shard.h"
 #include "src/runtime/production/file.h"
@@ -83,7 +84,7 @@ SEASTAR_TEST_CASE(
     co_await with_file([](auto& manager, auto& file) -> seastar::future<> {
         workload_budget budget{
           manager.acquire_workload(workload),
-          {.tasks = 1, .bytes = byte_count{256U * 1024U}, .handles = 1},
+          {.tasks = 1, .bytes = byte_count{256_KiB}, .handles = 1},
           bytes::testing::charge};
         auto reserved = take(completion_resources::make(budget, file));
         seastar::chunked_vector<runtime::file::metadata_reservation> pressure;
@@ -116,7 +117,7 @@ SEASTAR_TEST_CASE(
     co_await with_file([](auto& manager, auto& file) -> seastar::future<> {
         workload_budget budget{
           manager.acquire_workload(workload),
-          {.tasks = 8, .bytes = byte_count{1024U * 1024U}, .handles = 2},
+          {.tasks = 8, .bytes = byte_count{1_MiB}, .handles = 2},
           bytes::testing::charge};
         auto lease = manager.acquire_workload(workload);
         const auto available = lease.memory_admission().current();
@@ -173,15 +174,15 @@ SEASTAR_TEST_CASE(
     co_await with_file([](auto& manager, auto& file) -> seastar::future<> {
         workload_budget budget{
           manager.acquire_workload(workload),
-          {.tasks = 65536,
-           .bytes = byte_count{1024U * 1024U},
-           .handles = 65536},
+          {.tasks = 65536, .bytes = byte_count{1_MiB}, .handles = 65536},
           bytes::testing::charge};
         const std::array invalid{
-          completion_resource_limits{byte_count{}, byte_count{16384}},
-          completion_resource_limits{byte_count{4096}, byte_count{}},
-          completion_resource_limits{byte_count{UINT64_MAX}, byte_count{16384}},
-          completion_resource_limits{byte_count{4096}, byte_count{UINT64_MAX}}};
+          completion_resource_limits{byte_count{}, byte_count{16_KiB}},
+          completion_resource_limits{byte_count{4_KiB}, byte_count{}},
+          completion_resource_limits{
+            byte_count{UINT64_MAX}, byte_count{16_KiB}},
+          completion_resource_limits{
+            byte_count{4_KiB}, byte_count{UINT64_MAX}}};
         for (const auto bounds : invalid) {
             BOOST_CHECK(!bounds.validate());
             BOOST_CHECK(!completion_resources::make(budget, file, bounds));

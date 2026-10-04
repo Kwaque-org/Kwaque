@@ -1,3 +1,4 @@
+#include "src/base/units.h"
 #include "src/storage/local_metadata.h"
 #include "src/storage/tests/retry_test_support.h"
 
@@ -54,7 +55,7 @@ local_root_reference root(local_root_kind kind, std::uint64_t sequence = 40) {
              local_object_sequence::make(sequence).value(),
              runtime::file_position{
                kind == local_root_kind::sealed_retry ? 8192U : 0U},
-             byte_count{4096},
+             byte_count{4_KiB},
              page_count::make(0).value(),
              digest())
       .value();
@@ -168,7 +169,7 @@ std::vector<record_case> cases() {
          alignment(4096),
          replay_profile::v1,
          runtime::file_position{4096},
-         byte_count{65536}}},
+         byte_count{64_KiB}}},
       {local_metadata_kind::segment_descriptor,
        local_segment_descriptor{
          sc(),
@@ -178,7 +179,7 @@ std::vector<record_case> cases() {
          storage_profile::v1,
          1,
          local_layout_kind::initial,
-         byte_count{65536},
+         byte_count{64_KiB},
          runtime::monotonic_duration{3600000000000ULL}}},
       {local_metadata_kind::object_publication,
        local_object_publication{

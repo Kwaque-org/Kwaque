@@ -2,12 +2,12 @@
 #define KWAQUE_SRC_SIMULATION_SCHEDULER_DRIVER_H_
 
 #include "src/base/error.h"
+#include "src/runtime/testing/reactor_tasks.h"
 #include "src/simulation/scheduler.h"
 
 #include <seastar/core/coroutine.hh>
 #include <seastar/core/future.hh>
 #include <seastar/core/lowres_clock.hh>
-#include <seastar/util/later.hh>
 
 #include <algorithm>
 #include <chrono>
@@ -58,13 +58,19 @@ inline void run_next_batch(scheduler& events, std::uint64_t maximum_batch) {
 
 } // namespace scheduler_driver_detail
 
+// Every pump tests its future, reports a stall and steps virtual time only
+// once the reactor has nothing left to run. The continuations a batch woke
+// are then complete, in whatever order and however many tasks they took, so
+// a pump's steps and its return do not follow reactor task order. Pumps
+// nest: one started inside a callback of the call another is driving steps
+// the scheduler until it returns, and the outer one resumes after it.
 template<typename T>
 seastar::future<>
 pump_deterministic_until(scheduler& events, seastar::future<T>& waiting) {
     const auto maximum_batch = std::min<std::uint64_t>(
       scheduler_driver_batch_size, events.limits().events_per_pump());
-    while (!waiting.available()) {
-        co_await seastar::yield();
+    for (;;) {
+        co_await runtime::testing::drain_reactor_tasks();
         if (waiting.available()) {
             break;
         }
@@ -81,8 +87,8 @@ seastar::future<> pump_until(scheduler& events, seastar::future<T>& waiting) {
     const auto deadline = seastar::lowres_clock::now() + watchdog;
     const auto maximum_batch = std::min<std::uint64_t>(
       scheduler_driver_batch_size, events.limits().events_per_pump());
-    while (!waiting.available()) {
-        co_await seastar::yield();
+    for (;;) {
+        co_await runtime::testing::drain_reactor_tasks();
         if (waiting.available()) {
             break;
         }
@@ -103,8 +109,8 @@ seastar::future<> pump_registered_until(
     const auto deadline = seastar::lowres_clock::now() + watchdog;
     const auto maximum_batch = std::min<std::uint64_t>(
       scheduler_driver_batch_size, events.limits().events_per_pump());
-    while (!waiting.available()) {
-        co_await seastar::yield();
+    for (;;) {
+        co_await runtime::testing::drain_reactor_tasks();
         if (waiting.available()) {
             break;
         }

@@ -1,7 +1,8 @@
+load("@protobuf//:protobuf_version.bzl", "PROTOC_VERSION")
 load("//bazel:build.bzl", "kwaque_cc_library")
 load("//bazel:stamp_template.bzl", "stamp_template")
 load("//bazel:test.bzl", "kwaque_cc_test")
-load("//bazel:versions.bzl", "KWAQUE_VERSION", "PROTOBUF_VERSION", "SEASTAR_REVISION")
+load("//bazel:versions.bzl", "KWAQUE_VERSION", "SEASTAR_REVISION")
 
 package(default_visibility = ["//visibility:private"])
 
@@ -22,6 +23,7 @@ kwaque_cc_library(
     }),
     local_defines = ["KWAQUE_INVARIANT_TEST_OBSERVER=0"],
     visibility = ["//visibility:public"],
+    deps = [":base"],
 )
 
 kwaque_cc_library(
@@ -45,13 +47,13 @@ kwaque_cc_library(
         "//src/simulation:__pkg__",
         "//src/simulation/tests:__pkg__",
     ],
+    deps = [":base"],
 )
 
 kwaque_cc_library(
     name = "base",
     hdrs = [
         "allocation.h",
-        "compiler.h",
         "result.h",
         "units.h",
     ],
@@ -70,6 +72,10 @@ stamp_template(
     name = "build_stamp",
     out = "build_stamp.h",
     defaults = "build_info.defaults",
+    stamp = select({
+        "//bazel:stamped": True,
+        "//conditions:default": False,
+    }),
     template = "build_stamp.h.in",
 )
 
@@ -81,13 +87,17 @@ kwaque_cc_library(
     ],
     hdrs = ["build_info.h"],
     local_defines = [
-        "KWAQUE_PROTOBUF_VERSION=\\\"{}\\\"".format(PROTOBUF_VERSION),
+        "KWAQUE_PROTOBUF_VERSION=\\\"{}\\\"".format(PROTOC_VERSION),
         "KWAQUE_SEASTAR_VERSION=\\\"{}\\\"".format(SEASTAR_REVISION),
         "KWAQUE_VERSION=\\\"{}\\\"".format(KWAQUE_VERSION),
     ] + select({
-        "//bazel:debug_build": ["KWAQUE_BUILD_MODE=\\\"debug\\\""],
-        "//bazel:optimized_build": ["KWAQUE_BUILD_MODE=\\\"release\\\""],
-        "//conditions:default": ["KWAQUE_BUILD_MODE=\\\"development\\\""],
+        # The compilation mode, not a release claim; stamping is separate.
+        "//bazel:debug_build": ["KWAQUE_BUILD_MODE=\\\"dbg\\\""],
+        "//bazel:optimized_build": ["KWAQUE_BUILD_MODE=\\\"opt\\\""],
+        "//conditions:default": ["KWAQUE_BUILD_MODE=\\\"fastbuild\\\""],
+    }) + select({
+        "//bazel:stamped": ["KWAQUE_BUILD_STAMPED=1"],
+        "//conditions:default": ["KWAQUE_BUILD_STAMPED=0"],
     }),
     visibility = ["//visibility:public"],
 )
@@ -96,6 +106,11 @@ kwaque_cc_library(
     name = "logging",
     srcs = ["logging.cc"],
     hdrs = ["logging.h"],
+    # Seastar links statically, so its logger registry belongs to the
+    # executable. In a dynamically linked test a logger in a shared library
+    # would be constructed before the executable's statics and destroyed after
+    # the registry it unregisters from.
+    linkstatic = True,
     visibility = ["//visibility:public"],
     deps = ["@seastar"],
 )

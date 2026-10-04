@@ -1,3 +1,4 @@
+#include "src/base/units.h"
 #include "src/codec/tests/envelope_decode_test_support.h"
 #include "src/codec/tests/envelope_fuzz_cases.h"
 
@@ -11,6 +12,7 @@
 #include <vector>
 
 namespace {
+using kwaque::literals::operator""_KiB;
 
 namespace cases = kwaque::codec::testing;
 namespace fixture = cases::envelope_fixture;
@@ -62,7 +64,7 @@ TEST(EnvelopeFuzzCasesTest, MaximumHeadersCountsAndExistingMarksRemainBounded) {
             cases::exercise_envelope_case(input);
         }
     }
-    std::vector<std::uint8_t> maximum(16U * 1024U, 'x');
+    std::vector<std::uint8_t> maximum(16_KiB, 'x');
     maximum[0] = 7;
     maximum[1] = 0;
     maximum[2] = 0;

@@ -462,17 +462,17 @@ TEST(FragmentedBuffer, CopyIsDeepAndIndependent) {
     EXPECT_EQ(coalesced.retained_bytes(), coalesced.size());
     EXPECT_TRUE(fragmented_source->content_equals(coalesced));
 
-    const std::string large(200UL * 1024UL, 'L');
+    const std::string large(200_KiB, 'L');
     auto large_source = fragmented_buffer::copy_of(
       std::span<const char>{large.data(), large.size()});
     ASSERT_TRUE(large_source.has_value());
     EXPECT_EQ(
       fragment_sizes(*large_source),
-      (std::vector<std::size_t>{128UL * 1024UL, 72UL * 1024UL}));
+      (std::vector<std::size_t>{128_KiB, 72_KiB}));
     auto chunked = large_source->copy();
     EXPECT_EQ(
       fragment_sizes(chunked),
-      (std::vector<std::size_t>{128UL * 1024UL, 64UL * 1024UL, 8UL * 1024UL}));
+      (std::vector<std::size_t>{128_KiB, 64_KiB, 8_KiB}));
     EXPECT_TRUE(large_source->content_equals(chunked));
 }
 
@@ -813,13 +813,13 @@ TEST(BufferBuilder, RejectsInvalidConfigurationAndUseAfterFinish) {
     EXPECT_FALSE(bad.validate().has_value());
 
     fragmented_buffer_builder_config inverted;
-    inverted.initial_fragment_bytes = byte_count{4096};
+    inverted.initial_fragment_bytes = byte_count{4_KiB};
     inverted.max_fragment_bytes = byte_count{512};
     EXPECT_FALSE(inverted.validate().has_value());
 
     fragmented_buffer_builder_config fragment_exceeds_total;
-    fragment_exceeds_total.max_fragment_bytes = byte_count{2048};
-    fragment_exceeds_total.max_total_bytes = byte_count{1024};
+    fragment_exceeds_total.max_fragment_bytes = byte_count{2_KiB};
+    fragment_exceeds_total.max_total_bytes = byte_count{1_KiB};
     EXPECT_FALSE(fragment_exceeds_total.validate().has_value());
 
     fragmented_buffer_builder_config oversized_total;
@@ -833,7 +833,7 @@ TEST(BufferBuilder, RejectsInvalidConfigurationAndUseAfterFinish) {
     EXPECT_TRUE(maximum_total.validate().has_value());
 
     fragmented_buffer_builder_config retained_below_logical;
-    retained_below_logical.max_retained_bytes = byte_count{1024};
+    retained_below_logical.max_retained_bytes = byte_count{1_KiB};
     EXPECT_FALSE(retained_below_logical.validate().has_value());
 
     EXPECT_TRUE(fragmented_buffer_builder_config{}.validate().has_value());
@@ -1194,8 +1194,8 @@ TEST(BufferBuilder, AppendBufferSplicesAndEmptiesTheSource) {
     EXPECT_EQ(contents(*published), "firstsecondthird");
 
     fragmented_buffer_builder_config config;
-    config.max_fragment_bytes = byte_count{8192};
-    config.max_total_bytes = byte_count{16384};
+    config.max_fragment_bytes = byte_count{8_KiB};
+    config.max_total_bytes = byte_count{16_KiB};
     fragmented_buffer_builder zero_copy_builder{config};
     const std::string large(
       fragmented_buffer_builder::pack_copy_threshold.value() + 1, 'z');
@@ -1287,8 +1287,8 @@ TEST(
 
 TEST(BufferBuilder, SplicePacksOnlyOneBoundedPrefixIntoExistingTail) {
     fragmented_buffer_builder_config config;
-    config.initial_fragment_bytes = byte_count{8192};
-    config.max_fragment_bytes = byte_count{8192};
+    config.initial_fragment_bytes = byte_count{8_KiB};
+    config.max_fragment_bytes = byte_count{8_KiB};
     config.max_fragments = 3;
     fragmented_buffer_builder builder{config};
     ASSERT_TRUE(builder.append(std::string_view{"head"}));

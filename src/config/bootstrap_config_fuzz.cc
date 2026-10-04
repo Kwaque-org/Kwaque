@@ -6,8 +6,8 @@
 
 extern "C" int
 LLVMFuzzerTestOneInput(const std::uint8_t* data, std::size_t size) {
-    constexpr std::size_t max_input_size = 4096;
-    if (size > max_input_size) {
+    // Inputs past the cap exercise its rejection without parsing.
+    if (size > kwaque::config::max_bootstrap_config_bytes + 1) {
         return 0;
     }
 

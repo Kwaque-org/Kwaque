@@ -131,8 +131,9 @@ class ReportTest(unittest.TestCase):
         ):
             changed = copy.deepcopy(row)
             changed[field] = value
-            with self.subTest(field=field, value=value), self.assertRaisesRegex(
-                ValueError, "write"
+            with (
+                self.subTest(field=field, value=value),
+                self.assertRaisesRegex(ValueError, "write"),
             ):
                 validate(changed)
         changed = copy.deepcopy(row)
@@ -197,8 +198,9 @@ class ReportTest(unittest.TestCase):
         for mask in (None, [], [4, 4], [-1], [True], ["4"]):
             row = measurement()
             row["affinity_cpus"] = mask
-            with self.subTest(mask=mask), self.assertRaisesRegex(
-                ValueError, "affinity"
+            with (
+                self.subTest(mask=mask),
+                self.assertRaisesRegex(ValueError, "affinity"),
             ):
                 validate(row)
         row = aggregate_measurement()

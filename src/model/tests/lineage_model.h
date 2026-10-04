@@ -165,6 +165,6 @@ private:
     std::size_t root_{0};
 };
 
-static_assert(sizeof(lineage_model) + sizeof(lineage_frontier) < 8U * 1024U);
+static_assert(sizeof(lineage_model) + sizeof(lineage_frontier) < 8_KiB);
 
 } // namespace kwaque::model::testing

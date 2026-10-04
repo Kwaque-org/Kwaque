@@ -44,6 +44,16 @@ SEASTAR_TEST_CASE(reactor_uses_expected_allocation_policy_and_build_profile) {
 #endif
     constexpr bool sanitized = address_sanitized
                                || undefined_behavior_sanitized;
+#if defined(SEASTAR_DEBUG)
+    constexpr bool seastar_debug = true;
+#else
+    constexpr bool seastar_debug = false;
+#endif
+#if _LIBCPP_HARDENING_MODE == _LIBCPP_HARDENING_MODE_EXTENSIVE
+    constexpr bool libcxx_hardened = true;
+#else
+    constexpr bool libcxx_hardened = false;
+#endif
     BOOST_CHECK_EQUAL(
       seastar::memory::is_abort_on_allocation_failure(), native_allocator);
     BOOST_CHECK(native_allocator || !allocation_injection);
@@ -75,6 +85,14 @@ SEASTAR_TEST_CASE(reactor_uses_expected_allocation_policy_and_build_profile) {
     BOOST_CHECK_MESSAGE(
       expected_fields == 0 || expected_fields == fields.size(),
       "specify all four validation profile expectations");
+    if (expected_fields == fields.size()) {
+        BOOST_CHECK_MESSAGE(
+          seastar_debug == !native_allocator,
+          "Seastar debug checks must accompany the system allocator");
+        BOOST_CHECK_MESSAGE(
+          libcxx_hardened == !(optimized && !sanitized),
+          "libc++ hardening must be enabled in every non-release profile");
+    }
     if (
       const auto* expected = std::getenv("KWAQUE_EXPECT_TEST_SANITIZED");
       expected != nullptr && std::string_view{expected} == "true") {

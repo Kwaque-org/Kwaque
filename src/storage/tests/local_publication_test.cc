@@ -1,3 +1,4 @@
+#include "src/base/units.h"
 #include "src/bytes/test_allocation_profile.h"
 #include "src/resource/resource_registry.h"
 #include "src/runtime/production/file.h"
@@ -40,9 +41,7 @@ SEASTAR_TEST_CASE(local_publication_and_bounded_discovery_use_real_files) {
                 runtime::production::file_system files;
                 storage::workload_budget budget{
                   manager.acquire_workload(resource::workload_class::metadata),
-                  {.tasks = 4,
-                   .bytes = byte_count{2U * 1024U * 1024U},
-                   .handles = 4},
+                  {.tasks = 4, .bytes = byte_count{2_MiB}, .handles = 4},
                   bytes::testing::charge};
                 const auto root = take(
                   runtime::file_path::make(
@@ -78,6 +77,19 @@ SEASTAR_TEST_CASE(local_publication_and_bounded_discovery_use_real_files) {
                   work);
                 BOOST_REQUIRE(!rejected);
                 BOOST_CHECK(rejected.error().code() == errc::wrong_context);
+                // The directories an inspection verified are remembered,
+                // never the file it checked.
+                const auto store = directory.get_path() / "store";
+                auto inspected = co_await storage::inspect_local_path(
+                  files,
+                  take(runtime::file_path::make(directory.get_path().string())),
+                  take(runtime::file_path::make((store / "control").string())),
+                  runtime::file_kind::regular,
+                  work);
+                BOOST_REQUIRE(inspected);
+                BOOST_CHECK(files.verified_directory(store.string()));
+                BOOST_CHECK(
+                  !files.verified_directory((store / "control").string()));
             }));
     } catch (...) {
         first = std::current_exception();

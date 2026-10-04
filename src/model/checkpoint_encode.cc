@@ -1,4 +1,5 @@
 #include "src/base/invariant.h"
+#include "src/base/units.h"
 #include "src/bytes/fragmented_buffer_builder.h"
 #include "src/codec/envelope_encode.h"
 #include "src/model/checkpoint_codec.h"
@@ -31,7 +32,7 @@ codec::result<bytes::fragmented_buffer_builder_config> body_staging(
   codec::field_context context) {
     const auto cap = policy.config();
     auto width = std::min(
-      {std::uint64_t{65536}, body.value(), cap.max_allocation_bytes.value()});
+      {64_KiB, body.value(), cap.max_allocation_bytes.value()});
     byte_count tail;
     while (width != 0) {
         tail = charge(byte_count{width});

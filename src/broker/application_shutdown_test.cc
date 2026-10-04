@@ -1,3 +1,4 @@
+#include "src/base/units.h"
 #include "src/broker/application_internal.h"
 #include "src/broker/application_test_support.h"
 #include "src/broker/pid_file.h"
@@ -24,6 +25,7 @@
 #include <utility>
 
 namespace {
+using kwaque::literals::operator""_MiB;
 
 using kwaque::broker::detail::application_state;
 using access = kwaque::broker::detail::application_test_access;
@@ -44,7 +46,7 @@ configuration(const std::filesystem::path& directory, std::uint16_t port) {
     kwaque::config::bootstrap_config result;
     result.data_directory = directory;
     result.admin_port = port;
-    result.diagnostic_memory_per_shard_bytes = 192U * 1024U * 1024U;
+    result.diagnostic_memory_per_shard_bytes = 192_MiB;
     return result;
 }
 
@@ -132,10 +134,12 @@ SEASTAR_TEST_CASE(
     BOOST_CHECK_THROW(
       kwaque::broker::pid_file{root.get_path() / "kwaque.pid"},
       kwaque::broker::pid_file_locked);
-    for (const auto* route : {"/v1/health/ready", "/v1/health/live"}) {
-        const auto response = co_await health_response(port, route);
-        BOOST_CHECK(response.starts_with("HTTP/1.1 503"));
-    }
+    // A draining broker is not ready but stays live, so that it is not
+    // restarted before the drain completes.
+    const auto ready = co_await health_response(port, "/v1/health/ready");
+    BOOST_CHECK(ready.starts_with("HTTP/1.1 503"));
+    const auto live = co_await health_response(port, "/v1/health/live");
+    BOOST_CHECK(live.starts_with("HTTP/1.1 200"));
     BOOST_CHECK(
       seastar::metrics::impl::get_value_map().contains(
         seastar::sstring{"runtime_task_active"}));

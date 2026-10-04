@@ -1,6 +1,7 @@
 #include "src/bytes/fragmented_buffer_builder.h"
 
 #include "src/base/error.h"
+#include "src/base/units.h"
 
 #include <seastar/util/defer.hh>
 
@@ -19,7 +20,7 @@ served_allocation_size(std::uint64_t size) noexcept {
     constexpr unsigned fraction_bits = 2;
     constexpr std::uint64_t fraction_mask = (std::uint64_t{1} << fraction_bits)
                                             - 1;
-    constexpr std::uint64_t max_pooled = 16384;
+    constexpr std::uint64_t max_pooled = 16_KiB;
     constexpr std::uint64_t minimum_cell = sizeof(void*);
     if (size == 0) {
         return 0;

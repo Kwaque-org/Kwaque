@@ -157,6 +157,57 @@ seastar::future<> run(
     take(co_await drive.lifecycle(replace.close()));
     take(failed.outcome());
     co_await check_contents(files, path, drive, 'b');
+
+    // A dependency the rename waits for: once the temporary is durable it is
+    // awaited, and when it fails the temporary is removed, the target keeps
+    // its record and the publisher fences.
+    {
+        seastar::abort_source gate_abort;
+        codec::cooperative_work gate_work{
+          codec::limits::defaults(), gate_abort};
+        local_file_publisher<Files> gated{
+          files,
+          budget,
+          {owner(),
+           root,
+           root,
+           name,
+           runtime::file_rename_policy::replace,
+           generation(2)}};
+        runtime::first_failure gate_failed;
+        try {
+            bool awaited = false;
+            auto refused = co_await drive.lifecycle(gated.publish(
+              {owner(), generation(3), generation(2)},
+              payload('d'),
+              gate_work,
+              [&awaited] {
+                  awaited = true;
+                  return seastar::make_ready_future<runtime::result<void>>(
+                    runtime::failure(
+                      runtime::operation_error{
+                        errc::io_failure, runtime::operation_kind::file}));
+              }));
+            require(
+              awaited && refused.failure.error()
+                && refused.failure.error()->code() == errc::io_failure
+                && refused.stage == local_publication_stage::file_closed
+                && refused.disposition
+                     == local_publication_disposition::untouched
+                && gated.fenced(),
+              "a failed rename dependency published or kept the publisher");
+            const auto temporary = take(local_child_path(
+              root, take(local_temporary_name(name, generation(3), 0))));
+            require(
+              !take(co_await drive.lifecycle(files.exists(temporary))),
+              "a failed rename dependency left its temporary");
+        } catch (...) {
+            gate_failed.observe(std::current_exception());
+        }
+        take(co_await drive.lifecycle(gated.close()));
+        take(gate_failed.outcome());
+    }
+    co_await check_contents(files, path, drive, 'b');
     require(
       budget.snapshot().tasks == 0 && budget.snapshot().handles == 0
         && budget.snapshot().bytes == 0,

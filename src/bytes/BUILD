@@ -117,6 +117,7 @@ kwaque_cc_fuzz_test(
         "testdata/fragmented_buffer_fuzz_corpus/deep_marks_high_offsets.bin",
         "testdata/fragmented_buffer_fuzz_corpus/trim_share.bin",
     ],
+    tags = ["fuzz-campaign"],
     deps = [
         ":fragmented_buffer",
         ":fragmented_buffer_builder",

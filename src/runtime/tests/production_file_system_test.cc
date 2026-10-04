@@ -1,3 +1,4 @@
+#include "src/base/units.h"
 #include "src/runtime/file.h"
 #include "src/runtime/production/file.h"
 #include "src/runtime/testing/contracts/cleanup.h"
@@ -29,6 +30,7 @@
 #include <utility>
 
 namespace {
+using kwaque::literals::operator""_KiB;
 
 struct native_file_driver {
     template<typename T>
@@ -394,9 +396,10 @@ SEASTAR_TEST_CASE(production_space_preserves_permission_failure) {
       [](seastar::tmp_dir& directory) -> seastar::future<> {
           const auto denied = directory.get_path() / "denied";
           std::filesystem::create_directories(denied / "child");
-          auto restore = seastar::defer([&denied] {
+          auto restore = seastar::defer([&denied] noexcept {
+              std::error_code ignored;
               std::filesystem::permissions(
-                denied, std::filesystem::perms::owner_all);
+                denied, std::filesystem::perms::owner_all, ignored);
           });
           std::filesystem::permissions(denied, std::filesystem::perms::none);
           kwaque::runtime::production::file_system files;
@@ -469,7 +472,7 @@ SEASTAR_TEST_CASE(
                   BOOST_REQUIRE_LT(pages, 100U);
                   auto page = co_await opened->next(
                     {.maximum_entries = kwaque::item_count{17},
-                     .maximum_name_bytes = kwaque::byte_count{1024}});
+                     .maximum_name_bytes = kwaque::byte_count{1_KiB}});
                   BOOST_REQUIRE(page.has_value());
                   BOOST_CHECK_LE(page->entries().size(), 17U);
                   std::size_t bytes = 0;
@@ -529,5 +532,60 @@ SEASTAR_TEST_CASE(
             path_of(directory.get_path()));
           BOOST_REQUIRE(reopened.has_value());
           BOOST_REQUIRE((co_await reopened->close()).has_value());
+      });
+}
+
+SEASTAR_TEST_CASE(
+  production_file_system_forgets_removed_and_renamed_directories) {
+    return seastar::tmp_dir::do_with(
+      kwaque::runtime::testing::test_directory_template(),
+      [](seastar::tmp_dir& directory) -> seastar::future<> {
+          kwaque::runtime::production::file_system files;
+          const auto root = directory.get_path() / "verified";
+          std::filesystem::create_directories(root / "a" / "b");
+          std::filesystem::create_directories(root / "ab");
+          std::filesystem::create_directories(root / "empty");
+          const auto name = [](const std::filesystem::path& path) {
+              return path.string();
+          };
+          BOOST_CHECK(!files.verified_directory(name(root / "a")));
+          for (const auto& path : {root / "a", root / "a" / "b", root / "ab"})
+              files.remember_directory(name(path));
+          BOOST_CHECK(files.verified_directory(name(root / "a")));
+          BOOST_CHECK(files.verified_directory(name(root / "a" / "b")));
+
+          // A rename forgets its source and everything below it, never a
+          // sibling that only shares a name prefix.
+          BOOST_REQUIRE(
+            (co_await files.rename(path_of(root / "a"), path_of(root / "c")))
+              .has_value());
+          BOOST_CHECK(!files.verified_directory(name(root / "a")));
+          BOOST_CHECK(!files.verified_directory(name(root / "a" / "b")));
+          BOOST_CHECK(files.verified_directory(name(root / "ab")));
+
+          // So does a rename's destination, and a removed directory.
+          BOOST_REQUIRE((co_await files.rename(
+                           path_of(root / "empty"), path_of(root / "ab")))
+                          .has_value());
+          BOOST_CHECK(!files.verified_directory(name(root / "ab")));
+          files.remember_directory(name(root / "c"));
+          files.remember_directory(name(root / "c" / "b"));
+          BOOST_REQUIRE(
+            (co_await files.remove_directory(path_of(root / "c" / "b")))
+              .has_value());
+          BOOST_CHECK(!files.verified_directory(name(root / "c" / "b")));
+          BOOST_CHECK(files.verified_directory(name(root / "c")));
+
+          // Bounded: an overlong path is never remembered, and many entries
+          // displace older ones without losing the latest.
+          const auto overlong = "/" + std::string(300, 'x');
+          files.remember_directory(overlong);
+          BOOST_CHECK(!files.verified_directory(overlong));
+          for (int i = 0; i < 1000; ++i) {
+              const auto path = name(root / ("d" + std::to_string(i)));
+              files.remember_directory(path);
+              BOOST_CHECK(files.verified_directory(path));
+          }
+          co_return;
       });
 }

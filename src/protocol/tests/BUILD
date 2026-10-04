@@ -146,6 +146,7 @@ kwaque_cc_fuzz_test(
     ],
     corpus = glob(["testdata/control_fuzz_corpus/*.bin"]),
     tags = [
+        "fuzz-campaign",
         "resources:cpu:1",
         "resources:memory:1024",
     ],
@@ -543,6 +544,7 @@ kwaque_cc_fuzz_test(
     ],
     corpus = glob(["testdata/frame_fuzz_corpus/*.bin"]),
     tags = [
+        "fuzz-campaign",
         "resources:cpu:1",
         "resources:memory:1024",
     ],

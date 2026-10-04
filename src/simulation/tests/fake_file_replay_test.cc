@@ -1,6 +1,7 @@
 #include "src/bytes/fragmented_buffer.h"
 #include "src/runtime/file.h"
 #include "src/runtime/testing/contracts/file_system_contract.h"
+#include "src/runtime/testing/reactor_tasks.h"
 #include "src/simulation/determinism_version.h"
 #include "src/simulation/event_trace.h"
 #include "src/simulation/fake_file.h"
@@ -33,6 +34,7 @@ using kwaque::runtime::builtin_fault_point;
 using kwaque::runtime::fault_decision;
 using kwaque::runtime::fault_object_key;
 using kwaque::runtime::fault_occurrence;
+using kwaque::runtime::testing::drain_reactor_tasks;
 using kwaque::simulation::event_trace;
 using kwaque::simulation::fake_file_state_digest;
 using kwaque::simulation::fake_file_state_snapshot;
@@ -667,7 +669,7 @@ seastar::future<crash_boundary_result> run_crash_boundary(
             static_cast<void>(environment.events.discard_failed());
             break;
         }
-        co_await seastar::yield();
+        co_await drain_reactor_tasks();
     }
 
     if (!diverged) {

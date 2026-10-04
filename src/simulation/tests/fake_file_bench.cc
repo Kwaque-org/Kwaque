@@ -341,7 +341,7 @@ public:
     dirty_truncate_fixture()
       : files_(
           fake_file_system::make(
-            fake_file_system_config{.logical_capacity = byte_count{16U << 20U}})
+            fake_file_system_config{.logical_capacity = byte_count{16_MiB}})
             .value())
       , path_(fake_file_test_access::resolve(*files_, "value").value()) {
         const auto created = fake_file_test_access::create_file(*files_, path_);

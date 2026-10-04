@@ -443,7 +443,9 @@ SEASTAR_TEST_CASE(
             BOOST_CHECK(!stopping->available());
             BOOST_CHECK_EQUAL(completions, 0U);
             release.set_value();
-            co_await seastar::yield();
+            // stop() is already draining the task scope, and that drain is
+            // the accepted task's completion.
+            co_await target.tasks().close();
             BOOST_CHECK_EQUAL(completions, 1U);
             BOOST_CHECK(!stopping->available());
             static_cast<void>(capability.random().next_u64());

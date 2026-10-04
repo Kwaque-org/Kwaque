@@ -1,5 +1,6 @@
 #include "src/storage/segment_writer_state.h"
 
+#include "src/base/units.h"
 #include "src/storage/format_internal.h"
 #include "src/storage/local_paths.h"
 
@@ -15,10 +16,10 @@ runtime::result<void> segment_admission_limits::validate() const noexcept {
       !maximum_blocks || !maximum_retry_entries || !maximum_retry_pages
       || maximum_retry_entries > maximum_object_entries
       || maximum_retry_pages > maximum_object_pages
-      || metadata_bytes.value() == 0 || metadata_bytes > byte_count{1U << 20U}
+      || metadata_bytes.value() == 0 || metadata_bytes > byte_count{1_MiB}
       || working_bytes < metadata_bytes
       || working_bytes > runtime::maximum_file_io_bytes
-      || execution_bytes < byte_count{4096}
+      || execution_bytes < byte_count{4_KiB}
       || execution_bytes > byte_count{maximum_contiguous_allocation_bytes})
         return runtime::failure(detail::path_error(errc::invalid_argument));
     return {};
@@ -366,7 +367,7 @@ detail::segment_capacity_constants::make(
       .policy = policy,
       .charge = charge,
       .finalization_bytes = finalization_bytes,
-      .tiny = config.max_work_bytes < byte_count{1024}
+      .tiny = config.max_work_bytes < byte_count{1_KiB}
               || config.max_work_items < item_count{64},
       .block_limits = {
         config.max_encoded_body_bytes,
@@ -433,6 +434,21 @@ detail::segment_capacity_constants::fresh_root(std::size_t batches) {
         fresh_known[batches] = true;
     }
     return fresh_roots[batches];
+}
+
+std::optional<std::uint32_t>
+detail::segment_capacity_constants::seal_page_entries(
+  std::uint64_t entries) const {
+    auto projected = project_retries(
+      entries,
+      descriptor.alignment,
+      limits,
+      policy,
+      charge,
+      finalization_bytes,
+      retry_wire_capacity);
+    if (!projected) return std::nullopt;
+    return projected->entries_per_page;
 }
 
 runtime::result<segment_capacity_plan> plan_segment_capacity(

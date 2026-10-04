@@ -11,13 +11,10 @@ runtime::operation_error state_error(errc code) {
     return runtime::operation_error{code, runtime::operation_kind::file};
 }
 } // namespace
-runtime::result<wal_write_descriptor::pointer> wal_write_descriptor::make(
-  workload_budget& budget,
-  model::file_byte_span extent,
-  codec::limits policy,
-  byte_count execution_bytes) {
+runtime::result<byte_count> wal_write_descriptor::charge(
+  const workload_budget& budget, byte_count execution_bytes) {
     if (
-      extent.empty() || execution_bytes < minimum_execution_bytes
+      execution_bytes < minimum_execution_bytes
       || execution_bytes.value() > maximum_contiguous_allocation_bytes)
         return runtime::failure(state_error(errc::invalid_argument));
     // Native lw_shared control and a 16-entry FIFO chunk have fixed overhead.
@@ -28,8 +25,18 @@ runtime::result<wal_write_descriptor::pointer> wal_write_descriptor::make(
       byte_count{16 * sizeof(pointer) + 64});
     if (!node) return runtime::failure(node.error());
     if (!chunk) return runtime::failure(chunk.error());
-    auto held = budget.try_reserve(
-      byte_count{node->value() + chunk->value() + execution_bytes.value()});
+    return byte_count{node->value() + chunk->value() + execution_bytes.value()};
+}
+runtime::result<wal_write_descriptor::pointer> wal_write_descriptor::make(
+  workload_budget& budget,
+  model::file_byte_span extent,
+  codec::limits policy,
+  byte_count execution_bytes) {
+    if (extent.empty())
+        return runtime::failure(state_error(errc::invalid_argument));
+    auto cost = charge(budget, execution_bytes);
+    if (!cost) return runtime::failure(cost.error());
+    auto held = budget.try_reserve(*cost);
     if (!held) return runtime::failure(held.error());
     return seastar::make_lw_shared<wal_write_descriptor>(
       std::move(*held), extent, policy);

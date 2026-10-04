@@ -1,0 +1,6 @@
+defaults: &defaults
+  schema_version: 1
+kwaque:
+  <<: *defaults
+  developer_mode: !!bool true
+  data_directory: !!str 0o17

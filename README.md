@@ -17,8 +17,8 @@ project-specific system packages are needed. It does require:
 
 | Tool | Why |
 |---|---|
-| A Bazel launcher honoring `.bazelversion` | Selects the pinned Bazel `9.1.0`. [Bazelisk](https://github.com/bazelbuild/bazelisk) is the supported way to get it. |
-| `git` | Build stamping reads the revision and worktree state. |
+| A Bazel launcher honoring `.bazelversion` | Selects the pinned Bazel `9.2.0`. [Bazelisk](https://github.com/bazelbuild/bazelisk) is the supported way to get it. |
+| `git` | Release builds record the revision and worktree state; other builds report `unknown`. |
 | `make` | Several native dependencies build through their own configure/make scripts. |
 | `perl` | OpenSSL's `Configure` script is Perl. |
 | `python3` | Repository tooling and subprocess tests. |
@@ -29,24 +29,31 @@ Bazel cache.
 
 ### Runtime hosts
 
-Kwaque currently supports 64-bit Linux on Westmere-class x86-64 processors and
-ARMv8-A AArch64 processors with CRC and cryptography extensions. Packaged
-binaries target the Ubuntu 22.04 userspace baseline and require glibc 2.35 or
-newer. A Linux 5.15 or newer kernel is the supported baseline for the Seastar
-runtime and its io_uring backend.
+Kwaque supports 64-bit Linux on Westmere-class x86-64 processors and ARMv8-A
+AArch64 processors with CRC and cryptography extensions. The `kwaque` entry point
+checks the required CPU instructions before loading the native broker. Keep the
+packaged `bin/kwaque` and `bin/kwaque_native` together; launch through `kwaque`
+so the prerequisite check runs first.
 
-The `kwaque` entry point checks the required CPU instructions before loading the
-native broker. Keep the packaged `bin/kwaque` and `bin/kwaque_native` together;
-launch through `kwaque` so the prerequisite check runs first.
+Packaged binaries need glibc 2.34 or newer and the host's `libgcc_s.so.1`.
+Everything else, including OpenSSL and the C++ runtime, is linked into them; the
+package tests reject any other host library, a run path, or a newer glibc symbol.
+A Linux 5.15 or newer kernel is the supported baseline for the Seastar runtime
+and its io_uring backend.
 
 Seastar's default reactor backend is `linux-aio`. The broker also accepts
 `--reactor-backend=io_uring`, `epoll`, or `asymmetric_io_uring`; see
 [Troubleshooting](#troubleshooting) for choosing between them.
 
-Use XFS or ext4 on a local filesystem for the data directory. The directory
-must be writable by the broker process. Running the committed development
-configuration does not require root privileges, device access, or privileged
-ports. Hosts must provide enough unlocked memory for the selected Seastar
+Put the data directory on a local XFS filesystem; ext4 works but is reported as
+a warning. Storage I/O bypasses the page cache, so tmpfs, overlayfs and network
+filesystems are not supported. The directory must be writable by the broker's
+user. The broker needs no root privileges, device access, or privileged ports.
+Two capabilities help: `CAP_SYS_NICE` lets Seastar raise its timer threads to
+real-time priority, and `CAP_IPC_LOCK` with a large enough `RLIMIT_MEMLOCK`
+allows `--lock-memory`. The reference systemd unit grants both.
+
+Hosts must provide enough unlocked memory for the selected Seastar
 `--memory` value; production CPU, memory-locking, and filesystem tuning is not
 yet automated. Native-allocator builds derive workload admission from the
 smallest shard-local allocator after Seastar applies `--memory`. The broker
@@ -57,17 +64,74 @@ Explicit development fixtures retain the 64 MiB floor. System-allocator builds
 use `diagnostic_memory_per_shard_bytes` as a cooperative workload budget;
 `--memory` does not cap their process allocations.
 
+In a container, the cgroup's CPU set and memory limit bound the broker; choose
+`--smp` and `--memory` within them. Under Kubernetes on Linux 6.12 through 7.0,
+except long-term releases that carry the scheduler fix, Seastar enables
+`--overprovisioned` by itself to avoid a scheduler deadlock.
+
+#### Host checks
+
+At startup the broker grades the host and logs one `host check` line per item.
+The grades are advice: none of them stops startup, and the broker changes no host
+setting except raising its own open-file soft limit.
+
+| Check | Recommended | When not met |
+|---|---|---|
+| `filesystem` | XFS for the data directory | Warning on ext4; error on any other filesystem |
+| `disk_free_bytes` | At least 10 GiB free | Warning |
+| `host_physical_memory_bytes` | Readable | Warning |
+| `cgroup_memory_limit_bytes` | Readable | Warning |
+| `host_memory_mib_per_cgroup_cpu` | At least 2048 MiB per available CPU | Warning |
+| `cgroup_effective_cpuset_cpus` | Readable | Warning |
+| `cgroup_cpu_quota_millicores` | Readable | Warning |
+| `cgroup_version` | Readable | Warning |
+| `descriptor_limits` | Open-file soft limit of at least 200,000, after it is raised to the hard limit | Warning; error below 10,000 |
+| `swap_bytes` | Readable | Warning |
+| `swappiness` | `vm.swappiness` = 1 | Warning |
+| `aio_max_nr` | `fs.aio-max-nr` of at least 10,000,137 | Warning |
+| `clocksource` | `tsc` on x86-64, `arch_sys_counter` on AArch64 | Warning |
+| `transparent_hugepages` | `always` or `madvise` | Warning |
+| `io_calibration_configured` | An I/O properties file (see below) | Warning |
+| `io_calibration_device` | Properties for the data directory's device, with finite rates | Warning |
+| `data_mount_device` | Readable | Warning |
+
+With the `linux-aio` backend each shard asks for 11,026 kernel AIO control blocks:
+1,024 for storage, 2 for preemption and 10,000 for networking. When
+`fs.aio-max-nr` is lower, Seastar shrinks the networking share or, below the
+minimum, refuses to start.
+
+#### I/O calibration
+
+Seastar schedules disk I/O from measured device rates. Without them it treats
+the disk as unlimited, so foreground and background work compete without bounds
+when the disk saturates. Measure the data directory's device once with the
+packaged `iotune`, while the broker is stopped, and pass the result at every
+start:
+
+```bash
+bin/iotune --evaluation-directory /var/lib/kwaque \
+  --properties-file /etc/kwaque/io-properties.yaml
+bin/kwaque --config /etc/kwaque/kwaque.yaml \
+  --io-properties-file /etc/kwaque/io-properties.yaml
+```
+
+With the reference systemd unit, set
+`KWAQUE_ARGS=--io-properties-file /etc/kwaque/io-properties.yaml` in
+`/etc/default/kwaque`.
+
 ## Quick start
 
-Build and run the broker with the committed development configuration:
+Build the broker and run it from the repository root with the committed
+development configuration, which it reads from `conf/kwaque.yaml` by default:
 
 ```bash
 bazel build --config=dev //:kwaque
-bazel run --config=dev //:kwaque -- --config conf/kwaque.yaml --smp 1
+bazel-bin/src/broker/kwaque --smp 1
 ```
 
-The example configuration binds the administrative listener to
-`127.0.0.1:9644` and uses `./data` as the data directory. In another shell:
+The development example binds the administrative listener to
+`127.0.0.1:9644` and keeps its data in `./data`, resolved against the directory
+the broker starts in. In another shell:
 
 ```bash
 curl -s http://127.0.0.1:9644/v1/health/live
@@ -82,12 +146,42 @@ administrative connections, and exits zero.
 Print build metadata without starting the reactor:
 
 ```bash
-bazel run --config=dev //:kwaque -- --version
+bazel-bin/src/broker/kwaque --version
 ```
 
-Configuration keys, defaults, and validation rules live in
-[`conf/kwaque.yaml`](conf/kwaque.yaml). Pass a different file with `--config`;
-the default is `conf/kwaque.yaml` relative to the working directory.
+### Configuration
+
+The broker reads one bootstrap file, `conf/kwaque.yaml` relative to the working
+directory unless `--config` names another. [`conf/kwaque.yaml`](conf/kwaque.yaml)
+is the development example; [`conf/kwaque.production.yaml`](conf/kwaque.production.yaml)
+is the production example, installed as `etc/kwaque/kwaque.yaml` by the package.
+
+| Key | Default | Meaning |
+|---|---|---|
+| `schema_version` | required | Configuration schema; this broker accepts `1` |
+| `data_directory` | `./data` | Broker state; must be absolute unless `developer_mode` is true |
+| `admin.address`, `admin.port` | `127.0.0.1`, `9644` | Numeric listener address and port |
+| `developer_mode` | `false` | Relaxes resource suitability checks and crash-loop limiting |
+| `storage_strict_data_init` | `false` | Require `.kwaque_data_dir` in the data directory |
+| `crash_loop_limit` | `5` | Unclean exits before startup is refused; `null` disables |
+| `diagnostic_memory_per_shard_bytes` | unset | Workload budget for system-allocator diagnostic builds |
+
+The file is one YAML 1.2 document of at most 64 KiB of UTF-8 text, nested at
+most eight collections deep. Unknown and duplicate keys are rejected. Integers
+are plain decimal without leading zeros or prefixes, booleans are `true` or
+`false` (any of the three core capitalizations), and numbers and booleans must
+be unquoted and untagged. A string that reads as another type, such as `123`,
+must be quoted. Values are not shell words: a leading `~` is rejected rather
+than expanded. The broker logs the absolute configuration path and data
+directory it used.
+
+The schema version is checked before any other key, so a file written for a
+newer broker reports its version rather than its first unfamiliar key. Any change
+to the key set or to the meaning of a key increments the version.
+
+Log levels are runtime options, not configuration: use
+`--default-log-level` and `--logger-log-level kwaque-broker=debug`. List the
+available loggers with `--help-loggers`.
 
 The broker reads native runtime options from its command line and explicitly
 selected `--io-properties` or `--io-properties-file` input. It does not load
@@ -131,6 +225,59 @@ It does not tune the host or treat configured I/O rates as measured throughput.
 The admin listener uses bounded connections, headers, metrics work and absolute
 request lifetimes.
 
+### Process contract
+
+Signals:
+
+| Signal | Effect |
+|---|---|
+| `SIGTERM`, `SIGINT` | Drain and stop; a repeated signal does not escalate |
+| `SIGHUP` | Ignored; the configuration is static, so restart to apply changes |
+| `SIGKILL` | Immediate termination; the next start sees an unclean exit |
+
+Exit statuses are stable, so a service manager can decide whether to restart:
+
+| Status | Meaning | Retry? |
+|---|---|---|
+| 0 | Clean stop, or a stop requested before startup completed | |
+| 1 | Unexpected failure | Yes |
+| 2 | Invalid command line | No |
+| 6 | Invalid configuration or runtime options | No; fix the configuration |
+| 10 | Another process owns the data directory (`kwaque.pid` is locked) | No |
+| 11 | The crash-loop limit refused startup | No; inspect `crash_reports` |
+| 12 | The CPU lacks instructions the broker was built for | No |
+
+The broker sends `READY=1` to the service manager named by `NOTIFY_SOCKET` once
+startup completes and `STOPPING=1` when it starts to drain, as `sd_notify(3)`
+describes. The package includes a reference systemd unit,
+`share/kwaque/systemd/kwaque.service`, for a broker installed under `/opt/kwaque`
+and running as the `kwaque` user. It uses `Type=notify`, restarts the broker
+after an unexpected failure (status 1), and keeps a broker that cannot start from
+restarting in a loop with `RestartPreventExitStatus=2 6 10 11 12`. Its
+`TimeoutStopSec` leaves room for a full drain: a broker killed while draining
+counts toward its crash-loop limit.
+
+Health endpoints:
+
+- `/v1/health/live` returns 200 from the moment the admin listener starts
+  until the broker stops, including while it drains. A liveness failure means the
+  process should be restarted.
+- `/v1/health/ready` returns 200 only after startup completes and 503 from the
+  start of drain. Route traffic by readiness.
+- The admin listener starts after the other startup stages. Before it starts,
+  liveness requests are refused, so give a supervisor a startup allowance, such
+  as a Kubernetes `startupProbe` on `/v1/health/live`, rather than a short
+  liveness deadline.
+- Every endpoint answers `HEAD`. Errors are RFC 9457 problem documents
+  (`application/problem+json`) with a stable `code` member; other methods on a
+  known path return 405 with `Allow: GET, HEAD`.
+
+The data directory holds `kwaque.pid`, an exclusive lock for the broker's
+lifetime. A directory the broker creates is private to its owner. At startup the
+broker raises its open-file soft limit to the hard limit; a limit below 10,000
+is reported as an error and below 200,000 as a warning, so set `LimitNOFILE` or
+the equivalent high enough for the deployment.
+
 ## Development
 
 Keep related commands in the same build configuration: switching configurations
@@ -155,6 +302,19 @@ Unsupported process injection/OOM cases are reported as skipped.
 configuration uses light optimization and ASan. All configurations are defined
 in [`.bazelrc`](.bazelrc).
 
+Every configuration except `release` guards Seastar thread stacks and enables
+libc++'s extensive hardening checks. Configurations that use the system
+allocator (`dev`, `debugger`, `debug`, `ci-sanitizer`, and `fuzz`) also enable
+Seastar's debug checks: cross-shard pointer and promise checks, forced
+preemption, and task-queue shuffling. `fuzz` keeps task order unshuffled so a
+crashing input replays.
+
+Reactor tests and benchmarks run on the `epoll` backend unless
+`--//bazel:reactor_backend=linux-aio` or `--//bazel:reactor_backend=io_uring` is
+set. The CI debug suite runs on `linux-aio`, and a scheduled job runs it on
+`io_uring`. Tests tagged `exclusive` assert bounds on real elapsed time, so Bazel
+runs them alone.
+
 CI skips native builds, tests, formatting, and analysis for additions or edits
 limited to README files, contributor/security documents, and prose under
 `docs/`. Workflow syntax and CI selection checks still run. Source, tests,
@@ -162,15 +322,22 @@ build/tool configuration, dependency inventories, deletions, and unknown paths
 receive the complete checks. Manual workflow dispatches always run the full CI
 suite, as do changes whose complete Git comparison cannot be established.
 
-CI disk caches are separated by architecture and build configuration. One job
-per configuration writes a commit-specific snapshot; matching golden jobs
-restore it, falling back to an earlier snapshot for a new commit. These snapshots
-do not share ongoing compilation between concurrent jobs. Ordinary and fuzz
-clang-tidy jobs use separate caches of compilation prerequisites, saved after
-successful preparation so later analysis failures do not discard the cache.
-Both analysis jobs run independently of the release build.
-The native policy job uses its own configuration and cache. Release jobs execute
-focused runtime and process-policy tests after the ordinary build.
+CI caches downloads only: Bazel itself and the repository cache, written by runs
+on `main` and restored by pull requests and merge queue runs. Build outputs are
+not cached, because per-configuration snapshots exceed the repository's cache
+budget and evict one another; every job compiles from source. The analysis jobs
+and the native policy job run independently of the release builds.
+
+The x86-64 and AArch64 release jobs build every ordinary target, run the focused
+runtime and process-policy tests and the determinism goldens without cached
+results, and then test the shipped package, the broker processes and the fuzz
+replays on `linux-aio`. A newer push cancels a superseded pull request run but
+never a run on `main`.
+
+A single `CI result` job depends on every other job; it is the status check to
+require before merging. It fails when any job fails or is cancelled, including a
+job skipped because an earlier one failed, which GitHub would otherwise count as
+passing.
 
 ### Ordinary tests and builds
 
@@ -203,10 +370,40 @@ bazel test --config=ci-debug --spawn_strategy=sandboxed \
   --runs_per_test=10 --cache_test_results=no //src/runtime/tests:hermetic_contracts
 ```
 
+Tests that start the broker or another native binary use the same sanitizer
+options as C++ tests, so a sanitizer report fails them, and they scan the
+broker's log for unexpected errors. Each broker in a test listens on its own
+loopback address. Broker logs are kept in Bazel's test undeclared outputs.
+
+`--//bazel:reactor_backend=epoll|linux-aio|io_uring` selects the reactor
+backend for every test, including the Python harnesses; CI runs linux-aio, and
+a scheduled job runs io_uring.
+
+Sanitizer and debug builds shuffle the reactor's task queue. Each shard logs
+`task queue shuffle seed N`; rerun a failure in the same order with
+`--test_env=SEASTAR_SHUFFLE_TASK_QUEUE_SEED=N`. Test randomness otherwise comes
+from explicit fixture seeds, which a repository check enforces.
+
+A scheduled job repeats every `smoke` and `stress` test twenty times with
+GoogleTest shuffling, and another collects line coverage:
+
+```bash
+bazel test --config=ci-debug --runs_per_test=20 --cache_test_results=no \
+  --test_env=GTEST_SHUFFLE=1 --build_tag_filters=smoke,stress \
+  --test_tag_filters=smoke,stress,-manual //...
+bazel coverage --config=ci-debug \
+  --build_tag_filters=-fuzz,-manual,-benchmark \
+  --test_tag_filters=-fuzz,-manual,-benchmark //...
+```
+
+The combined report is `bazel-out/_coverage/_coverage_report.dat`.
+
 ### Determinism goldens
 
 The same fixed random, fault-decision, trace, terminal-digest, and structured-event
-constants run on x86-64 and native AArch64 under both debug and release in CI.
+constants run on x86-64 and native AArch64 under both debug and release in CI:
+inside the debug suite, inside both release jobs, and in a dedicated AArch64
+debug job.
 Run the suite locally with either configuration:
 
 ```bash
@@ -216,45 +413,40 @@ bazel test --config=ci-release //src/simulation/tests:determinism_goldens
 
 ### Bounded fuzzing
 
-The PR smoke exercises every configuration, control-message, fragmented-buffer,
-scheduler, fault-schedule, fake-file, and fake-network fuzzer. Each target starts
-with a checked-in corpus and a two-second fuzzing budget:
+The PR smoke runs every test tagged `fuzz`, so a new fuzz target is included
+without editing the workflow. Each target starts with its checked-in corpus and
+a two-second fuzzing budget:
 
 ```bash
 bazel test --config=ci --config=fuzz --keep_going --test_output=all \
   --test_env=KWAQUE_FUZZ_MINIMIZE_SECONDS=30 \
   --test_arg=-seed=1 --test_arg=-max_total_time=2 \
-  //src/config:bootstrap_config_fuzz \
-  //proto/kwaque/common/v1:build_info_fuzz \
-  //src/bytes:fragmented_buffer_fuzz \
-  //src/simulation/tests:scheduler_fuzz \
-  //src/simulation/tests:fault_schedule_fuzz \
-  //src/simulation/tests:fake_file_fuzz \
-  //src/simulation/tests:fake_network_fuzz \
-  //src/simulation/tests:signal_canary_test
+  --build_tag_filters=fuzz --test_tag_filters=fuzz,-manual //...
 ```
 
-The buffer/parser input cap is 4 KiB; stateful inputs are capped at 16 KiB and
+Most parser inputs are capped at 4 KiB; the configuration parser accepts one
+byte past its 64 KiB production limit. Stateful inputs are capped at 16 KiB and
 have additional command, callback, object, and retained-byte limits. Every
 stateful input owns a fresh fixture and drains it before returning.
 
-The scheduled workflow gives each stateful fuzzer ten minutes. To run that
-campaign locally:
+Each fuzz target also has a `<name>_replay` test that runs the empty input and
+its corpus through the target in ordinary builds. CI runs the replays in the
+debug and sanitizer suites and in the x86-64 and AArch64 release jobs, which
+never fuzz.
+
+The scheduled workflow gives every test tagged `fuzz-campaign` ten minutes, one
+target per job. To run one campaign locally:
 
 ```bash
-bazel test --config=ci --config=fuzz --keep_going --test_output=all \
+bazel test --config=ci --config=fuzz --test_output=all \
   --test_timeout=720 --test_env=KWAQUE_FUZZ_MINIMIZE_SECONDS=30 \
-  --test_arg=-max_total_time=600 \
-  //src/simulation/tests:scheduler_fuzz \
-  //src/simulation/tests:fault_schedule_fuzz \
-  //src/simulation/tests:fake_file_fuzz \
-  //src/simulation/tests:fake_network_fuzz
+  --test_arg=-max_total_time=600 --test_arg=-timeout=15 \
+  //src/simulation/tests:scheduler_fuzz
 ```
 
-The `ci` configuration runs local tests one at a time, so four healthy ten-minute
-campaigns take about forty minutes plus build time. The native per-input timeout
-and external watchdog also bound stuck inputs. Diagnostic minimization after a
-failure has a separate budget; the original failure status is preserved.
+The native per-input timeout and an external watchdog bound stuck inputs.
+Diagnostic minimization after a failure has a separate budget; the original
+failure status is preserved.
 
 The wrapper resolves runfiles before changing the child's working directory.
 Writable corpora stay below `TEST_TMPDIR`; logs and original/minimized failure
@@ -307,6 +499,10 @@ bazel query 'attr(tags, benchmark, //...)'
 bazel run --config=ci-release //src/runtime/tests:runtime_contract_bench -- --list
 ```
 
+Each benchmark also has a `<name>_test` target that runs every case once with
+`--iterations=1 --duration=0 --runs=1`, so ordinary test runs execute benchmark
+code without measuring it.
+
 The byte, runtime-contract, event, and simulation binaries include buffer, queue,
 scheduler, trace, event, fake-file, network, and bandwidth cases. Simulation
 absolute timings are informational. The paired comparison tool uses three
@@ -332,6 +528,8 @@ It requests OOM abort and records a native pre-run profile before accepting each
 result. Comparisons require optimized native allocation with injection and
 sanitizers disabled. The profile hook runs before timing and allocation snapshots;
 the caller still supplies release-build evidence for the measured binary.
+Invocations use the `epoll` reactor backend unless `--reactor-backend=linux-aio`
+or `--reactor-backend=io_uring` selects another; the manifest records the choice.
 Equal work and fixture boundaries still require review; a passing time ratio
 alone does not establish an equivalent workload.
 
@@ -339,14 +537,23 @@ alone does not establish an equivalent workload.
 
 ```bash
 bazel run //tools:format_cpp_changed -- --check
+bazel run //tools:format_cpp_changed -- --check --base=main
 bazel run //tools:buildifier_check
+ruff format --check && ruff check
 python3 tools/check_generated_artifacts.py
 python3 tools/check_dependency_inventory.py
+python3 tools/check_package_licenses.py
 python3 tools/check_bazel_package_cycles.py
 python3 tools/check_cross_shard_usage.py
 python3 -m tools.check_runtime_boundaries
 python3 tools/check_determinism.py
 ```
+
+`--base=main` also checks files committed on a branch since it left `main`.
+Buildifier lint warnings fail the check like formatting differences, and
+`//tools:buildifier_fix` applies the fixable ones. Python is formatted and linted
+with ruff 0.16.9 using `.ruff.toml`. The license check compares the package's
+`licenses/` directories with the C and C++ dependencies of the packaged binaries.
 
 The determinism checker is a lexical tripwire; executable goldens and noise tests
 remain necessary. Run the Python tooling tests directly without compiling C++:
@@ -424,20 +631,41 @@ use. `--profile` reports aggregated native check timings to identify expensive
 checks. A source selection still checks all of that file's compile variants.
 After changing a shared header, analyze its affected source files or run the
 complete scope. CI retains full ordinary, strict-production, and fuzz coverage.
-Bazel's disk cache speeds the preparation build; clang-tidy analysis still runs.
+
+Every enabled check is an error. Both configurations report diagnostics in
+first-party headers as well as source files; headers under `external/` and
+generated headers under `bazel-out/` are excluded. Strict production checks add
+the static analyzer's C++ checkers, `this auto` for capturing lambda coroutines
+(their captures then live in the coroutine frame), unused Seastar futures, and
+move, copy and redundancy checks to the baseline. Checks are listed one by one,
+apart from static-analyzer families, so a toolchain upgrade cannot enable new
+ones.
 
 ### Package
 
+Build the shipped artifact with the release configuration:
+
 ```bash
-bazel build //:kwaque_tar //:kwaque_tar_sha256
-bazel test //bazel/packaging:all
+bazel build --config=release //:kwaque_tar //:kwaque_tar_sha256
+bazel test --config=release //bazel/packaging:all
 ```
 
-The archive contains the broker, the example configuration, project license and
-notice files, the bundled shared libraries, and upstream license material for
-the dependencies that ship in or are linked into the binary. Its tests assert the
-exact file layout, that two builds of the same inputs produce identical
-archives, and that the extracted broker starts and stops cleanly.
+The archive contains the broker and its CPU-checking launcher, `iotune`, the
+production configuration as `etc/kwaque/kwaque.yaml` with the development
+example beside it, a reference systemd unit, project license and notice files,
+and upstream license material for every dependency compiled or linked into the
+binaries. Run the extracted broker with its installed configuration:
+
+```bash
+bin/kwaque --config etc/kwaque/kwaque.yaml
+```
+
+The package tests assert the exact file layout, the libraries and glibc version
+each binary needs, the checksum, and that the extracted broker starts and stops
+cleanly; under the native allocator it starts the installed production
+configuration. A scheduled job builds the release package twice, on separate
+runners from separate checkout paths and output bases, and requires
+byte-identical archives.
 
 ### Pre-commit hooks
 
@@ -446,10 +674,12 @@ pre-commit install        # run the hooks on every commit
 pre-commit run --all-files
 ```
 
-The hooks cover whitespace, end-of-file newlines, C++ formatting, Bazel
-formatting, and generated-artifact checks. They require `pre-commit` on the
-host; every hook is also enforced in continuous integration, so installing them
-locally is a convenience rather than a requirement.
+The hooks cover merge-conflict markers, large added files, line endings,
+whitespace, end-of-file newlines, Python formatting and lint, C++ and Protobuf
+formatting, Bazel formatting and lint, and generated-artifact checks. Hook
+revisions are frozen to commits. They require `pre-commit` on the host.
+Continuous integration enforces the formatting, lint and generated-artifact checks
+but not the whitespace, line-ending and end-of-file hooks.
 
 ## Repository layout
 
@@ -490,7 +720,7 @@ enforces this and runs in continuous integration.
 
 | Symptom | Cause | Diagnose or fix |
 |---|---|---|
-| Build uses an unexpected Bazel version | The launcher ignores `.bazelversion` | `bazel --version` must print `9.1.0` |
+| Build uses an unexpected Bazel version | The launcher ignores `.bazelversion` | `bazel --version` must print `9.2.0` |
 | `no such package` for a native dependency, or a configure script fails | Missing host build tool | `command -v make perl git python3` |
 | Hermetic toolchain fails to fetch or compile | Download failure or corrupted cache entry | `bazel test //bazel:toolchain_probe_test` |
 | Every target rebuilds after switching configurations | Bazel discards the analysis cache when build options change | Expected; keep one configuration per working session, or check the active one with `bazel config` |
@@ -528,6 +758,11 @@ fields from present zero or empty values. Unknown fields consume the enclosing
 limits and are discarded during owning conversion. Advertised future capabilities
 remain data; unknown peer and error enum values reject. Serialized Protobuf bytes are
 not canonical identities or fingerprints.
+
+`//proto:schema_lint_test` applies the Buf lint rules in
+[`proto/buf.yaml`](proto/buf.yaml), and `//proto:schema_breaking_test` rejects
+wire-incompatible changes against the committed
+[`proto/schema_baseline.binpb`](proto/schema_baseline.binpb).
 
 Decoding reserves input once, copies the admitted control payload, checks its
 wire profile, and admits fresh generated state and owning conversion storage.

@@ -43,6 +43,7 @@ using kwaque::errc;
 using kwaque::bytes::fragmented_buffer;
 using kwaque::bytes::fragmented_buffer_parser;
 using kwaque::bytes::testing::charge;
+using kwaque::literals::operator""_MiB;
 using observation::measure;
 using observation::require;
 using observation::retained_cost;
@@ -68,7 +69,7 @@ byte_count string_cost(const std::string& value) {
 codec::decode_budget memory(byte_count other = {}) {
     return {
       observation::residual.checked_sub(other).value(),
-      byte_count{1U << 20U},
+      byte_count{1_MiB},
       observed_charge};
 }
 std::string extension(std::size_t header) {
@@ -81,7 +82,7 @@ void header_operation(std::string_view name) {
     const auto h = name.ends_with("h4096") ? 4096U
                    : name.ends_with("h57") ? 57U
                                            : 48U;
-    const auto text = fixture::header(16U << 20U, 0, extension(h));
+    const auto text = fixture::header(16_MiB, 0, extension(h));
     auto bytes = fixture::fragmented(text, 7);
     const auto held
       = string_cost(text).checked_add(retained_cost(bytes)).value();
@@ -100,7 +101,7 @@ void header_operation(std::string_view name) {
         });
         require(
           result && result->header_bytes == h
-            && result->payload_bytes == (16U << 20U),
+            && result->payload_bytes == 16_MiB,
           "prefix changed scalar fields");
         require(
           input.checkpoint_depth() == 8
@@ -115,7 +116,7 @@ void header_operation(std::string_view name) {
         });
         require(
           result && result->header_bytes == byte_count{h}
-            && result->payload_bytes == byte_count{16U << 20U},
+            && result->payload_bytes == byte_count{16_MiB},
           "header inspection required absent payload");
         require(
           input.bytes_consumed() == byte_count{}
@@ -133,7 +134,7 @@ void frame_operation(std::string_view name) {
     const bool fragment_limit = name.ends_with("-fragment-limit");
     const bool control = name.ends_with("-control");
     const std::size_t size = name.ends_with("-empty") ? 0U
-                             : large                  ? 16U << 20U
+                             : large                  ? 16_MiB
                              : control                ? 65536U
                                                       : 71U;
     const auto h = name.ends_with("-extended") || control ? 4096U : 48U;

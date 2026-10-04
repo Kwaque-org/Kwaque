@@ -1,5 +1,6 @@
 #pragma once
 
+#include "src/base/units.h"
 #include "src/storage/tests/wal_rotation_contract.h"
 
 #include <seastar/core/semaphore.hh>
@@ -41,7 +42,7 @@ seastar::future<> inventory(
             take(co_await drive.lifecycle(ids.allocate_wal(work))));
           take(
             co_await drive.lifecycle(
-              writer.rotate(cut, byte_count{8192}, work)));
+              writer.rotate(cut, byte_count{8_KiB}, work)));
           const auto head = *writer.prepared_head();
           auto head_write = co_await rotation::submit_one(
             writer, budget, spec.owner.cluster(), work);
@@ -318,7 +319,7 @@ seastar::future<> shutdown(
           auto barrier = writer.barrier(one.boundary);
           std::array<std::optional<workload_reservation>, 32> pressure;
           for (auto& slot : pressure) {
-              auto reserve = budget.try_reserve(byte_count{4096});
+              auto reserve = budget.try_reserve(byte_count{4_KiB});
               if (!reserve) break;
               slot.emplace(std::move(*reserve));
           }
@@ -479,7 +480,7 @@ seastar::future<> exceptional_rotation_close(
           std::exception_ptr observed;
           try {
               static_cast<void>(co_await drive.lifecycle(
-                writer.rotate(one.boundary, byte_count{8192}, work)));
+                writer.rotate(one.boundary, byte_count{8_KiB}, work)));
           } catch (...) {
               observed = std::current_exception();
           }

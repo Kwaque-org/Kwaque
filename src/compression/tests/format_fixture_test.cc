@@ -1,3 +1,4 @@
+#include "src/base/units.h"
 #include "src/bytes/test_allocation_profile.h"
 #include "src/codec/tests/envelope_decode_test_support.h"
 #include "src/codec/tests/format_fixture.h"
@@ -19,9 +20,7 @@ TEST(CompressionFormatFixtureTest, IndependentRawBlockIncludesAllChecksums) {
         const auto memory
           = codec::detail::consume_decode_budget(
               work.policy(),
-              {byte_count{32U << 20U},
-               byte_count{1U << 20U},
-               bytes::testing::charge},
+              {byte_count{32_MiB}, byte_count{1_MiB}, bytes::testing::charge},
               cost.backing,
               cost.descriptors.checked_add(cost.share_controls).value(),
               {},

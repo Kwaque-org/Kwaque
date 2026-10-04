@@ -35,9 +35,9 @@ std::uint64_t schema_fingerprint() {
     return value;
 }
 
-static_assert(kwaque::metric_inventory_size == 56U);
+static_assert(kwaque::metric_inventory_size == 61U);
 static_assert(kwaque::metric_workload_values == 8U);
-static_assert(kwaque::metric_series_per_shard == 84U);
+static_assert(kwaque::metric_series_per_shard == 89U);
 
 TEST(MetricSchemaTest, InventoryIsAppendOnlyBoundedAndLowCardinality) {
     const auto descriptors = kwaque::metric_descriptors();
@@ -70,8 +70,8 @@ TEST(MetricSchemaTest, InventoryIsAppendOnlyBoundedAndLowCardinality) {
         }
     }
     EXPECT_EQ(series, kwaque::metric_series_per_shard);
-    EXPECT_EQ(series, 84U);
-    EXPECT_EQ(schema_fingerprint(), UINT64_C(0xa3537d2a1804c613));
+    EXPECT_EQ(series, 89U);
+    EXPECT_EQ(schema_fingerprint(), UINT64_C(0x97e544bdd5f3096d));
     EXPECT_EQ(
       kwaque::metric_series_count(kwaque::metric_label_domain::none), 1U);
     EXPECT_EQ(

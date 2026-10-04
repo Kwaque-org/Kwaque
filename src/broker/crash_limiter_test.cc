@@ -1,3 +1,4 @@
+#include "src/base/units.h"
 #include "src/broker/crash_limiter.h"
 
 #include <seastar/core/abort_source.hh>
@@ -38,6 +39,7 @@ public:
 } // namespace kwaque::broker
 
 namespace {
+using kwaque::literals::operator""_TiB;
 
 using kwaque::broker::crash_limiter;
 using kwaque::broker::crash_loop_limit_reached;
@@ -280,7 +282,7 @@ SEASTAR_TEST_CASE(crash_limiter_malformed_and_oversized_metadata_reset) {
         BOOST_CHECK_EQUAL(read_contents(path), metadata(1));
     }
     // A sparse operator-created file must never determine read allocation size.
-    std::filesystem::resize_file(path, 1ULL << 40);
+    std::filesystem::resize_file(path, 1_TiB);
     crash_limiter oversized{fixed_time};
     co_await oversized.start(directory.get_path(), configuration, false, abort);
     BOOST_CHECK_EQUAL(read_contents(path), metadata(1));

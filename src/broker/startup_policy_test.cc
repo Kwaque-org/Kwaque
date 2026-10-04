@@ -15,6 +15,8 @@
 #include <string_view>
 
 namespace {
+using kwaque::literals::operator""_KiB;
+using kwaque::literals::operator""_MiB;
 
 namespace bpo = boost::program_options;
 using kwaque::broker::detail::admin_is_loopback;
@@ -42,7 +44,7 @@ std::string_view policy_field(std::string_view policy, std::string_view name) {
 
 kwaque::resource::resource_config test_resources() {
     return *kwaque::resource::resource_config::from_total_memory(
-      kwaque::byte_count{128ULL * 1024ULL * 1024ULL});
+      kwaque::byte_count{128_MiB});
 }
 
 TEST(StartupPolicyTest, PresetsOnlySupportedNativeAllocationFailureMode) {
@@ -69,7 +71,7 @@ TEST(StartupPolicyTest, SystemAllocatorRequiresExplicitDevelopmentProfile) {
 #if defined(SEASTAR_DEFAULT_ALLOCATOR)
     EXPECT_THROW(validate_broker_profile(configuration), std::runtime_error);
 #endif
-    configuration.diagnostic_memory_per_shard_bytes = 134217728U;
+    configuration.diagnostic_memory_per_shard_bytes = 128_MiB;
     EXPECT_NO_THROW(validate_broker_profile(configuration));
 }
 
@@ -344,7 +346,7 @@ TEST(StartupPolicyTest, DistinguishesRequestedValuesFromUnobservedOutcomes) {
     runtime.smp_opts.cpuset.set_value({1, 3, 5, 7});
     runtime.smp_opts.memory.set_value("128MiB");
     runtime.smp_opts.reserve_memory.set_value("1GiB");
-    runtime.smp_opts.reserve_additional_memory_per_shard = 4096;
+    runtime.smp_opts.reserve_additional_memory_per_shard = 4_KiB;
     runtime.smp_opts.thread_affinity.set_value(false);
     runtime.smp_opts.mbind.set_value(true);
     runtime.reactor_opts.overprovisioned.set_value();
@@ -403,7 +405,7 @@ TEST(StartupPolicyTest, BoundsDiagnosticsAndOmitsIoContentsAndPaths) {
     EXPECT_NE(inline_policy.find("<truncated>"), std::string::npos);
     EXPECT_EQ(inline_policy.find('\n'), std::string::npos);
     EXPECT_EQ(inline_policy.find("secret-"), std::string::npos);
-    EXPECT_LT(inline_policy.size(), 16U * 1024U);
+    EXPECT_LT(inline_policy.size(), 16_KiB);
 
     seastar::app_template::seastar_options file_runtime;
     file_runtime.smp_opts.io_properties_file.set_value(

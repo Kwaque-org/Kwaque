@@ -32,6 +32,8 @@
 #include <vector>
 
 namespace {
+using kwaque::literals::operator""_KiB;
+using kwaque::literals::operator""_MiB;
 
 using namespace std::literals;
 namespace codec = kwaque::codec;
@@ -109,14 +111,14 @@ byte_count charge(byte_count request) noexcept {
 
 codec::decode_budget memory() {
     // The other half remains unavailable for fixture/native/frame/opaque costs.
-    return {byte_count{32U * 1024U * 1024U}, byte_count{1024U * 1024U}, charge};
+    return {byte_count{32_MiB}, byte_count{1_MiB}, charge};
 }
 
 fragmented_buffer text(std::string_view value) {
     return fragmented_buffer::copy_of(value).value();
 }
 
-fragmented_buffer payload(std::size_t length, std::size_t width = 65536) {
+fragmented_buffer payload(std::size_t length, std::size_t width = 64_KiB) {
     std::vector<seastar::temporary_buffer<char>> fragments;
     fragments.reserve(length == 0 ? 0 : 1U + (length - 1U) / width);
     for (std::size_t offset = 0; offset < length; offset += width) {
@@ -520,7 +522,7 @@ TEST(RecordTest, HeaderNamePayloadAndAggregateCapsRejectIndependently) {
         if (value) {
             EXPECT_EQ(
               model::record_encoded_size(*value).value().header_payload_bytes,
-              byte_count{65536});
+              byte_count{64_KiB});
         } else {
             expect_base_error(value, errc::resource_exhausted);
         }
@@ -666,14 +668,14 @@ TEST(RecordTest, SmallVisibleValueRetainsBackingAndDescriptorHistoryCharges) {
     EXPECT_EQ(
       model::record_encoded_size(value).value().encoded_bytes, byte_count{8});
     codec::limits_config config;
-    config.max_retained_bytes = byte_count{4096};
+    config.max_retained_bytes = byte_count{4_KiB};
     seastar::abort_source abort;
     codec::cooperative_work work{codec::limits::make(config).value(), abort};
     expect_codec_error(
       model::reserve_record_input(value, work, memory(), anchor).get(),
       errc::resource_exhausted);
     EXPECT_EQ(value.value()->size(), byte_count{1});
-    EXPECT_EQ(value.value()->retained_bytes(), byte_count{65536});
+    EXPECT_EQ(value.value()->retained_bytes(), byte_count{64_KiB});
 }
 
 TEST(RecordTest, ExactResidualReservationAndOneShortUseTheSameActualCosts) {

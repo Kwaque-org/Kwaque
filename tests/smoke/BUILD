@@ -1,4 +1,5 @@
-load("@rules_python//python:defs.bzl", "py_library", "py_test")
+load("@rules_python//python:defs.bzl", "py_library")
+load("//bazel:test.bzl", "kwaque_py_native_test")
 
 package(default_visibility = ["//visibility:private"])
 
@@ -22,12 +23,15 @@ _COMMON_TAGS = [
 py_library(
     name = "broker_test_support",
     srcs = ["broker_test_support.py"],
-    visibility = ["//bazel/packaging:__pkg__"],
+    visibility = [
+        "//bazel/packaging:__pkg__",
+        "//src/broker:__pkg__",
+    ],
+    deps = ["//bazel:native_test_environment"],
 )
 
-py_test(
+kwaque_py_native_test(
     name = "resource_memory_smoke_test",
-    size = "small",
     timeout = "moderate",
     srcs = ["resource_memory_smoke_test.py"],
     args = _COMMON_ARGS,
@@ -42,10 +46,11 @@ py_test(
     deps = [":broker_test_support"],
 )
 
+# Each broker listens on its own leased loopback address, so these tests share
+# the host network without port races and need not run exclusively.
 [
-    py_test(
+    kwaque_py_native_test(
         name = test_name,
-        size = "small",
         timeout = "short",
         srcs = [test_name + ".py"],
         args = _COMMON_ARGS,
@@ -56,6 +61,7 @@ py_test(
     )
     for test_name in [
         "broker_smoke_test",
+        "default_config_smoke_test",
         "pid_file_smoke_test",
         "sigint_smoke_test",
         "start_rollback_smoke_test",

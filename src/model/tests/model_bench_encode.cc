@@ -1,4 +1,5 @@
 #include "src/base/invariant.h"
+#include "src/base/units.h"
 #include "src/codec/staging_cooperative.h"
 #include "src/codec/tests/envelope_bench_native.h"
 #include "src/codec/transaction.h"
@@ -125,7 +126,7 @@ seastar::future<codec::result<fragmented_buffer>> encode_body(
         co_return codec::failure(at(errc::resource_exhausted, context));
     if (
       auto ready = co_await work.admit(
-        byte_count{1024}, item_count{64}, anchor);
+        byte_count{1_KiB}, item_count{64}, anchor);
       !ready)
         co_return codec::failure(ready.error());
     if (auto ready = work.poll(anchor); !ready)

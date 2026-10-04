@@ -1,3 +1,4 @@
+#include "src/base/units.h"
 #include "src/broker/storage_directories.h"
 #include "src/resource/resource_registry.h"
 #include "src/runtime/production/file.h"
@@ -60,9 +61,7 @@ SEASTAR_TEST_CASE(local_store_native_bootstrap_and_control) {
                 runtime::production::file_system files;
                 storage::workload_budget budget{
                   manager.acquire_workload(resource::workload_class::metadata),
-                  {.tasks = 16,
-                   .bytes = byte_count{8U * 1024U * 1024U},
-                   .handles = 32},
+                  {.tasks = 16, .bytes = byte_count{8_MiB}, .handles = 32},
                   bytes::testing::charge};
                 co_await storage::testing::store_contract::exercise(
                   files, *ownership, spec, budget, native_driver{});

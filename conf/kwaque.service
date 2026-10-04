@@ -1,0 +1,43 @@
+# Reference systemd unit for a broker installed under /opt/kwaque, running as
+# the kwaque user with its configuration in /etc/kwaque/kwaque.yaml.
+#
+# Runtime options that are not part of the configuration file, such as
+# --io-properties-file, go in KWAQUE_ARGS in /etc/default/kwaque.
+
+[Unit]
+Description=Kwaque broker
+Documentation=file:///opt/kwaque/README.md
+Wants=network-online.target
+After=local-fs.target network-online.target
+RequiresMountsFor=/var/lib/kwaque
+
+[Service]
+# The broker reports READY=1 once it is ready and STOPPING=1 when it starts
+# to drain.
+Type=notify
+User=kwaque
+Group=kwaque
+EnvironmentFile=-/etc/default/kwaque
+ExecStart=/opt/kwaque/bin/kwaque --config /etc/kwaque/kwaque.yaml $KWAQUE_ARGS
+TimeoutStartSec=900
+# Draining must finish before systemd sends SIGKILL: a killed broker counts
+# toward its crash-loop limit.
+TimeoutStopSec=900
+# Exit status 1 is an unexpected failure and is retried. These statuses mean
+# the command line, configuration or host must change first: usage (2),
+# configuration (6), data directory in use (10), crash loop (11) and
+# unsupported CPU (12).
+Restart=on-failure
+RestartPreventExitStatus=2 6 10 11 12
+LimitNOFILE=800000
+LimitMEMLOCK=infinity
+LimitCORE=infinity
+LimitAS=infinity
+LimitNPROC=8096
+OOMScoreAdjust=-950
+SyslogLevelPrefix=false
+# Real-time timer threads, and locked memory for --lock-memory.
+AmbientCapabilities=CAP_SYS_NICE CAP_IPC_LOCK
+
+[Install]
+WantedBy=multi-user.target

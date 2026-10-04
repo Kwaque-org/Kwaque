@@ -205,11 +205,7 @@ def validate(row: dict) -> None:
         raise ValueError("receipt does not cover its request")
     keys = cohort_keys(row)
     # A zero-written cohort flushes only if one of its writes was ordinary.
-    if (
-        row["flushes"] > len(keys)
-        if zero_written(row)
-        else len(keys) != row["flushes"]
-    ):
+    if row["flushes"] > len(keys) if zero_written(row) else len(keys) != row["flushes"]:
         raise ValueError("physical barrier count disagrees with completed cohorts")
     if zero_written(row) and not row["timing_only"]:
         writes = row.get("write_times")
@@ -229,9 +225,7 @@ def validate(row: dict) -> None:
             raise ValueError("incomplete zero-written write measurements")
     if not row["timing_only"]:
         flushes = row["flush_times"]
-        if len(flushes) != row["flushes"] or any(
-            end < begin for begin, end in flushes
-        ):
+        if len(flushes) != row["flushes"] or any(end < begin for begin, end in flushes):
             raise ValueError("incomplete flush timing")
         if (
             any(

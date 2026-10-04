@@ -1,5 +1,6 @@
 #include "src/model/tests/record_fuzz_oracle.h"
 
+#include "src/base/units.h"
 #include "src/codec/xxh3.h"
 
 #include <seastar/core/thread.hh>
@@ -30,7 +31,7 @@ std::uint32_t checksum(std::string_view input) {
 // Constant-width slabs keep both random scalar access and payload skipping
 // independent of production parsers, without flattening expanded records.
 struct expanded_bytes {
-    static constexpr std::size_t width = 32768;
+    static constexpr std::size_t width = 32_KiB;
     std::vector<std::unique_ptr<std::array<char, width>>> slabs;
     std::size_t size{0};
     void append(const char* bytes, std::size_t count) {
@@ -419,7 +420,7 @@ batch_probe probe_batch(
     if (wire.substr(0, 4) != "KQBF") return {.error = errc::malformed_data};
     const auto header = little(wire, 10, 2), body_size = little(wire, 12, 4);
     if (header < 32) return {.error = errc::malformed_data};
-    if (header > 4096 || body_size > (16U << 20U))
+    if (header > 4_KiB || body_size > 16_MiB)
         return {.error = errc::resource_exhausted};
     if (header + body_size > extent_limit)
         return {.error = errc::malformed_data};
@@ -496,8 +497,8 @@ batch_probe probe_batch(
         return {.error = errc::resource_exhausted};
     const auto encoded = little(body, 160, 4), expanded = little(body, 164, 4);
     if (
-      encoded > (16U << 20U) - fixed || expanded > (8U << 20U)
-      || (encoding == 0 && encoded > (8U << 20U)))
+      encoded > 16_MiB - fixed || expanded > 8_MiB
+      || (encoding == 0 && encoded > 8_MiB))
         return {.error = errc::resource_exhausted};
     if (encoding == 0 && encoded != expanded)
         return {.error = errc::malformed_data};

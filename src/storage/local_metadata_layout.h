@@ -1,5 +1,6 @@
 #pragma once
 
+#include "src/base/units.h"
 #include "src/storage/format_size.h"
 
 #include <array>
@@ -7,7 +8,9 @@
 
 namespace kwaque::storage {
 inline constexpr byte_count local_metadata_prefix_bytes{72};
-inline constexpr byte_count local_metadata_max_bytes{65536};
+inline constexpr byte_count local_metadata_max_bytes{64_KiB};
+// One read covers a fixed-size record, or a larger file's leading header.
+inline constexpr byte_count local_metadata_first_read_bytes{16_KiB};
 inline constexpr byte_count local_root_reference_bytes{60};
 inline constexpr byte_count local_footer_reference_bytes{48};
 inline constexpr byte_count local_wal_cursor_bytes{24};

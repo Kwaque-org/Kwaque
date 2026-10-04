@@ -27,6 +27,15 @@ EXTENSION_PATTERN = re.compile(
     r"([A-Za-z_][A-Za-z0-9_]*)\s*=\s*use_extension\(\s*"
     r'"//bazel:extensions\.bzl"\s*,\s*"' + ARCHIVE_EXTENSION + r'"\s*\)'
 )
+LLVM_VERSION_PATTERN = re.compile(r'\bllvm_version\s*=\s*"([^"]+)"')
+MODULE_NAME_PATTERN = re.compile(r'\bmodule_name\s*=\s*"([^"]+)"')
+REVISION_PATTERN = re.compile(r"\b[0-9a-f]{40}\b")
+DATE_PATTERN = re.compile(r"\d{4}-\d{2}-\d{2}")
+SCHEMA_DECLARATION_PATTERN = re.compile(
+    r'^\s*(syntax|edition)\s*=\s*"([^"]+)"\s*;', re.MULTILINE
+)
+# The carried Protobuf generator patches cover these schema forms only.
+SUPPORTED_SCHEMA_DECLARATIONS = frozenset({("syntax", "proto3"), ("edition", "2023")})
 
 
 def normalize(value: str) -> str:
@@ -164,6 +173,23 @@ def inventory_rows(inventory_text: str) -> list[tuple[str, str]]:
     return rows
 
 
+def first_table_rows(text: str) -> list[tuple[str, str]]:
+    """Return the (title, value) rows of the first Markdown table in text."""
+    rows = []
+    started = False
+    for line in text.splitlines():
+        if not line.startswith("|"):
+            if started:
+                break
+            continue
+        started = True
+        cells = [cell.strip() for cell in line.strip("|").split("|")]
+        if len(cells) < 2 or set(cells[0]) <= {"-"}:
+            continue
+        rows.append((cells[0], cells[1]))
+    return rows[1:]
+
+
 def module_dependency_errors(module_text: str, inventory_text: str) -> list[str]:
     rows = inventory_rows(inventory_text)
     errors = []
@@ -245,6 +271,139 @@ def workflow_dependency_errors(
     return errors
 
 
+def toolchain_pin_errors(
+    module_text: str, bazel_version: str, inventory_text: str
+) -> list[str]:
+    """Check pins declared outside bazel_dep against their inventory rows."""
+    pins = {"bazel": ("Bazel", bazel_version.strip())}
+    errors = []
+    llvm = LLVM_VERSION_PATTERN.search(module_text)
+    if llvm is None:
+        errors.append("MODULE.bazel declares no llvm_version")
+    else:
+        pins["llvmclangtoolchain"] = ("LLVM/Clang toolchain", llvm.group(1))
+    for body in call_bodies(module_text, "buf.toolchains"):
+        version = VERSION_PATTERN.search(body)
+        if version is not None:
+            pins["rulesbuftoolchains"] = ("Buf", version.group(1))
+    rows = inventory_rows(inventory_text)
+    for identifier, (label, version) in pins.items():
+        matching = [row for row in rows if identifier in row_identifiers(row[0])]
+        if not matching:
+            errors.append(f"{label} is missing from THIRD_PARTY.md")
+        elif all(version not in row_versions(row[1]) for row in matching):
+            errors.append(f"{label} version {version!r} is not inventoried")
+    return errors
+
+
+def override_errors(module_text: str, inventory_text: str) -> list[str]:
+    """Require the revision of every source override in the inventory row."""
+    rows = inventory_rows(inventory_text)
+    errors = []
+    for function_name in ("archive_override", "git_override"):
+        for body in call_bodies(module_text, function_name):
+            name = MODULE_NAME_PATTERN.search(body)
+            if name is None:
+                continue
+            matching = [
+                row
+                for row in rows
+                if normalize(name.group(1)) in row_identifiers(row[0])
+            ]
+            for revision in sorted(set(REVISION_PATTERN.findall(body))):
+                if all(revision not in row_versions(row[1]) for row in matching):
+                    errors.append(
+                        f"{function_name} for {name.group(1)!r} revision "
+                        f"{revision!r} is not inventoried"
+                    )
+    return errors
+
+
+def stale_row_errors(
+    module_text: str,
+    repositories_text: str,
+    versions_text: str,
+    workflow_texts: list[str],
+    inventory_text: str,
+) -> list[str]:
+    """Report dependency rows that no build or workflow declaration uses."""
+    declared = {"bazel", "llvmclangtoolchain"}
+    declared.update(normalize(name) for name, _ in module_dependencies(module_text))
+    declared.update(
+        normalize(name)
+        for name, _, _ in archive_dependencies(repositories_text, versions_text)
+    )
+    for body in call_bodies(module_text, "use_repo"):
+        declared.update(normalize(name) for name in STRING_PATTERN.findall(body))
+    declared.update(
+        normalize(name)
+        for text in workflow_texts
+        for name, _ in WORKFLOW_REFERENCE_PATTERN.findall(text)
+    )
+    return [
+        f"THIRD_PARTY.md row {title!r} matches no declared dependency"
+        for title, _ in first_table_rows(inventory_text)
+        if not row_identifiers(title) & declared
+    ]
+
+
+def baseline_errors(
+    compatibility_text: str,
+    module_text: str,
+    bazel_version: str,
+    repositories_text: str,
+    versions_text: str,
+) -> list[str]:
+    """Check the compatibility baseline in DEPENDENCIES.md against the build."""
+    expected = {"bazel": bazel_version.strip()}
+    llvm = LLVM_VERSION_PATTERN.search(module_text)
+    if llvm is not None:
+        expected["llvmclang"] = llvm.group(1)
+    modules = dict(module_dependencies(module_text))
+    if modules.get("protobuf"):
+        expected["protobuf"] = modules["protobuf"]
+    for name, version, _ in archive_dependencies(repositories_text, versions_text):
+        if version is None:
+            continue
+        if name == "seastar":
+            expected["seastar"] = version
+        elif name == "unordered_dense":
+            expected["unordereddense"] = version
+        elif name.endswith("_sysroot"):
+            dates = DATE_PATTERN.findall(version)
+            if dates:
+                architecture = name[: -len("_sysroot")]
+                expected[f"linux{normalize(architecture)}sysroot"] = dates[-1]
+    rows = {
+        normalize(title.replace("`", "")): value
+        for title, value in first_table_rows(compatibility_text)
+    }
+    errors = []
+    for key, version in sorted(expected.items()):
+        if key not in rows:
+            errors.append(f"DEPENDENCIES.md baseline has no row for {key!r}")
+        elif version not in row_versions(rows[key]):
+            errors.append(
+                f"DEPENDENCIES.md baseline for {key!r} does not record {version!r}"
+            )
+    return errors
+
+
+def schema_errors(schemas: dict[str, str]) -> list[str]:
+    errors = []
+    for path, text in sorted(schemas.items()):
+        declaration = SCHEMA_DECLARATION_PATTERN.search(text)
+        kind, value = (
+            declaration.groups() if declaration is not None else ("syntax", "proto2")
+        )
+        if (kind, value) not in SUPPORTED_SCHEMA_DECLARATIONS:
+            errors.append(
+                f"{path} declares {kind} {value!r}; the patched Protobuf generator "
+                "covers proto3 and edition 2023 only"
+            )
+    return errors
+
+
 def workspace_root() -> Path:
     configured = os.environ.get("BUILD_WORKSPACE_DIRECTORY")
     return Path(configured).resolve() if configured else Path.cwd().resolve()
@@ -260,6 +419,11 @@ def main() -> int:
             encoding="utf-8"
         )
         versions_text = (root / "bazel" / "versions.bzl").read_text(encoding="utf-8")
+        bazel_version = (root / ".bazelversion").read_text(encoding="utf-8")
+        schemas = {
+            str(path.relative_to(root)): path.read_text(encoding="utf-8")
+            for path in sorted((root / "proto").rglob("*.proto"))
+        }
         workflow_texts = [
             path.read_text(encoding="utf-8")
             for pattern in ("*.yml", "*.yaml")
@@ -273,8 +437,27 @@ def main() -> int:
             archive_import_errors(module_text, repositories_text, versions_text)
         )
         errors.extend(workflow_dependency_errors(workflow_texts, inventory_text))
-        if not compatibility_text.strip():
-            errors.append("DEPENDENCIES.md is empty")
+        errors.extend(toolchain_pin_errors(module_text, bazel_version, inventory_text))
+        errors.extend(override_errors(module_text, inventory_text))
+        errors.extend(
+            stale_row_errors(
+                module_text,
+                repositories_text,
+                versions_text,
+                workflow_texts,
+                inventory_text,
+            )
+        )
+        errors.extend(
+            baseline_errors(
+                compatibility_text,
+                module_text,
+                bazel_version,
+                repositories_text,
+                versions_text,
+            )
+        )
+        errors.extend(schema_errors(schemas))
     except OSError as error:
         print(f"unable to validate dependency inventory: {error}", file=sys.stderr)
         return 2

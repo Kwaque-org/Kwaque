@@ -319,6 +319,7 @@ kwaque_cc_fuzz_test(
     ],
     corpus = glob(["testdata/record_fuzz_corpus/*.bin"]),
     tags = [
+        "fuzz-campaign",
         "resources:cpu:1",
         "resources:memory:1024",
     ],
@@ -405,6 +406,7 @@ kwaque_cc_benchmark(
         "model_bench.cc",
     ],
     memory = "512MiB",
+    native_allocator_only = True,
     deps = [
         ":checkpoint_test_support",
         ":model_bench_support",
@@ -763,6 +765,7 @@ kwaque_cc_fuzz_test(
     ],
     corpus = glob(["testdata/checkpoint_fuzz_corpus/*.bin"]),
     tags = [
+        "fuzz-campaign",
         "resources:cpu:1",
         "resources:memory:1024",
     ],

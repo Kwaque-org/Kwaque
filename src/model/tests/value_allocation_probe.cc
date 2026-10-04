@@ -33,6 +33,7 @@ namespace model = kwaque::model;
 using kwaque::byte_count;
 using kwaque::errc;
 using kwaque::item_count;
+using kwaque::literals::operator""_KiB;
 constexpr auto maximum = std::numeric_limits<std::uint64_t>::max();
 
 void require(bool condition, const char* message) {
@@ -294,7 +295,7 @@ int exercise() {
             byte_count{64},
             byte_count{64}};
           const auto remaining = policy->remaining_operation_bytes(
-            usage, byte_count{1024});
+            usage, byte_count{1_KiB});
           return remaining && *remaining == byte_count{640};
       },
       is_true);

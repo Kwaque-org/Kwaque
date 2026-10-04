@@ -3,6 +3,7 @@
 #include <gtest/gtest.h>
 
 #include <array>
+#include <cstddef>
 #include <cstdlib>
 #include <filesystem>
 #include <string>
@@ -17,7 +18,6 @@ using kwaque::config::config_errc;
 using kwaque::config::config_value;
 using kwaque::config::config_visibility;
 using kwaque::config::load_bootstrap_config;
-using kwaque::config::log_level;
 using kwaque::config::parse_bootstrap_config;
 using kwaque::config::render_config;
 using kwaque::config::render_config_error;
@@ -32,33 +32,46 @@ std::filesystem::path example_config_path() {
            / "kwaque.yaml";
 }
 
+std::filesystem::path production_example_path() {
+    auto path = example_config_path();
+    return path.empty() ? path
+                        : path.replace_filename("kwaque.production.yaml");
+}
+
 TEST(BootstrapConfigTest, HasSafeDefaults) {
     const bootstrap_config configuration;
     EXPECT_EQ(configuration.schema_version, 1U);
-    EXPECT_EQ(configuration.node_id, 0);
     EXPECT_EQ(configuration.data_directory, "./data");
     EXPECT_EQ(configuration.admin_address, "127.0.0.1");
     EXPECT_EQ(configuration.admin_port, 9644);
-    EXPECT_EQ(configuration.level, log_level::info);
     EXPECT_FALSE(configuration.developer_mode);
     EXPECT_FALSE(configuration.storage_strict_data_init);
     EXPECT_EQ(configuration.crash_loop_limit, 5U);
     EXPECT_FALSE(configuration.diagnostic_memory_per_shard_bytes);
 }
 
-TEST(BootstrapConfigTest, LoadsCommittedExample) {
+TEST(BootstrapConfigTest, LoadsCommittedDevelopmentExample) {
     const auto configuration = load_bootstrap_config(example_config_path());
     ASSERT_TRUE(configuration.has_value())
       << (configuration ? "" : configuration.error().message);
     EXPECT_EQ(configuration->schema_version, 1U);
-    EXPECT_EQ(configuration->node_id, 0);
     EXPECT_EQ(configuration->data_directory, "./data");
     EXPECT_EQ(configuration->admin_address, "127.0.0.1");
     EXPECT_EQ(configuration->admin_port, 9644);
-    EXPECT_EQ(configuration->level, log_level::info);
     EXPECT_TRUE(configuration->developer_mode);
     EXPECT_FALSE(configuration->storage_strict_data_init);
     EXPECT_EQ(configuration->diagnostic_memory_per_shard_bytes, 134217728U);
+}
+
+TEST(BootstrapConfigTest, LoadsCommittedProductionExample) {
+    const auto configuration = load_bootstrap_config(production_example_path());
+    ASSERT_TRUE(configuration.has_value())
+      << (configuration ? "" : configuration.error().message);
+    EXPECT_FALSE(configuration->developer_mode);
+    EXPECT_TRUE(configuration->data_directory.is_absolute());
+    EXPECT_EQ(configuration->admin_address, "127.0.0.1");
+    EXPECT_EQ(configuration->crash_loop_limit, 5U);
+    EXPECT_FALSE(configuration->diagnostic_memory_per_shard_bytes);
 }
 
 TEST(BootstrapConfigTest, RejectsInvalidConfiguration) {
@@ -87,13 +100,18 @@ TEST(BootstrapConfigTest, RejectsInvalidConfiguration) {
        config_errc::unknown_key},
       {"kwaque: {schema_version: 1, reactor_headroom: 16777216}",
        config_errc::unknown_key},
-      {"kwaque: {schema_version: 1, node_id: -1}",
-       config_errc::invalid_node_id},
+      // Broker identity comes from the cluster registry, and log levels from
+      // the runtime's command-line options; neither is configuration.
+      {"kwaque: {schema_version: 1, node_id: 0}", config_errc::unknown_key},
+      {"kwaque: {schema_version: 1, log_level: info}",
+       config_errc::unknown_key},
       {"kwaque: {schema_version: 1, data_directory: ''}",
        config_errc::invalid_data_directory},
       {"kwaque: {schema_version: 1, data_directory: 123}",
        config_errc::invalid_type},
       {"kwaque: {schema_version: 1, data_directory: true}",
+       config_errc::invalid_type},
+      {"kwaque: {schema_version: 1, data_directory: 1.5}",
        config_errc::invalid_type},
       {"kwaque: {schema_version: 1, admin: {address: 'bad address'}}",
        config_errc::invalid_admin_address},
@@ -111,14 +129,9 @@ TEST(BootstrapConfigTest, RejectsInvalidConfiguration) {
        config_errc::invalid_admin_port},
       {"kwaque: {schema_version: 1, admin: {unknown: true}}",
        config_errc::unknown_key},
-      {"kwaque: {schema_version: 1, log_level: verbose}",
-       config_errc::invalid_log_level},
-      {"kwaque: {schema_version: 1, log_level: 123}",
-       config_errc::invalid_type},
-      {"kwaque: {schema_version: 1, log_level: true}",
-       config_errc::invalid_type},
-      {"kwaque: {node_id: 0}", config_errc::missing_key},
+      {"kwaque: {developer_mode: true}", config_errc::missing_key},
       {"kwaque: [schema_version, 1]", config_errc::invalid_type},
+      {"[kwaque]", config_errc::invalid_type},
       {"kwaque: {schema_version: nope}", config_errc::invalid_type},
       {"kwaque: {schema_version: 1}\nunexpected: true",
        config_errc::unknown_key},
@@ -135,11 +148,95 @@ TEST(BootstrapConfigTest, RejectsInvalidConfiguration) {
     }
 }
 
+TEST(BootstrapConfigTest, AcceptsOnlyCanonicalUntaggedIntegers) {
+    // YAML 1.1 reads 010000 as octal 4096 while YAML 1.2 reads 10000; prefixes,
+    // signs and quoting are rejected rather than resolved either way.
+    for (const auto* port :
+         {"010000",
+          "0x1F",
+          "0o17",
+          "+9644",
+          "\"9644\"",
+          "'9644'",
+          "!!int 9644",
+          "9_644",
+          "9644.0",
+          "1e3"}) {
+        SCOPED_TRACE(port);
+        const auto configuration = parse_bootstrap_config(
+          std::string{"kwaque: {schema_version: 1, developer_mode: true, "
+                      "admin: {port: "}
+          + port + "}}");
+        ASSERT_FALSE(configuration.has_value());
+        EXPECT_EQ(configuration.error().code, config_errc::invalid_type);
+        EXPECT_EQ(configuration.error().field, "kwaque.admin.port");
+    }
+    for (const auto* version : {"01", "\"1\"", "!!int 1"}) {
+        SCOPED_TRACE(version);
+        const auto configuration = parse_bootstrap_config(
+          std::string{"kwaque: {schema_version: "} + version + "}");
+        ASSERT_FALSE(configuration.has_value());
+        EXPECT_EQ(configuration.error().code, config_errc::invalid_type);
+    }
+    // A canonical integer reaches its range check.
+    const auto range_checked = parse_bootstrap_config(
+      "kwaque: {schema_version: 1, developer_mode: true, admin: {port: 0}}");
+    ASSERT_FALSE(range_checked.has_value());
+    EXPECT_EQ(range_checked.error().code, config_errc::invalid_admin_port);
+}
+
+TEST(BootstrapConfigTest, AcceptsOnlyCoreSchemaBooleans) {
+    for (const auto* value : {"true", "True", "TRUE"}) {
+        SCOPED_TRACE(value);
+        const auto configuration = parse_bootstrap_config(
+          std::string{"kwaque: {schema_version: 1, developer_mode: "} + value
+          + "}");
+        ASSERT_TRUE(configuration.has_value()) << configuration.error().message;
+        EXPECT_TRUE(configuration->developer_mode);
+    }
+    for (const auto* value :
+         {"yes",
+          "on",
+          "y",
+          "Yes",
+          "ON",
+          "no",
+          "off",
+          "n",
+          "1",
+          "\"true\"",
+          "!!bool true",
+          "tRUE"}) {
+        SCOPED_TRACE(value);
+        const auto configuration = parse_bootstrap_config(
+          std::string{"kwaque: {schema_version: 1, developer_mode: "} + value
+          + "}");
+        ASSERT_FALSE(configuration.has_value());
+        EXPECT_EQ(configuration.error().code, config_errc::invalid_type);
+        EXPECT_EQ(configuration.error().field, "kwaque.developer_mode");
+    }
+}
+
+TEST(BootstrapConfigTest, ResolvesStringScalarsByTheYaml12CoreSchema) {
+    // Plain text that the 1.2 core schema keeps as a string is accepted;
+    // YAML 1.1 would have read these as booleans.
+    for (const auto* path : {"yes", "off", "/srv/on"}) {
+        SCOPED_TRACE(path);
+        const auto configuration = parse_bootstrap_config(
+          std::string{"kwaque: {schema_version: 1, developer_mode: true, "
+                      "data_directory: "}
+          + path + "}");
+        ASSERT_TRUE(configuration.has_value()) << configuration.error().message;
+        EXPECT_EQ(configuration->data_directory, path);
+    }
+}
+
 TEST(BootstrapConfigTest, PreservesExplicitHostAndDiagnosticPolicies) {
     const auto configuration = parse_bootstrap_config(
-      "kwaque: {schema_version: 1, storage_strict_data_init: true, "
+      "kwaque: {schema_version: 1, data_directory: /srv/kwaque, "
+      "storage_strict_data_init: true, "
       "diagnostic_memory_per_shard_bytes: 100663296}");
-    ASSERT_TRUE(configuration);
+    ASSERT_TRUE(configuration) << configuration.error().message;
     EXPECT_TRUE(configuration->storage_strict_data_init);
     EXPECT_EQ(configuration->diagnostic_memory_per_shard_bytes, 100663296U);
     const auto rendered = render_config(*configuration);
@@ -154,17 +251,51 @@ TEST(BootstrapConfigTest, PreservesExplicitStringScalars) {
     const auto configuration = parse_bootstrap_config(R"yaml(
 kwaque:
   schema_version: 1
+  developer_mode: true
   data_directory: "123"
   admin:
-    address: '127.0.0.2'
-  log_level: !!str info
+    address: !!str 127.0.0.2
 )yaml");
 
     ASSERT_TRUE(configuration.has_value())
       << (configuration ? "" : configuration.error().message);
     EXPECT_EQ(configuration->data_directory, "123");
     EXPECT_EQ(configuration->admin_address, "127.0.0.2");
-    EXPECT_EQ(configuration->level, log_level::info);
+}
+
+TEST(BootstrapConfigTest, RequiresAnAbsoluteDataDirectoryOutsideDeveloperMode) {
+    for (const auto* yaml :
+         {"kwaque: {schema_version: 1}",
+          "kwaque: {schema_version: 1, data_directory: data}",
+          "kwaque: {schema_version: 1, data_directory: ./data}",
+          "kwaque: {schema_version: 1, developer_mode: false, "
+          "data_directory: ../data}"}) {
+        SCOPED_TRACE(yaml);
+        const auto configuration = parse_bootstrap_config(yaml);
+        ASSERT_FALSE(configuration.has_value());
+        EXPECT_EQ(
+          configuration.error().code, config_errc::invalid_data_directory);
+    }
+    const auto production = parse_bootstrap_config(
+      "kwaque: {schema_version: 1, data_directory: /var/lib/kwaque}");
+    ASSERT_TRUE(production.has_value()) << production.error().message;
+    const auto development = parse_bootstrap_config(
+      "kwaque: {schema_version: 1, developer_mode: true, data_directory: "
+      "data}");
+    ASSERT_TRUE(development.has_value()) << development.error().message;
+}
+
+TEST(BootstrapConfigTest, RejectsAHomeDirectoryShorthand) {
+    for (const auto* path : {"'~/data'", "'~'", "'~operator/data'"}) {
+        SCOPED_TRACE(path);
+        const auto configuration = parse_bootstrap_config(
+          std::string{"kwaque: {schema_version: 1, developer_mode: true, "
+                      "data_directory: "}
+          + path + "}");
+        ASSERT_FALSE(configuration.has_value());
+        EXPECT_EQ(
+          configuration.error().code, config_errc::invalid_data_directory);
+    }
 }
 
 TEST(BootstrapConfigTest, RejectsUnsupportedFutureSchemaVersion) {
@@ -178,6 +309,102 @@ TEST(BootstrapConfigTest, RejectsUnsupportedFutureSchemaVersion) {
     EXPECT_EQ(
       configuration.error().message,
       "unsupported configuration schema version 2; supported version is 1");
+}
+
+TEST(BootstrapConfigTest, ReportsAFutureVersionBeforeItsNewKeys) {
+    // A newer configuration has keys this binary does not know; the version
+    // is the diagnosis, not the first unknown key.
+    for (const auto* yaml :
+         {"kwaque: {schema_version: 2, future_setting: 1}",
+          "kwaque: {schema_version: 2}\nfuture_root: 1",
+          "kwaque: {schema_version: 0, admin: {future: 1}}"}) {
+        SCOPED_TRACE(yaml);
+        const auto configuration = parse_bootstrap_config(yaml);
+        ASSERT_FALSE(configuration.has_value());
+        EXPECT_EQ(
+          configuration.error().code, config_errc::unsupported_schema_version);
+    }
+}
+
+TEST(BootstrapConfigTest, RejectsMoreThanOneDocument) {
+    for (const auto* yaml :
+         {"kwaque: {schema_version: 1, developer_mode: true}\n---\n"
+          "kwaque: {schema_version: 1}\n",
+          "kwaque: {schema_version: 1, developer_mode: true}\n...\n---\n"
+          "unknown: [\n"}) {
+        SCOPED_TRACE(yaml);
+        const auto configuration = parse_bootstrap_config(yaml);
+        ASSERT_FALSE(configuration.has_value());
+        EXPECT_EQ(configuration.error().code, config_errc::malformed_yaml);
+    }
+}
+
+TEST(BootstrapConfigTest, BoundsNestingBeforeTheParserRecursesDeeply) {
+    // The broker parses on a small reactor thread stack; nesting is refused
+    // at the schema's depth bound, far below the parser's own recursion guard.
+    for (const std::size_t depth :
+         {kwaque::config::max_bootstrap_config_depth + 1,
+          std::size_t{501},
+          std::size_t{20000}}) {
+        SCOPED_TRACE(depth);
+        const auto yaml = "kwaque: " + std::string(depth, '[')
+                          + std::string(depth, ']');
+        const auto configuration = parse_bootstrap_config(yaml);
+        ASSERT_FALSE(configuration.has_value());
+        EXPECT_EQ(configuration.error().code, config_errc::malformed_yaml);
+        EXPECT_NE(
+          configuration.error().message.find("nests deeper"),
+          std::string::npos);
+    }
+    std::string block{"kwaque:\n"};
+    for (std::size_t level = 0; level < 12; ++level) {
+        block += std::string(2 * (level + 1), ' ') + "k:\n";
+    }
+    const auto configuration = parse_bootstrap_config(block);
+    ASSERT_FALSE(configuration.has_value());
+    EXPECT_EQ(configuration.error().code, config_errc::malformed_yaml);
+}
+
+TEST(BootstrapConfigTest, RejectsInputThatIsNotPrintableUtf8) {
+    const std::string valid{
+      "kwaque: {schema_version: 1, developer_mode: true}"};
+    for (const auto& invalid :
+         {valid + '\x04',
+          valid + std::string(1, '\0'),
+          valid + '\x7f',
+          valid + "\xff",
+          valid + "\xc0\x80",
+          valid + "\xed\xa0\x80",
+          valid + "\xc2\x9b",
+          std::string{"\xff\xfe"} + valid}) {
+        const auto configuration = parse_bootstrap_config(invalid);
+        ASSERT_FALSE(configuration.has_value());
+        EXPECT_EQ(configuration.error().code, config_errc::malformed_yaml);
+    }
+    const auto unicode = parse_bootstrap_config(
+      "kwaque: {schema_version: 1, developer_mode: true, data_directory: "
+      "\"/srv/\xc3\xa9t\xc3\xa9\"}");
+    ASSERT_TRUE(unicode.has_value()) << unicode.error().message;
+    EXPECT_EQ(unicode->data_directory, "/srv/\xc3\xa9t\xc3\xa9");
+}
+
+TEST(BootstrapConfigTest, RendersEverySchemaKey) {
+    // Rendering is an allowlist; a new key must be rendered explicitly or it
+    // would silently vanish from the startup record.
+    const auto rendered = render_config(bootstrap_config{});
+    for (const auto key : kwaque::config::bootstrap_config_keys) {
+        if (key == "admin") {
+            for (const auto admin_key : kwaque::config::bootstrap_admin_keys) {
+                EXPECT_NE(
+                  rendered.find("admin_" + std::string{admin_key} + "="),
+                  std::string::npos)
+                  << admin_key;
+            }
+            continue;
+        }
+        EXPECT_NE(rendered.find(std::string{key} + "="), std::string::npos)
+          << key;
+    }
 }
 
 TEST(BootstrapConfigTest, RejectsInputAboveTheProductionLimit) {
@@ -200,22 +427,22 @@ TEST(BootstrapConfigTest, RejectsDuplicateKeys) {
     const auto configuration = parse_bootstrap_config(R"yaml(
 kwaque:
   schema_version: 1
-  node_id: 0
-  node_id: 1
+  developer_mode: true
+  developer_mode: false
 )yaml");
     ASSERT_FALSE(configuration.has_value());
     EXPECT_EQ(configuration.error().code, config_errc::duplicate_key);
-    EXPECT_EQ(configuration.error().field, "kwaque.node_id");
+    EXPECT_EQ(configuration.error().field, "kwaque.developer_mode");
 }
 
 TEST(BootstrapConfigTest, RedactsValuesUnlessExplicitlySafe) {
     constexpr std::array values{
-      config_value{"node_id", "7", config_visibility::safe},
+      config_value{"admin_port", "9644", config_visibility::safe},
       config_value{"future_secret", "do-not-log"},
     };
     const std::string rendered = render_config(values);
 
-    EXPECT_EQ(rendered, "node_id=7 future_secret=<redacted>");
+    EXPECT_EQ(rendered, "admin_port=9644 future_secret=<redacted>");
     EXPECT_EQ(rendered.find("do-not-log"), std::string::npos);
 }
 
@@ -257,7 +484,8 @@ TEST(BootstrapConfigTest, BoundsAndEscapesErrorRendering) {
 TEST(BootstrapConfigLimitTest, AcceptsZeroAndLargestCrashLoopLimit) {
     for (const auto& value : {std::string{"0"}, std::string{"4294967295"}}) {
         const auto parsed = kwaque::config::parse_bootstrap_config(
-          "kwaque: {schema_version: 1, crash_loop_limit: " + value + "}");
+          "kwaque: {schema_version: 1, developer_mode: true, crash_loop_limit: "
+          + value + "}");
         ASSERT_TRUE(parsed);
         ASSERT_TRUE(parsed->crash_loop_limit);
         EXPECT_EQ(std::to_string(*parsed->crash_loop_limit), value);
@@ -271,8 +499,9 @@ TEST(BootstrapConfigLimitTest, AcceptsZeroAndLargestCrashLoopLimit) {
 TEST(BootstrapConfigLimitTest, NullDisablesTheFiniteCrashLoopLimit) {
     for (const auto value : {"null", "~", ""}) {
         const auto parsed = kwaque::config::parse_bootstrap_config(
-          std::string{"kwaque: {schema_version: 1, crash_loop_limit: "} + value
-          + "}");
+          std::string{"kwaque: {schema_version: 1, developer_mode: true, "
+                      "crash_loop_limit: "}
+          + value + "}");
         ASSERT_TRUE(parsed);
         EXPECT_FALSE(parsed->crash_loop_limit);
         EXPECT_NE(

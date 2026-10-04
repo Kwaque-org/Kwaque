@@ -1,5 +1,6 @@
 #pragma once
 
+#include "src/base/units.h"
 #include "src/runtime/testing/reactor_tasks.h"
 #include "src/storage/tests/wal_append_contract.h"
 #include "src/storage/wal_group_commit.h"
@@ -271,11 +272,14 @@ seastar::future<> formation(
                           std::move(direct->written));
                         take(completed.failure.outcome());
                     }
+                    // A refused direct submission still consumes its offer.
+                    // NOLINTBEGIN(bugprone-use-after-move)
                     require(
                       !direct && direct.error().code() == errc::queue_full
                         && offered.size() == 0,
                       "direct submission bypassed the coordinator or did not "
                       "consume its offer");
+                    // NOLINTEND(bugprone-use-after-move)
                 }
                 require(
                   take(writer.capture()) == direct_cut
@@ -300,12 +304,15 @@ seastar::future<> formation(
                 std::optional<wal_commit_ticket> one{take(
                   co_await groups.template submit<Clock>(
                     writer, std::move(input), work))};
+                // An accepted submission transfers its offer.
+                // NOLINTBEGIN(bugprone-use-after-move)
                 require(
                   one->members() == 1
-                    && one->encoded_bytes() == byte_count{8192}
+                    && one->encoded_bytes() == byte_count{8_KiB}
                     && input.size() == 0,
                   "cohort accounting used child bytes instead of aligned "
                   "envelopes");
+                // NOLINTEND(bugprone-use-after-move)
                 require(
                   !groups.capture(Clock::now()),
                   "singleton ignored the batching window");
@@ -318,7 +325,7 @@ seastar::future<> formation(
                 require(
                   captured && captured->groups() == 2
                     && captured->members() == 2
-                    && captured->encoded_bytes() == byte_count{16384}
+                    && captured->encoded_bytes() == byte_count{16_KiB}
                     && captured->boundary().cursor()
                          == two->boundary().cursor(),
                   "exact count threshold did not freeze the complete prefix");
@@ -357,9 +364,12 @@ seastar::future<> formation(
                     require(
                       !rejected && rejected.error().code() == errc::queue_full,
                       "retained tickets bypassed group capacity");
+                    // Local admission rejection preserves the offered group.
+                    // NOLINTBEGIN(bugprone-use-after-move)
                     require(
                       extra.size() == 1,
                       "local pressure consumed an unentered offer");
+                    // NOLINTEND(bugprone-use-after-move)
                 }
                 one.reset();
                 two.reset();
@@ -392,10 +402,13 @@ seastar::future<> formation(
           auto direct = take(co_await writer.submit(std::move(offered), work));
           auto completed = co_await drive.lifecycle(std::move(direct.written));
           take(completed.failure.outcome());
+          // An accepted direct submission transfers its offer.
+          // NOLINTBEGIN(bugprone-use-after-move)
           require(
             offered.size() == 0 && direct.members == 1
               && direct.extent.begin() == direct_cut.cursor().position(),
             "coordinator close did not restore direct writer admission");
+          // NOLINTEND(bugprone-use-after-move)
       });
 }
 
@@ -458,6 +471,9 @@ seastar::future<> boundaries(
                         && groups.retained_groups() == 0,
                       "preacceptance count/byte/time rejection changed "
                       "ownership or coordinates");
+                    // What a rejection leaves of the offer tells a local one
+                    // from the writer's.
+                    // NOLINTNEXTLINE(bugprone-use-after-move)
                     require(input.size() == (which == 0 ? 0U : which == 1 ? 2U : 1U),
                             "local rejection and consuming writer rejection were conflated");
                 });
@@ -465,7 +481,7 @@ seastar::future<> boundaries(
           for (auto target : {8191U, 8192U}) {
               auto config = slow_batch();
               config.target_bytes = byte_count{target};
-              config.maximum_bytes = byte_count{8192};
+              config.maximum_bytes = byte_count{8_KiB};
               co_await with_groups(
                 writer,
                 budget,
@@ -480,13 +496,13 @@ seastar::future<> boundaries(
                     auto capture = groups.capture(Clock::now());
                     require(
                       capture && capture->members() == 1
-                        && capture->encoded_bytes() == byte_count{8192},
+                        && capture->encoded_bytes() == byte_count{8_KiB},
                       "exact-byte target or valid larger singleton did not "
                       "close");
                 });
           }
           auto config = slow_batch();
-          config.target_bytes = byte_count{12288};
+          config.target_bytes = byte_count{12_KiB};
           co_await with_groups(
             writer,
             budget,
@@ -898,9 +914,12 @@ seastar::future<> allocation_cuts(
                     && writer.progress()->reserved == before,
                   "registration allocation failure occurred after acceptance "
                   "or leaked a gate/slot");
+                // A failed registration preserves the offered group.
+                // NOLINTBEGIN(bugprone-use-after-move)
                 require(
                   input.size() == 1,
                   "failed local registration consumed its offer");
+                // NOLINTEND(bugprone-use-after-move)
                 auto accepted = take(
                   co_await groups.template submit<Clock>(
                     writer, std::move(input), work));
@@ -1077,7 +1096,7 @@ seastar::future<> maximum_members(
   workload_budget& budget,
   Driver drive) {
     auto writer_config = wal_writer_contract::configuration();
-    writer_config.capacity_bytes = byte_count{2U << 20U};
+    writer_config.capacity_bytes = byte_count{2_MiB};
     co_await wal_append_contract::with_writer(
       files,
       owner,
@@ -1113,8 +1132,8 @@ seastar::future<> maximum_members(
                 auto capture = groups.capture(Clock::now());
                 require(
                   capture && capture->groups() == 2 && capture->members() == 128
-                    && capture->encoded_bytes() == byte_count{128U * 8192U},
-                  "legal D groups did not form the maximum cohort");
+                    && capture->encoded_bytes() == byte_count{128U * 8_KiB},
+                  "legal writer groups did not form the maximum cohort");
             });
       });
 }

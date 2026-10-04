@@ -1,3 +1,4 @@
+#include "src/base/units.h"
 #include "src/codec/tests/benchmark_buffer.h"
 #include "src/codec/tests/qualification_profile.h"
 #include "src/storage/tests/storage_format_fixture.h"
@@ -220,8 +221,7 @@ TEST(
                                      .value();
             auto shared
               = child
-                  .share(
-                    {remaining, byte_count{1U << 20U}, capacity_bound}, work)
+                  .share({remaining, byte_count{1_MiB}, capacity_bound}, work)
                   .get();
             ASSERT_TRUE(shared.has_value())
               << "share child: code="
@@ -255,7 +255,7 @@ TEST(
                   << " field=" << block.error().field();
                 wire = std::move(*block).release_bytes();
             }
-            EXPECT_GT(wire.size().value(), 8U << 20U);
+            EXPECT_GT(wire.size().value(), 8_MiB);
             EXPECT_LE(wire.fragment_count(), 1024U);
             // Each nested child contributes its complete envelope to its
             // wrapper.
@@ -264,7 +264,7 @@ TEST(
             const auto admitted = codec::reserve_decode_input(
               input,
               work.policy(),
-              {remaining, byte_count{1U << 20U}, capacity_bound});
+              {remaining, byte_count{1_MiB}, capacity_bound});
             ASSERT_TRUE(admitted.has_value())
               << "reserve wrapper: code="
               << static_cast<int>(admitted.error().code());

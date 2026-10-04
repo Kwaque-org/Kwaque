@@ -1,3 +1,4 @@
+#include "src/base/units.h"
 #include "src/codec/xxh3.h"
 #include "src/runtime/testing/reactor_tasks.h"
 #include "src/simulation/environment.h"
@@ -39,17 +40,17 @@ environment_config config(
   std::optional<fake_crash_policy> crash_policy = std::nullopt,
   std::optional<fault_rule> additional = std::nullopt,
   std::uint32_t memory_alignment = 4096,
-  std::uint32_t native_max_length = 131072,
+  std::uint32_t native_max_length = 128_KiB,
   std::uint32_t overwrite_alignment = 4096) {
     environment_config_values values;
-    values.resource_total_memory = byte_count{256U * 1024U * 1024U};
+    values.resource_total_memory = byte_count{256_MiB};
     values.scheduler.pending_events = 256;
     values.scheduler.events_per_pump = 64;
     values.scheduler.total_events = 100000;
     values.trace.entries = 32768;
-    values.trace.encoded_bytes = 8U * 1024U * 1024U;
+    values.trace.encoded_bytes = 8_MiB;
     values.event_log.entries = 32;
-    values.event_log.encoded_bytes = 32U * 1024U;
+    values.event_log.encoded_bytes = 32_KiB;
     values.file.crash_policy = crash_policy;
     values.file.maximum_objects = 256;
     values.file.maximum_open_handles = 16;
@@ -74,7 +75,7 @@ environment_config config(
     values.network.stop_batch = 8;
     values.dns.maximum_records = 16;
     values.dns.maximum_answers = 32;
-    values.dns.maximum_name_bytes = byte_count{8U * 1024U};
+    values.dns.maximum_name_bytes = byte_count{8_KiB};
     values.dns.stop_batch = 8;
     values.dns.query_limits.maximum_waiters = 8;
     values.maximum_fault_rules = 16;
@@ -117,9 +118,7 @@ seastar::future<> with_wal_environment(
         workload_budget budget{
           target->resource_manager().acquire_workload(
             resource::workload_class::metadata),
-          {.tasks = tasks,
-           .bytes = byte_count{16U * 1024U * 1024U},
-           .handles = 32},
+          {.tasks = tasks, .bytes = byte_count{16_MiB}, .handles = 32},
           bytes::testing::charge};
         co_await function(*target, budget, drive);
         BOOST_CHECK_EQUAL(
@@ -603,7 +602,7 @@ SEASTAR_TEST_CASE(
                   "overlapping barrier queued without admission");
                 std::array<std::optional<workload_reservation>, 32> pressure;
                 for (auto& slot : pressure) {
-                    auto held = budget.try_reserve(byte_count{4096});
+                    auto held = budget.try_reserve(byte_count{4_KiB});
                     if (!held) break;
                     slot.emplace(std::move(*held));
                 }
@@ -667,7 +666,7 @@ struct wal_fault_targets final {
 };
 seastar::future<wal_fault_targets> append_targets(
   std::uint32_t memory_alignment = 4096,
-  std::uint32_t native_max_length = 131072) {
+  std::uint32_t native_max_length = 128_KiB) {
     wal_fault_targets targets;
     co_await with_wal_environment(
       config(
@@ -902,7 +901,7 @@ seastar::future<rotation_fault_targets> rotation_history(
               return writer.statistics().write_calls == 1
                      || writer.failure().failed();
           });
-          auto transition = writer.rotate(cut, byte_count{8192}, work);
+          auto transition = writer.rotate(cut, byte_count{8_KiB}, work);
           runtime::first_failure assertions;
           try {
               require(
@@ -910,7 +909,7 @@ seastar::future<rotation_fault_targets> rotation_history(
                 "rotation did not freeze while the accepted native write was "
                 "pending");
               auto overlap = co_await writer.rotate(
-                cut, byte_count{8192}, work);
+                cut, byte_count{8_KiB}, work);
               require(
                 !overlap && overlap.error().code() == errc::queue_full,
                 "overlapping rotation acquired another successor");
@@ -974,7 +973,7 @@ seastar::future<rotation_fault_targets> rotation_history(
                     "durable head cleanup error lost confirmed namespace "
                     "state");
               }
-              auto retry = co_await writer.rotate(cut, byte_count{8192}, work);
+              auto retry = co_await writer.rotate(cut, byte_count{8_KiB}, work);
               require(
                 !retry && writer.statistics().rotations == 0,
                 "native failure became a retryable transition");
@@ -1010,10 +1009,12 @@ seastar::future<rotation_fault_targets> rotation_history(
             files,
             targets.header.object,
             runtime::builtin_fault_point::file_read);
+          // The successor's header is read back, then once more by the
+          // control update that corroborates it: that last read is targeted.
           require(
-            reads >= 3,
-            "successor corroboration did not read its header and prefix/body");
-          targets.verification_read = {targets.header.object, reads - 1};
+            reads >= 2,
+            "the control did not corroborate the successor's read-back header");
+          targets.verification_read = {targets.header.object, reads};
           targets.verification_close = {
             targets.header.object,
             wal_occurrences(
@@ -1344,7 +1345,7 @@ seastar::future<> parked_close_history(
   simulation::testing::scheduler_driver drive,
   bool fail,
   bool rotate = false,
-  std::uint32_t native_max_length = 131072) {
+  std::uint32_t native_max_length = 128_KiB) {
     auto& files = env.file_system();
     const auto spec = specification(
       take(runtime::file_path::make("/kwaque/store")), {1, 1});
@@ -1421,7 +1422,7 @@ seastar::future<> parked_close_history(
           std::optional<seastar::future<runtime::result<void>>> rotating;
           std::optional<seastar::future<wal_barrier_outcome>> barrier;
           if (rotate)
-              rotating.emplace(writer.rotate(cut, byte_count{8192}, work));
+              rotating.emplace(writer.rotate(cut, byte_count{8_KiB}, work));
           else
               barrier.emplace(writer.barrier(one.boundary));
           if (rotate) budget.close_admission();
@@ -1727,7 +1728,7 @@ seastar::future<std::size_t> wal_namespace_history(
                 static_cast<void>(
                   take(co_await drive.lifecycle(ids->allocate_wal(work))));
             pending.emplace(
-              writer->rotate(group.boundary, byte_count{8192}, work));
+              writer->rotate(group.boundary, byte_count{8_KiB}, work));
         } else {
             pending.emplace(writer->bootstrap(work));
         }
@@ -1792,6 +1793,10 @@ seastar::future<std::size_t> wal_namespace_history(
         control.reset();
     }
     take(failed.outcome());
+    // A crashed process issues nothing more, but these stale owners kept
+    // running: a publication they resumed after the crash can rename without
+    // its directory sync. Crash again so restart sees only what survived.
+    take(co_await drive.lifecycle(files.crash()));
     const auto paths = take(local_paths::make(spec.root));
     const auto control_path = take(paths.control(0));
     const auto recovered = co_await read_bytes(files, control_path, drive);
@@ -1975,7 +1980,7 @@ seastar::future<> wal_data_history(
           auto first_done = co_await drive.lifecycle(std::move(first.written));
           take(first_done.failure.outcome());
           require(
-            first_done.written == byte_count{8192},
+            first_done.written == byte_count{8_KiB},
             "observed write changed whole-group bytes");
           oracle.written(16384);
           auto first_sync = co_await drive.lifecycle(
@@ -3570,7 +3575,7 @@ seastar::future<> commit_crash_history(
                     const auto tail_cohort = oracle.freeze(2, 2);
                     take(
                       co_await drive.lifecycle(
-                        groups.rotate(writer, byte_count{8192}, work)));
+                        groups.rotate(writer, byte_count{8_KiB}, work)));
                     auto tail_result = co_await drive.lifecycle(
                       std::move(tail));
                     take(tail_result.failure().outcome());
@@ -3765,7 +3770,7 @@ SEASTAR_TEST_CASE(wal_group_commit_qualification_deadline_threshold_ties) {
                               1'000'000};
                             cfg.target_members = bytes ? 128U : 2U;
                             cfg.target_bytes = byte_count{
-                              bytes ? 16384U : 4U * 1024U * 1024U};
+                              bytes ? 16_KiB : 4_MiB};
                             co_await storage::testing::
                               wal_group_commit_contract::with_groups(
                                 writer,

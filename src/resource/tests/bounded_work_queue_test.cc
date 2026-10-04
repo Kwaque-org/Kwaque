@@ -1250,12 +1250,13 @@ SEASTAR_TEST_CASE(
         auto reenter = seastar::defer(
           [&] noexcept { reentered.emplace(queue.close(mode)); });
         auto lease = manager.acquire_workload(workload_class::maintenance);
-        auto units = seastar::get_units(lease.memory_admission(), 3).get();
+        auto units = seastar::try_get_units(lease.memory_admission(), 3);
+        BOOST_REQUIRE(units.has_value());
         queue.start_workers(
           {.workers = 1, .maximum_error_reports = 1},
           [owner = counted_queue_item{destroyed[0]},
            lease = std::move(lease),
-           units = std::move(units),
+           units = std::move(*units),
            &entered,
            &release](int) -> seastar::future<> {
               static_cast<void>(owner);

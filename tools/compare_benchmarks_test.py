@@ -57,6 +57,7 @@ class BenchmarkComparisonTest(unittest.TestCase):
         self.affinity = affinity.start()
         self.addCleanup(affinity.stop)
         self.expected_cpu = 3
+        self.reactor_backend = "epoll"
 
     def fake_native(
         self, arguments, *, cwd, stdin, stdout, stderr, timeout, check, shell, env
@@ -75,6 +76,7 @@ class BenchmarkComparisonTest(unittest.TestCase):
         self.assertFalse(check)
         self.assertGreater(timeout, 0)
         self.assertIn("--runs=7", arguments)
+        self.assertIn(f"--reactor-backend={self.reactor_backend}", arguments)
         self.assertIn("--smp=1", arguments)
         self.assertEqual(
             [arg for arg in arguments if arg.startswith("--cpuset=")],
@@ -383,6 +385,20 @@ class BenchmarkComparisonTest(unittest.TestCase):
             ):
                 driver.parse_pair(pair)
 
+    def test_selected_reactor_backend_reaches_every_invocation(self) -> None:
+        self.reactor_backend = "linux-aio"
+        with mock.patch.object(driver.subprocess, "run", side_effect=self.fake_native):
+            result = driver.run_comparison(
+                self.binary, [PAIR], self.output, reactor_backend="linux-aio"
+            )
+        self.assertEqual(result["configuration"]["reactor_backend"], "linux-aio")
+        for invocation in result["invocations"]:
+            self.assertIn("--reactor-backend=linux-aio", invocation["arguments"])
+        with self.assertRaises(driver.ComparisonError):
+            driver.run_comparison(
+                self.binary, [PAIR], self.root / "other", reactor_backend="dpdk"
+            )
+
     def test_every_case_uses_a_fresh_process_with_relative_artifact_paths(self) -> None:
         parent_cwd = Path.cwd()
         with mock.patch.object(
@@ -410,6 +426,7 @@ class BenchmarkComparisonTest(unittest.TestCase):
             driver.PRODUCTION_PROFILE,
         )
         self.assertIsNone(result["configuration"]["task_quota_ms"])
+        self.assertEqual(result["configuration"]["reactor_backend"], "epoll")
         self.affinity.assert_called_once_with(0)
         self.assertNotIn(str(self.root), json.dumps(result))
         for invocation in result["invocations"]:

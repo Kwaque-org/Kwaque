@@ -1,3 +1,4 @@
+#include "src/base/units.h"
 #include "src/codec/tests/qualification_profile.h"
 #include "src/storage/tests/range_manifest_test_support.h"
 #include "src/storage/tests/sparse_index_test_support.h"
@@ -35,7 +36,7 @@ codec::decode_budget memory_for(
     const auto available
       = codec::detail::consume_decode_budget(
           work.policy(),
-          {codec::testing::residual, byte_count{1U << 20U}, charge},
+          {codec::testing::residual, byte_count{1_MiB}, charge},
           charge(byte_count{wire.capacity() + 1U}),
           metadata,
           {},
@@ -441,7 +442,7 @@ TEST(
         std::uint64_t ticks = 0;
         std::chrono::steady_clock::duration largest_gap{};
         auto observer = control_progress(stop, ticks, largest_gap);
-        auto joined = seastar::defer([&] {
+        auto joined = seastar::defer([&] noexcept {
             stop.request_abort();
             observer.get();
         });

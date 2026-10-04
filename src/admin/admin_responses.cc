@@ -3,6 +3,7 @@
 #include "src/base/build_info.h"
 
 #include <algorithm>
+#include <string>
 
 namespace kwaque::admin {
 
@@ -63,67 +64,105 @@ void append_member(
     append_json_string(output, value, maximum_value);
 }
 
+std::string_view status_title(std::uint16_t status) noexcept {
+    switch (status) {
+    case 404:
+        return "Not Found";
+    case 405:
+        return "Method Not Allowed";
+    case 503:
+        return "Service Unavailable";
+    default:
+        return "Error";
+    }
+}
+
 } // namespace
 
 json_response liveness_response(bool live) {
     if (!live) {
         return {
           .status = 503,
-          .body = error_json(
-            "broker_not_live", "broker shutdown is in progress")};
+          .content_type = problem_content_type,
+          .body = problem_json(503, "broker_not_live", "broker is not live")};
     }
-    return {.status = 200, .body = R"({"status":"live"})"};
+    return {
+      .status = 200,
+      .content_type = json_content_type,
+      .body = R"({"status":"live"})"};
 }
 
 json_response readiness_response(bool ready) {
     if (!ready) {
         return {
           .status = 503,
-          .body = error_json("broker_not_ready", "broker is not ready")};
+          .content_type = problem_content_type,
+          .body = problem_json(503, "broker_not_ready", "broker is not ready")};
     }
-    return {.status = 200, .body = R"({"status":"ready"})"};
+    return {
+      .status = 200,
+      .content_type = json_content_type,
+      .body = R"({"status":"ready"})"};
 }
 
-kwaque::common::v1::BuildInfo current_build_info() {
-    kwaque::common::v1::BuildInfo info;
-    info.set_version(build_info::version());
-    info.set_revision(build_info::git_revision());
-    info.set_build_mode(build_info::build_mode());
-    return info;
+json_response not_found_response() {
+    return {
+      .status = 404,
+      .content_type = problem_content_type,
+      .body = problem_json(404, "not_found", "no such resource")};
 }
 
-std::string build_info_json(const kwaque::common::v1::BuildInfo& info) {
+json_response method_not_allowed_response() {
+    return {
+      .status = 405,
+      .content_type = problem_content_type,
+      .body = problem_json(
+        405, "method_not_allowed", "the resource supports only GET and HEAD")};
+}
+
+std::string build_info_json(const build_identity& build) {
     std::string output;
     output.reserve(512);
     output.push_back('{');
-    append_member(
-      output, "version", info.version(), max_json_build_field_bytes);
+    append_member(output, "version", build.version, max_json_build_field_bytes);
     output.push_back(',');
     append_member(
-      output, "revision", info.revision(), max_json_build_field_bytes);
+      output, "revision", build.revision, max_json_build_field_bytes);
+    output += build.dirty ? R"(,"dirty":true,)" : R"(,"dirty":false,)";
+    append_member(
+      output,
+      "build_timestamp",
+      build.build_timestamp,
+      max_json_build_field_bytes);
     output.push_back(',');
     append_member(
-      output, "build_mode", info.build_mode(), max_json_build_field_bytes);
+      output, "build_mode", build.build_mode, max_json_build_field_bytes);
     output.push_back('}');
     return output;
 }
 
-std::string error_json(
-  std::string_view code,
-  std::string_view message,
-  std::optional<std::string_view> correlation_id) {
+std::string current_version_json() {
+    return build_info_json({
+      .version = build_info::version(),
+      .revision = build_info::git_revision(),
+      .dirty = build_info::git_dirty(),
+      .build_timestamp = build_info::build_timestamp(),
+      .build_mode = build_info::build_mode(),
+    });
+}
+
+std::string problem_json(
+  std::uint16_t status, std::string_view code, std::string_view detail) {
     std::string output;
     output.reserve(512);
-    output.push_back('{');
-    append_member(output, "code", code, max_json_code_bytes);
+    output += R"({"type":"about:blank",)";
+    append_member(output, "title", status_title(status), 64);
+    output += R"(,"status":)";
+    output += std::to_string(status);
     output.push_back(',');
-    append_member(output, "message", message, max_json_message_bytes);
-    output += ",\"correlation_id\":";
-    if (correlation_id) {
-        append_json_string(output, *correlation_id, max_json_correlation_bytes);
-    } else {
-        output += "null";
-    }
+    append_member(output, "detail", detail, max_json_detail_bytes);
+    output.push_back(',');
+    append_member(output, "code", code, max_json_code_bytes);
     output.push_back('}');
     return output;
 }

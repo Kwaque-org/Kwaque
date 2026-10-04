@@ -6,9 +6,14 @@ from tools.check_dependency_inventory import (
     archive_dependencies,
     archive_dependency_errors,
     archive_import_errors,
+    baseline_errors,
     imported_archive_repositories,
     module_dependencies,
     module_dependency_errors,
+    override_errors,
+    schema_errors,
+    stale_row_errors,
+    toolchain_pin_errors,
     workflow_dependency_errors,
 )
 
@@ -160,7 +165,7 @@ if __name__ == "__main__":
 class ExactMatchingTest(unittest.TestCase):
     """A shorter name must not be satisfied by a longer inventoried one."""
 
-    INVENTORY = "| Dependency | Version |\n" "|---|---|\n" "| foo-tools | 11.2.3 |\n"
+    INVENTORY = "| Dependency | Version |\n|---|---|\n| foo-tools | 11.2.3 |\n"
 
     def test_a_shorter_name_does_not_match_a_longer_row(self) -> None:
         module = 'bazel_dep(name = "foo", version = "11.2.3")\n'
@@ -171,7 +176,7 @@ class ExactMatchingTest(unittest.TestCase):
         )
 
     def test_a_shorter_version_does_not_match_a_longer_one(self) -> None:
-        inventory = "| Dependency | Version |\n" "|---|---|\n" "| foo | 11.2.3 |\n"
+        inventory = "| Dependency | Version |\n|---|---|\n| foo | 11.2.3 |\n"
         module = 'bazel_dep(name = "foo", version = "1.2.3")\n'
         errors = module_dependency_errors(module, inventory)
         self.assertEqual(
@@ -182,9 +187,7 @@ class ExactMatchingTest(unittest.TestCase):
     def test_a_backticked_identifier_is_accepted(self) -> None:
         """Rows may name the project and give the build identifier in backticks."""
         inventory = (
-            "| Dependency | Version |\n"
-            "|---|---|\n"
-            "| Foo Project (`foo-cpp`) | 1.2.3 |\n"
+            "| Dependency | Version |\n|---|---|\n| Foo Project (`foo-cpp`) | 1.2.3 |\n"
         )
         module = 'bazel_dep(name = "foo-cpp", version = "1.2.3")\n'
         self.assertEqual(module_dependency_errors(module, inventory), [])
@@ -222,7 +225,7 @@ class SplitImportTest(unittest.TestCase):
 
     def test_split_declarations_satisfy_the_import_check(self) -> None:
         module = self.EXTENSION + (
-            'use_repo(native, "alpha")\n' 'use_repo(native, "beta", "gamma_sysroot")\n'
+            'use_repo(native, "alpha")\nuse_repo(native, "beta", "gamma_sysroot")\n'
         )
         self.assertEqual(archive_import_errors(module, REPOSITORIES, VERSIONS), [])
 
@@ -233,3 +236,169 @@ class SplitImportTest(unittest.TestCase):
             'use_repo(native, "beta", "gamma_sysroot")\n'
         )
         self.assertNotIn("unrelated", imported_archive_repositories(module))
+
+
+TOOLCHAIN_MODULE = """
+llvm.toolchain(
+    name = "llvm_toolchain",
+    llvm_version = "23.1.2",
+)
+buf.toolchains(
+    sha256 = "abc",
+    version = "v1.73.0",
+)
+"""
+
+TOOLCHAIN_INVENTORY = (
+    "| Dependency | Version |\n"
+    "|---|---|\n"
+    "| Bazel | 9.2.0 |\n"
+    "| LLVM/Clang toolchain | 23.1.2 |\n"
+    "| Buf CLI (`rules_buf_toolchains`) | v1.73.0 |\n"
+)
+
+BASELINE = (
+    "| Input | Selected version/revision | Status |\n"
+    "|---|---|---|\n"
+    "| Bazel | `9.2.0` | Pinned |\n"
+    "| LLVM/Clang | `23.1.2` | Hermetic toolchain |\n"
+    "| Linux gamma sysroot | Ubuntu, `2026-01-02` snapshot | Hermetic |\n"
+    "| Protobuf | `33.5` | Pinned |\n"
+    "\n"
+    "| Other | Table |\n"
+    "|---|---|\n"
+    "| Bazel | `0.0.0` |\n"
+)
+
+BASELINE_MODULE = TOOLCHAIN_MODULE + 'bazel_dep(name = "protobuf", version = "33.5")\n'
+
+
+class PinEqualityTest(unittest.TestCase):
+    def test_toolchain_pins_must_match_inventory_rows(self) -> None:
+        self.assertEqual(
+            toolchain_pin_errors(TOOLCHAIN_MODULE, "9.2.0\n", TOOLCHAIN_INVENTORY), []
+        )
+        for module, version, inventory in (
+            (TOOLCHAIN_MODULE, "9.3.0\n", TOOLCHAIN_INVENTORY),
+            (
+                TOOLCHAIN_MODULE.replace("23.1.2", "23.1.3"),
+                "9.2.0",
+                TOOLCHAIN_INVENTORY,
+            ),
+            (
+                TOOLCHAIN_MODULE.replace("v1.73.0", "v1.74.0"),
+                "9.2.0",
+                TOOLCHAIN_INVENTORY,
+            ),
+            (
+                TOOLCHAIN_MODULE,
+                "9.2.0",
+                TOOLCHAIN_INVENTORY.replace("| Bazel | 9.2.0 |\n", ""),
+            ),
+        ):
+            with self.subTest(module=module, version=version, inventory=inventory):
+                self.assertEqual(
+                    len(toolchain_pin_errors(module, version, inventory)), 1
+                )
+        self.assertEqual(
+            toolchain_pin_errors("", "9.2.0", TOOLCHAIN_INVENTORY),
+            ["MODULE.bazel declares no llvm_version"],
+        )
+
+    def test_override_revisions_must_be_inventoried(self) -> None:
+        revision = "0123456789abcdef0123456789abcdef01234567"
+        module = (
+            "archive_override(\n"
+            '    module_name = "rules_alpha",\n'
+            f'    strip_prefix = "rules_alpha-{revision}",\n'
+            f'    urls = ["https://example.invalid/{revision}.tar.gz"],\n'
+            ")\n"
+        )
+        inventory = (
+            f"| Dependency | Version |\n|---|---|\n| `rules_alpha` | `{revision}` |\n"
+        )
+        self.assertEqual(override_errors(module, inventory), [])
+        self.assertEqual(
+            len(override_errors(module, inventory.replace(revision, "1.0.0"))), 1
+        )
+
+    def test_rows_without_a_declaration_are_stale(self) -> None:
+        module = MODULE_IMPORTS + 'bazel_dep(name = "delta", version = "1.0")\n'
+        inventory = ARCHIVE_INVENTORY + "| `delta` | 1.0 |\n| Bazel | 9.2.0 |\n"
+        workflows = ["uses: actions/checkout@" + "0" * 40]
+        self.assertEqual(
+            stale_row_errors(module, REPOSITORIES, VERSIONS, workflows, inventory),
+            [],
+        )
+        errors = stale_row_errors(
+            module,
+            REPOSITORIES,
+            VERSIONS,
+            workflows,
+            inventory + "| `epsilon` | 2.0 |\n| `actions/checkout` | 6 |\n",
+        )
+        self.assertEqual(
+            errors, ["THIRD_PARTY.md row '`epsilon`' matches no declared dependency"]
+        )
+
+    def test_stale_rows_ignore_later_tables(self) -> None:
+        inventory = (
+            ARCHIVE_INVENTORY + "\n| Material | Source |\n|---|---|\n| X | Y |\n"
+        )
+        self.assertEqual(
+            stale_row_errors(MODULE_IMPORTS, REPOSITORIES, VERSIONS, [], inventory), []
+        )
+
+    def test_compatibility_baseline_must_match_the_build(self) -> None:
+        self.assertEqual(
+            baseline_errors(
+                BASELINE, BASELINE_MODULE, "9.2.0\n", REPOSITORIES, VERSIONS
+            ),
+            [],
+        )
+        self.assertEqual(
+            baseline_errors(
+                BASELINE.replace("| Protobuf | `33.5` | Pinned |\n", ""),
+                BASELINE_MODULE,
+                "9.2.0",
+                REPOSITORIES,
+                VERSIONS,
+            ),
+            ["DEPENDENCIES.md baseline has no row for 'protobuf'"],
+        )
+        errors = baseline_errors(
+            BASELINE.replace("2026-01-02", "2026-01-03"),
+            BASELINE_MODULE.replace("23.1.2", "23.1.3"),
+            "9.3.0",
+            REPOSITORIES,
+            VERSIONS,
+        )
+        self.assertIn(
+            "DEPENDENCIES.md baseline for 'bazel' does not record '9.3.0'", errors
+        )
+        self.assertIn(
+            "DEPENDENCIES.md baseline for 'llvmclang' does not record '23.1.3'", errors
+        )
+        self.assertIn(
+            "DEPENDENCIES.md baseline for 'linuxgammasysroot' does not record "
+            "'2026-01-02'",
+            errors,
+        )
+
+    def test_schemas_must_use_patched_generator_paths(self) -> None:
+        self.assertEqual(
+            schema_errors(
+                {
+                    "a.proto": 'syntax = "proto3";\npackage a;\n',
+                    "b.proto": '// header\nedition = "2023";\n',
+                }
+            ),
+            [],
+        )
+        for text in (
+            'edition = "2024";\n',
+            'syntax = "proto2";\n',
+            "package unspecified;\n",
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(len(schema_errors({"c.proto": text})), 1)

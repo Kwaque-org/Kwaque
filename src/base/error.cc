@@ -131,4 +131,13 @@ std::error_code make_error_code(errc error) noexcept {
     return {static_cast<int>(error), error_category()};
 }
 
+std::optional<errc> to_errc(const std::error_code& error) noexcept {
+    if (
+      error.category() != error_category() || error.value() < 0
+      || error.value() > static_cast<int>(errc_last)) {
+        return std::nullopt;
+    }
+    return static_cast<errc>(error.value());
+}
+
 } // namespace kwaque

@@ -1,0 +1,12 @@
+# Lint and wire-compatibility policy for the control schemas. Files are
+# addressed from the repository root, so their directories carry a `proto/`
+# prefix that their packages do not.
+version: v2
+lint:
+  use:
+    - STANDARD
+  except:
+    - PACKAGE_DIRECTORY_MATCH
+breaking:
+  use:
+    - WIRE

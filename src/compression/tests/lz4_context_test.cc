@@ -1,3 +1,4 @@
+#include "src/base/units.h"
 #include "src/compression/lz4.h"
 #include "src/compression/tests/test_support.h"
 
@@ -38,7 +39,7 @@ codec::result<lz4_plan> plan(
   codec::decode_budget memory = budget(),
   byte_count expanded = byte_count{1}) {
     return admit_lz4(
-      direction, expanded, byte_count{16U << 20U}, work, memory, context);
+      direction, expanded, byte_count{16_MiB}, work, memory, context);
 }
 
 std::size_t live_count(const lz4_memory& memory) {
@@ -86,10 +87,10 @@ TEST(Lz4ContextTest, AdmissionBoundsScratchOutputAndParentMetadata) {
     for (const auto direction :
          {lz4_direction::compress, lz4_direction::decompress}) {
         const auto admitted = plan(
-          direction, work, budget(), byte_count{8U << 20U});
+          direction, work, budget(), byte_count{8_MiB});
         ASSERT_TRUE(admitted.has_value());
-        EXPECT_LE(admitted->scratch_bytes.value(), 1U << 20U);
-        EXPECT_LE(admitted->bounce_bytes.value(), 128U << 10U);
+        EXPECT_LE(admitted->scratch_bytes.value(), 1_MiB);
+        EXPECT_LE(admitted->bounce_bytes.value(), 128_KiB);
         EXPECT_EQ(
           admitted->output_limit.value(),
           direction == lz4_direction::compress ? 8389659U : 8388608U);
@@ -99,19 +100,19 @@ TEST(Lz4ContextTest, AdmissionBoundsScratchOutputAndParentMetadata) {
           admitted->scratch_bytes.value() + admitted->output_backing.value()
           + admitted->output_metadata.value()};
         exact.metadata_remaining = admitted->output_metadata;
-        EXPECT_TRUE(plan(direction, work, exact, byte_count{8U << 20U}));
+        EXPECT_TRUE(plan(direction, work, exact, byte_count{8_MiB}));
         if (direction == lz4_direction::decompress) {
             exact.operation_remaining = *exact.operation_remaining.checked_sub(
               byte_count{1});
             expect_error(
-              plan(direction, work, exact, byte_count{8U << 20U}),
+              plan(direction, work, exact, byte_count{8_MiB}),
               errc::resource_exhausted);
         }
         exact = budget();
         exact.metadata_remaining = *admitted->output_metadata.checked_sub(
           byte_count{1});
         expect_error(
-          plan(direction, work, exact, byte_count{8U << 20U}),
+          plan(direction, work, exact, byte_count{8_MiB}),
           errc::resource_exhausted);
     }
 }
@@ -148,10 +149,10 @@ TEST(Lz4ContextTest, AdmissionRejectsBudgetAllocationAndWorkLimitsBeforeEntry) {
 }
 
 TEST(Lz4ContextTest, ThreeSlotsAreBoundedZeroedReusableAndBalanced) {
-    lz4_memory memory{codec::limits::defaults(), byte_count{1U << 20U}, charge};
+    lz4_memory memory{codec::limits::defaults(), byte_count{1_MiB}, charge};
     const auto callbacks = memory.callbacks();
     std::array<void*, 3> pointers{};
-    const auto cleanup = seastar::defer([&] {
+    const auto cleanup = seastar::defer([&] noexcept {
         for (auto* pointer : pointers)
             callbacks.customFree(callbacks.opaqueState, pointer);
     });
@@ -164,7 +165,7 @@ TEST(Lz4ContextTest, ThreeSlotsAreBoundedZeroedReusableAndBalanced) {
           std::ranges::all_of(content, [](auto value) { return value == 0; }));
     }
     EXPECT_EQ(live_count(memory), 3U);
-    verify_allocations(memory, byte_count{1U << 20U});
+    verify_allocations(memory, byte_count{1_MiB});
     callbacks.customFree(callbacks.opaqueState, pointers[1]);
     pointers[1] = nullptr;
     EXPECT_EQ(live_count(memory), 2U);
@@ -181,13 +182,13 @@ TEST(Lz4ContextTest, CallbacksRejectOversizedServedCapacityAndInvalidCharges) {
         auto config = codec::limits_config{};
         config.max_allocation_bytes = byte_count{131071};
         lz4_memory memory{
-          codec::limits::make(config).value(), byte_count{1U << 20U}, charge};
+          codec::limits::make(config).value(), byte_count{1_MiB}, charge};
         auto callbacks = memory.callbacks();
         // The request fits, but its served-capacity bound is one byte too big.
         EXPECT_EQ(callbacks.customAlloc(callbacks.opaqueState, 65540), nullptr);
         expect_error(memory.status(context), errc::resource_exhausted);
     }
-    for (const byte_count reserved : {byte_count{1}, byte_count{1U << 20U}}) {
+    for (const byte_count reserved : {byte_count{1}, byte_count{1_MiB}}) {
         lz4_memory memory{codec::limits::defaults(), reserved, charge};
         auto callbacks = memory.callbacks();
         const auto request = reserved.value() == 1 ? 2U : 131073U;
@@ -198,7 +199,7 @@ TEST(Lz4ContextTest, CallbacksRejectOversizedServedCapacityAndInvalidCharges) {
     }
     lz4_memory memory{
       codec::limits::defaults(),
-      byte_count{1U << 20U},
+      byte_count{1_MiB},
       +[](byte_count request) noexcept {
           return byte_count{request.value() - 1U};
       }};
@@ -287,7 +288,7 @@ TEST(Lz4ContextTest, NativeBudgetDenialPreservesPartialContextCleanup) {
          {lz4_direction::compress, lz4_direction::decompress}) {
         auto admitted = plan(direction, work).value();
         // Narrow only the native subreservation to cover context creation.
-        admitted.native_bytes = charge(byte_count{4096});
+        admitted.native_bytes = charge(byte_count{4_KiB});
         lz4_context owner{admitted};
         ASSERT_TRUE(owner.memory().status());
         lz4_staging staging{admitted};

@@ -25,9 +25,11 @@
 #include <utility>
 
 namespace {
+using kwaque::literals::operator""_KiB;
+using kwaque::literals::operator""_MiB;
 
 [[gnu::noinline]] void* allocate_block() {
-    auto* block = ::operator new(64U * 1024U);
+    auto* block = ::operator new(64_KiB);
     static_cast<volatile char*>(block)[0] = 1;
     return block;
 }
@@ -92,7 +94,7 @@ seastar::future<int> exercise(std::string_view scenario) {
             co_return 77;
         }
         require(
-          seastar::memory::stats().total_memory() <= 64U * 1024U * 1024U,
+          seastar::memory::stats().total_memory() <= 64_MiB,
           "OOM probe requires a heap no larger than 64 MiB");
         // Retain bounded blocks until the fixed native heap cannot satisfy one.
         // This branch never runs with the unbounded system allocator.

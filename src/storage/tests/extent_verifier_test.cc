@@ -1,3 +1,4 @@
+#include "src/base/units.h"
 #include "src/bytes/fragmented_buffer_test_support.h"
 #include "src/codec/xxh3.h"
 #include "src/model/record_scan.h"
@@ -404,7 +405,7 @@ TEST(
 
 TEST(
   ExtentVerifierTest, LongExtentExceedsOperationBytesWithoutRetainingHistory) {
-    constexpr std::uint64_t objects = 1025, width = 65536;
+    constexpr std::uint64_t objects = 1025, width = 64_KiB;
     seastar::abort_source abort;
     codec::cooperative_work work{codec::limits::defaults(), abort};
     const auto h = history(0x30, 1, width);
@@ -655,7 +656,7 @@ TEST(
         EXPECT_EQ(flat(block.bytes()), wire);
     }
     auto config = original.policy().config();
-    config.max_record_bytes = byte_count{65536};
+    config.max_record_bytes = byte_count{64_KiB};
     codec::cooperative_work work{codec::limits::make(config).value(), abort};
     auto verifier = extent_verifier::make(
                       history(), block.descriptor().coverage(), work.policy())
@@ -694,9 +695,10 @@ TEST(
           = extent_verifier::make(context, bounds, work.policy()).value();
         if (mode == 4) abort.request_abort();
         // Extraction deliberately leaves readable scalar metadata but no bytes.
-        // NOLINTNEXTLINE(bugprone-use-after-move)
+        // NOLINTBEGIN(bugprone-use-after-move)
         const auto rejected
           = verifier.add_block(block, expected, budget(), work).get();
+        // NOLINTEND(bugprone-use-after-move)
         EXPECT_FALSE(rejected);
         EXPECT_TRUE(verifier.closed());
     }
@@ -818,7 +820,7 @@ TEST(
         if (mode == 10) abort.request_abort();
         if (mode == 12) next = scope(100, 101, 0, 1, 512, 1024);
         auto narrower = work.policy().config();
-        narrower.max_record_bytes = byte_count{65536};
+        narrower.max_record_bytes = byte_count{64_KiB};
         codec::cooperative_work other{
           codec::limits::make(narrower).value(), abort};
         const auto rejected = walk.extend_expected(
@@ -966,7 +968,8 @@ TEST(ExtentVerifierTest, TypedFooterCannotBypassPlacementPolicyOrCancellation) {
                         .get()
                         .value();
         auto config = original.policy().config();
-        if (mode == 0 || mode == 1) config.max_record_bytes = byte_count{65536};
+        if (mode == 0 || mode == 1)
+            config.max_record_bytes = byte_count{64_KiB};
         codec::cooperative_work work{
           codec::limits::make(config).value(), abort};
         auto h = mode == 2 ? history(0x99) : history();
@@ -1022,6 +1025,151 @@ TEST(ExtentVerifierTest, TypedFooterStillChecksTheActualHistoryCrc) {
     EXPECT_EQ(rejected.error().code(), errc::corrupt_data);
     EXPECT_TRUE(walk.closed());
     EXPECT_FALSE(footer.bytes().empty());
+}
+
+codec::immutable_object_digest identity(std::string_view bytes) {
+    codec::xxh3_128_hasher hash;
+    hash.update(bytes.data(), bytes.size());
+    return codec::immutable_object_digest{std::move(hash).final()};
+}
+codec::result<resumed_extent> resume_after(
+  const std::string& footer,
+  std::uint64_t position,
+  codec::immutable_object_digest pinned,
+  storage::coverage expected,
+  codec::cooperative_work& work) {
+    auto bytes = buffer(footer, 67);
+    const auto memory = reserve(bytes, work);
+    return extent_verifier::resume(
+             {history(), runtime::file_position{position}},
+             pinned,
+             expected,
+             std::move(bytes),
+             memory,
+             work)
+      .get();
+}
+
+// A walk that knows only its end byte finishes at the prefix it accepted with
+// exactly the evidence and digest of a walk supplied that extent.
+TEST(ExtentVerifierTest, FinishAtThePrefixMatchesTheSuppliedExtent) {
+    seastar::abort_source abort;
+    codec::cooperative_work work{codec::limits::defaults(), abort};
+    const auto first = data_block();
+    const auto second = data_block(101, 1, 1024);
+    auto exact = extent_verifier::make(
+                   history(),
+                   scope(100, 102, 0, 2, 512, 1536),
+                   work.policy(),
+                   extent_layout_kind::initial_append,
+                   {},
+                   extent_integrity::crc32c_and_digest)
+                   .value();
+    ASSERT_TRUE(feed_block(exact, first, work));
+    ASSERT_TRUE(feed_block(exact, second, work));
+    const auto whole = exact.finish(work).value();
+    // Room for more than was supplied: only the accepted prefix counts.
+    auto open = extent_verifier::make(
+                  history(),
+                  scope(100, 110, 0, 10, 512, 4096),
+                  work.policy(),
+                  extent_layout_kind::initial_append,
+                  {},
+                  extent_integrity::crc32c_and_digest)
+                  .value();
+    ASSERT_TRUE(feed_block(open, first, work));
+    ASSERT_TRUE(feed_block(open, second, work));
+    const auto prefix = open.finish_prefix(work).value();
+    EXPECT_EQ(prefix.boundary(), whole.boundary());
+    ASSERT_TRUE(prefix.digest());
+    EXPECT_EQ(prefix.digest(), whole.digest());
+    const auto bytes = first + second;
+    EXPECT_EQ(
+      prefix.digest()->bytes(), codec::xxh3_128(bytes.data(), bytes.size()));
+    // Closed by finishing.
+    EXPECT_FALSE(feed_block(open, data_block(102, 2, 1536), work));
+    // A rewrite's coverage is never inferred from a prefix.
+    auto rewrite = extent_verifier::make(
+                     history(),
+                     scope(100, 102, 0, 2, 512, 1536),
+                     work.policy(),
+                     extent_layout_kind::rewrite)
+                     .value();
+    const auto refused = rewrite.finish_prefix(work);
+    ASSERT_FALSE(refused);
+    EXPECT_EQ(refused.error().code(), errc::invalid_argument);
+}
+
+TEST(ExtentVerifierTest, ResumeAfterAPinnedFooterMatchesTheFullWalk) {
+    seastar::abort_source abort;
+    codec::cooperative_work work{codec::limits::defaults(), abort};
+    const auto expected = scope(100, 102, 0, 2, 512, 2560);
+    auto full
+      = extent_verifier::make(history(), expected, work.policy()).value();
+    const auto first = data_block();
+    ASSERT_TRUE(feed_block(full, first, work));
+    const auto pinned = full.checkpoint(work).value();
+    const auto middle = footer_wire(
+      pinned.boundary(), {history(), runtime::file_position{1024}});
+    ASSERT_TRUE(feed_footer(full, middle, work, pinned));
+    const auto second = data_block(101, 1, 1536);
+    ASSERT_TRUE(feed_block(full, second, work));
+    const auto prefix = full.checkpoint(work).value();
+    const auto last = footer_wire(
+      prefix.boundary(), {history(), runtime::file_position{2048}});
+    ASSERT_TRUE(feed_footer(full, last, work, prefix));
+    const auto whole = full.finish(work).value();
+
+    // Only the pinned footer and later objects are supplied.
+    auto resumed
+      = resume_after(middle, 1024, identity(middle), expected, work).value();
+    EXPECT_EQ(resumed.footer.boundary(), pinned.boundary());
+    EXPECT_EQ(resumed.footer.location().position.value(), 1024U);
+    auto& walk = resumed.verifier;
+    ASSERT_TRUE(feed_block(walk, second, work));
+    EXPECT_EQ(walk.checkpoint(work).value().boundary(), prefix.boundary());
+    ASSERT_TRUE(feed_footer(walk, last, work));
+    const auto finished = walk.finish(work).value();
+    EXPECT_EQ(finished.boundary(), whole.boundary());
+    EXPECT_EQ(
+      finished.boundary().data_crc32c, crc(first + middle + second + last));
+    EXPECT_FALSE(finished.digest());
+}
+
+TEST(ExtentVerifierTest, ResumeAcceptsOnlyThePinnedFooterNamingItsPrefix) {
+    seastar::abort_source abort;
+    codec::cooperative_work work{codec::limits::defaults(), abort};
+    const auto expected = scope(100, 102, 0, 2, 512, 2560);
+    auto full
+      = extent_verifier::make(history(), expected, work.policy()).value();
+    ASSERT_TRUE(feed_block(full, data_block(), work));
+    const auto pinned = full.checkpoint(work).value();
+    const auto middle = footer_wire(
+      pinned.boundary(), {history(), runtime::file_position{1024}});
+    // Other bytes than the pinned ones are never decoded.
+    auto other = middle;
+    other[100] ^= 1;
+    const auto changed = resume_after(
+      other, 1024, identity(middle), expected, work);
+    ASSERT_FALSE(changed);
+    EXPECT_EQ(changed.error().code(), errc::corrupt_data);
+    // The pinned bytes at another position name another footer.
+    const auto moved = resume_after(
+      middle, 1536, identity(middle), expected, work);
+    ASSERT_FALSE(moved);
+    EXPECT_EQ(moved.error().code(), errc::wrong_context);
+    // A footer after the prefix it names leaves its gap unverified.
+    const auto gapped = footer_wire(
+      pinned.boundary(), {history(), runtime::file_position{1536}});
+    const auto gap = resume_after(
+      gapped, 1536, identity(gapped), expected, work);
+    ASSERT_FALSE(gap);
+    EXPECT_EQ(gap.error().code(), errc::malformed_data);
+    // The independent extent must contain the pinned footer.
+    const auto outside = resume_after(
+      middle, 1024, identity(middle), scope(100, 101, 0, 1, 512, 1024), work);
+    ASSERT_FALSE(outside);
+    EXPECT_EQ(outside.error().code(), errc::invalid_argument);
 }
 
 } // namespace

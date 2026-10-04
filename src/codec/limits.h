@@ -19,7 +19,7 @@ struct limits_config final {
     // Complete record encoding, including its lengths and header framing.
     byte_count max_record_bytes{1'048'576};
     item_count max_record_headers{64};
-    byte_count max_header_name_bytes{4096};
+    byte_count max_header_name_bytes{4_KiB};
     // Sum of header-name/value payload bytes; framing also counts above.
     byte_count max_record_header_bytes{65'536};
     item_count max_original_records{absolute_max_original_records};
@@ -33,13 +33,13 @@ struct limits_config final {
     byte_count max_retained_bytes{33'554'432};
     byte_count max_operation_bytes{67'108'864};
     byte_count max_scratch_bytes{1'048'576};
-    byte_count max_header_bytes{4096};
+    byte_count max_header_bytes{4_KiB};
     item_count max_extensions{64};
     byte_count max_control_bytes{65'536};
     item_count max_nesting_depth{8};
     item_count max_control_fields{256};
     item_count max_control_repeated{256};
-    byte_count max_control_field_bytes{4096};
+    byte_count max_control_field_bytes{4_KiB};
     item_count max_checkpoint_cursors{4096};
     // Checkpoint and page/root caps include their enclosing headers/padding.
     byte_count max_checkpoint_bytes{131'072};

@@ -49,20 +49,88 @@ codec::result<T> from_wire(
       offset));
 }
 template<std::size_t Offset, typename Id>
-codec::result<void> check_id(
+codec::result<Id> read_id(
   const std::array<char, 136>& fixed,
-  Id expected,
   codec::field_context context,
   wal_field field) {
     static_assert(Offset + Id::width <= 136);
     std::array<std::uint8_t, Id::width> raw{};
     for (std::size_t i = 0; i < raw.size(); ++i)
         raw[i] = static_cast<std::uint8_t>(fixed[Offset + i]);
-    const auto id = from_wire(Id::make(raw), context, field, Offset);
+    return from_wire(Id::make(raw), context, field, Offset);
+}
+template<std::size_t Offset, typename Id>
+codec::result<void> check_id(
+  const std::array<char, 136>& fixed,
+  Id expected,
+  codec::field_context context,
+  wal_field field) {
+    const auto id = read_id<Offset, Id>(fixed, context, field);
     if (!id) return codec::failure(id.error());
     if (*id != expected)
         return codec::failure(at(errc::wrong_context, context, field, Offset));
     return {};
+}
+// Scalar syntax only, in field order; nothing is compared with context.
+codec::result<wal_prepare_claims>
+read_claims(const std::array<char, 136>& fixed, codec::field_context context) {
+    const auto incarnation = read_id<0, model::wal_incarnation_id>(
+      fixed, context, wal_field::incarnation);
+    if (!incarnation) return codec::failure(incarnation.error());
+    const auto cluster = read_id<24, model::cluster_id>(
+      fixed, context, wal_field::cluster);
+    if (!cluster) return codec::failure(cluster.error());
+    const auto topic = read_id<40, model::topic_id>(
+      fixed, context, wal_field::topic);
+    if (!topic) return codec::failure(topic.error());
+    const auto range = read_id<56, model::range_id>(
+      fixed, context, wal_field::range);
+    if (!range) return codec::failure(range.error());
+    const auto segment = read_id<72, model::segment_id>(
+      fixed, context, wal_field::segment);
+    if (!segment) return codec::failure(segment.error());
+    const auto generation = from_wire(
+      model::segment_generation::make(load<88, std::uint64_t>(fixed)),
+      context,
+      wal_field::generation,
+      88);
+    if (!generation) return codec::failure(generation.error());
+    const auto routing = from_wire(
+      model::range_routing_epoch::make(load<96, std::uint64_t>(fixed)),
+      context,
+      wal_field::routing_epoch,
+      96);
+    if (!routing) return codec::failure(routing.error());
+    const auto alignment = from_wire(
+      storage_alignment::make(byte_count{load<120, std::uint32_t>(fixed)}),
+      context,
+      wal_field::alignment,
+      120);
+    if (!alignment) return codec::failure(alignment.error());
+    const auto profile = from_wire(
+      parse_replay_profile(load<124, std::uint16_t>(fixed)),
+      context,
+      wal_field::replay_profile,
+      124);
+    if (!profile) return codec::failure(profile.error());
+    if (load<126, std::uint16_t>(fixed) != 0)
+        return codec::failure(
+          at(errc::malformed_data, context, wal_field::reserved, 126));
+    const auto target = from_wire(
+      segment_context::make(*cluster, *topic, *range, *segment, *generation),
+      context,
+      wal_field::segment,
+      72);
+    if (!target) return codec::failure(target.error());
+    return wal_prepare_claims{
+      *incarnation,
+      runtime::file_position{load<16, std::uint64_t>(fixed)},
+      *alignment,
+      *profile,
+      *target,
+      *routing,
+      model::segment_relative_end{load<104, std::uint64_t>(fixed)},
+      runtime::file_position{load<112, std::uint64_t>(fixed)}};
 }
 wal_child_expectation child_expectation(const wal_prepare_expectation& e) {
     return {
@@ -434,9 +502,47 @@ seastar::future<codec::result<fragmented_buffer>> encode_wal_prepare(
 
 namespace {
 struct wal_reader final {
-    wal_prepare_expectation expected;
+    std::optional<wal_prepare_expectation> selected;
     std::uint64_t start;
     codec::decode_budget original;
+    // Present for a resolving decode; selected is then chosen from the claims.
+    wal_prepare_resolver* resolve{nullptr};
+
+    // The declared child size and padding against the envelope, and the file
+    // extent the PREPARE occupies at `wal_position`: nothing here depends on
+    // the segment it names.
+    codec::result<model::file_byte_span> occupied(
+      const std::array<char, 136>& fixed,
+      const fragmented_buffer_parser& input,
+      codec::field_context context,
+      storage_alignment alignment,
+      runtime::file_position wal_position,
+      const codec::limits& policy) const {
+        const byte_count child_bytes{load<128, std::uint32_t>(fixed)};
+        if (child_bytes.value() == 0)
+            return codec::failure(at(
+              errc::malformed_data, context, wal_field::assigned_bytes, 128));
+        const auto layout = from_wire(
+          aligned_envelope_layout::make(
+            {byte_count{context.origin - start},
+             wal_prepare_fixed_bytes,
+             child_bytes},
+            alignment,
+            policy,
+            limits(policy)),
+          context,
+          wal_field::assigned_bytes,
+          128);
+        if (!layout) return codec::failure(layout.error());
+        if (
+          input.total_bytes() != layout->body_bytes()
+          || load<132, std::uint32_t>(fixed) != layout->padding_bytes().value())
+            return codec::failure(
+              at(errc::malformed_data, context, wal_field::padding, 132));
+        return from_wire(
+          layout->at(wal_position), context, wal_field::wal_position, 16);
+    }
+
     seastar::future<codec::result<decoded_wal_prepare>> operator()(
       fragmented_buffer_parser& input,
       codec::field_context context,
@@ -470,48 +576,57 @@ struct wal_reader final {
                     failed = ready.error();
                     break;
                 }
+                if (resolve) {
+                    const auto claims = read_claims(fixed, context);
+                    if (!claims) {
+                        failed = claims.error();
+                        break;
+                    }
+                    // Routing claims are used only once the PREPARE's size
+                    // and layout hold where it lies.
+                    if (
+                      auto shape = occupied(
+                        fixed,
+                        input,
+                        context,
+                        claims->alignment,
+                        claims->wal_position,
+                        work.policy());
+                      !shape) {
+                        failed = shape.error();
+                        break;
+                    }
+                    auto resolved = co_await (*resolve)(*claims);
+                    if (!resolved) {
+                        failed = resolved.error();
+                        break;
+                    }
+                    if (
+                      auto valid = check_expectation(*resolved, context);
+                      !valid) {
+                        failed = valid.error();
+                        break;
+                    }
+                    selected.emplace(std::move(*resolved));
+                    if (auto ready = work.poll(anchor); !ready) {
+                        failed = ready.error();
+                        break;
+                    }
+                }
+                const wal_prepare_expectation& expected = *selected;
                 if (
                   auto valid = check_fixed(fixed, expected, context); !valid) {
                     failed = valid.error();
                     break;
                 }
                 const byte_count child_bytes{load<128, std::uint32_t>(fixed)};
-                if (child_bytes.value() == 0) {
-                    failed = at(
-                      errc::malformed_data,
-                      context,
-                      wal_field::assigned_bytes,
-                      128);
-                    break;
-                }
-                const auto layout = from_wire(
-                  aligned_envelope_layout::make(
-                    {byte_count{context.origin - start},
-                     wal_prepare_fixed_bytes,
-                     child_bytes},
-                    expected.wal.alignment(),
-                    work.policy(),
-                    limits(work.policy())),
+                const auto position = occupied(
+                  fixed,
+                  input,
                   context,
-                  wal_field::assigned_bytes,
-                  128);
-                if (!layout) {
-                    failed = layout.error();
-                    break;
-                }
-                if (
-                  input.total_bytes() != layout->body_bytes()
-                  || load<132, std::uint32_t>(fixed)
-                       != layout->padding_bytes().value()) {
-                    failed = at(
-                      errc::malformed_data, context, wal_field::padding, 132);
-                    break;
-                }
-                const auto position = from_wire(
-                  layout->at(expected.wal.position()),
-                  context,
-                  wal_field::wal_position,
-                  16);
+                  expected.wal.alignment(),
+                  expected.wal.position(),
+                  work.policy());
                 if (!position) {
                     failed = position.error();
                     break;
@@ -576,9 +691,13 @@ struct wal_reader final {
                 auto padding_context = context;
                 padding_context.field = static_cast<std::uint16_t>(
                   wal_field::padding);
+                // occupied() checked the field against the layout.
                 if (
                   auto padding = co_await detail::read_padding(
-                    input, layout->padding_bytes(), work, padding_context);
+                    input,
+                    byte_count{load<132, std::uint32_t>(fixed)},
+                    work,
+                    padding_context);
                   !padding) {
                     failed = padding.error();
                     break;
@@ -628,7 +747,7 @@ struct wal_reader final {
             co_return codec::failure(ready.error());
         }
         co_return decoded_wal_prepare{
-          detail::wal_codec::make(expected, *extent, std::move(**child)),
+          detail::wal_codec::make(*selected, *extent, std::move(**child)),
           *remaining};
     }
 };
@@ -661,6 +780,35 @@ seastar::future<codec::result<decoded_wal_prepare>> decode_wal_prepare(
       memory,
       work,
       wal_reader{std::move(expected), *start, memory},
+      context,
+      boundary);
+}
+
+seastar::future<codec::result<decoded_wal_prepare>> decode_wal_prepare_resolved(
+  fragmented_buffer_parser& input,
+  wal_prepare_resolver& resolve,
+  codec::decode_budget memory,
+  codec::cooperative_work& work,
+  codec::field_context context,
+  codec::input_boundary boundary) {
+    context.family = static_cast<std::uint16_t>(
+      codec::format_family::wal_prepare);
+    const auto start = codec::detail::integer_read_start(
+      input, context, boundary);
+    const auto fail = [](codec::error error) {
+        return seastar::make_ready_future<codec::result<decoded_wal_prepare>>(
+          codec::failure(error));
+    };
+    if (!start) return fail(start.error());
+    if (auto ready = work.poll(at(errc::success, context)); !ready)
+        return fail(ready.error());
+    return codec::decode_envelope<decoded_wal_prepare>(
+      input,
+      codec::format_family::wal_prepare,
+      limits(work.policy()),
+      memory,
+      work,
+      wal_reader{std::nullopt, *start, memory, &resolve},
       context,
       boundary);
 }

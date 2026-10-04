@@ -1,3 +1,4 @@
+#include "src/base/units.h"
 #include "src/bytes/test_allocation_profile.h"
 #include "src/codec/tests/envelope_decode_test_support.h"
 #include "src/codec/tests/format_fixture.h"
@@ -42,9 +43,7 @@ auto reserve(
     return codec::reserve_decode_input(
              input,
              work.policy(),
-             {byte_count{32U << 20U},
-              byte_count{1U << 20U},
-              bytes::testing::charge})
+             {byte_count{32_MiB}, byte_count{1_MiB}, bytes::testing::charge})
       .value();
 }
 

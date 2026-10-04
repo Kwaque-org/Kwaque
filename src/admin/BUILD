@@ -8,6 +8,8 @@ kwaque_cc_library(
     srcs = ["admin_state.cc"],
     hdrs = ["admin_state.h"],
     deps = [
+        "//src/base:build_info",
+        "//src/base:metric_schema",
         "//src/runtime:shard_affinity",
         "@seastar",
     ],
@@ -17,16 +19,14 @@ kwaque_cc_library(
     name = "admin_responses",
     srcs = ["admin_responses.cc"],
     hdrs = ["admin_responses.h"],
-    deps = [
-        "//proto/kwaque/common/v1:build_info_cc_proto",
-        "//src/base:build_info",
-    ],
+    deps = ["//src/base:build_info"],
 )
 
 kwaque_cc_library(
     name = "admin_limits",
     hdrs = ["admin_limits.h"],
     visibility = ["//src/broker:__pkg__"],
+    deps = ["//src/base"],
 )
 
 kwaque_cc_library(
@@ -53,6 +53,8 @@ kwaque_cc_seastar_gtest(
     deps = [
         ":admin_limits",
         ":admin_server",
+        ":admin_server_test_support",
+        "//src/base",
     ],
 )
 
@@ -72,10 +74,13 @@ kwaque_cc_seastar_gtest(
     srcs = ["admin_resource_test.cc"],
     cpu = 2,
     memory = "256MiB",
+    # Asserts upper bounds on real elapsed time around 100-400 ms timeouts.
+    tags = ["exclusive"],
     deps = [
         ":admin_limits",
         ":admin_server",
         ":admin_server_test_support",
+        "//src/base",
     ],
 )
 
@@ -84,7 +89,10 @@ kwaque_cc_seastar_gtest(
     srcs = ["admin_state_test.cc"],
     cpu = 1,
     memory = "128MiB",
-    deps = [":admin_state"],
+    deps = [
+        ":admin_state",
+        "//src/base:build_info",
+    ],
 )
 
 kwaque_cc_test(
@@ -92,7 +100,6 @@ kwaque_cc_test(
     srcs = ["admin_responses_test.cc"],
     deps = [
         ":admin_responses",
-        "//proto/kwaque/common/v1:build_info_cc_proto",
         "//src/base:build_info",
     ],
 )

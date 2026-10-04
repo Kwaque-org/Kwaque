@@ -84,6 +84,7 @@ kwaque_cc_library(
         "//src/runtime:file",
         "//src/runtime:network",
         "//src/runtime:random",
+        "//src/runtime/testing:reactor_tasks",
         "//src/runtime/testing:seastar_fuzz",
         "//src/runtime/testing/contracts:cleanup",
         "//src/simulation:bandwidth",
@@ -169,6 +170,7 @@ kwaque_cc_fuzz_test(
         "testdata/scheduler_fuzz_corpus/saturation.script",
     ],
     tags = [
+        "fuzz-campaign",
         "resources:cpu:1",
         "resources:memory:1024",
     ],
@@ -217,6 +219,7 @@ kwaque_cc_fuzz_test(
         "testdata/fault_schedule_fuzz_corpus/selectors.script",
     ],
     tags = [
+        "fuzz-campaign",
         "resources:cpu:1",
         "resources:memory:1024",
     ],
@@ -249,6 +252,7 @@ kwaque_cc_fuzz_test(
         "testdata/fake_file_fuzz_corpus/write_torn.script",
     ],
     tags = [
+        "fuzz-campaign",
         "resources:cpu:1",
         "resources:memory:1024",
     ],
@@ -282,6 +286,7 @@ kwaque_cc_fuzz_test(
         "testdata/fake_network_fuzz_corpus/partition_then_write.script",
     ],
     tags = [
+        "fuzz-campaign",
         "resources:cpu:1",
         "resources:memory:1024",
     ],
@@ -339,6 +344,7 @@ kwaque_cc_test(
     srcs = ["network_oracle_test.cc"],
     deps = [
         ":network_oracle",
+        "//src/base",
         "//src/simulation:bandwidth",
         "//src/simulation:deterministic_random",
     ],
@@ -380,6 +386,7 @@ kwaque_cc_seastar_test(
     cpu = 1,
     memory = "192MiB",
     deps = [
+        "//src/base",
         "//src/runtime:error",
         "//src/runtime:fault_api",
         "//src/runtime:time",
@@ -640,6 +647,7 @@ kwaque_cc_seastar_test(
     cpu = 2,
     memory = "256MiB",
     deps = [
+        "//src/base",
         "//src/bytes:fragmented_buffer",
         "//src/runtime:file",
         "//src/runtime:random",
@@ -665,6 +673,7 @@ kwaque_cc_seastar_test(
         "//src/bytes:fragmented_buffer",
         "//src/runtime:fault",
         "//src/runtime:file",
+        "//src/runtime/testing:reactor_tasks",
         "//src/runtime/testing/contracts:file_system_contract",
         "//src/simulation:event_trace",
         "//src/simulation:fake_file",
@@ -732,6 +741,7 @@ kwaque_cc_seastar_test(
     cpu = 1,
     memory = "256MiB",
     deps = [
+        "//src/base",
         "//src/bytes:fragmented_buffer",
         "//src/runtime:fault",
         "//src/runtime:file",
@@ -772,6 +782,32 @@ kwaque_cc_seastar_test(
 )
 
 kwaque_cc_seastar_test(
+    name = "local_append_test",
+    timeout = "moderate",
+    srcs = ["local_append_test.cc"],
+    data = ["//src/storage/tests:local_metadata_fixture_data"],
+    memory = "256MiB",
+    deps = [
+        "//src/base",
+        "//src/base:error",
+        "//src/bytes:allocation_test_profile",
+        "//src/resource:resource_manager",
+        "//src/resource:workload_class",
+        "//src/runtime:file",
+        "//src/runtime/testing:reactor_tasks",
+        "//src/simulation:environment",
+        "//src/simulation:fake_file",
+        "//src/simulation:fake_file_test_support",
+        "//src/simulation:scheduler_driver",
+        "//src/simulation:virtual_time",
+        "//src/storage:workload_budget",
+        "//src/storage/tests:local_append_contract",
+        "//src/storage/tests:local_store_contract",
+        "//src/storage/tests:recovery_successor_contract",
+    ],
+)
+
+kwaque_cc_seastar_test(
     name = "local_store_test",
     timeout = "moderate",
     srcs = ["local_store_test.cc"],
@@ -805,8 +841,11 @@ kwaque_cc_seastar_test(
         "//src/storage/tests:local_qualification_contract",
         "//src/storage/tests:local_reader_contract",
         "//src/storage/tests:local_store_contract",
+        "//src/storage/tests:recovery_contract",
         "//src/storage/tests:segment_qualification_contract",
+        "//src/storage/tests:segment_scan_contract",
         "//src/storage/tests:segment_writer_contract",
+        "//src/storage/tests:wal_scan_contract",
     ],
 )
 

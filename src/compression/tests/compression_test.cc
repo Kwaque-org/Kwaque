@@ -1,3 +1,4 @@
+#include "src/base/units.h"
 #include "src/bytes/fragmented_buffer_builder.h"
 #include "src/bytes/fragmented_buffer_test_support.h"
 #include "src/compression/tests/test_support.h"
@@ -100,8 +101,8 @@ TEST(CompressionTest, NonePreservesEveryFragmentAtTheStructuralLimit) {
     bytes::fragmented_buffer_builder builder{
       {.initial_fragment_bytes = byte_count{1},
        .max_fragment_bytes = byte_count{1},
-       .max_total_bytes = byte_count{1024},
-       .max_retained_bytes = byte_count{1024},
+       .max_total_bytes = byte_count{1_KiB},
+       .max_retained_bytes = byte_count{1_KiB},
        .max_fragments = 1024}};
     ASSERT_TRUE(builder.reserve_fragments(item_count{1024}));
     for (std::size_t index = 0; index < 1024; ++index) {
@@ -114,8 +115,9 @@ TEST(CompressionTest, NonePreservesEveryFragmentAtTheStructuralLimit) {
     const auto last = input.fragment_at(1023)->data();
     seastar::abort_source abort;
     codec::cooperative_work work{codec::limits::defaults(), abort};
-    auto result
-      = transfer_none(std::move(input), byte_count{1024}, work, budget()).get();
+    auto result = transfer_none(
+                    std::move(input), byte_count{1_KiB}, work, budget())
+                    .get();
     ASSERT_TRUE(result.has_value());
     EXPECT_EQ(result->retained, cost);
     EXPECT_EQ(result->value.fragment_count(), 1024U);

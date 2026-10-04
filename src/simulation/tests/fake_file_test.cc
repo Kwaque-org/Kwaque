@@ -1,3 +1,4 @@
+#include "src/base/units.h"
 #include "src/simulation/fake_file.h"
 #include "src/simulation/fake_file_test_support.h"
 
@@ -24,6 +25,7 @@
 #include <vector>
 
 namespace {
+using kwaque::literals::operator""_MiB;
 
 using kwaque::simulation::canonical_fake_path;
 using kwaque::simulation::fake_directory_entry;
@@ -57,7 +59,7 @@ void verify_allocation_failures(Function function) {
 
 std::unique_ptr<fake_file_system> make_filesystem(
   std::string root = "/virtual/root",
-  std::uint64_t capacity = 1U << 20U,
+  std::uint64_t capacity = 1_MiB,
   std::uint32_t maximum_objects = 1'024) {
     auto filesystem = fake_file_system::make(
       fake_file_system_config{
@@ -305,7 +307,7 @@ SEASTAR_TEST_CASE(fake_paths_are_canonical_and_confined_to_the_virtual_root) {
 
 SEASTAR_TEST_CASE(
   fake_state_snapshot_rejects_dense_materialization_over_limit) {
-    auto filesystem = make_filesystem("/disk", 1U << 20U);
+    auto filesystem = make_filesystem("/disk", 1_MiB);
     const auto root = path(*filesystem, ".");
     const auto file = path(*filesystem, "file");
     static_cast<void>(make_durable_file(*filesystem, root, file));
@@ -939,7 +941,7 @@ SEASTAR_TEST_CASE(fake_sparse_state_matches_an_independent_dense_image) {
 SEASTAR_TEST_CASE(fake_truncate_prepares_node_before_nonallocating_commit) {
     // Cross the former dirty-index chunk boundary with distinct live pages.
     constexpr std::size_t pages = 16'384;
-    auto filesystem = make_filesystem("/disk", 128U << 20U);
+    auto filesystem = make_filesystem("/disk", 128_MiB);
     const auto root = path(*filesystem, ".");
     const auto file = path(*filesystem, "file");
     static_cast<void>(make_durable_file(*filesystem, root, file));

@@ -1,3 +1,4 @@
+#include "src/base/units.h"
 #include "src/codec/crc32c.h"
 #include "src/codec/digest.h"
 #include "src/codec/xxh3.h"
@@ -26,6 +27,7 @@
 #include <utility>
 
 namespace {
+using kwaque::literals::operator""_KiB;
 
 #if defined(SEASTAR_ENABLE_ALLOC_FAILURE_INJECTION)
 constexpr std::uint32_t crc_seed = 0x13579bdfU;
@@ -154,7 +156,7 @@ int measure_first_use(
     using clock = std::chrono::steady_clock;
     static_cast<void>(clock::now());
     seastar::memory::scoped_large_allocation_warning_threshold warning{
-      128U * 1024U + 1U};
+      128_KiB + 1U};
     const auto before = seastar::memory::stats();
     const auto start = clock::now();
     // Make input opaque to the optimizer without emitting instructions.

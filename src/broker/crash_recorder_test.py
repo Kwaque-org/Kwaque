@@ -11,6 +11,9 @@ import tempfile
 import unittest
 from pathlib import Path
 
+# The test macros export the reactor backend selected for this build.
+REACTOR_BACKEND = os.environ.get("KWAQUE_REACTOR_BACKEND", "epoll")
+
 
 def runfile(path: str) -> Path:
     if root := os.environ.get("RUNFILES_DIR"):
@@ -42,7 +45,7 @@ class CrashRecorderTest(unittest.TestCase):
                     self.binary,
                     f"--scenario={scenario}",
                     f"--directory={directory}",
-                    "--reactor-backend=epoll",
+                    f"--reactor-backend={REACTOR_BACKEND}",
                     f"--smp={shards}",
                     f"--memory={96 * shards}MiB",
                     "--overprovisioned",

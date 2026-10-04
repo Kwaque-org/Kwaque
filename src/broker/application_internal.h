@@ -29,6 +29,7 @@
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <system_error>
 
 namespace kwaque::broker::detail {
 
@@ -160,14 +161,26 @@ seastar::future<> application_state::start_services_with(
         const auto minimum_shard_memory
           = co_await observe_minimum_shard_memory();
         stop_signal_->abort_source().check();
-        auto resources = broker_resource_config(
-          minimum_shard_memory, configuration_->developer_mode);
+        auto resources = [this, minimum_shard_memory] {
+            try {
+                return broker_resource_config(
+                  minimum_shard_memory, configuration_->developer_mode);
+            } catch (const std::system_error& error) {
+                // The selected memory and profile cannot run; retrying
+                // without changing them cannot succeed.
+                throw configuration_error(error.what());
+            }
+        }();
         const auto admin_memory = resources.admin_memory_reservation();
         if (runtime_options != nullptr) {
             // The caller keeps native options alive until this startup
             // finishes.
             freeze_startup_policy(*runtime_options, resources);
         }
+        // Every stage before admin is short and bounded, so supervisors see
+        // liveness soon after start. A stage whose duration grows with stored
+        // data, such as recovery, must start after admin, so liveness stays
+        // reachable while readiness is withheld.
         checkpoint(0);
         co_await start_data_directory();
         checkpoint(1);

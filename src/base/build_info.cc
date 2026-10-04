@@ -13,6 +13,10 @@
 #define KWAQUE_BUILD_MODE "unknown"
 #endif
 
+#ifndef KWAQUE_BUILD_STAMPED
+#define KWAQUE_BUILD_STAMPED 0
+#endif
+
 #ifndef KWAQUE_SEASTAR_VERSION
 #define KWAQUE_SEASTAR_VERSION "unknown"
 #endif
@@ -53,6 +57,8 @@ void append_field(
 } // namespace
 
 std::string_view version() noexcept { return KWAQUE_VERSION; }
+
+bool stamped() noexcept { return KWAQUE_BUILD_STAMPED != 0; }
 
 std::string_view git_revision() noexcept {
     return detail::stamped_git_revision;

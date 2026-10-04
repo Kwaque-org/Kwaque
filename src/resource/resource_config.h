@@ -36,19 +36,19 @@ public:
       byte_count total_memory, memory_reservations reservations) noexcept;
 
     [[nodiscard]] static constexpr byte_count minimum_total_memory() noexcept {
-        return byte_count{64ULL * 1024ULL * 1024ULL};
+        return byte_count{64_MiB};
     }
     [[nodiscard]] static constexpr byte_count
     default_reactor_headroom() noexcept {
-        return byte_count{16ULL * 1024ULL * 1024ULL};
+        return byte_count{16_MiB};
     }
     [[nodiscard]] static constexpr byte_count
     production_baseline_memory() noexcept {
-        return byte_count{128ULL * 1024ULL * 1024ULL};
+        return byte_count{128_MiB};
     }
     [[nodiscard]] static constexpr byte_count
     recommended_total_memory() noexcept {
-        return byte_count{1024ULL * 1024ULL * 1024ULL};
+        return byte_count{1_GiB};
     }
 
     [[nodiscard]] byte_count total_memory() const noexcept {

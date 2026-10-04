@@ -1,3 +1,4 @@
+#include "src/base/units.h"
 #include "src/codec/tests/benchmark_buffer.h"
 #include "src/codec/tests/qualification_profile.h"
 #include "src/compression/compression.h"
@@ -85,7 +86,8 @@ seastar::future<std::size_t> kernel(
             for (std::size_t at = 0; at < fragment.size();) {
                 const auto count = std::min(
                   fragment.size() - at, std::size_t{65536});
-                (co_await work.admit(byte_count{65536}, item_count{8})).value();
+                (co_await work.admit(byte_count{64_KiB}, item_count{8}))
+                  .value();
                 const auto bound = LZ4F_compressBound(count, &prefs);
                 require(
                   !LZ4F_isError(bound) && bound <= output.size(),
@@ -126,7 +128,7 @@ seastar::future<std::size_t> kernel(
                   : std::min((*fragment).size() - offset, std::size_t{65536});
             auto consumed = offered;
             auto produced = std::min(output.size(), std::size_t{65536});
-            (co_await work.admit(byte_count{65536}, item_count{8})).value();
+            (co_await work.admit(byte_count{64_KiB}, item_count{8})).value();
             const auto code = LZ4F_decompress(
               owner.decompressor(),
               output.get_write(),
@@ -195,7 +197,7 @@ public:
                   std::move(input), byte_count{size_}, work, memory);
             else if constexpr (Operation == operation::compress)
                 return compress_lz4(
-                  std::move(input), byte_count{16U << 20U}, work, memory);
+                  std::move(input), byte_count{16_MiB}, work, memory);
             else
                 return decompress_lz4(
                   std::move(input), byte_count{size_}, work, memory);
@@ -240,13 +242,10 @@ public:
         co_await initialize();
         seastar::abort_source abort;
         codec::cooperative_work work{codec::limits::defaults(), abort};
-        const auto plan = detail::admit_lz4(
-                            Direction,
-                            byte_count{size_},
-                            byte_count{16U << 20U},
-                            work,
-                            budget())
-                            .value();
+        const auto plan
+          = detail::admit_lz4(
+              Direction, byte_count{size_}, byte_count{16_MiB}, work, budget())
+              .value();
         // Operation-local warmup and teardown are outside this kernel scope.
         detail::lz4_context native{plan};
         native.memory().status().value();
@@ -273,9 +272,8 @@ private:
     codec::decode_budget budget() const {
         return {
           byte_count{
-            ((64U << 20U) - codec::testing::execution_reservation.value())
-            - cache_},
-          byte_count{1U << 20U},
+            (64_MiB - codec::testing::execution_reservation.value()) - cache_},
+          byte_count{1_MiB},
           capacity_bound};
     }
     seastar::future<> initialize() {
@@ -297,10 +295,9 @@ private:
                         {},
                         0)
                         .value();
-        auto compressed
-          = (co_await compress_lz4(
-               raw_.share(), byte_count{16U << 20U}, work, memory))
-              .value();
+        auto compressed = (co_await compress_lz4(
+                             raw_.share(), byte_count{16_MiB}, work, memory))
+                            .value();
         encoded_ = co_await codec::bench::copy_layout(
           std::move(compressed.value),
           width_,
@@ -313,7 +310,7 @@ private:
             const auto plan = detail::admit_lz4(
                                 direction,
                                 byte_count{size_},
-                                byte_count{16U << 20U},
+                                byte_count{16_MiB},
                                 work,
                                 budget())
                                 .value();
@@ -392,13 +389,12 @@ struct fixture : measurements {
 using tiny_repeat = fixture<64, 64, payload_pattern::compressible>;
 using tiny_noise = fixture<64, 7, payload_pattern::incompressible>;
 using tiny_mixed = fixture<64, 7, payload_pattern::mixed>;
-using block_repeat = fixture<65536, 67, payload_pattern::compressible>;
-using block_noise = fixture<65536, 4096, payload_pattern::incompressible>;
-using block_mixed = fixture<65536, 4096, payload_pattern::mixed>;
-using maximum_repeat = fixture<8U << 20U, 65536, payload_pattern::compressible>;
-using maximum_noise
-  = fixture<8U << 20U, 65536, payload_pattern::incompressible>;
-using maximum_mixed = fixture<8U << 20U, 65536, payload_pattern::mixed>;
+using block_repeat = fixture<64_KiB, 67, payload_pattern::compressible>;
+using block_noise = fixture<64_KiB, 4_KiB, payload_pattern::incompressible>;
+using block_mixed = fixture<64_KiB, 4_KiB, payload_pattern::mixed>;
+using maximum_repeat = fixture<8_MiB, 64_KiB, payload_pattern::compressible>;
+using maximum_noise = fixture<8_MiB, 64_KiB, payload_pattern::incompressible>;
+using maximum_mixed = fixture<8_MiB, 64_KiB, payload_pattern::mixed>;
 
 #define COMPRESSION_CASES(group)                                               \
     PERF_TEST_F(group, cold_none) { return cold<operation::none>(); }          \

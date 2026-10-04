@@ -1,5 +1,6 @@
 #pragma once
 
+#include "src/base/units.h"
 #include "src/bytes/fragmented_buffer_parser.h"
 #include "src/codec/tests/memory_qualification_support.h"
 #include "src/codec/transaction.h"
@@ -32,7 +33,7 @@ inline byte_count available(byte_count held) {
 // All owners alive on entry, including the input, are accounted by held. Do
 // not reserve the same backing twice or refund it when returning an alias.
 inline codec::decode_budget memory(byte_count held) {
-    return {available(held), byte_count{1U << 20U}, charge};
+    return {available(held), byte_count{1_MiB}, charge};
 }
 inline std::size_t header_bytes(std::string_view name) {
     return name.contains("h4096") ? 4096U : 32U;

@@ -35,6 +35,8 @@
 #include <vector>
 
 namespace {
+using kwaque::literals::operator""_KiB;
+using kwaque::literals::operator""_MiB;
 
 namespace codec = kwaque::codec;
 using kwaque::byte_count;
@@ -60,8 +62,7 @@ byte_count test_charge(byte_count requested) noexcept {
 }
 
 codec::decode_budget generous_budget() noexcept {
-    return {
-      byte_count{64U * 1024U * 1024U}, byte_count{1024U * 1024U}, test_charge};
+    return {byte_count{64_MiB}, byte_count{1_MiB}, test_charge};
 }
 
 struct entry final {
@@ -149,7 +150,7 @@ TEST(CollectionTest, UnorderedResultOutlivesItsSourceOwner) {
 
 TEST(CollectionTest, NarrowWorkQuantaStillProduceTheCompleteOrdering) {
     auto config = codec::limits::defaults().config();
-    config.max_work_bytes = byte_count{4096};
+    config.max_work_bytes = byte_count{4_KiB};
     config.max_work_items = item_count{32};
     seastar::abort_source abort;
     codec::cooperative_work work{codec::limits::make(config).value(), abort};
@@ -207,15 +208,15 @@ seastar::chunked_fifo<padded_entry, 1> one_entry_runs_input(bool duplicate) {
 
 codec::limits one_entry_run_policy() {
     auto config = codec::limits::defaults().config();
-    config.max_allocation_bytes = byte_count{2048};
+    config.max_allocation_bytes = byte_count{2_KiB};
     return codec::limits::make(config).value();
 }
 
 TEST(CollectionTest, SixteenSingleEntryRunsMergeWithoutTruncation) {
     // One served entry fits, but two entries cannot share a run allocation.
-    EXPECT_LE(test_charge(byte_count{sizeof(padded_entry)}), byte_count{2048});
+    EXPECT_LE(test_charge(byte_count{sizeof(padded_entry)}), byte_count{2_KiB});
     EXPECT_GT(
-      test_charge(byte_count{2U * sizeof(padded_entry)}), byte_count{2048});
+      test_charge(byte_count{2U * sizeof(padded_entry)}), byte_count{2_KiB});
     seastar::abort_source abort;
     codec::cooperative_work work{one_entry_run_policy(), abort};
     auto source = one_entry_runs_input(false);

@@ -1,6 +1,5 @@
-load("@rules_python//python:defs.bzl", "py_test")
 load("//bazel:build.bzl", "kwaque_cc_binary", "kwaque_cc_library")
-load("//bazel:test.bzl", "kwaque_cc_seastar_gtest")
+load("//bazel:test.bzl", "kwaque_cc_seastar_gtest", "kwaque_py_native_test")
 
 package(default_visibility = ["//visibility:private"])
 
@@ -61,13 +60,13 @@ kwaque_cc_binary(
     ],
 )
 
-py_test(
+kwaque_py_native_test(
     name = "seastar_fuzz_test",
-    size = "small",
     timeout = "moderate",
     srcs = ["seastar_fuzz_test.py"],
     args = ["$(rootpath :seastar_fuzz_canary)"],
     data = [":seastar_fuzz_canary"],
+    main = "seastar_fuzz_test.py",
     tags = [
         "resources:cpu:1",
         "resources:memory:256",
@@ -80,6 +79,7 @@ kwaque_cc_library(
     hdrs = ["reactor_tasks.h"],
     visibility = [
         "//src/runtime/tests:__pkg__",
+        "//src/simulation:__pkg__",
         "//src/simulation/tests:__pkg__",
         "//src/storage/tests:__pkg__",
     ],

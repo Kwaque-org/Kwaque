@@ -27,6 +27,7 @@
 #include <vector>
 
 namespace {
+using kwaque::literals::operator""_MiB;
 
 using namespace std::literals;
 namespace codec = kwaque::codec;
@@ -37,7 +38,7 @@ using kwaque::bytes::allocation_charge_fn;
 using kwaque::bytes::fragmented_buffer;
 
 constexpr auto maximum = std::numeric_limits<std::uint64_t>::max();
-constexpr byte_count parent_budget{64U * 1024U * 1024U};
+constexpr byte_count parent_budget{64_MiB};
 constexpr codec::field_context context{.origin = 123, .family = 7, .field = 9};
 
 template<typename Prefix>

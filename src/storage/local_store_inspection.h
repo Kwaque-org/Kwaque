@@ -1,5 +1,6 @@
 #pragma once
 
+#include "src/base/units.h"
 #include "src/storage/local_metadata_file.h"
 
 #include <array>
@@ -89,7 +90,7 @@ public:
 
     seastar::future<runtime::result<local_store_report>> inspect() {
         auto reservation = budget_.try_reserve(
-          byte_count{limits_.execution_bytes.value() + 131072});
+          byte_count{limits_.execution_bytes.value() + 128_KiB});
         if (!reservation) co_return runtime::failure(reservation.error());
         if (
           auto held = reservation->try_acquire_handles(
@@ -155,7 +156,7 @@ public:
                         }
                         auto page = co_await current.cursor->next(
                           {.maximum_entries = item_count{16},
-                           .maximum_name_bytes = byte_count{4096}});
+                           .maximum_name_bytes = byte_count{4_KiB}});
                         if (!page) {
                             failed.observe(page);
                             break;
@@ -326,8 +327,19 @@ private:
             if ((frame.seen & needed) != needed) missing_ = true;
         } else if (frame.kind == node::checkpoints && !(frame.seen & 1U))
             missing_ = true;
-        else if (frame.kind == node::segment && (frame.seen & 7U) != 7U)
-            missing_ = true;
+        else if (frame.kind == node::segment && (frame.seen & 7U) != 7U) {
+            // Creation makes the empty objects directory and publishes the
+            // descriptor, then the data file, then the publication, and
+            // admits no append or object before the last. Without a
+            // publication a prefix of the others is an interrupted creation;
+            // any other gap is missing data.
+            const bool creation = !(frame.seen & 12U)
+                                  && (!(frame.seen & 2U) || (frame.seen & 1U));
+            if (creation)
+                ++report_.interrupted_creations;
+            else
+                missing_ = true;
+        }
     }
     seastar::future<runtime::result<void>>
     entry_at(frame& frame, const runtime::directory_entry& entry) {
@@ -526,7 +538,7 @@ private:
                 co_return regular();
             }
             if (name == "objects") co_return co_await descend(node::objects);
-            for (auto target : {"descriptor", "published"}) {
+            for (auto target : {"descriptor", "data", "published"}) {
                 if (
                   parse_local_temporary_name(
                     name, runtime::file_name::make(target).value()))
@@ -545,6 +557,8 @@ private:
         case node::deletions: {
             if (auto valid = regular(); !valid) co_return valid;
             report_.has_payload = true;
+            // An object of a segment exists only after its publication.
+            if (frame.kind == node::objects) frames_[depth_ - 2].seen |= 8U;
             const bool metadata = frame.kind == node::evidence
                                   || frame.kind == node::decisions
                                   || frame.kind == node::deletions;

@@ -1,5 +1,6 @@
 #pragma once
 
+#include "src/base/units.h"
 #include "src/storage/local_cleanup.h"
 #include "src/storage/local_control.h"
 
@@ -46,7 +47,7 @@ seastar::future<runtime::result<wal_inventory_progress>> inspect_wal_inventory(
   ChainVisitor chain_visit,
   NamespaceVisitor namespace_visit,
   local_discovery_limits bounds = {}) {
-    static_assert(sizeof(ChainVisitor) + sizeof(NamespaceVisitor) <= 8192);
+    static_assert(sizeof(ChainVisitor) + sizeof(NamespaceVisitor) <= 8_KiB);
     if (auto checked = validate_local_device_spec(spec); !checked)
         co_return runtime::failure(checked.error());
     const auto shard = snapshot.owner.shard();
@@ -61,7 +62,7 @@ seastar::future<runtime::result<wal_inventory_progress>> inspect_wal_inventory(
     if (auto ready = work.poll(); !ready)
         co_return runtime::failure(detail::path_error(ready.error().code()));
     auto held = budget.try_reserve(
-      byte_count{limits.execution_bytes.value() + 16384});
+      byte_count{limits.execution_bytes.value() + 16_KiB});
     if (!held) co_return runtime::failure(held.error());
     auto checked = co_await ownership.validate(spec);
     if (!checked) co_return runtime::failure(checked.error());

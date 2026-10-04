@@ -36,6 +36,8 @@
 #include <vector>
 
 namespace {
+using kwaque::literals::operator""_KiB;
+using kwaque::literals::operator""_MiB;
 
 namespace codec = kwaque::codec;
 using kwaque::byte_count;
@@ -44,7 +46,7 @@ using kwaque::item_count;
 using kwaque::bytes::fragmented_buffer;
 using kwaque::bytes::fragmented_buffer_parser;
 
-constexpr std::size_t maximum_input = 16U * 1024U;
+constexpr std::size_t maximum_input = 16_KiB;
 constexpr codec::field_context context{.origin = 100, .family = 3, .field = 7};
 constexpr codec::error anchor{errc::success, 3, 7, 100};
 
@@ -226,7 +228,7 @@ void staging(const script& input) {
                  work,
                  cap,
                  {},
-                 byte_count{no_memory ? 0U : 2U * 1024U * 1024U},
+                 byte_count{no_memory ? 0U : 2_MiB},
                  charge,
                  context)
           .get();
@@ -286,9 +288,7 @@ void collections(const script& input) {
     }
     const bool no_memory = (input.control[3] & 8U) != 0;
     codec::decode_budget memory{
-      byte_count{no_memory ? 0U : 2U * 1024U * 1024U},
-      byte_count{1024U * 1024U},
-      charge};
+      byte_count{no_memory ? 0U : 2_MiB}, byte_count{1_MiB}, charge};
     std::size_t comparisons = 0;
     const auto stop_after = std::size_t{1} + input.control[4];
     auto result

@@ -1,5 +1,6 @@
 #pragma once
 
+#include "src/base/units.h"
 #include "src/storage/tests/local_reader_contract.h"
 
 #include <seastar/util/alloc_failure_injector.hh>
@@ -190,8 +191,8 @@ seastar::future<> root_pressure_and_cancellation(
             }
             require(count != held.size(), "test task bound too small");
         } else {
-            held[0].emplace(take(budget.try_reserve(
-              byte_count{kind == 1 ? 8U * 1024U * 1024U - 32768U : 1U})));
+            held[0].emplace(take(
+              budget.try_reserve(byte_count{kind == 1 ? 8_MiB - 32_KiB : 1U})));
             if (kind == 2) take(held[0]->try_acquire_handles(32));
         }
         const auto before = budget.snapshot();

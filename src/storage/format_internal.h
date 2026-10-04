@@ -1,5 +1,6 @@
 #pragma once
 
+#include "src/base/units.h"
 #include "src/codec/crc32c.h"
 #include "src/codec/envelope_decode.h"
 #include "src/codec/xxh3.h"
@@ -57,7 +58,7 @@ T load(const std::array<char, N>& input) noexcept {
   codec::xxh3_128_hasher& hasher,
   codec::cooperative_work& work,
   codec::error anchor) {
-    std::array<char, 1024> buffer;
+    std::array<char, 1_KiB> buffer;
     const auto capacity = std::min<std::size_t>(
       buffer.size(), work.byte_quantum().value() / 2U);
     if (capacity == 0)

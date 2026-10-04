@@ -1,6 +1,7 @@
 #include "proto/kwaque/common/v1/error.pb.h"
 #include "proto/kwaque/control/v1/handshake.pb.h"
 #include "proto/kwaque/control/v1/redirect.pb.h"
+#include "src/base/units.h"
 #include "src/codec/tests/benchmark_buffer.h"
 #include "src/protocol/control_frame_codec.h"
 #include "src/protocol/control_memory.h"
@@ -323,9 +324,9 @@ private:
     item_count units_;
     detail::control_parse_cost native_cost_;
     codec::decode_budget memory_{
-      frame::parent_budget, byte_count{1048576}, capacity_bound};
+      frame::parent_budget, byte_count{1_MiB}, capacity_bound};
     codec::decode_budget frame_memory_{
-      frame::parent_budget, byte_count{1048576}, capacity_bound};
+      frame::parent_budget, byte_count{1_MiB}, capacity_bound};
 };
 
 using control_error = measurement<frame_kind::error, 0, 7>;

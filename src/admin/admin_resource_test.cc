@@ -1,6 +1,7 @@
 #include "src/admin/admin_limits.h"
 #include "src/admin/admin_server.h"
 #include "src/admin/admin_server_test_support.h"
+#include "src/base/units.h"
 
 #include <seastar/core/coroutine.hh>
 #include <seastar/core/iostream.hh>
@@ -10,6 +11,7 @@
 #include <seastar/core/preempt.hh>
 #include <seastar/core/prometheus.hh>
 #include <seastar/core/seastar.hh>
+#include <seastar/core/semaphore.hh>
 #include <seastar/core/shard_id.hh>
 #include <seastar/core/sharded.hh>
 #include <seastar/core/sleep.hh>
@@ -53,6 +55,8 @@ struct prometheus_test_fixture {
 };
 
 namespace {
+using kwaque::literals::operator""_KiB;
+using kwaque::literals::operator""_MiB;
 
 using namespace std::chrono_literals;
 namespace http = seastar::http;
@@ -99,7 +103,7 @@ public:
             if (next.empty()) {
                 return result;
             }
-            if (result.size() + next.size() > 64U * 1024U) {
+            if (result.size() + next.size() > 64_KiB) {
                 throw std::length_error(
                   "test response exceeded expected bound");
             }
@@ -341,7 +345,7 @@ TEST(
     }
     EXPECT_GT(ticks, 1U);
     EXPECT_GT(written, 0U);
-    EXPECT_LT(written, 64U * 1024U * 1024U);
+    EXPECT_LT(written, 64_MiB);
     EXPECT_EQ(fixture.server.current_connections(), 0U);
 }
 
@@ -417,18 +421,30 @@ TEST(
                   ? before - seastar::memory::stats().free_memory()
                   : 0;
     for (auto& connection : clients) {
-        // Stream and discard; a failed competing scrape may be a truncated
-        // body.
+        // Competing scrapes queue for each source shard's snapshot slot, so
+        // every response is a complete 200, never a truncated body.
+        std::string head;
+        std::string tail;
         while (true) {
             auto buffer = connection->input.read().get();
             if (buffer.empty()) {
                 break;
+            }
+            if (head.size() < 16) {
+                head.append(
+                  buffer.get(), std::min(buffer.size(), 16 - head.size()));
+            }
+            tail.append(buffer.get(), buffer.size());
+            if (tail.size() > 16) {
+                tail.erase(0, tail.size() - 16);
             }
             const auto remaining = seastar::memory::stats().free_memory();
             if (remaining < before) {
                 peak = std::max(peak, before - remaining);
             }
         }
+        EXPECT_TRUE(head.starts_with("HTTP/1.1 200")) << head;
+        EXPECT_TRUE(tail.ends_with("0\r\n\r\n")) << tail;
     }
     wait_for_connections(fixture.server, 0);
 #if !defined(SEASTAR_DEFAULT_ALLOCATOR)
@@ -438,6 +454,104 @@ TEST(
     auto snapshot = metrics::impl::get_values(
       metrics::impl::default_handle(), config.snapshot_bounds);
     snapshot.destroy().get();
+}
+
+TEST(AdminResourceTest, DisabledSeriesDoNotConsumeSnapshotCapacity) {
+    // Every shard registers disabled queue series for each peer shard; on a
+    // large host they would exceed the series cap if they were counted.
+    constexpr int handle = 19;
+    metrics::metric_groups group{handle};
+    const metrics::label peer{"peer"};
+    for (unsigned index = 0; index < 4096; ++index) {
+        group.add_group(
+          "disabled_probe",
+          {metrics::make_gauge(
+            "value", [] { return 1; }, metrics::description{}, {peer(index)})(
+            metrics::metric_disabled)});
+    }
+    group.add_group(
+      "enabled_probe", {metrics::make_gauge("value", [] { return 1; })});
+    const metrics::impl::snapshot_limits limits;
+    auto snapshot = metrics::impl::get_values(handle, limits);
+    EXPECT_EQ(snapshot->values.size(), 1U);
+    snapshot.destroy().get();
+
+    // Enabled series remain bounded.
+    for (unsigned index = 0; index < limits.series; ++index) {
+        group.add_group(
+          "enabled_bound",
+          {metrics::make_gauge(
+            "value", [] { return 1; }, metrics::description{}, {peer(index)})});
+    }
+    EXPECT_THROW(metrics::impl::get_values(handle, limits), std::length_error);
+}
+
+TEST(AdminResourceTest, QueuedSnapshotAdmissionWaitsForTheShardSlot) {
+    const metrics::impl::snapshot_limits limits;
+    auto held = metrics::impl::get_values(
+      metrics::impl::default_handle(), limits);
+    auto waiting = seastar::get_units(
+      metrics::impl::snapshot_admission(), 1, std::chrono::seconds{5});
+    seastar::yield().get();
+    EXPECT_FALSE(waiting.available());
+    held.destroy().get();
+    auto admitted = metrics::impl::get_values(
+      metrics::impl::default_handle(), limits, waiting.get());
+    admitted.destroy().get();
+    EXPECT_THROW(
+      metrics::impl::get_values(
+        metrics::impl::default_handle(), limits, seastar::semaphore_units<>{}),
+      std::invalid_argument);
+}
+
+TEST(AdminResourceTest, HealthRoutesFollowTheLifecycleOverHttp) {
+    const auto endpoint = kwaque::admin::detail::lease_loopback_endpoint();
+    kwaque::admin::admin_server server;
+    const auto request = [&endpoint](std::string_view line) {
+        client connection(endpoint.socket());
+        connection.send(std::string{line} + " HTTP/1.1\r\n\r\n");
+        return connection.response();
+    };
+    std::exception_ptr failure;
+    try {
+        server
+          .start(
+            endpoint.address, endpoint.port, seastar::this_smp_shard_count())
+          .get();
+        // Live but not yet ready.
+        EXPECT_NE(
+          request("GET /v1/health/live").find("200 OK"), std::string::npos);
+        const auto starting = request("GET /v1/health/ready");
+        EXPECT_NE(starting.find("503 Service Unavailable"), std::string::npos);
+        EXPECT_NE(starting.find("application/problem+json"), std::string::npos);
+
+        server.mark_ready(std::chrono::seconds{1}).get();
+        EXPECT_NE(
+          request("GET /v1/health/ready").find("200 OK"), std::string::npos);
+        const auto head = request("HEAD /v1/health/ready");
+        EXPECT_NE(head.find("200 OK"), std::string::npos);
+        EXPECT_TRUE(head.ends_with("\r\n\r\n")) << head;
+        EXPECT_NE(request("HEAD /metrics").find("200 OK"), std::string::npos);
+        EXPECT_NE(
+          request("GET /missing").find("404 Not Found"), std::string::npos);
+        const auto method = request("POST /v1/health/live");
+        EXPECT_NE(method.find("405 Method Not Allowed"), std::string::npos);
+        EXPECT_NE(method.find("Allow: GET, HEAD"), std::string::npos);
+
+        // Draining leaves service but must not be restarted.
+        server.begin_shutdown().get();
+        EXPECT_NE(
+          request("GET /v1/health/live").find("200 OK"), std::string::npos);
+        EXPECT_NE(
+          request("GET /v1/health/ready").find("503 Service Unavailable"),
+          std::string::npos);
+    } catch (...) {
+        failure = std::current_exception();
+    }
+    server.stop().get();
+    if (failure) {
+        std::rethrow_exception(failure);
+    }
 }
 
 TEST(AdminResourceTest, FragmentedParserAppliesLimitsAcrossReadBoundaries) {
@@ -494,7 +608,7 @@ TEST(AdminResourceTest, SnapshotByteCapChargesDequeBlocksBeforeSampling) {
     metrics::impl::snapshot_limits limits;
     // Each family owns a value deque block even with only one scalar. These
     // blocks cannot fit into 64 KiB; rejecting them must precede callbacks.
-    limits.value_bytes = 64U * 1024U;
+    limits.value_bytes = 64_KiB;
     EXPECT_THROW(metrics::impl::get_values(handle, limits), std::length_error);
     EXPECT_EQ(calls, 0U);
     limits.value_bytes = kwaque::admin::metrics_snapshot_bytes;
@@ -820,6 +934,9 @@ TEST(AdminResourceTest, LaterShardRejectionReleasesEarlierCollectedSnapshot) {
         seastar::prometheus::config config;
         config.handle = aggregation_probe_handle;
         config.snapshot_bounds.emplace();
+        // Shard 1's slot stays held, so the scrape's wait for it can only
+        // time out; a short wait keeps that rejection prompt.
+        config.snapshot_wait_timeout = 100ms;
         seastar::prometheus::add_prometheus_routes(fixture.server, config)
           .get();
         client connection(fixture.address);
@@ -847,16 +964,12 @@ TEST(AdminResourceTest, AdminStopDrainsParkedExporterAndForeignSnapshots) {
     std::exception_ptr failure;
     try {
         sources.invoke_on_all(&snapshot_source::add_large_output).get();
-        seastar::listen_options probe_options;
-        auto probe = seastar::listen(
-          seastar::socket_address{seastar::net::inet_address{"127.0.0.1"}, 0},
-          probe_options);
-        const auto port = probe.local_address().port();
-        probe = {};
-        server.start("127.0.0.1", port, seastar::this_smp_shard_count()).get();
-        client connection(
-          seastar::socket_address{
-            seastar::net::inet_address{"127.0.0.1"}, port});
+        const auto endpoint = kwaque::admin::detail::lease_loopback_endpoint();
+        server
+          .start(
+            endpoint.address, endpoint.port, seastar::this_smp_shard_count())
+          .get();
+        client connection(endpoint.socket());
         const int receive_bytes = 1024;
         connection.socket.set_sockopt(
           SOL_SOCKET, SO_RCVBUF, &receive_bytes, sizeof(receive_bytes));
@@ -886,7 +999,7 @@ TEST(AdminResourceTest, AdminStopDrainsParkedExporterAndForeignSnapshots) {
         std::string prefix;
         while (prefix.find("admin_parked_output_value") == std::string::npos) {
             auto bytes = connection.input.read().get();
-            if (bytes.empty() || prefix.size() + bytes.size() > 16U * 1024U) {
+            if (bytes.empty() || prefix.size() + bytes.size() > 16_KiB) {
                 throw std::runtime_error("exporter did not start its body");
             }
             prefix.append(bytes.get(), bytes.size());

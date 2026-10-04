@@ -1,5 +1,6 @@
 #pragma once
 
+#include "src/base/units.h"
 #include "src/storage/extent_verifier.h"
 #include "src/storage/local_metadata.h"
 #include "src/storage/retry_format.h"
@@ -8,6 +9,7 @@
 #include <cstdint>
 #include <deque>
 #include <optional>
+#include <span>
 #include <string_view>
 #include <vector>
 
@@ -30,9 +32,13 @@ struct shape final {
     }
 };
 inline constexpr std::uint32_t maximum_batches = 128;
-inline constexpr std::uint32_t maximum_group_blocks = 8;
+// The writer's own per-group block bound.
+inline constexpr std::uint32_t maximum_group_blocks = 64;
+// Concurrent segment owners of this benchmark. The fixture can give up to
+// maximum_extent_segments segments distinct identities.
 inline constexpr std::uint32_t maximum_segments = 4;
-inline constexpr byte_count working_bytes{32U << 20U};
+inline constexpr std::uint32_t maximum_extent_segments = 32;
+inline constexpr byte_count working_bytes{32_MiB};
 
 struct group_input final {
     std::vector<encoded_assigned_batch> children;
@@ -63,6 +69,14 @@ make_extent(const shape&, std::uint32_t segment, codec::cooperative_work&);
 verify_extent(extent_input&, bool raw, codec::cooperative_work&);
 [[nodiscard]] seastar::future<verified_extent>
 encode_extent(extent_input&, codec::cooperative_work&);
+// The exact extent of these children, the input's batches in order, stored
+// from its data start in groups of the given sizes, each sealed by one
+// footer. Consumes the children.
+[[nodiscard]] seastar::future<verified_extent> encode_cut_extent(
+  const extent_input&,
+  std::span<encoded_assigned_batch> children,
+  std::span<const std::uint32_t> cuts,
+  codec::cooperative_work&);
 void export_extent(extent_input&, const shape&, std::string_view path);
 [[nodiscard]] seastar::future<> export_records(
   extent_input&, const shape&, std::string_view path, codec::cooperative_work&);

@@ -1,3 +1,4 @@
+#include "src/base/units.h"
 #include "src/model/batch_builder.h"
 #include "src/model/batch_codec.h"
 #include "src/model/batch_rewrite.h"
@@ -80,7 +81,7 @@ model::batch_decode_expectation original_expected(std::uint64_t sequence) {
 codec::decode_budget operation_budget() {
     // Leave 32 MiB and half the metadata allowance for the fixed two-block
     // fixture, held aliases and native/test frames outside the current call.
-    return {byte_count{32U << 20U}, byte_count{512U << 10U}, charge};
+    return {byte_count{32_MiB}, byte_count{512_KiB}, charge};
 }
 
 model::submitted_batch

@@ -28,7 +28,8 @@ namespace {
 using namespace kwaque::broker::detail;
 
 constexpr std::string_view original_configuration{
-  "kwaque:\n  schema_version: 1\n  node_id: 7\n  data_directory: ./data\n"};
+  "kwaque:\n  schema_version: 1\n  developer_mode: true\n"
+  "  data_directory: ./data\n  admin:\n    port: 19001\n"};
 
 class parked_source final : public seastar::data_source_impl {
 public:
@@ -142,13 +143,19 @@ SEASTAR_TEST_CASE(
     co_await state.load_configuration(options);
     const auto identity = application_test_access::identity(state);
     BOOST_CHECK(identity == identify_configuration(original_configuration));
-    BOOST_CHECK_EQUAL(application_test_access::configuration(state).node_id, 7);
+    BOOST_CHECK_EQUAL(
+      application_test_access::configuration(state).admin_port, 19001);
+    // The relative directory was resolved once, against the start directory.
+    BOOST_CHECK(
+      application_test_access::configuration(state).data_directory
+      == std::filesystem::absolute("./data"));
 
     std::string replacement{original_configuration};
-    replacement.replace(replacement.find("node_id: 7"), 10, "node_id: 9");
+    replacement.replace(replacement.find("port: 19001"), 11, "port: 19002");
     co_await write_configuration(path, replacement);
     BOOST_CHECK(application_test_access::identity(state) == identity);
-    BOOST_CHECK_EQUAL(application_test_access::configuration(state).node_id, 7);
+    BOOST_CHECK_EQUAL(
+      application_test_access::configuration(state).admin_port, 19001);
     bool refused = false;
     try {
         co_await state.load_configuration(options);

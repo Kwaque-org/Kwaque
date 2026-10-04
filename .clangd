@@ -1,12 +1,28 @@
 CompileFlags:
   CompilationDatabase: Ancestors
-  Add:
-    - -std=c++23
-  Remove:
-    - -ferror-limit=*
+  Remove: [-ferror-limit=*]
 Diagnostics:
-  ClangTidy:
-    Remove:
-      - bugprone-unchecked-optional-access
+  Includes:
+    AnalyzeAngledIncludes: true
+Style:
+  # Inserted includes follow the project layout: dependency headers in angle
+  # brackets, first-party headers quoted from the workspace root.
+  AngledHeaders:
+    - "seastar/.*"
+    - "absl/.*"
+    - "boost/.*"
+    - "fmt/.*"
+    - "google/protobuf/.*"
+    - "gtest/.*"
+    - "yaml-cpp/.*"
+  QuotedHeaders:
+    - "src/.*"
+    - "proto/.*"
 Index:
   Background: Build
+---
+# Files without a compilation database entry are C++23 unless they are C.
+If:
+  PathMatch: .*\.(cc|cpp|cxx|h|hh|hpp|hxx)
+CompileFlags:
+  Add: [-std=c++23]

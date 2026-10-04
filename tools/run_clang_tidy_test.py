@@ -32,8 +32,7 @@ def write_python_executable(
     script.write_text(source)
     # Bazel's interpreter path can exceed the kernel's shebang length limit.
     path.write_text(
-        "#!/bin/sh\n"
-        f'exec {shlex.quote(interpreter)} {shlex.quote(str(script))} "$@"\n'
+        f'#!/bin/sh\nexec {shlex.quote(interpreter)} {shlex.quote(str(script))} "$@"\n'
     )
     path.chmod(0o700)
 
@@ -73,8 +72,9 @@ class ClangTidySelectionTest(unittest.TestCase):
         self,
     ) -> None:
         for value in ("0", "-1"):
-            with self.subTest(value=value), self.assertRaises(
-                argparse.ArgumentTypeError
+            with (
+                self.subTest(value=value),
+                self.assertRaises(argparse.ArgumentTypeError),
             ):
                 driver.positive_jobs(value)
         self.assertEqual(driver.positive_jobs("3"), 3)
@@ -89,19 +89,21 @@ class ClangTidySelectionTest(unittest.TestCase):
                 for name in ("a", "b", "c")
             ]
             (root / "compile_commands.json").write_text(json.dumps(entries))
-            with mock.patch.object(
-                driver, "workspace_root", return_value=root
-            ), mock.patch.object(
-                driver.subprocess, "run", return_value=mock.Mock(returncode=17)
-            ) as run, mock.patch.object(
-                sys,
-                "argv",
-                [
-                    "clang_tidy",
-                    "--tool=/tidy",
-                    "--runner=/runner",
-                    "--config=.clang-tidy",
-                ],
+            with (
+                mock.patch.object(driver, "workspace_root", return_value=root),
+                mock.patch.object(
+                    driver.subprocess, "run", return_value=mock.Mock(returncode=17)
+                ) as run,
+                mock.patch.object(
+                    sys,
+                    "argv",
+                    [
+                        "clang_tidy",
+                        "--tool=/tidy",
+                        "--runner=/runner",
+                        "--config=.clang-tidy",
+                    ],
+                ),
             ):
                 self.assertEqual(driver.main(), 17)
             self.assertIn("-j=2", run.call_args.args[0])
@@ -278,7 +280,97 @@ class PartitionedAnalysisTest(unittest.TestCase):
                 re.search(rf"^{field}:.*$", ordinary, re.MULTILINE)[0],
                 re.search(rf"^{field}:.*$", strict, re.MULTILINE)[0],
             )
-        self.assertIn("WarningsAsErrors: '*'", strict)
+        for text in (ordinary, strict):
+            self.assertIn("WarningsAsErrors: '*'", text)
+            # Wildcards outside the analyzer would enable new checks silently
+            # on a toolchain upgrade.
+            for check in checks(text):
+                self.assertTrue(
+                    "*" not in check
+                    or check == "-*"
+                    or check.startswith("clang-analyzer-"),
+                    check,
+                )
+
+    def test_header_filters_select_first_party_headers_as_clang_names_them(self):
+        root = Path(__file__).resolve().parents[1]
+        config = (root / ".clang-tidy").read_text()
+
+        def field(name: str) -> re.Pattern[str]:
+            value = re.search(rf"^{name}: '(.*)'$", config, re.MULTILINE)[1]
+            return re.compile(value)
+
+        include, exclude = field("HeaderFilterRegex"), field("ExcludeHeaderFilterRegex")
+
+        def reported(name: str) -> bool:
+            return bool(include.search(name)) and not exclude.search(name)
+
+        # Bazel adds `-iquote .`, so clang opens first-party headers as ./src/...
+        for name in ("./src/admin/admin_server.h", "src/base/units.h", "./bazel/x.h"):
+            self.assertTrue(reported(name), name)
+        for name in (
+            "external/seastar/include/seastar/core/future.hh",
+            "./external/abseil-cpp+/absl/base/config.h",
+            "bazel-out/k8-dbg/bin/proto/kwaque/common/v1/build_info.pb.h",
+        ):
+            self.assertFalse(reported(name), name)
+
+    @unittest.skipUnless(
+        os.environ.get("KWAQUE_TEST_CLANG_TIDY"),
+        "clang-tidy supplied by the Bazel test target",
+    )
+    def test_both_configurations_report_first_party_header_diagnostics(self):
+        tool = driver.resolve_runfile(os.environ["KWAQUE_TEST_CLANG_TIDY"])
+        repository = Path(__file__).resolve().parents[1]
+        header = textwrap.dedent("""\
+            #pragma once
+            inline int {name}(int value) {{
+                if (value = 1) {{
+                    return value;
+                }}
+                return 0;
+            }}
+            """)
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "src" / "probe").mkdir(parents=True)
+            (root / "external" / "dependency").mkdir(parents=True)
+            (root / "src" / "probe" / "probe.h").write_text(header.format(name="probe"))
+            (root / "external" / "dependency" / "dependency.h").write_text(
+                header.format(name="dependency")
+            )
+            (root / "src" / "probe" / "probe.cc").write_text(
+                '#include "src/probe/probe.h"\n'
+                '#include "dependency.h"\n'
+                "int use() { return probe(2) + dependency(3); }\n"
+            )
+            for name in (".clang-tidy", ".clang-tidy-strict"):
+                with self.subTest(config=name):
+                    result = subprocess.run(
+                        [
+                            str(tool),
+                            f"--config-file={repository / name}",
+                            "src/probe/probe.cc",
+                            "--",
+                            "-std=c++23",
+                            "-iquote",
+                            ".",
+                            "-iquote",
+                            "external/dependency",
+                        ],
+                        cwd=root,
+                        text=True,
+                        capture_output=True,
+                        check=False,
+                    )
+                    output = result.stdout + result.stderr
+                    self.assertNotEqual(result.returncode, 0, output)
+                    self.assertRegex(
+                        output,
+                        r"(?m)^(\./)?src/probe/probe\.h:3:\d+: error: .*"
+                        r"\[bugprone-assignment-in-if-condition",
+                    )
+                    self.assertNotRegex(output, r"(?m)^(\./)?external/.*: error:")
 
     @unittest.skipUnless(
         os.environ.get("KWAQUE_TEST_TIDY_RUNNER"),

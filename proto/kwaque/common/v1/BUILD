@@ -1,14 +1,17 @@
 load("@protobuf//bazel:cc_proto_library.bzl", "cc_proto_library")
 load("@protobuf//bazel:proto_library.bzl", "proto_library")
 load("//bazel:build.bzl", "kwaque_cc_library")
-load("//bazel:test.bzl", "kwaque_cc_fuzz_test", "kwaque_cc_seastar_test", "kwaque_cc_test")
+load("//bazel:test.bzl", "kwaque_cc_seastar_test", "kwaque_cc_test")
 
 package(default_visibility = ["//visibility:private"])
 
 proto_library(
     name = "identity_proto",
     srcs = ["identity.proto"],
-    visibility = ["//proto/kwaque/control/v1:__pkg__"],
+    visibility = [
+        "//proto:__pkg__",
+        "//proto/kwaque/control/v1:__pkg__",
+    ],
 )
 
 cc_proto_library(
@@ -23,7 +26,10 @@ cc_proto_library(
 proto_library(
     name = "capability_proto",
     srcs = ["capability.proto"],
-    visibility = ["//proto/kwaque/control/v1:__pkg__"],
+    visibility = [
+        "//proto:__pkg__",
+        "//proto/kwaque/control/v1:__pkg__",
+    ],
 )
 
 cc_proto_library(
@@ -38,7 +44,10 @@ cc_proto_library(
 proto_library(
     name = "error_proto",
     srcs = ["error.proto"],
-    visibility = ["//proto/kwaque/control/v1:__pkg__"],
+    visibility = [
+        "//proto:__pkg__",
+        "//proto/kwaque/control/v1:__pkg__",
+    ],
     deps = [":identity_proto"],
 )
 
@@ -65,28 +74,13 @@ cc_proto_library(
 
 kwaque_cc_library(
     name = "build_info_codec",
+    testonly = True,
     srcs = ["build_info_codec.cc"],
     hdrs = ["build_info_codec.h"],
-    visibility = ["//visibility:public"],
-    deps = [":build_info_cc_proto"],
-)
-
-genrule(
-    name = "build_info_fuzz_seed_truncated",
-    outs = ["testdata/build_info_fuzz_corpus/truncated.pb"],
-    cmd = "printf '\\x0a\\x05" + "0.1.0" + "\\x12\\x10" + "0123456789abcdef" + "\\x1a\\x07" + "releas' > $@",
-)
-
-genrule(
-    name = "build_info_fuzz_seed_unknown_field",
-    outs = ["testdata/build_info_fuzz_corpus/unknown_field.pb"],
-    cmd = "printf '\\x20\\x01' > $@",
-)
-
-genrule(
-    name = "build_info_fuzz_seed_valid",
-    outs = ["testdata/build_info_fuzz_corpus/valid.pb"],
-    cmd = "printf '\\x0a\\x05" + "0.1.0" + "\\x12\\x10" + "0123456789abcdef" + "\\x1a\\x07" + "release' > $@",
+    deps = [
+        ":build_info_cc_proto",
+        "//src/base",
+    ],
 )
 
 kwaque_cc_library(
@@ -105,27 +99,6 @@ kwaque_cc_test(
     name = "build_info_test",
     srcs = ["build_info_test.cc"],
     data = ["testdata/build_info_v1.hex"],
-    deps = [":build_info_codec"],
-)
-
-kwaque_cc_fuzz_test(
-    name = "build_info_fuzz",
-    srcs = ["build_info_fuzz.cc"],
-    args = [
-        "-dict=$(rootpath :build_info_fuzz.dict)",
-        "-max_len=4096",
-        "-rss_limit_mb=512",
-    ],
-    corpus = [
-        ":build_info_fuzz_seed_truncated",
-        ":build_info_fuzz_seed_unknown_field",
-        ":build_info_fuzz_seed_valid",
-    ],
-    data = ["build_info_fuzz.dict"],
-    tags = [
-        "resources:cpu:1",
-        "resources:memory:512",
-    ],
     deps = [":build_info_codec"],
 )
 

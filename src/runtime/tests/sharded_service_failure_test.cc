@@ -150,11 +150,14 @@ public:
     seastar::future<> start() { return seastar::make_ready_future<>(); }
     void request_abort() {}
     seastar::future<> stop() { return seastar::make_ready_future<>(); }
+    // Resolves once wait() holds its invocation on this shard.
+    seastar::future<> entered() { return entered_.get_future(); }
     seastar::future<> wait() {
         if (pending_invocation != nullptr) {
             throw std::logic_error("concurrent invocation on one shard");
         }
         pending_invocation = &release_;
+        entered_.set_value();
         co_await release_.get_future();
         pending_invocation = nullptr;
     }
@@ -162,6 +165,7 @@ public:
 private:
     std::reference_wrapper<std::atomic<unsigned>> destroyed_;
     seastar::promise<> release_;
+    seastar::promise<> entered_;
 };
 
 seastar::future<> verify_invocation_drain(unsigned target, bool fanout) {
@@ -187,10 +191,16 @@ seastar::future<> verify_invocation_drain(unsigned target, bool fanout) {
                             },
                             owner)
                           .discard_result();
-    // The following message is ordered after submission to the same target.
-    const bool entered = co_await seastar::smp::submit_to(
-      target, [] { return pending_invocation != nullptr; });
-    BOOST_REQUIRE(entered);
+    // Separate submissions to one shard are not ordered against each other,
+    // so every invoked service reports that it holds its call before stop.
+    const auto entered = [](invocation_service& service) {
+        return service.entered();
+    };
+    if (fanout) {
+        co_await services.invoke_on_all(entered);
+    } else {
+        co_await services.invoke_on_owner(owner, entered);
+    }
     auto stopping = services.stop();
     co_await seastar::yield();
     BOOST_CHECK(!stopping.available());

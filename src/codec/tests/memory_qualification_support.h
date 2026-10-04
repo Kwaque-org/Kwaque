@@ -28,7 +28,7 @@ using bytes::testing::charge;
 #if defined(SEASTAR_DEFAULT_ALLOCATOR)
 inline constexpr std::size_t fixture_fragment_bytes = 65536 - 32;
 #else
-inline constexpr std::size_t fixture_fragment_bytes = 65536;
+inline constexpr std::size_t fixture_fragment_bytes = 64_KiB;
 #endif
 
 inline void require(bool condition, const char* message) {

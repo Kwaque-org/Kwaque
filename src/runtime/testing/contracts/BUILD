@@ -109,6 +109,7 @@ kwaque_cc_library(
     ],
     deps = [
         ":cleanup",
+        "//src/base",
         "//src/bytes:fragmented_buffer_builder",
         "//src/runtime:network",
         "@seastar",

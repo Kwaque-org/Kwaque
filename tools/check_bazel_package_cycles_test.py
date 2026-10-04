@@ -11,7 +11,10 @@ from tools.check_bazel_package_cycles import (
     find_cycle,
     graph_from_query_xml,
     main,
+    mixed_test_frameworks,
     resolve_workspace,
+    unwrapped_cc_rules,
+    unwrapped_native_python_tests,
 )
 
 
@@ -94,6 +97,75 @@ class PackageCycleTest(unittest.TestCase):
         self.assertEqual(
             find_cycle(graph_from_query_xml(query_xml)),
             ["//src", "//src/model", "//src"],
+        )
+
+    def test_rejects_cc_rules_without_a_kwaque_macro(self) -> None:
+        query_xml = """\
+<query version="2">
+  <rule class="cc_library" name="//src/model:wrapped">
+    <string name="generator_function" value="kwaque_cc_library"/>
+  </rule>
+  <rule class="cc_test" name="//bazel/tests:raw_test"/>
+  <rule class="cc_binary" name="//src/broker:launcher">
+    <string name="generator_function" value="kwaque_launcher"/>
+  </rule>
+  <rule class="cc_proto_library" name="//proto/kwaque/common/v1:build_info_cc_proto"/>
+  <rule class="cc_library" name="@seastar//:seastar"/>
+</query>
+"""
+        self.assertEqual(unwrapped_cc_rules(query_xml), ["//bazel/tests:raw_test"])
+
+    def test_rejects_tests_that_link_two_test_frameworks(self) -> None:
+        query_xml = """\
+<query version="2">
+  <rule class="cc_test" name="//src/a:mixed_test">
+    <rule-input name="//src/a:support"/>
+    <rule-input name="@googletest//:gtest"/>
+  </rule>
+  <rule class="cc_library" name="//src/a:support">
+    <rule-input name="@boost//:test.so"/>
+  </rule>
+  <rule class="cc_test" name="//src/a:boost_test">
+    <rule-input name="@boost//:test.so"/>
+  </rule>
+  <rule class="cc_test" name="//src/a:gtest_test">
+    <rule-input name="@googletest//:gtest"/>
+  </rule>
+</query>
+"""
+        self.assertEqual(mixed_test_frameworks(query_xml), ["//src/a:mixed_test"])
+
+    def test_rejects_raw_python_tests_that_reach_native_programs(self) -> None:
+        query_xml = """\
+<query version="2">
+  <rule class="py_test" name="//tests/smoke:raw_smoke_test">
+    <rule-input name="//src/broker:kwaque"/>
+  </rule>
+  <rule class="py_test" name="//bazel/packaging:raw_archive_test">
+    <rule-input name="//bazel/packaging:archive"/>
+  </rule>
+  <rule class="pkg_tar" name="//bazel/packaging:archive">
+    <rule-input name="//src/broker:kwaque"/>
+  </rule>
+  <rule class="py_test" name="//tests/smoke:wrapped_smoke_test">
+    <string name="generator_function" value="kwaque_py_native_test"/>
+    <rule-input name="//src/broker:kwaque"/>
+  </rule>
+  <rule class="py_test" name="//src/a:bench_test">
+    <string name="generator_function" value="kwaque_cc_benchmark"/>
+    <rule-input name="//src/a:bench"/>
+  </rule>
+  <rule class="py_test" name="//bazel:pure_python_test"/>
+  <rule class="py_test" name="//tools:tool_test">
+    <rule-input name="//src/broker:kwaque"/>
+  </rule>
+  <rule class="cc_binary" name="//src/broker:kwaque"/>
+  <rule class="cc_binary" name="//src/a:bench"/>
+</query>
+"""
+        self.assertEqual(
+            unwrapped_native_python_tests(query_xml),
+            ["//bazel/packaging:raw_archive_test", "//tests/smoke:raw_smoke_test"],
         )
 
     def test_rejects_rule_without_name(self) -> None:

@@ -1,8 +1,9 @@
 load("@rules_pkg//pkg:mappings.bzl", "pkg_attributes", "pkg_files", "strip_prefix")
 load("@rules_pkg//pkg:tar.bzl", "pkg_tar")
-load("@rules_python//python:defs.bzl", "py_binary", "py_test")
+load("@rules_python//python:defs.bzl", "py_binary")
+load("//bazel:test.bzl", "kwaque_py_native_test")
 load("//bazel:versions.bzl", "KWAQUE_VERSION")
-load(":packaging.bzl", "patched_binary", "runtime_libraries", "sha256_file")
+load(":packaging.bzl", "sha256_file")
 
 package(default_visibility = ["//visibility:private"])
 
@@ -11,22 +12,12 @@ _PACKAGE_NAMES = {
     "@platforms//cpu:x86_64": "kwaque-{}-linux-x86_64".format(KWAQUE_VERSION),
 }
 
-patched_binary(
-    name = "packaged_kwaque_native",
-    out = "kwaque_native",
-    binary = "//src/broker:kwaque_native",
-)
-
-runtime_libraries(
-    name = "runtime_libraries",
-    openssl = "@openssl//:openssl_foreign_cc",
-)
-
 pkg_files(
     name = "binary_files",
     srcs = [
-        ":packaged_kwaque_native",
         "//src/broker:kwaque",
+        "//src/broker:kwaque_native",
+        "@seastar//:iotune",
     ],
     attributes = pkg_attributes(
         gid = 0,
@@ -37,27 +28,36 @@ pkg_files(
     strip_prefix = strip_prefix.files_only(),
 )
 
-pkg_files(
-    name = "runtime_library_files",
-    srcs = [":runtime_libraries"],
-    attributes = pkg_attributes(
-        gid = 0,
-        mode = "0644",
-        uid = 0,
-    ),
-    prefix = "lib",
-    strip_prefix = strip_prefix.files_only(),
-)
-
+# The installed configuration is the production example; the development
+# example ships beside it under a name that cannot be mistaken for it.
 pkg_files(
     name = "config_files",
-    srcs = ["//conf:kwaque_config"],
+    srcs = [
+        "//conf:kwaque.production.yaml",
+        "//conf:kwaque.yaml",
+    ],
     attributes = pkg_attributes(
         gid = 0,
         mode = "0644",
         uid = 0,
     ),
     prefix = "etc/kwaque",
+    renames = {
+        "//conf:kwaque.production.yaml": "kwaque.yaml",
+        "//conf:kwaque.yaml": "kwaque.development.yaml",
+    },
+)
+
+# A reference unit, not installed: the operator copies it into place.
+pkg_files(
+    name = "systemd_files",
+    srcs = ["//conf:kwaque.service"],
+    attributes = pkg_attributes(
+        gid = 0,
+        mode = "0644",
+        uid = 0,
+    ),
+    prefix = "share/kwaque/systemd",
     strip_prefix = strip_prefix.files_only(),
 )
 
@@ -205,6 +205,18 @@ pkg_files(
 )
 
 pkg_files(
+    name = "utf8_range_license",
+    srcs = ["@protobuf//third_party/utf8_range:LICENSE"],
+    attributes = pkg_attributes(
+        gid = 0,
+        mode = "0644",
+        uid = 0,
+    ),
+    prefix = "licenses/utf8_range",
+    strip_prefix = strip_prefix.files_only(),
+)
+
+pkg_files(
     name = "seastar_license",
     srcs = ["@seastar//:license_files"],
     attributes = pkg_attributes(
@@ -229,18 +241,6 @@ pkg_files(
 )
 
 pkg_files(
-    name = "xxhash_license",
-    srcs = ["@xxhash//:LICENSE"],
-    attributes = pkg_attributes(
-        gid = 0,
-        mode = "0644",
-        uid = 0,
-    ),
-    prefix = "licenses/xxhash",
-    strip_prefix = strip_prefix.files_only(),
-)
-
-pkg_files(
     name = "yaml_cpp_license",
     srcs = ["@yaml-cpp//:LICENSE"],
     attributes = pkg_attributes(
@@ -249,6 +249,18 @@ pkg_files(
         uid = 0,
     ),
     prefix = "licenses/yaml-cpp",
+    strip_prefix = strip_prefix.files_only(),
+)
+
+pkg_files(
+    name = "zlib_license",
+    srcs = ["@zlib//:LICENSE"],
+    attributes = pkg_attributes(
+        gid = 0,
+        mode = "0644",
+        uid = 0,
+    ),
+    prefix = "licenses/zlib",
     strip_prefix = strip_prefix.files_only(),
 )
 
@@ -267,11 +279,12 @@ _PACKAGE_SRCS = [
     ":lz4_license",
     ":openssl_license",
     ":protobuf_license",
-    ":runtime_library_files",
     ":seastar_license",
+    ":systemd_files",
     ":unordered_dense_license",
-    ":xxhash_license",
+    ":utf8_range_license",
     ":yaml_cpp_license",
+    ":zlib_license",
 ]
 
 pkg_tar(
@@ -305,9 +318,9 @@ sha256_file(
     visibility = ["//visibility:public"],
 )
 
-py_test(
+# The archive holds the native broker, so this test uses the native macro.
+kwaque_py_native_test(
     name = "package_contents_test",
-    size = "small",
     srcs = ["package_contents_test.py"],
     args = [
         "$(rootpath :kwaque_tar)",
@@ -318,65 +331,21 @@ py_test(
         ":kwaque_tar_sha256",
     ],
     main = "package_contents_test.py",
+    tags = ["package"],
 )
 
-pkg_tar(
-    name = "reproducibility_archive_a",
-    testonly = True,
-    srcs = _PACKAGE_SRCS,
-    allow_duplicates_with_different_content = False,
-    extension = "tar.gz",
-    package_dir = select(_PACKAGE_NAMES),
-    package_file_name = select({
-        architecture: "reproducibility/a/" + name + ".tar.gz"
-        for architecture, name in _PACKAGE_NAMES.items()
-    }),
-    portable_mtime = True,
-    stamp = 0,
-)
-
-pkg_tar(
-    name = "reproducibility_archive_b",
-    testonly = True,
-    srcs = _PACKAGE_SRCS,
-    allow_duplicates_with_different_content = False,
-    extension = "tar.gz",
-    package_dir = select(_PACKAGE_NAMES),
-    package_file_name = select({
-        architecture: "reproducibility/b/" + name + ".tar.gz"
-        for architecture, name in _PACKAGE_NAMES.items()
-    }),
-    portable_mtime = True,
-    stamp = 0,
-)
-
-py_test(
-    name = "package_reproducibility_test",
-    size = "small",
-    srcs = ["package_reproducibility_test.py"],
-    args = [
-        "$(rootpath :reproducibility_archive_a)",
-        "$(rootpath :reproducibility_archive_b)",
-    ],
-    data = [
-        ":reproducibility_archive_a",
-        ":reproducibility_archive_b",
-    ],
-    main = "package_reproducibility_test.py",
-)
-
-py_test(
+kwaque_py_native_test(
     name = "package_smoke_test",
-    size = "small",
     timeout = "short",
     srcs = ["package_smoke_test.py"],
     args = ["$(rootpath :kwaque_tar)"],
     data = [":kwaque_tar"],
     main = "package_smoke_test.py",
     tags = [
+        "package",
         "requires-network",
-        "resources:cpu:1",
-        "resources:memory:128",
+        "resources:cpu:2",
+        "resources:memory:384",
         "smoke",
     ],
     deps = ["//tests/smoke:broker_test_support"],

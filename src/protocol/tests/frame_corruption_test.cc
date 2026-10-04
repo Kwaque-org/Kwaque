@@ -1,3 +1,4 @@
+#include "src/base/units.h"
 #include "src/protocol/batch_frame_codec.h"
 #include "src/protocol/tests/batch_frame_test_support.h"
 
@@ -27,7 +28,7 @@ reserve(const fragmented_buffer_parser& input, codec::cooperative_work& work) {
     return codec::reserve_decode_input(
              input,
              work.policy(),
-             {fixture::parent_budget, byte_count{1U << 20U}, fixture::charge},
+             {fixture::parent_budget, byte_count{1_MiB}, fixture::charge},
              fixture::context)
       .value();
 }

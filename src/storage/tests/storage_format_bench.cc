@@ -1,3 +1,4 @@
+#include "src/base/units.h"
 #include "src/codec/tests/benchmark_buffer.h"
 #include "src/codec/tests/qualification_profile.h"
 #include "src/codec/xxh3_cooperative.h"
@@ -141,7 +142,7 @@ public:
                    byte_count{tail}},
                   source_->history.alignment,
                   work.policy(),
-                  {byte_count{65536}, byte_count{65536}});
+                  {byte_count{64_KiB}, byte_count{64_KiB}});
                 perf_tests::do_not_optimize(result);
                 require(
                   result && result->encoded_bytes() == wire_.size(),
@@ -291,7 +292,7 @@ public:
 
 private:
     codec::decode_budget budget() const {
-        return {remaining_, byte_count{1U << 20U}, capacity_bound};
+        return {remaining_, byte_count{1_MiB}, capacity_bound};
     }
     template<operation Op>
     auto decode(

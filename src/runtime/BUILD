@@ -1,4 +1,4 @@
-load("//bazel:build.bzl", "kwaque_cc_binary", "kwaque_cc_library")
+load("//bazel:build.bzl", "kwaque_cc_library")
 
 package(default_visibility = ["//visibility:private"])
 
@@ -283,11 +283,4 @@ kwaque_cc_library(
         "//src/base:invariant",
         "@seastar",
     ],
-)
-
-kwaque_cc_binary(
-    name = "reactor_probe",
-    srcs = ["reactor_probe.cc"],
-    visibility = ["//visibility:public"],
-    deps = ["@seastar"],
 )

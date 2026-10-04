@@ -182,7 +182,7 @@ SEASTAR_TEST_CASE(shutdown_stage_names_are_bounded_and_single_line) {
 SEASTAR_TEST_CASE(
   lifecycle_can_retain_failed_start_for_owner_ordered_rollback) {
     seastar::abort_source abort_source;
-    kwaque::broker::service_lifecycle lifecycle{abort_source, false};
+    kwaque::broker::service_lifecycle lifecycle{abort_source};
     std::array<unsigned, 2> stopped{};
     std::size_t count{};
     co_await lifecycle.start_step(

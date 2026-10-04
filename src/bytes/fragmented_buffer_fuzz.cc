@@ -1,3 +1,4 @@
+#include "src/base/units.h"
 #include "src/bytes/fragmented_buffer.h"
 #include "src/bytes/fragmented_buffer_builder.h"
 #include "src/bytes/fragmented_buffer_parser.h"
@@ -19,7 +20,7 @@ namespace {
 using namespace kwaque;
 using namespace kwaque::bytes;
 
-constexpr std::size_t max_input_size = 4096;
+constexpr std::size_t max_input_size = 4_KiB;
 constexpr std::size_t max_operations = 192;
 
 void require(bool condition) {

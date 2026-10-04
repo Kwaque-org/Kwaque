@@ -1,9 +1,10 @@
 kwaque:
   schema_version: 1
-  node_id: 7
-  data_directory: ./fuzz-data
+  data_directory: "./fuzz-data"
   admin:
     address: 127.0.0.1
     port: 9644
-  log_level: debug
   developer_mode: true
+  storage_strict_data_init: false
+  crash_loop_limit: ~
+  diagnostic_memory_per_shard_bytes: 134217728

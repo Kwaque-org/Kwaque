@@ -1,5 +1,6 @@
 #include "src/storage/tests/segment_bench_fixture.h"
 
+#include "src/base/units.h"
 #include "src/codec/tests/benchmark_buffer.h"
 #include "src/codec/transaction.h"
 #include "src/codec/xxh3.h"
@@ -20,7 +21,7 @@ namespace kwaque::storage::testing::segment_bench_support {
 namespace {
 using bytes::testing::charge;
 using store_contract::require;
-static_assert(sizeof(group_input) <= 4096);
+static_assert(sizeof(group_input) <= 4_KiB);
 #if defined(_LIBCPP_ABI_USE_SMALL_DEQUE_BLOCK_SIZE)
 constexpr std::size_t group_block_entries = sizeof(group_input) < 128
                                               ? 512 / sizeof(group_input)
@@ -32,7 +33,7 @@ constexpr std::size_t group_block_entries = sizeof(group_input) < 256
 #endif
 
 codec::decode_budget memory() {
-    return {working_bytes, byte_count{1U << 20U}, charge};
+    return {working_bytes, byte_count{1_MiB}, charge};
 }
 storage::coverage prefix(
   const segment_history_context& history,
@@ -80,8 +81,8 @@ seastar::future<encoded_assigned_batch> make_child(
   std::uint64_t sequence,
   codec::cooperative_work& work) {
     const auto records = std::max<std::size_t>(
-      1, selected.payload_bytes / (1U << 20U));
-    const auto size = selected.payload_bytes == (8U << 20U) ? 1048565U
+      1, selected.payload_bytes / 1_MiB);
+    const auto size = selected.payload_bytes == 8_MiB ? 1048565U
                       : selected.payload_bytes == 0
                         ? 64U
                         : selected.payload_bytes / records - 1024U;
@@ -120,9 +121,9 @@ seastar::future<encoded_assigned_batch> make_child(
            working_bytes))
           .value();
     auto submitted = (co_await builder.finalize(work, working_bytes)).value();
-    if (selected.payload_bytes == (8U << 20U))
+    if (selected.payload_bytes == 8_MiB)
         require(
-          submitted.records().size() == byte_count{8U << 20U},
+          submitted.records().size() == byte_count{8_MiB},
           "maximum segment fixture has wrong expanded size");
     auto assigned = model::assigned_batch::assign(
                       std::move(submitted), logical, binding)
@@ -178,10 +179,10 @@ codec::limits policy(const shape& selected) {
 seastar::future<extent_input> make_extent(
   const shape& selected, std::uint32_t index, codec::cooperative_work& work) {
     require(
-      selected.batches() <= maximum_batches && index < maximum_segments
+      selected.batches() <= maximum_batches && index < maximum_extent_segments
         && selected.blocks > 0 && selected.blocks <= maximum_group_blocks
         && selected.window > 0 && selected.window <= 8
-        && (selected.payload_bytes == 0 || (selected.payload_bytes >= 1024 && selected.payload_bytes <= (8U << 20U))),
+        && (selected.payload_bytes == 0 || (selected.payload_bytes >= 1_KiB && selected.payload_bytes <= 8_MiB)),
       "segment benchmark shape exceeds its bound");
     auto descriptor = installation_contract::descriptor();
     descriptor.segment
@@ -198,7 +199,7 @@ seastar::future<extent_input> make_extent(
         descriptor.logical_origin = model::range_logical_end{
           descriptor.logical_origin.value()
           + std::uint64_t{index} * selected.batches()
-              * std::max<std::size_t>(1, selected.payload_bytes / (1U << 20U))};
+              * std::max<std::size_t>(1, selected.payload_bytes / 1_MiB)};
     descriptor.alignment
       = storage_alignment::make(byte_count{selected.alignment}).value();
     auto header = (co_await encode_segment_header(
@@ -237,7 +238,7 @@ seastar::future<extent_input> make_extent(
                                  {}},
                                 descriptor.alignment,
                                 work.policy(),
-                                {byte_count{65536}, byte_count{65536}})
+                                {byte_count{64_KiB}, byte_count{64_KiB}})
                                 .value()
                                 .encoded_bytes();
     std::uint32_t batch = 0;
@@ -475,6 +476,68 @@ encode_extent(extent_input& input, codec::cooperative_work& work) {
         (co_await verifier.add_footer(footer, memory(), work, checkpoint))
           .value();
     }
+    co_return verifier.finish(work).value();
+}
+
+seastar::future<verified_extent> encode_cut_extent(
+  const extent_input& input,
+  std::span<encoded_assigned_batch> children,
+  std::span<const std::uint32_t> cuts,
+  codec::cooperative_work& work) {
+    const auto& history = input.history;
+    const model::batch_decode_expectation expected{
+      history.segment.topic(), history.segment.range()};
+    const auto footer_bytes = aligned_envelope_layout::make(
+                                {byte_count{codec::envelope_prefix_bytes},
+                                 durable_footer_fixed_bytes,
+                                 {}},
+                                history.alignment,
+                                work.policy(),
+                                {byte_count{64_KiB}, byte_count{64_KiB}})
+                                .value()
+                                .encoded_bytes();
+    auto verifier = empty_verifier(history, work.policy());
+    auto logical = history.logical_origin;
+    auto physical = history.physical_origin;
+    auto position = history.data_start;
+    std::size_t next = 0;
+    for (const auto size : cuts) {
+        require(
+          size != 0 && size <= children.size() - next,
+          "group cut exceeds the supplied children");
+        std::vector<segment_block> blocks;
+        blocks.reserve(size);
+        // Blocks are contiguous inside a group; its one footer follows them.
+        for (std::uint32_t i = 0; i < size; ++i, ++next) {
+            auto block = (co_await encode_segment_block(
+                            std::move(children[next]),
+                            placement(history, physical, position),
+                            work,
+                            working_bytes,
+                            charge))
+                           .value();
+            const auto covered = block.descriptor().coverage();
+            logical = covered.logical().end();
+            physical = covered.physical().end();
+            position = covered.bytes().end();
+            blocks.push_back(std::move(block));
+        }
+        const auto end = position.checked_add(footer_bytes).value();
+        verifier.extend_expected(prefix(history, logical, physical, end), work)
+          .value();
+        for (const auto& block : blocks)
+            (co_await verifier.add_block(block, expected, memory(), work))
+              .value();
+        const auto checkpoint = verifier.checkpoint(work).value();
+        auto footer
+          = (co_await encode_durable_footer(
+               checkpoint, {history, position}, work, working_bytes, charge))
+              .value();
+        (co_await verifier.add_footer(footer, memory(), work, checkpoint))
+          .value();
+        position = end;
+    }
+    require(next == children.size(), "group cuts omit supplied children");
     co_return verifier.finish(work).value();
 }
 

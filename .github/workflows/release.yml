@@ -1,0 +1,112 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v[0-9]+.[0-9]+.[0-9]+'
+      - 'v[0-9]+.[0-9]+.[0-9]+-*'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  package:
+    name: Release package (${{ matrix.runner }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 150
+    permissions:
+      contents: read
+      # Signs the provenance attestation for the archive.
+      id-token: write
+      attestations: write
+    strategy:
+      matrix:
+        runner:
+          - ubuntu-24.04
+          - ubuntu-24.04-arm
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/setup-build
+      - name: Allow concurrent linux-aio reactors
+        run: sudo sysctl -w fs.aio-max-nr=1048576
+      - name: Build and test the release package
+        id: tests
+        run: >-
+          bazel test --config=ci-release
+          --//bazel:reactor_backend=linux-aio
+          --test_tag_filters=package
+          //bazel/packaging:all
+      - name: Require the tagged version, built from a clean tree
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          bazel-bin/src/broker/kwaque --version > version.txt
+          python3 - "${TAG}" version.txt <<'CHECK'
+          import sys
+          tag, path = sys.argv[1], sys.argv[2]
+          line = open(path, encoding="utf-8").read().strip()
+          fields = dict(field.split("=", 1) for field in line.split("\t"))
+          errors = []
+          if tag != "v" + fields["version"]:
+              errors.append(f"tag {tag} does not name version {fields['version']}")
+          if "-dev" in fields["version"]:
+              errors.append("a development version cannot be released")
+          if fields["dirty"] != "false":
+              errors.append("the build saw uncommitted changes")
+          if fields["build_mode"] != "opt":
+              errors.append("the package was not built optimized")
+          for error in errors:
+              print(error, file=sys.stderr)
+          sys.exit(1 if errors else 0)
+          CHECK
+      - name: Attest the build provenance
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: bazel-bin/bazel/packaging/kwaque-*.tar.gz
+      - name: Keep the archive for publication
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-${{ runner.arch }}
+          path: |
+            bazel-bin/bazel/packaging/kwaque-*.tar.gz
+            bazel-bin/bazel/packaging/kwaque-*.tar.gz.sha256
+          retention-days: 7
+          if-no-files-found: error
+      - name: Retain failed test diagnostics
+        if: failure() && steps.tests.outcome == 'failure'
+        uses: ./.github/actions/retain-logs
+        with:
+          name: release-${{ github.job }}-${{ runner.arch }}-${{ github.run_attempt }}
+
+  publish:
+    name: Draft the GitHub release
+    needs: package
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      - name: Download both packages
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: release-*
+          path: release
+          merge-multiple: true
+      - name: Create a draft release for review
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        # A maintainer reviews and publishes the draft. Consumers verify an
+        # archive with `gh attestation verify <archive> --repo <owner/repo>`.
+        run: >-
+          gh release create "${TAG}" release/*
+          --repo "${GITHUB_REPOSITORY}"
+          --draft --verify-tag --title "${TAG}" --generate-notes

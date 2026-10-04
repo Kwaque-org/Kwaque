@@ -1,3 +1,4 @@
+#include "src/base/units.h"
 #include "src/codec/tests/allocation_observer.h"
 #include "src/codec/tests/benchmark_buffer.h"
 #include "src/codec/tests/memory_qualification_support.h"
@@ -111,12 +112,12 @@ struct wal_bench {
                       manager.acquire_workload(
                         resource::workload_class::metadata),
                       {.tasks = 128,
-                       .bytes = byte_count{96U << 20U},
+                       .bytes = byte_count{96_MiB},
                        .handles = 32},
                       charge};
                     auto config = wal_writer_contract::configuration();
-                    config.capacity_bytes = byte_count{128U << 20U};
-                    config.children.working_bytes = byte_count{16U << 20U};
+                    config.capacity_bytes = byte_count{128_MiB};
+                    config.children.working_bytes = byte_count{16_MiB};
                     co_await wal_append_contract::with_writer(
                       files,
                       owner,
@@ -133,13 +134,13 @@ struct wal_bench {
                                   std::move(child).release_bytes(),
                                   257,
                                   work,
-                                  byte_count{32U << 20U},
+                                  byte_count{32_MiB},
                                   1020);
                               child = (co_await validate_encoded_assigned_batch(
                                          std::move(fragmented),
                                          batch_expected(),
-                                         {byte_count{32U << 20U},
-                                          byte_count{1U << 20U},
+                                         {byte_count{32_MiB},
+                                          byte_count{1_MiB},
                                           charge},
                                          work))
                                         .value();
@@ -177,8 +178,8 @@ struct wal_bench {
                           // the timed/observed interval and remains separately
                           // charged.
                           auto alias = (co_await child.share(
-                                          {byte_count{32U << 20U},
-                                           byte_count{1U << 20U},
+                                          {byte_count{32_MiB},
+                                           byte_count{1_MiB},
                                            charge},
                                           work))
                                          .value();
@@ -186,7 +187,7 @@ struct wal_bench {
                                              std::move(alias),
                                              context,
                                              work,
-                                             byte_count{32U << 20U},
+                                             byte_count{32_MiB},
                                              charge))
                                             .value();
                           auto expected_charge = take(
@@ -257,9 +258,9 @@ struct wal_bench {
                             !preallocate || (!Noop && !Rotation),
                             "preallocation requires a disk append case");
                           const auto extent = ((8192 + encoded_bytes.value()
-                                                + (2U << 20U) - 1)
-                                               / (2U << 20U))
-                                              * (2U << 20U);
+                                                + 2_MiB - 1)
+                                               / 2_MiB)
+                                              * 2_MiB;
                           bool stop_foreground = false;
                           std::uint64_t foreground_turns = 0;
                           auto foreground_work = [&] -> seastar::future<> {
@@ -395,7 +396,7 @@ struct wal_bench {
                                                   std::move(reference->batch),
                                                   context,
                                                   work,
-                                                  byte_count{32U << 20U},
+                                                  byte_count{32_MiB},
                                                   charge))
                                                  .value();
                                   }
@@ -642,7 +643,7 @@ struct wal_bench {
                                        offset < encoded_bytes.value();) {
                                       const auto length = byte_count{
                                         std::min<std::uint64_t>(
-                                          65536,
+                                          64_KiB,
                                           encoded_bytes.value() - offset)};
                                       auto actual = take(
                                         co_await file.read(
@@ -693,20 +694,20 @@ struct wal_bench {
 WAL_COST_CASE(tiny_noop_written, 0, false, true, false)
 WAL_COST_CASE(tiny_disk_written, 0, false, false, false)
 WAL_COST_CASE(tiny_disk_barrier, 0, false, false, true)
-WAL_COST_CASE(k128_noop_written, 131072, false, true, false)
-WAL_COST_CASE(k128_disk_written, 131072, false, false, false)
-WAL_COST_CASE(k128_disk_barrier, 131072, false, false, true)
-WAL_COST_CASE(m4_noop_written, 4U << 20U, false, true, false)
-WAL_COST_CASE(m4_disk_written, 4U << 20U, false, false, false)
-WAL_COST_CASE(m4_disk_barrier, 4U << 20U, false, false, true)
-WAL_COST_CASE(maximum_noop_written, 8U << 20U, false, true, false)
-WAL_COST_CASE(maximum_disk_written, 8U << 20U, false, false, false)
-WAL_COST_CASE(maximum_disk_barrier, 8U << 20U, false, false, true)
-WAL_COST_CASE(fragmented_noop_written, 131072, true, true, false)
-WAL_COST_CASE(fragmented_disk_barrier, 131072, true, false, true)
+WAL_COST_CASE(k128_noop_written, 128_KiB, false, true, false)
+WAL_COST_CASE(k128_disk_written, 128_KiB, false, false, false)
+WAL_COST_CASE(k128_disk_barrier, 128_KiB, false, false, true)
+WAL_COST_CASE(m4_noop_written, 4_MiB, false, true, false)
+WAL_COST_CASE(m4_disk_written, 4_MiB, false, false, false)
+WAL_COST_CASE(m4_disk_barrier, 4_MiB, false, false, true)
+WAL_COST_CASE(maximum_noop_written, 8_MiB, false, true, false)
+WAL_COST_CASE(maximum_disk_written, 8_MiB, false, false, false)
+WAL_COST_CASE(maximum_disk_barrier, 8_MiB, false, false, true)
+WAL_COST_CASE(fragmented_noop_written, 128_KiB, true, true, false)
+WAL_COST_CASE(fragmented_disk_barrier, 128_KiB, true, false, true)
 #undef WAL_COST_CASE
 PERF_TEST_F(wal_bench, writer_disk_rotation) {
-    return (measure<131072, false, false, true, false, true>());
+    return (measure<128_KiB, false, false, true, false, true>());
 }
 
 #define WAL_PREENCODED(Name, Size, Fragmented, Noop)                           \
@@ -714,10 +715,10 @@ PERF_TEST_F(wal_bench, writer_disk_rotation) {
         return (measure<Size, Fragmented, Noop, true, true, false, true>());   \
     }
 WAL_PREENCODED(tiny_disk_barrier, 0, false, false)
-WAL_PREENCODED(k128_disk_barrier, 131072, false, false)
-WAL_PREENCODED(m4_disk_barrier, 4U << 20U, false, false)
-WAL_PREENCODED(maximum_disk_barrier, 8U << 20U, false, false)
-WAL_PREENCODED(fragmented_disk_barrier, 131072, true, false)
-WAL_PREENCODED(m4_noop_barrier, 4U << 20U, false, true)
+WAL_PREENCODED(k128_disk_barrier, 128_KiB, false, false)
+WAL_PREENCODED(m4_disk_barrier, 4_MiB, false, false)
+WAL_PREENCODED(maximum_disk_barrier, 8_MiB, false, false)
+WAL_PREENCODED(fragmented_disk_barrier, 128_KiB, true, false)
+WAL_PREENCODED(m4_noop_barrier, 4_MiB, false, true)
 #undef WAL_PREENCODED
 } // namespace kwaque::storage::testing

@@ -7,6 +7,8 @@ def kwaque_copts():
         "-Wextra",
         "-Wpedantic",
         "-Wconversion",
+        "-Wdeprecated",
+        "-Werror=unused-result",
         "-Wformat=2",
         "-Wimplicit-fallthrough",
         "-Wno-missing-field-initializers",

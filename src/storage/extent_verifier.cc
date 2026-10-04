@@ -2,6 +2,7 @@
 
 #include "src/storage/footer_internal.h"
 #include "src/storage/format_internal.h"
+#include "src/storage/page_internal.h"
 
 #include <exception>
 #include <limits>
@@ -72,6 +73,159 @@ codec::result<extent_verifier> extent_verifier::make(
         return codec::failure(at(errc::invalid_argument, context));
     return extent_verifier{history, expected, policy, kind, integrity};
 }
+seastar::future<codec::result<resumed_extent>> extent_verifier::resume(
+  footer_expectation pinned,
+  codec::immutable_object_digest digest,
+  storage::coverage expected,
+  bytes::fragmented_buffer&& source,
+  codec::decode_budget memory,
+  codec::cooperative_work& work,
+  codec::field_context context) {
+    auto owned = std::move(source);
+    context.family = static_cast<std::uint16_t>(
+      codec::format_family::durable_boundary_footer);
+    const auto& history = pinned.history;
+    auto made = make(
+      history,
+      expected,
+      work.policy(),
+      extent_layout_kind::initial_append,
+      context);
+    if (!made) co_return codec::failure(made.error());
+    auto verifier = std::move(*made);
+    if (auto valid = detail::validate_footer_location(pinned, context); !valid)
+        co_return codec::failure(valid.error());
+    const auto end = pinned.position.checked_add(owned.size());
+    if (
+      owned.empty() || !end || pinned.position < expected.bytes().begin()
+      || *end > expected.bytes().end())
+        co_return codec::failure(at(errc::invalid_argument, context));
+    std::optional<bytes::fragmented_buffer_parser> parser;
+    std::optional<codec::result<durable_footer>> footer;
+    std::optional<codec::error> failed;
+    std::exception_ptr exception;
+    std::uint32_t crc = 0;
+    try {
+        do {
+            // Bytes that are not the pinned object are never decoded.
+            auto hashed = co_await detail::hash_exact(owned, work, context);
+            if (!hashed) {
+                failed = hashed.error();
+                break;
+            }
+            if (*hashed != digest) {
+                failed = at(errc::corrupt_data, context);
+                break;
+            }
+            const auto& policy = verifier.policy_;
+            const byte_count cap{
+              policy.config().max_encoded_body_bytes.value()
+              + policy.config().max_header_bytes.value()};
+            const auto cost = owned.allocation_cost(memory.charge);
+            if (!cost) {
+                failed = codec::detail::allocation_cost_error(
+                  cost.error(), context, context.origin);
+                break;
+            }
+            if (
+              auto valid = codec::detail::validate_decode_cost(
+                owned.size(), cap, *cost, policy, context, context.origin);
+              !valid) {
+                failed = valid.error();
+                break;
+            }
+            const auto alias = owned.slice_allocation_cost(
+              {}, owned.size(), memory.charge);
+            if (!alias) {
+                failed = codec::detail::allocation_cost_error(
+                  alias.error(), context, context.origin);
+                break;
+            }
+            if (
+              auto valid = codec::detail::validate_decode_cost(
+                owned.size(), cap, *alias, policy, context, context.origin);
+              !valid) {
+                failed = valid.error();
+                break;
+            }
+            const auto remaining = codec::detail::consume_decode_budget(
+              policy, memory, {}, alias->descriptors, context, context.origin);
+            if (!remaining) {
+                failed = remaining.error();
+                break;
+            }
+            auto shared = owned.share({}, owned.size());
+            if (!shared) {
+                failed = codec::detail::allocation_cost_error(
+                  shared.error(), context, context.origin);
+                break;
+            }
+            parser.emplace(std::move(*shared));
+            footer.emplace(
+              co_await decode_durable_footer(
+                *parser,
+                pinned,
+                *remaining,
+                work,
+                context,
+                codec::input_boundary::complete));
+            if (!footer->has_value()) {
+                failed = footer->error();
+                break;
+            }
+            if (!parser->at_end()) {
+                failed = at(errc::malformed_data, context);
+                break;
+            }
+            // The pin certifies a dense initial-append prefix from the
+            // origins to this footer, as the writer emits it.
+            const auto fields = (*footer)->boundary();
+            const auto& scope = fields.coverage;
+            if (
+              scope.logical().begin() != history.logical_origin
+              || scope.physical().begin() != history.physical_origin
+              || scope.bytes().begin() != history.data_start
+              || scope.bytes().end() != pinned.position
+              || scope.logical().count().value()
+                   != scope.physical().count().value()
+              || scope.logical().end() > expected.logical().end()
+              || scope.physical().end() > expected.physical().end()) {
+                failed = at(errc::malformed_data, context);
+                break;
+            }
+            auto summed = co_await detail::extend_validated_envelope(
+              owned, fields.data_crc32c, nullptr, work, context);
+            if (!summed) {
+                failed = summed.error();
+                break;
+            }
+            crc = *summed;
+        } while (false);
+    } catch (...) {
+        exception = std::current_exception();
+    }
+    if (parser) {
+        co_await work.drain_inline(work.byte_quantum(), work.item_quantum());
+        parser.reset();
+    }
+    co_await work.drain_inline(work.byte_quantum(), work.item_quantum());
+    owned = bytes::fragmented_buffer{};
+    if (!failed && !exception) {
+        if (auto polled = work.poll(at(errc::success, context)); !polled)
+            failed = polled.error();
+    }
+    if (exception) std::rethrow_exception(exception);
+    if (failed) co_return codec::failure(*failed);
+    const auto fields = (*footer)->boundary();
+    verifier.logical_ = fields.coverage.logical().end();
+    verifier.physical_ = fields.coverage.physical().end();
+    verifier.position_ = *end;
+    verifier.last_ = fields.last_block;
+    verifier.count_ = fields.block_count;
+    verifier.crc_ = crc;
+    co_return resumed_extent{std::move(verifier), **footer};
+}
+
 boundary_fields extent_verifier::prefix() const noexcept {
     return {
       storage::coverage{
@@ -163,6 +317,17 @@ codec::result<verified_extent> extent_verifier::finish(
             return codec::failure(ready.error());
     }
     return verified_extent{history_, {expected_, count_, last_, crc_}, digest};
+}
+codec::result<verified_extent> extent_verifier::finish_prefix(
+  codec::cooperative_work& work, codec::field_context context) {
+    if (auto valid = ready(work, context); !valid)
+        return codec::failure(valid.error());
+    if (kind_ != extent_layout_kind::initial_append) {
+        close();
+        return codec::failure(at(errc::invalid_argument, context));
+    }
+    expected_ = prefix().coverage;
+    return finish(work, context);
 }
 codec::result<extent_digest_walk>
 extent_verifier::deferred_digest(codec::field_context context) {

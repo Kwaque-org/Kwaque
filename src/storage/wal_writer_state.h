@@ -1,5 +1,6 @@
 #pragma once
 
+#include "src/base/units.h"
 #include "src/codec/cooperative.h"
 #include "src/runtime/file.h"
 #include "src/runtime/first_failure.h"
@@ -98,7 +99,10 @@ struct wal_write_completion final {
 class wal_write_descriptor final {
 public:
     using pointer = seastar::lw_shared_ptr<wal_write_descriptor>;
-    static constexpr byte_count minimum_execution_bytes{4096};
+    static constexpr byte_count minimum_execution_bytes{4_KiB};
+    // What make() reserves: the node, its queue chunk and execution state.
+    [[nodiscard]] static runtime::result<byte_count>
+    charge(const workload_budget&, byte_count execution_bytes);
     [[nodiscard]] static runtime::result<pointer> make(
       workload_budget&,
       model::file_byte_span,
@@ -224,5 +228,61 @@ struct wal_submission final {
     seastar::future<detail::wal_write_completion> written;
     model::file_byte_span extent;
     std::uint32_t members;
+};
+
+// rotate_required: the group fits only a fresh file. too_large: no file can
+// accept it within the writer and supplied bounds; a smaller group might.
+enum class wal_admission_decision : std::uint8_t {
+    fits,
+    rotate_required,
+    too_large
+};
+struct wal_admission_measure final {
+    wal_admission_decision decision{wal_admission_decision::too_large};
+    // Complete aligned PREPARE extent of the measured group.
+    byte_count encoded_bytes;
+};
+
+// Position-independent costs of one later submission, taken before its
+// caller commits irreversibly: working, assembly and descriptor allowances,
+// checked against the file and queue bounds at the reserved end it names.
+// It reserves no coordinates. Only a submission of at most these members,
+// bytes and costs, starting at that same reserved end, can consume it.
+class wal_submission_admission final {
+public:
+    wal_submission_admission(wal_submission_admission&&) noexcept = default;
+    wal_submission_admission& operator=(wal_submission_admission&&) = delete;
+    wal_submission_admission(const wal_submission_admission&) = delete;
+    wal_submission_admission&
+    operator=(const wal_submission_admission&) = delete;
+    [[nodiscard]] std::uint32_t members() const noexcept { return members_; }
+    [[nodiscard]] byte_count encoded_bytes() const noexcept { return extent_; }
+
+private:
+    template<runtime::file_system_backend Backend, typename Owner>
+    friend class wal_writer;
+    wal_submission_admission(
+      wal_captured_boundary start,
+      workload_reservation working,
+      workload_reservation encoded,
+      workload_reservation descriptor,
+      std::uint32_t members,
+      byte_count extent,
+      byte_count retained) noexcept
+      : start_(std::move(start))
+      , working_(std::move(working))
+      , encoded_(std::move(encoded))
+      , descriptor_(std::move(descriptor))
+      , members_(members)
+      , extent_(extent)
+      , retained_(retained) {}
+    wal_captured_boundary start_;
+    workload_reservation working_, encoded_, descriptor_;
+    std::uint32_t members_;
+    byte_count extent_, retained_;
+};
+struct wal_admission_outcome final {
+    wal_admission_measure measure;
+    std::optional<wal_submission_admission> admission;
 };
 } // namespace kwaque::storage

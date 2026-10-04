@@ -10,6 +10,7 @@ kwaque_cc_library(
         ":deterministic_random",
         "//src/codec:sha256",
         "//src/runtime:fault",
+        "//src/runtime:fault_api",
         "//src/runtime:random",
     ],
 )
@@ -175,6 +176,7 @@ kwaque_cc_library(
     deps = [
         ":scheduler",
         "//src/base:error",
+        "//src/runtime/testing:reactor_tasks",
         "@seastar",
     ],
 )

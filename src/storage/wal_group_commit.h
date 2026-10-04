@@ -1,5 +1,6 @@
 #pragma once
 
+#include "src/base/units.h"
 #include "src/runtime/timer.h"
 #include "src/storage/wal_writer.h"
 
@@ -16,6 +17,7 @@
 #include <cstdint>
 #include <memory>
 #include <optional>
+#include <span>
 #include <utility>
 
 namespace kwaque::storage {
@@ -27,14 +29,14 @@ inline constexpr std::uint32_t maximum_wal_commit_observers = 256;
 struct wal_group_commit_config final {
     std::uint32_t target_members{32};
     std::uint32_t maximum_members{maximum_wal_cohort_members};
-    byte_count target_bytes{4U * 1024U * 1024U};
+    byte_count target_bytes{4_MiB};
     byte_count maximum_bytes{runtime::maximum_file_io_bytes};
     std::uint32_t outstanding_groups{2};
     // Includes one pre-admitted observer per group; must be at least
     // outstanding_groups. Additional observers share this pool.
     std::uint32_t maximum_observers{64};
     runtime::monotonic_duration maximum_wait{1'000'000};
-    byte_count execution_bytes{4096};
+    byte_count execution_bytes{4_KiB};
     [[nodiscard]] runtime::result<void> validate() const noexcept;
 };
 
@@ -226,6 +228,38 @@ private:
     detail::wal_commit_node_ptr node_;
 };
 
+// A cohort node and the writer's admission for one later submission, taken
+// synchronously before the caller commits irreversibly (e.g. freezing target
+// positions). Consuming it can then fail only for a terminal owner state.
+// Dropping it releases both without effect.
+class wal_commit_admission final {
+public:
+    wal_commit_admission(wal_commit_admission&&) noexcept = default;
+    wal_commit_admission& operator=(wal_commit_admission&&) = delete;
+    wal_commit_admission(const wal_commit_admission&) = delete;
+    wal_commit_admission& operator=(const wal_commit_admission&) = delete;
+    [[nodiscard]] std::uint32_t members() const noexcept {
+        return writer_.members();
+    }
+    [[nodiscard]] byte_count encoded_bytes() const noexcept {
+        return writer_.encoded_bytes();
+    }
+
+private:
+    friend class wal_group_commit;
+    wal_commit_admission(
+      detail::wal_commit_node_ptr node,
+      wal_submission_admission writer) noexcept
+      : node_(std::move(node))
+      , writer_(std::move(writer)) {}
+    detail::wal_commit_node_ptr node_;
+    wal_submission_admission writer_;
+};
+struct wal_commit_admission_outcome final {
+    wal_admission_measure measure;
+    std::optional<wal_commit_admission> admission;
+};
+
 // Immutable, complete membership and the final writer-issued cut. Retaining
 // this value retains group admission, never an open file or the queue owner.
 class wal_flush_capture final {
@@ -317,6 +351,80 @@ public:
               admission,
               std::move(*node),
               operations_.hold());
+        } catch (...) {
+            return seastar::current_exception_as_future<
+              runtime::result<wal_commit_ticket>>();
+        }
+    }
+
+    // The same local admission as submit(), plus the writer's, taken now for a
+    // group whose members are measured with provisional targets. rotate_
+    // required and too_large return no admission. Rejection has no effect.
+    template<
+      runtime::monotonic_clock Clock,
+      runtime::file_system_backend Backend,
+      typename Owner>
+    [[nodiscard]] runtime::result<wal_commit_admission_outcome> admit(
+      wal_writer<Backend, Owner>& writer,
+      std::span<const wal_admission_member> members,
+      const codec::limits& policy,
+      std::optional<runtime::monotonic_time> origin = std::nullopt) {
+        assert_current();
+        if (stopped_ || closing_ || closed_ || first_.failed())
+            return runtime::failure(error(errc::closed));
+        if (submitting_ || rotating_)
+            return runtime::failure(error(errc::queue_full));
+        if (auto valid = writer.validate_capture(scope_); !valid)
+            return runtime::failure(valid.error());
+        auto current = writer.positions();
+        if (!current) return runtime::failure(current.error());
+        if (current->reserved != scope_.cursor())
+            return runtime::failure(error(errc::wrong_context));
+        const auto now = Clock::now();
+        auto node = reserve(members.size(), origin.value_or(now), now);
+        if (!node) return runtime::failure(node.error());
+        auto admitted = writer.admit_entered(
+          members, policy, submission_limits());
+        if (!admitted) return runtime::failure(admitted.error());
+        wal_commit_admission_outcome output{admitted->measure, std::nullopt};
+        if (admitted->admission)
+            output.admission.emplace(
+              wal_commit_admission{
+                std::move(*node), std::move(*admitted->admission)});
+        return output;
+    }
+
+    // Consumes an admission from admit() on this owner and writer. Only a
+    // terminal owner state or a group larger than admitted rejects.
+    template<
+      runtime::monotonic_clock Clock,
+      runtime::file_system_backend Backend,
+      typename Owner>
+    [[nodiscard]] seastar::future<runtime::result<wal_commit_ticket>> submit(
+      wal_writer<Backend, Owner>& writer,
+      wal_group&& offered,
+      wal_commit_admission&& admitted,
+      codec::cooperative_work& work) {
+        assert_current();
+        auto admission = std::move(admitted);
+        if (stopped_ || closing_ || closed_ || first_.failed())
+            return reject_submission(error(errc::closed));
+        if (submitting_ || rotating_)
+            return reject_submission(error(errc::queue_full));
+        if (
+          !admission.node_ || admission.node_->result->lifetime != lifetime_
+          || offered.size() == 0 || offered.size() > admission.node_->members)
+            return reject_submission(error(errc::wrong_context));
+        // A frozen membership may be smaller than the admitted one.
+        admission.node_->members = static_cast<std::uint32_t>(offered.size());
+        try {
+            return submit_owned<Clock>(
+              writer,
+              std::move(offered),
+              work,
+              std::move(admission.node_),
+              operations_.hold(),
+              std::move(admission.writer_));
         } catch (...) {
             return seastar::current_exception_as_future<
               runtime::result<wal_commit_ticket>>();
@@ -440,6 +548,12 @@ public:
     // Up to eight concurrent callers join the same close. Further pending
     // interests reject; calls after completion return the cached outcome.
     [[nodiscard]] seastar::future<runtime::result<void>> close();
+    // The member and byte bounds this owner submits one group under.
+    [[nodiscard]] wal_submission_limits submission_limits() const noexcept {
+        return {
+          std::min(config_.maximum_members, maximum_wal_group_members),
+          config_.maximum_bytes};
+    }
     [[nodiscard]] std::size_t queued_groups() const noexcept;
     [[nodiscard]] std::uint32_t retained_groups() const noexcept;
     [[nodiscard]] const runtime::first_failure& failure() const& noexcept {
@@ -493,7 +607,8 @@ private:
       wal_group&& offered,
       codec::cooperative_work& admission,
       detail::wal_commit_node_ptr node,
-      seastar::gate::holder holder) {
+      seastar::gate::holder holder,
+      std::optional<wal_submission_admission> writer_admission = std::nullopt) {
         static_cast<void>(holder);
         submitting_ = true;
         auto idle = seastar::defer([this] noexcept {
@@ -505,8 +620,8 @@ private:
         auto submission = co_await writer.submit_entered(
           std::move(offered),
           admission,
-          {std::min(config_.maximum_members, maximum_wal_group_members),
-           config_.maximum_bytes});
+          submission_limits(),
+          std::move(writer_admission));
         if (!submission) co_return runtime::failure(submission.error());
         // Node/FIFO capacity already exists. Caller abort cannot undo this
         // accepted ticket, and installation requires no fallible allocation.

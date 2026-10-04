@@ -8,6 +8,8 @@ import sys
 import tempfile
 from pathlib import Path
 
+from bazel.native_test_environment import normalized_environment
+
 
 def inspect_command(
     binary: Path,
@@ -21,7 +23,7 @@ def inspect_command(
         check=True,
         text=True,
         timeout=5.0,
-        env=environment,
+        env=normalized_environment(environment),
         cwd=directory,
     )
     for forbidden in ("configuration loaded", "startup stage=", "runtime shards="):
@@ -103,8 +105,9 @@ def main() -> None:
             for option, expected in (
                 ("--help", "--config"),
                 ("--help-seastar", "--smp"),
-                # The broker logger is initialized lazily during startup.
                 ("--help-loggers", "    seastar\n"),
+                # Broker loggers are registered before options are applied.
+                ("--help-loggers", "    kwaque-broker\n"),
             ):
                 result = inspect_command(
                     binary,

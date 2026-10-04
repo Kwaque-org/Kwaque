@@ -1,5 +1,6 @@
 #pragma once
 
+#include "src/base/units.h"
 #include "src/codec/cooperative.h"
 #include "src/runtime/file.h"
 #include "src/runtime/first_failure.h"
@@ -94,7 +95,8 @@ inline runtime::operation_error path_error(errc code) noexcept {
 }
 inline seastar::future<runtime::result<void>>
 path_checkpoint(codec::cooperative_work& work) {
-    const auto admitted = co_await work.admit(byte_count{8192}, item_count{16});
+    const auto admitted = co_await work.admit(
+      byte_count{8_KiB}, item_count{16});
     if (!admitted)
         co_return runtime::failure(path_error(admitted.error().code()));
     const auto ready = work.poll();
@@ -136,20 +138,33 @@ seastar::future<runtime::result<void>> inspect_local_path(
     for (;;) {
         const auto ready = co_await detail::path_checkpoint(work);
         if (!ready) co_return runtime::failure(ready.error());
-        auto prefix = runtime::file_path::make(
-          std::string_view{value}.substr(0, end));
-        if (!prefix) co_return runtime::failure(prefix.error());
-        const auto status = co_await files.stat(std::move(*prefix));
+        const auto part = std::string_view{value}.substr(0, end);
         const bool final = end == value.size();
-        if (!status) {
-            if (
-              final && end != root.size() && missing_leaf
-              && status.error().code() == errc::not_found)
-                co_return runtime::result<void>{};
-            co_return runtime::failure(status.error());
+        const auto kind = final ? required : runtime::file_kind::directory;
+        // Under the exclusive ownership above, nothing else changes a
+        // directory the file system verified and has not removed or renamed.
+        bool known = false;
+        if constexpr (runtime::verified_directory_memo<Backend>)
+            known = kind == runtime::file_kind::directory
+                    && files.verified_directory(part);
+        if (!known) {
+            auto prefix = runtime::file_path::make(part);
+            if (!prefix) co_return runtime::failure(prefix.error());
+            const auto status = co_await files.stat(std::move(*prefix));
+            if (!status) {
+                if (
+                  final && end != root.size() && missing_leaf
+                  && status.error().code() == errc::not_found)
+                    co_return runtime::result<void>{};
+                co_return runtime::failure(status.error());
+            }
+            if (status->kind != kind)
+                co_return runtime::failure(
+                  detail::path_error(errc::wrong_context));
+            if constexpr (runtime::verified_directory_memo<Backend>)
+                if (kind == runtime::file_kind::directory)
+                    files.remember_directory(part);
         }
-        if (status->kind != (final ? required : runtime::file_kind::directory))
-            co_return runtime::failure(detail::path_error(errc::wrong_context));
         if (final) break;
         const auto next = value.find('/', end + 1);
         end = next == std::string::npos ? value.size() : next;
@@ -169,7 +184,7 @@ seastar::future<runtime::result<void>> walk_local_buckets(
   codec::cooperative_work& work,
   Visitor visit) {
     static_assert(
-      sizeof(Visitor) <= 4096,
+      sizeof(Visitor) <= 4_KiB,
       "large visitors require a separately admitted owner");
     using cursor = typename Backend::directory_cursor_type;
     std::optional<cursor> buckets, children;
@@ -249,7 +264,7 @@ seastar::future<runtime::result<void>> walk_local_buckets(
                         }
                         auto entries = co_await children->next(
                           {.maximum_entries = item_count{16},
-                           .maximum_name_bytes = byte_count{4096}});
+                           .maximum_name_bytes = byte_count{4_KiB}});
                         if (!entries) {
                             failed.observe(entries);
                             break;

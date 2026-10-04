@@ -90,6 +90,7 @@ kwaque_cc_seastar_gtest(
     deps = [
         ":envelope_fuzz_cases",
         ":envelope_test_fixture",
+        "//src/base",
         "//src/bytes:fragmented_buffer",
     ],
 )
@@ -254,6 +255,7 @@ kwaque_cc_benchmark(
         "envelope_bench_reference.cc",
     ],
     memory = "512MiB",
+    native_allocator_only = True,
     deps = [
         ":codec_bench_reference",
         ":qualification_profile",
@@ -287,6 +289,7 @@ kwaque_cc_fuzz_test(
     ],
     corpus = glob(["testdata/codec_fuzz_corpus/*.bin"]),
     tags = [
+        "fuzz-campaign",
         "resources:cpu:1",
         "resources:memory:1024",
     ],
@@ -318,6 +321,7 @@ kwaque_cc_fuzz_test(
     ],
     corpus = glob(["testdata/codec_cooperative_fuzz_corpus/*.bin"]),
     tags = [
+        "fuzz-campaign",
         "resources:cpu:1",
         "resources:memory:1024",
     ],
@@ -455,6 +459,7 @@ kwaque_cc_binary(
     testonly = True,
     srcs = ["integrity_cold_probe.cc"],
     deps = [
+        "//src/base",
         "//src/codec:crc32c",
         "//src/codec:digest",
         "//src/codec:xxh3",

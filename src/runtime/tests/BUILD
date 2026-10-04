@@ -30,6 +30,10 @@ kwaque_py_native_test(
     timeout = "moderate",
     srcs = ["lifecycle_invariant_test.py"],
     data = [":lifecycle_invariant_probe"],
+    tags = [
+        "resources:cpu:2",
+        "resources:memory:256",
+    ],
 )
 
 kwaque_cc_test(
@@ -125,6 +129,7 @@ kwaque_cc_seastar_test(
     cpu = 1,
     memory = "128MiB",
     deps = [
+        "//src/base",
         "//src/runtime:file",
         "//src/runtime:file_error_internal",
         "//src/runtime:file_test_support",
@@ -152,6 +157,7 @@ kwaque_cc_seastar_test(
     cpu = 1,
     memory = "128MiB",
     deps = [
+        "//src/base",
         "//src/runtime:file",
         "//src/runtime/production:file",
         "//src/runtime/testing:test_directory",
@@ -164,6 +170,7 @@ kwaque_cc_test(
     name = "file_io_contract_test",
     srcs = ["file_io_contract_test.cc"],
     deps = [
+        "//src/base",
         "//src/bytes:fragmented_buffer",
         "//src/runtime:file",
         "//src/runtime:fragmented_buffer_internal",
@@ -175,6 +182,7 @@ kwaque_cc_test(
     name = "network_dns_fault_contract_test",
     srcs = ["network_dns_fault_contract_test.cc"],
     deps = [
+        "//src/base",
         "//src/bytes:fragmented_buffer",
         "//src/runtime:dns",
         "//src/runtime:fault",
@@ -286,6 +294,7 @@ kwaque_cc_benchmark(
     srcs = ["runtime_file_bench.cc"],
     memory = "128MiB",
     deps = [
+        "//src/base",
         "//src/bytes:fragmented_buffer",
         "//src/runtime:file",
         "//src/runtime:fragmented_buffer_internal",
@@ -298,6 +307,7 @@ kwaque_cc_benchmark(
     srcs = ["runtime_network_bench.cc"],
     memory = "128MiB",
     deps = [
+        "//src/base",
         "//src/bytes:fragmented_buffer",
         "//src/runtime:fragmented_buffer_internal",
         "//src/runtime:network",
@@ -353,6 +363,7 @@ kwaque_cc_seastar_test(
     srcs = ["task_scope_test.cc"],
     cpu = 1,
     memory = "128MiB",
+    tags = ["stress"],
     deps = ["//src/runtime:task_scope"],
 )
 
@@ -413,6 +424,7 @@ kwaque_cc_seastar_test(
     srcs = ["stop_signal_test.cc"],
     cpu = 1,
     memory = "128MiB",
+    tags = ["stress"],
     deps = ["//src/runtime:stop_signal"],
 )
 
@@ -458,6 +470,7 @@ kwaque_cc_seastar_test(
         "-Wl,--wrap=ftruncate",
     ],
     deps = [
+        "//src/base",
         "//src/runtime:file",
         "//src/runtime/testing:test_directory",
         "@seastar//:file_test_support",

@@ -31,7 +31,12 @@ enum class local_object_state : std::uint8_t {
 enum class local_recovery_action : std::uint16_t {
     preserve = 1,
     reconstruct = 2,
-    discard = 3
+    discard = 3,
+    // One segment sealed at a supplied end. The decision's fields carry the
+    // segment scope: `prepare` is the WAL content end its suffix plan was
+    // classified against, `prepare_digest` that plan's content identity and
+    // `target_position` the end.
+    seal_at = 4
 };
 enum class local_checkpoint_disposition : std::uint16_t {
     segment_boundary = 1,

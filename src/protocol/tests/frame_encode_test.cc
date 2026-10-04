@@ -1,3 +1,4 @@
+#include "src/base/units.h"
 #include "src/bytes/fragmented_buffer_test_support.h"
 #include "src/codec/crc32c.h"
 #include "src/protocol/tests/frame_test_support.h"
@@ -157,7 +158,7 @@ TEST(FrameEncodeTest, SmallVisiblePayloadDoesNotHideLargeRetainedBacking) {
     auto body = fixture::fragmented(std::string(32768, 'x'), 32768);
     ASSERT_TRUE(body.trim_front(byte_count{32767}).has_value());
     auto config = codec::limits_config{};
-    config.max_retained_bytes = byte_count{4096};
+    config.max_retained_bytes = byte_count{4_KiB};
     seastar::abort_source abort;
     codec::cooperative_work work{codec::limits::make(config).value(), abort};
     expect_error(

@@ -1,3 +1,4 @@
+#include "src/base/units.h"
 #include "src/runtime/file.h"
 #include "src/runtime/file_error_internal.h"
 #include "src/runtime/file_test_support.h"
@@ -36,6 +37,9 @@
 #include <vector>
 
 namespace {
+using kwaque::literals::operator""_KiB;
+using kwaque::literals::operator""_MiB;
+using kwaque::literals::operator""_GiB;
 
 struct file_probe final {
     struct io_call final {
@@ -68,8 +72,8 @@ struct file_probe final {
     unsigned read_alignment{4096};
     unsigned write_alignment{4096};
     unsigned overwrite_alignment{4096};
-    unsigned read_max_length{1U << 30U};
-    unsigned write_max_length{1U << 30U};
+    unsigned read_max_length{1_GiB};
+    unsigned write_max_length{1_GiB};
     unsigned flushes{0};
     unsigned truncates{0};
     unsigned sizes{0};
@@ -409,10 +413,10 @@ SEASTAR_TEST_CASE(file_metadata_admission_bounds_native_operations) {
     probe.delayed_flush.emplace();
     auto owner = make_file(
       probe,
-      {.pending_read_bytes = kwaque::byte_count{4096},
+      {.pending_read_bytes = kwaque::byte_count{4_KiB},
        .pending_reads = 1,
        .pending_metadata_operations = 1,
-       .queued_write_bytes = kwaque::byte_count{4096},
+       .queued_write_bytes = kwaque::byte_count{4_KiB},
        .queued_writes = 1});
 
     auto active = owner.flush();
@@ -792,7 +796,7 @@ SEASTAR_TEST_CASE(file_read_admission_bounds_count_and_requested_bytes) {
       probe,
       {.pending_read_bytes = kwaque::byte_count{8},
        .pending_reads = 1,
-       .queued_write_bytes = kwaque::byte_count{4096},
+       .queued_write_bytes = kwaque::byte_count{4_KiB},
        .queued_writes = 1});
 
     auto active = owner.read(
@@ -856,7 +860,7 @@ SEASTAR_TEST_CASE(file_write_stages_only_the_unaligned_native_chunk) {
       std::span<const char>{source});
     BOOST_REQUIRE(backing.has_value());
     auto unaligned = backing->share(
-      kwaque::byte_count{1}, kwaque::byte_count{4096});
+      kwaque::byte_count{1}, kwaque::byte_count{4_KiB});
     BOOST_REQUIRE(unaligned.has_value());
     const auto source_fragment = unaligned->fragment_at(0);
     BOOST_REQUIRE(source_fragment.has_value());
@@ -912,7 +916,7 @@ SEASTAR_TEST_CASE(file_write_coalesces_fragment_batch_without_native_iovecs) {
 SEASTAR_TEST_CASE(file_aligned_fragments_keep_independent_native_dma_storage) {
     using access = kwaque::runtime::detail::fragmented_buffer_io_access;
     file_probe probe;
-    probe.write_max_length = 4096;
+    probe.write_max_length = 4_KiB;
     probe.storage.assign(4096, 'p');
     probe.size = probe.storage.size();
     auto owner = make_file(probe);
@@ -922,9 +926,9 @@ SEASTAR_TEST_CASE(file_aligned_fragments_keep_independent_native_dma_storage) {
     std::memset(second.get_write(), 'z', second.size());
     const auto first_address = reinterpret_cast<std::uintptr_t>(first.get());
     const auto second_address = reinterpret_cast<std::uintptr_t>(second.get());
-    auto data = access::adopt(std::move(first), kwaque::byte_count{4096});
+    auto data = access::adopt(std::move(first), kwaque::byte_count{4_KiB});
     const auto appended = access::append_adopted(
-      data, std::move(second), kwaque::byte_count{4096});
+      data, std::move(second), kwaque::byte_count{4_KiB});
     BOOST_REQUIRE(appended.has_value());
     const auto written = co_await owner.write(
       kwaque::runtime::file_position{4096}, std::move(data));
@@ -993,7 +997,7 @@ SEASTAR_TEST_CASE(file_staging_observes_abort_from_released_source_ownership) {
             owner.request_abort();
         }));
     auto data = kwaque::runtime::detail::fragmented_buffer_io_access::adopt(
-      std::move(fragment), kwaque::byte_count{8192});
+      std::move(fragment), kwaque::byte_count{8_KiB});
     const auto written = co_await owner.write(
       kwaque::runtime::file_position{0}, std::move(data));
     const auto statistics = owner.statistics();
@@ -1462,7 +1466,7 @@ SEASTAR_TEST_CASE(
           std::span<const char>{source});
         BOOST_REQUIRE(backing.has_value());
         auto unaligned = backing->share(
-          kwaque::byte_count{1}, kwaque::byte_count{4096});
+          kwaque::byte_count{1}, kwaque::byte_count{4_KiB});
         BOOST_REQUIRE(unaligned.has_value());
 
         const auto written = co_await owner.write(
@@ -1505,9 +1509,9 @@ SEASTAR_TEST_CASE(file_write_admission_bounds_retained_contenders) {
     probe.delayed_write.emplace();
     auto owner = make_file(
       probe,
-      {.pending_read_bytes = kwaque::byte_count{4096},
+      {.pending_read_bytes = kwaque::byte_count{4_KiB},
        .pending_reads = 1,
-       .queued_write_bytes = kwaque::byte_count{8192},
+       .queued_write_bytes = kwaque::byte_count{8_KiB},
        .queued_writes = 2});
 
     auto active = owner.write(
@@ -1524,7 +1528,7 @@ SEASTAR_TEST_CASE(file_write_admission_bounds_retained_contenders) {
       std::span<const char>{retained_source});
     BOOST_REQUIRE(retained_backing.has_value());
     auto retained_slice = retained_backing->share(
-      kwaque::byte_count{}, kwaque::byte_count{4096});
+      kwaque::byte_count{}, kwaque::byte_count{4_KiB});
     BOOST_REQUIRE(retained_slice.has_value());
     BOOST_CHECK_EQUAL(retained_slice->retained_bytes().value(), 4097U);
     const auto retained_saturated = co_await owner.write(
@@ -1563,10 +1567,10 @@ SEASTAR_TEST_CASE(file_geometry_is_an_owning_snapshot_with_independent_limits) {
     probe.read_alignment = 1024;
     probe.write_alignment = 4096;
     probe.overwrite_alignment = 8192;
-    probe.read_max_length = 1U << 20U;
+    probe.read_max_length = 1_MiB;
     probe.write_max_length = 300000;
     kwaque::runtime::file_io_limits limits;
-    limits.pending_read_bytes = kwaque::byte_count{65536};
+    limits.pending_read_bytes = kwaque::byte_count{64_KiB};
     auto owner = make_file(probe, limits);
     const auto geometry = owner.geometry();
     auto moved = std::move(owner);
@@ -1613,7 +1617,7 @@ SEASTAR_TEST_CASE(file_geometry_rejects_unusable_recommendations) {
         if (which == 2) {
             probe.write_alignment = 512;
             probe.overwrite_alignment = 4096;
-            probe.write_max_length = 1024;
+            probe.write_max_length = 1_KiB;
         }
         auto owner = make_file(probe);
         const auto geometry = owner.geometry();
@@ -1642,7 +1646,7 @@ SEASTAR_TEST_CASE(
         BOOST_CHECK(!rejected);
         BOOST_CHECK(owner.geometry() == original);
     }
-    const auto limited = owner.limit_write_allocation(byte_count{65536});
+    const auto limited = owner.limit_write_allocation(byte_count{64_KiB});
     const auto window = owner.limit_write_concurrency(1);
     runtime::result<void> pinned;
     runtime::result<void> pinned_window;
@@ -1650,12 +1654,12 @@ SEASTAR_TEST_CASE(
     {
         auto pin = owner.try_reserve_metadata();
         pin_admitted = pin.has_value();
-        pinned = owner.limit_write_allocation(byte_count{32768});
+        pinned = owner.limit_write_allocation(byte_count{32_KiB});
         pinned_window = owner.limit_write_concurrency(1);
     }
     const auto geometry = owner.geometry();
     const auto closed = co_await owner.close();
-    const auto after_close = owner.limit_write_allocation(byte_count{32768});
+    const auto after_close = owner.limit_write_allocation(byte_count{32_KiB});
     const auto closed_window = owner.limit_write_concurrency(1);
     BOOST_CHECK(window.has_value());
     BOOST_REQUIRE(!pinned_window && !closed_window);
@@ -2153,7 +2157,7 @@ SEASTAR_TEST_CASE(
     for (const auto concurrency : {1U, 4U}) {
         for (const auto fragments : {3U, 16U}) {
             file_probe probe;
-            probe.write_max_length = 16384;
+            probe.write_max_length = 16_KiB;
             const auto size = fragments * 4096U;
             probe.storage.resize(size);
             auto limits = runtime::file_io_limits{};
@@ -2168,7 +2172,7 @@ SEASTAR_TEST_CASE(
                   4096, 4096);
                 std::memset(part.get_write(), value, part.size());
                 const auto appended = access::append_adopted(
-                  data, std::move(part), byte_count{4096});
+                  data, std::move(part), byte_count{4_KiB});
                 BOOST_REQUIRE(appended);
                 expected.append(4096, value);
             }
@@ -2197,22 +2201,22 @@ SEASTAR_TEST_CASE(file_pipeline_honors_reduced_allocation_through_short_write) {
     for (auto concurrency : {1U, 4U}) {
         file_probe probe;
         probe.memory_alignment = 8192;
-        probe.write_max_length = 131072;
-        constexpr std::size_t size = 8U * 65536U;
+        probe.write_max_length = 128_KiB;
+        constexpr std::size_t size = 8U * 64_KiB;
         probe.storage.resize(size);
         auto owner = pipeline_file(probe);
-        const auto limited = owner.limit_write_allocation(byte_count{65536});
+        const auto limited = owner.limit_write_allocation(byte_count{64_KiB});
         const auto window = owner.limit_write_concurrency(concurrency);
         auto moved = std::move(owner);
         // A subsequent larger request must not undo a previously installed cap.
-        const auto enlarged = moved.limit_write_allocation(byte_count{131072});
+        const auto enlarged = moved.limit_write_allocation(byte_count{128_KiB});
         const auto expanded_window = moved.limit_write_concurrency(4);
         const auto layout = moved.geometry().value().write_buffers(
           {}, byte_count{size});
         auto writing = moved.write({}, staging_data(true, size));
         co_await drain_reactor_tasks();
         const auto initial = probe.writes.size();
-        const auto busy = moved.limit_write_allocation(byte_count{32768});
+        const auto busy = moved.limit_write_allocation(byte_count{32_KiB});
         const auto busy_window = moved.limit_write_concurrency(1);
         finish_parked(probe, 0, 4096);
         co_await drain_parked(probe);
@@ -2258,11 +2262,11 @@ SEASTAR_TEST_CASE(file_pipeline_bounds_reversed_completion_and_joined_close) {
         }
         if (mode == 3) {
             limits.write_concurrency = 8;
-            limits.write_buffer_bytes = byte_count{6U * 131072U};
+            limits.write_buffer_bytes = byte_count{6U * 128_KiB};
         }
         if (byte_limited) {
             limits.write_concurrency = 8;
-            limits.write_buffer_bytes = byte_count{4U * 131072U};
+            limits.write_buffer_bytes = byte_count{4U * 128_KiB};
         }
         auto owner = pipeline_file(probe, limits);
         auto data = staging_data(true, size);
@@ -2309,7 +2313,7 @@ SEASTAR_TEST_CASE(file_pipeline_recovers_short_writes_in_each_slot) {
     using namespace kwaque;
     file_probe probe;
     probe.memory_alignment = 8192;
-    probe.write_max_length = 8192;
+    probe.write_max_length = 8_KiB;
     probe.storage.resize(65536);
     auto owner = pipeline_file(probe);
     auto writing = owner.write({}, staging_data(true, 65536));
@@ -2342,7 +2346,7 @@ SEASTAR_TEST_CASE(file_pipeline_stops_on_failure_and_joins_remaining_requests) {
     using namespace kwaque;
     for (unsigned mode = 0; mode != 4; ++mode) {
         file_probe probe;
-        probe.write_max_length = 4096;
+        probe.write_max_length = 4_KiB;
         probe.storage.resize(32768);
         auto owner = pipeline_file(probe);
         auto writing = owner.write({}, staging_data(true, 32768));
@@ -2406,7 +2410,7 @@ SEASTAR_TEST_CASE(
   file_pipeline_abort_prevents_refill_and_drains_submitted_bytes) {
     using namespace kwaque;
     file_probe probe;
-    probe.write_max_length = 4096;
+    probe.write_max_length = 4_KiB;
     probe.storage.resize(32768);
     auto owner = pipeline_file(probe);
     auto writing = owner.write({}, staging_data(true, 32768));
@@ -2433,7 +2437,7 @@ SEASTAR_TEST_CASE(file_pipeline_allocation_cuts_join_started_workers) {
     std::size_t cuts = 0, partial_starts = 0;
     for (std::size_t cut = 0; cut != 32; ++cut) {
         file_probe probe;
-        probe.write_max_length = 4096;
+        probe.write_max_length = 4_KiB;
         probe.storage.resize(32768);
         auto owner = pipeline_file(probe);
         auto data = staging_data(true, 32768);
@@ -2478,7 +2482,7 @@ SEASTAR_TEST_CASE(
     using namespace kwaque;
     using access = runtime::detail::fragmented_buffer_io_access;
     file_probe probe;
-    probe.write_max_length = 16384;
+    probe.write_max_length = 16_KiB;
     probe.storage.resize(131072);
     auto owner = pipeline_file(probe);
     bytes::fragmented_buffer data;
@@ -2486,7 +2490,7 @@ SEASTAR_TEST_CASE(
         auto block = seastar::temporary_buffer<char>::aligned(4096, 16384);
         std::memset(block.get_write(), 'd', block.size());
         const auto appended = access::append_adopted(
-          data, std::move(block), byte_count{16384});
+          data, std::move(block), byte_count{16_KiB});
         BOOST_REQUIRE(appended);
     }
     auto tail = staging_data(true, 65536);
@@ -2559,7 +2563,7 @@ SEASTAR_TEST_CASE(
     // no effect, for either serial execution or the parallel window.
     for (const std::uint32_t concurrency : {1U, 4U}) {
         file_probe probe;
-        probe.write_max_length = 4096;
+        probe.write_max_length = 4_KiB;
         probe.storage.resize(32768);
         auto owner = pipeline_file(probe, {.write_concurrency = concurrency});
         auto writing = owner.write({}, staging_data(true, 32768));
@@ -2612,12 +2616,12 @@ SEASTAR_TEST_CASE(
         file_probe probe;
         auto owner = pipeline_file(
           probe,
-          {.write_concurrency = 4, .write_buffer_bytes = byte_count{262144}});
+          {.write_concurrency = 4, .write_buffer_bytes = byte_count{256_KiB}});
         const auto zero = owner.allow_concurrent_writes(0);
         const auto wide = owner.allow_concurrent_writes(5);
         // Two chunk-sized writes and their recovery exceed these buffers.
         const auto staged = owner.allow_concurrent_writes(2);
-        const auto narrowed = owner.limit_write_allocation(byte_count{65536});
+        const auto narrowed = owner.limit_write_allocation(byte_count{64_KiB});
         const auto fits = owner.allow_concurrent_writes(2);
         const auto closed = co_await owner.close();
         const auto after_close = owner.allow_concurrent_writes(1);
@@ -2630,7 +2634,7 @@ SEASTAR_TEST_CASE(
     }
     {
         file_probe probe;
-        probe.write_max_length = 16384;
+        probe.write_max_length = 16_KiB;
         auto owner = pipeline_file(probe);
         probe.storage.assign(32768, 'p');
         probe.size = probe.storage.size();

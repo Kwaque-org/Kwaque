@@ -581,6 +581,20 @@ public:
     lookup(fake_file_system& filesystem, const canonical_fake_path& path) {
         return filesystem.lookup(path);
     }
+    // Operations at point already counted for one object; a fault rule for
+    // its next one names this count plus one.
+    [[nodiscard]] static runtime::result<std::uint64_t> occurrences(
+      const fake_file_system& filesystem,
+      fake_object_id id,
+      runtime::builtin_fault_point point) {
+        filesystem.assert_current();
+        const auto* inode = filesystem.find_inode(id);
+        if (!inode)
+            return runtime::failure(
+              runtime::operation_error{
+                errc::not_found, runtime::operation_kind::file});
+        return inode->occurrences[static_cast<std::size_t>(point)];
+    }
     [[nodiscard]] static runtime::result<fake_native_file_probe>
     make_native_file_probe(
       fake_file_system& filesystem,

@@ -24,14 +24,12 @@ class service_lifecycle final : public runtime::shard_affine {
 public:
     using action = std::function<seastar::future<>()>;
 
-    // An owner with additional abort broadcasts can retain rollback until
-    // stop().
-    explicit service_lifecycle(
-      seastar::abort_source& abort_source,
-      bool rollback_on_start_failure = true) noexcept;
+    // A failed start keeps every registered cleanup, including the failed
+    // step's, until the owner calls stop(); the owner first broadcasts its
+    // abort to other services.
+    explicit service_lifecycle(seastar::abort_source& abort_source) noexcept;
     ~service_lifecycle();
 
-    [[nodiscard]] seastar::future<> start_step(action start, action stop);
     [[nodiscard]] seastar::future<>
     start_step(std::string_view name, action start, action stop);
     [[nodiscard]] seastar::future<> stop();
@@ -52,7 +50,6 @@ private:
     seastar::shared_promise<> stop_done_;
     service_lifecycle_state state_{service_lifecycle_state::open};
     bool operation_active_{false};
-    bool rollback_on_start_failure_;
 };
 
 } // namespace kwaque::broker

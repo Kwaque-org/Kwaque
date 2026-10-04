@@ -1,5 +1,7 @@
 #include "src/admin/admin_limits.h"
 #include "src/admin/admin_server.h"
+#include "src/admin/admin_server_test_support.h"
+#include "src/base/units.h"
 
 #include <seastar/core/coroutine.hh>
 #include <seastar/core/memory.hh>
@@ -29,13 +31,14 @@
 #include <vector>
 
 namespace {
+using kwaque::literals::operator""_KiB;
 
 #if !defined(SEASTAR_DEFAULT_ALLOCATOR)
 
 class shard_pressure final {
 public:
     seastar::future<> fill() {
-        constexpr std::size_t chunk_size = 64U * 1024U;
+        constexpr std::size_t chunk_size = 64_KiB;
         while (seastar::memory::stats().free_memory()
                > kwaque::admin::admin_reservation_bytes) {
             seastar::temporary_buffer<char> chunk{chunk_size};
@@ -177,15 +180,6 @@ private:
     seastar::output_stream<char> output_;
 };
 
-std::uint16_t unused_port() {
-    seastar::listen_options options;
-    options.reuse_address = false;
-    auto probe = seastar::listen(
-      seastar::socket_address{seastar::net::inet_address{"127.0.0.1"}, 0},
-      options);
-    return probe.local_address().port();
-}
-
 void check_live(seastar::socket_address address) {
     connection live{address};
     live.send("GET /v1/health/live HTTP/1.1\r\n\r\n");
@@ -241,23 +235,23 @@ TEST(AdminMemoryTest, NativeReservationContainsStartupScrapesAndShutdown) {
     // so transient extra page consumption cannot escape through sampling gaps.
     // Preexisting small-pool pages and the test-runner fiber are baseline.
     // Admin fiber stacks created after ballast use the constrained native heap.
-    const auto port = unused_port();
+    const auto endpoint = kwaque::admin::detail::lease_loopback_endpoint();
     seastar::sharded<shard_pressure> pressure;
     pressure.start().get();
     kwaque::admin::admin_server server;
     std::exception_ptr failure;
     try {
         pressure.invoke_on_all(&shard_pressure::fill).get();
-        server.start("127.0.0.1", port, seastar::this_smp_shard_count()).get();
+        server
+          .start(
+            endpoint.address, endpoint.port, seastar::this_smp_shard_count())
+          .get();
         pressure.invoke_on_all(&shard_pressure::fill_metric_families).get();
-        exercise(
-          seastar::socket_address{
-            seastar::net::inet_address{"127.0.0.1"}, port});
+        exercise(endpoint.socket());
         // Leave partial headers parked while the actual admin owner drains its
         // listener, cross-shard state, and scheduling group under the same cap.
         std::vector<std::unique_ptr<connection>> idle;
-        const auto address = seastar::socket_address{
-          seastar::net::inet_address{"127.0.0.1"}, port};
+        const auto address = endpoint.socket();
         for (std::size_t i = 0; i < kwaque::admin::connections_per_shard
                                       * seastar::this_smp_shard_count();
              ++i) {

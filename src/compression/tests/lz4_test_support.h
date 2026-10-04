@@ -1,5 +1,6 @@
 #pragma once
 
+#include "src/base/units.h"
 #include "src/bytes/fragmented_buffer_builder.h"
 #include "src/compression/tests/allocation_profile.h"
 
@@ -86,7 +87,7 @@ inline void native_ok(std::size_t code) {
 // native context allocation. Flush policy/level can differ on the wire.
 inline std::string native_frame(
   std::string_view input,
-  std::size_t chunk = 65536,
+  std::size_t chunk = 64_KiB,
   unsigned auto_flush = 0,
   int level = 0) {
     if (

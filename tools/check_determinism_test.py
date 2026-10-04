@@ -12,6 +12,7 @@ try:
         Allowance,
         Writer,
         is_deterministic_source,
+        is_test_source,
         masked_code,
         occurrences,
         scan,
@@ -23,6 +24,7 @@ except ModuleNotFoundError:
         Allowance,
         Writer,
         is_deterministic_source,
+        is_test_source,
         masked_code,
         occurrences,
         scan,
@@ -180,6 +182,31 @@ class DeterminismSourceTest(unittest.TestCase):
         ):
             self.assertFalse(is_deterministic_source(Path(path)), path)
 
+    def test_every_test_source_rejects_host_randomness_but_not_clocks(self) -> None:
+        for path in (
+            "src/broker/tests/new_test.cc",
+            "src/broker/pid_file_test.cc",
+            "src/runtime/testing/fixture.h",
+            "bazel/tests/probe.cc",
+        ):
+            self.assertTrue(is_test_source(Path(path)), path)
+        for path in ("src/broker/application.cc", "tools/check_determinism.py"):
+            self.assertFalse(is_test_source(Path(path)), path)
+        for path in ("src/broker/pid_file_test.cc", "bazel/tests/probe.cc"):
+            for violation in (
+                "std::mt19937 engine{std::random_device{}()};",
+                "auto value = seastar::testing::local_random_engine();",
+            ):
+                with self.subTest(path=path, violation=violation):
+                    self.write(violation, path)
+                    self.assertTrue(
+                        any(": random-source: " in item for item in self.scan()),
+                        violation,
+                    )
+            # Only randomness is in scope outside deterministic code.
+            self.write("auto now = std::chrono::steady_clock::now();", path)
+            self.assertEqual(self.scan(), [])
+
     def test_namespace_and_static_inferred_random_sources_are_rejected(self) -> None:
         for source in (
             "sequential_random_source draws;",
@@ -252,14 +279,17 @@ class DeterminismSourceTest(unittest.TestCase):
         allowance = Allowance(
             self.path, "unordered-state", declaration, 1, "Lookup only"
         )
-        self.write(declaration + """
+        self.write(
+            declaration
+            + """
             index_type queue;
             void export_values(index_type& values, index_type *ready) {
                 for (auto& item : values) { emit(item); }
                 auto it = queue.begin();
                 auto it2 = ready->begin();
             }
-        """)
+        """
+        )
         failures = self.scan((allowance,))
         self.assertEqual(len(failures), 3, failures)
         self.assertTrue(all("unordered-iteration:" in item for item in failures))

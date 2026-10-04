@@ -16,6 +16,26 @@ WORKFLOW = (
     else Path(__file__).resolve().parents[1] / ".github/workflows/ci.yml"
 )
 GOLDENS = "//src/simulation/tests:determinism_goldens"
+GOLDEN_SUITE = (
+    GOLDENS,
+    "//src/storage/tests:format_tests",
+    "//src/model/tests:checkpoint_tests",
+    "//src/model/tests:format_fixture_test",
+    "//src/model/tests:batch_builder_test",
+    "//src/protocol/tests:golden_tests",
+    "//src/compression/tests:format_fixture_test",
+    "//tools:verify_format_fixtures_test",
+)
+SHIPPED_FLAGS = (
+    "--config=ci-release",
+    "--//bazel:reactor_backend=linux-aio",
+    "--build_tag_filters=-fuzz,-manual",
+    "--test_tag_filters=package,smoke,fuzz_replay",
+    "//...",
+)
+GATE_FAILURE = (
+    "contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled')"
+)
 FUZZ_WORKFLOW = (
     Path(sys.argv[2]) if WORKFLOW_ARGUMENTS else WORKFLOW.with_name("fuzz.yml")
 )
@@ -28,31 +48,11 @@ SETUP_BUILD = (
     else WORKFLOW.parents[1] / "actions/setup-build/action.yml"
 )
 RETAIN_LOGS = SETUP_BUILD.parents[1] / "retain-logs/action.yml"
-STATEFUL_FUZZERS = {
-    "scheduler_fuzz",
-    "fault_schedule_fuzz",
-    "fake_file_fuzz",
-    "fake_network_fuzz",
-}
-FORMAT_FUZZERS = {
-    "//src/codec/tests:codec_fuzz",
-    "//src/codec/tests:codec_cooperative_fuzz",
-    "//src/compression/tests:compression_fuzz",
-    "//src/model/tests:record_fuzz",
-    "//src/model/tests:checkpoint_fuzz",
-    "//src/protocol/tests:frame_fuzz",
-    "//src/protocol/tests:control_fuzz",
-    "//src/storage/tests:storage_format_fuzz",
-}
-SCHEDULED_FUZZERS = FORMAT_FUZZERS | {
-    f"//src/simulation/tests:{name}" for name in STATEFUL_FUZZERS
-}
-SMOKE_FUZZERS = SCHEDULED_FUZZERS | {
-    "//src/config:bootstrap_config_fuzz",
-    "//proto/kwaque/common/v1:build_info_fuzz",
-    "//src/bytes:fragmented_buffer_fuzz",
-    "//src/simulation/tests:signal_canary_test",
-}
+REACTOR_WORKFLOW = WORKFLOW.with_name("reactor-backends.yml")
+NIGHTLY_WORKFLOW = WORKFLOW.with_name("nightly.yml")
+RELEASE_WORKFLOW = WORKFLOW.with_name("release.yml")
+CAMPAIGN_QUERY = 'attr(tags, "\\bfuzz-campaign\\b", tests(//...))'
+CAMPAIGN_MATRIX = "target: ${{ fromJSON(needs.campaign-targets.outputs.targets) }}"
 
 
 def fuzz_coverage_errors(workflow: str, scheduled: str, config: str) -> list[str]:
@@ -61,14 +61,12 @@ def fuzz_coverage_errors(workflow: str, scheduled: str, config: str) -> list[str
     commands = run_commands(smoke)
     runs = [command for command in commands if command.startswith("bazel test ")]
     if len(runs) != 1:
-        errors.append("smoke must execute one explicit fuzz target set")
+        errors.append("smoke must execute one fuzz target selection")
     else:
-        command = runs[0]
-        targets = {word for word in command.split() if word.startswith("//")}
-        if targets != SMOKE_FUZZERS:
-            errors.append(
-                "smoke must execute every fuzzer and the verifying signal canary"
-            )
+        words = runs[0].split()
+        # Tags select the targets, so a new fuzz test cannot be left out.
+        if [word for word in words if word.startswith("//")] != ["//..."]:
+            errors.append("smoke must select every fuzz test by tag, not by list")
         for flag in (
             "--config=ci",
             "--config=fuzz",
@@ -76,8 +74,10 @@ def fuzz_coverage_errors(workflow: str, scheduled: str, config: str) -> list[str
             "--test_output=all",
             "--test_arg=-max_total_time=2",
             "--test_arg=-seed=1",
+            "--build_tag_filters=fuzz",
+            "--test_tag_filters=fuzz,-manual",
         ):
-            if flag not in command.split():
+            if flag not in words:
                 errors.append(f"smoke requires {flag}")
     if "build:fuzz --config=san-all" not in config.splitlines():
         errors.append("fuzz mode must select the full sanitizer configuration")
@@ -91,19 +91,15 @@ def fuzz_coverage_errors(workflow: str, scheduled: str, config: str) -> list[str
             errors.append(
                 "fuzz mode must compile and link address and undefined behavior checks"
             )
-    campaign = job_blocks(scheduled).get("fuzz-campaign", "")
-    entries = re.findall(
-        r"^          - name: ([a-z_]+)\n            target: (//\S+)$",
-        campaign,
-        re.MULTILINE,
-    )
-    expected_entries = {
-        (target.rsplit(":", 1)[1], target) for target in SCHEDULED_FUZZERS
-    }
-    if set(entries) != expected_entries or len(entries) != len(expected_entries):
-        errors.append(
-            "scheduled matrix must contain every simulation and format target exactly once"
-        )
+    jobs = job_blocks(scheduled)
+    campaign = jobs.get("fuzz-campaign", "")
+    selection = " ".join(run_commands(jobs.get("campaign-targets", "")))
+    if "bazel query" not in selection or CAMPAIGN_QUERY not in selection:
+        errors.append("scheduled targets must come from the fuzz-campaign tag")
+    if "needs: campaign-targets" not in campaign or CAMPAIGN_MATRIX not in campaign:
+        errors.append("scheduled matrix must use the queried campaign targets")
+    if re.search(r"^ +target: //", campaign, re.MULTILINE):
+        errors.append("scheduled matrix must not list targets by hand")
     if "  schedule:" not in scheduled or "    - cron:" not in scheduled:
         errors.append("fuzz campaigns must be scheduled")
     if "fail-fast: false" not in campaign:
@@ -112,7 +108,9 @@ def fuzz_coverage_errors(workflow: str, scheduled: str, config: str) -> list[str
         errors.append("scheduled campaigns must run at most four jobs together")
     if "          FUZZ_TARGET: ${{ matrix.target }}" not in campaign.splitlines():
         errors.append("scheduled campaigns must pass the selected full target label")
-    commands = run_commands(campaign)
+    commands = [
+        command for command in run_commands(campaign) if command.startswith("bazel ")
+    ]
     if len(commands) != 1 or not commands[0].startswith("bazel test "):
         errors.append("scheduled matrix must execute its fuzzer")
     else:
@@ -123,10 +121,17 @@ def fuzz_coverage_errors(workflow: str, scheduled: str, config: str) -> list[str
             "--test_timeout=720",
             "--test_arg=-max_total_time=600",
             "--test_arg=-timeout=15",
+            '--test_env=KWAQUE_FUZZ_CORPUS_DIR="${CORPUS}"',
+            '--sandbox_writable_path="${CORPUS}"',
             '"${FUZZ_TARGET}"',
         ):
             if flag not in commands[0].split():
                 errors.append(f"scheduled campaign requires {flag}")
+    restored = campaign.find("uses: actions/cache/restore@")
+    saved = campaign.find("uses: actions/cache/save@")
+    run = campaign.find("bazel test ")
+    if not 0 <= restored < run < saved:
+        errors.append("scheduled campaigns must restore and then keep their corpus")
     for name, job in (("smoke", smoke), ("scheduled", campaign)):
         for required in (
             "--test_env=KWAQUE_FUZZ_MINIMIZE_SECONDS=30",
@@ -239,6 +244,11 @@ def job_blocks(workflow: str) -> dict[str, str]:
     }
 
 
+def jobs_section(workflow: str) -> dict[str, str]:
+    """Job blocks only: keys under `on:` share the two-space layout."""
+    return job_blocks(workflow.split("\njobs:\n", 1)[1])
+
+
 def run_commands(job: str) -> list[str]:
     lines = job.splitlines()
     commands = []
@@ -280,6 +290,19 @@ PROFILE_TARGETS = {
 }
 
 
+def untagged_broad(command: str) -> bool:
+    """A //... test command that no positive tag filter narrows."""
+    words = command.split()
+    filters = [
+        word.split("=", 1)[1]
+        for word in words
+        if word.startswith("--test_tag_filters=")
+    ]
+    return "//..." in words and all(
+        not tag or tag.startswith("-") for value in filters for tag in value.split(",")
+    )
+
+
 def validation_profile_errors(workflow: str, config: str) -> list[str]:
     errors = []
     lines = set(config.splitlines())
@@ -302,7 +325,7 @@ def validation_profile_errors(workflow: str, config: str) -> list[str]:
             for command in commands
             if command.startswith(f"bazel test --config={profile} ")
         ]
-        if not any("//..." in command.split() for command in selected):
+        if not any(untagged_broad(command) for command in selected):
             targets = {
                 word
                 for command in selected
@@ -356,28 +379,22 @@ def coverage_errors(workflow: str) -> list[str]:
         if configs != {config}:
             errors.append(f"{name}: isolate build configurations in separate jobs")
 
-    goldens = jobs.get("goldens", "")
-    if "runs-on: ${{ matrix.runner }}" not in goldens:
-        errors.append("goldens: select native runners through the runner matrix")
-    for field, expected in (
-        ("runner", {"ubuntu-24.04", "ubuntu-24.04-arm"}),
-        ("config", {"ci-debug", "ci-release"}),
+    # The x86-64 debug goldens run inside the test job's //... suite.
+    for name, config, runner in (
+        ("build", "ci-release", "ubuntu-24.04"),
+        ("arm-build", "ci-release", "ubuntu-24.04-arm"),
+        ("goldens", "ci-debug", "ubuntu-24.04-arm"),
     ):
-        match = re.search(
-            rf"^        {field}:\s*\n((?:          - [^\n]+\n)+)", goldens, re.MULTILINE
-        )
-        values = set(re.findall(r"- (\S+)", match.group(1))) if match else set()
-        if values != expected:
-            errors.append(
-                f"goldens: requires both {field} values for all four native jobs"
-            )
-    commands = run_commands(goldens)
-    expected = f'bazel test --config="${{{{ matrix.config }}}}" --cache_test_results=no {GOLDENS} //src/storage/tests:format_tests //src/model/tests:checkpoint_tests //src/model/tests:format_fixture_test //src/model/tests:batch_builder_test //src/protocol/tests:golden_tests //src/compression/tests:format_fixture_test //tools:verify_format_fixtures_test'
-    if commands != [expected]:
-        errors.append(
-            "goldens: all four jobs must execute the identical explicit uncached suite"
-        )
-
+        job = jobs.get(name, "")
+        if f"    runs-on: {runner}\n" not in job:
+            errors.append(f"{name}: run the goldens on {runner}")
+        if not any(
+            command.startswith(f"bazel test --config={config} ")
+            and "--cache_test_results=no" in command.split()
+            and set(GOLDEN_SUITE) <= set(command.split())
+            for command in run_commands(job)
+        ):
+            errors.append(f"{name}: execute the complete golden suite uncached")
     arm = jobs.get("arm-build", "")
     if "runs-on: ubuntu-24.04-arm" not in arm:
         errors.append("arm-build: use a native aarch64 runner")
@@ -403,6 +420,40 @@ def coverage_errors(workflow: str) -> list[str]:
     return errors
 
 
+def shipped_artifact_errors(workflow: str) -> list[str]:
+    jobs = job_blocks(workflow)
+    errors = []
+    for name in ("build", "arm-build"):
+        commands = run_commands(jobs.get(name, ""))
+        if "sudo sysctl -w fs.aio-max-nr=1048576" not in commands:
+            errors.append(f"{name}: allow linux-aio reactors")
+        if not any(
+            command.startswith("bazel test ")
+            and all(flag in command.split() for flag in SHIPPED_FLAGS)
+            for command in commands
+        ):
+            errors.append(
+                f"{name}: test the release package, broker processes and replays"
+            )
+    return errors
+
+
+def gate_errors(workflow: str) -> list[str]:
+    jobs = jobs_section(workflow)
+    gate = jobs.get("ci-ok", "")
+    errors = []
+    if "    if: always()\n" not in gate:
+        errors.append("ci-ok must run when other jobs fail or are skipped")
+    listed = re.search(r"^    needs:\n((?:      - [a-z0-9-]+\n)+)", gate, re.MULTILINE)
+    needed = set(re.findall(r"- ([a-z0-9-]+)", listed.group(1))) if listed else set()
+    if needed != set(jobs) - {"ci-ok"}:
+        errors.append("ci-ok must depend on every other job")
+    failing = re.search(r"      - if: \$\{\{ (.+) \}\}\n        run: exit 1\n", gate)
+    if failing is None or failing.group(1) != GATE_FAILURE:
+        errors.append("ci-ok must fail when any job fails or is cancelled")
+    return errors
+
+
 class CiCoverageTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
@@ -421,39 +472,22 @@ class CiCoverageTest(unittest.TestCase):
             "python3 -m unittest tools.ci_changes_test tools.check_ci_coverage_test",
             run_commands(gate),
         )
-        for name in (
-            "build",
-            "test",
-            "sanitizer",
-            "native-policy",
-            "goldens",
-            "cpp-format",
-            "clang-tidy",
-            "clang-tidy-fuzz",
-            "repository-checks",
-            "fuzz-smoke",
-            "arm-build",
-        ):
+        # No job waits for another job's build; all start from the change check.
+        for name in set(jobs_section(self.workflow)) - {"workflow-lint", "ci-ok"}:
             with self.subTest(job=name):
                 self.assertIn(
-                    "if: needs.workflow-lint.outputs.run_checks != 'false'", jobs[name]
+                    "    if: needs.workflow-lint.outputs.run_checks != 'false'\n",
+                    jobs[name],
                 )
-                if name == "arm-build":
-                    self.assertIn("needs: [workflow-lint, build]", jobs[name])
-                else:
-                    self.assertIn("needs: workflow-lint", jobs[name])
-        goldens = jobs["goldens"]
-        self.assertNotRegex(goldens, r"(?m)^    if:")
-        steps = re.split(r"(?m)^      - ", goldens)[1:]
-        checks = [
-            step for step in steps if "uses: ./.github/actions/retain-logs" not in step
-        ]
-        self.assertEqual(len(checks), 3)
-        for step in checks:
-            self.assertIn("if: needs.workflow-lint.outputs.run_checks != 'false'", step)
+                self.assertIn("    needs: workflow-lint\n", jobs[name])
 
     def test_only_failed_test_steps_can_trigger_retention(self) -> None:
-        for workflow in (self.workflow, FUZZ_WORKFLOW.read_text()):
+        for workflow in (
+            self.workflow,
+            FUZZ_WORKFLOW.read_text(),
+            REACTOR_WORKFLOW.read_text(),
+            NIGHTLY_WORKFLOW.read_text(),
+        ):
             for name, job in job_blocks(workflow).items():
                 with self.subTest(job=name):
                     steps = re.split(r"(?m)^      - ", job)[1:]
@@ -461,7 +495,7 @@ class CiCoverageTest(unittest.TestCase):
                         step
                         for step in steps
                         if any(
-                            command.startswith("bazel test ")
+                            command.startswith(("bazel test ", "bazel coverage "))
                             for command in run_commands(step)
                         )
                     ]
@@ -488,11 +522,8 @@ class CiCoverageTest(unittest.TestCase):
                         failed = f"({failed})"
                     self.assertIn(f"if: failure() && {failed}", retention[0])
                     self.assertIn("${{ github.run_attempt }}", retention[0])
-                    if name == "goldens":
-                        self.assertIn("${{ runner.arch }}", retention[0])
-                        self.assertIn("${{ matrix.config }}", retention[0])
-                    elif name == "fuzz-campaign":
-                        self.assertIn("${{ matrix.name }}", retention[0])
+                    if name == "fuzz-campaign":
+                        self.assertIn("${{ strategy.job-index }}", retention[0])
                     elif name != "fuzz-smoke":
                         self.assertIn("${{ github.job }}", retention[0])
 
@@ -583,75 +614,139 @@ class CiCoverageTest(unittest.TestCase):
                 if "//tools:clang_tidy" in command:
                     self.assertIn("-- --jobs=2", command)
 
-    def test_cache_families_have_one_writer_and_analysis_reuses_matching_inputs(
-        self,
-    ) -> None:
-        jobs = job_blocks(self.workflow)
-        for name, scope in {
-            "build": "ci-release",
-            "test": "ci-debug",
-            "sanitizer": "ci-sanitizer",
-            "native-policy": "ci-native",
-            "cpp-format": "tools",
-            "repository-checks": "tools",
-            "clang-tidy": "analysis-debug",
-            "clang-tidy-fuzz": "analysis-fuzz",
-            "fuzz-smoke": "fuzz",
-            "arm-build": "ci-release",
-        }.items():
-            with self.subTest(job=name):
-                self.assertIn(f"cache-scope: {scope}", jobs[name])
-                if name in {
-                    "build",
-                    "test",
-                    "sanitizer",
-                    "native-policy",
-                    "repository-checks",
-                    "fuzz-smoke",
-                    "arm-build",
-                }:
-                    self.assertIn("cache-write: 'true'", jobs[name])
-                else:
-                    self.assertNotIn("cache-write:", jobs[name])
-        self.assertIn("cache-scope: ${{ matrix.config }}", jobs["goldens"])
-        self.assertIn(
-            "cache-write: ${{ matrix.runner == 'ubuntu-24.04-arm' && matrix.config == 'ci-debug' }}",
-            jobs["goldens"],
-        )
-        scheduled = FUZZ_WORKFLOW.read_text()
-        self.assertIn("cache-scope: fuzz", scheduled)
-        self.assertNotIn("cache-write:", scheduled)
+    def test_caches_hold_downloads_written_only_from_main(self) -> None:
         setup = SETUP_BUILD.read_text()
         self.assertIn("disk-cache: false", setup)
-        self.assertIn("build --disk_cache=${{ runner.temp }}/kwaque-bazel-disk", setup)
-        self.assertEqual(setup.count("path: ${{ runner.temp }}/kwaque-bazel-disk"), 2)
-        prefix = (
-            "bazel-v1-${{ runner.os }}-${{ runner.arch }}-${{ inputs.cache-scope }}-"
-        )
-        self.assertIn(f"CACHE_KEY: {prefix}${{{{ github.sha }}}}", setup)
-        self.assertEqual(setup.count("key: ${{ steps.disk-cache.outputs.key }}"), 2)
-        self.assertEqual(setup.count(f"restore-keys: |\n          {prefix}\n"), 2)
-        self.assertIn("inputs.cache-write == 'true'", setup)
+        self.assertIn("repository-cache: true", setup)
+        self.assertIn("bazelisk-cache: true", setup)
+        self.assertIn("cache-save: ${{ github.ref == 'refs/heads/main' }}", setup)
+        self.assertNotIn("--disk_cache", setup)
+        self.assertNotIn("inputs:", setup)
+        for workflow in (
+            self.workflow,
+            FUZZ_WORKFLOW.read_text(),
+            REACTOR_WORKFLOW.read_text(),
+            NIGHTLY_WORKFLOW.read_text(),
+        ):
+            for value in ("cache-scope:", "cache-write:", "--disk_cache"):
+                self.assertNotIn(value, workflow)
+        # The only other cache is each scheduled fuzz target's corpus.
+        for workflow in (
+            self.workflow,
+            REACTOR_WORKFLOW.read_text(),
+            NIGHTLY_WORKFLOW.read_text(),
+        ):
+            self.assertNotIn("actions/cache", workflow)
+
+    def test_one_result_job_gates_every_job(self) -> None:
+        self.assertEqual(gate_errors(self.workflow), [])
+        gate = job_blocks(self.workflow)["ci-ok"]
+        for changed in (
+            gate.replace("      - sanitizer\n", ""),
+            gate.replace("    if: always()\n", ""),
+            gate.replace(" || contains(needs.*.result, 'cancelled')", ""),
+        ):
+            with self.subTest(changed=changed):
+                self.assertNotEqual(changed, gate)
+                self.assertTrue(gate_errors(self.workflow.replace(gate, changed)))
+
+    def test_runs_on_main_are_never_cancelled(self) -> None:
         self.assertIn(
-            "github.event.pull_request.head.repo.full_name == github.repository", setup
+            "  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}\n",
+            self.workflow,
         )
-        self.assertIn("if: steps.disk-cache.outputs.write == 'true'", setup)
-        self.assertIn("if: steps.disk-cache.outputs.write != 'true'", setup)
-        for name in ("clang-tidy", "clang-tidy-fuzz"):
-            job = jobs[name]
-            self.assertIn("uses: actions/cache/save@", job)
-            self.assertIn("key: ${{ steps.setup.outputs.disk-cache-key }}", job)
-            self.assertIn("steps.setup.outputs.disk-cache-hit != 'true'", job)
-            self.assertIn(
-                "github.event.pull_request.head.repo.full_name == github.repository",
-                job,
-            )
-            self.assertLess(
-                job.index("Materialize"), job.index("Save prepared analysis inputs")
-            )
-            self.assertLess(
-                job.index("Save prepared analysis inputs"), job.index("Generate")
-            )
+
+    def test_release_jobs_test_the_shipped_artifact(self) -> None:
+        self.assertEqual(shipped_artifact_errors(self.workflow), [])
+        for value in (
+            "package,smoke,fuzz_replay",
+            "--//bazel:reactor_backend=linux-aio",
+        ):
+            with self.subTest(value=value):
+                job = job_blocks(self.workflow)["arm-build"]
+                changed = job.replace(value, "")
+                self.assertTrue(
+                    shipped_artifact_errors(self.workflow.replace(job, changed))
+                )
+
+    def test_python_workflow_module_and_license_checks_run(self) -> None:
+        jobs = job_blocks(self.workflow)
+        python = jobs["python-lint"]
+        self.assertIn("args: format --check --diff", python)
+        self.assertIn("args: check --output-format=github", python)
+        self.assertEqual(python.count("version: 0.16.9"), 2)
+        self.assertEqual(python.count("checksum: "), 2)
+        lint = jobs["workflow-lint"]
+        self.assertIn("uses: zizmorcore/zizmor-action@", lint)
+        self.assertRegex(lint, r"(?m)^          version: \d+\.\d+\.\d+$")
+        integrity = run_commands(jobs["repository-checks"])
+        joined = " ".join(integrity)
+        for required in (
+            "bazel mod tidy --lockfile_mode=update",
+            "bazel mod deps --lockfile_mode=update",
+            "git diff --exit-code -- MODULE.bazel MODULE.bazel.lock",
+            "//tools:check_package_licenses",
+        ):
+            with self.subTest(required=required):
+                self.assertIn(required, joined)
+
+    def test_release_attests_and_drafts_only_tested_tagged_packages(self) -> None:
+        release = RELEASE_WORKFLOW.read_text()
+        jobs = jobs_section(release)
+        self.assertIn("  push:\n    tags:\n", release)
+        self.assertIn("permissions:\n  contents: read\n", release)
+        package = jobs["package"]
+        for runner in ("ubuntu-24.04", "ubuntu-24.04-arm"):
+            self.assertIn(f"          - {runner}\n", package)
+        commands = run_commands(package)
+        tests = [command for command in commands if command.startswith("bazel test ")]
+        self.assertEqual(len(tests), 1)
+        for flag in (
+            "--config=ci-release",
+            "--test_tag_filters=package",
+            "//bazel/packaging:all",
+        ):
+            self.assertIn(flag, tests[0].split())
+        gate = " ".join(commands)
+        for required in (
+            'tag != "v" + fields["version"]',
+            '"-dev" in fields["version"]',
+            'fields["dirty"] != "false"',
+        ):
+            self.assertIn(required, gate)
+        # Attestation follows the tests and the version gate.
+        self.assertLess(
+            package.index("bazel test "), package.index("attest-build-provenance")
+        )
+        self.assertLess(
+            package.index("--version"), package.index("attest-build-provenance")
+        )
+        self.assertIn("      id-token: write\n      attestations: write\n", package)
+        publish = jobs["publish"]
+        self.assertIn("    needs: package\n", publish)
+        self.assertIn("    permissions:\n      contents: write\n", publish)
+        self.assertIn("--draft", " ".join(run_commands(publish)))
+
+    def test_nightly_compares_two_independent_release_packages(self) -> None:
+        nightly = NIGHTLY_WORKFLOW.read_text()
+        jobs = job_blocks(nightly)
+        output_bases = set()
+        for name in ("reproducible-package-a", "reproducible-package-b"):
+            builds = [
+                command
+                for command in run_commands(jobs[name])
+                if "build --config=ci-release" in command
+            ]
+            self.assertEqual(len(builds), 1, name)
+            self.assertIn("//bazel/packaging:kwaque_tar", builds[0].split())
+            output_bases.add(re.search(r"--output_base=(\S+)", builds[0]).group(1))
+        self.assertEqual(len(output_bases), 2)
+        self.assertIn("path: relocated/kwaque", jobs["reproducible-package-b"])
+        compare = jobs["reproducible-package"]
+        self.assertIn(
+            "needs: [reproducible-package-a, reproducible-package-b]", compare
+        )
+        self.assertIn('cmp -s "${first[0]}" "${second[0]}"', compare)
 
     def test_analysis_covers_ordinary_and_fuzz_sources(self) -> None:
         self.assertEqual(analysis_coverage_errors(self.workflow), [])
@@ -702,12 +797,14 @@ class CiCoverageTest(unittest.TestCase):
             [],
         )
 
-    def test_each_omitted_smoke_target_or_missing_cap_fails(self) -> None:
-        for value in SMOKE_FUZZERS | {
+    def test_each_missing_smoke_selection_or_cap_fails(self) -> None:
+        for value in (
             "--test_arg=-max_total_time=2",
             "--test_output=all",
+            "--build_tag_filters=fuzz",
+            "--test_tag_filters=fuzz,-manual",
             "--runs_per_test=10",
-        }:
+        ):
             with self.subTest(value=value):
                 self.assertTrue(
                     fuzz_coverage_errors(
@@ -716,10 +813,20 @@ class CiCoverageTest(unittest.TestCase):
                         BAZEL_CONFIG.read_text(),
                     )
                 )
+        listed = self.workflow.replace(
+            "--test_tag_filters=fuzz,-manual\n          //...",
+            "--test_tag_filters=fuzz,-manual\n          //src/codec/tests:codec_fuzz",
+        )
+        self.assertNotEqual(listed, self.workflow)
+        self.assertTrue(
+            fuzz_coverage_errors(
+                listed, FUZZ_WORKFLOW.read_text(), BAZEL_CONFIG.read_text()
+            )
+        )
 
     def test_each_omitted_campaign_or_retention_setting_fails(self) -> None:
         scheduled = FUZZ_WORKFLOW.read_text()
-        for value in SCHEDULED_FUZZERS | {
+        for value in (
             "--test_arg=-max_total_time=600",
             "--test_arg=-timeout=15",
             "if: failure()",
@@ -729,8 +836,15 @@ class CiCoverageTest(unittest.TestCase):
             "FUZZ_TARGET: ${{ matrix.target }}",
             '"${FUZZ_TARGET}"',
             "  schedule:",
-        }:
+            "needs: campaign-targets",
+            "fromJSON(needs.campaign-targets.outputs.targets)",
+            "fuzz-campaign\\b",
+            "uses: actions/cache/restore@",
+            "uses: actions/cache/save@",
+            '--test_env=KWAQUE_FUZZ_CORPUS_DIR="${CORPUS}"',
+        ):
             with self.subTest(value=value):
+                self.assertIn(value, scheduled)
                 self.assertTrue(
                     fuzz_coverage_errors(
                         self.workflow,
@@ -739,33 +853,55 @@ class CiCoverageTest(unittest.TestCase):
                     )
                 )
 
-    def test_campaign_duplicates_canary_or_wrong_target_binding_fail(self) -> None:
+    def test_campaign_listing_or_wrong_target_binding_fail(self) -> None:
         scheduled = FUZZ_WORKFLOW.read_text()
-        entry = (
-            "          - name: codec_fuzz\n"
-            "            target: //src/codec/tests:codec_fuzz\n"
-        )
         for altered in (
-            scheduled.replace(entry, entry + entry),
             scheduled.replace(
-                entry,
-                entry
-                + (
-                    "          - name: signal_canary_fuzz\n"
-                    "            target: //src/simulation/tests:signal_canary_fuzz\n"
-                ),
+                "        target: ${{ fromJSON(needs.campaign-targets.outputs.targets) }}",
+                "        target:\n          - //src/codec/tests:codec_fuzz",
             ),
-            scheduled.replace("name: codec_fuzz", "name: frame_fuzz"),
             scheduled.replace('"${FUZZ_TARGET}"', "//src/codec/tests:codec_fuzz"),
             scheduled.replace("bazel test", "bazel build"),
             scheduled.replace("max-parallel: 4", "max-parallel: 12"),
+            scheduled.replace("fuzz-campaign\\b", "fuzz\\b"),
         ):
             with self.subTest(workflow=altered):
+                self.assertNotEqual(altered, scheduled)
                 self.assertTrue(
                     fuzz_coverage_errors(
                         self.workflow, altered, BAZEL_CONFIG.read_text()
                     )
                 )
+
+    def test_nightly_repeats_flaky_candidates_and_measures_coverage(self) -> None:
+        jobs = job_blocks(NIGHTLY_WORKFLOW.read_text())
+        self.assertIn("  schedule:", NIGHTLY_WORKFLOW.read_text())
+        stress = run_commands(jobs["stress"])
+        self.assertIn("sudo sysctl -w fs.aio-max-nr=1048576", stress)
+        repeated = [command for command in stress if command.startswith("bazel test ")]
+        self.assertEqual(len(repeated), 1)
+        for flag in (
+            "--config=ci-debug",
+            "--//bazel:reactor_backend=linux-aio",
+            "--runs_per_test=20",
+            "--cache_test_results=no",
+            "--test_env=GTEST_SHUFFLE=1",
+            "--build_tag_filters=smoke,stress",
+            "--test_tag_filters=smoke,stress,-manual",
+            "//...",
+        ):
+            with self.subTest(flag=flag):
+                self.assertIn(flag, repeated[0].split())
+        coverage = [
+            command
+            for command in run_commands(jobs["coverage"])
+            if command.startswith("bazel coverage ")
+        ]
+        self.assertEqual(len(coverage), 1)
+        self.assertIn("//...", coverage[0].split())
+        self.assertIn(
+            "path: bazel-out/_coverage/_coverage_report.dat", jobs["coverage"]
+        )
 
     def test_fuzz_cache_cannot_skip_a_campaign(self) -> None:
         config = BAZEL_CONFIG.read_text()
@@ -836,6 +972,31 @@ class CiCoverageTest(unittest.TestCase):
         )
         self.assertTrue(validation_profile_errors(changed, config))
 
+    def test_production_and_io_uring_reactor_backends_are_exercised(self) -> None:
+        commands = run_commands(job_blocks(self.workflow)["test"])
+        self.assertIn("sudo sysctl -w fs.aio-max-nr=1048576", commands)
+        tests = [command for command in commands if command.startswith("bazel test ")]
+        self.assertEqual(len(tests), 2)
+        for command in tests:
+            self.assertIn("--//bazel:reactor_backend=linux-aio", command.split())
+        scheduled = REACTOR_WORKFLOW.read_text()
+        self.assertIn("  schedule:", scheduled)
+        tests = [
+            command
+            for command in run_commands(job_blocks(scheduled).get("io-uring", ""))
+            if command.startswith("bazel test ")
+        ]
+        self.assertEqual(len(tests), 1)
+        for flag in (
+            "--config=ci-debug",
+            "--//bazel:reactor_backend=io_uring",
+            "--build_tag_filters=-fuzz,-manual",
+            "--test_tag_filters=-fuzz,-manual",
+            "//...",
+        ):
+            with self.subTest(flag=flag):
+                self.assertIn(flag, tests[0].split())
+
     def test_current_workflow_covers_all_required_jobs(self) -> None:
         self.assertEqual(coverage_errors(self.workflow), [])
 
@@ -863,27 +1024,32 @@ class CiCoverageTest(unittest.TestCase):
         )
 
     def test_each_missing_golden_dimension_or_changed_suite_fails(self) -> None:
-        for value in ("ubuntu-24.04", "ubuntu-24.04-arm", "ci-debug", "ci-release"):
-            with self.subTest(value=value):
-                self.assertTrue(
-                    coverage_errors(self.workflow.replace(f"          - {value}\n", ""))
-                )
+        jobs = job_blocks(self.workflow)
+        goldens = jobs["goldens"]
         self.assertTrue(
             coverage_errors(
-                self.workflow.replace(GOLDENS, "//src/simulation/tests:philox_kat_test")
+                self.workflow.replace(
+                    goldens, goldens.replace("ubuntu-24.04-arm", "ubuntu-24.04")
+                )
             )
         )
-        self.assertTrue(
-            coverage_errors(self.workflow.replace("--cache_test_results=no", ""))
-        )
-        for target in (
-            "//src/model/tests:format_fixture_test",
-            "//src/model/tests:batch_builder_test",
-            "//src/compression/tests:format_fixture_test",
-            "//tools:verify_format_fixtures_test",
-        ):
-            with self.subTest(target=target):
-                self.assertTrue(coverage_errors(self.workflow.replace(target, "")))
+        for name in ("build", "arm-build", "goldens"):
+            job = jobs[name]
+            with self.subTest(job=name):
+                self.assertTrue(
+                    coverage_errors(
+                        self.workflow.replace(
+                            job, job.replace("--cache_test_results=no", "")
+                        )
+                    )
+                )
+                for target in GOLDEN_SUITE:
+                    self.assertTrue(
+                        coverage_errors(
+                            self.workflow.replace(job, job.replace(target + "\n", "\n"))
+                        ),
+                        target,
+                    )
 
     def test_actual_test_execution_and_configuration_isolation_are_required(
         self,

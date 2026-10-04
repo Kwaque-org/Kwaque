@@ -1,5 +1,7 @@
 #include "src/storage/local_types.h"
 
+#include "src/base/units.h"
+
 #include <algorithm>
 
 namespace kwaque::storage {
@@ -84,7 +86,7 @@ result<local_root_reference> local_root_reference::make(
     if (!valid) return failure(valid.error());
     if (!sequence.is_valid() || bytes.value() < 32)
         return failure(errc::invalid_argument);
-    if (bytes.value() > 65536 || !position.checked_add(bytes))
+    if (bytes.value() > 64_KiB || !position.checked_add(bytes))
         return failure(errc::out_of_range);
     if ((kind == local_root_kind::sealed_retry) != (position.value() != 0))
         return failure(errc::invalid_argument);
@@ -107,7 +109,7 @@ result<local_footer_reference> local_footer_reference::make(
     if (family != 6 && family != 7) return failure(errc::unsupported_format);
     if (bytes.value() < 32 || position.value() == 0)
         return failure(errc::invalid_argument);
-    if (bytes.value() > 65536 || !position.checked_add(bytes))
+    if (bytes.value() > 64_KiB || !position.checked_add(bytes))
         return failure(errc::out_of_range);
     return local_footer_reference{position, bytes, family, digest};
 }

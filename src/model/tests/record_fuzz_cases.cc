@@ -1,5 +1,6 @@
 #include "src/model/tests/record_fuzz_cases.h"
 
+#include "src/base/units.h"
 #include "src/bytes/test_allocation_profile.h"
 #include "src/codec/xxh3.h"
 #include "src/model/batch_codec.h"
@@ -34,7 +35,7 @@ void require(bool condition) {
 }
 using kwaque::bytes::testing::charge;
 codec::decode_budget memory() {
-    return {byte_count{32U << 20U}, byte_count{1U << 20U}, charge};
+    return {byte_count{32_MiB}, byte_count{1_MiB}, charge};
 }
 codec::content_digest record_digest(const fragmented_buffer& value) {
     codec::xxh3_128_hasher hash;
@@ -306,7 +307,7 @@ void exercise_record(
     auto input = parser(raw, layout, depth);
     codec::limits_config config;
     if (narrow) {
-        config.max_work_bytes = byte_count{16384};
+        config.max_work_bytes = byte_count{16_KiB};
         config.max_work_items = item_count{64};
     }
     seastar::abort_source abort;
@@ -386,7 +387,7 @@ void exercise_batch(
     auto input = parser(raw, layout, depth);
     codec::limits_config config;
     if (narrow) {
-        config.max_work_bytes = byte_count{16384};
+        config.max_work_bytes = byte_count{16_KiB};
         config.max_work_items = item_count{64};
     }
     seastar::abort_source abort;

@@ -1,3 +1,4 @@
+#include "src/base/units.h"
 #include "src/model/record_scan.h"
 #include "src/model/tests/model_bench_fixture.h"
 #include "src/model/tests/model_bench_reference.h"
@@ -30,6 +31,8 @@ using kwaque::errc;
 using kwaque::item_count;
 using kwaque::bytes::fragmented_buffer;
 using kwaque::bytes::fragmented_buffer_parser;
+using kwaque::literals::operator""_KiB;
+using kwaque::literals::operator""_MiB;
 
 TEST(ModelQualificationTest, CheckedFramingAndModelPathsAgreeOnCompleteBodies) {
     for (const auto width : std::array<std::size_t, 3>{0, 7, 67}) {
@@ -180,7 +183,7 @@ TEST(ModelQualificationTest, ThousandsOfHeadersFitActualDescriptorBudget) {
                          + budget.metadata_remaining.value()
                          - decoded->remaining.metadata_remaining.value()
                          + sizeof(model::record_layout) + sizeof(*decoded);
-    EXPECT_LT(charged, 1U << 20U);
+    EXPECT_LT(charged, 1_MiB);
     RecordProperty(
       "decoded_metadata_capacity_bound_bytes", std::to_string(charged));
     RecordProperty(
@@ -197,7 +200,7 @@ TEST(
     // envelope. Splitting at 32 bytes reaches the substrate's 1024 fragments.
     bench::model_fixture fixture{1, 32539, 0};
     fixture.initialize().get();
-    ASSERT_EQ(fixture.assigned_wire.size(), byte_count{32768});
+    ASSERT_EQ(fixture.assigned_wire.size(), byte_count{32_KiB});
     seastar::abort_source abort;
     codec::cooperative_work work{codec::limits::defaults(), abort};
     auto source
@@ -237,7 +240,7 @@ TEST(ModelQualificationTest, TinyViewsKeepBackingAndPromotionReservations) {
     auto tiny = owner.share(byte_count{101}, byte_count{1}).value();
     owner = fragmented_buffer{};
     EXPECT_EQ(tiny.size(), byte_count{1});
-    EXPECT_GE(tiny.retained_bytes(), byte_count{65536});
+    EXPECT_GE(tiny.retained_bytes(), byte_count{64_KiB});
     const auto after = tiny.allocation_cost(bench::capacity_bound).value();
     EXPECT_GE(after.backing.value(), observed);
     EXPECT_EQ(after.backing, before.backing);
@@ -323,7 +326,7 @@ TEST(
     EXPECT_GT(ticks, 0U);
     ASSERT_TRUE(result.has_value());
     ASSERT_TRUE(result->has_value());
-    EXPECT_EQ((*result)->value.records().size(), byte_count{8U << 20U});
+    EXPECT_EQ((*result)->value.records().size(), byte_count{8_MiB});
     EXPECT_GE(
       (*result)
         ->value.records()

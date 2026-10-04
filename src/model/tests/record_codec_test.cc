@@ -38,6 +38,8 @@
 #include <vector>
 
 namespace {
+using kwaque::literals::operator""_KiB;
+using kwaque::literals::operator""_MiB;
 
 using namespace std::literals;
 namespace codec = kwaque::codec;
@@ -79,7 +81,7 @@ byte_count charge(byte_count request) noexcept {
 codec::decode_budget memory() {
     // The unclaimed half of the operation ceiling covers fixture owners and
     // native/frame costs; these tests do not measure whole-operation peaks.
-    return {byte_count{32U * 1024U * 1024U}, byte_count{1024U * 1024U}, charge};
+    return {byte_count{32_MiB}, byte_count{1_MiB}, charge};
 }
 
 fragmented_buffer text(std::string_view value) {
@@ -679,7 +681,7 @@ TEST(RecordCodecTest, SixtyFourEmptyHeadersAndNarrowedHeaderLimits) {
 }
 
 TEST(RecordCodecTest, MaximumRecordAndNarrowNewAllocationsKeepSourceIntact) {
-    for (const auto size : {std::size_t{65536}, std::size_t{1048565}}) {
+    for (const auto size : {std::size_t{64_KiB}, std::size_t{1048565}}) {
         auto source = model::make_record(
                         {}, std::nullopt, nullable_bytes{payload(size)}, {})
                         .value();
@@ -693,7 +695,7 @@ TEST(RecordCodecTest, MaximumRecordAndNarrowNewAllocationsKeepSourceIntact) {
         codec::limits_config config;
         config.max_work_bytes = byte_count{128};
         config.max_work_items = item_count{64};
-        if (size == 65536) config.max_allocation_bytes = byte_count{4096};
+        if (size == 64_KiB) config.max_allocation_bytes = byte_count{4_KiB};
         codec::cooperative_work work{
           codec::limits::make(config).value(), abort};
         auto encoded
@@ -729,11 +731,11 @@ TEST(RecordCodecTest, HeaderPayloadTotalIsCumulativeAcrossAllHeaders) {
     const auto value = decode(input);
     ASSERT_TRUE(value.has_value());
     ASSERT_EQ(value->value.headers().size(), 1U);
-    EXPECT_EQ(value->value.headers()[0].name().size(), byte_count{4096});
+    EXPECT_EQ(value->value.headers()[0].name().size(), byte_count{4_KiB});
     EXPECT_EQ(value->value.headers()[0].value()->size(), byte_count{61440});
     EXPECT_EQ(
       model::record_encoded_size(value->value).value().header_payload_bytes,
-      byte_count{65536});
+      byte_count{64_KiB});
 
     std::string oversized{"\x00\x00\x00\x01\x01\x02"sv};
     for (const unsigned length : {40000U, 25537U}) {

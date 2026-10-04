@@ -1,5 +1,7 @@
 #include "src/storage/local_store_config.h"
 
+#include "src/base/units.h"
+
 namespace kwaque::storage {
 runtime::result<void>
 validate_local_device_spec(const local_device_spec& spec) {
@@ -67,8 +69,7 @@ validate_local_device_set(std::span<const local_device_spec> specs) {
 }
 runtime::result<void> local_store_io_limits::validate() const noexcept {
     if (
-      !charge || operation_bytes.value() == 0
-      || operation_bytes.value() > 4U * 1024U * 1024U
+      !charge || operation_bytes.value() == 0 || operation_bytes.value() > 4_MiB
       || metadata_bytes.value() == 0 || metadata_bytes > operation_bytes
       || execution_bytes.value() == 0
       || execution_bytes.value() > maximum_contiguous_allocation_bytes)

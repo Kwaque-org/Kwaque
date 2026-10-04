@@ -1,6 +1,7 @@
 #ifndef KWAQUE_SRC_SIMULATION_FAKE_NETWORK_H_
 #define KWAQUE_SRC_SIMULATION_FAKE_NETWORK_H_
 
+#include "src/base/units.h"
 #include "src/runtime/network.h"
 #include "src/runtime/shard_affinity.h"
 #include "src/runtime/time.h"
@@ -32,20 +33,14 @@ inline constexpr std::uint32_t default_fake_network_operations{4'096};
 inline constexpr std::uint32_t maximum_fake_network_operations{65'536};
 inline constexpr std::uint32_t default_fake_network_parked_operations{256};
 inline constexpr std::uint32_t maximum_fake_network_parked_operations{4'096};
-inline constexpr byte_count default_fake_network_direction_bytes{
-  std::uint64_t{16} * 1024U * 1024U};
-inline constexpr byte_count maximum_fake_network_direction_bytes{
-  std::uint64_t{64} * 1024U * 1024U};
+inline constexpr byte_count default_fake_network_direction_bytes{16_MiB};
+inline constexpr byte_count maximum_fake_network_direction_bytes{64_MiB};
 inline constexpr std::uint32_t default_fake_network_packets{8'192};
 inline constexpr std::uint32_t maximum_fake_network_packets{65'536};
-inline constexpr byte_count default_fake_network_packet_logical_bytes{
-  std::uint64_t{256} * 1024U * 1024U};
-inline constexpr byte_count maximum_fake_network_packet_logical_bytes{
-  std::uint64_t{2} * 1024U * 1024U * 1024U};
-inline constexpr byte_count default_fake_network_packet_retained_bytes{
-  std::uint64_t{256} * 1024U * 1024U};
-inline constexpr byte_count maximum_fake_network_packet_retained_bytes{
-  std::uint64_t{2} * 1024U * 1024U * 1024U};
+inline constexpr byte_count default_fake_network_packet_logical_bytes{256_MiB};
+inline constexpr byte_count maximum_fake_network_packet_logical_bytes{2_GiB};
+inline constexpr byte_count default_fake_network_packet_retained_bytes{256_MiB};
+inline constexpr byte_count maximum_fake_network_packet_retained_bytes{2_GiB};
 inline constexpr std::uint32_t default_fake_network_direction_packets{64};
 inline constexpr std::uint32_t maximum_fake_network_direction_packets{1'024};
 inline constexpr std::uint32_t default_fake_network_links{1'024};

@@ -15,10 +15,14 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <functional>
+#include <memory>
 #include <new>
 #include <optional>
+#include <string_view>
 #include <system_error>
 #include <utility>
+#include <vector>
 
 namespace kwaque::runtime::production {
 
@@ -548,7 +552,34 @@ seastar::future<result<void>> file_system::create_directories(file_path path) {
     assert_current();
     [[maybe_unused]] auto metric = statistics_->accept();
     try {
-        co_await seastar::recursive_touch_directory(path.value());
+        // Every prefix that ends at a component, shortest first. A relative
+        // path starts at the working directory, which exists.
+        const std::string_view value = path.value();
+        std::vector<std::string_view> prefixes;
+        for (std::size_t at = 0; at < value.size();) {
+            const auto next = value.find('/', at);
+            const auto end = next == std::string_view::npos ? value.size()
+                                                            : next;
+            if (end != at) prefixes.push_back(value.substr(0, end));
+            at = end + 1;
+        }
+        // The deepest prefix that exists; every later one is missing.
+        auto present = prefixes.size();
+        for (; present != 0; --present) {
+            const auto type = co_await seastar::file_type(
+              prefixes[present - 1]);
+            if (!type) continue;
+            if (*type != seastar::directory_entry_type::directory)
+                co_return failure(make_file_error(
+                  errc::not_a_directory, file_failure_detail::unknown));
+            break;
+        }
+        // Creation only. A new entry is durable once the directory holding
+        // it is synced, which the caller does, as for files and renames.
+        // Seastar's recursive_touch_directory also syncs every existing
+        // ancestor up to the root, one after another.
+        for (auto next = present; next < prefixes.size(); ++next)
+            co_await seastar::touch_directory(prefixes[next]);
         co_return result<void>{};
     } catch (const std::bad_alloc&) {
         throw;
@@ -572,8 +603,48 @@ seastar::future<result<void>> file_system::remove_file(file_path path) {
     }
 }
 
+verified_directories::verified_directories()
+  : groups_(std::make_unique<std::array<group, sets>>()) {}
+
+namespace {
+std::size_t verified_set(std::string_view path, std::size_t sets) noexcept {
+    return std::hash<std::string_view>{}(path) % sets;
+}
+} // namespace
+
+bool verified_directories::contains(std::string_view path) const noexcept {
+    if (path.empty() || path.size() > longest) return false;
+    const auto& group = (*groups_)[verified_set(path, sets)];
+    return std::any_of(
+      group.entries.begin(), group.entries.end(), [path](const entry& held) {
+          return std::string_view{held.path.data(), held.length} == path;
+      });
+}
+
+void verified_directories::insert(std::string_view path) noexcept {
+    if (path.empty() || path.size() > longest || contains(path)) return;
+    auto& group = (*groups_)[verified_set(path, sets)];
+    auto& held = group.entries[group.next];
+    group.next = static_cast<std::uint8_t>((group.next + 1) % ways);
+    held.length = static_cast<std::uint16_t>(path.size());
+    std::copy(path.begin(), path.end(), held.path.begin());
+}
+
+void verified_directories::forget(std::string_view path) noexcept {
+    for (auto& group : *groups_)
+        for (auto& held : group.entries) {
+            const std::string_view value{held.path.data(), held.length};
+            if (
+              held.length != 0 && value.starts_with(path)
+              && (value.size() == path.size() || path.ends_with('/')
+                  || value[path.size()] == '/'))
+                held.length = 0;
+        }
+}
+
 seastar::future<result<void>> file_system::remove_directory(file_path path) {
     assert_current();
+    verified_.forget(path.value());
     [[maybe_unused]] auto metric = statistics_->accept();
     try {
         co_await seastar::remove_directory(path.value());
@@ -587,6 +658,8 @@ seastar::future<result<void>> file_system::remove_directory(file_path path) {
 seastar::future<result<void>> file_system::rename(
   file_path source, file_path destination, file_rename_policy policy) {
     assert_current();
+    verified_.forget(source.value());
+    verified_.forget(destination.value());
     [[maybe_unused]] auto metric = statistics_->accept();
     try {
         if (

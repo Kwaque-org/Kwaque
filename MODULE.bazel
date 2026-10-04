@@ -7,13 +7,20 @@ bazel_dep(name = "abseil-cpp", version = "20260526.0")
 bazel_dep(name = "bazel_skylib", version = "1.9.0")
 
 bazel_dep(name = "buildifier_prebuilt", version = "8.2.0.2", dev_dependency = True)
+bazel_dep(name = "rules_buf", version = "0.5.4", dev_dependency = True)
+
+buf = use_extension("@rules_buf//buf:extensions.bzl", "buf", dev_dependency = True)
+buf.toolchains(
+    sha256 = "18f603d3b418f6a1259da4425b04bbe2fbaf60c2b796b98114d961e8736198b9",
+    version = "v1.73.0",
+)
+use_repo(buf, "rules_buf_toolchains")
 
 bazel_dep(name = "crc32c", version = "1.1.0")
 bazel_dep(name = "fmt", version = "12.1.0")
 bazel_dep(name = "googletest", version = "1.17.0.bcr.2")
 bazel_dep(name = "liburing", version = "2.14")
 bazel_dep(name = "lz4", version = "1.9.4")
-bazel_dep(name = "patchelf", version = "0.18.0")
 bazel_dep(name = "platforms", version = "1.1.0")
 bazel_dep(name = "protobuf", version = "33.5")
 bazel_dep(name = "ragel", version = "26.04.0-20260414092900-8841e561489e")
@@ -23,6 +30,7 @@ bazel_dep(name = "rules_pkg", version = "1.0.1")
 bazel_dep(name = "rules_python", version = "1.7.0")
 bazel_dep(name = "xxhash", version = "0.8.3.bcr.1")
 bazel_dep(name = "yaml-cpp", version = "0.8.0")
+bazel_dep(name = "zlib", version = "1.3.1.bcr.6")
 bazel_dep(
     name = "rules_boost",
     repo_name = "com_github_nelhage_rules_boost",
@@ -112,13 +120,7 @@ use_repo(
     "x86_64_sysroot",
 )
 
-bazel_dep(name = "toolchains_llvm", version = "1.7.0", dev_dependency = True)
-archive_override(
-    module_name = "toolchains_llvm",
-    integrity = "sha256-moo9nZEm6v8R/gq4audotnJyFLp89pcy4Ic97PUCaN0=",
-    strip_prefix = "toolchains_llvm-98414f360d37e4fc9fb308b357d1bd8df9f92428",
-    urls = ["https://github.com/bazel-contrib/toolchains_llvm/archive/98414f360d37e4fc9fb308b357d1bd8df9f92428.tar.gz"],
-)
+bazel_dep(name = "toolchains_llvm", version = "1.10.0", dev_dependency = True)
 
 llvm = use_extension(
     "@toolchains_llvm//toolchain/extensions:llvm.bzl",
@@ -127,39 +129,19 @@ llvm = use_extension(
 )
 llvm.toolchain(
     name = "current_llvm_toolchain",
-    compile_flags = {
-        "linux-aarch64": [
-            "--target=aarch64-unknown-linux-gnu",
-            "-march=armv8-a+crc+crypto",
-            "-U_FORTIFY_SOURCE",
-            "-fstack-protector",
-            "-fno-omit-frame-pointer",
-            "-fcolor-diagnostics",
-            "-Wall",
-            "-Wthread-safety",
-            "-Wself-assign",
-        ],
-        "linux-x86_64": [
-            "--target=x86_64-unknown-linux-gnu",
-            "-march=westmere",
-            "-U_FORTIFY_SOURCE",
-            "-fstack-protector",
-            "-fno-omit-frame-pointer",
-            "-fcolor-diagnostics",
-            "-Wall",
-            "-Wthread-safety",
-            "-Wself-assign",
-        ],
-    },
     cxx_standard = {"": "c++23"},
-    llvm_version = "23.1.0-rc2",
+    extra_compile_flags = {
+        "linux-aarch64": ["-march=armv8-a+crc+crypto"],
+        "linux-x86_64": ["-march=westmere"],
+    },
+    llvm_version = "23.1.2",
     sha256 = {
-        "linux-aarch64": "9e588aeaad2baf5606609053d18f496aa1b5c056f7e12bddac2615f0a1695d11",
-        "linux-x86_64": "ef36b2d7d9a38e6fa7b94b9bd8ef634b90aa312434c1f76a14143004d5497eab",
+        "linux-aarch64": "38f9123ac31b954164d5cee1664ecc45a4db2e9795247635a46d919f2a1fb6ea",
+        "linux-x86_64": "5581ff63eb2d1ec8a2cf61847240465a4e177f2ece3d663ef3f43e309d28eb53",
     },
     urls = {
-        "linux-aarch64": ["https://github.com/redpanda-data/llvm-project/releases/download/llvmorg-23.1.0-rc2/llvm-23.1.0-rc2-debian-11-aarch64-2026-07-28.tar.zst"],
-        "linux-x86_64": ["https://github.com/redpanda-data/llvm-project/releases/download/llvmorg-23.1.0-rc2/llvm-23.1.0-rc2-debian-11-x86_64-2026-07-28.tar.zst"],
+        "linux-aarch64": ["https://github.com/redpanda-data/llvm-project/releases/download/llvmorg-23.1.2/llvm-23.1.2-debian-11-aarch64-2026-09-28.tar.zst"],
+        "linux-x86_64": ["https://github.com/redpanda-data/llvm-project/releases/download/llvmorg-23.1.2/llvm-23.1.2-debian-11-x86_64-2026-09-28.tar.zst"],
     },
 )
 llvm.sysroot(

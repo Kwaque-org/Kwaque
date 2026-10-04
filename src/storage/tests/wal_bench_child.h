@@ -1,5 +1,6 @@
 #pragma once
 
+#include "src/base/units.h"
 #include "src/codec/tests/allocation_observer.h"
 #include "src/codec/tests/benchmark_buffer.h"
 #include "src/codec/tests/memory_qualification_support.h"
@@ -36,20 +37,20 @@ child(std::size_t size, codec::cooperative_work& work) {
         co_return (co_await validate_encoded_assigned_batch(
                      std::move(raw),
                      batch_expected(),
-                     {byte_count{32U << 20U}, byte_count{1U << 20U}, charge},
+                     {byte_count{32_MiB}, byte_count{1_MiB}, charge},
                      work))
           .value();
     }
-    if (size == 8U << 20U)
-        co_return (co_await large_child(false, work, byte_count{64U << 20U}))
+    if (size == 8_MiB)
+        co_return (co_await large_child(false, work, byte_count{64_MiB}))
           .value();
-    const auto count = std::max<std::size_t>(1, size / (1U << 20U));
+    const auto count = std::max<std::size_t>(1, size / 1_MiB);
     auto payload = co_await codec::bench::patterned_buffer(
       size / count - 1024,
       65504,
       codec::bench::payload_pattern::incompressible,
       work,
-      byte_count{64U << 20U});
+      byte_count{64_MiB});
     auto record
       = model::make_record(
           {}, {}, std::optional{std::move(payload)}, {}, work.policy())
@@ -75,10 +76,10 @@ child(std::size_t size, codec::cooperative_work& work) {
            record,
            runtime::wall_time{static_cast<std::int64_t>(i)},
            work,
-           byte_count{48U << 20U}))
+           byte_count{48_MiB}))
           .value();
     auto submitted
-      = (co_await builder.finalize(work, byte_count{48U << 20U})).value();
+      = (co_await builder.finalize(work, byte_count{48_MiB})).value();
     auto assigned = model::assigned_batch::assign(
                       std::move(submitted),
                       model::range_logical_end{100},
@@ -88,7 +89,7 @@ child(std::size_t size, codec::cooperative_work& work) {
                  std::move(assigned),
                  compression::codec_id::none,
                  work,
-                 byte_count{48U << 20U},
+                 byte_count{48_MiB},
                  charge))
       .value();
 }

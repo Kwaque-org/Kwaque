@@ -19,6 +19,7 @@
 #include <utility>
 
 namespace {
+using kwaque::literals::operator""_KiB;
 
 using kwaque::byte_count;
 using kwaque::item_count;
@@ -311,8 +312,8 @@ TEST(CodecLimitsTest, BufferChecksDistinguishEmptyStagingAndInvalidAccounting) {
       kwaque::errc::resource_exhausted);
     EXPECT_TRUE(value
                   .validate_buffer(
-                    byte_count{1024},
-                    byte_count{1024},
+                    byte_count{1_KiB},
+                    byte_count{1_KiB},
                     item_count{1024},
                     byte_count{1025})
                   .has_value());

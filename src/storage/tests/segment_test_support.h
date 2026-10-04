@@ -1,5 +1,6 @@
 #pragma once
 
+#include "src/base/units.h"
 #include "src/bytes/fragmented_buffer_builder.h"
 #include "src/bytes/test_allocation_profile.h"
 #include "src/storage/segment_format.h"
@@ -22,7 +23,7 @@
 namespace kwaque::storage::testing {
 using kwaque::bytes::testing::charge;
 inline codec::decode_budget budget() {
-    return {byte_count{32U << 20U}, byte_count{1U << 20U}, charge};
+    return {byte_count{32_MiB}, byte_count{1_MiB}, charge};
 }
 template<typename Id>
 Id id(std::uint8_t value) {

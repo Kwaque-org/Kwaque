@@ -43,7 +43,7 @@ using bytes::fragmented_buffer;
 using bytes::fragmented_buffer_parser;
 using namespace std::literals;
 
-constexpr std::size_t maximum_input = 16U * 1024U;
+constexpr std::size_t maximum_input = 16_KiB;
 constexpr field_context context{.origin = 1024, .family = 1, .field = 90};
 constexpr std::uint64_t object_start = context.origin + 2U;
 constexpr std::array<std::uint64_t, 3> original_context{
@@ -698,15 +698,13 @@ void exercise_envelope_case(
     }
     // Harness/oracle vectors and native/frame storage are reserved outside
     // these residuals; the input owner is admitted once before alias creation.
-    auto memory
-      = reserve_decode_input(
-          parser,
-          policy,
-          decode_budget{
-            byte_count{8U * 1024U * 1024U}, byte_count{1024U * 1024U}, charge},
-          context,
-          test.boundary)
-          .value();
+    auto memory = reserve_decode_input(
+                    parser,
+                    policy,
+                    decode_budget{byte_count{8_MiB}, byte_count{1_MiB}, charge},
+                    context,
+                    test.boundary)
+                    .value();
     if (options.exhaust_operation) {
         memory.operation_remaining = byte_count{};
     }
@@ -819,7 +817,7 @@ void exercise_envelope_case(
                                  byte_count{maximum_input},
                                  byte_count{maximum_input}},
                                {},
-                               byte_count{2U * 1024U * 1024U},
+                               byte_count{2_MiB},
                                charge,
                                context)
                                .get();

@@ -1,0 +1,5 @@
+target-version = "py311"
+
+[lint]
+# Ruff's classic default rules, listed so that upgrading ruff cannot add rules.
+select = ["E4", "E7", "E9", "F"]

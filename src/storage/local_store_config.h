@@ -1,5 +1,6 @@
 #pragma once
 
+#include "src/base/units.h"
 #include "src/storage/local_metadata.h"
 #include "src/storage/local_paths.h"
 
@@ -65,10 +66,10 @@ struct local_store_open_options final {
 };
 struct local_store_io_limits final {
     bytes::allocation_charge_fn charge{nullptr};
-    byte_count operation_bytes{262144};
-    byte_count metadata_bytes{65536};
+    byte_count operation_bytes{256_KiB};
+    byte_count metadata_bytes{64_KiB};
     // Excluded from codec budgets; caller-qualified native/control/frame cost.
-    byte_count execution_bytes{65536};
+    byte_count execution_bytes{64_KiB};
     [[nodiscard]] runtime::result<void> validate() const noexcept;
 };
 enum class local_store_state : std::uint8_t {
@@ -85,6 +86,9 @@ struct local_store_report final {
     bool has_payload{false};
     bool all_heads_present{true};
     std::uint32_t controls{0};
+    // Segment directories holding a creation prefix but no publication: no
+    // append can have reached them. Retained; never a store-wide gap.
+    std::uint32_t interrupted_creations{0};
     std::optional<runtime::operation_error> reason;
 };
 } // namespace kwaque::storage

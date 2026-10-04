@@ -4,10 +4,19 @@ common --experimental_repository_downloader_retries=15
 common --http_connector_attempts=24
 common --check_direct_dependencies=error
 common --incompatible_autoload_externally=+@rules_cc
+common --repo_env=BAZEL_DO_NOT_DETECT_CPP_TOOLCHAIN=1
 common:ci --lockfile_mode=error
 
 build --features=external_include_paths
 build --host_features=external_include_paths
+
+# Protobuf's own sources call APIs that protobuf and the resolved abseil
+# deprecate (absl::disjunction, pointer-taking mutex locks, the weak field
+# option). Those warnings are not ours to fix and bury the rest of the build
+# output. per_file_copt, unlike --copt, stays out of rules_foreign_cc builds.
+build --per_file_copt=external/protobuf.*@-Wno-deprecated-declarations
+build --host_per_file_copt=external/protobuf.*@-Wno-deprecated-declarations
+
 build --cxxopt=-std=c++23
 build --host_cxxopt=-std=c++23
 build --copt=-ffile-compilation-dir=.
@@ -16,21 +25,37 @@ build --incompatible_strict_action_env
 build --sandbox_default_allow_network=false
 build --incompatible_enable_proto_toolchain_resolution
 build --experimental_proto_descriptor_sets_include_source_info
-build --workspace_status_command=./bazel/stamp_vars.sh
+build --@protobuf//bazel/toolchains:prefer_prebuilt_protoc=false
 build --@toolchains_llvm//toolchain/config:libunwind=False
 build --@toolchains_llvm//toolchain/config:compiler-rt=False
 build --linkopt=--unwindlib=libgcc
 
+# Clang enables -fextend-variable-liveness=all at -Og, which miscompiles some
+# coroutines (llvm/llvm-project#163007).
+build --copt=-fextend-variable-liveness=none
+
+# libc++ checks preconditions in every build except release.
+build --cxxopt=-D_LIBCPP_HARDENING_MODE=_LIBCPP_HARDENING_MODE_EXTENSIVE
+build --host_cxxopt=-D_LIBCPP_HARDENING_MODE=_LIBCPP_HARDENING_MODE_EXTENSIVE
+
+# Every build uses stack clash protection. Outside release, Seastar thread
+# stacks also get a guard page, which frames larger than a page then probe
+# instead of skipping over.
+build --@seastar//:stack_guards=True
+build --copt=-fstack-clash-protection
+
 build:fastbuild --compilation_mode=fastbuild
 
 build:ci --per_file_copt=^(bazel|proto|src)/.*@-Werror
-test:ci --local_test_jobs=1
+# A cold CI build reports every failing target, not only the first.
+build:ci --keep_going
 
 build:ci-debug --config=ci
 build:ci-debug --compilation_mode=dbg
 build:ci-debug --copt=-gline-tables-only
 build:ci-debug --@seastar//:system_allocator=False
 build:ci-debug --@seastar//:allocation_failure_injection=True
+build:ci-debug --process_headers_in_dependencies
 test:ci-debug --test_env=KWAQUE_EXPECT_TEST_ALLOCATOR=native
 test:ci-debug --test_env=KWAQUE_EXPECT_TEST_INJECTION=true
 test:ci-debug --test_env=KWAQUE_EXPECT_TEST_OPTIMIZED=false
@@ -74,7 +99,10 @@ build:debugger --strip=never
 build:debug --config=debugger
 build:debug --copt=-O1
 
+# libFuzzer replays and minimizes one input at a time, so the reactor must run
+# tasks in a reproducible order.
 build:fuzz --config=san-all
+build:fuzz --@seastar//:shuffle_task_queue=false
 build:fuzz --define=kwaque_fuzz=1
 build:fuzz --copt=-O1
 build:fuzz --copt=-fsanitize=fuzzer-no-link
@@ -84,8 +112,21 @@ test:fuzz --test_arg=-max_total_time=2
 build:heap-profile --@seastar//:heap_profiling=True
 build:heap-profile --@seastar//:system_allocator=False
 
+build:lto --copt=-flto=thin
+build:lto --linkopt=-flto=thin
+
+coverage --config=coverage
+build:coverage --combined_report=lcov
+build:coverage --experimental_use_llvm_covmap
+build:coverage --experimental_generate_llvm_lcov
+build:coverage --instrumentation_filter=^//(bazel|proto|src)[/:]
+
+# As in Seastar's own debug builds, its debug checks accompany the system
+# allocator: cross-shard pointer and promise checks, forced preemption, and
+# task queue shuffling.
 build:san-base --@seastar//:system_allocator=True
 build:san-base --@seastar//:allocation_failure_injection=False
+build:san-base --@seastar//:debug=True
 build:san-base --linkopt=-fsanitize-link-c++-runtime
 build:san-asan-only --config=san-base
 build:san-asan-only --copt=-fsanitize=address
@@ -95,22 +136,26 @@ build:san-all --copt=-fsanitize=address,undefined,vptr,function,alignment
 build:san-all --linkopt=-fsanitize=address,undefined,vptr,function,alignment
 
 build:fortify-source --copt=-U_FORTIFY_SOURCE
-build:fortify-source --copt=-D_FORTIFY_SOURCE=2
-build:stack-clash --copt=-fstack-clash-protection
+build:fortify-source --copt=-D_FORTIFY_SOURCE=3
 build:stack-protector --copt=-fstack-protector-strong
 build:relro --copt=-fno-plt
 build:relro --linkopt=-Wl,-z,relro,-z,now
 build:secure --config=fortify-source
-build:secure --config=stack-clash
 build:secure --config=stack-protector
 build:secure --config=relro
 
 build:release --compilation_mode=opt
 build:release --config=secure
+build:release --stamp
+build:release --workspace_status_command=./bazel/stamp_vars.sh
 build:release --@seastar//:stack_guards=False
 build:release --@seastar//:debug=False
 build:release --@seastar//:system_allocator=False
 build:release --@seastar//:allocation_failure_injection=False
+build:release --cxxopt=-U_LIBCPP_HARDENING_MODE
+build:release --host_cxxopt=-U_LIBCPP_HARDENING_MODE
+build:release --cxxopt=-D_LIBCPP_HARDENING_MODE=_LIBCPP_HARDENING_MODE_NONE
+build:release --host_cxxopt=-D_LIBCPP_HARDENING_MODE=_LIBCPP_HARDENING_MODE_NONE
 build:release --copt=-g
 build:release --strip=never
 

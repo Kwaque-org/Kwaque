@@ -1,5 +1,6 @@
 #pragma once
 
+#include "src/base/units.h"
 #include "src/storage/tests/local_installation_contract.h"
 #include "src/storage/tests/wal_test_support.h"
 #include "src/storage/wal_writer.h"
@@ -12,8 +13,8 @@ using store_contract::require;
 using store_contract::take;
 
 inline wal_writer_config configuration() {
-    wal_writer_config config{alignment(8192), byte_count{1048576}};
-    config.children.working_bytes = byte_count{2U * 1024U * 1024U};
+    wal_writer_config config{alignment(8192), byte_count{1_MiB}};
+    config.children.working_bytes = byte_count{2_MiB};
     config.children.charge = charge;
     return config;
 }
@@ -46,11 +47,11 @@ inline seastar::future<admitted_wal_batch> offer(
   workload_budget& budget, std::string wire, codec::cooperative_work& work) {
     auto raw = co_await installation_contract::buffer_async(wire, 67);
     auto held = take(budget.try_reserve_buffer(raw));
-    auto working = take(budget.try_reserve(byte_count{(2U << 20U) + 65536}));
+    auto working = take(budget.try_reserve(byte_count{2_MiB + 64_KiB}));
     const auto cost = raw.allocation_cost(charge).value();
     auto memory = codec::detail::consume_decode_budget(
                     work.policy(),
-                    {byte_count{2U << 20U}, byte_count{65536}, charge},
+                    {byte_count{2_MiB}, byte_count{64_KiB}, charge},
                     cost.backing,
                     *cost.descriptors.checked_add(cost.share_controls),
                     {},
@@ -69,7 +70,7 @@ inline std::string header_bytes(
   std::uint32_t shard,
   model::wal_incarnation_id incarnation,
   std::optional<local_wal_cursor> predecessor = std::nullopt,
-  std::uint64_t capacity = 1048576) {
+  std::uint64_t capacity = 1_MiB) {
     const auto fixed = predecessor ? 68U : 44U;
     std::string body(72 + fixed, '\0');
     put(body, 0, 3, 2);
@@ -168,7 +169,7 @@ seastar::future<> exercise(
             .working_bytes = byte_count{UINT64_MAX - 65535}, .charge = charge},
           wal_child_limits{.metadata_bytes = byte_count{}, .charge = charge},
           wal_child_limits{
-            .metadata_bytes = byte_count{9U << 20U}, .charge = charge},
+            .metadata_bytes = byte_count{9_MiB}, .charge = charge},
           wal_child_limits{.execution_bytes = byte_count{}, .charge = charge},
           wal_child_limits{
             .execution_bytes = byte_count{4095}, .charge = charge},
@@ -428,7 +429,7 @@ seastar::future<> exercise(
             auto child = co_await offer(budget, assigned_wire(), work);
             std::array<std::optional<workload_reservation>, 32> pressure;
             for (auto& slot : pressure) {
-                auto held = budget.try_reserve(byte_count{4096});
+                auto held = budget.try_reserve(byte_count{4_KiB});
                 if (!held) break;
                 slot.emplace(std::move(*held));
             }
@@ -437,9 +438,12 @@ seastar::future<> exercise(
             require(
               !rejected && rejected.error().code() == errc::queue_full,
               "preparation bypassed task admission");
+            // A preparation refused after entry has consumed its offer.
+            // NOLINTBEGIN(bugprone-use-after-move)
             require(
               child.batch().bytes().empty(),
               "entered pressure rejection did not consume offer");
+            // NOLINTEND(bugprone-use-after-move)
             require(
               take(writer->positions()).reserved == positions.reserved,
               "pressure rejection changed cursor");
@@ -455,9 +459,12 @@ seastar::future<> exercise(
             require(
               !rejected && rejected.error().code() == errc::aborted,
               "canceled preflight admitted a child");
+            // A preparation refused after entry has consumed its offer.
+            // NOLINTBEGIN(bugprone-use-after-move)
             require(
               child.batch().bytes().empty(),
               "entered cancellation did not consume offer");
+            // NOLINTEND(bugprone-use-after-move)
         }
         {
             // Force the native preemption seam, without another scheduler or

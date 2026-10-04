@@ -36,6 +36,15 @@ public:
         return strong_count{value_ - other.value_};
     }
 
+    [[nodiscard]] constexpr std::optional<strong_count>
+    checked_mul(value_type factor) const noexcept {
+        value_type product = 0;
+        if (__builtin_mul_overflow(value_, factor, &product)) {
+            return std::nullopt;
+        }
+        return strong_count{product};
+    }
+
     auto operator<=>(const strong_count&) const = default;
 
 private:
@@ -49,5 +58,50 @@ struct item_count_tag;
 
 using byte_count = detail::strong_count<detail::byte_count_tag>;
 using item_count = detail::strong_count<detail::item_count_tag>;
+
+// NOLINTBEGIN(google-runtime-int)
+namespace detail {
+
+// Deliberately not constexpr: an overflowing size literal calls it during
+// constant evaluation, so the literal does not compile and the diagnostic
+// names this function.
+inline void size_literal_overflows_64_bits() noexcept {}
+
+consteval std::uint64_t
+scaled_size(unsigned long long value, unsigned shift) noexcept {
+    if (value > std::numeric_limits<std::uint64_t>::max() >> shift) {
+        size_literal_overflows_64_bits();
+    }
+    return value << shift;
+}
+
+} // namespace detail
+
+// Binary size literals in 64-bit arithmetic. An out-of-range literal does not
+// compile, so a size constant can never wrap. The literals are noexcept, so a
+// default member initializer that uses one keeps its class nothrow
+// constructible. The namespace is inline, as std::literals is: code in kwaque
+// uses the literals directly, and other code imports them with
+// `using kwaque::literals::operator""_KiB` and its siblings.
+inline namespace literals {
+
+consteval std::uint64_t operator""_KiB(unsigned long long value) noexcept {
+    return detail::scaled_size(value, 10U);
+}
+
+consteval std::uint64_t operator""_MiB(unsigned long long value) noexcept {
+    return detail::scaled_size(value, 20U);
+}
+
+consteval std::uint64_t operator""_GiB(unsigned long long value) noexcept {
+    return detail::scaled_size(value, 30U);
+}
+
+consteval std::uint64_t operator""_TiB(unsigned long long value) noexcept {
+    return detail::scaled_size(value, 40U);
+}
+
+} // namespace literals
+// NOLINTEND(google-runtime-int)
 
 } // namespace kwaque

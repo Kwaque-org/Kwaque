@@ -4,9 +4,9 @@
 #include <seastar/core/coroutine.hh>
 #include <seastar/core/iostream.hh>
 #include <seastar/util/file.hh>
-#include <seastar/util/log-level.hh>
 
 #include <array>
+#include <filesystem>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -14,26 +14,6 @@
 #include <utility>
 
 namespace kwaque::broker::detail {
-
-namespace {
-
-seastar::log_level to_seastar_log_level(config::log_level level) noexcept {
-    switch (level) {
-    case config::log_level::trace:
-        return seastar::log_level::trace;
-    case config::log_level::debug:
-        return seastar::log_level::debug;
-    case config::log_level::info:
-        return seastar::log_level::info;
-    case config::log_level::warn:
-        return seastar::log_level::warn;
-    case config::log_level::error:
-        return seastar::log_level::error;
-    }
-    return seastar::log_level::info;
-}
-
-} // namespace
 
 seastar::future<seastar::temporary_buffer<char>> read_configuration_bytes(
   seastar::input_stream<char>& input, seastar::abort_source& abort_source) {
@@ -74,12 +54,15 @@ seastar::future<loaded_configuration_result> load_configuration_file(
           path, [&abort_source](seastar::input_stream<char>& input) {
               return read_configuration_bytes(input, abort_source);
           });
-    } catch (const std::system_error&) {
+    } catch (const std::system_error& error) {
+        // Keep the operating-system reason: a missing file, a permission
+        // problem and a directory need different fixes.
         co_return std::unexpected(
           config::config_error{
             .code = config::config_errc::file_unavailable,
             .field = "config",
-            .message = "unable to read configuration file",
+            .message = "unable to read configuration file: "
+                       + error.code().message(),
           });
     }
     abort_source.check();
@@ -100,7 +83,10 @@ seastar::future<> application_state::load_configuration(
           "configuration requires a stop owner and may only be loaded once");
     }
     stop_signal_->abort_source().check();
-    config_path_ = options["config"].as<std::string>();
+    // Resolve relative paths once, against the directory the broker started
+    // in, and log the result so the files actually used are unambiguous.
+    config_path_ = std::filesystem::absolute(
+      options["config"].as<std::string>());
     auto loaded = co_await load_configuration_file(
       config_path_, stop_signal_->abort_source());
     const std::string config_path_string = config_path_.string();
@@ -108,14 +94,15 @@ seastar::future<> application_state::load_configuration(
       "path", config_path_string, config::config_visibility::safe}};
     if (!loaded) {
         const auto& error = loaded.error();
-        throw std::runtime_error(
+        throw configuration_error(
           "configuration error " + config::render_config(path_value) + " "
           + config::render_config_error(error));
     }
     configuration_identity_ = loaded->identity;
     configuration_ = std::move(loaded->settings);
+    configuration_->data_directory = std::filesystem::absolute(
+      configuration_->data_directory);
 
-    log::broker().set_level(to_seastar_log_level(configuration_->level));
     log::broker().info(
       "configuration loaded {} {}",
       config::render_config(path_value),

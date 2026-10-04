@@ -3,15 +3,17 @@ from __future__ import annotations
 import re
 import signal
 import sys
-import tempfile
 import unittest
 from pathlib import Path
 
 from tests.smoke.broker_test_support import (
+    REACTOR_BACKEND,
     BrokerProcess,
     assert_clean_shutdown,
     http_get,
-    reserve_loopback_port,
+    lease_loopback_endpoint,
+    log_path,
+    test_directory,
     write_config,
 )
 
@@ -25,7 +27,7 @@ CONFIGURED_MEMORY_METRIC = "kwaque_resource_manager_memory_configured_bytes"
 
 def reactor_arguments(shards: int) -> tuple[str, ...]:
     return (
-        "--reactor-backend=epoll",
+        f"--reactor-backend={REACTOR_BACKEND}",
         f"--smp={shards}",
         "--memory=128M",
         "--overprovisioned",
@@ -41,8 +43,7 @@ def configured_memory(exposition: str) -> int:
             values.append(float(line.rsplit(maxsplit=1)[1]))
     if len(values) != 8:
         raise AssertionError(
-            "expected one aggregated configured-memory sample per workload: "
-            f"{values}"
+            f"expected one aggregated configured-memory sample per workload: {values}"
         )
     total = sum(values)
     if not total.is_integer():
@@ -54,22 +55,22 @@ class ResourceMemorySmokeTest(unittest.TestCase):
     def test_native_memory_supports_one_and_two_shards(self) -> None:
         binary = Path(sys.argv[1])
         template = Path(sys.argv[2])
-        with tempfile.TemporaryDirectory() as directory:
+        with test_directory() as directory:
             root = Path(directory)
             for shards in (1, 2):
                 with self.subTest(shards=shards):
-                    port = reserve_loopback_port()
+                    endpoint = lease_loopback_endpoint()
                     data_directory = root / f"data-{shards}"
                     config = root / f"kwaque-{shards}.yaml"
-                    write_config(template, config, data_directory, port)
+                    write_config(template, config, data_directory, endpoint)
                     broker = BrokerProcess(
                         binary,
                         config,
-                        root / f"broker-{shards}.log",
+                        log_path(root, f"broker-{shards}.log"),
                         reactor_arguments(shards),
                     )
                     try:
-                        broker.wait_until_ready(port)
+                        broker.wait_until_ready(endpoint)
                         output = broker.output()
                         match = re.search(
                             r"runtime shards=(\d+) "
@@ -96,7 +97,7 @@ class ResourceMemorySmokeTest(unittest.TestCase):
                             budget_per_shard, MINIMUM_SHARD_MEMORY_BYTES
                         )
 
-                        status, content_type, metrics = http_get(port, "/metrics")
+                        status, content_type, metrics = http_get(endpoint, "/metrics")
                         self.assertEqual(status, 200)
                         self.assertEqual(content_type, "text/plain")
                         self.assertEqual(

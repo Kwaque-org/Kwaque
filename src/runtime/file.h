@@ -49,10 +49,10 @@ class file_test_access;
 inline constexpr std::size_t maximum_file_path_bytes = 4095;
 inline constexpr std::size_t maximum_file_name_bytes = 255;
 inline constexpr std::size_t maximum_directory_entries = 1U << 16U;
-inline constexpr byte_count maximum_directory_name_bytes{16U * 1024U * 1024U};
+inline constexpr byte_count maximum_directory_name_bytes{16_MiB};
 inline constexpr std::size_t maximum_directory_page_entries = 1024;
-inline constexpr byte_count maximum_directory_page_name_bytes{256U * 1024U};
-inline constexpr byte_count maximum_file_io_bytes{64U * 1024U * 1024U};
+inline constexpr byte_count maximum_directory_page_name_bytes{256_KiB};
+inline constexpr byte_count maximum_file_io_bytes{64_MiB};
 inline constexpr std::uint32_t maximum_pending_file_reads = 96;
 inline constexpr std::uint32_t maximum_pending_file_metadata_operations = 96;
 inline constexpr std::uint32_t maximum_queued_file_writes = 96;
@@ -196,7 +196,7 @@ private:
 
 struct directory_listing_limits final {
     item_count maximum_entries{4096};
-    byte_count maximum_name_bytes{1024U * 1024U};
+    byte_count maximum_name_bytes{1_MiB};
 
     [[nodiscard]] result<void> validate() const noexcept;
 
@@ -209,7 +209,7 @@ struct directory_listing_limits final {
 // An empty page without end may have advanced through deleted entries.
 struct directory_page_limits final {
     item_count maximum_entries{128};
-    byte_count maximum_name_bytes{32U * 1024U};
+    byte_count maximum_name_bytes{32_KiB};
 
     [[nodiscard]] result<void> validate() const noexcept;
     bool operator==(const directory_page_limits&) const = default;
@@ -741,6 +741,17 @@ concept file_system_backend
                  std::move(path), file_close_policy::checked)
            } -> std::same_as<seastar::future<result<void>>>;
        };
+
+// A file system that remembers the directories it found to be real
+// directories, not symbolic links, and has not removed or renamed since.
+// Only a caller with exclusive ownership of the namespace below a path may
+// skip checking a remembered directory again: nothing else changes it.
+template<typename FileSystem>
+concept verified_directory_memo = requires(
+  FileSystem& file_system, std::string_view path) {
+    { file_system.verified_directory(path) } noexcept -> std::same_as<bool>;
+    { file_system.remember_directory(path) } noexcept -> std::same_as<void>;
+};
 
 } // namespace kwaque::runtime
 

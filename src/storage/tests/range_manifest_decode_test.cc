@@ -767,7 +767,8 @@ TEST(
     metadata_abort = &abort;
     // The scalar charge callback aborts at vector admission. Allocation and
     // joined cleanup still run; no partially decoded page escapes.
-    const auto cleanup = seastar::defer([] { metadata_abort = nullptr; });
+    const auto cleanup = seastar::defer(
+      [] noexcept { metadata_abort = nullptr; });
     const auto result = walk.next(input, memory, work).get();
     EXPECT_TRUE(metadata_admitted);
     error(result, errc::aborted);

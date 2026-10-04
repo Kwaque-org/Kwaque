@@ -1,3 +1,4 @@
+#include "src/base/units.h"
 #include "src/storage/local_metadata_internal.h"
 
 #include <algorithm>
@@ -66,7 +67,7 @@ public:
         const auto anchor = page_error(errc::success, c);
         if (
           auto ready = co_await work_.admit(
-            byte_count{1024}, item_count{64}, anchor);
+            byte_count{1_KiB}, item_count{64}, anchor);
           !ready)
             co_return codec::failure(ready.error());
         if (auto ready = work_.poll(anchor); !ready)
@@ -558,7 +559,7 @@ struct body_reader final {
             co_return codec::failure(read.error());
         if (
           auto ready = co_await work.admit(
-            byte_count{1024}, item_count{64}, anchor);
+            byte_count{1_KiB}, item_count{64}, anchor);
           !ready)
             co_return codec::failure(ready.error());
         if (auto ready = work.poll(anchor); !ready)

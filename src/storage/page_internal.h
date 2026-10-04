@@ -1,5 +1,6 @@
 #pragma once
 
+#include "src/base/units.h"
 #include "src/bytes/fragmented_buffer_builder.h"
 #include "src/codec/digest.h"
 #include "src/codec/xxh3.h"
@@ -18,7 +19,7 @@
 namespace kwaque::storage::detail {
 inline constexpr auto sealed_family = codec::format_family::sealed_extent;
 inline constexpr codec::envelope_extent_limits page_limits{
-  byte_count{65536}, byte_count{65536}};
+  byte_count{64_KiB}, byte_count{64_KiB}};
 inline codec::error page_error(
   errc code, codec::field_context c, std::uint64_t offset = 0) noexcept {
     return codec::error{code, c.family, c.field, c.origin + offset};
@@ -294,7 +295,7 @@ seastar::future<codec::result<bytes::fragmented_buffer>> encode_entries(
     std::optional<bytes::fragmented_buffer> output;
     try {
         do {
-            if (!charge || entries.size() > 65536U / Width) {
+            if (!charge || entries.size() > 64_KiB / Width) {
                 failed = page_error(errc::invalid_argument, c);
                 break;
             }
@@ -327,7 +328,7 @@ seastar::future<codec::result<bytes::fragmented_buffer>> encode_entries(
             }
             if (
               auto ready = co_await work.admit(
-                byte_count{1024}, item_count{64}, anchor);
+                byte_count{1_KiB}, item_count{64}, anchor);
               !ready) {
                 failed = ready.error();
                 break;
@@ -347,7 +348,7 @@ seastar::future<codec::result<bytes::fragmented_buffer>> encode_entries(
             for (const auto& entry : entries) {
                 if (
                   auto ready = co_await work.admit(
-                    byte_count{1024}, item_count{64}, anchor);
+                    byte_count{1_KiB}, item_count{64}, anchor);
                   !ready) {
                     failed = ready.error();
                     break;
