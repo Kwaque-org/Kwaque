@@ -15,9 +15,10 @@
 
 SEASTAR_TEST_CASE(bootstrap_config_allocation_failures_do_not_terminate) {
 #if defined(SEASTAR_ENABLE_ALLOC_FAILURE_INJECTION)
-    const std::string document = "kwaque:\n  schema_version: 1\n  node_id: 7\n"
-                                 "  data_directory: "
-                                 + std::string(256, 'p') + "\n";
+    const std::string document
+      = "kwaque:\n  schema_version: 1\n  developer_mode: true\n"
+        "  data_directory: "
+        + std::string(256, 'p') + "\n";
     const auto expected = kwaque::config::parse_bootstrap_config(document);
     BOOST_REQUIRE(expected.has_value());
     bool completed = false;

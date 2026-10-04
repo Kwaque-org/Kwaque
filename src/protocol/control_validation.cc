@@ -192,7 +192,8 @@ public:
           || !array(message::capabilities, 3, value.compression_codecs))
             co_return 0;
         std::uint64_t size = 0;
-        const auto integers = [&](const auto& values, std::uint32_t field)
+        const auto integers =
+          [&](this auto, const auto& values, std::uint32_t field)
           -> seastar::future<std::uint64_t> {
             std::uint64_t packed = 0;
             std::optional<std::uint64_t> previous;

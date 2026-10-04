@@ -1,3 +1,4 @@
+#include "src/base/units.h"
 #include "src/bytes/fragmented_buffer.h"
 #include "src/runtime/fragmented_buffer_internal.h"
 #include "src/runtime/network.h"
@@ -35,11 +36,11 @@ namespace kwaque::runtime {
 
 namespace {
 
-constexpr std::size_t network_benchmark_bytes = 4096;
-constexpr std::uint64_t network_benchmark_max_unflushed_bytes = 1024U * 1024U;
+constexpr std::size_t network_benchmark_bytes = 4_KiB;
+constexpr std::uint64_t network_benchmark_max_unflushed_bytes = 1_MiB;
 const std::string network_benchmark_payload(network_benchmark_bytes, 'n');
 constexpr std::size_t concurrent_writer_count = 8;
-constexpr std::size_t concurrent_write_bytes = 64U * 1024U;
+constexpr std::size_t concurrent_write_bytes = 64_KiB;
 constexpr std::size_t concurrent_total_bytes = concurrent_writer_count
                                                * concurrent_write_bytes;
 const std::string concurrent_benchmark_payload(concurrent_total_bytes, 'q');
@@ -611,7 +612,7 @@ public:
         auto listening = backend_
                            .listen(
                              kwaque_loopback(),
-                             {.send_buffer_bytes = byte_count{4096}})
+                             {.send_buffer_bytes = byte_count{4_KiB}})
                            .get();
         if (!listening) {
             std::terminate();

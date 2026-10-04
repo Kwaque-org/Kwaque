@@ -29,8 +29,8 @@ inline constexpr std::uint32_t default_fake_dns_answers{16'384};
 inline constexpr std::uint32_t maximum_fake_dns_answers{262'144};
 inline constexpr std::size_t maximum_fake_dns_record_answers{
   runtime::maximum_dns_results};
-inline constexpr byte_count default_fake_dns_name_bytes{4U * 1024U * 1024U};
-inline constexpr byte_count maximum_fake_dns_name_bytes{64U * 1024U * 1024U};
+inline constexpr byte_count default_fake_dns_name_bytes{4_MiB};
+inline constexpr byte_count maximum_fake_dns_name_bytes{64_MiB};
 inline constexpr std::uint32_t default_fake_dns_stop_batch{256};
 inline constexpr std::uint32_t maximum_fake_dns_stop_batch{1'024};
 

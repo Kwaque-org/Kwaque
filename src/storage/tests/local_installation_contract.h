@@ -1,5 +1,6 @@
 #pragma once
 
+#include "src/base/units.h"
 #include "src/bytes/fragmented_buffer_builder.h"
 #include "src/storage/local_bundle.h"
 #include "src/storage/local_id_allocator.h"
@@ -247,7 +248,7 @@ inline local_segment_descriptor descriptor() {
       storage_profile::v1,
       1,
       local_layout_kind::initial,
-      byte_count{67108864},
+      byte_count{64_MiB},
       runtime::monotonic_duration{3600000000000ULL}};
 }
 inline segment_header segment_head() {
@@ -311,7 +312,7 @@ seastar::future<> descriptors(
         auto wrong = expected;
         if (field == 0) wrong.logical_origin = model::range_logical_end{101};
         if (field == 1) wrong.physical_origin = model::segment_relative_end{1};
-        if (field == 2) wrong.maximum_data_bytes = byte_count{33554432};
+        if (field == 2) wrong.maximum_data_bytes = byte_count{32_MiB};
         if (field == 3) wrong.record_profile = 2;
         if (field == 4) wrong.maximum_lifetime = runtime::monotonic_duration{1};
         if (field == 5) wrong.alignment = alignment(512);
@@ -377,9 +378,9 @@ inline local_root_reference checkpoint_reference() {
              local_root_kind::checkpoint,
              local_object_sequence::make(70).value(),
              runtime::file_position{},
-             byte_count{4096},
+             byte_count{4_KiB},
              page_count::make(1).value(),
-             literal_digest("31418feff68a7d139678667989f61e4d"))
+             literal_digest("86b813b9ac8abb528465817af6e15348"))
       .value();
 }
 inline local_metadata_expectation
@@ -534,17 +535,17 @@ seastar::future<> segment_bundles(
                      : local_root_kind::completed_retry_snapshot,
             local_object_sequence::make(is_index ? 41 : 40).value(),
             runtime::file_position{},
-            byte_count{4096},
+            byte_count{4_KiB},
             page_count::make(1).value(),
             literal_digest(
-              is_index ? "6bb870e77cf82b929664f981e060b034"
-                       : "1c622fae3a64d8ba0297f7a5d3647a22")));
+              is_index ? "c45f8294b5f3a284ad000102abfd778f"
+                       : "58032fdff862aa9a3dc5869021e05dfc")));
         const auto index_context
           = sparse_index_context::make(
               segment(),
               scope(100, 102, 0, 2, 4096, 16384),
               codec::extent_digest{
-                literal_digest("f2b1003c9e034dfc8ffa143f02be19ab").bytes()},
+                literal_digest("eca717818b53c4ae00458133840519cc").bytes()},
               alignment(4096))
               .value();
         local_metadata_expectation local{
@@ -604,9 +605,9 @@ seastar::future<> segment_bundles(
             local_root_kind::sealed_retry,
             local_object_sequence::make(45).value(),
             runtime::file_position{16384},
-            byte_count{4096},
+            byte_count{4_KiB},
             page_count::make(1).value(),
-            literal_digest("982e762d646470ca20d637b68cbcf8a4")));
+            literal_digest("23f26dfc1ea13edbe500c410124c229c")));
         footer_expectation context{
           {segment(),
            alignment(4096),
@@ -691,7 +692,7 @@ seastar::future<> segment_bundles(
         local_root_kind::sealed_retry,
         local_object_sequence::make(42).value(),
         runtime::file_position{4096},
-        byte_count{4096},
+        byte_count{4_KiB},
         page_count::make(0).value(),
         literal_digest("6d93f4087752ba9c90cdc90796a30851")));
     auto bundle = take(

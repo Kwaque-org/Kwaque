@@ -52,10 +52,11 @@ using kwaque::errc;
 using kwaque::item_count;
 using kwaque::bytes::fragmented_buffer;
 using kwaque::bytes::fragmented_buffer_parser;
+using kwaque::literals::operator""_MiB;
 using observation::measure;
 using observation::require;
 using observation::retained_cost;
-constexpr byte_count maximum{8U << 20U};
+constexpr byte_count maximum{8_MiB};
 
 using observation::prepared_abort_source;
 
@@ -88,7 +89,7 @@ public:
 };
 
 codec::decode_budget memory(byte_count remaining = observation::residual) {
-    return {remaining, byte_count{1U << 20U}, observed_charge};
+    return {remaining, byte_count{1_MiB}, observed_charge};
 }
 byte_count held_with(const bench::model_fixture& fixture, byte_count input) {
     return fixture.cache_charge.checked_add(input).value();
@@ -322,7 +323,7 @@ void lz4_operation(std::string_view scenario) {
         auto encoded
           = compression::compress_lz4(
               std::move(input),
-              byte_count{16U << 20U},
+              byte_count{16_MiB},
               setup,
               codec::detail::consume_decode_budget(
                 setup.policy(),
@@ -372,7 +373,7 @@ void lz4_operation(std::string_view scenario) {
                          std::move(input), maximum, work, budget)
                          .get()
                      : compression::compress_lz4(
-                         std::move(input), byte_count{16U << 20U}, work, budget)
+                         std::move(input), byte_count{16_MiB}, work, budget)
                          .get();
         });
     }

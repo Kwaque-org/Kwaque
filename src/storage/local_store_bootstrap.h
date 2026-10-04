@@ -1,5 +1,6 @@
 #pragma once
 
+#include "src/base/units.h"
 #include "src/storage/local_publication.h"
 #include "src/storage/local_store_inspection.h"
 
@@ -272,7 +273,7 @@ seastar::future<local_bootstrap_outcome> initialize_local_stores(
         co_return output;
     }
     auto reservation = budget.try_reserve(
-      byte_count{limits.execution_bytes.value() + 32768});
+      byte_count{limits.execution_bytes.value() + 32_KiB});
     if (!reservation) {
         output.failure.observe(reservation);
         co_return output;

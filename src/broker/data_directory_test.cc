@@ -67,17 +67,33 @@ SEASTAR_TEST_CASE(data_directory_accepts_writable_existing_path) {
 }
 
 SEASTAR_TEST_CASE(data_directory_rejects_read_only_path) {
+    if (::geteuid() == 0) {
+        // A privileged process can write a 0555 directory; the probe, not the
+        // mode bits, decides writability.
+        co_return;
+    }
     temporary_directory directory;
     std::filesystem::create_directories(directory.path());
     ::chmod(directory.path().c_str(), 0555);
 
-    bool rejected = false;
+    std::string message;
     try {
         co_await kwaque::broker::prepare_data_directory(directory.path());
-    } catch (const std::runtime_error&) {
-        rejected = true;
+    } catch (const std::runtime_error& error) {
+        message = error.what();
     }
-    BOOST_CHECK(rejected);
+    BOOST_CHECK(message.starts_with("data directory is not writable"));
+    BOOST_CHECK(std::filesystem::is_empty(directory.path()));
+}
+
+SEASTAR_TEST_CASE(data_directory_creates_an_owner_only_directory) {
+    temporary_directory directory;
+    const auto created = directory.path() / "nested";
+    co_await kwaque::broker::prepare_data_directory(created);
+    const auto permissions = std::filesystem::status(created).permissions();
+    BOOST_CHECK(
+      (permissions & std::filesystem::perms::all)
+      == std::filesystem::perms::owner_all);
 }
 
 SEASTAR_TEST_CASE(data_directory_abort_before_start_creates_nothing) {

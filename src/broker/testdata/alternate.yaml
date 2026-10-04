@@ -1,9 +1,8 @@
 kwaque:
   schema_version: 1
-  node_id: 7
-  data_directory: "./alternate-data"
+  data_directory: "/var/lib/kwaque-alternate"
   admin:
     address: "127.0.0.1"
     port: 19644
-  log_level: info
   developer_mode: false
+  crash_loop_limit: 5

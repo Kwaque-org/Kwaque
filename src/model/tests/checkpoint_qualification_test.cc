@@ -1,3 +1,4 @@
+#include "src/base/units.h"
 #include "src/bytes/test_allocation_profile.h"
 #include "src/codec/collection.h"
 #include "src/codec/tests/prepared_abort_source.h"
@@ -36,9 +37,10 @@ using kwaque::errc;
 using kwaque::item_count;
 using kwaque::bytes::fragmented_buffer_parser;
 using kwaque::bytes::testing::charge;
+using kwaque::literals::operator""_MiB;
 using source_type = seastar::chunked_fifo<model::range_cursor, 16>;
 codec::decode_budget memory() {
-    return {byte_count{32U << 20U}, byte_count{1U << 20U}, charge};
+    return {byte_count{32_MiB}, byte_count{1_MiB}, charge};
 }
 std::vector<model::range_cursor> entries(std::uint32_t count) {
     std::vector<model::range_cursor> values;
@@ -312,7 +314,7 @@ TEST(
     admission_abort = &abort;
     admission_ordinal = 0;
     admission_calls = 0;
-    auto reset = seastar::defer([] { admission_abort = nullptr; });
+    auto reset = seastar::defer([] noexcept { admission_abort = nullptr; });
     const byte_count request{4096};
     const auto expected = charge(request);
 #if !defined(SEASTAR_DEFAULT_ALLOCATOR)
@@ -354,7 +356,8 @@ TEST(
             admission_ordinal = ordinal;
             admission_calls = 0;
             admission_abort = &abort;
-            auto reset = seastar::defer([] { admission_abort = nullptr; });
+            auto reset = seastar::defer(
+              [] noexcept { admission_abort = nullptr; });
             const auto result = start(work, budget);
             admission_abort = nullptr;
             if (abort.abort_requested()) {
@@ -430,7 +433,7 @@ TEST(
         std::uint64_t ticks = 0;
         std::chrono::steady_clock::duration gap{};
         auto observer = control_progress(stop, ticks, gap);
-        auto joined = seastar::defer([&] {
+        auto joined = seastar::defer([&] noexcept {
             stop.request_abort();
             observer.get();
         });

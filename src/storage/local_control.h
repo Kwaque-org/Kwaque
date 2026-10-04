@@ -1,5 +1,6 @@
 #pragma once
 
+#include "src/base/units.h"
 #include "src/storage/local_store_bootstrap.h"
 
 #include <memory>
@@ -91,7 +92,7 @@ public:
         if (!spec.controls() || shard >= spec.identity.shard_count)
             co_return runtime::failure(
               detail::path_error(errc::invalid_argument));
-        auto held = budget.try_reserve(byte_count{32768});
+        auto held = budget.try_reserve(byte_count{32_KiB});
         if (!held) co_return runtime::failure(held.error());
         auto ownership = co_await owner.validate(spec);
         if (!ownership) co_return runtime::failure(ownership.error());
@@ -206,7 +207,7 @@ public:
              && std::is_nothrow_move_constructible_v<Dependencies>
     [[nodiscard]] seastar::future<local_publication_outcome> update(
       Edit edit, Dependencies dependencies, codec::cooperative_work& work) {
-        static_assert(sizeof(Edit) + sizeof(Dependencies) <= 8192);
+        static_assert(sizeof(Edit) + sizeof(Dependencies) <= 8_KiB);
         assert_current();
         auto reject = [](runtime::operation_error error) {
             local_publication_outcome result;

@@ -80,6 +80,7 @@ kwaque_cc_library(
     ],
     visibility = ["//src/runtime/tests:__pkg__"],
     deps = [
+        "//src/base",
         "//src/base:invariant",
         "//src/runtime:error",
         "//src/runtime:fragmented_buffer_internal",

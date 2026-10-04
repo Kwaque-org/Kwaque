@@ -1,3 +1,4 @@
+#include "src/base/units.h"
 #include "src/broker/application_internal.h"
 #include "src/broker/application_test_support.h"
 #include "src/runtime/cross_shard.h"
@@ -120,7 +121,7 @@ seastar::future<> exercise(std::int64_t fail_at) {
     config::bootstrap_config config;
     config.data_directory = root.get_path();
     config.admin_port = available_port();
-    config.diagnostic_memory_per_shard_bytes = 192U * 1024U * 1024U;
+    config.diagnostic_memory_per_shard_bytes = 192_MiB;
     access::configure(app, std::move(config));
     app.construct_services(false);
     bool failed = false;

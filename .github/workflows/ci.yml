@@ -13,18 +13,20 @@ permissions:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: true
+  # A newer push replaces a pull request run, but never a run on main: every
+  # main commit keeps a complete result.
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 jobs:
   workflow-lint:
     name: Workflow syntax
     runs-on: ubuntu-24.04
-    timeout-minutes: 5
+    timeout-minutes: 10
     outputs:
       run_checks: ${{ steps.changes.outputs.run_checks }}
     steps:
       - name: Check out source
-        uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # 6.0.1
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
           persist-credentials: false
@@ -39,40 +41,63 @@ jobs:
           --volume "$PWD:/repo"
           --workdir /repo
           rhysd/actionlint@sha256:b1934ee5f1c509618f2508e6eb47ee0d3520686341fec936f3b79331f9315667
+      - name: Audit workflow security
+        uses: zizmorcore/zizmor-action@cc914d7f3750a2d13d75c7f184a1060aa0e9d482 # v0.6.4
+        with:
+          version: 1.30.1
+          advanced-security: false
+          annotations: true
 
   build:
-    name: Release build including tests and benchmarks
+    name: Release build and shipped-artifact tests
     needs: workflow-lint
     if: needs.workflow-lint.outputs.run_checks != 'false'
     runs-on: ubuntu-24.04
-    timeout-minutes: 90
+    timeout-minutes: 150
     steps:
       - name: Check out source
-        uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # 6.0.1
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - uses: ./.github/actions/setup-build
-        with:
-          cache-scope: ci-release
-          cache-write: 'true'
+      - name: Allow concurrent linux-aio reactors
+        run: sudo sysctl -w fs.aio-max-nr=1048576
       - name: Build all ordinary targets
         run: >-
           bazel build --config=ci-release
           --build_tag_filters=-fuzz,-manual
           //...
 
-      - name: Verify optimized runtime and process policy
+      - name: Verify optimized runtime, process policy and determinism goldens
         id: tests
         run: >-
           bazel test --config=ci-release
+          --cache_test_results=no
           //bazel/tests:seastar_gtest
           //src/runtime/tests:reactor_smoke_test
           //src/runtime/tests:runtime_metrics_test
           //src/broker:failure_policy_test
           //src/broker:crash_recorder_process_test
+          //src/simulation/tests:determinism_goldens
+          //src/storage/tests:format_tests
+          //src/model/tests:checkpoint_tests
+          //src/model/tests:format_fixture_test
+          //src/model/tests:batch_builder_test
+          //src/protocol/tests:golden_tests
+          //src/compression/tests:format_fixture_test
+          //tools:verify_format_fixtures_test
+
+      - name: Test the shipped package, broker processes and fuzz replays
+        id: shipped
+        run: >-
+          bazel test --config=ci-release
+          --//bazel:reactor_backend=linux-aio
+          --build_tag_filters=-fuzz,-manual
+          --test_tag_filters=package,smoke,fuzz_replay
+          //...
 
       - name: Retain failed test diagnostics
-        if: failure() && steps.tests.outcome == 'failure'
+        if: failure() && (steps.tests.outcome == 'failure' || steps.shipped.outcome == 'failure')
         uses: ./.github/actions/retain-logs
         with:
           name: ci-${{ github.job }}-${{ runner.arch }}-${{ github.run_attempt }}
@@ -85,13 +110,10 @@ jobs:
     timeout-minutes: 90
     steps:
       - name: Check out source
-        uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # 6.0.1
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - uses: ./.github/actions/setup-build
-        with:
-          cache-scope: ci-native
-          cache-write: 'true'
       - name: Verify native runtime and process policy
         id: tests
         run: >-
@@ -113,20 +135,20 @@ jobs:
     needs: workflow-lint
     if: needs.workflow-lint.outputs.run_checks != 'false'
     runs-on: ubuntu-24.04
-    timeout-minutes: 90
+    timeout-minutes: 120
     steps:
       - name: Check out source
-        uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # 6.0.1
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - uses: ./.github/actions/setup-build
-        with:
-          cache-scope: ci-debug
-          cache-write: 'true'
+      - name: Allow concurrent linux-aio reactors
+        run: sudo sysctl -w fs.aio-max-nr=1048576
       - name: Run unit and smoke tests
         id: unit_tests
         run: >-
           bazel test --config=ci-debug
+          --//bazel:reactor_backend=linux-aio
           --build_tag_filters=-fuzz,-manual
           --test_tag_filters=-fuzz,-manual
           //...
@@ -135,6 +157,7 @@ jobs:
         id: hermetic_tests
         run: >-
           bazel test --config=ci-debug --spawn_strategy=sandboxed
+          --//bazel:reactor_backend=linux-aio
           --runs_per_test=10 --cache_test_results=no
           //src/runtime/tests:hermetic_contracts
 
@@ -149,16 +172,13 @@ jobs:
     needs: workflow-lint
     if: needs.workflow-lint.outputs.run_checks != 'false'
     runs-on: ubuntu-24.04
-    timeout-minutes: 90
+    timeout-minutes: 150
     steps:
       - name: Check out source
-        uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # 6.0.1
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - uses: ./.github/actions/setup-build
-        with:
-          cache-scope: ci-sanitizer
-          cache-write: 'true'
       - name: Execute tests with sanitizers
         id: tests
         run: >-
@@ -174,37 +194,23 @@ jobs:
           name: ci-${{ github.job }}-${{ runner.arch }}-${{ github.run_attempt }}
 
   goldens:
-    name: Determinism goldens (${{ matrix.runner }}, ${{ matrix.config }})
+    # The other runner and build combinations execute the same suite inside
+    # the test, build and arm-build jobs.
+    name: Determinism goldens (aarch64, debug)
     needs: workflow-lint
-    runs-on: ${{ matrix.runner }}
+    if: needs.workflow-lint.outputs.run_checks != 'false'
+    runs-on: ubuntu-24.04-arm
     timeout-minutes: 90
-    strategy:
-      fail-fast: false
-      matrix:
-        runner:
-          - ubuntu-24.04
-          - ubuntu-24.04-arm
-        config:
-          - ci-debug
-          - ci-release
-    # Expand every matrix entry so its named status remains available to branch
-    # protection. Documentation-only runs skip all checkout and build steps.
     steps:
       - name: Check out source
-        if: needs.workflow-lint.outputs.run_checks != 'false'
-        uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # 6.0.1
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - uses: ./.github/actions/setup-build
-        with:
-          cache-scope: ${{ matrix.config }}
-          cache-write: ${{ matrix.runner == 'ubuntu-24.04-arm' && matrix.config == 'ci-debug' }}
-        if: needs.workflow-lint.outputs.run_checks != 'false'
       - name: Execute the canonical golden suite
         id: tests
-        if: needs.workflow-lint.outputs.run_checks != 'false'
         run: >-
-          bazel test --config="${{ matrix.config }}"
+          bazel test --config=ci-debug
           --cache_test_results=no
           //src/simulation/tests:determinism_goldens
           //src/storage/tests:format_tests
@@ -219,7 +225,7 @@ jobs:
         if: failure() && steps.tests.outcome == 'failure'
         uses: ./.github/actions/retain-logs
         with:
-          name: ci-${{ github.job }}-${{ runner.arch }}-${{ matrix.config }}-${{ github.run_attempt }}
+          name: ci-${{ github.job }}-${{ runner.arch }}-${{ github.run_attempt }}
 
   cpp-format:
     name: C++ and Bazel formatting
@@ -229,16 +235,38 @@ jobs:
     timeout-minutes: 15
     steps:
       - name: Check out source
-        uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # 6.0.1
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - uses: ./.github/actions/setup-build
-        with:
-          cache-scope: tools
       - name: Check C++ formatting
         run: bazel run --lockfile_mode=error //tools:format_cpp_all -- --check
-      - name: Check Bazel formatting
+      - name: Check Bazel formatting and lint
         run: bazel run --lockfile_mode=error //tools:buildifier_check
+
+  python-lint:
+    name: Python formatting and lint
+    needs: workflow-lint
+    if: needs.workflow-lint.outputs.run_checks != 'false'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Check Python formatting
+        uses: astral-sh/ruff-action@278981a28ce3188b1e39527901f38254bf3aac89 # v4.1.0
+        with:
+          args: format --check --diff
+          version: 0.16.9
+          checksum: 1bfbb819b5d4f9af501748862276b60e412d336034d99387691a4d4bce7a6f13
+      - name: Lint Python
+        uses: astral-sh/ruff-action@278981a28ce3188b1e39527901f38254bf3aac89 # v4.1.0
+        with:
+          args: check --output-format=github
+          version: 0.16.9
+          checksum: 1bfbb819b5d4f9af501748862276b60e412d336034d99387691a4d4bce7a6f13
 
   clang-tidy:
     name: Clang tidy
@@ -248,13 +276,10 @@ jobs:
     timeout-minutes: 240
     steps:
       - name: Check out source
-        uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # 6.0.1
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - uses: ./.github/actions/setup-build
-        id: setup
-        with:
-          cache-scope: analysis-debug
       - name: Materialize generated analysis inputs
         run: >-
           bazel build --config=ci-debug
@@ -262,15 +287,6 @@ jobs:
           --aspects=//bazel:analysis_inputs.bzl%analysis_inputs
           --output_groups=clang_tidy_inputs
           --build_tag_filters=-fuzz,-manual //...
-      - name: Save prepared analysis inputs
-        if: >-
-          steps.setup.outputs.disk-cache-hit != 'true' &&
-          (github.event_name != 'pull_request' ||
-           github.event.pull_request.head.repo.full_name == github.repository)
-        uses: actions/cache/save@caa296126883cff596d87d8935842f9db880ef25 # 5.1.0
-        with:
-          path: ${{ runner.temp }}/kwaque-bazel-disk
-          key: ${{ steps.setup.outputs.disk-cache-key }}
       - name: Generate compilation database
         run: >-
           bazel run --config=ci-debug --lockfile_mode=error //tools:compile_commands --
@@ -288,13 +304,10 @@ jobs:
     timeout-minutes: 240
     steps:
       - name: Check out source
-        uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # 6.0.1
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - uses: ./.github/actions/setup-build
-        id: setup
-        with:
-          cache-scope: analysis-fuzz
       - name: Materialize fuzz analysis inputs
         run: >-
           bazel build --config=ci --config=fuzz
@@ -302,15 +315,6 @@ jobs:
           --aspects=//bazel:analysis_inputs.bzl%analysis_inputs
           --output_groups=clang_tidy_inputs
           --build_tag_filters=fuzz //...
-      - name: Save prepared analysis inputs
-        if: >-
-          steps.setup.outputs.disk-cache-hit != 'true' &&
-          (github.event_name != 'pull_request' ||
-           github.event.pull_request.head.repo.full_name == github.repository)
-        uses: actions/cache/save@caa296126883cff596d87d8935842f9db880ef25 # 5.1.0
-        with:
-          path: ${{ runner.temp }}/kwaque-bazel-disk
-          key: ${{ steps.setup.outputs.disk-cache-key }}
       - name: Generate the fuzz compilation database
         run: >-
           bazel run --config=ci --config=fuzz --lockfile_mode=error //tools:compile_commands --
@@ -323,20 +327,19 @@ jobs:
     needs: workflow-lint
     if: needs.workflow-lint.outputs.run_checks != 'false'
     runs-on: ubuntu-24.04
-    timeout-minutes: 15
+    timeout-minutes: 20
     steps:
       - name: Check out source
-        uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # 6.0.1
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - uses: ./.github/actions/setup-build
-        with:
-          cache-scope: tools
-          cache-write: 'true'
       - name: Check generated artifacts
         run: bazel run --lockfile_mode=error //tools:check_generated_artifacts
       - name: Check dependency inventory
         run: bazel run --lockfile_mode=error //tools:check_dependency_inventory
+      - name: Check packaged licenses against the linked dependencies
+        run: bazel run --lockfile_mode=error //tools:check_package_licenses
       - name: Check package dependency graph
         run: bazel run --lockfile_mode=error //tools:check_bazel_package_cycles
       - name: Check cross-shard ownership
@@ -345,10 +348,13 @@ jobs:
         run: bazel run --lockfile_mode=error //tools:check_runtime_boundaries
       - name: Check deterministic source boundaries
         run: bazel run --lockfile_mode=error //tools:check_determinism
-      - name: Check module lock
+      - name: Check module files and lock
+        # Tidy rewrites use_repo lists and formatting; the lock must then match
+        # every module and extension. Either change means a stale commit.
         run: |
+          bazel mod tidy --lockfile_mode=update
           bazel mod deps --lockfile_mode=update
-          git diff --exit-code -- MODULE.bazel.lock
+          git diff --exit-code -- MODULE.bazel MODULE.bazel.lock
 
   fuzz-smoke:
     name: ASan and UBSan fuzz smoke
@@ -358,36 +364,21 @@ jobs:
     timeout-minutes: 90
     steps:
       - name: Check out source
-        uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # 6.0.1
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - uses: ./.github/actions/setup-build
-        with:
-          cache-scope: fuzz
-          cache-write: 'true'
       - name: Run every fixed-corpus fuzz smoke and the signal artifact canary
         id: tests
+        # Tags select the targets, so a new fuzz test cannot be left out.
         run: >-
           bazel test --config=ci --config=fuzz
           --keep_going --test_output=all --test_arg=-seed=1
           --test_env=KWAQUE_FUZZ_MINIMIZE_SECONDS=30
           --test_arg=-max_total_time=2
-          //src/config:bootstrap_config_fuzz
-          //proto/kwaque/common/v1:build_info_fuzz
-          //src/bytes:fragmented_buffer_fuzz
-          //src/codec/tests:codec_fuzz
-          //src/codec/tests:codec_cooperative_fuzz
-          //src/compression/tests:compression_fuzz
-          //src/model/tests:record_fuzz
-          //src/model/tests:checkpoint_fuzz
-          //src/protocol/tests:frame_fuzz
-          //src/protocol/tests:control_fuzz
-          //src/storage/tests:storage_format_fuzz
-          //src/simulation/tests:scheduler_fuzz
-          //src/simulation/tests:fault_schedule_fuzz
-          //src/simulation/tests:fake_file_fuzz
-          //src/simulation/tests:fake_network_fuzz
-          //src/simulation/tests:signal_canary_test
+          --build_tag_filters=fuzz
+          --test_tag_filters=fuzz,-manual
+          //...
 
       - name: Retain failed test diagnostics
         if: failure() && steps.tests.outcome == 'failure'
@@ -396,29 +387,32 @@ jobs:
           name: fuzz-smoke-${{ github.run_attempt }}
 
   arm-build:
-    name: Linux aarch64 release build and runtime tests
-    needs: [workflow-lint, build]
+    name: Linux aarch64 release build and tests
+    needs: workflow-lint
     if: needs.workflow-lint.outputs.run_checks != 'false'
     runs-on: ubuntu-24.04-arm
-    timeout-minutes: 90
+    timeout-minutes: 150
     steps:
       - name: Check out source
-        uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # 6.0.1
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - uses: ./.github/actions/setup-build
-        with:
-          cache-scope: ci-release
-          cache-write: 'true'
+      - name: Allow concurrent linux-aio reactors
+        run: sudo sysctl -w fs.aio-max-nr=1048576
       - name: Build all ordinary targets
         run: >-
           bazel build --config=ci-release
           --build_tag_filters=-fuzz,-manual
           //...
-      - name: Test deterministic runtime on aarch64 release
+      - name: Test deterministic runtime and goldens on aarch64 release
         id: tests
         run: >-
           bazel test --config=ci-release
+          --cache_test_results=no
+          //src/simulation/tests:determinism_goldens
+          //src/compression/tests:format_fixture_test
+          //tools:verify_format_fixtures_test
           //src/compression/tests:format_tests
           //src/storage/tests:format_tests
           //src/model/tests:checkpoint_tests
@@ -462,8 +456,45 @@ jobs:
           //src/simulation/tests:fake_file_runtime_test
           //src/simulation/tests:fake_file_replay_test
 
+      - name: Test the shipped package, broker processes and fuzz replays
+        id: shipped
+        run: >-
+          bazel test --config=ci-release
+          --//bazel:reactor_backend=linux-aio
+          --build_tag_filters=-fuzz,-manual
+          --test_tag_filters=package,smoke,fuzz_replay
+          //...
+
       - name: Retain failed test diagnostics
-        if: failure() && steps.tests.outcome == 'failure'
+        if: failure() && (steps.tests.outcome == 'failure' || steps.shipped.outcome == 'failure')
         uses: ./.github/actions/retain-logs
         with:
           name: ci-${{ github.job }}-${{ runner.arch }}-${{ github.run_attempt }}
+
+  ci-ok:
+    # The one required status check. GitHub counts a skipped required job as
+    # passing, so a failure that skips its dependents must fail here instead:
+    # https://docs.github.com/en/repositories/configuring-branches-and-merges-in-your-repository/managing-protected-branches/about-protected-branches#require-status-checks-before-merging
+    name: CI result
+    if: always()
+    needs:
+      - workflow-lint
+      - build
+      - native-policy
+      - test
+      - sanitizer
+      - goldens
+      - cpp-format
+      - python-lint
+      - clang-tidy
+      - clang-tidy-fuzz
+      - repository-checks
+      - fuzz-smoke
+      - arm-build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - if: ${{ !(contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled')) }}
+        run: exit 0
+      - if: ${{ contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled') }}
+        run: exit 1

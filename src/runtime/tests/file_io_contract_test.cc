@@ -1,3 +1,4 @@
+#include "src/base/units.h"
 #include "src/runtime/file.h"
 #include "src/runtime/fragmented_buffer_internal.h"
 
@@ -16,6 +17,7 @@
 #include <utility>
 
 namespace {
+using kwaque::literals::operator""_KiB;
 
 static_assert(requires(
   kwaque::runtime::file& owner,
@@ -169,10 +171,10 @@ TEST(FileIoContractTest, NativeAdoptionTracksHiddenRetainedBacking) {
     auto storage = seastar::temporary_buffer<char>::aligned(4096, 4096);
     storage.trim(1);
     auto buffer = kwaque::runtime::detail::fragmented_buffer_io_access::adopt(
-      std::move(storage), kwaque::byte_count{4096});
+      std::move(storage), kwaque::byte_count{4_KiB});
 
     EXPECT_EQ(buffer.size(), kwaque::byte_count{1});
-    EXPECT_EQ(buffer.retained_bytes(), kwaque::byte_count{4096});
+    EXPECT_EQ(buffer.retained_bytes(), kwaque::byte_count{4_KiB});
     EXPECT_EQ(buffer.fragment_count(), 1U);
 }
 

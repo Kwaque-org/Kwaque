@@ -1,5 +1,6 @@
 #pragma once
 
+#include "src/base/units.h"
 #include "src/codec/crc32c.h"
 #include "src/storage/tests/segment_writer_contract.h"
 
@@ -11,6 +12,7 @@
 #include <atomic>
 #include <new>
 #include <optional>
+#include <utility>
 #include <vector>
 
 namespace kwaque::storage {
@@ -22,6 +24,16 @@ public:
       runtime::monotonic_clock Clock>
     static runtime::file& data(segment_writer<Backend, Owner, Clock>& writer) {
         return writer.data_.value();
+    }
+    // Ordinary writes completed so far, and how many of them the last flush
+    // covered.
+    template<
+      runtime::file_system_backend Backend,
+      typename Owner,
+      runtime::monotonic_clock Clock>
+    static std::pair<std::uint64_t, std::uint64_t>
+    plain_writes(const segment_writer<Backend, Owner, Clock>& writer) {
+        return {writer.plain_writes_, writer.flushed_plain_writes_};
     }
 };
 } // namespace kwaque::storage
@@ -92,7 +104,7 @@ seastar::future<> age_boundaries(
       [original] noexcept { controlled_clock::current = original; });
     controlled_clock::current = runtime::monotonic_time{100};
     auto config = contract::configuration();
-    config.admission.working_bytes = byte_count{1U << 20U};
+    config.admission.working_bytes = byte_count{1_MiB};
     auto description = contract::descriptor();
     description.maximum_lifetime = runtime::monotonic_duration{10};
     co_await with_segment<controlled_clock>(
@@ -255,7 +267,7 @@ seastar::future<> reserved_completion(
   workload_budget& resources,
   Driver drive) {
     auto config = contract::configuration();
-    config.admission.working_bytes = byte_count{1U << 20U};
+    config.admission.working_bytes = byte_count{1_MiB};
     co_await with_segment<Clock>(
       files,
       owner,
@@ -322,7 +334,7 @@ seastar::future<> freeze_allocation_cut(
   std::size_t at) {
 #if defined(SEASTAR_ENABLE_ALLOC_FAILURE_INJECTION)
     auto config = contract::configuration();
-    config.admission.working_bytes = byte_count{1U << 20U};
+    config.admission.working_bytes = byte_count{1_MiB};
     bool injected = false, observed = false;
     co_await with_segment<Clock>(
       files,
@@ -416,7 +428,7 @@ seastar::future<> close_entered_preflight(
   Driver drive,
   bool sealing) {
     auto config = contract::configuration();
-    config.admission.working_bytes = byte_count{1U << 20U};
+    config.admission.working_bytes = byte_count{1_MiB};
     co_await with_segment<Clock>(
       files,
       owner,
@@ -489,13 +501,13 @@ seastar::future<> paged_seal_and_retained_results(
   Driver drive,
   bool preallocated = false) {
     auto config = contract::configuration();
-    config.admission.working_bytes = byte_count{1U << 20U};
+    config.admission.working_bytes = byte_count{1_MiB};
     config.maximum_groups = 1;
     // Zero-written past the sealed end: groups take synchronized writes and
     // sealing must truncate back to the exact end.
-    if (preallocated) config.preallocation_bytes = byte_count{1U << 20U};
+    if (preallocated) config.preallocation_bytes = byte_count{1_MiB};
     auto policy = config.policy.config();
-    policy.max_page_bytes = byte_count{4096};
+    policy.max_page_bytes = byte_count{4_KiB};
     config.policy = codec::limits::make(policy).value();
     auto description = contract::descriptor();
     description.alignment = alignment(4096);
@@ -508,7 +520,7 @@ seastar::future<> paged_seal_and_retained_results(
       config,
       description,
       [&](auto& writer, auto& work) -> seastar::future<> {
-          auto fact_grant = take(resources.try_reserve(byte_count{16384}));
+          auto fact_grant = take(resources.try_reserve(byte_count{16_KiB}));
           std::vector<completed_retry> facts;
           facts.reserve(32);
           codec::crc32c checksum;

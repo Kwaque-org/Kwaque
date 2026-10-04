@@ -2,12 +2,11 @@
 # Bazel build definition for the Seastar dependency.
 #
 
-load("@bazel_skylib//rules:common_settings.bzl", "bool_flag", "int_flag")
+load("@bazel_skylib//rules:common_settings.bzl", "bool_flag", "int_flag", "string_flag")
 load("@protobuf//bazel:cc_proto_library.bzl", "cc_proto_library")
 load("@protobuf//bazel:proto_library.bzl", "proto_library")
 load("@rules_cc//cc:cc_binary.bzl", "cc_binary")
 load("@rules_cc//cc:cc_library.bzl", "cc_library")
-load("@rules_python//python:defs.bzl", "py_binary")
 
 filegroup(
     name = "license_files",
@@ -76,9 +75,16 @@ bool_flag(
     build_setting_default = False,
 )
 
-bool_flag(
+# Defines SEASTAR_SHUFFLE_TASK_QUEUE; "auto" enables it when the
+# @seastar//:debug flag is true.
+string_flag(
     name = "shuffle_task_queue",
-    build_setting_default = False,
+    build_setting_default = "auto",
+    values = [
+        "auto",
+        "true",
+        "false",
+    ],
 )
 
 int_flag(
@@ -177,10 +183,12 @@ config_setting(
     },
 )
 
-py_binary(
-    name = "seastar-json2code",
-    srcs = ["scripts/seastar-json2code.py"],
-    visibility = ["//visibility:public"],
+config_setting(
+    name = "with_shuffle_task_queue_auto",
+    flag_values = {
+        ":debug": "true",
+        ":shuffle_task_queue": "auto",
+    },
 )
 
 genrule(
@@ -602,6 +610,7 @@ cc_library(
     }),
     defines = [
         "SEASTAR_API_LEVEL=$(API_LEVEL)",
+        "SEASTAR_DEFERRED_ACTION_REQUIRE_NOEXCEPT",
         "SEASTAR_HAS_MEMBARRIER",
         "SEASTAR_SCHEDULING_GROUPS_COUNT=$(SCHEDULING_GROUPS)",
         "SEASTAR_HAVE_OPENSSL",
@@ -645,7 +654,6 @@ cc_library(
     ],
     linkstatic = True,
     local_defines = [
-        "SEASTAR_DEFERRED_ACTION_REQUIRE_NOEXCEPT",
         # This is nested in a `#ifdef SEASTAR_ASAN_ENABLED` so it's safe
         # to always enable this as it will only have effect if ASAN is
         # is enabled for the build.
@@ -665,6 +673,7 @@ cc_library(
         "//conditions:default": [],
     }) + select({
         ":with_shuffle_task_queue": ["SEASTAR_SHUFFLE_TASK_QUEUE"],
+        ":with_shuffle_task_queue_auto": ["SEASTAR_SHUFFLE_TASK_QUEUE"],
         "//conditions:default": [],
     }) + select({
         ":use_stack_guards": ["SEASTAR_THREAD_STACK_GUARDS"],
@@ -794,12 +803,6 @@ cc_binary(
     name = "iotune",
     srcs = [
         "apps/iotune/iotune.cc",
-    ],
-    # Silences "CFG hash mismatch" warnings which stem from the fact that we
-    # compile multiple binaries with only the RP profile data.
-    # Similar to: https://issues.chromium.org/issues/40272404
-    copts = [
-        "-Wno-backend-plugin",
     ],
     visibility = ["//visibility:public"],
     deps = [

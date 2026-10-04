@@ -1,3 +1,4 @@
+#include "src/base/units.h"
 #include "src/bytes/fragmented_buffer_builder.h"
 #include "src/storage/tests/wal_test_support.h"
 #include "src/storage/wal_group.h"
@@ -833,15 +834,15 @@ TEST(WalFormatTest, PreflightSharesContextAndGeometryWithoutConsumingTheChild) {
                      runtime::file_position{8192})
                      .value();
     const codec::envelope_extent_limits cap{
-      byte_count{65536}, byte_count{65536}};
+      byte_count{64_KiB}, byte_count{64_KiB}};
     auto layout = preflight_wal_prepare(child, expected, work.policy(), cap);
     ASSERT_TRUE(layout);
-    EXPECT_EQ(layout->encoded_bytes(), byte_count{8192});
+    EXPECT_EQ(layout->encoded_bytes(), byte_count{8_KiB});
     EXPECT_EQ(
       layout->at(expected.wal.position())->end(),
       runtime::file_position{16384});
     auto tight = preflight_wal_prepare(
-      child, expected, work.policy(), {byte_count{4096}, byte_count{4096}});
+      child, expected, work.policy(), {byte_count{4_KiB}, byte_count{4_KiB}});
     EXPECT_FALSE(tight);
     auto wrong = expected;
     wrong.routing_epoch = model::range_routing_epoch::make(9).value();
@@ -909,7 +910,7 @@ TEST(WalFormatTest, GroupMemoryBoundCoversTheEncoderAtTheFragmentCeiling) {
               *checked,
               expected,
               work.policy(),
-              {byte_count{65536}, byte_count{65536}});
+              {byte_count{64_KiB}, byte_count{64_KiB}});
             ASSERT_TRUE(layout);
             auto bound = kwaque::storage::detail::wal_prepare_memory(
               *checked, *layout, work.policy(), charge);
@@ -937,6 +938,98 @@ TEST(WalFormatTest, GroupMemoryBoundCoversTheEncoderAtTheFragmentCeiling) {
             EXPECT_EQ(flat(*encoded), wal_wire(wire, expected));
         }
     }
+}
+TEST(
+  WalFormatTest, ResolvedDecodeSelectsContextOnlyFromIntegrityCheckedClaims) {
+    const auto expected = wal_expected();
+    struct recorder final {
+        std::optional<wal_prepare_expectation> answer;
+        std::optional<errc> refusal;
+        std::vector<wal_prepare_claims> seen;
+    };
+    const auto decode = [](const std::string& wire, recorder& state) {
+        seastar::abort_source abort;
+        codec::cooperative_work work{codec::limits::defaults(), abort};
+        wal_prepare_resolver resolve{
+          [&state](const wal_prepare_claims& claims) {
+              state.seen.push_back(claims);
+              if (state.refusal)
+                  return seastar::make_ready_future<
+                    codec::result<wal_prepare_expectation>>(
+                    codec::failure(codec::error{*state.refusal}));
+              return seastar::make_ready_future<
+                codec::result<wal_prepare_expectation>>(*state.answer);
+          }};
+        fragmented_buffer_parser input{buffer(wire, 7)};
+        auto result = decode_wal_prepare_resolved(
+                        input, resolve, reserve(input, work), work)
+                        .get();
+        return std::pair{std::move(result), input.bytes_consumed()};
+    };
+    recorder accepted{expected};
+    auto [decoded, consumed] = decode(wal_wire(), accepted);
+    ASSERT_TRUE(decoded);
+    EXPECT_EQ(consumed.value(), wal_wire().size());
+    ASSERT_EQ(accepted.seen.size(), 1U);
+    const auto& claims = accepted.seen.front();
+    EXPECT_EQ(claims.incarnation, expected.wal.incarnation());
+    EXPECT_EQ(claims.wal_position, expected.wal.position());
+    EXPECT_EQ(claims.alignment, expected.wal.alignment());
+    EXPECT_EQ(claims.profile, expected.profile);
+    EXPECT_EQ(claims.target, expected.target.segment());
+    EXPECT_EQ(claims.routing_epoch, expected.routing_epoch);
+    EXPECT_EQ(claims.physical_begin, expected.target.physical_begin());
+    EXPECT_EQ(claims.target_position, expected.target.position());
+    EXPECT_EQ(decoded->value.target(), expected.target);
+
+    // Integrity and scalar syntax come first: no claims escape damage.
+    auto damaged = wal_wire();
+    damaged[32 + 200] ^= 1;
+    recorder untouched{expected};
+    auto [corrupt, kept] = decode(damaged, untouched);
+    ASSERT_FALSE(corrupt);
+    EXPECT_EQ(corrupt.error().code(), errc::corrupt_data);
+    EXPECT_TRUE(untouched.seen.empty());
+    EXPECT_EQ(kept.value(), 0U);
+    auto reserved = wal_wire();
+    put(reserved, 32 + 126, 1, 2);
+    repair(reserved);
+    auto [malformed, unused] = decode(reserved, untouched);
+    ASSERT_FALSE(malformed);
+    EXPECT_EQ(malformed.error().code(), errc::malformed_data);
+    EXPECT_TRUE(untouched.seen.empty());
+    // So do its size and layout where it lies: padding that disagrees with
+    // the envelope never reaches the resolver, whatever segment it names.
+    auto padded = wal_wire();
+    put(padded, 32 + 132, 120, 4);
+    repair(padded);
+    recorder unrouted{expected};
+    auto [unpadded, left] = decode(padded, unrouted);
+    ASSERT_FALSE(unpadded);
+    EXPECT_EQ(unpadded.error().code(), errc::malformed_data);
+    EXPECT_TRUE(unrouted.seen.empty());
+    EXPECT_EQ(left.value(), 0U);
+
+    // A resolver refusal is returned unchanged and consumes nothing.
+    recorder refused{std::nullopt, errc::not_found};
+    auto [missing, rest] = decode(wal_wire(), refused);
+    ASSERT_FALSE(missing);
+    EXPECT_EQ(missing.error().code(), errc::not_found);
+    EXPECT_EQ(refused.seen.size(), 1U);
+    EXPECT_EQ(rest.value(), 0U);
+
+    // Every claim is still compared with the selected context.
+    auto moved = expected;
+    moved.wal = wal_write_context::make(
+                  expected.wal.incarnation(),
+                  expected.wal.alignment(),
+                  runtime::file_position{512})
+                  .value();
+    recorder elsewhere{moved};
+    auto [foreign, none] = decode(wal_wire(), elsewhere);
+    ASSERT_FALSE(foreign);
+    EXPECT_EQ(foreign.error().code(), errc::wrong_context);
+    EXPECT_EQ(none.value(), 0U);
 }
 } // namespace
 } // namespace kwaque::storage

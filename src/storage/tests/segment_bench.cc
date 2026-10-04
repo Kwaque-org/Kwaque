@@ -1,3 +1,4 @@
+#include "src/base/units.h"
 #include "src/bytes/fragmented_buffer_builder.h"
 #include "src/codec/tests/benchmark_buffer.h"
 #include "src/codec/tests/memory_qualification_support.h"
@@ -98,6 +99,9 @@ struct measurement final {
       page_reads{0};
     std::uint64_t retained_results{0}, reopen_count{0}, setup_extent{0},
       layout_calls{0};
+    // Preparations that met ordinary pressure and waited for the deferred
+    // digest to release earlier groups' memory.
+    std::uint64_t pressure_waits{0};
     std::uint64_t setup_allocated_bytes{0};
     // After the interval: the wait for the deferred extent digest to hash
     // every written byte. Receipts never wait for it.
@@ -172,9 +176,9 @@ writer_config(const shape& selected, byte_count preallocation = {}) {
     result.preallocation_bytes = preallocation;
     result.policy = policy(selected);
     result.maximum_groups = selected.window;
-    result.admission.working_bytes = selected.payload_bytes >= (4U << 20U)
+    result.admission.working_bytes = selected.payload_bytes >= 4_MiB
                                        ? working_bytes
-                                       : byte_count{1U << 20U};
+                                       : byte_count{1_MiB};
     return result;
 }
 seastar::future<std::unique_ptr<writer_type>> create_writer(
@@ -225,8 +229,19 @@ seastar::future<segment_frozen_group> freeze_children(
   writer_type& writer,
   std::vector<encoded_assigned_batch> batches,
   workload_budget& resources,
-  codec::cooperative_work& work) {
-    auto prepared = take(writer.prepare_group(std::span{batches}, work));
+  codec::cooperative_work& work,
+  measurement& observed) {
+    std::optional<runtime::result<segment_group_preparation>> preparation;
+    preparation.emplace(writer.prepare_group(std::span{batches}, work));
+    // Ordinary pressure: a written group keeps its memory until the deferred
+    // digest has hashed it. Wait for that, as a caller under pressure must,
+    // and prepare once more.
+    if (!*preparation && preparation->error().code() == errc::queue_full) {
+        ++observed.pressure_waits;
+        take(co_await writer.digest_caught_up());
+        preparation.emplace(writer.prepare_group(std::span{batches}, work));
+    }
+    auto prepared = take(std::move(*preparation));
     require(
       prepared.prepared.has_value(),
       "writer admission rejected the benchmark group; reduce its batches");
@@ -268,7 +283,8 @@ seastar::future<> append_groups(
                       *writers[f],
                       std::move(inputs[f].groups[first + i].children),
                       resources,
-                      work);
+                      work,
+                      observed);
                     require(
                       group.layout().boundary().end().bytes
                         == inputs[f].groups[first + i].end,
@@ -579,6 +595,7 @@ void print_measurement(
     number("retained_results", value.retained_results);
     number("reopens", value.reopen_count);
     number("layout_calls", value.layout_calls);
+    number("pressure_waits", value.pressure_waits);
     number("setup_extent", value.setup_extent);
     number("setup_allocated_bytes", value.setup_allocated_bytes);
     number("device", device);
@@ -746,7 +763,7 @@ struct segment_bench {
                       manager.acquire_workload(
                         resource::workload_class::metadata),
                       {.tasks = 512,
-                       .bytes = byte_count{96U << 20U},
+                       .bytes = byte_count{96_MiB},
                        .handles = 32},
                       charge};
                     seastar::abort_source abort;
@@ -809,12 +826,11 @@ struct segment_bench {
                     // creation (its own mechanism), while the raw baseline
                     // and the reference reserve it with fallocate.
                     const auto setup_extent
-                      = preallocate
-                          ? ((inputs[0].history.data_start.value()
-                              + inputs[0].encoded_bytes + (2U << 20U) - 1)
-                             / (2U << 20U))
-                              * (2U << 20U)
-                          : std::uint64_t{0};
+                      = preallocate ? ((inputs[0].history.data_start.value()
+                                        + inputs[0].encoded_bytes + 2_MiB - 1)
+                                       / 2_MiB)
+                                        * 2_MiB
+                                    : std::uint64_t{0};
                     try {
                         if (op == operation::writer)
                             writers[0] = co_await create_writer(
@@ -1136,8 +1152,17 @@ struct segment_bench {
                                 + std::uint64_t{selected.groups}
                                     * (durable_footer_fixed_bytes.value()
                                        + 2 * codec::envelope_prefix_bytes);
+                            // The writer's deferred extent digest takes one
+                            // CRC pass over each stored byte, off the receipt
+                            // path and partly inside the interval. Framing
+                            // never rescans child or padding bytes.
+                            std::uint64_t stored = 0;
+                            if (op == operation::writer)
+                                for (const auto& extent : inputs)
+                                    stored += extent.encoded_bytes;
                             require(
-                              result.work.crc_bulk_bytes <= header_crc_bound,
+                              result.work.crc_bulk_bytes
+                                <= header_crc_bound + stored,
                               "typed framing rescanned child or padding bytes "
                               "for CRC");
                         }
@@ -1213,29 +1238,29 @@ struct segment_bench {
         return run_case(SEGMENT_SHAPE(Name, __VA_ARGS__), operation::writer);  \
     }
 SEGMENT_CASE(tiny)
-SEGMENT_CASE(aligned, .payload_bytes = 131072)
+SEGMENT_CASE(aligned, .payload_bytes = 128_KiB)
 // A 257-byte-fragmented batch uses about half of the writer's per-group
 // fragment bound, so group commit can seal at most two under one footer.
 SEGMENT_CASE(
   fragmented,
-  .payload_bytes = 131072,
+  .payload_bytes = 128_KiB,
   .fragmented = true,
   .groups = 4,
   .blocks = 2,
   .window = 2)
-SEGMENT_CASE(m4, .payload_bytes = 4U << 20U, .groups = 2, .blocks = 1)
-SEGMENT_CASE(maximum, .payload_bytes = 8U << 20U, .groups = 1, .blocks = 1)
+SEGMENT_CASE(m4, .payload_bytes = 4_MiB, .groups = 2, .blocks = 1)
+SEGMENT_CASE(maximum, .payload_bytes = 8_MiB, .groups = 1, .blocks = 1)
 SEGMENT_CASE(
-  lz4, .payload_bytes = 131072, .encoding = compression::codec_id::lz4)
+  lz4, .payload_bytes = 128_KiB, .encoding = compression::codec_id::lz4)
 SEGMENT_CASE(
   lz4_maximum,
-  .payload_bytes = 8U << 20U,
+  .payload_bytes = 8_MiB,
   .encoding = compression::codec_id::lz4,
   .groups = 1,
   .blocks = 1)
-SEGMENT_CASE(a8192, .payload_bytes = 131072, .alignment = 8192)
-SEGMENT_CASE(a65536, .payload_bytes = 131072, .alignment = 65536)
-SEGMENT_CASE(singleton, .payload_bytes = 131072, .groups = 8, .blocks = 1)
+SEGMENT_CASE(a8192, .payload_bytes = 128_KiB, .alignment = 8192)
+SEGMENT_CASE(a65536, .payload_bytes = 128_KiB, .alignment = 65536)
+SEGMENT_CASE(singleton, .payload_bytes = 128_KiB, .groups = 8, .blocks = 1)
 SEGMENT_CASE(final_flush, .groups = 1, .blocks = 8)
 SEGMENT_CASE(footers32, .groups = 32, .blocks = 1, .window = 4)
 SEGMENT_CASE(footers128, .groups = 128, .blocks = 1, .window = 4)
@@ -1247,17 +1272,17 @@ SEGMENT_CASE(footers128, .groups = 128, .blocks = 1, .window = 4)
           SEGMENT_SHAPE(Name, __VA_ARGS__), operation::lifecycle);             \
     }
 SEGMENT_LIFECYCLE(tiny)
-SEGMENT_LIFECYCLE(aligned, .payload_bytes = 131072)
+SEGMENT_LIFECYCLE(aligned, .payload_bytes = 128_KiB)
 SEGMENT_LIFECYCLE(
   fragmented,
-  .payload_bytes = 131072,
+  .payload_bytes = 128_KiB,
   .fragmented = true,
   .groups = 4,
   .blocks = 2,
   .window = 2)
-SEGMENT_LIFECYCLE(maximum, .payload_bytes = 8U << 20U, .groups = 1, .blocks = 1)
+SEGMENT_LIFECYCLE(maximum, .payload_bytes = 8_MiB, .groups = 1, .blocks = 1)
 SEGMENT_LIFECYCLE(
-  lz4, .payload_bytes = 131072, .encoding = compression::codec_id::lz4)
+  lz4, .payload_bytes = 128_KiB, .encoding = compression::codec_id::lz4)
 SEGMENT_LIFECYCLE(empty, .groups = 0)
 SEGMENT_LIFECYCLE(many_segments, .segments = 2)
 SEGMENT_LIFECYCLE(replacement, .segments = 3, .replace = true)

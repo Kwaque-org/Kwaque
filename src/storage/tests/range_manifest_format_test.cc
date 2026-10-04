@@ -1,3 +1,4 @@
+#include "src/base/units.h"
 #include "src/storage/range_manifest_format.h"
 #include "src/storage/tests/range_manifest_test_support.h"
 #include "src/storage/tests/segment_test_support.h"
@@ -497,7 +498,7 @@ TEST(RangeManifestFormatTest, PageCapacityAndNarrowerPoliciesBoundOutput) {
       628U);
     EXPECT_EQ(
       range_manifest_page_capacity(
-        byte_count{4096}, alignment(65536), work.policy())
+        byte_count{4_KiB}, alignment(65536), work.policy())
         .value(),
       589U);
     std::vector<range_manifest_entry> entries;

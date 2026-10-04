@@ -1,5 +1,6 @@
 #pragma once
 
+#include "src/base/units.h"
 #include "src/storage/local_root.h"
 #include "src/storage/local_segment.h"
 
@@ -130,7 +131,7 @@ local_generation_owner::open(
     auto held = budget.try_reserve(
       byte_count{
         limits.operation_bytes.value() + limits.execution_bytes.value()
-        + 32768});
+        + 32_KiB});
     if (!held) co_return runtime::failure(held.error());
     if (auto handles = held->try_acquire_handles(1); !handles)
         co_return runtime::failure(handles.error());

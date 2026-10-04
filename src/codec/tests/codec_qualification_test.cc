@@ -46,6 +46,8 @@
 #include <vector>
 
 namespace {
+using kwaque::literals::operator""_KiB;
+using kwaque::literals::operator""_MiB;
 
 namespace codec = kwaque::codec;
 using kwaque::byte_count;
@@ -54,7 +56,7 @@ using kwaque::bytes::fragmented_buffer;
 using native_fragment = seastar::temporary_buffer<char>;
 using namespace std::literals;
 
-constexpr byte_count parent_budget{64U * 1024U * 1024U};
+constexpr byte_count parent_budget{64_MiB};
 
 // This is a conservative fixture allowance. Usable-size observations below
 // verify its payload bound only for the allocations made by that fixture.
@@ -84,7 +86,7 @@ fragmented_buffer fixed_layout(std::size_t count, std::size_t width) {
 
 TEST(CodecQualificationTest, LargestFragmentComposesWithBothIntegrityPasses) {
     auto payload = [] {
-        native_fragment fragment{128U * 1024U};
+        native_fragment fragment{128_KiB};
         for (std::size_t index = 0; index < fragment.size(); ++index) {
             fragment.get_write()[index] = std::bit_cast<char>(
               static_cast<std::uint8_t>(index % 251U));
@@ -94,7 +96,7 @@ TEST(CodecQualificationTest, LargestFragmentComposesWithBothIntegrityPasses) {
     ASSERT_EQ(payload.fragment_count(), 1);
     auto prefix = fragmented_buffer::copy_of("hdr:"sv).value();
     codec::limits_config config;
-    config.max_work_bytes = byte_count{1024};
+    config.max_work_bytes = byte_count{1_KiB};
     config.max_work_items = item_count{8};
     seastar::abort_source abort;
     codec::cooperative_work work{codec::limits::make(config).value(), abort};
@@ -179,7 +181,7 @@ packing_input(std::size_t count, char value, releases& state) {
     config.initial_fragment_bytes = byte_count{1};
     config.max_fragment_bytes = byte_count{1};
     config.max_total_bytes = byte_count{count * 4096U};
-    config.max_retained_bytes = byte_count{32U * 1024U * 1024U};
+    config.max_retained_bytes = byte_count{32_MiB};
     config.max_fragments = count;
     kwaque::bytes::fragmented_buffer_builder builder{config};
     builder.reserve_fragments(item_count{count}).value();
@@ -232,9 +234,9 @@ TEST(
                 std::move(prefix),
                 std::move(payload),
                 work,
-                byte_count{4U * 1024U * 1024U},
+                byte_count{4_MiB},
                 codec::operation_usage{
-                  .payload_bookkeeping = byte_count{128U * 1024U}},
+                  .payload_bookkeeping = byte_count{128_KiB}},
                 parent_budget,
                 charge)
                 .get());
@@ -251,7 +253,7 @@ TEST(
         EXPECT_EQ(state.live, 1024);
         EXPECT_EQ(state.destroyed, 0);
         const auto& output = **assembled;
-        EXPECT_EQ(output.size(), byte_count{4U * 1024U * 1024U});
+        EXPECT_EQ(output.size(), byte_count{4_MiB});
         EXPECT_LE(output.fragment_count(), 1024);
         std::size_t offset = 0;
         bool matches = true;
@@ -263,7 +265,7 @@ TEST(
             seastar::thread::maybe_yield();
         }
         EXPECT_TRUE(matches);
-        EXPECT_EQ(offset, 4U * 1024U * 1024U);
+        EXPECT_EQ(offset, 4_MiB);
         assembled.reset();
         EXPECT_EQ(state.live, 0);
         EXPECT_EQ(state.destroyed, 1024);
@@ -275,14 +277,14 @@ TEST(
 TEST(
   CodecQualificationTest,
   RetainedPayloadObservationsStayBelowTheirConservativeCharge) {
-    auto input = fixed_layout(1024, 16U * 1024U);
+    auto input = fixed_layout(1024, 16_KiB);
     ASSERT_EQ(input.fragment_count(), 1024);
     std::array<const char*, 1024> bases{};
     std::array<std::size_t, 1024> served{};
     std::size_t observed_payload = 0;
     std::size_t index = 0;
     for (const auto fragment : input) {
-        ASSERT_EQ(fragment.size(), 16U * 1024U);
+        ASSERT_EQ(fragment.size(), 16_KiB);
         bases[index] = fragment.data();
         // This fixture copied whole native malloc allocations. These addresses
         // are allocation bases, never offsets into arbitrary shared slices.
@@ -294,7 +296,7 @@ TEST(
         ++index;
     }
     const auto input_cost = input.allocation_cost(charge).value();
-    ASSERT_EQ(input_cost.backing, byte_count{32U * 1024U * 1024U});
+    ASSERT_EQ(input_cost.backing, byte_count{32_MiB});
     EXPECT_LE(byte_count{observed_payload}, input_cost.backing);
     seastar::abort_source abort;
     codec::cooperative_work work{codec::limits::defaults(), abort};
@@ -302,7 +304,7 @@ TEST(
                     fragmented_buffer{},
                     std::move(input),
                     work,
-                    byte_count{16U * 1024U * 1024U},
+                    byte_count{16_MiB},
                     {},
                     parent_budget,
                     charge)
@@ -330,7 +332,7 @@ TEST(
       work.policy().config().max_allocation_bytes);
     RecordProperty(
       "observed_retained_payload_bytes", static_cast<int>(observed_payload));
-    RecordProperty("conservative_retained_backing_bytes", 32 * 1024 * 1024);
+    RecordProperty("conservative_retained_backing_bytes", 32_MiB);
     // These observations exclude descriptor/share owners, coroutine/native
     // engine state, allocator pages and transient allocations. They are not an
     // operation peak measurement or a backend-selection performance result.
@@ -368,8 +370,7 @@ TEST(
             output.emplace(
               codec::canonicalize_unordered(
                 std::move(source),
-                codec::decode_budget{
-                  parent_budget, byte_count{1024U * 1024U}, charge},
+                codec::decode_budget{parent_budget, byte_count{1_MiB}, charge},
                 work,
                 [&](const entry& left, const entry& right) noexcept {
                     ++comparisons;
@@ -412,8 +413,8 @@ namespace envelope_fixture = codec::testing::envelope_fixture;
 constexpr codec::field_context envelope_context{
   .origin = 700, .family = 1, .field = 91};
 constexpr codec::envelope_extent_limits envelope_bounds{
-  .max_body_bytes = byte_count{16U * 1024U * 1024U},
-  .max_encoded_bytes = byte_count{32U * 1024U * 1024U}};
+  .max_body_bytes = byte_count{16_MiB},
+  .max_encoded_bytes = byte_count{32_MiB}};
 
 // Only this fixture's opaque body grammar: byte i contains (i / 65536) % 127.
 // The four header checksums below were derived independently from literal
@@ -455,7 +456,7 @@ envelope_input(fragmented_buffer body, std::string_view header) {
     config.initial_fragment_bytes = byte_count{1};
     config.max_fragment_bytes = byte_count{1};
     config.max_total_bytes = byte_count{header.size() + body.size().value()};
-    config.max_retained_bytes = byte_count{32U * 1024U * 1024U};
+    config.max_retained_bytes = byte_count{32_MiB};
     config.max_fragments = 1 + body.fragment_count();
     kwaque::bytes::fragmented_buffer_builder builder{config};
     builder.reserve_fragments(item_count{config.max_fragments}).value();
@@ -565,16 +566,14 @@ TEST(CodecQualificationTest, EnvelopeHeaderShapesUseTheSameExactBody) {
           envelope_input(std::move(body), header)};
         seastar::abort_source abort;
         codec::limits_config config;
-        config.max_work_bytes = byte_count{1024};
+        config.max_work_bytes = byte_count{1_KiB};
         config.max_work_items = item_count{64};
         codec::cooperative_work work{
           codec::limits::make(config).value(), abort};
         const auto memory = codec::reserve_decode_input(
                               input,
                               work.policy(),
-                              {byte_count{32U * 1024U * 1024U},
-                               byte_count{1024U * 1024U},
-                               charge},
+                              {byte_count{32_MiB}, byte_count{1_MiB}, charge},
                               envelope_context)
                               .value();
         envelope_progress progress;
@@ -584,7 +583,8 @@ TEST(CodecQualificationTest, EnvelopeHeaderShapesUseTheSameExactBody) {
                               envelope_bounds,
                               memory,
                               work,
-                              pattern_body_decoder{progress, byte_count{65536}},
+                              pattern_body_decoder{
+                                progress, byte_count{64_KiB}},
                               envelope_context)
                               .get();
         ASSERT_TRUE(result.has_value());
@@ -602,16 +602,15 @@ TEST(CodecQualificationTest, EnvelopeBodyAbortAfterProgressRollsBackTheParent) {
       envelope_input(std::move(body), header)};
     seastar::abort_source abort;
     codec::limits_config config;
-    config.max_work_bytes = byte_count{1024};
+    config.max_work_bytes = byte_count{1_KiB};
     config.max_work_items = item_count{64};
     codec::cooperative_work work{codec::limits::make(config).value(), abort};
-    const auto memory
-      = codec::reserve_decode_input(
-          input,
-          work.policy(),
-          {byte_count{32U * 1024U * 1024U}, byte_count{1024U * 1024U}, charge},
-          envelope_context)
-          .value();
+    const auto memory = codec::reserve_decode_input(
+                          input,
+                          work.policy(),
+                          {byte_count{32_MiB}, byte_count{1_MiB}, charge},
+                          envelope_context)
+                          .value();
     envelope_progress progress{.abort_after_first = &abort};
     const auto result = codec::decode_envelope<std::uint64_t>(
                           input,
@@ -619,7 +618,7 @@ TEST(CodecQualificationTest, EnvelopeBodyAbortAfterProgressRollsBackTheParent) {
                           envelope_bounds,
                           memory,
                           work,
-                          pattern_body_decoder{progress, byte_count{65536}},
+                          pattern_body_decoder{progress, byte_count{64_KiB}},
                           envelope_context)
                           .get();
     ASSERT_FALSE(result.has_value());
@@ -653,7 +652,7 @@ TEST(CodecQualificationTest, MaximumEnvelopeBodyMakesObservedControlProgress) {
 #if defined(SEASTAR_DEFAULT_ALLOCATOR)
     GTEST_SKIP() << "maximum-body geometry uses the native allocator profile";
 #else
-    constexpr byte_count maximum_body{16U * 1024U * 1024U};
+    constexpr byte_count maximum_body{16_MiB};
     auto body = fixed_layout(256, 65536);
     ASSERT_EQ(body.size(), maximum_body);
     ASSERT_EQ(body.fragment_count(), 256U);
@@ -676,17 +675,16 @@ TEST(CodecQualificationTest, MaximumEnvelopeBodyMakesObservedControlProgress) {
       envelope_input(std::move(body), header)};
     seastar::abort_source abort;
     codec::limits_config config;
-    config.max_work_bytes = byte_count{1024};
+    config.max_work_bytes = byte_count{1_KiB};
     config.max_work_items = item_count{64};
     codec::cooperative_work work{codec::limits::make(config).value(), abort};
-    const auto memory = codec::reserve_decode_input(
-                          input,
-                          work.policy(),
-                          {byte_count{63U * 1024U * 1024U},
-                           byte_count{1024U * 1024U},
-                           envelope_native_charge},
-                          envelope_context)
-                          .value();
+    const auto memory
+      = codec::reserve_decode_input(
+          input,
+          work.policy(),
+          {byte_count{63_MiB}, byte_count{1_MiB}, envelope_native_charge},
+          envelope_context)
+          .value();
     seastar::promise<> first_progress;
     envelope_progress progress{.first = &first_progress};
     bool observed = false;

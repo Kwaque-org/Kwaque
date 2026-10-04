@@ -22,11 +22,11 @@ struct fragmented_buffer_builder_config final {
     byte_count initial_fragment_bytes{byte_count{512}};
     // Absolute ceiling on any single allocation. Growth stops here and long
     // appends continue into further fragments instead of one huge allocation.
-    byte_count max_fragment_bytes{byte_count{128UL * 1024UL}};
-    byte_count max_total_bytes{byte_count{64UL * 1024UL * 1024UL}};
+    byte_count max_fragment_bytes{byte_count{128_KiB}};
+    byte_count max_total_bytes{byte_count{64_MiB}};
     // Bounds backing allocations retained by tails and zero-copy published
     // fragments independently of their logical presented bytes.
-    byte_count max_retained_bytes{byte_count{128UL * 1024UL * 1024UL}};
+    byte_count max_retained_bytes{byte_count{128_MiB}};
     std::size_t max_fragments{max_buffer_fragments};
 
     [[nodiscard]] result<void> validate() const noexcept;
@@ -46,7 +46,7 @@ public:
     // shorter fragment list. Fixed rather than configured: packing is a
     // deterministic property of the builder, and the copy is bounded again by
     // whatever tail capacity actually exists.
-    static constexpr byte_count pack_copy_threshold{4096};
+    static constexpr byte_count pack_copy_threshold{4_KiB};
 
     fragmented_buffer_builder();
     explicit fragmented_buffer_builder(fragmented_buffer_builder_config config);

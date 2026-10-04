@@ -1,3 +1,4 @@
+#include "src/base/units.h"
 #include "src/protocol/control_memory.h"
 #include "src/protocol/tests/control_test_support.h"
 
@@ -465,7 +466,7 @@ TEST(ControlCodecTest, MaximumPayloadAndOwningCapacitiesFitTheCombinedProof) {
     EXPECT_LE(
       native_cost->generated_peak.value() + native_cost->input_copy.value()
         + output_cost,
-      1U << 20U);
+      1_MiB);
     fragmented_buffer_parser oversized{
       fixture::fragmented(wire + scalar(99, 1), 67)};
     expect_error(
@@ -484,7 +485,7 @@ TEST(ControlCodecTest, LocalPolicyDoesNotRewritePeerAdvertisements) {
     fragmented_buffer_parser input{fixture::fragmented(fixture::request(), 7)};
     seastar::abort_source abort;
     auto config = codec::limits::defaults().config();
-    config.max_encoded_body_bytes = byte_count{1024};
+    config.max_encoded_body_bytes = byte_count{1_KiB};
     config.max_nesting_depth = item_count{3};
     codec::cooperative_work work{*codec::limits::make(config), abort};
     auto decoded = protocol::decode_control(

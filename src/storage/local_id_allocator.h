@@ -1,5 +1,6 @@
 #pragma once
 
+#include "src/base/units.h"
 #include "src/storage/local_control.h"
 
 namespace kwaque::storage {
@@ -43,7 +44,7 @@ public:
         auto instance = budget.allocation_charge(
           byte_count{sizeof(local_id_allocator)});
         if (!instance) return runtime::failure(instance.error());
-        auto held = budget.try_reserve(byte_count{instance->value() + 4096});
+        auto held = budget.try_reserve(byte_count{instance->value() + 4_KiB});
         if (!held) return runtime::failure(held.error());
         auto allocator = std::unique_ptr<local_id_allocator>{
           new local_id_allocator(control, block_size, std::move(*held))};

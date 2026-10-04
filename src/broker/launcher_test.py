@@ -14,6 +14,8 @@ import tempfile
 import unittest
 from pathlib import Path
 
+# The documented exit status for an unsupported CPU (src/broker/exit_code.h).
+UNSUPPORTED_CPU_STATUS = 12
 X86_REQUIRED = sum(1 << bit for bit in (0, 1, 9, 13, 19, 20, 23, 32))
 ARM_REQUIRED = sum(1 << bit for bit in (0, 1, 3, 4, 5, 6, 7))
 
@@ -162,7 +164,7 @@ class LauncherTest(unittest.TestCase):
                         required & ~(1 << bit)
                     )
                     result = self.launch("--version")
-                    self.assertEqual(result.returncode, 1)
+                    self.assertEqual(result.returncode, UNSUPPORTED_CPU_STATUS)
                     self.assertEqual(result.stdout, "")
                     self.assertIn("CPU lacks required", result.stderr)
                     self.assertFalse(self.marker.exists())
@@ -173,7 +175,7 @@ class LauncherTest(unittest.TestCase):
                 self.environment["KWAQUE_TEST_ARCH"] = architecture
                 self.environment["KWAQUE_TEST_FEATURES"] = "0"
                 result = self.launch("--help")
-                self.assertEqual(result.returncode, 1)
+                self.assertEqual(result.returncode, UNSUPPORTED_CPU_STATUS)
                 self.assertIn("CPU lacks required", result.stderr)
                 self.assertFalse(self.marker.exists())
 

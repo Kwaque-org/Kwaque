@@ -1,5 +1,7 @@
 #pragma once
 
+#include "src/base/units.h"
+
 #include <sys/types.h>
 
 #include <array>
@@ -12,8 +14,8 @@
 
 namespace kwaque::broker::detail {
 
-inline constexpr std::size_t crash_field_capacity = 4096;
-inline constexpr std::size_t crash_serialization_capacity = 9216;
+inline constexpr std::size_t crash_field_capacity = 4_KiB;
+inline constexpr std::size_t crash_serialization_capacity = 9_KiB;
 inline constexpr std::size_t crash_v1_header_size = 40;
 inline constexpr std::size_t crash_header_size = 44;
 inline constexpr std::size_t crash_version_capacity = 128;

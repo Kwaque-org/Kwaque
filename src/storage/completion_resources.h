@@ -1,6 +1,7 @@
 #ifndef KWAQUE_SRC_STORAGE_COMPLETION_RESOURCES_H_
 #define KWAQUE_SRC_STORAGE_COMPLETION_RESOURCES_H_
 
+#include "src/base/units.h"
 #include "src/runtime/file.h"
 #include "src/storage/workload_budget.h"
 
@@ -13,10 +14,10 @@
 namespace kwaque::storage {
 
 struct completion_resource_limits final {
-    byte_count scratch_bytes{4096};
+    byte_count scratch_bytes{4_KiB};
     // Caller-qualified served memory for retained control/work frames and
     // callbacks, independently of scratch backing and reservation bookkeeping.
-    byte_count execution_bytes{16384};
+    byte_count execution_bytes{16_KiB};
 
     [[nodiscard]] runtime::result<void> validate() const noexcept;
 };

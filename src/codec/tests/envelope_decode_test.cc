@@ -43,6 +43,7 @@
 #include <vector>
 
 namespace {
+using kwaque::literals::operator""_MiB;
 
 using namespace std::literals;
 namespace codec = kwaque::codec;
@@ -141,8 +142,7 @@ byte_count test_charge(byte_count requested) noexcept {
 }
 
 codec::decode_budget generous_budget() noexcept {
-    return {
-      byte_count{64U * 1024U * 1024U}, byte_count{1024U * 1024U}, test_charge};
+    return {byte_count{64_MiB}, byte_count{1_MiB}, test_charge};
 }
 
 codec::field_context
@@ -355,7 +355,7 @@ codec::result<codec::decode_budget> admitted_input(
     // native-engine/coroutine/callback storage, independently of input sharing.
     // This generous fixture reserve does not measure native/frame peak usage.
     auto budget = generous_budget();
-    budget.operation_remaining = byte_count{32U * 1024U * 1024U};
+    budget.operation_remaining = byte_count{32_MiB};
     return codec::reserve_decode_input(input, policy, budget, origin, boundary);
 }
 

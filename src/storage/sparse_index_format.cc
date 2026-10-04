@@ -1,5 +1,6 @@
 #include "src/storage/sparse_index_format.h"
 
+#include "src/base/units.h"
 #include "src/storage/footer_format.h"
 #include "src/storage/page_internal.h"
 
@@ -126,7 +127,7 @@ struct root_reader final {
             co_return codec::failure(read.error());
         if (
           auto ready = co_await work.admit(
-            byte_count{1024}, item_count{64}, anchor);
+            byte_count{1_KiB}, item_count{64}, anchor);
           !ready)
             co_return codec::failure(ready.error());
         if (auto ready = work.poll(anchor); !ready)
@@ -175,7 +176,7 @@ struct root_reader final {
                 co_return codec::failure(read.error());
             if (
               auto ready = co_await work.admit(
-                byte_count{1024}, item_count{64}, anchor);
+                byte_count{1_KiB}, item_count{64}, anchor);
               !ready)
                 co_return codec::failure(ready.error());
             if (auto ready = work.poll(anchor); !ready)
@@ -245,7 +246,7 @@ struct page_reader final {
             co_return codec::failure(read.error());
         if (
           auto ready = co_await work.admit(
-            byte_count{1024}, item_count{64}, anchor);
+            byte_count{1_KiB}, item_count{64}, anchor);
           !ready)
             co_return codec::failure(ready.error());
         if (auto ready = work.poll(anchor); !ready)
@@ -487,7 +488,7 @@ encode_sparse_index_page(
     const auto anchor = page_error(errc::success, c);
     if (
       auto ready = co_await work.admit(
-        byte_count{1024}, item_count{64}, anchor);
+        byte_count{1_KiB}, item_count{64}, anchor);
       !ready)
         co_return codec::failure(ready.error());
     if (auto ready = work.poll(anchor); !ready)
@@ -581,7 +582,7 @@ encode_sparse_index_root(
     const auto anchor = page_error(errc::success, c);
     if (
       auto ready = co_await work.admit(
-        byte_count{1024}, item_count{64}, anchor);
+        byte_count{1_KiB}, item_count{64}, anchor);
       !ready)
         co_return codec::failure(ready.error());
     if (auto ready = work.poll(anchor); !ready)
@@ -594,7 +595,7 @@ encode_sparse_index_root(
     for (std::uint32_t i = 0; i < refs.size(); ++i) {
         if (
           auto ready = co_await work.admit(
-            byte_count{1024}, item_count{64}, anchor);
+            byte_count{1_KiB}, item_count{64}, anchor);
           !ready)
             co_return codec::failure(ready.error());
         if (auto ready = work.poll(anchor); !ready)

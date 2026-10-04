@@ -1,6 +1,7 @@
 #include "src/model/record_encode.h"
 
 #include "src/base/invariant.h"
+#include "src/base/units.h"
 #include "src/bytes/fragmented_buffer_builder.h"
 #include "src/model/record_codec.h"
 
@@ -32,12 +33,11 @@ codec::error at(errc reason, codec::field_context context) noexcept {
 
 codec::result<byte_count>
 multiply(byte_count bytes, std::uint64_t count, codec::field_context context) {
-    if (
-      count != 0
-      && bytes.value() > std::numeric_limits<std::uint64_t>::max() / count) {
+    const auto product = bytes.checked_mul(count);
+    if (!product) {
         return codec::failure(at(errc::out_of_range, context));
     }
-    return byte_count{bytes.value() * count};
+    return *product;
 }
 
 struct copy_shape final {
@@ -59,7 +59,7 @@ seastar::future<codec::result<copy_shape>> choose_shape(
     const auto config = policy.config();
     auto width = std::min(
       {total.value(),
-       std::uint64_t{65536},
+       64_KiB,
        config.max_allocation_bytes.value(),
        remaining.value()});
     while (width != 0) {

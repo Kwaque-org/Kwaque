@@ -1,3 +1,4 @@
+#include "src/base/units.h"
 #include "src/bytes/fragmented_buffer_parser.h"
 #include "src/bytes/fragmented_buffer_test_support.h"
 #include "src/model/batch_builder.h"
@@ -44,6 +45,8 @@ using kwaque::errc;
 using kwaque::item_count;
 using kwaque::bytes::fragmented_buffer;
 using kwaque::runtime::wall_time;
+using kwaque::literals::operator""_KiB;
+using kwaque::literals::operator""_MiB;
 using delta = model::range_logical_count;
 using nullable = std::optional<fragmented_buffer>;
 
@@ -113,7 +116,7 @@ byte_count charge(byte_count request) noexcept {
 codec::decode_budget memory() {
     // Other fixture/selection/native/frame reservations occupy the unclaimed
     // half. These profile bounds do not measure process RSS or hidden owners.
-    return {byte_count{32U << 20U}, byte_count{1U << 20U}, charge};
+    return {byte_count{32_MiB}, byte_count{1_MiB}, charge};
 }
 template<typename Id>
 Id object(std::uint8_t first) {
@@ -644,32 +647,22 @@ TEST(AssignedBatchTest, PendingRemovalOwnsBytesAndJoinsQueuedCancellation) {
                && std::chrono::steady_clock::now() < deadline) {
         }
         ASSERT_TRUE(seastar::need_preempt());
-        auto observer = seastar::yield().then([&] {
-            if (cancel) abort.request_abort();
-        });
-        bool pending = false, retained = false;
-        std::exception_ptr exception;
-        std::optional<codec::result<model::removed_batch_coverage>> result;
-        try {
-            auto removed = model::remove_all_records(std::move(*source), work);
-            pending = !removed.available();
-            source.reset();
-            retained = !probe.released;
-            result.emplace(removed.get());
-        } catch (...) {
-            exception = std::current_exception();
-        }
-        observer.get();
-        if (exception) std::rethrow_exception(exception);
+        auto removed = model::remove_all_records(std::move(*source), work);
+        const bool pending = !removed.available();
+        source.reset();
+        const bool retained = !probe.released;
+        // Removal suspends once, so the cancellation is requested inside that
+        // window: a reactor task would race its only resumption.
+        if (cancel) abort.request_abort();
+        const auto result = removed.get();
         EXPECT_TRUE(pending);
         EXPECT_TRUE(retained);
         EXPECT_TRUE(probe.released);
-        ASSERT_TRUE(result.has_value());
         if (cancel)
-            error(*result, errc::aborted);
+            error(result, errc::aborted);
         else {
-            ASSERT_TRUE(result->has_value());
-            EXPECT_EQ(digest_hex((*result)->fingerprint()), original_digest);
+            ASSERT_TRUE(result.has_value());
+            EXPECT_EQ(digest_hex(result->fingerprint()), original_digest);
         }
     }
 }
@@ -779,7 +772,7 @@ TEST(
                     .get();
     ASSERT_TRUE(result.has_value());
     EXPECT_EQ((*result->records().begin()).data(), first);
-    EXPECT_EQ(result->records().size(), byte_count{8U << 20U});
+    EXPECT_EQ(result->records().size(), byte_count{8_MiB});
     EXPECT_EQ(result->context(), context);
     EXPECT_EQ(result->fingerprint(), digest);
     EXPECT_LE(
@@ -823,7 +816,7 @@ TEST(AssignedBatchTest, MaximumAssignedEncodingIncludesItsWholeFixedBody) {
     parser.skip(byte_count{32U + 168U - 16U}).value();
     EXPECT_EQ(parser.read_le<std::uint64_t>().value(), 100U);
     EXPECT_EQ(parser.read_le<std::uint64_t>().value(), 101U);
-    EXPECT_EQ(parser.bytes_remaining(), byte_count{1048576});
+    EXPECT_EQ(parser.bytes_remaining(), byte_count{1_MiB});
 }
 
 TEST(AssignedBatchTest, LiveOutputReservationIsCarriedIntoLaterScanChildren) {
@@ -845,7 +838,7 @@ TEST(AssignedBatchTest, LiveOutputReservationIsCarriedIntoLaterScanChildren) {
         // One output tail and one reserved descriptor array remain live
         // during later scans. That same array transfers into publication.
         const auto staging
-          = charge(byte_count{65536}).value()
+          = charge(byte_count{64_KiB}).value()
             + charge(
                 byte_count{
                   128U * fragmented_buffer::fragment_descriptor_size()})
@@ -970,7 +963,7 @@ TEST(
                     std::move(source), keep, memory(), work)
                     .get()
                     .value();
-    EXPECT_EQ(result.records().size(), byte_count{1048576});
+    EXPECT_EQ(result.records().size(), byte_count{1_MiB});
     EXPECT_EQ(result.fingerprint(), original);
     auto scanner = scan(std::move(result), work);
     ASSERT_TRUE(scanner.next(work).get().value());

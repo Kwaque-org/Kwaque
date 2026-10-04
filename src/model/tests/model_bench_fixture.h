@@ -1,5 +1,6 @@
 #pragma once
 
+#include "src/base/units.h"
 #include "src/codec/tests/benchmark_buffer.h"
 #include "src/codec/tests/qualification_profile.h"
 #include "src/model/batch_builder.h"
@@ -36,7 +37,7 @@ public:
     seastar::future<assigned_batch>
     assigned(codec::cooperative_work& work, bool sparse = false);
     codec::decode_budget memory() const noexcept {
-        return {remaining, byte_count{1U << 20U}, capacity_bound};
+        return {remaining, byte_count{1_MiB}, capacity_bound};
     }
     static runtime::wall_time timestamp(std::size_t i) noexcept {
         return runtime::wall_time{100 + static_cast<std::int64_t>(i % 7U)};
@@ -55,7 +56,7 @@ public:
     byte_count record_region_bytes;
     byte_count cache_charge;
     byte_count remaining{
-      (64U << 20U) - codec::testing::execution_reservation.value()};
+      64_MiB - codec::testing::execution_reservation.value()};
 
 private:
     bool initialized_{false};

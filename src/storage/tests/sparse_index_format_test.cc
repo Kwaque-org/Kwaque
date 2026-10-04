@@ -1,3 +1,4 @@
+#include "src/base/units.h"
 #include "src/storage/sparse_index_format.h"
 #include "src/storage/tests/footer_test_support.h"
 #include "src/storage/tests/sparse_index_test_support.h"
@@ -757,10 +758,13 @@ TEST(
         .get(),
       errc::corrupt_data);
     EXPECT_EQ(input.bytes_consumed().value(), 0U);
-    const std::array larger{
-      page_ref::make(
-        page_ordinal::make(0).value(), 0, 1, byte_count{1024}, refs[0].digest())
-        .value()};
+    const std::array larger{page_ref::make(
+                              page_ordinal::make(0).value(),
+                              0,
+                              1,
+                              byte_count{1_KiB},
+                              refs[0].digest())
+                              .value()};
     const auto larger_root = pin(root_wire(larger), target(), work);
     fragmented_buffer_parser wrong_size{buffer(page)};
     error(

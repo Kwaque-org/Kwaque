@@ -1,11 +1,13 @@
 #pragma once
 
+#include "src/base/units.h"
 #include "src/codec/envelope.h"
 #include "src/storage/local_store_config.h"
 #include "src/storage/workload_budget.h"
 
 #include <seastar/core/coroutine.hh>
 
+#include <algorithm>
 #include <exception>
 #include <optional>
 #include <utility>
@@ -67,17 +69,29 @@ seastar::future<runtime::result<local_metadata_file>> read_local_metadata_file(
                 failed.observe(detail::path_error(errc::malformed_data));
                 break;
             }
+            // One read serves the prefix and every envelope it covers: the
+            // whole bounded file, or the first bytes of a larger one.
+            const auto first = std::min(
+              file_bytes,
+              extent == local_metadata_extent::exact_file
+                ? limits.operation_bytes.value()
+                : std::min(
+                    limits.operation_bytes.value(),
+                    local_metadata_first_read_bytes.value()));
+            auto head = co_await file.read(
+              runtime::file_position{}, byte_count{first});
+            if (!head) {
+                failed.observe(head);
+                break;
+            }
+            if (head->data().size() != byte_count{first}) {
+                failed.observe(detail::path_error(errc::malformed_data));
+                break;
+            }
+            output = std::move(*head).take_data();
             byte_count length;
             {
-                auto prefix = co_await file.read(
-                  runtime::file_position{},
-                  byte_count{codec::envelope_prefix_bytes});
-                if (!prefix) {
-                    failed.observe(prefix);
-                    break;
-                }
-                bytes::fragmented_buffer_parser input{
-                  std::move(*prefix).take_data()};
+                bytes::fragmented_buffer_parser input{output.share()};
                 auto header = codec::peek_envelope_prefix(
                   input,
                   work.policy(),
@@ -106,16 +120,28 @@ seastar::future<runtime::result<local_metadata_file>> read_local_metadata_file(
                 failed.observe(detail::path_error(ready.error().code()));
                 break;
             }
-            auto body = co_await file.read(runtime::file_position{}, length);
-            if (!body) {
-                failed.observe(body);
-                break;
+            if (length.value() <= first) {
+                if (
+                  auto trimmed = output.trim_back(
+                    byte_count{first - length.value()});
+                  !trimmed) {
+                    failed.observe(detail::path_error(errc::malformed_data));
+                    break;
+                }
+            } else {
+                output = bytes::fragmented_buffer{};
+                auto body = co_await file.read(
+                  runtime::file_position{}, length);
+                if (!body) {
+                    failed.observe(body);
+                    break;
+                }
+                if (body->data().size() != length) {
+                    failed.observe(detail::path_error(errc::malformed_data));
+                    break;
+                }
+                output = std::move(*body).take_data();
             }
-            if (body->data().size() != length) {
-                failed.observe(detail::path_error(errc::malformed_data));
-                break;
-            }
-            output = std::move(*body).take_data();
             auto after = co_await file.size();
             if (!after) {
                 failed.observe(after);
@@ -181,7 +207,7 @@ load_local_metadata_file(
   codec::cooperative_work& work,
   local_metadata_extent extent,
   Decoder decoder) {
-    static_assert(sizeof(Decoder) <= 4096);
+    static_assert(sizeof(Decoder) <= 4_KiB);
     auto raw = co_await read_local_metadata_file(
       files, spec.root, path, budget, limits, work, extent);
     if (!raw) co_return runtime::failure(raw.error());

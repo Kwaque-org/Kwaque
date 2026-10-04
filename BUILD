@@ -81,6 +81,7 @@ exports_files(
         "MODULE.bazel",
         "LICENSE",
         "NOTICE",
+        "README.md",
     ],
     visibility = ["//visibility:public"],
 )
@@ -88,6 +89,24 @@ exports_files(
 filegroup(
     name = "fuzz_workflow",
     srcs = [".github/workflows/fuzz.yml"],
+    visibility = ["//tools:__pkg__"],
+)
+
+filegroup(
+    name = "reactor_backend_workflow",
+    srcs = [".github/workflows/reactor-backends.yml"],
+    visibility = ["//tools:__pkg__"],
+)
+
+filegroup(
+    name = "nightly_workflow",
+    srcs = [".github/workflows/nightly.yml"],
+    visibility = ["//tools:__pkg__"],
+)
+
+filegroup(
+    name = "release_workflow",
+    srcs = [".github/workflows/release.yml"],
     visibility = ["//tools:__pkg__"],
 )
 

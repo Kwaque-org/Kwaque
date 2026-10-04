@@ -1,3 +1,4 @@
+#include "src/base/units.h"
 #include "src/simulation/bandwidth.h"
 #include "src/simulation/deterministic_random.h"
 #include "src/simulation/tests/network_oracle.h"
@@ -12,6 +13,7 @@
 #include <vector>
 
 namespace {
+using kwaque::literals::operator""_KiB;
 
 using kwaque::simulation::bandwidth_capacity;
 using kwaque::simulation::bandwidth_constraint;
@@ -150,7 +152,7 @@ TEST(NetworkOracleTest, GeneratorIsCanonicalBoundedAndCoversEverySurface) {
     ASSERT_TRUE(first.has_value());
     ASSERT_TRUE(second.has_value());
     EXPECT_EQ(first->render(), second->render());
-    EXPECT_LT(first->render().size(), 128U * 1024U);
+    EXPECT_LT(first->render().size(), 128_KiB);
 
     std::array<bool, kwaque::simulation::testing::oracle_step_kind_count>
       seen{};

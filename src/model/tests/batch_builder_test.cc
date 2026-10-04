@@ -1,3 +1,4 @@
+#include "src/base/units.h"
 #include "src/model/batch_builder.h"
 #include "src/model/batch_codec.h"
 #include "src/model/fingerprint.h"
@@ -36,6 +37,8 @@ using kwaque::errc;
 using kwaque::item_count;
 using kwaque::bytes::fragmented_buffer;
 using kwaque::runtime::wall_time;
+using kwaque::literals::operator""_KiB;
+using kwaque::literals::operator""_MiB;
 using nullable = std::optional<fragmented_buffer>;
 
 constexpr auto null_record = "\x06\x00\x00\x00\x01\x01\x00"sv;
@@ -66,7 +69,7 @@ byte_count charge(byte_count request) noexcept {
 codec::decode_budget memory() {
     // Other fixture owners and verified native/frame reservations occupy the
     // unclaimed half. Allocator upper bounds are distinct from process RSS.
-    return {byte_count{32U << 20U}, byte_count{1U << 20U}, charge};
+    return {byte_count{32_MiB}, byte_count{1_MiB}, charge};
 }
 template<typename Id>
 Id object(std::uint8_t first) {
@@ -101,7 +104,7 @@ model::producer_stream_binding binding(
              model::segment_generation::make(generation).value())
       .value();
 }
-fragmented_buffer bytes(std::string_view raw, std::size_t width = 65536) {
+fragmented_buffer bytes(std::string_view raw, std::size_t width = 64_KiB) {
     std::vector<seastar::temporary_buffer<char>> parts;
     for (std::size_t at = 0; at < raw.size(); at += width) {
         const auto piece = raw.substr(at, width);
@@ -124,7 +127,7 @@ fragmented_buffer payload(std::size_t count) {
 model::record null_value() {
     return model::make_record({}, std::nullopt, std::nullopt, {}).value();
 }
-model::record header_value(std::size_t width = 65536, bool reverse = false) {
+model::record header_value(std::size_t width = 64_KiB, bool reverse = false) {
     std::vector<model::record_header> headers;
     headers.push_back(
       model::make_record_header(bytes("a", width), nullable{bytes("1", width)})
@@ -432,7 +435,7 @@ TEST(BatchBuilderTest, ExactStagingBudgetAndOneByteShortAreDistinct) {
     // transfers into publication. The bound uses actual compiled sizes.
     const auto desc = charge(
       byte_count{128U * fragmented_buffer::fragment_descriptor_size()});
-    const byte_count exact{charge(byte_count{65536}).value() + desc.value()};
+    const byte_count exact{charge(byte_count{64_KiB}).value() + desc.value()};
     for (const bool short_budget : {false, true}) {
         auto out = builder();
         seastar::abort_source abort;
@@ -504,7 +507,7 @@ TEST(
                     {}, std::nullopt, nullable{payload(1048565)}, {})
                     .value();
     codec::limits_config config;
-    config.max_allocation_bytes = byte_count{65536};
+    config.max_allocation_bytes = byte_count{64_KiB};
     const auto policy = codec::limits::make(config).value();
     auto out = builder(policy);
     seastar::abort_source abort;
@@ -516,7 +519,7 @@ TEST(
         .get()
         .has_value());
     auto batch = out.finalize(work, memory().operation_remaining).get().value();
-    EXPECT_EQ(batch.records().size(), byte_count{1048576});
+    EXPECT_EQ(batch.records().size(), byte_count{1_MiB});
     auto cost = batch.records().allocation_cost(charge).value();
     EXPECT_LE(cost.largest_allocation, config.max_allocation_bytes);
     auto encoded
@@ -552,7 +555,7 @@ TEST(BatchBuilderTest, ExactExpandedBatchMaximumAndOneMoreRecord) {
         }
         auto batch
           = out.finalize(work, memory().operation_remaining).get().value();
-        EXPECT_EQ(batch.records().size(), byte_count{8U << 20U});
+        EXPECT_EQ(batch.records().size(), byte_count{8_MiB});
         EXPECT_EQ(batch.context().original_count().value(), 8U);
         auto scanner = model::record_region_scanner::make(
                          std::move(batch).release_records(),
@@ -573,7 +576,7 @@ TEST(BatchBuilderTest, ExactExpandedBatchMaximumAndOneMoreRecord) {
 
 TEST(BatchBuilderTest, NarrowDescriptorCeilingStillAllowsSmallBatches) {
     codec::limits_config config;
-    config.max_allocation_bytes = byte_count{4096};
+    config.max_allocation_bytes = byte_count{4_KiB};
     const auto policy = codec::limits::make(config).value();
     auto out = builder(policy);
     auto source = null_value();

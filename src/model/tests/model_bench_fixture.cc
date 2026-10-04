@@ -1,5 +1,6 @@
 #include "src/model/tests/model_bench_fixture.h"
 
+#include "src/base/units.h"
 #include "src/codec/tests/qualification_profile.h"
 #include "src/model/batch_rewrite.h"
 
@@ -74,7 +75,7 @@ seastar::future<> model_fixture::account(codec::cooperative_work& work) {
     // allowance covers native engines and fixture/coroutine frames; native
     // qualification remains required for that allowance.
     remaining
-      = byte_count{(64U << 20U) - codec::testing::execution_reservation.value()}
+      = byte_count{64_MiB - codec::testing::execution_reservation.value()}
           .checked_sub(total)
           .value();
 }

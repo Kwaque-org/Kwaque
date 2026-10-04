@@ -1,3 +1,5 @@
+#include "src/base/units.h"
+
 #include <seastar/core/memory.hh>
 #include <seastar/core/shard_id.hh>
 #include <seastar/core/smp.hh>
@@ -9,9 +11,25 @@
 #include <cstdlib>
 #include <string_view>
 
+using kwaque::literals::operator""_MiB;
+
 TEST(SeastarGtest, RunsOnTheConfiguredReactor) {
     EXPECT_EQ(seastar::this_shard_id(), 0U);
     EXPECT_EQ(seastar::this_smp_shard_count(), 2U);
+}
+
+TEST(SeastarGtest, ReceivesTheConfiguredMemory) {
+#if defined(SEASTAR_DEFAULT_ALLOCATOR)
+    GTEST_SKIP() << "the system allocator reports synthetic capacity";
+#else
+    // The macro passes this target's memory attribute, 192MiB, as --memory;
+    // the runtime divides it between the shards, less alignment.
+    constexpr std::size_t requested = 192_MiB;
+    const std::size_t total = seastar::memory::stats().total_memory()
+                              * seastar::this_smp_shard_count();
+    EXPECT_LE(total, requested);
+    EXPECT_GE(total, requested / 10U * 9U);
+#endif
 }
 
 TEST(SeastarGtest, UsesTheExpectedAllocationPolicyAndBuildProfile) {

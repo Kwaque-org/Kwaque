@@ -11,7 +11,10 @@ def declare_native_dependencies():
         build_file = "//bazel/thirdparty:c-ares.BUILD",
         sha256 = "556f781dd188ad932dc8263fee0ad3aaba675b4cd8e54d86908681b43ce3e327",
         strip_prefix = "c-ares-1.34.7",
-        url = "https://vectorized-public.s3.amazonaws.com/dependencies/c-ares-1.34.7.tar.gz",
+        urls = [
+            "https://github.com/c-ares/c-ares/releases/download/v1.34.7/c-ares-1.34.7.tar.gz",
+            "https://vectorized-public.s3.amazonaws.com/dependencies/c-ares-1.34.7.tar.gz",
+        ],
     )
 
     http_archive(
@@ -19,7 +22,10 @@ def declare_native_dependencies():
         build_file = "//bazel/thirdparty:hwloc.BUILD",
         sha256 = "866ac8ef07b350a6a2ba0c6826c37d78e8994dcbcd443bdd2b436350de19d540",
         strip_prefix = "hwloc-2.11.2",
-        url = "https://vectorized-public.s3.amazonaws.com/dependencies/hwloc-2.11.2.tar.gz",
+        urls = [
+            "https://download.open-mpi.org/release/hwloc/v2.11/hwloc-2.11.2.tar.gz",
+            "https://vectorized-public.s3.amazonaws.com/dependencies/hwloc-2.11.2.tar.gz",
+        ],
     )
 
     http_archive(
@@ -27,7 +33,10 @@ def declare_native_dependencies():
         build_file = "//bazel/thirdparty:lksctp.BUILD",
         sha256 = "0c8fac0a5c66eea339dce6be857101b308ce1064c838b81125b0dde3901e8032",
         strip_prefix = "lksctp-tools-lksctp-tools-1.0.19",
-        url = "https://vectorized-public.s3.amazonaws.com/dependencies/lksctp-tools-1.0.19.tar.gz",
+        urls = [
+            "https://github.com/sctp/lksctp-tools/archive/refs/tags/lksctp-tools-1.0.19.tar.gz",
+            "https://vectorized-public.s3.amazonaws.com/dependencies/lksctp-tools-1.0.19.tar.gz",
+        ],
     )
 
     http_archive(
@@ -35,9 +44,12 @@ def declare_native_dependencies():
         build_file = "//bazel/thirdparty:openssl.BUILD",
         patch_args = ["-p1"],
         patches = ["//bazel/thirdparty:openssl-reproducible-buildinf.patch"],
-        sha256 = "a8c0d28a529ca480f9f36cf5792e2cd21984552a3c8e4aa11a24aa31aeac98e8",
-        strip_prefix = "openssl-3.5.7",
-        url = "https://vectorized-public.s3.amazonaws.com/dependencies/openssl-3.5.7.tar.gz",
+        sha256 = "603f5602e2eef00d77fbd429d34dcd5822bb301757a1bc9cdb24c670f1eb859a",
+        strip_prefix = "openssl-3.5.9",
+        urls = [
+            "https://github.com/openssl/openssl/releases/download/openssl-3.5.9/openssl-3.5.9.tar.gz",
+            "https://www.openssl.org/source/openssl-3.5.9.tar.gz",
+        ],
     )
 
     http_archive(
@@ -52,6 +64,7 @@ def declare_native_dependencies():
             "//bazel/thirdparty:seastar-spinlock-include.patch",
             "//bazel/thirdparty:seastar-file-removal-kind.patch",
             "//bazel/thirdparty:seastar-checked-close.patch",
+            "//bazel/thirdparty:seastar-task-queue-shuffle-seed.patch",
         ],
         sha256 = "5918f72ec59c159a8d2fe36870e7d30c6e61426fde766d7dd6853fa7f9871f7f",
         strip_prefix = "seastar-{}".format(SEASTAR_REVISION),

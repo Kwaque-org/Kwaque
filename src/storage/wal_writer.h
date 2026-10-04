@@ -1,5 +1,6 @@
 #pragma once
 
+#include "src/base/units.h"
 #include "src/bytes/fragmented_buffer_builder.h"
 #include "src/codec/transaction.h"
 #include "src/storage/completion_resources.h"
@@ -10,13 +11,22 @@
 #include "src/storage/zero_fill.h"
 
 #include <seastar/core/condition-variable.hh>
+#include <seastar/core/when_all.hh>
 #include <seastar/core/with_scheduling_group.hh>
 
 #include <array>
+#include <exception>
+#include <span>
 
 namespace kwaque::storage {
 
-enum class wal_start_intent : std::uint8_t { known_unactivated };
+enum class wal_start_intent : std::uint8_t {
+    // The store never activated a WAL: bootstrap() creates the first head.
+    known_unactivated,
+    // The control pins a head that recovery classified after a restart:
+    // activate_recovered() closes it with a successor and never resumes it.
+    recovered_head
+};
 struct wal_writer_config final {
     storage_alignment alignment;
     // Logical bound. Without preallocation, files grow through writes; no
@@ -37,7 +47,7 @@ struct wal_writer_config final {
     // range, uses a second handle opened for synchronized writes: its
     // completion is durable, so a barrier covering only such writes needs no
     // flush. Larger writes use the ordinary handle and the barrier's flush.
-    byte_count synchronous_write_bytes{byte_count{1U << 20U}};
+    byte_count synchronous_write_bytes{byte_count{1_MiB}};
     replay_profile profile{replay_profile::v1};
     std::uint32_t maximum_descriptors{64};
     byte_count maximum_pending_bytes{runtime::maximum_file_io_bytes};
@@ -109,7 +119,8 @@ public:
         control.assert_current();
         if (
           &ids.control_ != &control || ids.closing_ || ids.closed_
-          || intent != wal_start_intent::known_unactivated
+          || (intent != wal_start_intent::known_unactivated
+              && intent != wal_start_intent::recovered_head)
           || config.maximum_descriptors == 0
           || config.maximum_descriptors > runtime::maximum_queued_file_writes
           || config.maximum_pending_bytes.value() == 0
@@ -134,7 +145,10 @@ public:
                   : errc::invalid_argument));
         auto current = control.snapshot();
         if (!current) return runtime::failure(current.error());
-        if (current->fields.wal_head || current->fields.checkpoint)
+        if (
+          intent == wal_start_intent::known_unactivated
+            ? current->fields.wal_head || current->fields.checkpoint
+            : !current->fields.wal_head)
             return runtime::failure(detail::path_error(errc::wrong_context));
         if (control.wal_writer_active_)
             return runtime::failure(detail::path_error(errc::already_exists));
@@ -197,7 +211,7 @@ public:
         }
         auto held = budget.try_reserve(
           byte_count{
-            instance->value() + 16 * path->value() + chunk->value() + 65536
+            instance->value() + 16 * path->value() + chunk->value() + 64_KiB
             + handles * 2 * runtime::maximum_file_write_concurrency
                 * staging->value()
             + gather->value() + zero});
@@ -215,6 +229,7 @@ public:
           write_allocation,
           std::move(*held),
           std::move(lifetime))};
+        value->intent_ = intent;
         control.wal_writer_active_ = true;
         return value;
     }
@@ -234,11 +249,33 @@ public:
     [[nodiscard]] seastar::future<runtime::result<void>>
     bootstrap(codec::cooperative_work& admission) {
         assert_current();
+        if (intent_ != wal_start_intent::known_unactivated)
+            return reject(errc::invalid_argument);
         if (started_ || admission_stopped_ || closing_ || closed_)
             return reject(errc::closed);
         if (auto ready = admission.poll(); !ready)
             return reject(ready.error().code());
         return bootstrap_owned(admission.policy(), operations_.hold());
+    }
+    // Activates a successor of the recovered head the control pins, never
+    // resuming the head. The head is opened read-only and flushed once while
+    // the successor, naming `content_end`, the head's classified content end,
+    // as its predecessor cursor, is prepared; the control pins the successor
+    // as the head only after both, so the head's surviving bytes seed it only
+    // after that fresh barrier. Bytes after the content end stay in the old
+    // file as slack, never written or truncated. One attempt, as for
+    // bootstrap(): a failure is latched and never retried here.
+    [[nodiscard]] seastar::future<runtime::result<void>> activate_recovered(
+      local_wal_cursor content_end, codec::cooperative_work& admission) {
+        assert_current();
+        if (intent_ != wal_start_intent::recovered_head)
+            return reject(errc::invalid_argument);
+        if (started_ || admission_stopped_ || closing_ || closed_)
+            return reject(errc::closed);
+        if (auto ready = admission.poll(); !ready)
+            return reject(ready.error().code());
+        return activate_owned(
+          content_end, admission.policy(), operations_.hold());
     }
     // Bind before admission starts. Early environment stop only closes input
     // and wakes the existing dispatcher; accepted work owns independent abort
@@ -309,6 +346,17 @@ public:
     [[nodiscard]] wal_writer_statistics statistics() const noexcept {
         assert_current();
         return statistics_;
+    }
+    // The limits children are prepared under, and the replay profile their
+    // expectations must name, for callers that prepare before submission.
+    [[nodiscard]] const wal_child_limits& child_limits() const& noexcept {
+        assert_current();
+        return config_.children;
+    }
+    const wal_child_limits& child_limits() const&& = delete;
+    [[nodiscard]] replay_profile profile() const noexcept {
+        assert_current();
+        return config_.profile;
     }
     [[nodiscard]] const local_publication_outcome&
     header_publication() const& noexcept {
@@ -522,11 +570,213 @@ public:
         return submit_entered(std::move(offered), admission, limits);
     }
 
+    // Measures a later submission of exactly these members from the current
+    // reserved end, with the same checks the submission applies before its
+    // awaited validation. Nothing is reserved or accepted.
+    [[nodiscard]] runtime::result<wal_admission_measure> measure_submission(
+      std::span<const wal_admission_member> members,
+      const codec::limits& policy,
+      wal_submission_limits limits = {}) const {
+        auto measured = measure_group(members, policy, limits);
+        if (!measured) return runtime::failure(measured.error());
+        return measured->measure;
+    }
+
 private:
+    // The bounds a submitted group accumulates member by member.
+    struct group_bounds final {
+        byte_count input, additional, retained;
+        std::size_t fragments{0};
+        [[nodiscard]] runtime::result<void> add(
+          const detail::wal_member_memory& memory,
+          const codec::limits& policy) {
+            auto next_input = input.checked_add(memory.input);
+            auto next_additional = additional.checked_add(memory.additional);
+            auto next_retained = retained.checked_add(memory.retained);
+            if (!next_input || !next_additional || !next_retained)
+                return runtime::failure(detail::path_error(errc::out_of_range));
+            input = *next_input;
+            additional = *next_additional;
+            retained = *next_retained;
+            fragments += static_cast<std::size_t>(memory.fragments.value());
+            if (
+              fragments > bytes::max_buffer_fragments
+              || fragments > policy.config().max_buffer_fragments.value()
+              || retained > runtime::maximum_file_io_bytes)
+                return runtime::failure(
+                  detail::path_error(errc::resource_exhausted));
+            return {};
+        }
+    };
+    struct member_cost final {
+        aligned_envelope_layout layout;
+        detail::wal_member_memory memory;
+    };
+    // One member at end: complete layout, owner context and live memory. The
+    // submission repeats this with final targets before accepting.
+    [[nodiscard]] runtime::result<member_cost> measure_member(
+      const encoded_assigned_batch& child,
+      const wal_prepare_expectation& reserved,
+      const codec::limits& policy,
+      const local_store_context& owner) const {
+        auto layout = preflight_wal_prepare(
+          child,
+          reserved,
+          policy,
+          {config_.maximum_pending_bytes, config_.maximum_pending_bytes},
+          {reserved.wal.position().value()});
+        if (!layout)
+            return runtime::failure(detail::path_error(layout.error().code()));
+        if (
+          reserved.target.segment().cluster() != owner.cluster()
+          || reserved.profile != config_.profile)
+            return runtime::failure(detail::path_error(errc::wrong_context));
+        auto memory = detail::wal_prepare_memory(
+          child, *layout, policy, config_.children.charge);
+        if (!memory) return runtime::failure(memory.error());
+        return member_cost{*layout, *memory};
+    }
+    static wal_prepare_expectation reserve_member(
+      const wal_child_expectation& e,
+      local_wal_cursor cursor,
+      storage_alignment alignment,
+      runtime::file_position at) {
+        return {
+          wal_write_context::make(cursor.incarnation(), alignment, at).value(),
+          e.target,
+          e.target_data_start,
+          e.routing_epoch,
+          e.batch,
+          e.profile,
+          e.target_profile};
+    }
+    struct group_measure final {
+        wal_admission_measure measure;
+        group_bounds bounds;
+    };
+    runtime::result<group_measure> measure_group(
+      std::span<const wal_admission_member> members,
+      const codec::limits& policy,
+      wal_submission_limits limits) const {
+        auto before = positions();
+        if (!before) return runtime::failure(before.error());
+        if (
+          members.empty() || limits.members == 0
+          || limits.members > maximum_wal_group_members
+          || limits.encoded_bytes.value() == 0
+          || limits.encoded_bytes > runtime::maximum_file_io_bytes)
+            return runtime::failure(detail::path_error(errc::invalid_argument));
+        group_measure output;
+        if (members.size() > limits.members) return output;
+        const auto start = before->reserved.position();
+        auto end = start;
+        for (const auto& member : members) {
+            if (!member.child || !member.expected)
+                return runtime::failure(
+                  detail::path_error(errc::invalid_argument));
+            auto cost = measure_member(
+              *member.child,
+              reserve_member(
+                *member.expected, before->reserved, config_.alignment, end),
+              policy,
+              before->owner);
+            if (!cost) return runtime::failure(cost.error());
+            if (!output.bounds.add(cost->memory, policy)) return output;
+            end = cost->layout.at(end)->end();
+        }
+        const auto extent = model::file_byte_span::make(start, end).value();
+        output.measure.encoded_bytes = extent.size();
+        if (
+          extent.size() > config_.maximum_pending_bytes
+          || extent.size() > limits.encoded_bytes
+          || members.size() > UINT64_MAX - reserved_members_)
+            return output;
+        if (end.value() <= config_.capacity_bytes.value()) {
+            output.measure.decision = wal_admission_decision::fits;
+            return output;
+        }
+        // The same fresh-file check rotation applies before allocating an ID.
+        const auto header = local_metadata_layout(
+          local_metadata_kind::wal_descriptor,
+          byte_count{68},
+          byte_count{codec::envelope_prefix_bytes},
+          config_.alignment,
+          policy);
+        if (!header)
+            return runtime::failure(
+              detail::path_error(
+                codec::detail::allocation_cost_error(header.error(), {}, 0)
+                  .code()));
+        const auto fresh = header->encoded_bytes().checked_add(extent.size());
+        if (fresh && *fresh <= config_.capacity_bytes && reserved_members_ != 0)
+            output.measure.decision = wal_admission_decision::rotate_required;
+        return output;
+    }
+
+    // Reserves what the submission of a measured group would reserve after
+    // its awaits, in one synchronous step. Only ordinary pressure (queue_full)
+    // or a changed owner can reject it; neither leaves any effect.
+    runtime::result<wal_admission_outcome> admit_entered(
+      std::span<const wal_admission_member> members,
+      const codec::limits& policy,
+      wal_submission_limits limits) {
+        assert_current();
+        if (admission_stopped_ || closing_ || closed_)
+            return runtime::failure(detail::path_error(errc::closed));
+        if (rotation_ || preflight_busy_)
+            return runtime::failure(detail::path_error(errc::queue_full));
+        auto measured = measure_group(members, policy, limits);
+        if (!measured) return runtime::failure(measured.error());
+        wal_admission_outcome output{measured->measure, std::nullopt};
+        if (output.measure.decision != wal_admission_decision::fits)
+            return output;
+        const auto extent = output.measure.encoded_bytes;
+        const auto queued = inflight_.bytes().checked_add(extent);
+        const auto kept = inflight_.retained_bytes().checked_add(
+          measured->bounds.retained);
+        if (
+          inflight_.size() >= config_.maximum_descriptors || !queued
+          || *queued > config_.maximum_pending_bytes || !kept
+          || *kept > config_.maximum_pending_bytes)
+            return runtime::failure(detail::path_error(errc::queue_full));
+        auto working = budget_.try_reserve(
+          byte_count{
+            config_.children.working_bytes.value()
+            + config_.children.execution_bytes.value()});
+        if (!working) return runtime::failure(working.error());
+        const auto descriptors = budget_.allocation_charge(
+          byte_count{
+            measured->bounds.fragments
+            * bytes::fragmented_buffer::fragment_descriptor_size()});
+        if (!descriptors) return runtime::failure(descriptors.error());
+        const auto assembly = measured->bounds.additional.checked_add(
+          *descriptors);
+        if (!assembly)
+            return runtime::failure(detail::path_error(errc::out_of_range));
+        auto encoded = budget_.try_reserve(*assembly);
+        if (!encoded) return runtime::failure(encoded.error());
+        const auto node = detail::wal_write_descriptor::charge(
+          budget_, config_.children.execution_bytes);
+        if (!node) return runtime::failure(node.error());
+        auto descriptor = budget_.try_reserve(*node);
+        if (!descriptor) return runtime::failure(descriptor.error());
+        output.admission.emplace(
+          wal_submission_admission{
+            *capture(),
+            std::move(*working),
+            std::move(*encoded),
+            std::move(*descriptor),
+            static_cast<std::uint32_t>(members.size()),
+            extent,
+            measured->bounds.retained});
+        return output;
+    }
+
     seastar::future<runtime::result<wal_submission>> submit_entered(
       wal_group&& offered,
       codec::cooperative_work& admission,
-      wal_submission_limits limits) {
+      wal_submission_limits limits,
+      std::optional<wal_submission_admission> admitted = std::nullopt) {
         std::optional<wal_group> group{std::in_place, std::move(offered)};
         assert_current();
         if (admission_stopped_ || closing_ || closed_)
@@ -535,7 +785,8 @@ private:
         std::optional<runtime::result<wal_submission>> result;
         std::exception_ptr exception;
         try {
-            result.emplace(co_await submit_owned(*group, admission, limits));
+            result.emplace(
+              co_await submit_owned(*group, admission, limits, admitted));
         } catch (...) {
             exception = std::current_exception();
         }
@@ -645,7 +896,8 @@ private:
     seastar::future<runtime::result<wal_submission>> submit_owned(
       wal_group& group,
       codec::cooperative_work& admission,
-      wal_submission_limits limits) {
+      wal_submission_limits limits,
+      std::optional<wal_submission_admission>& admitted) {
         auto before = positions();
         if (!before) co_return runtime::failure(before.error());
         if (
@@ -662,47 +914,41 @@ private:
           rotation_ || preflight_busy_
           || inflight_.size() >= config_.maximum_descriptors)
             co_return runtime::failure(detail::path_error(errc::queue_full));
+        // An admission is bound to the reserved end it measured.
+        if (
+          admitted
+          && (admitted->start_ != *capture() || group.size() > admitted->members_))
+            co_return runtime::failure(detail::path_error(errc::wrong_context));
         if (auto ready = admission.poll(); !ready)
             co_return runtime::failure(
               detail::path_error(ready.error().code()));
         preflight_busy_ = true;
         auto idle = seastar::defer(
           [this] noexcept { preflight_busy_ = false; });
-        auto working = budget_.try_reserve(
-          byte_count{
-            config_.children.working_bytes.value()
-            + config_.children.execution_bytes.value()});
-        if (!working) co_return runtime::failure(working.error());
+        std::optional<workload_reservation> working;
+        if (admitted)
+            working.emplace(std::move(admitted->working_));
+        else {
+            auto held = budget_.try_reserve(
+              byte_count{
+                config_.children.working_bytes.value()
+                + config_.children.execution_bytes.value()});
+            if (!held) co_return runtime::failure(held.error());
+            working.emplace(std::move(*held));
+        }
         const auto start = before->reserved.position();
         auto end = start;
+        group_bounds bounds;
         for (auto& member : group.members_) {
             const auto& e = member.expected;
             member.reserved.emplace(
-              wal_prepare_expectation{
-                wal_write_context::make(
-                  before->reserved.incarnation(), config_.alignment, end)
-                  .value(),
-                e.target,
-                e.target_data_start,
-                e.routing_epoch,
-                e.batch,
-                e.profile,
-                e.target_profile});
-            auto layout = preflight_wal_prepare(
+              reserve_member(e, before->reserved, config_.alignment, end));
+            auto cost = measure_member(
               member.input.batch,
               *member.reserved,
               admission.policy(),
-              {config_.maximum_pending_bytes, config_.maximum_pending_bytes},
-              {end.value()});
-            if (!layout)
-                co_return runtime::failure(
-                  detail::path_error(layout.error().code()));
-            if (
-              member.expected.target.segment().cluster()
-                != before->owner.cluster()
-              || member.expected.profile != config_.profile)
-                co_return runtime::failure(
-                  detail::path_error(errc::wrong_context));
+              before->owner);
+            if (!cost) co_return runtime::failure(cost.error());
             auto valid = co_await member.input.batch.validate(
               e.batch,
               {config_.children.working_bytes,
@@ -715,37 +961,19 @@ private:
             if (auto ready = admission.poll(); !ready)
                 co_return runtime::failure(
                   detail::path_error(ready.error().code()));
-            auto memory = detail::wal_prepare_memory(
-              member.input.batch,
-              *layout,
-              admission.policy(),
-              config_.children.charge);
-            if (!memory) co_return runtime::failure(memory.error());
-            member.memory = *memory;
-            end = layout->at(end)->end();
+            member.memory = cost->memory;
+            end = cost->layout.at(end)->end();
             if (end.value() > config_.capacity_bytes.value())
                 co_return runtime::failure(
                   detail::path_error(errc::resource_exhausted));
-            auto input = group.input_bytes_.checked_add(memory->input);
-            auto extra = group.additional_bytes_.checked_add(
-              memory->additional);
-            auto retained = group.retained_bound_.checked_add(memory->retained);
-            if (!input || !extra || !retained)
-                co_return runtime::failure(
-                  detail::path_error(errc::out_of_range));
-            group.input_bytes_ = *input;
-            group.additional_bytes_ = *extra;
-            group.retained_bound_ = *retained;
-            group.fragment_bound_ += static_cast<std::size_t>(
-              memory->fragments.value());
             if (
-              group.fragment_bound_ > bytes::max_buffer_fragments
-              || group.fragment_bound_
-                   > admission.policy().config().max_buffer_fragments.value()
-              || group.retained_bound_ > runtime::maximum_file_io_bytes)
-                co_return runtime::failure(
-                  detail::path_error(errc::resource_exhausted));
+              auto added = bounds.add(cost->memory, admission.policy()); !added)
+                co_return runtime::failure(added.error());
         }
+        group.input_bytes_ = bounds.input;
+        group.additional_bytes_ = bounds.additional;
+        group.retained_bound_ = bounds.retained;
+        group.fragment_bound_ = bounds.fragments;
         const auto extent = model::file_byte_span::make(start, end).value();
         if (
           extent.size() > config_.maximum_pending_bytes
@@ -761,15 +989,32 @@ private:
         auto assembly = group.additional_bytes_.checked_add(*descriptors);
         if (!assembly)
             co_return runtime::failure(detail::path_error(errc::out_of_range));
-        auto encoded = budget_.try_reserve(*assembly);
-        if (!encoded) co_return runtime::failure(encoded.error());
-        group.encoding_.emplace(std::move(*encoded));
-        auto descriptor = detail::wal_write_descriptor::make(
-          budget_,
-          extent,
-          admission.policy(),
-          config_.children.execution_bytes);
-        if (!descriptor) co_return runtime::failure(descriptor.error());
+        std::optional<detail::wal_write_descriptor::pointer> descriptor;
+        if (admitted) {
+            // The final targets change no geometry or cost, so the admitted
+            // allowances cover the (possibly smaller) submitted group.
+            if (
+              extent.size() > admitted->extent_
+              || group.retained_bound_ > admitted->retained_
+              || *assembly > admitted->encoded_.retained_bytes())
+                co_return runtime::failure(
+                  detail::path_error(errc::wrong_context));
+            group.encoding_.emplace(std::move(admitted->encoded_));
+            descriptor.emplace(
+              seastar::make_lw_shared<detail::wal_write_descriptor>(
+                std::move(admitted->descriptor_), extent, admission.policy()));
+        } else {
+            auto encoded = budget_.try_reserve(*assembly);
+            if (!encoded) co_return runtime::failure(encoded.error());
+            group.encoding_.emplace(std::move(*encoded));
+            auto made = detail::wal_write_descriptor::make(
+              budget_,
+              extent,
+              admission.policy(),
+              config_.children.execution_bytes);
+            if (!made) co_return runtime::failure(made.error());
+            descriptor.emplace(std::move(*made));
+        }
         auto node = std::move(*descriptor);
         const auto members = group.size();
         node->group_.emplace(std::move(group));
@@ -1533,6 +1778,7 @@ private:
                       return {};
                   },
                   [this](
+                    this auto,
                     const local_control_snapshot& before,
                     const local_shard_control& after,
                     codec::cooperative_work&)
@@ -1638,6 +1884,7 @@ private:
                       return {};
                   },
                   [this](
+                    this auto,
                     const local_control_snapshot& before,
                     const local_shard_control& after,
                     codec::cooperative_work&)
@@ -1665,31 +1912,249 @@ private:
                     stopped = true;
                     break;
                 }
-                const auto cursor = local_wal_cursor::make(
-                                      current_file().descriptor->incarnation,
-                                      current_file().descriptor->data_start)
-                                      .value();
-                positions_.emplace(owner, cursor, cursor, cursor);
-                dispatcher_.emplace(
-                  seastar::with_scheduling_group(
-                    budget_.scheduling_group(),
-                    [this]() noexcept -> seastar::future<> {
-                        try {
-                            return dispatch();
-                        } catch (...) {
-                            first_.observe(std::current_exception());
-                            dispatcher_started_.set_value();
-                            return seastar::make_ready_future<>();
-                        }
-                    }));
-                co_await dispatcher_started_.get_future();
-                if (first_.failed() || admission_stopped_) {
+                if (!co_await start_current(owner)) {
                     stopped = admission_stopped_;
-                    dispatcher_stopping_ = true;
-                    changed_.broadcast();
                     break;
                 }
-                active_ = true;
+            } while (false);
+        } catch (...) {
+            first_.observe(std::current_exception());
+        }
+        if (first_.failed() || stopped) {
+            active_ = false;
+            try {
+                co_await close_file();
+            } catch (...) {
+                first_.observe(std::current_exception());
+            }
+        }
+        if (first_.failed()) co_return first_.outcome();
+        if (stopped)
+            co_return runtime::failure(detail::path_error(errc::closed));
+        co_return runtime::result<void>{};
+    }
+    // Installs the current file's empty positions and starts its dispatcher;
+    // false when a failure or a stop came first.
+    seastar::future<bool> start_current(local_store_context owner) {
+        const auto cursor = local_wal_cursor::make(
+                              current_file().descriptor->incarnation,
+                              current_file().descriptor->data_start)
+                              .value();
+        positions_.emplace(owner, cursor, cursor, cursor);
+        dispatcher_.emplace(
+          seastar::with_scheduling_group(
+            budget_.scheduling_group(), [this]() noexcept -> seastar::future<> {
+                try {
+                    return dispatch();
+                } catch (...) {
+                    first_.observe(std::current_exception());
+                    dispatcher_started_.set_value();
+                    return seastar::make_ready_future<>();
+                }
+            }));
+        co_await dispatcher_started_.get_future();
+        if (first_.failed() || admission_stopped_) {
+            dispatcher_stopping_ = true;
+            changed_.broadcast();
+            co_return false;
+        }
+        active_ = true;
+        co_return true;
+    }
+    // One new flush of the recovered head through a read-only handle: the
+    // head is never written again.
+    seastar::future<runtime::result<void>> flush_recovered(
+      model::wal_incarnation_id head,
+      runtime::file_position content_end,
+      codec::cooperative_work& work) {
+        const auto& spec = control_.spec_;
+        auto& files = control_.files_;
+        auto held = budget_.try_reserve(control_.limits_.execution_bytes);
+        if (!held) co_return runtime::failure(held.error());
+        if (auto handles = held->try_acquire_handles(1); !handles)
+            co_return runtime::failure(handles.error());
+        auto path = local_paths::make(spec.root).value().wal(
+          control_.shard_, head);
+        if (!path) co_return runtime::failure(path.error());
+        if (
+          auto inspected = co_await inspect_local_path(
+            files, spec.root, *path, runtime::file_kind::regular, work);
+          !inspected)
+            co_return inspected;
+        auto opened = co_await files.open(
+          *path,
+          {.access = runtime::file_access::read_only,
+           .close_policy = runtime::file_close_policy::checked});
+        if (!opened) co_return runtime::failure(opened.error());
+        auto file = std::move(*opened);
+        runtime::first_failure failed;
+        try {
+            do {
+                auto size = co_await file.size();
+                if (!size) {
+                    failed.observe(size);
+                    break;
+                }
+                // The classified content must still be there.
+                if (*size < content_end.value()) {
+                    failed.observe(detail::path_error(errc::truncated_data));
+                    break;
+                }
+                auto unit = file.try_reserve_metadata();
+                if (!unit) {
+                    failed.observe(unit);
+                    break;
+                }
+                failed.observe(co_await file.flush(*unit));
+            } while (false);
+        } catch (...) {
+            failed.observe(std::current_exception());
+        }
+        try {
+            failed.observe(co_await file.close());
+        } catch (...) {
+            failed.observe(std::current_exception());
+        }
+        co_return failed.outcome();
+    }
+    seastar::future<runtime::result<void>> activate_owned(
+      local_wal_cursor content_end,
+      codec::limits policy,
+      seastar::gate::holder holder) {
+        started_ = true;
+        static_cast<void>(holder);
+        seastar::abort_source execution_abort;
+        codec::cooperative_work work{policy, execution_abort};
+        const auto& spec = control_.spec_;
+        const auto owner = spec.shard_owner(control_.shard_).value();
+        bool stopped = false;
+        try {
+            do {
+                auto current = control_.snapshot();
+                if (
+                  !current || !current->fields.wal_head
+                  || current->fields.wal_head->incarnation
+                       != content_end.incarnation()) {
+                    first_.observe(detail::path_error(errc::wrong_context));
+                    break;
+                }
+                const auto old = *current->fields.wal_head;
+                if (admission_stopped_) {
+                    stopped = true;
+                    break;
+                }
+                // The head's own descriptor bounds the cursor.
+                auto loaded = co_await load_local_wal_head(
+                  control_.files_,
+                  spec,
+                  control_.shard_,
+                  old,
+                  budget_,
+                  control_.limits_,
+                  work);
+                if (!loaded) {
+                    first_.observe(loaded);
+                    break;
+                }
+                const auto& head = std::get<local_wal_descriptor>(
+                  loaded->value.payload());
+                const auto at = content_end.position();
+                if (
+                  at < head.data_start || !head.alignment.aligned(at)
+                  || at.value() > head.capacity_bytes.value()
+                  || at.value() > loaded->file_bytes) {
+                    first_.observe(detail::path_error(errc::wrong_context));
+                    break;
+                }
+                // The successor is prepared while the head's fresh barrier
+                // runs: nothing names it until the control update below,
+                // after both succeeded. A failed barrier leaves a prepared
+                // successor unnamed, as a failed rotation does.
+                codec::cooperative_work barrier_work{policy, execution_abort};
+                auto [fresh, successor] = co_await seastar::when_all(
+                  flush_recovered(old.incarnation, at, barrier_work),
+                  prepare_file(current_file(), content_end, work));
+                std::exception_ptr thrown;
+                runtime::result<void> flushed{}, prepared{};
+                try {
+                    flushed = fresh.get();
+                } catch (...) {
+                    thrown = std::current_exception();
+                }
+                try {
+                    prepared = successor.get();
+                } catch (...) {
+                    if (!thrown) thrown = std::current_exception();
+                }
+                if (thrown) std::rethrow_exception(thrown);
+                if (!flushed) {
+                    first_.observe(flushed);
+                    break;
+                }
+                recovered_flushed_ = true;
+                // A preparation refused admission while the barrier held its
+                // share changed nothing; it runs once more, alone, as an
+                // untouched rotation preparation may.
+                if (
+                  !prepared && current_file().retryable
+                  && !current_file().abandoned && !admission_stopped_)
+                    prepared = co_await prepare_file(
+                      current_file(), content_end, work);
+                if (!prepared) {
+                    if (
+                      current_file().abandoned
+                      || (admission_stopped_ && current_file().retryable))
+                        stopped = true;
+                    else
+                        first_.observe(prepared);
+                    break;
+                }
+                if (admission_stopped_) {
+                    stopped = true;
+                    break;
+                }
+                current_file().head_publication = co_await control_.update(
+                  [old, head = *current_file().head](
+                    local_shard_control& fields) -> runtime::result<void> {
+                      if (fields.wal_head != old)
+                          return runtime::failure(
+                            detail::path_error(errc::wrong_context));
+                      fields.wal_head = head;
+                      return {};
+                  },
+                  [this, old](
+                    this auto,
+                    const local_control_snapshot& before,
+                    const local_shard_control& after,
+                    codec::cooperative_work&)
+                    -> seastar::future<runtime::result<void>> {
+                      if (
+                        !recovered_flushed_ || before.fields.wal_head != old
+                        || !current_file().completion
+                        || current_file().header_publication.failure.failed()
+                        || current_file().header_publication.disposition
+                             != local_publication_disposition::durable
+                        || after.wal_head != current_file().head)
+                          co_return runtime::failure(
+                            detail::path_error(errc::wrong_context));
+                      co_return runtime::result<void>{};
+                  },
+                  work);
+                if (!published(current_file().head_publication)) break;
+                current = control_.snapshot();
+                if (
+                  !current || current->fields.wal_head != current_file().head) {
+                    first_.observe(detail::path_error(errc::wrong_context));
+                    break;
+                }
+                if (admission_stopped_) {
+                    stopped = true;
+                    break;
+                }
+                if (!co_await start_current(owner)) {
+                    stopped = admission_stopped_;
+                    break;
+                }
             } while (false);
         } catch (...) {
             first_.observe(std::current_exception());
@@ -1894,5 +2359,8 @@ private:
     bool shutdown_bound_{false}, admission_stopped_{false};
     bool dispatcher_stopping_{false}, barrier_busy_{false},
       prefix_failed_{false};
+    wal_start_intent intent_{wal_start_intent::known_unactivated};
+    // The recovered head's fresh barrier completed.
+    bool recovered_flushed_{false};
 };
 } // namespace kwaque::storage

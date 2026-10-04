@@ -18,12 +18,10 @@ forums, events, and when a person officially represents the project.
 
 ## Reporting
 
-Do not post sensitive conduct reports publicly. Submit a private report through
-the repository's **Security → Report a vulnerability** form and prefix its title
-with `[Conduct]`. Include the relevant links, dates, behavior, and any context
-that helps the maintainers investigate. If private vulnerability reporting is
-temporarily unavailable, use the repository owner's private contact method and
-identify the message as a Kwaque conduct report.
+Do not post sensitive conduct reports publicly. Email
+contact.vikramaditya33@gmail.com with `Kwaque conduct report` in the subject.
+Include the relevant links, dates, behavior, and any context that helps the
+maintainers investigate.
 
 Maintainers will acknowledge a report, limit disclosure to people needed for
 the investigation, avoid conflicts of interest, and communicate the outcome to

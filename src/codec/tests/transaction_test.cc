@@ -30,6 +30,7 @@
 #include <vector>
 
 namespace {
+using kwaque::literals::operator""_MiB;
 
 using namespace std::literals;
 namespace codec = kwaque::codec;
@@ -66,8 +67,7 @@ byte_count excessive_charge(byte_count requested) noexcept {
 }
 
 decode_budget generous_budget() noexcept {
-    return {
-      byte_count{64U * 1024U * 1024U}, byte_count{1024U * 1024U}, test_charge};
+    return {byte_count{64_MiB}, byte_count{1_MiB}, test_charge};
 }
 
 seastar::temporary_buffer<char> fragment_of(std::string_view bytes) {

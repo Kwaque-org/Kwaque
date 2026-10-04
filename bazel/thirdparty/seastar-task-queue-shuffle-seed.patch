@@ -1,0 +1,51 @@
+diff --git a/src/core/reactor.cc b/src/core/reactor.cc
+--- a/src/core/reactor.cc
++++ b/src/core/reactor.cc
+@@ -93,6 +93,7 @@
+ 
+ #ifdef SEASTAR_SHUFFLE_TASK_QUEUE
+ #include <random>
++#include <charconv>
+ #endif
+ 
+ #include <sys/mman.h>
+@@ -2936,8 +2937,38 @@
+ namespace {
+ 
+ #ifdef SEASTAR_SHUFFLE_TASK_QUEUE
++// A task-order failure is replayable only with its seed. The process-wide base
++// seed comes from SEASTAR_SHUFFLE_TASK_QUEUE_SEED when set, and is otherwise
++// drawn once; each shard derives its own generator and logs the base seed.
++uint64_t shuffle_base_seed() {
++    if (const char* text = std::getenv("SEASTAR_SHUFFLE_TASK_QUEUE_SEED")) {
++        const std::string_view value{text};
++        uint64_t seed = 0;
++        const auto [end, error] = std::from_chars(value.data(), value.data() + value.size(), seed);
++        if (error == std::errc{} && end == value.data() + value.size()) {
++            return seed;
++        }
++        seastar_logger.error("ignoring invalid SEASTAR_SHUFFLE_TASK_QUEUE_SEED={}", value);
++    }
++    std::random_device device;
++    return (uint64_t(device()) << 32) | device();
++}
++
++std::mt19937_64 make_shuffle_generator() {
++    static const uint64_t base_seed = shuffle_base_seed();
++    const auto shard = this_shard_id();
++    try {
++        memory::scoped_critical_alloc_section section;
++        seastar_logger.info("task queue shuffle seed {} on shard {}; replay with SEASTAR_SHUFFLE_TASK_QUEUE_SEED={}",
++                base_seed, shard, base_seed);
++    } catch (...) {
++    }
++    std::seed_seq sequence{uint32_t(base_seed), uint32_t(base_seed >> 32), uint32_t(shard)};
++    return std::mt19937_64{sequence};
++}
++
+ void shuffle(task*& t, circular_buffer<task*>& q) {
+-    static thread_local std::mt19937 gen{std::random_device{}()};
++    static thread_local std::mt19937_64 gen = make_shuffle_generator();
+     std::uniform_int_distribution<size_t> tasks_dist{0, q.size() - 1};
+     auto& to_swap = q[tasks_dist(gen)];
+     std::swap(to_swap, t);

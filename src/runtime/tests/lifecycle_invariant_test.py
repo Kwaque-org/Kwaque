@@ -8,6 +8,9 @@ import subprocess
 import unittest
 from pathlib import Path
 
+# The test macros export the reactor backend selected for this build.
+REACTOR_BACKEND = os.environ.get("KWAQUE_REACTOR_BACKEND", "epoll")
+
 
 class LifecycleInvariantTest(unittest.TestCase):
     def test_destruction_fails_at_the_intended_boundary(self) -> None:
@@ -29,7 +32,7 @@ class LifecycleInvariantTest(unittest.TestCase):
                     [
                         str(probe),
                         scenario,
-                        "--reactor-backend=epoll",
+                        f"--reactor-backend={REACTOR_BACKEND}",
                         "--memory=256MiB",
                         "--smp=2",
                         "--overprovisioned",

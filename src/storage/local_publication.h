@@ -1,6 +1,7 @@
 #pragma once
 
 #include "src/base/invariant.h"
+#include "src/base/units.h"
 #include "src/storage/local_paths.h"
 #include "src/storage/workload_budget.h"
 
@@ -91,10 +92,10 @@ struct local_publication_request final {
     std::optional<local_publication_generation> expected_current;
 };
 struct local_publication_limits final {
-    byte_count maximum_bytes{65536};
+    byte_count maximum_bytes{64_KiB};
     // Caller-qualified frame/control allowance in addition to payload,
     // native write backing and the bounded path allocations charged below.
-    byte_count execution_bytes{65536};
+    byte_count execution_bytes{64_KiB};
 };
 
 // One externally owned namespace target. The caller supplies already validated
@@ -141,12 +142,12 @@ public:
             co_return runtime::failure(detail::path_error(errc::queue_full));
         if (
           limits_.maximum_bytes.value() == 0
-          || limits_.maximum_bytes > byte_count{65536}
+          || limits_.maximum_bytes > byte_count{64_KiB}
           || limits_.execution_bytes.value() == 0
           || limits_.execution_bytes
                > byte_count{maximum_contiguous_allocation_bytes}
-          || working_bytes < byte_count{65536}
-          || working_bytes > byte_count{4U * 1024U * 1024U})
+          || working_bytes < byte_count{64_KiB}
+          || working_bytes > byte_count{4_MiB})
             co_return runtime::failure(
               detail::path_error(errc::invalid_argument));
         auto paths = path_charge();
@@ -193,6 +194,23 @@ public:
       local_publication_request request,
       bytes::fragmented_buffer payload,
       codec::cooperative_work& admission) {
+        return publish(
+          request, std::move(payload), admission, immediately_ready{});
+    }
+    // As above, but the rename that makes the record current first awaits
+    // `ready`, which runs while the temporary is written and flushed: a
+    // dependency the record must not be visible before. A failed dependency
+    // leaves the target untouched and removes the temporary.
+    template<typename Ready>
+    requires std::same_as<
+               std::invoke_result_t<Ready&>,
+               seastar::future<runtime::result<void>>>
+             && std::is_nothrow_move_constructible_v<Ready>
+    [[nodiscard]] seastar::future<local_publication_outcome> publish(
+      local_publication_request request,
+      bytes::fragmented_buffer payload,
+      codec::cooperative_work& admission,
+      Ready ready) {
         auto final = validate_request(request);
         if (!final) return reject(final.error());
         if (
@@ -224,7 +242,8 @@ public:
           admission,
           std::move(*reservation),
           prepared_ ? prepared_write_credit_ : *write_backing,
-          operations_.hold());
+          operations_.hold(),
+          std::move(ready));
     }
     // Stream one page of at most 64 KiB per write into a new immutable file.
     // The writer joins each write; file_bytes is the complete file extent.
@@ -246,16 +265,15 @@ public:
       byte_count file_bytes,
       byte_count working_bytes,
       codec::cooperative_work& admission) {
-        static_assert(sizeof(Writer) <= 8192);
+        static_assert(sizeof(Writer) <= 8_KiB);
         auto final = validate_request(request);
         if (!final) return reject(final.error());
         if (
           target_.policy != runtime::file_rename_policy::no_replace
-          || target_.current || file_bytes.value() > 257ULL * 65536ULL
-          || working_bytes.value() < 65536
-          || working_bytes.value() > 4U * 1024U * 1024U)
+          || target_.current || file_bytes.value() > 257U * 64_KiB
+          || working_bytes.value() < 64_KiB || working_bytes.value() > 4_MiB)
             return reject(detail::path_error(errc::invalid_argument));
-        auto backing = budget_.allocation_charge(byte_count{65536});
+        auto backing = budget_.allocation_charge(byte_count{64_KiB});
         auto paths = path_charge();
         if (!backing) return reject(backing.error());
         if (!paths) return reject(paths.error());
@@ -279,7 +297,8 @@ public:
           admission,
           std::move(*reservation),
           prepared_ ? prepared_write_credit_ : *backing,
-          operations_.hold());
+          operations_.hold(),
+          immediately_ready{});
     }
     [[nodiscard]] seastar::future<runtime::result<void>> close() {
         assert_current();
@@ -373,7 +392,7 @@ private:
           || (!target_.current && target_.policy != runtime::file_rename_policy::no_replace)
           || (target_.policy != runtime::file_rename_policy::replace && target_.policy != runtime::file_rename_policy::no_replace)
           || limits_.maximum_bytes.value() == 0
-          || limits_.maximum_bytes.value() > 65536
+          || limits_.maximum_bytes.value() > 64_KiB
           || limits_.execution_bytes.value() == 0
           || limits_.execution_bytes.value()
                > maximum_contiguous_allocation_bytes)
@@ -411,6 +430,11 @@ private:
         }
         return byte_count{maximum};
     }
+    struct immediately_ready final {
+        seastar::future<runtime::result<void>> operator()() const {
+            return seastar::make_ready_future<runtime::result<void>>();
+        }
+    };
     struct buffer_writer final {
         bytes::fragmented_buffer payload;
         seastar::future<runtime::result<void>>
@@ -425,7 +449,7 @@ private:
             co_return runtime::result<void>{};
         }
     };
-    template<typename Writer>
+    template<typename Writer, typename Ready>
     seastar::future<local_publication_outcome> publish_owned(
       local_publication_request request,
       Writer writer,
@@ -434,7 +458,8 @@ private:
       codec::cooperative_work& admission,
       workload_reservation reservation,
       byte_count write_credit,
-      seastar::gate::holder holder) {
+      seastar::gate::holder holder,
+      Ready ready) {
         busy_ = true;
         auto idle = seastar::defer([this] noexcept { busy_ = false; });
         static_cast<void>(reservation);
@@ -484,7 +509,7 @@ private:
                 output.stage = local_publication_stage::parent_open;
                 for (std::uint8_t attempt = 0; attempt != 64; ++attempt) {
                     auto room = co_await execution.admit(
-                      byte_count{16384}, item_count{16});
+                      byte_count{16_KiB}, item_count{16});
                     if (!room) {
                         output.failure.observe(
                           detail::path_error(room.error().code()));
@@ -564,7 +589,7 @@ private:
                     }
                 }
                 auto native_memory = write_charge(
-                  *temporary, std::min(size, byte_count{65536}));
+                  *temporary, std::min(size, byte_count{64_KiB}));
                 if (!native_memory) {
                     output.failure.observe(native_memory);
                     break;
@@ -622,6 +647,11 @@ private:
                     break;
                 }
                 output.stage = local_publication_stage::file_closed;
+                auto dependency = co_await ready();
+                if (!dependency) {
+                    output.failure.observe(dependency);
+                    break;
+                }
                 rename_attempted = true;
                 output.disposition = local_publication_disposition::uncertain;
                 auto renamed = co_await files_.rename(

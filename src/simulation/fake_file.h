@@ -44,18 +44,14 @@ namespace kwaque::simulation {
 inline constexpr std::size_t fake_file_page_bytes{4'096};
 inline constexpr std::size_t fake_path_component_bytes_max{255};
 inline constexpr std::size_t fake_path_bytes_max{4'096};
-inline constexpr byte_count default_fake_disk_capacity{
-  std::uint64_t{256} * 1024U * 1024U};
-inline constexpr byte_count maximum_fake_disk_capacity{
-  std::uint64_t{4} * 1024U * 1024U * 1024U};
+inline constexpr byte_count default_fake_disk_capacity{256_MiB};
+inline constexpr byte_count maximum_fake_disk_capacity{4_GiB};
 inline constexpr std::uint32_t default_fake_file_objects{65'536};
 inline constexpr std::uint32_t maximum_fake_file_objects{1'048'576};
 inline constexpr std::uint32_t maximum_fake_open_handles{4'096};
 inline constexpr std::uint32_t maximum_fake_pending_operations{1'024};
-inline constexpr byte_count maximum_fake_pending_bytes{
-  std::uint64_t{1} * 1024U * 1024U * 1024U};
-inline constexpr byte_count maximum_fake_retained_path_bytes{
-  std::uint64_t{256} * 1024U * 1024U};
+inline constexpr byte_count maximum_fake_pending_bytes{1_GiB};
+inline constexpr byte_count maximum_fake_retained_path_bytes{256_MiB};
 
 class fake_file_test_access;
 class fake_file_system;
@@ -163,7 +159,7 @@ struct fake_crash_policy final {
     std::uint8_t eof_percent{0};
     std::uint32_t granule_bytes{512};
     std::uint32_t maximum_namespace_groups{4096};
-    byte_count maximum_scratch_bytes{64U * 1024U * 1024U};
+    byte_count maximum_scratch_bytes{64_MiB};
     bool operator==(const fake_crash_policy&) const = default;
 };
 
@@ -180,10 +176,10 @@ struct fake_file_system_config final {
     byte_count logical_capacity{default_fake_disk_capacity};
     std::uint32_t maximum_objects{default_fake_file_objects};
     byte_count maximum_operation_bytes{runtime::maximum_file_io_bytes};
-    byte_count maximum_retained_path_bytes{std::uint64_t{16} * 1024U * 1024U};
+    byte_count maximum_retained_path_bytes{16_MiB};
     std::uint32_t maximum_open_handles{256};
     std::uint32_t maximum_pending_operations{96};
-    byte_count maximum_pending_bytes{std::uint64_t{128} * 1024U * 1024U};
+    byte_count maximum_pending_bytes{128_MiB};
     runtime::monotonic_duration base_latency{1};
     runtime::monotonic_duration read_latency_min;
     runtime::monotonic_duration read_latency_mean;

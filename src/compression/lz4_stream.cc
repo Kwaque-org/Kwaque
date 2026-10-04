@@ -1,4 +1,5 @@
 #include "src/base/invariant.h"
+#include "src/base/units.h"
 #include "src/compression/compression.h"
 #include "src/compression/compression_internal.h"
 #include "src/compression/lz4.h"
@@ -40,7 +41,7 @@ public:
     [[nodiscard]] bool empty() const noexcept { return fragment_ == end_; }
     [[nodiscard]] std::uint64_t position() const noexcept { return consumed_; }
     [[nodiscard]] std::span<const char>
-    window(std::size_t limit = 65536) const noexcept {
+    window(std::size_t limit = 64_KiB) const noexcept {
         if (empty()) return std::span<const char>{&sentinel_, std::size_t{0}};
         const auto fragment = *fragment_;
         return std::span<const char>{

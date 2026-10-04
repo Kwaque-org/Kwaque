@@ -3,6 +3,7 @@
 #include <gtest/gtest.h>
 
 #include <array>
+#include <cstddef>
 #include <string>
 #include <string_view>
 #include <system_error>
@@ -58,6 +59,28 @@ constexpr std::array cases{
   error_case{kwaque::errc::wrong_context, 25, "wrong context"},
   error_case{kwaque::errc::unsupported_format, 26, "unsupported format"},
 };
+
+// A new code must extend both the table and the marker.
+static_assert(cases.size() == static_cast<std::size_t>(kwaque::errc_last) + 1U);
+static_assert(cases.back().code == kwaque::errc_last);
+
+TEST(ErrorTest, ConvertsOnlyKwaqueCodesBackToTheEnumeration) {
+    for (const auto& test_case : cases) {
+        EXPECT_EQ(
+          kwaque::to_errc(kwaque::make_error_code(test_case.code)),
+          test_case.code);
+    }
+    EXPECT_FALSE(
+      kwaque::to_errc(std::make_error_code(std::errc::io_error)).has_value());
+    EXPECT_FALSE(
+      kwaque::to_errc(
+        std::error_code{
+          static_cast<int>(kwaque::errc_last) + 1, kwaque::error_category()})
+        .has_value());
+    EXPECT_FALSE(
+      kwaque::to_errc(std::error_code{-1, kwaque::error_category()})
+        .has_value());
+}
 
 TEST(ErrorTest, PreservesStableValuesAndRoundTripsEveryCode) {
     for (const auto& test_case : cases) {

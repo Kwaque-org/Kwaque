@@ -1,6 +1,7 @@
 #include "src/observability/event_log.h"
 
 #include "src/base/invariant.h"
+#include "src/base/units.h"
 
 #include <seastar/coroutine/maybe_yield.hh>
 
@@ -385,9 +386,7 @@ seastar::future<bool> event_log_artifact::equals_cooperatively(
     event_log_artifact_reader right{other};
     while (left.remaining() != 0) {
         if (!equal_batch(
-              left,
-              right,
-              std::min<std::uint64_t>(left.remaining(), 64U * 1024U))) {
+              left, right, std::min<std::uint64_t>(left.remaining(), 64_KiB))) {
             co_return false;
         }
         co_await seastar::coroutine::maybe_yield{};

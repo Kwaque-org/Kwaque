@@ -1,3 +1,4 @@
+#include "src/base/units.h"
 #include "src/runtime/dns.h"
 #include "src/runtime/fault.h"
 #include "src/runtime/network.h"
@@ -19,6 +20,8 @@
 #include <vector>
 
 namespace {
+
+using kwaque::literals::operator""_KiB;
 
 class contract_connection final {
 public:
@@ -404,7 +407,7 @@ TEST(FaultContractTest, ZeroProgressFaultIsOnlyAFileWriteCompletion) {
         EXPECT_TRUE(
           validate_fault_decision(
             request,
-            fault_decision::make_short_operation(kwaque::byte_count{1024}))
+            fault_decision::make_short_operation(kwaque::byte_count{1_KiB}))
             .has_value());
     }
 }

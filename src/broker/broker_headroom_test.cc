@@ -1,4 +1,5 @@
 #include "src/admin/admin_limits.h"
+#include "src/base/units.h"
 #include "src/broker/application_internal.h"
 #include "src/broker/application_test_support.h"
 #include "src/config/bootstrap_config.h"
@@ -59,6 +60,8 @@ struct kwaque::runtime::enable_cross_shard_value<
   kwaque::broker::test_types::headroom_test_port> : std::true_type {};
 
 namespace {
+using kwaque::literals::operator""_KiB;
+using kwaque::literals::operator""_MiB;
 
 using kwaque::broker::test_types::headroom_test_port;
 static_assert(kwaque::runtime::cross_shard_value<headroom_test_port>);
@@ -178,7 +181,9 @@ public:
                 prefix_bytes += copy;
                 total += received;
                 if (
-                  total > kwaque::admin::metrics_response_bytes + 16U * 1024U) {
+                  total > kwaque::admin::metrics_response_bytes(
+                            seastar::this_smp_shard_count())
+                            + 16_KiB) {
                     throw std::runtime_error(
                       "scrape exceeded its response bound");
                 }
@@ -279,7 +284,7 @@ seastar::future<> saturate_broker(
         workload.emplace(manager.acquire_workload(classification));
         auto remaining = workload->hard_budget().value();
         while (remaining != 0) {
-            const auto amount = std::min<std::uint64_t>(remaining, 64U * 1024U);
+            const auto amount = std::min<std::uint64_t>(remaining, 64_KiB);
             auto units = co_await seastar::get_units(
               workload->memory_admission(), amount);
             seastar::temporary_buffer<char> bytes{amount};
@@ -402,7 +407,7 @@ SEASTAR_TEST_CASE(broker_headroom_covers_live_foundation_payload_and_admin) {
     configuration.data_directory = temporary.get_path() / "data";
     configuration.admin_port = reserve_loopback_port();
     configuration.developer_mode = true;
-    configuration.diagnostic_memory_per_shard_bytes = 192U * 1024U * 1024U;
+    configuration.diagnostic_memory_per_shard_bytes = 192_MiB;
     kwaque::broker::detail::application_state application;
     kwaque::broker::detail::application_test_access::configure(
       application, configuration);

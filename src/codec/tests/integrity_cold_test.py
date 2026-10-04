@@ -13,6 +13,9 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+# The test macros export the reactor backend selected for this build.
+REACTOR_BACKEND = os.environ.get("KWAQUE_REACTOR_BACKEND", "epoll")
+
 ISOLATED_FAILURE_OBSERVED = 86
 MEMORY_FIELDS = {
     "mallocs",
@@ -201,7 +204,7 @@ class IntegrityColdTest(unittest.TestCase):
                 [
                     self.binary,
                     f"--scenario={scenario}",
-                    "--reactor-backend=epoll",
+                    f"--reactor-backend={REACTOR_BACKEND}",
                     "--smp=1",
                     "--memory=64MiB",
                     "--overprovisioned",

@@ -1,4 +1,5 @@
 #include "src/base/invariant.h"
+#include "src/base/units.h"
 #include "src/broker/crash_recorder.h"
 #include "src/broker/startup_policy.h"
 
@@ -26,6 +27,9 @@
 
 namespace {
 
+using kwaque::literals::operator""_KiB;
+using kwaque::literals::operator""_MiB;
+
 std::atomic<unsigned> arrived{0};
 
 void prior_handler(int, siginfo_t*, void*) {
@@ -41,7 +45,7 @@ void require(bool condition, const char* message) {
 }
 
 [[gnu::noinline]] void* allocate_block() {
-    auto* block = ::operator new(64U * 1024U);
+    auto* block = ::operator new(64_KiB);
     static_cast<volatile char*>(block)[0] = 1;
     return block;
 }
@@ -156,7 +160,7 @@ exercise(std::string_view scenario, std::filesystem::path path) {
           seastar::memory::is_abort_on_allocation_failure(), "OOM must abort");
         require(
           seastar::this_smp_shard_count() == 1
-            && seastar::memory::stats().total_memory() <= 96U * 1024U * 1024U,
+            && seastar::memory::stats().total_memory() <= 96_MiB,
           "OOM probe requires one bounded managed heap");
         std::array<void*, 2048> blocks{};
         for (auto& block : blocks) {

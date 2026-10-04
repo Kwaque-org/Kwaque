@@ -1,3 +1,4 @@
+#include "src/base/units.h"
 #include "src/runtime/environment.h"
 #include "src/runtime/operation_statistics.h"
 #include "src/runtime/production/clocks.h"
@@ -57,7 +58,7 @@ struct disabled_fault_policy {
 };
 
 struct network_admission_fixture {
-    static constexpr std::size_t write_bytes = 4096;
+    static constexpr std::size_t write_bytes = 4_KiB;
 
     seastar::semaphore direct_operations{
       network_connection_limits{}.pending_writes};

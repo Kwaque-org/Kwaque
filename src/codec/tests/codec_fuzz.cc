@@ -32,6 +32,8 @@
 #include <vector>
 
 namespace {
+using kwaque::literals::operator""_KiB;
+using kwaque::literals::operator""_MiB;
 
 namespace codec = kwaque::codec;
 using kwaque::byte_count;
@@ -41,7 +43,7 @@ using kwaque::bytes::fragmented_buffer;
 using kwaque::bytes::fragmented_buffer_builder;
 using kwaque::bytes::fragmented_buffer_parser;
 
-constexpr std::size_t max_input_size = 16U * 1024U;
+constexpr std::size_t max_input_size = 16_KiB;
 constexpr codec::field_context context{.origin = 1024, .family = 3, .field = 7};
 constexpr std::uint64_t wire_origin = context.origin + 2U;
 constexpr codec::error injected_result{errc::wrong_context, 91, 92, 93};
@@ -96,10 +98,7 @@ byte_count allocation_charge(byte_count requested) noexcept {
 codec::decode_budget memory_budget() noexcept {
     // Residuals leave ample separate reservations for the bounded harness,
     // callback/frame storage and any borrowed input owners.
-    return {
-      byte_count{8U * 1024U * 1024U},
-      byte_count{128U * 1024U},
-      allocation_charge};
+    return {byte_count{8_MiB}, byte_count{128_KiB}, allocation_charge};
 }
 
 fragmented_buffer_parser

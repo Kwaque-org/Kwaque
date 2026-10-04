@@ -1,0 +1,6 @@
+kwaque:
+  schema_version: 1
+  data_directory: /var/lib/kwaque
+  admin: {address: "::1", port: 9644}
+  developer_mode: False
+  crash_loop_limit: 5

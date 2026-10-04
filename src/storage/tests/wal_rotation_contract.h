@@ -1,5 +1,6 @@
 #pragma once
 
+#include "src/base/units.h"
 #include "src/storage/tests/wal_append_contract.h"
 
 namespace kwaque::storage::testing::wal_rotation_contract {
@@ -39,11 +40,12 @@ seastar::future<> exercise(
           const auto empty_extent = take(
             co_await drive.lifecycle(writer.inspect_extent()));
           require(
-            empty_extent.capacity_bytes == byte_count{1048576}
+            empty_extent.capacity_bytes == byte_count{1_MiB}
               && empty_extent.observed_eof.value() == 8192
               && empty_extent.positions.write_complete == empty.cursor(),
             "capacity was confused with header EOF or complete end");
-          auto rejected = co_await writer.rotate(empty, byte_count{8192}, work);
+          auto rejected = co_await writer.rotate(
+            empty, byte_count{8_KiB}, work);
           require(
             !rejected && !writer.rotation_pending(), "rotated an empty file");
           auto first = co_await submit_one(
@@ -56,7 +58,7 @@ seastar::future<> exercise(
             std::move(second.written));
           take(second_done.failure.outcome());
           rejected = co_await writer.rotate(
-            first.boundary, byte_count{8192}, work);
+            first.boundary, byte_count{8_KiB}, work);
           require(
             !rejected && rejected.error().code() == errc::wrong_context
               && !writer.rotation_pending(),
@@ -70,7 +72,7 @@ seastar::future<> exercise(
               && extent.positions.durable == empty.cursor(),
             "visible written bytes became durable evidence");
           const auto before = take(control.snapshot());
-          rejected = co_await writer.rotate(cut, byte_count{1048576}, work);
+          rejected = co_await writer.rotate(cut, byte_count{1_MiB}, work);
           require(
             !rejected && !writer.rotation_pending()
               && take(control.snapshot()).generation == before.generation,
@@ -86,7 +88,7 @@ seastar::future<> exercise(
             files, old_path, drive);
           take(
             co_await drive.lifecycle(
-              writer.rotate(cut, byte_count{8192}, work)));
+              writer.rotate(cut, byte_count{8_KiB}, work)));
           const auto next = *writer.prepared_head();
           const auto current = take(control.snapshot());
           require(
@@ -133,7 +135,7 @@ seastar::future<> exercise(
           const auto second_cut = third.boundary;
           take(
             co_await drive.lifecycle(
-              writer.rotate(second_cut, byte_count{8192}, work)));
+              writer.rotate(second_cut, byte_count{8_KiB}, work)));
           require(
             writer.statistics().rotations == 2
               && writer.statistics().flush_calls == 2,
@@ -156,7 +158,7 @@ seastar::future<> capacity(
   workload_budget& budget,
   Driver drive) {
     auto config = wal_writer_contract::configuration();
-    config.capacity_bytes = byte_count{16384};
+    config.capacity_bytes = byte_count{16_KiB};
     co_await append::with_writer(
       files,
       ownership,
@@ -181,7 +183,7 @@ seastar::future<> capacity(
             "capacity rejection reserved a partial group");
           take(
             co_await drive.lifecycle(
-              writer.rotate(first.boundary, byte_count{8192}, work)));
+              writer.rotate(first.boundary, byte_count{8_KiB}, work)));
           auto second = co_await submit_one(
             writer, budget, spec.owner.cluster(), work);
           auto done = co_await drive.lifecycle(std::move(second.written));
@@ -216,7 +218,7 @@ seastar::future<> pressure(
           const auto old = *writer.prepared_head();
           std::array<std::optional<workload_reservation>, 32> held;
           for (auto& slot : held) {
-              auto reserve = budget.try_reserve(byte_count{4096});
+              auto reserve = budget.try_reserve(byte_count{4_KiB});
               if (!reserve) break;
               slot.emplace(std::move(*reserve));
           }
@@ -224,7 +226,7 @@ seastar::future<> pressure(
             !budget.try_reserve(byte_count{1}),
             "ordinary tasks did not saturate");
           auto rejected = co_await drive.lifecycle(
-            writer.rotate(cut, byte_count{8192}, work));
+            writer.rotate(cut, byte_count{8_KiB}, work));
           require(
             !rejected && writer.rotation_pending() && !writer.successor_head()
               && !writer.failure().failed(),
@@ -266,7 +268,7 @@ seastar::future<> pressure(
           try {
               co_await drive.lifecycle(std::move(entered_future));
               rejected = co_await drive.lifecycle(
-                writer.rotate(cut, byte_count{8192}, work));
+                writer.rotate(cut, byte_count{8_KiB}, work));
               pending = writer.successor_head();
               require(
                 !rejected
@@ -296,7 +298,7 @@ seastar::future<> pressure(
                 !submission && writer.progress()->reserved == cut.cursor(),
                 "pending successor admitted a PREPARE");
               auto again = co_await drive.lifecycle(
-                writer.rotate(cut, byte_count{8192}, work));
+                writer.rotate(cut, byte_count{8_KiB}, work));
               require(
                 !again && writer.successor_head() == pending,
                 "busy retry allocated another successor");
@@ -328,7 +330,7 @@ seastar::future<> pressure(
           }
           take(
             co_await drive.lifecycle(
-              writer.rotate(cut, byte_count{8192}, work)));
+              writer.rotate(cut, byte_count{8_KiB}, work)));
           const auto after = take(control.snapshot()).fields;
           require(
             writer.prepared_head() == pending && after.wal_head == pending

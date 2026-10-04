@@ -140,7 +140,7 @@ public:
         config.initial_fragment_bytes = byte_count{64};
         config.max_fragment_bytes = byte_count{64};
         config.max_total_bytes = byte_count{encoded_.size()};
-        config.max_retained_bytes = byte_count{4096};
+        config.max_retained_bytes = byte_count{4_KiB};
         bytes::fragmented_buffer_builder output{config};
         perf_tests::start_measuring_time();
         for (std::size_t index = 0; index < scalar_count; ++index) {
@@ -201,8 +201,7 @@ byte_count capacity_bound(byte_count requested) noexcept {
 }
 
 constexpr byte_count frame_reservation = testing::execution_reservation;
-constexpr byte_count parent_remainder{
-  64U * 1024U * 1024U - frame_reservation.value()};
+constexpr byte_count parent_remainder{64_MiB - frame_reservation.value()};
 
 struct entry {
     std::uint64_t key;
@@ -227,7 +226,7 @@ struct unordered_fixture {
         seastar::abort_source abort;
         cooperative_work work{limits::defaults(), abort};
         const decode_budget budget{
-          parent_remainder, byte_count{1024U * 1024U}, capacity_bound};
+          parent_remainder, byte_count{1_MiB}, capacity_bound};
         clobber_memory();
         perf_tests::start_measuring_time();
         auto result = co_await canonicalize_unordered(

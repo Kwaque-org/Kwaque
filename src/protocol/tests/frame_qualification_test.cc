@@ -1,4 +1,5 @@
 #include "src/base/allocation.h"
+#include "src/base/units.h"
 #include "src/bytes/fragmented_buffer_builder.h"
 #include "src/codec/staging_cooperative.h"
 #include "src/codec/tests/prepared_abort_source.h"
@@ -41,14 +42,14 @@ using fixture::charge;
 // One MiB stays unavailable for native/frame/fixture costs. No retained large
 // source cache is kept alongside these operation-local inputs.
 constexpr byte_count available{codec::testing::residual};
-constexpr std::size_t maximum_payload = 16U << 20U;
+constexpr std::size_t maximum_payload = 16_MiB;
 
 codec::decode_budget
 reserve(const fragmented_buffer_parser& input, codec::cooperative_work& work) {
     return codec::reserve_decode_input(
              input,
              work.policy(),
-             {available, byte_count{1U << 20U}, charge},
+             {available, byte_count{1_MiB}, charge},
              fixture::context)
       .value();
 }
@@ -105,7 +106,7 @@ auto with_control_progress(const std::string& name, Start start) {
     std::uint64_t ticks = 0;
     std::chrono::steady_clock::duration gap{};
     auto observer = control_progress(stop, ticks, gap);
-    auto joined = seastar::defer([&] {
+    auto joined = seastar::defer([&] noexcept {
         stop.request_abort();
         observer.get();
     });
@@ -317,7 +318,7 @@ TEST(
         auto* frame = std::get_if<protocol::decoded_assigned_frame>(&*decoded);
         ASSERT_NE(frame, nullptr);
         EXPECT_TRUE(input.at_end());
-        EXPECT_EQ(frame->batch.records().size(), byte_count{8U << 20U});
+        EXPECT_EQ(frame->batch.records().size(), byte_count{8_MiB});
         EXPECT_EQ(
           frame->batch.context().submitted().binding(),
           model::bench::fixture_binding());
@@ -327,7 +328,7 @@ TEST(
         EXPECT_LE(
           memory.metadata_remaining.value()
             - frame->remaining.metadata_remaining.value(),
-          1U << 20U);
+          1_MiB);
     }
 }
 
@@ -344,7 +345,7 @@ TEST(FrameQualificationTest, CompleteFrameAndControlCapsIncludeActualHeaders) {
     const auto memory = reserve(input, work);
     auto result = protocol::decode_frame(
                     input,
-                    {byte_count{65536}, byte_count{69632}},
+                    {byte_count{64_KiB}, byte_count{68_KiB}},
                     memory,
                     work,
                     fixture::context)
@@ -352,7 +353,7 @@ TEST(FrameQualificationTest, CompleteFrameAndControlCapsIncludeActualHeaders) {
     ASSERT_TRUE(result.has_value());
     auto* frame = std::get_if<protocol::framed_payload>(&*result);
     ASSERT_NE(frame, nullptr);
-    EXPECT_EQ(frame->header.header_bytes, byte_count{4096});
+    EXPECT_EQ(frame->header.header_bytes, byte_count{4_KiB});
     EXPECT_TRUE(input.at_end());
     auto too_large = fixture::header(65537, 0, {}, fields);
     fragmented_buffer_parser denied{fixture::fragmented(too_large, 7)};
@@ -400,7 +401,7 @@ TEST(
     admission_abort = &abort;
     admission_ordinal = 0;
     admission_calls = 0;
-    auto reset = seastar::defer([] { admission_abort = nullptr; });
+    auto reset = seastar::defer([] noexcept { admission_abort = nullptr; });
     const byte_count request{4096};
     const auto expected = charge(request);
 #if !defined(SEASTAR_DEFAULT_ALLOCATOR)
@@ -443,7 +444,8 @@ TEST(FrameQualificationTest, CancellationAtEveryAdmissionDrainsAllPublicPaths) {
             admission_calls = 0;
             largest_served = 0;
             admission_abort = &abort;
-            auto reset = seastar::defer([] { admission_abort = nullptr; });
+            auto reset = seastar::defer(
+              [] noexcept { admission_abort = nullptr; });
             const auto run = [&] -> codec::result<void> {
                 if (operation == 0) {
                     auto result = protocol::encode_frame(

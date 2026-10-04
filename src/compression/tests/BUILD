@@ -194,6 +194,7 @@ kwaque_cc_fuzz_test(
     ],
     corpus = glob(["testdata/compression_fuzz_corpus/*.bin"]),
     tags = [
+        "fuzz-campaign",
         "resources:cpu:1",
         "resources:memory:1024",
     ],
@@ -207,6 +208,7 @@ kwaque_cc_benchmark(
     name = "compression_bench",
     srcs = ["compression_bench.cc"],
     memory = "256MiB",
+    native_allocator_only = True,
     deps = [
         "//src/base",
         "//src/base:error",

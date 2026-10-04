@@ -1,3 +1,4 @@
+#include "src/base/units.h"
 #include "src/broker/storage_directories.h"
 #include "src/resource/resource_registry.h"
 #include "src/runtime/production/clocks.h"
@@ -31,7 +32,7 @@ template<typename Func>
 seastar::future<> with_installation(
   std::uint8_t device,
   Func function,
-  byte_count budget_bytes = byte_count{8U * 1024U * 1024U},
+  byte_count budget_bytes = byte_count{8_MiB},
   resource::workload_class classification = resource::workload_class::metadata,
   std::uint32_t budget_tasks = 16) {
     auto config = resource::resource_config::from_total_memory(
@@ -159,7 +160,7 @@ SEASTAR_TEST_CASE(segment_writer_native_creation) {
             runtime::production::monotonic_clock>(
             files, owner, spec, budget, drive);
       },
-      byte_count{18U * 1024U * 1024U},
+      byte_count{18_MiB},
       resource::workload_class::foreground_protocol);
 }
 
@@ -171,7 +172,7 @@ SEASTAR_TEST_CASE(segment_writer_native_admission) {
             runtime::production::monotonic_clock>(
             files, owner, spec, budget, drive);
       },
-      byte_count{18U * 1024U * 1024U},
+      byte_count{18_MiB},
       resource::workload_class::foreground_protocol);
 }
 
@@ -182,7 +183,7 @@ SEASTAR_TEST_CASE(segment_writer_native_reserved_publication) {
           return storage::testing::segment_writer_contract::
             reserved_publication(files, owner, spec, budget, drive);
       },
-      byte_count{18U * 1024U * 1024U},
+      byte_count{18_MiB},
       resource::workload_class::foreground_protocol);
 }
 
@@ -194,7 +195,7 @@ SEASTAR_TEST_CASE(segment_writer_native_execution) {
             runtime::production::monotonic_clock>(
             files, owner, spec, budget, drive);
       },
-      byte_count{48U * 1024U * 1024U},
+      byte_count{48_MiB},
       resource::workload_class::foreground_protocol,
       64);
 }
@@ -207,7 +208,7 @@ SEASTAR_TEST_CASE(segment_writer_native_barriers) {
             runtime::production::monotonic_clock>(
             files, owner, spec, budget, drive, true);
       },
-      byte_count{48U * 1024U * 1024U},
+      byte_count{48_MiB},
       resource::workload_class::foreground_protocol,
       64);
 }
@@ -220,7 +221,7 @@ SEASTAR_TEST_CASE(segment_writer_native_grouped_execution) {
             runtime::production::monotonic_clock>(
             files, owner, spec, budget, drive);
       },
-      byte_count{48U * 1024U * 1024U},
+      byte_count{48_MiB},
       resource::workload_class::foreground_protocol,
       64);
 }
@@ -233,7 +234,7 @@ SEASTAR_TEST_CASE(segment_writer_native_preallocated_execution) {
             preallocated_execution<runtime::production::monotonic_clock>(
               files, owner, spec, budget, drive);
       },
-      byte_count{48U * 1024U * 1024U},
+      byte_count{48_MiB},
       resource::workload_class::foreground_protocol,
       64);
 }
@@ -246,7 +247,7 @@ SEASTAR_TEST_CASE(segment_writer_native_concurrent_execution) {
             concurrent_execution<runtime::production::monotonic_clock>(
               files, owner, spec, budget, drive);
       },
-      byte_count{48U * 1024U * 1024U},
+      byte_count{48_MiB},
       resource::workload_class::foreground_protocol,
       64);
 }
@@ -259,7 +260,7 @@ SEASTAR_TEST_CASE(segment_writer_native_extended_execution) {
             runtime::production::monotonic_clock>(
             files, owner, spec, budget, drive);
       },
-      byte_count{48U * 1024U * 1024U},
+      byte_count{48_MiB},
       resource::workload_class::foreground_protocol,
       64);
 }
@@ -272,7 +273,7 @@ SEASTAR_TEST_CASE(segment_writer_native_abandoned_group) {
             runtime::production::monotonic_clock>(
             files, owner, spec, budget, drive);
       },
-      byte_count{48U * 1024U * 1024U},
+      byte_count{48_MiB},
       resource::workload_class::foreground_protocol,
       64);
 }
@@ -285,7 +286,7 @@ SEASTAR_TEST_CASE(segment_writer_native_close_preserves_borrowed_blocks) {
             runtime::production::monotonic_clock>(
             files, owner, spec, budget, drive, true);
       },
-      byte_count{48U * 1024U * 1024U},
+      byte_count{48_MiB},
       resource::workload_class::foreground_protocol,
       64);
 }
@@ -298,7 +299,7 @@ SEASTAR_TEST_CASE(segment_writer_native_seal) {
             runtime::production::monotonic_clock>(
             files, owner, spec, budget, drive);
       },
-      byte_count{48U * 1024U * 1024U},
+      byte_count{48_MiB},
       resource::workload_class::foreground_protocol,
       64);
 }
@@ -311,7 +312,7 @@ SEASTAR_TEST_CASE(segment_writer_native_empty_seal) {
             runtime::production::monotonic_clock>(
             files, owner, spec, budget, drive, true);
       },
-      byte_count{48U * 1024U * 1024U},
+      byte_count{48_MiB},
       resource::workload_class::foreground_protocol,
       64);
 }
@@ -324,7 +325,7 @@ SEASTAR_TEST_CASE(segment_writer_native_reserved_seal) {
             runtime::production::monotonic_clock>(
             files, owner, spec, budget, drive, false, true);
       },
-      byte_count{48U * 1024U * 1024U},
+      byte_count{48_MiB},
       resource::workload_class::foreground_protocol,
       64);
 }
@@ -337,7 +338,7 @@ SEASTAR_TEST_CASE(segment_writer_native_changed_seal_source) {
             runtime::production::monotonic_clock>(
             files, owner, spec, budget, drive, false, false, true);
       },
-      byte_count{48U * 1024U * 1024U},
+      byte_count{48_MiB},
       resource::workload_class::foreground_protocol,
       64);
 }
@@ -356,7 +357,7 @@ SEASTAR_TEST_CASE(segment_writer_native_immutable_empty_initial) {
             storage::testing::segment_writer_contract::immutable_import_kind::
               empty_initial);
       },
-      byte_count{48U * 1024U * 1024U},
+      byte_count{48_MiB},
       resource::workload_class::foreground_protocol,
       64);
 }
@@ -375,7 +376,7 @@ SEASTAR_TEST_CASE(segment_writer_native_immutable_sparse_rewrite) {
             storage::testing::segment_writer_contract::immutable_import_kind::
               sparse_rewrite);
       },
-      byte_count{48U * 1024U * 1024U},
+      byte_count{48_MiB},
       resource::workload_class::foreground_protocol,
       64);
 }
@@ -394,7 +395,7 @@ SEASTAR_TEST_CASE(segment_writer_native_immutable_dense_relocation) {
             storage::testing::segment_writer_contract::immutable_import_kind::
               dense_relocation);
       },
-      byte_count{48U * 1024U * 1024U},
+      byte_count{48_MiB},
       resource::workload_class::foreground_protocol,
       64);
 }
@@ -413,7 +414,7 @@ SEASTAR_TEST_CASE(segment_writer_native_immutable_removed_terminal) {
             storage::testing::segment_writer_contract::immutable_import_kind::
               removed_terminal);
       },
-      byte_count{48U * 1024U * 1024U},
+      byte_count{48_MiB},
       resource::workload_class::foreground_protocol,
       64);
 }
@@ -432,7 +433,7 @@ SEASTAR_TEST_CASE(segment_writer_native_immutable_empty_terminal) {
             storage::testing::segment_writer_contract::immutable_import_kind::
               empty_terminal);
       },
-      byte_count{48U * 1024U * 1024U},
+      byte_count{48_MiB},
       resource::workload_class::foreground_protocol,
       64);
 }
@@ -445,7 +446,7 @@ SEASTAR_TEST_CASE(segment_writer_native_unresolved_seal) {
             runtime::production::monotonic_clock>(
             files, owner, spec, budget, drive, false, false, false, true);
       },
-      byte_count{48U * 1024U * 1024U},
+      byte_count{48_MiB},
       resource::workload_class::foreground_protocol,
       64);
 }
@@ -457,7 +458,7 @@ SEASTAR_TEST_CASE(segment_writer_native_age) {
           return storage::testing::segment_qualification_contract::
             age_boundaries(files, owner, spec, budget, drive, false);
       },
-      byte_count{48U * 1024U * 1024U},
+      byte_count{48_MiB},
       resource::workload_class::foreground_protocol,
       64);
 }
@@ -469,7 +470,7 @@ SEASTAR_TEST_CASE(segment_writer_native_age_overflow_restart) {
           return storage::testing::segment_qualification_contract::
             age_boundaries(files, owner, spec, budget, drive, true);
       },
-      byte_count{48U * 1024U * 1024U},
+      byte_count{48_MiB},
       resource::workload_class::foreground_protocol,
       64);
 }
@@ -482,7 +483,7 @@ SEASTAR_TEST_CASE(segment_writer_native_completion_pressure) {
             reserved_completion<runtime::production::monotonic_clock>(
               files, owner, spec, budget, drive);
       },
-      byte_count{48U * 1024U * 1024U},
+      byte_count{48_MiB},
       resource::workload_class::foreground_protocol,
       64);
 }
@@ -501,7 +502,7 @@ SEASTAR_TEST_CASE(segment_writer_native_freeze_allocation_cuts) {
                 freeze_allocation_cut<runtime::production::monotonic_clock>(
                   files, owner, spec, budget, drive, cut);
           },
-          byte_count{48U * 1024U * 1024U},
+          byte_count{48_MiB},
           resource::workload_class::foreground_protocol,
           64);
     }
@@ -515,7 +516,7 @@ SEASTAR_TEST_CASE(segment_writer_native_close_preflight) {
             close_entered_preflight<runtime::production::monotonic_clock>(
               files, owner, spec, budget, drive, false);
       },
-      byte_count{48U * 1024U * 1024U},
+      byte_count{48_MiB},
       resource::workload_class::foreground_protocol,
       64);
 }
@@ -528,7 +529,7 @@ SEASTAR_TEST_CASE(segment_writer_native_seal_preflight) {
             close_entered_preflight<runtime::production::monotonic_clock>(
               files, owner, spec, budget, drive, true);
       },
-      byte_count{48U * 1024U * 1024U},
+      byte_count{48_MiB},
       resource::workload_class::foreground_protocol,
       64);
 }
@@ -543,7 +544,7 @@ SEASTAR_TEST_CASE(
               runtime::production::monotonic_clock>(
               files, owner, spec, budget, drive, true);
       },
-      byte_count{48U * 1024U * 1024U},
+      byte_count{48_MiB},
       resource::workload_class::foreground_protocol,
       64);
 }
@@ -557,7 +558,7 @@ SEASTAR_TEST_CASE(segment_writer_native_paged_seal_and_retained_results) {
               runtime::production::monotonic_clock>(
               files, owner, spec, budget, drive);
       },
-      byte_count{48U * 1024U * 1024U},
+      byte_count{48_MiB},
       resource::workload_class::foreground_protocol,
       64);
 }

@@ -1,5 +1,6 @@
 #pragma once
 
+#include "src/base/units.h"
 #include "src/codec/limits.h"
 #include "src/protocol/frame.h"
 
@@ -34,8 +35,8 @@ enum class control_field_kind : std::uint8_t {
 };
 
 inline constexpr byte_count control_identity_bytes{16};
-inline constexpr byte_count control_build_info_bytes{4096};
-inline constexpr byte_count control_reason_bytes{1024};
+inline constexpr byte_count control_build_info_bytes{4_KiB};
+inline constexpr byte_count control_reason_bytes{1_KiB};
 inline constexpr byte_count control_host_bytes{253};
 inline constexpr item_count control_protocol_versions{16};
 inline constexpr item_count control_format_capabilities{32};

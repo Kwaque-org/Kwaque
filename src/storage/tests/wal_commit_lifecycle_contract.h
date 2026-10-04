@@ -1,5 +1,6 @@
 #pragma once
 
+#include "src/base/units.h"
 #include "src/storage/tests/wal_group_commit_contract.h"
 
 #include <stdexcept>
@@ -229,7 +230,7 @@ seastar::future<> rotation(
                 auto observed = take(first.observe());
                 const auto old = first.boundary();
                 auto direct = co_await writer.rotate(
-                  old, byte_count{8192}, work);
+                  old, byte_count{8_KiB}, work);
                 require(
                   !direct && direct.error().code() == errc::queue_full,
                   "direct rotation bypassed the registered coordinator");
@@ -237,7 +238,7 @@ seastar::future<> rotation(
                 // result before switching incarnations.
                 take(
                   co_await drive.lifecycle(
-                    groups.rotate(writer, byte_count{8192}, work)));
+                    groups.rotate(writer, byte_count{8_KiB}, work)));
                 auto retained = co_await drive.lifecycle(std::move(observed));
                 take(retained.failure().outcome());
                 require(
@@ -258,7 +259,7 @@ seastar::future<> rotation(
                 // cannot return ordinary capacity during successor preparation.
                 std::array<std::optional<workload_reservation>, 32> pressure;
                 for (auto& slot : pressure) {
-                    auto held = budget.try_reserve(byte_count{4096});
+                    auto held = budget.try_reserve(byte_count{4_KiB});
                     if (!held) break;
                     slot.emplace(std::move(*held));
                 }
@@ -266,7 +267,7 @@ seastar::future<> rotation(
                   !budget.try_reserve(byte_count{1}),
                   "rotation pressure did not engage");
                 auto rejected = co_await drive.lifecycle(
-                  groups.rotate(writer, byte_count{8192}, work));
+                  groups.rotate(writer, byte_count{8_KiB}, work));
                 require(
                   !rejected && writer.rotation_pending()
                     && !groups.failure().failed(),
@@ -277,7 +278,7 @@ seastar::future<> rotation(
                 const auto flushes = writer.statistics().flush_calls;
                 take(
                   co_await drive.lifecycle(
-                    groups.rotate(writer, byte_count{8192}, work)));
+                    groups.rotate(writer, byte_count{8_KiB}, work)));
                 require(
                   !writer.validate_capture(middle.boundary())
                     && writer.statistics().flush_calls == flushes,
@@ -605,7 +606,7 @@ seastar::future<> shutdown(
                 auto interested = ticket.template observe<Clock>(timer, caller);
                 std::array<std::optional<workload_reservation>, 32> pressure;
                 for (auto& slot : pressure) {
-                    auto held = budget.try_reserve(byte_count{4096});
+                    auto held = budget.try_reserve(byte_count{4_KiB});
                     if (!held) break;
                     slot.emplace(std::move(*held));
                 }

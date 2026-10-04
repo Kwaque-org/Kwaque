@@ -1,3 +1,4 @@
+#include "src/base/units.h"
 #include "src/bytes/test_allocation_profile.h"
 #include "src/model/checkpoint_codec.h"
 #include "src/model/fingerprint.h"
@@ -37,6 +38,8 @@ using kwaque::item_count;
 using kwaque::bytes::fragmented_buffer;
 using kwaque::bytes::fragmented_buffer_parser;
 using kwaque::bytes::testing::charge;
+using kwaque::literals::operator""_KiB;
+using kwaque::literals::operator""_MiB;
 using namespace kwaque::model::testing::checkpoint_fixture;
 using cursor_list = seastar::chunked_fifo<model::range_cursor, 16>;
 constexpr codec::field_context context{.origin = 71, .family = 10};
@@ -61,7 +64,7 @@ static_assert(!rvalue_cursor_view<const model::read_checkpoint>);
 
 codec::decode_budget memory() {
     // The unclaimed half reserves native/frame/crypto costs and live fixtures.
-    return {byte_count{32U << 20U}, byte_count{1U << 20U}, charge};
+    return {byte_count{32_MiB}, byte_count{1_MiB}, charge};
 }
 model::read_checkpoint build(
   std::span<const model::range_cursor> cursors, codec::cooperative_work& work) {
@@ -525,7 +528,7 @@ TEST(
     const auto served = malloc_usable_size(
       const_cast<model::range_cursor*>(built->value.cursors().data()));
     EXPECT_LE(served, reserved.value());
-    EXPECT_LE(reserved.value(), 128U * 1024U);
+    EXPECT_LE(reserved.value(), 128_KiB);
     auto encoded = model::encode_read_checkpoint(
                      built->value, work, memory().operation_remaining, charge)
                      .get();

@@ -1,5 +1,6 @@
 #pragma once
 
+#include "src/base/units.h"
 #include "src/storage/wal_format.h"
 #include "src/storage/workload_budget.h"
 
@@ -8,9 +9,9 @@
 namespace kwaque::storage {
 
 struct wal_child_limits final {
-    byte_count working_bytes{8U * 1024U * 1024U};
-    byte_count metadata_bytes{65536};
-    byte_count execution_bytes{65536};
+    byte_count working_bytes{8_MiB};
+    byte_count metadata_bytes{64_KiB};
+    byte_count execution_bytes{64_KiB};
     bytes::allocation_charge_fn charge{nullptr};
 
     [[nodiscard]] runtime::result<void> validate() const noexcept;

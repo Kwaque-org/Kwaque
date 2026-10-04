@@ -574,7 +574,7 @@ effect_position_is_valid(const trace_entry& entry) noexcept {
         if (entry.kind != trace_event_kind::filesystem || entry.stable_id == 0
             || entry.domain != runtime::descriptor_for(runtime::builtin_fault_point::filesystem_space)->id.value()
             || !effect_position_is_valid(entry)
-            || (failed ? (code == 0 || code > static_cast<std::uint32_t>(errc::unsupported_format)
+            || (failed ? (code == 0 || code > static_cast<std::uint32_t>(errc_last)
                           || entry.coordinate_a != 0 || entry.coordinate_b != 0 || entry.value != 0)
                        : (entry.result > 1 || entry.coordinate_a == maximum
                           || entry.coordinate_b > entry.coordinate_a || entry.value > entry.coordinate_b))) {
@@ -611,7 +611,7 @@ effect_position_is_valid(const trace_entry& entry) noexcept {
             const auto detail = (entry.result >> 8U) & 0xffU;
             const auto receipt = entry.result >> 16U;
             if (
-              code > static_cast<std::uint32_t>(errc::unsupported_format)
+              code > static_cast<std::uint32_t>(errc_last)
               || detail > static_cast<std::uint8_t>(
                    runtime::file_failure_detail::quota)
               || receipt == 0 || receipt > 3 || (code == 0 && detail != 0)

@@ -17,6 +17,7 @@ enum class extent_integrity {
 };
 
 class extent_verifier;
+struct resumed_extent;
 
 // The digest half of a deferred-digest walk. Callers supply the same stored
 // bytes, in file order, after the owning verifier accepted them. It also
@@ -67,6 +68,22 @@ public:
       extent_layout_kind kind = extent_layout_kind::initial_append,
       codec::field_context context = {},
       extent_integrity integrity = extent_integrity::crc32c);
+    // Initial-append walks only: continue after a footer whose exact bytes an
+    // independent record pinned. Those bytes must match the pinned identity
+    // before they are decoded at the pinned position, and the footer must
+    // name the complete prefix from the origins to itself. The walk then
+    // starts just after the footer from its boundary fields, so the history it
+    // covers is neither read nor hashed again; every later footer is checked
+    // against that seeded prefix. CRC evidence only: a prefix cannot seed an
+    // exact-byte extent digest. Source and memory are as for add_footer.
+    [[nodiscard]] static seastar::future<codec::result<resumed_extent>> resume(
+      footer_expectation pinned,
+      codec::immutable_object_digest digest,
+      storage::coverage expected,
+      bytes::fragmented_buffer&& source,
+      codec::decode_budget memory,
+      codec::cooperative_work& work,
+      codec::field_context context = {});
     extent_verifier(const extent_verifier&) = delete;
     extent_verifier& operator=(const extent_verifier&) = delete;
     extent_verifier(extent_verifier&&) noexcept;
@@ -149,6 +166,13 @@ public:
     // original logical span, but cannot manufacture an empty durable footer.
     [[nodiscard]] codec::result<verified_extent>
     finish(codec::cooperative_work& work, codec::field_context context = {});
+    // Initial-append walks only: finish exactly at the complete prefix
+    // accepted so far, as though it had been the supplied coverage. A walk
+    // that requested a digest has hashed exactly those bytes. This serves a
+    // walk that knows its end byte but not the logical and physical ends
+    // there. Success and failure both close the verifier.
+    [[nodiscard]] codec::result<verified_extent> finish_prefix(
+      codec::cooperative_work& work, codec::field_context context = {});
     // Deferred-digest walks only: once, before any bytes are supplied, start
     // the separate digest owner for this extent.
     [[nodiscard]] codec::result<extent_digest_walk>
@@ -199,5 +223,11 @@ private:
     std::uint32_t crc_{0};
     state state_{state::open};
     bool digest_started_{false};
+};
+
+// A walk resumed after its pinned footer, and that footer.
+struct resumed_extent final {
+    extent_verifier verifier;
+    durable_footer footer;
 };
 } // namespace kwaque::storage

@@ -1,5 +1,6 @@
 #include "src/storage/tests/storage_large_fixture.h"
 
+#include "src/base/units.h"
 #include "src/codec/tests/benchmark_buffer.h"
 #include "src/model/batch_builder.h"
 #include "src/model/record_codec.h"
@@ -56,7 +57,7 @@ seastar::future<codec::result<encoded_assigned_batch>> large_child(
     if (!finalized) co_return codec::failure(finalized.error());
     auto submitted = std::move(*finalized);
     codec::bench::require(
-      submitted.records().size() == byte_count{8U << 20U},
+      submitted.records().size() == byte_count{8_MiB},
       "maximum record fixture has wrong expanded size");
     auto assigned = model::assigned_batch::assign(
                       std::move(submitted),

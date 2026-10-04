@@ -1,5 +1,6 @@
 #pragma once
 
+#include "src/base/units.h"
 #include "src/storage/tests/wal_writer_contract.h"
 
 namespace kwaque::storage::testing::wal_append_contract {
@@ -204,6 +205,8 @@ seastar::future<> exercise(
           auto group = co_await offer(
             budget, spec.owner.cluster(), work, records);
           auto accepted = take(co_await writer.submit(std::move(group), work));
+          // An entered group is transferred to the writer.
+          // NOLINTNEXTLINE(bugprone-use-after-move)
           require(group.size() == 0, "entered group did not transfer");
           const auto cut = accepted.boundary;
           require(
@@ -215,7 +218,7 @@ seastar::future<> exercise(
           auto written = co_await drive.lifecycle(std::move(accepted.written));
           take(written.failure.outcome());
           require(
-            written.written == byte_count{16384},
+            written.written == byte_count{16_KiB},
             "group completion byte count changed");
           require(
             writer.progress()->write_complete == cut.cursor()
@@ -282,12 +285,12 @@ seastar::future<> zero_written(
   const local_device_spec& spec,
   workload_budget& budget,
   Driver drive) {
-    constexpr std::uint64_t window = 32768;
+    constexpr std::uint64_t window = 32_KiB;
     constexpr unsigned groups = 6;
     auto config = wal_writer_contract::configuration();
     config.preallocation_bytes = byte_count{window};
     config.preallocation_extension_bytes = byte_count{window};
-    config.synchronous_write_bytes = byte_count{16384};
+    config.synchronous_write_bytes = byte_count{16_KiB};
     std::optional<runtime::file_path> path;
     std::string expected;
     std::uint64_t start = 0;
@@ -362,7 +365,7 @@ seastar::future<> capacity(
   workload_budget& budget,
   Driver drive) {
     auto config = wal_writer_contract::configuration();
-    config.capacity_bytes = byte_count{24576};
+    config.capacity_bytes = byte_count{24_KiB};
     co_await with_writer(
       files,
       ownership,

@@ -7,9 +7,9 @@ the build and lock files are dependency pins.
 
 | Input | Selected version/revision | Status |
 |---|---|---|
-| Bazel | `9.1.0` | Pinned |
+| Bazel | `9.2.0` | Pinned |
 | C++ language mode | C++23 | Required |
-| LLVM/Clang | `23.1.0-rc2` | Hermetic toolchain |
+| LLVM/Clang | `23.1.2` | Hermetic toolchain |
 | Linux x86_64 sysroot | Ubuntu 22.04, `2026-05-05` snapshot | Hermetic headers and libraries |
 | Linux aarch64 sysroot | Ubuntu 22.04, `2026-05-05` snapshot | Hermetic headers and libraries |
 | Protobuf | `33.5` | Pinned |
@@ -20,6 +20,18 @@ The Abseil pin carries a Clang 23 compatibility patch that replaces deprecated
 `lifetime_capture_by(this)` annotations with `lifetime_capture_by_this` when
 available, retaining the existing fallback for older compilers. This preserves
 lifetime diagnostics without suppressing warnings or changing runtime behavior.
+
+The Protobuf module carries two exception-safety patches. One changes the
+runtime parser, unknown-field set and `RepeatedPtrField` growth so an allocation
+failure while parsing leaves the message consistent. The other changes the C++
+code generator so generated string and message setters update presence only
+after the field allocation succeeds. Because the second patch changes `protoc`,
+the build sets `--@protobuf//bazel/toolchains:prefer_prebuilt_protoc=false`:
+newer Protobuf releases default to a prebuilt, unpatched compiler. The patches
+cover the generators used by proto3 and edition 2023 schemas;
+`//tools:check_dependency_inventory` rejects other schema declarations, such as
+edition 2024 `VIEW` strings, whose generator paths are not patched. A Protobuf
+update must rebase both patches and keep their parser and accessor tests.
 
 The xxHash module carries two build patches. The first caps its x86-64
 run-time kernel selection at AVX2: 512-bit kernels can lower the clock of the
@@ -53,11 +65,22 @@ Bounded snapshot accounting includes deque/map capacity and cached function stor
 dirty bounded refreshes release old cache capacity before replacement. Its trusted
 callback-copy and temporary-allocation requirements are part of the native API
 contract. Filtered and empty output paths retain preemption checks.
+Snapshot bounds count only enabled series, which are the only ones a snapshot
+copies, so the disabled per-peer queue metrics do not grow with the shard count.
+Each source shard admits one bounded snapshot at a time. A scrape queues for each
+source shard in shard order, up to its configured wait, so concurrent scrapes
+serialize and each returns complete output instead of a truncated body. The server
+counts connections refused at the connection limit and connections closed by a
+header or exchange deadline.
 The Seastar patches use Bazel's native patch application so changes to patch
 contents invalidate the materialized repository.
 
 A header compatibility patch includes `<new>` at global scope in the native
 spinlock header, preserving its alignment and locking implementation with libc++.
+
+A task-queue patch makes debug-build task shuffling replayable. Each shard seeds
+its shuffle generator from a process-wide base seed and logs it; setting
+`SEASTAR_SHUFFLE_TASK_QUEUE_SEED` to a logged value reuses that seed.
 
 A scheduling-group patch rolls back local task queues and scheduling-specific
 state when construction fails, and cleans initialized shards when a remote
@@ -90,7 +113,14 @@ patch.
 The sysroot archives are published under an `llvmorg-22.1.0` release path, but
 that path identifies the sysroot artifact release rather than the selected
 compiler version. Kwaque intentionally pairs those Ubuntu 22.04 snapshots with
-the LLVM/Clang 23.1.0-rc2 toolchain pinned above.
+the LLVM/Clang 23.1.2 toolchain pinned above.
+
+OpenSSL is built as static libraries only (`no-shared`) and linked into the
+binaries, so the package carries no shared libraries and no run path. It is
+configured with `no-autoload-config` and `no-module`: the broker never reads a
+host `openssl.cnf` or loads provider modules, and its cryptography does not
+depend on the host's OpenSSL installation. `OPENSSLDIR` stays `/etc/ssl` so TLS
+finds the system certificate store.
 
 Foreign C/C++ dependency builds that contribute code to the distribution map
 both their transient execroot and Bazel's canonical external-repository root.
@@ -163,13 +193,12 @@ prefix from that constant and carries the archive checksum separately;
 ### Updating Protobuf
 
 Protobuf is a registry module. Its pin lives in `MODULE.bazel` as
-`bazel_dep(name = "protobuf", version = ...)`, and `PROTOBUF_VERSION` in
-`bazel/versions.bzl` is the same version reported in the broker's build
-metadata. **Both must move together**, or the binary will report a version it was
-not built against.
+`bazel_dep(name = "protobuf", version = ...)`. The broker's build metadata reads
+the version from the resolved module's `protobuf_version.bzl`, so it always
+reports the version it was built against.
 
-1. **Move the pin** in `MODULE.bazel` and update `PROTOBUF_VERSION` in
-   `bazel/versions.bzl` to match.
+1. **Move the pin** in `MODULE.bazel` and rebase the two Protobuf patches in
+   `bazel/thirdparty`.
 2. **Refresh the lockfile** with two `bazel mod tidy` runs, as above. A registry
    bump can raise shared transitive modules; if module resolution selects new
    versions of other direct dependencies, update their `MODULE.bazel` entries in
@@ -178,18 +207,38 @@ not built against.
    most plausibly breaks:
 
    ```bash
-   bazel test --config=dev //proto/...
-   bazel test --config=fuzz //proto/kwaque/common/v1:build_info_fuzz
+   bazel test --config=dev //proto/... //src/protocol/tests:control_fuzz_replay
+   bazel test --config=fuzz //src/protocol/tests:control_fuzz
    ```
 
    This covers generated-code round-tripping, the committed golden byte fixture,
-   malformed and oversized input handling, and linking generated code into a
-   Seastar-based library.
+   malformed and oversized input handling, linking generated code into a
+   Seastar-based library, and the Buf lint and wire-compatibility tests.
 4. **Rebuild and test** the whole project and the package, as in the Seastar
    procedure.
 5. **Update the records** in this file and `THIRD_PARTY.md`, then run
    `bazel run //tools:check_dependency_inventory`.
 6. **Decide and record** adoption or retention, and why.
+
+### Schema compatibility baseline
+
+`//proto:schema_breaking_test` compares the control schemas with
+`proto/schema_baseline.binpb` under Buf's `WIRE` rules, and
+`//proto:schema_lint_test` applies `proto/buf.yaml`. A change that deliberately
+accepts a new wire baseline regenerates the image from the repository root with
+the Buf CLI version pinned in `MODULE.bazel`, and states why in its description:
+
+```bash
+buf build --config proto/buf.yaml --path proto --exclude-source-info \
+  -o proto/schema_baseline.binpb .
+```
+
+### Automated update proposals
+
+Dependabot proposes updates for registry modules in `MODULE.bazel` and for the
+pinned GitHub Actions. It does not track the archives in
+`bazel/repositories.bzl`, the LLVM toolchain, the sysroots, or `.bazelversion`;
+check those by hand before each release.
 
 ### Rolling back
 

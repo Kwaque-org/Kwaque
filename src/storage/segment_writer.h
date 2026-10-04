@@ -1,5 +1,6 @@
 #pragma once
 
+#include "src/base/units.h"
 #include "src/bytes/fragmented_buffer_builder.h"
 #include "src/codec/format_registry.h"
 #include "src/storage/completion_resources.h"
@@ -9,11 +10,13 @@
 #include "src/storage/segment_seal.h"
 #include "src/storage/zero_fill.h"
 
+#include <seastar/core/shared_future.hh>
 #include <seastar/core/with_scheduling_group.hh>
 #include <seastar/util/defer.hh>
 
 #include <algorithm>
 #include <array>
+#include <exception>
 #include <memory>
 #include <optional>
 #include <span>
@@ -45,7 +48,7 @@ struct segment_writer_config final {
     // range, uses a second handle opened for synchronized writes: its
     // completion is durable, so a barrier covering only such writes needs no
     // flush. Larger writes use the ordinary handle and the barrier's flush.
-    byte_count synchronous_write_bytes{byte_count{1U << 20U}};
+    byte_count synchronous_write_bytes{byte_count{1_MiB}};
     // Synchronized writes in flight at once. Each group is written as soon
     // as it is assembled instead of waiting for the previous write; results
     // still apply in file order. Ordinary writes keep one in flight.
@@ -60,9 +63,10 @@ struct segment_creation_progress final {
 
 // Owns one supplied SC/descriptor and its handles. Directory ownership,
 // backend and budget outlive joined close. Creation never resumes an existing
-// name. Recovered active opens verify metadata; sealed opens also require the
-// independently pinned complete extent. Neither entrance grants append
-// authority.
+// name. Recovered active and recovering opens verify metadata; sealed opens
+// also require the independently pinned complete extent. Neither entrance
+// grants append authority. A recovered segment is never appended again: only
+// a durable decision's recovered seal changes it.
 template<
   runtime::file_system_backend Backend,
   typename Owner,
@@ -176,6 +180,8 @@ public:
                 output->generation_ = std::move(*generation);
                 if (
                   expected.publication.state != local_object_state::active
+                  && expected.publication.state
+                       != local_object_state::recovering
                   && expected.publication.state != local_object_state::sealed)
                     output->lifetime_->failure.observe(
                       detail::path_error(errc::wrong_context));
@@ -197,6 +203,65 @@ public:
         }
         if (output->lifetime_->failure.failed()) {
             // Cleanup all owned handles before returning either error channel.
+            const auto failed = output->lifetime_->failure;
+            try {
+                static_cast<void>(co_await output->close());
+            } catch (...) {
+            }
+            output.reset();
+            auto result = failed.outcome();
+            co_return runtime::failure(result.error());
+        }
+        co_return std::move(output);
+    }
+
+    // Opens a recovered segment only to execute a durable recovered-seal
+    // decision. The current publication is selected by its fixed path and must
+    // be active or recovering. Its pinned boundary and roots are not opened:
+    // the decision supersedes them, and the seal verifies the whole extent
+    // below its end. A seal interrupted after its root replaced a pinned
+    // footer therefore still resumes. config.retry_object is reserved afresh
+    // for every attempt.
+    [[nodiscard]] static seastar::future<
+      runtime::result<std::unique_ptr<segment_writer>>>
+    open_recovered_seal(
+      Backend& files,
+      Owner& owner,
+      const local_device_spec& spec,
+      std::uint32_t shard,
+      local_segment_descriptor descriptor,
+      workload_budget& budget,
+      segment_writer_config config,
+      codec::cooperative_work& work) {
+        if (
+          !config.retry_object || !config.retry_object->is_valid()
+          || config.metadata.operation_bytes < byte_count{64_KiB})
+            co_return runtime::failure(
+              detail::path_error(errc::invalid_argument));
+        auto made = make(
+          files,
+          owner,
+          spec,
+          shard,
+          std::move(descriptor),
+          budget,
+          config,
+          false);
+        if (!made) co_return runtime::failure(made.error());
+        auto output = std::move(*made);
+        output->entered_ = true;
+        output->recovered_ = true;
+        output->recovered_seal_ = true;
+        try {
+            output->lifetime_->failure.observe(
+              co_await output->select_recovered(work));
+            if (!output->lifetime_->failure.failed())
+                output->lifetime_->failure.observe(
+                  co_await output->open_data(false, work));
+        } catch (...) {
+            output->lifetime_->failure.observe(std::current_exception());
+        }
+        if (output->lifetime_->failure.failed()) {
             const auto failed = output->lifetime_->failure;
             try {
                 static_cast<void>(co_await output->close());
@@ -311,6 +376,20 @@ public:
       std::span<const encoded_assigned_batch> batches,
       codec::cooperative_work& work) {
         assert_current();
+        if (batches.size() > maximum_segment_group_blocks)
+            return runtime::failure(detail::path_error(errc::invalid_argument));
+        std::array<const encoded_assigned_batch*, maximum_segment_group_blocks>
+          input{};
+        for (std::size_t i = 0; i < batches.size(); ++i)
+            input[i] = &batches[i];
+        return prepare_group(std::span{input}.first(batches.size()), work);
+    }
+    // The same preparation for children owned elsewhere, e.g. by separate
+    // requests. Each pointer is borrowed for this call only.
+    [[nodiscard]] runtime::result<segment_group_preparation> prepare_group(
+      std::span<const encoded_assigned_batch* const> batches,
+      codec::cooperative_work& work) {
+        assert_current();
         if (
           lifetime_->failure.failed() || closing_ || closed_
           || append_ != model::append_state::active)
@@ -324,16 +403,14 @@ public:
             return runtime::failure(detail::path_error(errc::invalid_argument));
         if (auto ready = work.poll(); !ready)
             return runtime::failure(detail::path_error(ready.error().code()));
+        for (const auto* batch : batches)
+            if (!batch)
+                return runtime::failure(
+                  detail::path_error(errc::invalid_argument));
         auto fixed = capacity();
         if (!fixed) return runtime::failure(fixed.error());
-        std::array<const encoded_assigned_batch*, maximum_segment_group_blocks>
-          input{};
-        for (std::size_t i = 0; i < batches.size(); ++i)
-            input[i] = &batches[i];
         auto plan = detail::plan_segment_capacity(
-          **fixed,
-          positions_->reserved,
-          std::span{input}.first(batches.size()));
+          **fixed, positions_->reserved, batches);
         if (!plan) return runtime::failure(plan.error());
         if (plan->decision != segment_capacity_decision::fits)
             return segment_group_preparation{plan->decision, {}};
@@ -364,8 +441,15 @@ public:
         if (!required)
             return runtime::failure(detail::path_error(errc::out_of_range));
         std::size_t fragments = 3;
-        for (const auto& batch : batches)
-            fragments += batch.bytes().fragment_count() + 3;
+        byte_count retained = plan->staging_bytes;
+        for (const auto* batch : batches) {
+            fragments += batch->bytes().fragment_count() + 3;
+            const auto next = retained.checked_add(
+              batch->bytes().retained_bytes());
+            if (!next)
+                return runtime::failure(detail::path_error(errc::out_of_range));
+            retained = *next;
+        }
         const auto control = node_charge(fragments);
         if (!control)
             return segment_group_preparation{
@@ -390,12 +474,14 @@ public:
         }
         auto retries = budget_.try_reserve(plan->retry_metadata);
         if (!retries) return runtime::failure(retries.error());
+        auto node = budget_.try_reserve(*control);
+        if (!node) return runtime::failure(node.error());
         if (auto ready = work.poll(); !ready)
             return runtime::failure(detail::path_error(ready.error().code()));
         std::vector<detail::segment_plan_input> inputs;
         inputs.reserve(batches.size());
-        for (const auto& batch : batches)
-            inputs.push_back(detail::plan_input(batch));
+        for (const auto* batch : batches)
+            inputs.push_back(detail::plan_input(*batch));
         return segment_group_preparation{
           segment_capacity_decision::fits,
           segment_prepared_group{
@@ -404,7 +490,42 @@ public:
             std::move(inputs),
             std::move(*held),
             std::move(*retries),
+            std::move(*node),
+            retained,
             work.policy()}};
+    }
+
+    // Whether freeze_group of this current preparation would now pass its
+    // queue, pending-byte and age admission, without effect. Pressure is
+    // queue_full and a crossed age limit timed_out. Child validation, native
+    // allocation and a later state change can still reject the freeze.
+    [[nodiscard]] runtime::result<void>
+    freeze_admission(const segment_prepared_group& prepared) const {
+        assert_current();
+        auto before = capture();
+        if (!before) return runtime::failure(before.error());
+        if (
+          prepared.base_ != *before || prepared.policy_ != config_.policy
+          || !prepared.plan_.end)
+            return runtime::failure(detail::path_error(errc::wrong_context));
+        if (
+          freezing_ || inflight_.size() >= config_.maximum_groups
+          || digesting_.size() >= runtime::maximum_queued_file_writes)
+            return runtime::failure(detail::path_error(errc::queue_full));
+        const auto extent = model::file_byte_span::make(
+          before->end().bytes, prepared.plan_.end->bytes);
+        if (!extent)
+            return runtime::failure(detail::path_error(errc::wrong_context));
+        const auto pending = pending_bytes_.checked_add(extent->size());
+        const auto retained = pending_retained_.checked_add(prepared.retained_);
+        if (
+          !pending || *pending > config_.maximum_pending_bytes || !retained
+          || *retained > config_.maximum_pending_bytes)
+            return runtime::failure(detail::path_error(errc::queue_full));
+        auto aged = age_expired(Clock::now());
+        if (!aged) return runtime::failure(aged.error());
+        if (*aged) return runtime::failure(detail::path_error(errc::timed_out));
+        return {};
     }
 
     // Consumes admitted exact children. All validation and fallible allocation
@@ -466,7 +587,8 @@ private:
           || children.capacity() > 2 * children.size()
           || prepared.base_ != *before || prepared.policy_ != work.policy()
           || !budget_.owns(prepared.held_) || !prepared.held_.exclusive()
-          || !budget_.owns(prepared.retries_) || !prepared.retries_.exclusive())
+          || !budget_.owns(prepared.retries_) || !prepared.retries_.exclusive()
+          || !budget_.owns(prepared.control_) || !prepared.control_.exclusive())
             co_return runtime::failure(detail::path_error(errc::wrong_context));
         freezing_ = true;
         auto idle = seastar::defer([this] noexcept { freezing_ = false; });
@@ -579,8 +701,16 @@ private:
             co_return runtime::failure(detail::path_error(errc::queue_full));
         auto control = node_charge(fragments);
         if (!control) co_return runtime::failure(control.error());
-        auto held = budget_.try_reserve(*control);
-        if (!held) co_return runtime::failure(held.error());
+        // The preparation holds this node's allowance; only children other
+        // than the prepared ones can need a fresh one.
+        std::optional<workload_reservation> held;
+        if (*control <= prepared.control_.retained_bytes())
+            held.emplace(std::move(prepared.control_));
+        else {
+            auto fresh = budget_.try_reserve(*control);
+            if (!fresh) co_return runtime::failure(fresh.error());
+            held.emplace(std::move(*fresh));
+        }
         const auto footer
           = model::file_byte_span::make(position, plan->end->bytes).value();
         const segment_captured_boundary cut{
@@ -828,7 +958,7 @@ public:
       std::uint32_t completed,
       std::uint32_t unresolved,
       codec::cooperative_work& admission) {
-        static_assert(sizeof(Source) <= 8192);
+        static_assert(sizeof(Source) <= 8_KiB);
         assert_current();
         if (seal_done_) co_return seal_result_;
         if (seal_waiters_ == maximum_control_waiters) {
@@ -889,6 +1019,194 @@ public:
         seal_done_ = true;
         lifetime_->changed.broadcast();
         co_return seal_result_;
+    }
+
+    // Writes one object a recovered seal reconstructed below its decided end,
+    // before seal_recovered(): only on an owner opened by
+    // open_recovered_seal, once its decision is durable and the caller's walk
+    // verified the object in place. The writable handle replaces every read
+    // handle; the bytes stay unflushed until the seal's one flush.
+    [[nodiscard]] seastar::future<runtime::result<void>> write_recovered(
+      runtime::file_position at,
+      bytes::fragmented_buffer object,
+      codec::cooperative_work& work) {
+        assert_current();
+        if (
+          closing_ || closed_ || !recovered_seal_ || seal_started_ || positions_
+          || append_ != model::append_state::active
+          || lifetime_->failure.failed())
+            co_return runtime::failure(detail::path_error(errc::closed));
+        if (read_busy_ || read_operations_.get_count() != 0)
+            co_return runtime::failure(detail::path_error(errc::queue_full));
+        const auto length = object.size();
+        const auto end = at.checked_add(length);
+        if (
+          object.empty() || at < data_start_
+          || !descriptor_.alignment.aligned(at) || !end
+          || !descriptor_.alignment.aligned(*end)
+          || end->value() > descriptor_.maximum_data_bytes.value())
+            co_return runtime::failure(
+              detail::path_error(errc::invalid_argument));
+        if (auto ready = work.poll(); !ready)
+            co_return runtime::failure(
+              detail::path_error(ready.error().code()));
+        auto holder = read_operations_.hold();
+        read_busy_ = true;
+        auto idle = seastar::defer([this] noexcept { read_busy_ = false; });
+        try {
+            if (!writable_) {
+                co_await close_handles();
+                if (!lifetime_->failure.failed())
+                    lifetime_->failure.observe(
+                      co_await open_data(true, work, true));
+            }
+            if (!lifetime_->failure.failed()) {
+                auto written = co_await data_->write(at, std::move(object));
+                lifetime_->failure.observe(written);
+                if (written && *written != length)
+                    lifetime_->failure.observe(
+                      detail::path_error(errc::io_failure));
+            }
+        } catch (...) {
+            lifetime_->failure.observe(std::current_exception());
+        }
+        co_return lifetime_->failure.outcome();
+    }
+
+    // Seals a recovered segment at the end of `extent`, the complete surviving
+    // prefix a durable recovered-seal decision fixed. The caller made that
+    // decision durable and walked the extent from its data start with a
+    // digest; this owner never appends to it. In order: the retry bundle, the
+    // sealed root at the end, removal of every byte after the root, one flush
+    // covering the surviving extent and the root, then the sealed
+    // publication. Nothing else is published until that last step, so a
+    // failure or crash anywhere leaves the earlier publication and every byte
+    // below the end, and the same decision resumes the seal. No reader may
+    // overlap it. Source and the counts are as for seal().
+    template<typename Source>
+    [[nodiscard]] seastar::future<segment_seal_outcome> seal_recovered(
+      verified_extent extent,
+      Source source,
+      std::uint32_t completed,
+      std::uint32_t unresolved,
+      codec::cooperative_work& admission) {
+        static_assert(sizeof(Source) <= 8_KiB);
+        assert_current();
+        if (seal_done_) co_return seal_result_;
+        if (seal_waiters_ == maximum_control_waiters) {
+            segment_seal_outcome rejected;
+            rejected.failure.observe(detail::path_error(errc::queue_full));
+            co_return rejected;
+        }
+        ++seal_waiters_;
+        auto waiter = seastar::defer([this] noexcept { --seal_waiters_; });
+        if (seal_started_) {
+            while (!seal_done_)
+                co_await lifetime_->changed.when();
+            co_return seal_result_;
+        }
+        segment_seal_outcome rejected;
+        // Only an owner opened to execute a durable decision seals: any other
+        // recovered owner holds no decision that authorizes the truncation.
+        if (
+          closing_ || closed_ || !recovered_ || !recovered_seal_ || positions_
+          || append_ != model::append_state::active
+          || lifetime_->failure.failed()) {
+            rejected.failure = lifetime_->failure;
+            rejected.failure.observe(detail::path_error(errc::closed));
+            co_return rejected;
+        }
+        if (read_busy_ || read_operations_.get_count() != 0) {
+            rejected.failure.observe(detail::path_error(errc::queue_full));
+            co_return rejected;
+        }
+        if (admission.policy() != config_.policy || !config_.retry_object) {
+            rejected.failure.observe(
+              detail::path_error(errc::invalid_argument));
+            co_return rejected;
+        }
+        if (auto ready = admission.poll(); !ready) {
+            rejected.failure.observe(detail::path_error(ready.error().code()));
+            co_return rejected;
+        }
+        // From here no read entrance admits work.
+        seal_started_ = true;
+        append_ = model::append_state::sealing;
+        seal_result_.unresolved = unresolved;
+        try {
+            seastar::abort_source abort;
+            codec::cooperative_work work{config_.policy, abort};
+            lifetime_->failure.observe(
+              co_await seastar::with_scheduling_group(
+                budget_.scheduling_group(),
+                [this, &source, &extent, completed, &work] {
+                    return seal_recovered_owned(
+                      source, extent, completed, work);
+                }));
+        } catch (...) {
+            lifetime_->failure.observe(std::current_exception());
+        }
+        seal_result_.failure = lifetime_->failure;
+        seal_done_ = true;
+        lifetime_->changed.broadcast();
+        co_return seal_result_;
+    }
+
+    // After a restart classified this recovered segment: one new flush of its
+    // data file, then a recovering publication pinning `boundary`, the last
+    // footer the restart verified, or nothing for a segment without one.
+    // Surviving bytes prove no earlier flush, so the flush comes first and the
+    // publication only after it succeeded. The boundary never lowers the
+    // current pin, and an unchanged recovering publication is not published
+    // again. Any failure fails this owner, which no later flush makes healthy;
+    // the segment then stays as published before. It stays roll-required
+    // either way and nothing is appended. No reader may overlap it.
+    [[nodiscard]] seastar::future<runtime::result<void>> publish_recovering(
+      std::optional<local_footer_reference> boundary,
+      codec::cooperative_work& work) {
+        assert_current();
+        if (
+          closing_ || closed_ || !recovered_ || recovered_seal_ || immutable_
+          || seal_started_ || positions_ || !publication_ || !read_publication_
+          || append_ != model::append_state::active
+          || lifetime_->failure.failed())
+            co_return runtime::failure(detail::path_error(errc::closed));
+        if (read_busy_ || read_operations_.get_count() != 0)
+            co_return runtime::failure(detail::path_error(errc::queue_full));
+        const auto& current = *read_publication_;
+        if (
+          current.boundary
+          && (!boundary || boundary->position() < current.boundary->position()
+              || (boundary->position() == current.boundary->position() && *boundary != *current.boundary)))
+            co_return runtime::failure(detail::path_error(errc::wrong_context));
+        if (
+          (current.state == local_object_state::recovering
+           && current.boundary == boundary)
+          || (boundary
+              && (boundary->family() != static_cast<std::uint16_t>(codec::format_family::durable_boundary_footer)
+                  || boundary->position() < data_start_
+                  || !boundary->validate_alignment(descriptor_.alignment))))
+            co_return runtime::failure(
+              detail::path_error(errc::invalid_argument));
+        if (auto ready = work.poll(); !ready)
+            co_return runtime::failure(
+              detail::path_error(ready.error().code()));
+        auto held = budget_.try_reserve(
+          byte_count{
+            config_.metadata.operation_bytes.value()
+            + config_.metadata.execution_bytes.value()});
+        if (!held) co_return runtime::failure(held.error());
+        auto holder = read_operations_.hold();
+        read_busy_ = true;
+        auto idle = seastar::defer([this] noexcept { read_busy_ = false; });
+        try {
+            lifetime_->failure.observe(
+              co_await publish_recovering_owned(boundary, work));
+        } catch (...) {
+            lifetime_->failure.observe(std::current_exception());
+        }
+        co_await close_publishers();
+        co_return lifetime_->failure.outcome();
     }
 
     // Only fully verified immutable owners expose data reads. Returned bytes
@@ -1284,6 +1602,285 @@ private:
               detail::path_error(finished.error().code()));
         sealing_.extent = *finished;
         extent_.reset();
+        auto dependencies = [this, end](this auto, codec::cooperative_work&)
+          -> seastar::future<runtime::result<void>> {
+            if (lifetime_->failure.failed())
+                co_return lifetime_->failure.outcome();
+            if (!sealing_.data_synced || positions_->durable != end)
+                co_return runtime::failure(
+                  detail::path_error(errc::wrong_context));
+            co_return runtime::result<void>{};
+        };
+        co_return co_await seal_root(
+          source,
+          *finished,
+          end.bytes,
+          completed,
+          prezeroed_end_,
+          std::move(dependencies),
+          work);
+    }
+
+    // Selects the recovered segment's current publication by its fixed path:
+    // it must name this segment and be active or recovering.
+    seastar::future<runtime::result<void>>
+    select_recovered(codec::cooperative_work& work) {
+        auto selected = co_await load_local_metadata_file(
+          files_,
+          spec_,
+          path(local_segment_file::published),
+          budget_,
+          config_.metadata,
+          work,
+          local_metadata_extent::exact_file,
+          [owner = spec_.shard_owner(shard_).value(),
+           segment = descriptor_.segment,
+           metadata = spec_.identity.metadata_alignment,
+           data = descriptor_.alignment](
+            auto& input, byte_count, codec::decode_budget memory, auto& work) {
+              return decode_selected_object_publication(
+                input,
+                owner,
+                segment,
+                metadata,
+                data,
+                memory,
+                work,
+                {},
+                codec::input_boundary::complete);
+          });
+        if (!selected) co_return runtime::failure(selected.error());
+        const auto& publication = std::get<local_object_publication>(
+          selected->value.payload());
+        if (
+          publication.segment != descriptor_.segment
+          || (publication.state != local_object_state::active && publication.state != local_object_state::recovering))
+            co_return runtime::failure(detail::path_error(errc::wrong_context));
+        publication_ = selected->value.header().generation();
+        read_publication_ = publication;
+        append_ = model::append_state::active;
+        co_return runtime::result<void>{};
+    }
+
+    seastar::future<runtime::result<void>> publish_recovering_owned(
+      std::optional<local_footer_reference> boundary,
+      codec::cooperative_work& work) {
+        if (!data_) {
+            if (auto reopened = co_await reopen_read(work); !reopened)
+                co_return reopened;
+        }
+        auto size = co_await data_->size();
+        if (!size) co_return runtime::failure(size.error());
+        // The bytes the restart classified must still be there.
+        const auto certified = boundary ? boundary->position().checked_add(
+                                            boundary->bytes())
+                                        : std::optional{data_start_};
+        if (!certified)
+            co_return runtime::failure(detail::path_error(errc::out_of_range));
+        if (*size < certified->value())
+            co_return runtime::failure(
+              detail::path_error(errc::truncated_data));
+        if (publication_->value() == UINT64_MAX)
+            co_return runtime::failure(detail::path_error(errc::out_of_range));
+        auto next = local_publication_generation::make(
+          publication_->value() + 1);
+        if (!next)
+            co_return runtime::failure(detail::path_error(errc::out_of_range));
+        const auto metadata_header = local_metadata_header::make(
+                                       local_metadata_kind::object_publication,
+                                       spec_.shard_owner(shard_).value(),
+                                       *next)
+                                       .value();
+        const local_object_publication publication{
+          descriptor_.segment,
+          local_object_state::recovering,
+          boundary,
+          read_publication_->roots};
+        // The fresh flush runs while the publication's temporary is written
+        // and flushed; only the rename that makes it current waits for the
+        // flush, so a failed flush still publishes nothing. The flush is
+        // joined, and its reservation returned, before any handle closes.
+        runtime::result<void> published{};
+        {
+            auto unit = data_->try_reserve_metadata();
+            if (!unit) co_return runtime::failure(unit.error());
+            // Allocated before the flush starts, and the flush is always
+            // joined below: nothing it borrows can go before it ends.
+            seastar::shared_promise<runtime::result<void>> flushed;
+            auto flushing =
+              [](
+                runtime::file& data,
+                runtime::file::metadata_reservation& unit,
+                seastar::shared_promise<runtime::result<void>>& flushed)
+              -> seastar::future<> {
+                try {
+                    flushed.set_value(co_await data.flush(unit));
+                } catch (...) {
+                    flushed.set_exception(std::current_exception());
+                }
+            }(*data_, *unit, flushed);
+            std::exception_ptr thrown;
+            try {
+                do {
+                    auto pointer = co_await encode_local_metadata(
+                      {metadata_header,
+                       spec_.identity.metadata_alignment,
+                       descriptor_.alignment},
+                      local_metadata_payload{publication},
+                      work,
+                      config_.metadata.operation_bytes,
+                      config_.metadata.charge);
+                    if (!pointer) {
+                        published = runtime::failure(
+                          detail::path_error(pointer.error().code()));
+                        break;
+                    }
+                    pointer_publisher_.emplace(
+                      files_,
+                      budget_,
+                      target(
+                        path(local_segment_file::published),
+                        runtime::file_rename_policy::replace,
+                        publication_));
+                    published = co_await pointer_publisher_->prepare(
+                      config_.metadata.operation_bytes, work);
+                    if (!published) break;
+                    published = co_await owner_.validate(spec_);
+                    if (!published) break;
+                    auto outcome = co_await pointer_publisher_->publish(
+                      {spec_.shard_owner(shard_).value(), *next, publication_},
+                      std::move(pointer->bytes),
+                      work,
+                      [&flushed] { return flushed.get_shared_future(); });
+                    if (outcome.failure.failed())
+                        published = outcome.failure.outcome();
+                    else if (
+                      outcome.disposition
+                      != local_publication_disposition::durable)
+                        published = runtime::failure(
+                          detail::path_error(errc::io_failure));
+                } while (false);
+            } catch (...) {
+                thrown = std::current_exception();
+            }
+            co_await std::move(flushing);
+            runtime::result<void> synced{};
+            try {
+                synced = co_await flushed.get_shared_future();
+            } catch (...) {
+                if (!thrown) thrown = std::current_exception();
+            }
+            if (thrown) std::rethrow_exception(thrown);
+            if (!synced) co_return runtime::failure(synced.error());
+        }
+        if (!published) co_return published;
+        publication_ = *next;
+        read_publication_ = publication;
+        // Later readers reopen under the new publication.
+        co_await close_handles();
+        handle_ = lifetime_->failure.failed() ? segment_handle_state::closed
+                                              : segment_handle_state::evicted;
+        co_return runtime::result<void>{};
+    }
+
+    template<typename Source>
+    seastar::future<runtime::result<void>> seal_recovered_owned(
+      Source& source,
+      const verified_extent& extent,
+      std::uint32_t completed,
+      codec::cooperative_work& work) {
+        // The seal's writable handle replaces every read handle.
+        co_await close_handles();
+        if (lifetime_->failure.failed()) co_return lifetime_->failure.outcome();
+        const segment_history_context history{
+          descriptor_.segment,
+          descriptor_.alignment,
+          data_start_,
+          descriptor_.logical_origin,
+          descriptor_.physical_origin,
+          descriptor_.profile};
+        const auto covered = extent.boundary().coverage;
+        if (
+          extent.context() != history || !extent.digest()
+          || covered.bytes().begin() != data_start_)
+            co_return runtime::failure(detail::path_error(errc::wrong_context));
+        const auto end = covered.bytes().end();
+        auto fixed = capacity();
+        if (!fixed) co_return runtime::failure(fixed.error());
+        const auto entries = (*fixed)->seal_page_entries(completed);
+        if (!entries)
+            co_return runtime::failure(
+              detail::path_error(errc::resource_exhausted));
+        retry_page_entries_ = *entries;
+        // The grants and publishers creation would have prepared.
+        auto bundle = budget_.try_reserve(
+          byte_count{
+            2 * config_.metadata.operation_bytes.value()
+            + config_.metadata.execution_bytes.value() + 32_KiB});
+        if (!bundle) co_return runtime::failure(bundle.error());
+        bundle_memory_.emplace(std::move(*bundle));
+        const auto object = local_paths::make(spec_.root)
+                              ->object(
+                                shard_,
+                                {descriptor_.segment.segment(),
+                                 descriptor_.segment.generation()},
+                                *config_.retry_object);
+        if (!object) co_return runtime::failure(object.error());
+        bundle_publisher_.emplace(
+          files_,
+          budget_,
+          target(*object, runtime::file_rename_policy::no_replace));
+        if (
+          auto prepared = co_await bundle_publisher_->prepare(
+            config_.metadata.operation_bytes, work);
+          !prepared)
+            co_return prepared;
+        pointer_publisher_.emplace(
+          files_,
+          budget_,
+          target(
+            path(local_segment_file::published),
+            runtime::file_rename_policy::replace,
+            publication_));
+        if (
+          auto prepared = co_await pointer_publisher_->prepare(
+            config_.metadata.operation_bytes, work);
+          !prepared)
+            co_return prepared;
+        if (auto opened = co_await open_data(true, work, true); !opened)
+            co_return opened;
+        auto size = co_await data_->size();
+        if (!size) co_return runtime::failure(size.error());
+        // Every byte the walk verified must still be there.
+        if (*size < end.value())
+            co_return runtime::failure(
+              detail::path_error(errc::truncated_data));
+        sealing_.extent = extent;
+        // The one flush after the root covers the surviving extent as well.
+        auto dependencies = [this](this auto, codec::cooperative_work&)
+          -> seastar::future<runtime::result<void>> {
+            if (lifetime_->failure.failed())
+                co_return lifetime_->failure.outcome();
+            co_return runtime::result<void>{};
+        };
+        co_return co_await seal_root(
+          source, extent, end, completed, *size, std::move(dependencies), work);
+    }
+
+    // The retry bundle, then the sealed root at `end`; every byte past the
+    // root is removed in the same durable step, one flush covers the extent
+    // and the root, and only then is the sealed publication the first
+    // published change. `file_bytes` is the file's size before the root,
+    // through any zero-written or recovered tail.
+    template<typename Source, typename Dependencies>
+    seastar::future<runtime::result<void>> seal_root(
+      Source& source,
+      const verified_extent& finished,
+      runtime::file_position end,
+      std::uint32_t completed,
+      std::uint64_t file_bytes,
+      Dependencies dependencies,
+      codec::cooperative_work& work) {
         const footer_expectation location{
           {descriptor_.segment,
            descriptor_.alignment,
@@ -1291,7 +1888,7 @@ private:
            descriptor_.logical_origin,
            descriptor_.physical_origin,
            descriptor_.profile},
-          end.bytes};
+          end};
         const auto pages = (std::uint64_t{completed} + retry_page_entries_ - 1)
                            / retry_page_entries_;
         if (
@@ -1329,7 +1926,7 @@ private:
               work.byte_quantum(), work.item_quantum());
         }
         auto encoded = co_await encode_sealed_footer(
-          *finished,
+          finished,
           location,
           completed,
           refs,
@@ -1339,7 +1936,7 @@ private:
         if (!encoded)
             co_return runtime::failure(
               detail::path_error(encoded.error().code()));
-        const auto file_end = end.bytes.checked_add(encoded->bytes.size());
+        const auto file_end = end.checked_add(encoded->bytes.size());
         if (
           !file_end
           || file_end->value() > descriptor_.maximum_data_bytes.value())
@@ -1348,7 +1945,7 @@ private:
         const auto reference = local_root_reference::make(
           local_root_kind::sealed_retry,
           *config_.retry_object,
-          end.bytes,
+          end,
           encoded->bytes.size(),
           page_count::make(static_cast<std::uint32_t>(pages)).value(),
           encoded->digest);
@@ -1356,7 +1953,7 @@ private:
             co_return runtime::failure(
               detail::path_error(errc::invalid_argument));
         const auto footer = local_footer_reference::make(
-          end.bytes,
+          end,
           encoded->bytes.size(),
           static_cast<std::uint16_t>(codec::format_family::sealed_extent),
           encoded->digest);
@@ -1385,15 +1982,6 @@ private:
           retry_page_entries_,
           config_.metadata,
           *refs_charge};
-        auto dependencies = [this, end](codec::cooperative_work&)
-          -> seastar::future<runtime::result<void>> {
-            if (lifetime_->failure.failed())
-                co_return lifetime_->failure.outcome();
-            if (!sealing_.data_synced || positions_->durable != end)
-                co_return runtime::failure(
-                  detail::path_error(errc::wrong_context));
-            co_return runtime::result<void>{};
-        };
         auto published = co_await publish_local_bundle(
           files_,
           owner_,
@@ -1410,15 +1998,14 @@ private:
             co_return sealing_.retry.failure.outcome();
         if (!published.reference)
             co_return runtime::failure(detail::path_error(errc::io_failure));
-        auto written = co_await data_->write(
-          end.bytes, std::move(encoded->bytes));
+        auto written = co_await data_->write(end, std::move(encoded->bytes));
         if (!written) co_return runtime::failure(written.error());
         if (*written != reference->bytes())
             co_return runtime::failure(detail::path_error(errc::io_failure));
         sealing_.root_written = true;
         // A sealed extent ends exactly after its root; drop the zero-written
-        // tail in the same durable step.
-        if (prezeroed_end_ > file_end->value()) {
+        // or recovered tail in the same durable step.
+        if (file_bytes > file_end->value()) {
             auto trimmed = co_await data_->truncate(file_end->value());
             if (!trimmed) co_return runtime::failure(trimmed.error());
         }
@@ -1467,9 +2054,9 @@ private:
         publication_ = *next;
         append_ = model::append_state::sealed;
         immutable_ = segment_immutable_expectation{
-          finished->boundary().coverage, *finished->digest(), *file_end};
+          finished.boundary().coverage, *finished.digest(), *file_end};
         read_publication_ = publication;
-        read_roots_.push_back(location);
+        read_roots_.assign(1, location);
         co_await close_publishers();
         co_await close_handles();
         handle_ = lifetime_->failure.failed() ? segment_handle_state::closed
@@ -2072,7 +2659,7 @@ private:
             return runtime::failure(valid.error());
         if (fresh) {
             if (
-              config.policy.config().max_work_bytes < byte_count{1024}
+              config.policy.config().max_work_bytes < byte_count{1_KiB}
               || config.policy.config().max_work_items < item_count{64})
                 return runtime::failure(
                   detail::path_error(errc::invalid_argument));
@@ -2087,7 +2674,7 @@ private:
                 return runtime::failure(valid.error());
             if (
               !config.retry_object || !config.retry_object->is_valid()
-              || config.metadata.operation_bytes < byte_count{65536})
+              || config.metadata.operation_bytes < byte_count{64_KiB})
                 return runtime::failure(
                   detail::path_error(errc::invalid_argument));
             if (
@@ -2264,8 +2851,10 @@ private:
         }
         co_return output;
     }
-    seastar::future<runtime::result<void>>
-    open_data(bool writable, codec::cooperative_work& work) {
+    // A writable handle normally opens a file holding only its header; a
+    // recovered seal's opens the existing extent.
+    seastar::future<runtime::result<void>> open_data(
+      bool writable, codec::cooperative_work& work, bool existing = false) {
         auto loaded = co_await load_local_segment(
           files_,
           owner_,
@@ -2313,7 +2902,7 @@ private:
         if (
           *size < data_start_.value()
           || *size > descriptor_.maximum_data_bytes.value()
-          || (writable && *size != data_start_.value()))
+          || (writable && !existing && *size != data_start_.value()))
             co_return runtime::failure(detail::path_error(errc::wrong_context));
         auto read = co_await data_->read({}, byte_count{data_start_.value()});
         if (!read) co_return runtime::failure(read.error());
@@ -2412,7 +3001,7 @@ private:
         auto bundle = budget_.try_reserve(
           byte_count{
             2 * config_.metadata.operation_bytes.value()
-            + config_.metadata.execution_bytes.value() + 32768});
+            + config_.metadata.execution_bytes.value() + 32_KiB});
         if (!bundle) {
             lifetime_->failure.observe(bundle);
             co_return;
@@ -2739,5 +3328,7 @@ private:
     model::append_state append_{model::append_state::creating};
     segment_handle_state handle_{segment_handle_state::closed};
     bool entered_{false}, recovered_{false}, closing_{false}, closed_{false};
+    // Opened only to execute a recovered seal's decision.
+    bool recovered_seal_{false};
 };
 } // namespace kwaque::storage

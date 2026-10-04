@@ -1,3 +1,4 @@
+#include "src/base/units.h"
 #include "src/compression/lz4.h"
 #include "src/compression/tests/lz4_test_support.h"
 #include "src/compression/tests/test_support.h"
@@ -49,7 +50,7 @@ TEST(Lz4HeaderTest, WireProfilesAndChecksumValidationBeforePayloadScratch) {
         const auto plan = detail::admit_lz4(
                             detail::lz4_direction::decompress,
                             byte_count{value.expanded},
-                            byte_count{1024},
+                            byte_count{1_KiB},
                             work,
                             budget())
                             .value();
@@ -96,7 +97,7 @@ TEST(Lz4HeaderTest, EveryPartialHeaderRejectsOnAFreshContext) {
             const auto plan = detail::admit_lz4(
                                 detail::lz4_direction::decompress,
                                 byte_count{3},
-                                byte_count{1024},
+                                byte_count{1_KiB},
                                 work,
                                 budget())
                                 .value();

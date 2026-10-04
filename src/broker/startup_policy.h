@@ -9,10 +9,18 @@
 
 #include <array>
 #include <cstdint>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 
 namespace kwaque::broker::detail {
+
+// A configuration or runtime-option problem; retrying without changing the
+// configuration fails the same way.
+class configuration_error final : public std::runtime_error {
+public:
+    using std::runtime_error::runtime_error;
+};
 
 struct configuration_identity final {
     std::array<char, 64> checksum{};

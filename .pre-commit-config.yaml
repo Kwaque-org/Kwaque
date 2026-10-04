@@ -3,26 +3,40 @@ default_language_version:
 
 repos:
   - repo: https://github.com/pre-commit/pre-commit-hooks
-    rev: v5.0.0
+    rev: 3e8a8703264a2f4a69428a0aa4dcb512790b2c8c  # frozen: v6.0.0
     hooks:
+      - id: check-added-large-files
+      - id: check-merge-conflict
+      - id: end-of-file-fixer
+      - id: mixed-line-ending
+        args: [--fix=lf]
       - id: trailing-whitespace
         exclude: '\.patch$'
-      - id: end-of-file-fixer
+
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: a56c0b927e6465d37cae3e97d35d4d18ab2b96cd  # frozen: v0.16.9
+    hooks:
+      - id: ruff-check
+      - id: ruff-format
 
   - repo: local
     hooks:
       - id: clang-format
-        name: C++ formatting
+        name: C++ and Protobuf formatting
         entry: bazel run //tools:format_cpp_changed -- --check
         language: system
-        files: '\.(c|cc|cpp|cxx|h|hh|hpp|hxx)$'
+        files: '\.(c|cc|cpp|cxx|h|hh|hpp|hxx|proto)$'
+        # One Bazel invocation at a time; parallel chunks would queue on the
+        # server lock.
+        require_serial: true
 
       - id: buildifier
-        name: Bazel formatting
+        name: Bazel formatting and lint
         entry: bazel run //tools:buildifier_check
         language: system
-        files: '(^|/)(BUILD(\.bazel)?|MODULE\.bazel)$|\.(bzl|bazel)$'
+        files: '(^|/)(BUILD(\.bazel)?|MODULE\.bazel)$|\.(bzl|bazel|BUILD)$'
         pass_filenames: false
+        require_serial: true
 
       - id: generated-artifacts
         name: Forbidden generated artifacts

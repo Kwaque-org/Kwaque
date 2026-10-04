@@ -151,11 +151,12 @@ runtime::result<local_classified_entry> classify_local_entry(
             auto parsed = parse_local_temporary_name(
               entry.name.value(), *target);
             auto candidate = classify_spelling(spec, parent, target->value());
+            // A segment's data file is published with its header like any
+            // other file, so a creation interrupted there leaves its temp.
             if (
               parsed && !candidate.directory
               && candidate.kind != local_entry_kind::unknown
-              && candidate.kind != local_entry_kind::broker_file
-              && candidate.kind != local_entry_kind::data) {
+              && candidate.kind != local_entry_kind::broker_file) {
                 temporary = *parsed;
                 spelling = candidate;
             }

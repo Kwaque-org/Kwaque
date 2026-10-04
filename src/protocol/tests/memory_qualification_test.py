@@ -185,8 +185,9 @@ class ReservationBoundsTest(unittest.TestCase):
             ("prefix-h4096", "peak_upper_bound", 1),
             ("xxh3-cold", "peak_upper_bound", 1 << 20),
         ):
-            with self.subTest(name=name, field=field), self.assertRaises(
-                AssertionError
+            with (
+                self.subTest(name=name, field=field),
+                self.assertRaises(AssertionError),
             ):
                 samples = self.samples()
                 samples[name][field] = value

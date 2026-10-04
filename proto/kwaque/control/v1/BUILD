@@ -6,6 +6,7 @@ package(default_visibility = ["//visibility:private"])
 proto_library(
     name = "redirect_proto",
     srcs = ["redirect.proto"],
+    visibility = ["//proto:__pkg__"],
     deps = [
         "//proto/kwaque/common/v1:error_proto",
         "//proto/kwaque/common/v1:identity_proto",
@@ -24,6 +25,7 @@ cc_proto_library(
 proto_library(
     name = "handshake_proto",
     srcs = ["handshake.proto"],
+    visibility = ["//proto:__pkg__"],
     deps = [
         "//proto/kwaque/common/v1:build_info_proto",
         "//proto/kwaque/common/v1:capability_proto",

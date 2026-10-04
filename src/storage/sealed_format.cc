@@ -1,5 +1,6 @@
 #include "src/storage/sealed_format.h"
 
+#include "src/base/units.h"
 #include "src/storage/footer_internal.h"
 #include "src/storage/page_internal.h"
 #include "src/storage/retry_format.h"
@@ -68,7 +69,7 @@ struct sealed_reader final {
             co_return codec::failure(read.error());
         if (
           auto ready = co_await work.admit(
-            byte_count{1024}, item_count{64}, anchor);
+            byte_count{1_KiB}, item_count{64}, anchor);
           !ready)
             co_return codec::failure(ready.error());
         if (auto ready = work.poll(anchor); !ready)
@@ -158,7 +159,7 @@ struct sealed_reader final {
                 co_return codec::failure(read.error());
             if (
               auto ready = co_await work.admit(
-                byte_count{1024}, item_count{64}, anchor);
+                byte_count{1_KiB}, item_count{64}, anchor);
               !ready)
                 co_return codec::failure(ready.error());
             if (auto ready = work.poll(anchor); !ready)
@@ -274,7 +275,7 @@ seastar::future<codec::result<encoded_sealed_footer>> encode_sealed_footer(
     const auto anchor = page_error(errc::success, c);
     if (
       auto ready = co_await work.admit(
-        byte_count{1024}, item_count{64}, anchor);
+        byte_count{1_KiB}, item_count{64}, anchor);
       !ready)
         co_return codec::failure(ready.error());
     if (auto ready = work.poll(anchor); !ready)
@@ -293,7 +294,7 @@ seastar::future<codec::result<encoded_sealed_footer>> encode_sealed_footer(
     for (std::uint32_t i = 0; i < refs.size(); ++i) {
         if (
           auto ready = co_await work.admit(
-            byte_count{1024}, item_count{64}, anchor);
+            byte_count{1_KiB}, item_count{64}, anchor);
           !ready)
             co_return codec::failure(ready.error());
         if (auto ready = work.poll(anchor); !ready)

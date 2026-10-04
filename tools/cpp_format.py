@@ -6,7 +6,9 @@ import subprocess
 import sys
 from pathlib import Path
 
-CPP_SUFFIXES = frozenset({".c", ".cc", ".cpp", ".cxx", ".h", ".hh", ".hpp", ".hxx"})
+CPP_SUFFIXES = frozenset(
+    {".c", ".cc", ".cpp", ".cxx", ".h", ".hh", ".hpp", ".hxx", ".proto"}
+)
 
 
 def workspace_root() -> Path:
@@ -46,7 +48,9 @@ def git_paths(root: Path, arguments: list[str]) -> list[Path]:
     return [Path(value.decode()) for value in output.split(b"\0") if value]
 
 
-def selected_files(root: Path, scope: str, explicit: list[str]) -> list[Path]:
+def selected_files(
+    root: Path, scope: str, explicit: list[str], base: str = "HEAD"
+) -> list[Path]:
     if explicit:
         candidates = [Path(value) for value in explicit]
     elif scope == "all":
@@ -54,8 +58,12 @@ def selected_files(root: Path, scope: str, explicit: list[str]) -> list[Path]:
             root, ["ls-files", "--cached", "--others", "--exclude-standard", "-z"]
         )
     else:
+        # Compare the working tree with the point where HEAD left the base, so
+        # a branch also checks the files of its earlier commits.
         candidates = []
-        candidates.extend(git_paths(root, ["diff", "--name-only", "-z", "HEAD", "--"]))
+        candidates.extend(
+            git_paths(root, ["diff", "--name-only", "-z", "--merge-base", base, "--"])
+        )
         candidates.extend(
             git_paths(root, ["ls-files", "--others", "--exclude-standard", "-z"])
         )
@@ -69,17 +77,24 @@ def selected_files(root: Path, scope: str, explicit: list[str]) -> list[Path]:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Format Kwaque C++ source files")
+    parser = argparse.ArgumentParser(
+        description="Format Kwaque C++ and Protobuf source files"
+    )
     parser.add_argument("--tool", required=True)
     parser.add_argument("--scope", choices=("all", "changed"), default="changed")
+    parser.add_argument(
+        "--base",
+        default="HEAD",
+        help="with --scope=changed, the revision a branch is compared against",
+    )
     parser.add_argument("--check", action="store_true")
     parser.add_argument("files", nargs="*")
     arguments = parser.parse_args()
 
     root = workspace_root()
-    files = selected_files(root, arguments.scope, arguments.files)
+    files = selected_files(root, arguments.scope, arguments.files, arguments.base)
     if not files:
-        print("No C++ files selected.")
+        print("No C++ or Protobuf files selected.")
         return 0
 
     command = [str(resolve_runfile(arguments.tool)), "--style=file"]
@@ -91,7 +106,7 @@ def main() -> int:
     result = subprocess.run(command, cwd=root, check=False)
     if result.returncode == 0:
         action = "Checked" if arguments.check else "Formatted"
-        print(f"{action} {len(files)} C++ file(s).")
+        print(f"{action} {len(files)} C++ or Protobuf file(s).")
     return result.returncode
 
 

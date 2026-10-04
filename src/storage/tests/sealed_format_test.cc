@@ -1,3 +1,4 @@
+#include "src/base/units.h"
 #include "src/storage/tests/retry_test_support.h"
 
 #include <seastar/util/alloc_failure_injector.hh>
@@ -250,7 +251,7 @@ TEST(SealedFormatTest, PrefixPackingPreservesSmallAllocationAndWorkLimits) {
     ASSERT_TRUE(baseline);
     auto policy = setup.policy().config();
     policy.max_allocation_bytes = byte_count{512};
-    policy.max_work_bytes = byte_count{1024};
+    policy.max_work_bytes = byte_count{1_KiB};
     policy.max_work_items = item_count{64};
     codec::cooperative_work work{codec::limits::make(policy).value(), abort};
     const auto bounded = encode_sealed_footer(

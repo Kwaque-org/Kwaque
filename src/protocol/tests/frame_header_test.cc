@@ -1,3 +1,4 @@
+#include "src/base/units.h"
 #include "src/codec/crc32c.h"
 #include "src/protocol/tests/frame_test_support.h"
 
@@ -227,7 +228,7 @@ TEST(FrameHeaderTest, SharedExtensionGrammarAndBoundsApplyAtTheFrameOffset) {
     codec::cooperative_work work{codec::limits::defaults(), abort};
     const auto result = fixture::inspect(maximum, work);
     ASSERT_TRUE(result.has_value());
-    EXPECT_EQ(result->header_bytes, byte_count{4096});
+    EXPECT_EQ(result->header_bytes, byte_count{4_KiB});
 }
 
 TEST(FrameHeaderTest, AliasBudgetAndCancellationPreserveTheParent) {

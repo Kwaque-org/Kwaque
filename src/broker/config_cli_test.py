@@ -8,26 +8,47 @@ import os
 import re
 import signal
 import socket
-import subprocess
 import sys
-import tempfile
-import time
-import urllib.request
 from pathlib import Path
 
-REACTOR_ARGUMENTS = ("--smp=2", "--memory=384M", "--overprovisioned")
-STARTUP_ATTEMPTS = 5
+from tests.smoke.broker_test_support import (
+    EXIT_CRASH_LOOP,
+    EXIT_DATA_DIRECTORY_IN_USE,
+    EXIT_FAILURE,
+    EXIT_NOT_CONFIGURED,
+    EXIT_USAGE,
+    REACTOR_BACKEND,
+    BrokerProcess,
+    Endpoint,
+    assert_one_error,
+    http_get,
+    lease_loopback_endpoint,
+    log_path,
+    run_broker,
+    test_directory,
+    version_fields,
+    write_config,
+)
+
+REACTOR_ARGUMENTS = (
+    f"--reactor-backend={REACTOR_BACKEND}",
+    "--smp=2",
+    "--memory=384M",
+    "--overprovisioned",
+)
 ADMIN_EXPOSURE_WARNING = "admin API is exposed without authentication or TLS"
 
 ADMIN_METRICS = frozenset(
     {
         "kwaque_broker_process_readiness",
-        "kwaque_broker_shard_count",
+        "kwaque_broker_draining",
+        "kwaque_broker_shards",
         "kwaque_broker_startup_duration_seconds",
-        "kwaque_broker_shutdown_total",
-        "kwaque_broker_http_requests_total",
+        "kwaque_broker_start_time_seconds",
     }
 )
+BUILD_METRICS = frozenset({"kwaque_build_info"})
+BUILD_LABELS = frozenset({"version", "revision", "build_mode", "dirty"})
 RUNTIME_METRICS = frozenset(
     {
         "kwaque_runtime_task_active",
@@ -63,13 +84,16 @@ RESOURCE_METRICS = frozenset(
         "kwaque_resource_manager_memory_waiters",
     }
 )
-WORKLOAD_COUNT = 8
-PRODUCT_METRICS = ADMIN_METRICS | RUNTIME_METRICS | RESOURCE_METRICS
-SHARD_AGGREGATED_METRICS = (
-    RUNTIME_METRICS | RESOURCE_METRICS | {"kwaque_broker_http_requests_total"}
+# Admission counters added to the native HTTP server for the admin listener.
+HTTP_ADMISSION_METRICS = (
+    "kwaque_httpd_connections_rejected",
+    "kwaque_httpd_deadline_terminations",
 )
+WORKLOAD_COUNT = 8
+PRODUCT_METRICS = ADMIN_METRICS | BUILD_METRICS | RUNTIME_METRICS | RESOURCE_METRICS
 PRODUCT_PREFIXES = (
     "kwaque_broker_",
+    "kwaque_build_",
     "kwaque_runtime_task_",
     "kwaque_runtime_timer_",
     "kwaque_runtime_file_",
@@ -81,62 +105,6 @@ DEFERRED_PREFIXES = (
     "kwaque_bounded_queue_",
     "kwaque_simulation_",
 )
-
-
-def reserve_loopback_port() -> int:
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
-        listener.bind(("127.0.0.1", 0))
-        return listener.getsockname()[1]
-
-
-def write_test_config(
-    template: Path,
-    output: Path,
-    data_directory: Path,
-    port: int,
-    *,
-    address: str | None = None,
-) -> None:
-    contents = template.read_text(encoding="utf-8")
-    contents, directory_count = re.subn(
-        r"(?m)^(\s*data_directory:)\s*.*$",
-        rf'\1 "{data_directory}"',
-        contents,
-    )
-    contents, port_count = re.subn(
-        r"(?m)^(\s*port:)\s*\d+\s*$", rf"\1 {port}", contents
-    )
-    if directory_count != 1 or port_count != 1:
-        raise AssertionError(f"unable to specialize configuration template {template}")
-    if address is not None:
-        contents, address_count = re.subn(
-            r"(?m)^(\s*address:)\s*.*$", rf'\1 "{address}"', contents
-        )
-        if address_count != 1:
-            raise AssertionError(f"unable to specialize admin address in {template}")
-    output.write_text(contents, encoding="utf-8")
-
-
-def get(url: str) -> tuple[int, str, str]:
-    with urllib.request.urlopen(url, timeout=5.0) as response:
-        return (
-            response.status,
-            response.headers.get_content_type(),
-            response.read().decode("utf-8"),
-        )
-
-
-def version_fields(binary: Path) -> dict[str, str]:
-    result = subprocess.run(
-        [binary, "--version"],
-        capture_output=True,
-        check=True,
-        text=True,
-        timeout=5.0,
-    )
-    return dict(
-        field.split("=", maxsplit=1) for field in result.stdout.strip().split("\t")
-    )
 
 
 def metric_value(exposition: str, name: str) -> float:
@@ -188,40 +156,44 @@ def verify_product_metrics(exposition: str, *, aggregated: bool) -> None:
             f"missing={sorted(PRODUCT_METRICS - observed)} "
             f"unexpected={sorted(observed - PRODUCT_METRICS)}"
         )
+    shard = set() if aggregated else {"shard"}
     for name in PRODUCT_METRICS:
         matching = metric_samples(exposition, name)
         if name in RESOURCE_METRICS:
             expected_samples = WORKLOAD_COUNT if aggregated else 2 * WORKLOAD_COUNT
-            expected_labels = {"workload"} if aggregated else {"shard", "workload"}
+            expected_labels = {"workload"} | shard
+        elif name in RUNTIME_METRICS:
+            expected_samples = 1 if aggregated else 2
+            expected_labels = shard
+        elif name in BUILD_METRICS:
+            # Process-wide values are owned by shard zero and aggregate away
+            # the shard label.
+            expected_samples = 1
+            expected_labels = set(BUILD_LABELS) | shard
         else:
-            expected_samples = (
-                1
-                if aggregated
-                or name in ADMIN_METRICS - {"kwaque_broker_http_requests_total"}
-                else 2
-            )
-            expected_labels = (
-                set() if aggregated and name in SHARD_AGGREGATED_METRICS else {"shard"}
-            )
+            expected_samples = 1
+            expected_labels = shard
         if len(matching) != expected_samples:
             raise AssertionError(
                 f"expected {expected_samples} sample(s) for {name!r}: {matching}"
             )
         for sample in matching:
             labels = label_names(sample)
-            if not labels.issubset({"shard", "workload"}):
-                raise AssertionError(
-                    f"metric {name!r} exposed forbidden labels: {sorted(labels)}"
-                )
             if labels != expected_labels:
                 raise AssertionError(
                     f"metric {name!r} has labels {sorted(labels)}, "
                     f"expected {sorted(expected_labels)}"
                 )
-        if not aggregated and (name in RESOURCE_METRICS or expected_samples == 2):
-            for shard in (0, 1):
+            if (
+                not aggregated
+                and 'shard="0"' not in sample
+                and name in (ADMIN_METRICS | BUILD_METRICS)
+            ):
+                raise AssertionError(f"process metric {name!r} left shard zero")
+        if not aggregated and name in RUNTIME_METRICS | RESOURCE_METRICS:
+            for shard_id in (0, 1):
                 shard_samples = [
-                    sample for sample in matching if f'shard="{shard}"' in sample
+                    sample for sample in matching if f'shard="{shard_id}"' in sample
                 ]
                 expected_shard_samples = (
                     WORKLOAD_COUNT if name in RESOURCE_METRICS else 1
@@ -229,7 +201,7 @@ def verify_product_metrics(exposition: str, *, aggregated: bool) -> None:
                 if len(shard_samples) != expected_shard_samples:
                     raise AssertionError(
                         f"metric {name!r} expected {expected_shard_samples} "
-                        f"sample(s) for shard {shard}: {matching}"
+                        f"sample(s) for shard {shard_id}: {matching}"
                     )
     deferred = {
         sample_name(line)
@@ -240,64 +212,9 @@ def verify_product_metrics(exposition: str, *, aggregated: bool) -> None:
         raise AssertionError(
             f"deferred metric families appeared in broker output: {sorted(deferred)}"
         )
-
-
-class RunningBroker:
-    def __init__(
-        self,
-        binary: Path,
-        log_path: Path,
-        *arguments: str,
-        environment: dict[str, str] | None = None,
-    ) -> None:
-        output = log_path.open("w", encoding="utf-8")
-        try:
-            self.process = subprocess.Popen(
-                [binary, *arguments, *REACTOR_ARGUMENTS],
-                stdout=output,
-                stderr=subprocess.STDOUT,
-                text=True,
-                env=environment,
-            )
-        finally:
-            output.close()
-        self.log_path = log_path
-
-    def output(self) -> str:
-        return self.log_path.read_text(encoding="utf-8")
-
-    def wait_for(self, expected: str, timeout: float = 60.0) -> str:
-        deadline = time.monotonic() + timeout
-        while time.monotonic() < deadline:
-            output = self.output()
-            if expected in output:
-                return output
-            return_code = self.process.poll()
-            if return_code is not None:
-                raise AssertionError(
-                    f"broker exited with {return_code} before {expected!r}:\n{output}"
-                )
-            time.sleep(0.05)
-        raise AssertionError(f"timed out waiting for {expected!r}:\n{self.output()}")
-
-    def stop(self) -> str:
-        if self.process.poll() is None:
-            self.process.send_signal(signal.SIGTERM)
-        try:
-            return_code = self.process.wait(timeout=10.0)
-        except subprocess.TimeoutExpired:
-            self.process.kill()
-            self.process.wait(timeout=5.0)
-            raise AssertionError(f"broker did not stop after SIGTERM:\n{self.output()}")
-        output = self.output()
-        if return_code != 0:
-            raise AssertionError(f"broker exited with {return_code}\noutput:\n{output}")
-        return output
-
-    def kill_if_running(self) -> None:
-        if self.process.poll() is None:
-            self.process.kill()
-            self.process.wait(timeout=5.0)
+    for name in HTTP_ADMISSION_METRICS:
+        if not metric_samples(exposition, name):
+            raise AssertionError(f"admin listener does not export {name!r}")
 
 
 def start_broker(
@@ -308,35 +225,25 @@ def start_broker(
     data_directory: Path,
     *arguments: str,
     environment: dict[str, str] | None = None,
-    address: str | None = None,
-) -> tuple[RunningBroker, Path, int, str]:
-    for attempt in range(1, STARTUP_ATTEMPTS + 1):
-        port = reserve_loopback_port()
-        config = logs / f"{name}-{attempt}.yaml"
-        write_test_config(template, config, data_directory, port, address=address)
-        broker = RunningBroker(
-            binary,
-            logs / f"{name}-{attempt}.log",
-            "--config",
-            str(config),
-            *arguments,
-            environment=environment,
-        )
-        try:
-            output = broker.wait_for("startup stage=admin state=ready")
-        except AssertionError:
-            output = broker.output()
-            broker.kill_if_running()
-            address_in_use = (
-                "address already in use" in output.casefold()
-                or "eaddrinuse" in output.casefold()
-            )
-            if not address_in_use or attempt == STARTUP_ATTEMPTS:
-                raise
-            continue
-        return broker, config, port, output
-
-    raise AssertionError("exhausted broker startup attempts")
+    endpoint: Endpoint | None = None,
+) -> tuple[BrokerProcess, Path, Endpoint, str]:
+    endpoint = endpoint or lease_loopback_endpoint()
+    config = logs / f"{name}.yaml"
+    write_config(template, config, data_directory, endpoint)
+    broker = BrokerProcess(
+        binary,
+        config,
+        log_path(logs, f"{name}.log"),
+        REACTOR_ARGUMENTS,
+        arguments=arguments,
+        environment=environment,
+    )
+    try:
+        output = broker.wait_for("startup stage=admin state=ready")
+    except AssertionError:
+        broker.kill_if_running()
+        raise
+    return broker, config, endpoint, output
 
 
 def assert_ordered(output: str, expected: tuple[str, ...]) -> None:
@@ -357,21 +264,23 @@ def assert_startup_rejected(
     before_reactor: bool = False,
     after_configuration: bool = False,
     after_memory_observation: bool = False,
+    status: int = EXIT_NOT_CONFIGURED,
 ) -> None:
     before = set(directory.rglob("*"))
-    result = subprocess.run(
-        [binary, *arguments, *REACTOR_ARGUMENTS],
-        check=False,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-        timeout=15.0,
-        env=environment,
+    result = run_broker(
+        binary,
+        None,
+        *arguments,
+        *REACTOR_ARGUMENTS,
         cwd=directory,
+        environment=environment,
+        timeout=15.0,
     )
-    if result.returncode <= 0 or (before_reactor and result.returncode != 2):
+    # The native option parser owns command-line errors.
+    expected_status = EXIT_USAGE if before_reactor else status
+    if result.returncode != expected_status:
         raise AssertionError(
-            f"expected startup rejection for {arguments}, "
+            f"expected exit {expected_status} for {arguments}, "
             f"got exit {result.returncode}:\n{result.stdout}"
         )
     for value in expected:
@@ -379,6 +288,8 @@ def assert_startup_rejected(
             raise AssertionError(
                 f"startup rejection did not report {value!r}:\n{result.stdout}"
             )
+    if not before_reactor:
+        assert_one_error(result.stdout, expected[0])
     if after_configuration:
         if result.stdout.count("configuration loaded ") != 1:
             raise AssertionError(
@@ -416,8 +327,34 @@ def verify_configuration_rejections(
         ("malformed", "kwaque: [", "unable to parse YAML"),
         (
             "missing-setting",
-            "kwaque: {node_id: 0}",
+            "kwaque: {developer_mode: true}",
             "required configuration key is missing",
+        ),
+        (
+            # The version is checked before keys a newer schema may add.
+            "future-schema",
+            "kwaque: {schema_version: 2, future_setting: 1}",
+            "unsupported configuration schema version 2",
+        ),
+        (
+            "octal-looking-port",
+            "kwaque: {schema_version: 1, developer_mode: true, admin: {port: 010000}}",
+            "expected an unquoted decimal integer without leading zeros",
+        ),
+        (
+            "second-document",
+            "kwaque: {schema_version: 1, developer_mode: true}\n---\nother: 1\n",
+            "configuration must contain exactly one YAML document",
+        ),
+        (
+            "relative-production-directory",
+            "kwaque: {schema_version: 1, data_directory: ./data}",
+            "data directory must be an absolute path",
+        ),
+        (
+            "removed-log-level",
+            "kwaque: {schema_version: 1, developer_mode: true, log_level: debug}",
+            "unknown configuration key",
         ),
         (
             "duplicate-setting",
@@ -480,11 +417,11 @@ def verify_runtime_rejections(
     io_properties.write_text("disks: []\n", encoding="utf-8")
     for index, template in enumerate(templates):
         config = directory / f"runtime-policy-{index}.yaml"
-        write_test_config(
+        write_config(
             template,
             config,
             directory / f"rejected-data-{index}",
-            reserve_loopback_port(),
+            lease_loopback_endpoint(),
         )
         for arguments, option in unsafe_options:
             assert_startup_rejected(
@@ -584,11 +521,11 @@ def verify_memory_and_mount_policies(
             re.sub(budget_pattern, "", contents), encoding="utf-8"
         )
         missing_config = directory / "missing-diagnostic.yaml"
-        write_test_config(
+        write_config(
             missing_template,
             missing_config,
             directory / "missing-diagnostic-data",
-            reserve_loopback_port(),
+            lease_loopback_endpoint(),
         )
         assert_startup_rejected(
             binary,
@@ -602,7 +539,7 @@ def verify_memory_and_mount_policies(
             after_configuration=True,
         )
 
-    broker, configuration, port, output = start_broker(
+    broker, configuration, endpoint, output = start_broker(
         binary,
         directory,
         "explicit-diagnostic",
@@ -631,7 +568,7 @@ def verify_memory_and_mount_policies(
         ):
             if int(policy[name]) != expected:
                 raise AssertionError(f"startup reservation {name} changed:\n{output}")
-        status, content_type, exposition = get(f"http://127.0.0.1:{port}/metrics")
+        status, content_type, exposition = http_get(endpoint, "/metrics")
         samples = metric_samples(
             exposition, "kwaque_resource_manager_memory_configured_bytes"
         )
@@ -646,7 +583,7 @@ def verify_memory_and_mount_policies(
             raise AssertionError(
                 f"workload budgets do not conserve their explicit reservations:\n{exposition}"
             )
-        broker.stop()
+        broker.stop(signal.SIGTERM)
     finally:
         broker.kill_if_running()
 
@@ -661,8 +598,8 @@ def verify_memory_and_mount_policies(
     strict_template.write_text(strict, encoding="utf-8")
     missing_config = directory / "missing-mount-marker.yaml"
     missing_data = directory / "missing-mount-data"
-    write_test_config(
-        strict_template, missing_config, missing_data, reserve_loopback_port()
+    write_config(
+        strict_template, missing_config, missing_data, lease_loopback_endpoint()
     )
     assert_startup_rejected(
         binary,
@@ -673,6 +610,8 @@ def verify_memory_and_mount_policies(
         environment=environment,
         after_configuration=True,
         after_memory_observation=True,
+        # A missing mount is an environment failure, not a configuration error.
+        status=EXIT_FAILURE,
     )
     if missing_data.exists():
         raise AssertionError(
@@ -696,7 +635,7 @@ def verify_memory_and_mount_policies(
         policy = verify_startup_policy(output, configuration, "development")
         if policy["storage_strict_data_init"] != "true":
             raise AssertionError(f"strict initialization was not recorded:\n{output}")
-        broker.stop()
+        broker.stop(signal.SIGTERM)
         if (
             marker.read_bytes() != marker_contents
             or (marked_data / "kwaque.pid").exists()
@@ -749,7 +688,7 @@ def verify_explicit_io_sources(
         )
         try:
             verify_startup_policy(output, config, profile)
-            output = broker.stop()
+            output = broker.stop(signal.SIGTERM)
             if output.count("configuration loaded ") != 1:
                 raise AssertionError(
                     f"configuration was reread after startup:\n{output}"
@@ -758,21 +697,75 @@ def verify_explicit_io_sources(
             broker.kill_if_running()
 
 
+def verify_crash_loop_refusal(
+    binary: Path, logs: Path, template: Path, environment: dict[str, str]
+) -> None:
+    """An unclean exit past crash_loop_limit refuses the next start with 11."""
+    contents, count = re.subn(
+        r"(?m)^(\s*crash_loop_limit:)\s*\d+\s*$",
+        r"\g<1> 0",
+        template.read_text(encoding="utf-8"),
+    )
+    if count != 1:
+        raise AssertionError("production template must set crash_loop_limit")
+    limited = logs / "crash-loop-template.yaml"
+    limited.write_text(contents, encoding="utf-8")
+    data_directory = logs / "crash-loop-data"
+    broker, config, _, _ = start_broker(
+        binary, logs, "crash-loop", limited, data_directory, environment=environment
+    )
+    # A killed broker never records a clean shutdown, so its start stays counted.
+    broker.kill_if_running()
+    tracker = data_directory / ".kwaque-crash-loop"
+    if not tracker.is_file():
+        raise AssertionError("an unclean exit removed the crash-loop tracker")
+    recorded = tracker.read_bytes()
+
+    refused = run_broker(
+        binary, config, *REACTOR_ARGUMENTS, environment=environment, timeout=15.0
+    )
+    if refused.returncode != EXIT_CRASH_LOOP:
+        raise AssertionError(
+            f"crash-looping broker exited {refused.returncode}, expected "
+            f"{EXIT_CRASH_LOOP}:\n{refused.stdout}"
+        )
+    assert_one_error(refused.stdout, "crash loop detected")
+    if "startup stage=crash_tracking" in refused.stdout:
+        raise AssertionError(f"refused start passed crash tracking:\n{refused.stdout}")
+    if tracker.read_bytes() != recorded:
+        raise AssertionError("a refused start changed the crash-loop tracker")
+
+
+def wildcard_endpoint() -> Endpoint:
+    # A wildcard listener conflicts with every loopback lease on its port, so
+    # it takes an ephemeral port instead of the shared admin port.
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+        probe.bind(("0.0.0.0", 0))
+        return Endpoint("0.0.0.0", probe.getsockname()[1])
+
+
 def verify_remote_admin_warning(
     binary: Path,
     directory: Path,
     template: Path,
     environment: dict[str, str],
 ) -> None:
-    broker, config, _, output = start_broker(
-        binary,
-        directory,
-        "remote-admin",
-        template,
-        directory / "remote-admin-data",
-        environment=environment,
-        address="0.0.0.0",
-    )
+    for attempt in range(1, 6):
+        try:
+            broker, config, _, output = start_broker(
+                binary,
+                directory,
+                f"remote-admin-{attempt}",
+                template,
+                directory / f"remote-admin-data-{attempt}",
+                environment=environment,
+                endpoint=wildcard_endpoint(),
+            )
+            break
+        except AssertionError as error:
+            # Another process may take the probed port before the broker.
+            if "Address already in use" not in str(error) or attempt == 5:
+                raise
     try:
         verify_startup_policy(output, config, "development")
         if output.count(ADMIN_EXPOSURE_WARNING) != 1:
@@ -781,9 +774,54 @@ def verify_remote_admin_warning(
             output,
             (ADMIN_EXPOSURE_WARNING, "startup stage=data_directory state=ready"),
         )
-        broker.stop()
+        broker.stop(signal.SIGTERM)
     finally:
         broker.kill_if_running()
+
+
+def verify_logger_options(
+    binary: Path,
+    directory: Path,
+    template: Path,
+    environment: dict[str, str],
+) -> None:
+    """The runtime's log options reach the broker logger before startup."""
+    broker, _, _, output = start_broker(
+        binary,
+        directory,
+        "debug-logging",
+        template,
+        directory / "debug-logging-data",
+        "--logger-log-level",
+        "kwaque-broker=debug",
+        environment=environment,
+    )
+    try:
+        broker.stop(signal.SIGTERM)
+    finally:
+        broker.kill_if_running()
+
+    endpoint = lease_loopback_endpoint()
+    config = directory / "quiet-logging.yaml"
+    write_config(template, config, directory / "quiet-logging-data", endpoint)
+    quiet = BrokerProcess(
+        binary,
+        config,
+        log_path(directory, "quiet-logging.log"),
+        REACTOR_ARGUMENTS,
+        arguments=("--logger-log-level", "kwaque-broker=error"),
+        environment=environment,
+    )
+    try:
+        quiet.wait_until_ready(endpoint)
+        output = quiet.stop(signal.SIGTERM)
+    finally:
+        quiet.kill_if_running()
+    for suppressed in ("startup stage=", "configuration loaded", "shutdown complete"):
+        if suppressed in output:
+            raise AssertionError(
+                f"kwaque-broker=error still logged {suppressed!r}:\n{output}"
+            )
 
 
 def main() -> None:
@@ -791,7 +829,7 @@ def main() -> None:
     default_template = Path(sys.argv[2]).resolve()
     alternate_template = Path(sys.argv[3]).resolve()
 
-    with tempfile.TemporaryDirectory() as directory:
+    with test_directory() as directory:
         logs = Path(directory)
         home = logs / "home"
         home.mkdir()
@@ -800,7 +838,7 @@ def main() -> None:
         verify_runtime_rejections(
             binary, logs, (default_template, alternate_template), environment
         )
-        default, default_config, default_port, output = start_broker(
+        default, default_config, default_endpoint, output = start_broker(
             binary,
             logs,
             "default",
@@ -818,8 +856,9 @@ def main() -> None:
                 )
             for expected in (
                 f"configuration loaded path={default_config}",
-                "node_id=0",
+                f"data_directory={logs / 'default-data'}",
                 "build version=",
+                "host kernel=",
                 "runtime shards=2",
                 "minimum_shard_memory_bytes=",
                 "reactor_backend=",
@@ -841,8 +880,7 @@ def main() -> None:
                 ),
             )
 
-            base_url = f"http://127.0.0.1:{default_port}"
-            status, content_type, body = get(base_url + "/v1/health/live")
+            status, content_type, body = http_get(default_endpoint, "/v1/health/live")
             if (status, content_type, json.loads(body)) != (
                 200,
                 "application/json",
@@ -850,7 +888,7 @@ def main() -> None:
             ):
                 raise AssertionError(f"unexpected liveness response: {status} {body}")
 
-            status, content_type, body = get(base_url + "/v1/health/ready")
+            status, content_type, body = http_get(default_endpoint, "/v1/health/ready")
             if (status, content_type, json.loads(body)) != (
                 200,
                 "application/json",
@@ -858,16 +896,18 @@ def main() -> None:
             ):
                 raise AssertionError(f"unexpected readiness response: {status} {body}")
 
-            _, _, body = get(base_url + "/v1/version")
+            _, _, body = http_get(default_endpoint, "/v1/version")
             version = json.loads(body)
             expected_version = version_fields(binary)
-            for field in ("version", "revision", "build_mode"):
+            for field in ("version", "revision", "build_timestamp", "build_mode"):
                 if version.get(field) != expected_version[field]:
                     raise AssertionError(
                         f"version endpoint field {field!r} did not match CLI: {body}"
                     )
+            if version.get("dirty") != (expected_version["dirty"] == "true"):
+                raise AssertionError(f"version endpoint hid the dirty state: {body}")
 
-            status, content_type, metrics = get(base_url + "/metrics")
+            status, content_type, metrics = http_get(default_endpoint, "/metrics")
             if status != 200 or content_type != "text/plain":
                 raise AssertionError(
                     f"unexpected metrics response: {status} {content_type}"
@@ -876,32 +916,33 @@ def main() -> None:
             metric_prefix = "kwaque_broker_"
             if metric_value(metrics, metric_prefix + "process_readiness") != 1:
                 raise AssertionError("readiness metric was not set")
-            if metric_value(metrics, metric_prefix + "shard_count") != 2:
-                raise AssertionError("shard-count metric did not match --smp")
+            if metric_value(metrics, metric_prefix + "shards") != 2:
+                raise AssertionError("shard metric did not match --smp")
             if metric_value(metrics, metric_prefix + "startup_duration_seconds") < 0:
                 raise AssertionError("startup duration metric was negative")
-            if metric_value(metrics, metric_prefix + "shutdown_total") != 0:
-                raise AssertionError("shutdown counter changed before shutdown")
-            if metric_value(metrics, metric_prefix + "http_requests_total") < 3:
-                raise AssertionError("administrative request counter did not advance")
+            if metric_value(metrics, metric_prefix + "draining") != 0:
+                raise AssertionError("draining was reported before shutdown")
+            if metric_value(metrics, metric_prefix + "start_time_seconds") <= 0:
+                raise AssertionError("start time metric was not set")
+            if metric_value(metrics, "kwaque_build_info") != 1:
+                raise AssertionError("build information metric must be 1")
 
-            status, content_type, unaggregated = get(
-                base_url + "/metrics?__aggregate__=false"
+            status, content_type, unaggregated = http_get(
+                default_endpoint, "/metrics?__aggregate__=false"
             )
             if status != 200 or content_type != "text/plain":
                 raise AssertionError(
-                    "unexpected unaggregated metrics response: "
-                    f"{status} {content_type}"
+                    f"unexpected unaggregated metrics response: {status} {content_type}"
                 )
             verify_product_metrics(unaggregated, aggregated=False)
 
             incomplete_request = socket.create_connection(
-                ("127.0.0.1", default_port), timeout=5.0
+                (default_endpoint.address, default_endpoint.port), timeout=5.0
             )
             incomplete_request.sendall(
                 b"GET /v1/health/live HTTP/1.1\r\nHost: localhost\r\n"
             )
-            output = default.stop()
+            output = default.stop(signal.SIGTERM)
             incomplete_request.close()
             assert_ordered(output, ("shutdown requested", "shutdown complete"))
         finally:
@@ -913,11 +954,11 @@ def main() -> None:
         alternate_profile = "production"
         if policy["allocator"] == "system":
             rejected = logs / "production-system-allocator.yaml"
-            write_test_config(
+            write_config(
                 alternate_template,
                 rejected,
                 logs / "production-system-data",
-                reserve_loopback_port(),
+                lease_loopback_endpoint(),
             )
             assert_startup_rejected(
                 binary,
@@ -944,7 +985,7 @@ def main() -> None:
             )
             alternate_profile = "development"
 
-        alternate, alternate_config, alternate_port, output = start_broker(
+        alternate, alternate_config, alternate_endpoint, output = start_broker(
             binary,
             logs,
             "alternate",
@@ -965,8 +1006,7 @@ def main() -> None:
             expected_path = f"configuration loaded path={alternate_config}"
             for expected in (
                 expected_path,
-                "node_id=7",
-                f"admin_port={alternate_port}",
+                f"admin_port={alternate_endpoint.port}",
                 f"developer_mode={'true' if alternate_profile == 'development' else 'false'}",
             ):
                 if expected not in output:
@@ -981,26 +1021,19 @@ def main() -> None:
             }
             before_tracker = tracker.read_bytes() if tracker.exists() else None
 
-            contender = subprocess.run(
-                [
-                    binary,
-                    "--config",
-                    str(alternate_config),
-                    *REACTOR_ARGUMENTS,
-                ],
-                check=False,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
+            contender = run_broker(
+                binary,
+                alternate_config,
+                *REACTOR_ARGUMENTS,
+                environment=environment,
                 timeout=15.0,
-                env=environment,
             )
-            if contender.returncode == 0:
-                raise AssertionError("second broker unexpectedly acquired the PID file")
-            if "PID file is already locked" not in contender.stdout:
+            if contender.returncode != EXIT_DATA_DIRECTORY_IN_USE:
                 raise AssertionError(
-                    f"second broker did not report PID lock ownership:\n{contender.stdout}"
+                    f"second broker exited {contender.returncode}, expected "
+                    f"{EXIT_DATA_DIRECTORY_IN_USE}:\n{contender.stdout}"
                 )
+            assert_one_error(contender.stdout, "PID file is already locked")
 
             after_reports = {
                 path.name: path.read_bytes() for path in crash_directory.iterdir()
@@ -1009,13 +1042,16 @@ def main() -> None:
             if before_reports != after_reports or before_tracker != after_tracker:
                 raise AssertionError("PID-lock contender changed crash bookkeeping")
 
-            output = alternate.stop()
+            output = alternate.stop(signal.SIGTERM)
             if "shutdown complete" not in output:
                 raise AssertionError(f"alternate broker did not shut down:\n{output}")
             if tracker.exists() or any(crash_directory.iterdir()):
                 raise AssertionError("clean shutdown retained crash bookkeeping")
         finally:
             alternate.kill_if_running()
+
+        if alternate_profile == "production":
+            verify_crash_loop_refusal(binary, logs, alternate_template, environment)
 
         verify_explicit_io_sources(
             binary,
@@ -1025,6 +1061,7 @@ def main() -> None:
             alternate_profile,
         )
         verify_remote_admin_warning(binary, logs, default_template, environment)
+        verify_logger_options(binary, logs, default_template, environment)
 
 
 if __name__ == "__main__":

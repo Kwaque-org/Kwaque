@@ -1,3 +1,4 @@
+#include "src/base/units.h"
 #include "src/storage/footer_internal.h"
 #include "src/storage/format_internal.h"
 
@@ -8,7 +9,7 @@ namespace {
 using detail::load;
 using detail::store;
 constexpr codec::envelope_extent_limits footer_limits{
-  byte_count{65536}, byte_count{65536}};
+  byte_count{64_KiB}, byte_count{64_KiB}};
 codec::error at(
   errc code,
   codec::field_context context,
@@ -242,7 +243,7 @@ seastar::future<codec::result<encoded_durable_footer>> encode_durable_footer(
     const auto anchor = at(errc::success, context);
     if (
       auto ready = co_await work.admit(
-        byte_count{1024}, item_count{64}, anchor);
+        byte_count{1_KiB}, item_count{64}, anchor);
       !ready)
         co_return codec::failure(ready.error());
     if (auto ready = work.poll(anchor); !ready)
@@ -340,7 +341,7 @@ struct footer_reader final {
         const auto anchor = at(errc::success, context);
         if (
           auto ready = co_await work.admit(
-            byte_count{1024}, item_count{64}, anchor);
+            byte_count{1_KiB}, item_count{64}, anchor);
           !ready)
             co_return codec::failure(ready.error());
         if (auto ready = work.poll(anchor); !ready)

@@ -1,5 +1,6 @@
 #include "src/model/tests/checkpoint_fuzz_cases.h"
 
+#include "src/base/units.h"
 #include "src/bytes/test_allocation_profile.h"
 #include "src/model/checkpoint_codec.h"
 #include "src/model/tests/checkpoint_test_support.h"
@@ -35,7 +36,7 @@ void require(bool condition) {
     if (!condition) __builtin_trap();
 }
 codec::decode_budget memory() {
-    return {byte_count{32U << 20U}, byte_count{1U << 20U}, charge};
+    return {byte_count{32_MiB}, byte_count{1_MiB}, charge};
 }
 
 // These controls force rejection. Keep their entry-point precedence explicit

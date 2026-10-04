@@ -1,5 +1,6 @@
 #include "proto/kwaque/common/v1/error.pb.h"
 #include "proto/kwaque/control/v1/handshake.pb.h"
+#include "src/base/units.h"
 #include "src/protocol/tests/control_test_support.h"
 
 #include <gtest/gtest.h>
@@ -110,7 +111,7 @@ TEST(ControlEncodeTest, ConstructorRejectsInvalidOwnedInputsAndExcessCapacity) {
         }
         seastar::abort_source abort;
         auto config = codec::limits::defaults().config();
-        if (mode == 6) config.max_allocation_bytes = byte_count{32768};
+        if (mode == 6) config.max_allocation_bytes = byte_count{32_KiB};
         codec::cooperative_work work{*codec::limits::make(config), abort};
         auto result = protocol::make_control(
                         std::move(input), fixture::budget(), work)

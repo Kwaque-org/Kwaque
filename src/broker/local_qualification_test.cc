@@ -1,4 +1,5 @@
 #include "src/base/allocation.h"
+#include "src/base/units.h"
 #include "src/broker/storage_directories.h"
 #include "src/resource/resource_registry.h"
 #include "src/runtime/production/file.h"
@@ -81,9 +82,7 @@ seastar::future<> with_qualification(std::uint8_t device, Func function) {
                 runtime::production::file_system files;
                 storage::workload_budget budget{
                   manager.acquire_workload(resource::workload_class::metadata),
-                  {.tasks = 16,
-                   .bytes = byte_count{8U * 1024U * 1024U},
-                   .handles = 32},
+                  {.tasks = 16, .bytes = byte_count{8_MiB}, .handles = 32},
                   bytes::testing::charge};
                 co_await function(
                   files, *ownership, spec, budget, native_driver{});

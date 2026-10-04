@@ -1,3 +1,4 @@
+#include "src/base/units.h"
 #include "src/resource/resource_registry.h"
 #include "src/runtime/production/clocks.h"
 #include "src/runtime/production/file.h"
@@ -56,9 +57,7 @@ void segment_operation(std::string_view name) {
                   workload_budget resources{
                     manager.acquire_workload(
                       resource::workload_class::foreground_protocol),
-                    {.tasks = 64,
-                     .bytes = byte_count{48U << 20U},
-                     .handles = 32},
+                    {.tasks = 64, .bytes = byte_count{48_MiB}, .handles = 32},
                     charge};
                   // Bound the existing path/spec carriers individually under
                   // this allocation profile; new writer/fixture owners begin

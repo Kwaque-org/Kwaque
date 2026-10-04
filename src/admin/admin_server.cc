@@ -5,7 +5,9 @@
 #include "src/base/invariant.h"
 
 #include <seastar/core/coroutine.hh>
+#include <seastar/core/do_with.hh>
 #include <seastar/core/gate.hh>
+#include <seastar/core/iostream.hh>
 #include <seastar/core/prometheus.hh>
 #include <seastar/core/scheduling.hh>
 #include <seastar/core/shard_id.hh>
@@ -13,15 +15,19 @@
 #include <seastar/core/shared_future.hh>
 #include <seastar/core/sstring.hh>
 #include <seastar/core/with_scheduling_group.hh>
-#include <seastar/http/function_handlers.hh>
+#include <seastar/http/handlers.hh>
 #include <seastar/http/httpd.hh>
 #include <seastar/net/inet_address.hh>
 
+#include <algorithm>
+#include <array>
 #include <chrono>
 #include <exception>
+#include <functional>
 #include <memory>
 #include <optional>
 #include <stdexcept>
+#include <string_view>
 #include <utility>
 
 namespace kwaque::admin {
@@ -30,17 +36,93 @@ namespace {
 
 using reply_status = seastar::http::reply::status_type;
 
+constexpr std::array<std::string_view, 4> known_paths{
+  "/v1/health/live", "/v1/health/ready", "/v1/version", "/metrics"};
+constexpr std::string_view allowed_methods = "GET, HEAD";
+
+seastar::future<std::unique_ptr<seastar::http::reply>>
+send(std::unique_ptr<seastar::http::reply> reply, json_response response) {
+    reply->set_status(static_cast<reply_status>(response.status));
+    reply->write_body(response.content_type, seastar::sstring(response.body));
+    return seastar::make_ready_future<std::unique_ptr<seastar::http::reply>>(
+      std::move(reply));
+}
+
+// Serves a fixed JSON resource. The native server suppresses the body of a
+// HEAD reply while keeping its status and headers.
+class json_route final : public seastar::httpd::handler_base {
+public:
+    explicit json_route(std::function<json_response()> respond)
+      : respond_(std::move(respond)) {}
+
+    seastar::future<std::unique_ptr<seastar::http::reply>> handle(
+      const seastar::sstring&,
+      std::unique_ptr<seastar::http::request>,
+      std::unique_ptr<seastar::http::reply> reply) override {
+        return send(std::move(reply), respond_());
+    }
+
+private:
+    std::function<json_response()> respond_;
+};
+
+// HEAD for the exposition route reports its headers without collecting a
+// scrape; the content length is only known while generating the content.
+class metrics_head_route final : public seastar::httpd::handler_base {
+public:
+    seastar::future<std::unique_ptr<seastar::http::reply>> handle(
+      const seastar::sstring&,
+      std::unique_ptr<seastar::http::request>,
+      std::unique_ptr<seastar::http::reply> reply) override {
+        reply->write_body("txt", [](seastar::output_stream<char>&& output) {
+            return seastar::do_with(
+              std::move(output), [](seastar::output_stream<char>& stream) {
+                  return stream.close();
+              });
+        });
+        return seastar::make_ready_future<
+          std::unique_ptr<seastar::http::reply>>(std::move(reply));
+    }
+};
+
+// Unknown paths are 404. A known path with another method is 405 with Allow.
+class fallback_route final : public seastar::httpd::handler_base {
+public:
+    seastar::future<std::unique_ptr<seastar::http::reply>> handle(
+      const seastar::sstring& path,
+      std::unique_ptr<seastar::http::request>,
+      std::unique_ptr<seastar::http::reply> reply) override {
+        std::string_view requested{path.data(), path.size()};
+        // Route lookup ignores one trailing slash; classify the same way.
+        if (requested.size() > 1 && requested.ends_with('/')) {
+            requested.remove_suffix(1);
+        }
+        if (std::ranges::find(known_paths, requested) == known_paths.end()) {
+            return send(std::move(reply), not_found_response());
+        }
+        reply->add_header("Allow", seastar::sstring{allowed_methods});
+        return send(std::move(reply), method_not_allowed_response());
+    }
+};
+
+void put_route(
+  seastar::httpd::routes& routes,
+  seastar::httpd::operation_type method,
+  std::string_view path,
+  std::unique_ptr<seastar::httpd::handler_base> handler) {
+    routes.put(method, seastar::sstring{path}, handler.get());
+    static_cast<void>(handler.release());
+}
+
 void put_json_route(
   seastar::httpd::routes& routes,
-  seastar::sstring path,
-  seastar::httpd::handle_function handler) {
-    auto owned_handler = std::make_unique<seastar::httpd::function_handler>(
-      std::move(handler), "application/json");
-    routes.put(
-      seastar::httpd::operation_type::GET,
-      std::move(path),
-      owned_handler.get());
-    static_cast<void>(owned_handler.release());
+  std::string_view path,
+  const std::function<json_response()>& respond) {
+    for (const auto method :
+         {seastar::httpd::operation_type::GET,
+          seastar::httpd::operation_type::HEAD}) {
+        put_route(routes, method, path, std::make_unique<json_route>(respond));
+    }
 }
 
 void register_routes(
@@ -48,32 +130,27 @@ void register_routes(
   admin_state& state,
   const std::string& version_json) {
     auto* local_state = &state;
-    put_json_route(
+    put_json_route(routes, "/v1/health/live", [local_state] {
+        return liveness_response(local_state->live());
+    });
+    put_json_route(routes, "/v1/health/ready", [local_state] {
+        return readiness_response(local_state->ready());
+    });
+    put_json_route(routes, "/v1/version", [version_json] {
+        return json_response{
+          .status = 200,
+          .content_type = json_content_type,
+          .body = version_json};
+    });
+    put_route(
       routes,
-      "/v1/health/live",
-      [local_state](seastar::httpd::const_req, seastar::http::reply& reply) {
-          local_state->record_request();
-          auto response = liveness_response(local_state->live());
-          reply.set_status(static_cast<reply_status>(response.status));
-          return seastar::sstring(std::move(response.body));
-      });
-    put_json_route(
-      routes,
-      "/v1/health/ready",
-      [local_state](seastar::httpd::const_req, seastar::http::reply& reply) {
-          local_state->record_request();
-          auto response = readiness_response(local_state->ready());
-          reply.set_status(static_cast<reply_status>(response.status));
-          return seastar::sstring(std::move(response.body));
-      });
-    put_json_route(
-      routes,
-      "/v1/version",
-      [local_state,
-       version_json](seastar::httpd::const_req, seastar::http::reply&) {
-          local_state->record_request();
-          return seastar::sstring(version_json);
-      });
+      seastar::httpd::operation_type::HEAD,
+      "/metrics",
+      std::make_unique<metrics_head_route>());
+    // The native routes table does not own its default handler; this
+    // stateless instance outlives every server on its shard.
+    static thread_local fallback_route fallback;
+    routes.add_default_handler(&fallback);
 }
 
 } // namespace
@@ -81,7 +158,7 @@ void register_routes(
 class admin_server::impl final {
 public:
     impl()
-      : version_json_(build_info_json(current_build_info())) {}
+      : version_json_(current_version_json()) {}
 
     enum class lifecycle { constructed, starting, started, stopping, stopped };
 
@@ -194,9 +271,13 @@ seastar::future<> admin_server::start(
         seastar::prometheus::config prometheus_config;
         prometheus_config.prefix = "kwaque";
         prometheus_config.snapshot_bounds.emplace();
+        prometheus_config.snapshot_bounds->families = metrics_snapshot_families;
+        prometheus_config.snapshot_bounds->series = metrics_snapshot_series;
         prometheus_config.snapshot_bounds->value_bytes = metrics_snapshot_bytes;
-        prometheus_config.max_response_bytes = metrics_response_bytes;
+        prometheus_config.max_response_bytes = metrics_response_bytes(
+          shard_count);
         prometheus_config.max_scrape_shards = max_scrape_shards;
+        prometheus_config.snapshot_wait_timeout = metrics_snapshot_wait;
         co_await seastar::prometheus::start(
           impl_->server_, std::move(prometheus_config));
         check_abort();

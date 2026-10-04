@@ -66,7 +66,7 @@ def selected_files(root: Path) -> list[Path]:
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Format tracked Bazel and Starlark files"
+        description="Format and lint tracked Bazel and Starlark files"
     )
     parser.add_argument("--tool", required=True)
     parser.add_argument("--mode", choices=("diff", "fix"), required=True)
@@ -78,16 +78,18 @@ def main() -> int:
         print("No Bazel or Starlark files selected.")
         return 0
     # Hooks and CI must produce terminal diffs even in a desktop environment.
-    diff_options = (
-        ["-diff_command=diff -u", "-multi_diff=false"]
+    # Lint warnings fail the check like formatting differences; fix mode
+    # applies the fixable ones.
+    mode_options = (
+        ["-diff_command=diff -u", "-multi_diff=false", "-lint=warn"]
         if arguments.mode == "diff"
-        else []
+        else ["-lint=fix"]
     )
     result = subprocess.run(
         [
             str(resolve_runfile(arguments.tool)),
             f"-mode={arguments.mode}",
-            *diff_options,
+            *mode_options,
             *map(str, files),
         ],
         cwd=root,

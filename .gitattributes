@@ -1,0 +1,6 @@
+* text=auto eol=lf
+
+# Patches, fixtures, corpora, and schema images are compared byte for byte.
+*.patch -text
+**/testdata/** -text
+*.binpb binary

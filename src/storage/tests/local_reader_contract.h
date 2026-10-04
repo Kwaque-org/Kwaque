@@ -1,5 +1,6 @@
 #pragma once
 
+#include "src/base/units.h"
 #include "src/storage/local_cleanup.h"
 #include "src/storage/local_generation.h"
 #include "src/storage/tests/local_installation_contract.h"
@@ -53,9 +54,9 @@ inline local_root_reference snapshot_ref() {
         local_root_kind::completed_retry_snapshot,
         local_object_sequence::make(40).value(),
         runtime::file_position{},
-        byte_count{4096},
+        byte_count{4_KiB},
         page_count::make(1).value(),
-        literal_digest("1c622fae3a64d8ba0297f7a5d3647a22")));
+        literal_digest("58032fdff862aa9a3dc5869021e05dfc")));
 }
 inline local_root_reference sealed_ref() {
     return take(
@@ -63,9 +64,9 @@ inline local_root_reference sealed_ref() {
         local_root_kind::sealed_retry,
         local_object_sequence::make(41).value(),
         runtime::file_position{16384},
-        byte_count{4096},
+        byte_count{4_KiB},
         page_count::make(1).value(),
-        literal_digest("982e762d646470ca20d637b68cbcf8a4")));
+        literal_digest("23f26dfc1ea13edbe500c410124c229c")));
 }
 inline local_root_reference index_ref() {
     return take(
@@ -73,9 +74,9 @@ inline local_root_reference index_ref() {
         local_root_kind::index,
         local_object_sequence::make(42).value(),
         runtime::file_position{},
-        byte_count{4096},
+        byte_count{4_KiB},
         page_count::make(1).value(),
-        literal_digest("6bb870e77cf82b929664f981e060b034")));
+        literal_digest("c45f8294b5f3a284ad000102abfd778f")));
 }
 inline segment_history_context history() {
     return {
@@ -89,9 +90,9 @@ inline local_footer_reference active_boundary() {
     return take(
       local_footer_reference::make(
         runtime::file_position{12288},
-        byte_count{4096},
+        byte_count{4_KiB},
         6,
-        literal_digest("bd77b0a3ed338668713e003a88c3e130")));
+        literal_digest("c156c15a2d7d3870d7d6d8d16d52ba64")));
 }
 inline local_footer_reference sealed_boundary() {
     return take(
@@ -118,7 +119,7 @@ contexts(const local_device_spec& spec) {
           segment(),
           scope(100, 102, 0, 2, 4096, 16384),
           codec::extent_digest{
-            literal_digest("f2b1003c9e034dfc8ffa143f02be19ab").bytes()},
+            literal_digest("eca717818b53c4ae00458133840519cc").bytes()},
           alignment(4096))
           .value();
     return {
@@ -1089,7 +1090,7 @@ seastar::future<> empty_retry(
         local_root_kind::sealed_retry,
         local_object_sequence::make(42).value(),
         runtime::file_position{4096},
-        byte_count{4096},
+        byte_count{4_KiB},
         page_count::make(0).value(),
         literal_digest("6d93f4087752ba9c90cdc90796a30851")));
     footer_expectation expected{

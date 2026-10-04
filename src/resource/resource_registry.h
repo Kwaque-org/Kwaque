@@ -4,6 +4,7 @@
 #include "src/resource/workload_class.h"
 #include "src/runtime/shard_affinity.h"
 
+#include <seastar/core/coroutine.hh>
 #include <seastar/core/future.hh>
 #include <seastar/core/scheduling.hh>
 #include <seastar/core/shared_future.hh>

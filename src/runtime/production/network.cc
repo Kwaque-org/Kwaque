@@ -1,6 +1,7 @@
 #include "src/runtime/production/network.h"
 
 #include "src/base/invariant.h"
+#include "src/base/units.h"
 #include "src/runtime/fragmented_buffer_internal.h"
 #include "src/runtime/production/network_connect_internal.h"
 
@@ -27,7 +28,7 @@ constexpr invariant_id connection_closed_invariant{"KQ-NET-CONN-CLOSED"};
 constexpr invariant_id connection_gate_invariant{"KQ-NET-CONN-GATE"};
 constexpr invariant_id listener_move_invariant{"KQ-NET-LISTEN-MOVE-IDLE"};
 constexpr invariant_id listener_closed_invariant{"KQ-NET-LISTEN-CLOSED"};
-constexpr std::uint64_t maximum_unflushed_bytes = 1024U * 1024U;
+constexpr std::uint64_t maximum_unflushed_bytes = 1_MiB;
 constexpr auto native_input_buffer_limit = static_cast<unsigned>(
   maximum_contiguous_allocation_bytes);
 static_assert(
@@ -111,7 +112,7 @@ connection::connection(
   , native_(std::move(native))
   , input_(native_.input(
       seastar::connected_socket_input_stream_config{
-        .buffer_size = 8192,
+        .buffer_size = 8_KiB,
         .min_buffer_size = 512,
         .max_buffer_size = native_input_buffer_limit,
       }))
@@ -246,7 +247,8 @@ seastar::future<result<network_read_result>> connection::read(
           seastar::future<seastar::temporary_buffer<char>> completed) mutable
           -> result<network_read_result> {
             static_cast<void>(holder);
-            auto reset = seastar::defer([this] { read_in_flight_ = false; });
+            auto reset = seastar::defer(
+              [this] noexcept { read_in_flight_ = false; });
             try {
                 auto native = completed.get();
                 if (abort_requested_) {
@@ -600,7 +602,7 @@ seastar::future<result<void>> connection::close_once() {
     co_await input_operations_.close();
     co_await output_operations_.close();
     auto release_native = seastar::defer(
-      [this] { native_ = seastar::connected_socket{}; });
+      [this] noexcept { native_ = seastar::connected_socket{}; });
     static_cast<void>(release_native);
     std::optional<operation_error> first_error;
     std::exception_ptr first_exception;
@@ -708,7 +710,8 @@ listener::accept(seastar::abort_source& caller_abort) {
       "open listener rejected accept gate entry");
     accept_in_flight_ = true;
     [[maybe_unused]] auto metric = statistics_->accept();
-    auto reset_accept = seastar::defer([this] { accept_in_flight_ = false; });
+    auto reset_accept = seastar::defer(
+      [this] noexcept { accept_in_flight_ = false; });
     try {
         auto accepted = co_await native_.accept();
         if (caller_abort.abort_requested()) {
@@ -774,7 +777,7 @@ seastar::future<result<void>> listener::close() {
       [this, metric = std::move(metric)](seastar::future<> drained) mutable {
           static_cast<void>(metric);
           auto release_native = seastar::defer(
-            [this] { native_ = seastar::server_socket{}; });
+            [this] noexcept { native_ = seastar::server_socket{}; });
           static_cast<void>(release_native);
           try {
               drained.get();

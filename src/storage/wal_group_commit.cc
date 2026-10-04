@@ -1,6 +1,7 @@
 #include "src/storage/wal_group_commit.h"
 
 #include "src/base/invariant.h"
+#include "src/base/units.h"
 
 #include <seastar/core/abort_on_expiry.hh>
 #include <seastar/core/abortable_fifo.hh>
@@ -111,7 +112,7 @@ runtime::result<void> wal_group_commit_config::validate() const noexcept {
       || maximum_observers == 0
       || maximum_observers > maximum_wal_commit_observers
       || maximum_observers < outstanding_groups
-      || execution_bytes.value() < 4096
+      || execution_bytes.value() < 4_KiB
       || execution_bytes.value() > maximum_contiguous_allocation_bytes)
         return runtime::failure(commit_error(errc::invalid_argument));
     return {};

@@ -160,8 +160,9 @@ class ReservationBoundsTest(unittest.TestCase):
         ):
             samples = self.samples()
             samples[name][field] = value
-            with self.subTest(name=name, field=field), self.assertRaises(
-                AssertionError
+            with (
+                self.subTest(name=name, field=field),
+                self.assertRaises(AssertionError),
             ):
                 MemoryQualificationTest().execution_bounds(samples)
 

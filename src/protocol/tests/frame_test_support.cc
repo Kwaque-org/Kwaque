@@ -1,5 +1,6 @@
 #include "src/protocol/tests/frame_test_support.h"
 
+#include "src/base/units.h"
 #include "src/bytes/fragmented_buffer_builder.h"
 #include "src/codec/staging_cooperative.h"
 #include "src/codec/tests/qualification_profile.h"
@@ -16,7 +17,7 @@
 namespace kwaque::protocol::testing::frame_fixture {
 using bytes::fragmented_buffer;
 namespace {
-constexpr std::size_t maximum_payload = 16U << 20U;
+constexpr std::size_t maximum_payload = 16_MiB;
 constexpr byte_count available{codec::testing::residual};
 } // namespace
 seastar::future<patterned_payload> make_payload(

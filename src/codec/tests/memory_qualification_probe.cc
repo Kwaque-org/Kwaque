@@ -67,6 +67,7 @@ using kwaque::item_count;
 using kwaque::bytes::fragmented_buffer;
 using kwaque::bytes::fragmented_buffer_parser;
 using kwaque::bytes::testing::charge;
+using kwaque::literals::operator""_MiB;
 using testing::measure;
 using testing::opaque;
 using testing::report;
@@ -77,7 +78,7 @@ using testing::residual;
 using testing::retained_cost;
 constexpr codec::field_context context{.origin = 512, .family = 1, .field = 3};
 constexpr codec::envelope_extent_limits extents{
-  byte_count{16U * 1024U * 1024U}, byte_count{32U * 1024U * 1024U}};
+  byte_count{16_MiB}, byte_count{32_MiB}};
 constexpr codec::bench::envelope_expected_body expected{7, 11};
 constexpr std::array<std::size_t, 8> hash_sizes{0, 1, 3, 55, 56, 64, 65, 4096};
 
@@ -306,7 +307,7 @@ void engines(std::string_view scenario) {
           "XXH3 observation changed the result");
 }
 void xxh3_owner() {
-    auto input = make_body(1024U * 1024U);
+    auto input = make_body(1_MiB);
     const auto retained = retained_cost(input);
     const auto expected_digest = [&] {
         codec::xxh3_128_hasher hasher;
@@ -318,14 +319,13 @@ void xxh3_owner() {
     }();
     seastar::abort_source abort;
     codec::cooperative_work work{codec::limits::defaults(), abort};
-    const auto result = measure("xxh3-owner", 1024U * 1024U, retained, [&] {
+    const auto result = measure("xxh3-owner", 1_MiB, retained, [&] {
         return codec::xxh3_128_cooperatively(std::move(input), work).get();
     });
     require(result && *result == expected_digest, "XXH3 owner changed bytes");
 }
 void envelope(std::string_view scenario) {
-    const std::size_t size = scenario.ends_with("max") ? 16U * 1024U * 1024U
-                                                       : 64U;
+    const std::size_t size = scenario.ends_with("max") ? 16_MiB : 64U;
     auto body = make_body(size);
     seastar::abort_source setup_abort;
     codec::cooperative_work setup{codec::limits::defaults(), setup_abort};
@@ -372,12 +372,10 @@ void envelope(std::string_view scenario) {
                   .value();
     const auto retained = retained_cost(wire);
     fragmented_buffer_parser input{std::move(wire)};
-    auto memory = codec::reserve_decode_input(
-                    input,
-                    work.policy(),
-                    {residual, byte_count{1024U * 1024U}, charge},
-                    context)
-                    .value();
+    auto memory
+      = codec::reserve_decode_input(
+          input, work.policy(), {residual, byte_count{1_MiB}, charge}, context)
+          .value();
     auto independent = expected;
     if (scenario == "decode-invalid") ++independent.object;
     if (scenario == "decode-abort") abort.request_abort();
@@ -465,7 +463,7 @@ void collection(std::string_view scenario) {
     }
     seastar::abort_source abort;
     codec::cooperative_work work{codec::limits::defaults(), abort};
-    codec::decode_budget memory{residual, byte_count{1024U * 1024U}, charge};
+    codec::decode_budget memory{residual, byte_count{1_MiB}, charge};
     if (scenario == "collection-pressure")
         memory.metadata_remaining = byte_count{1};
     const auto retained = byte_count{

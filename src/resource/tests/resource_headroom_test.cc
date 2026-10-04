@@ -36,7 +36,7 @@ namespace {
 
 using payload = seastar::temporary_buffer<char>;
 using queue = bounded_work_queue<payload>;
-constexpr std::uint64_t payload_chunk_bytes = 64ULL * 1024ULL;
+constexpr std::uint64_t payload_chunk_bytes = 64_KiB;
 constexpr std::size_t parked_tasks = 256;
 
 // All retained payload is physically allocated and touched. Semaphore units

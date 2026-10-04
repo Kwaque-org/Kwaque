@@ -77,6 +77,11 @@ enum class metric_id : std::uint16_t {
     storage_reserved_tasks = 54,
     storage_reserved_bytes = 55,
     storage_reserved_handles = 56,
+    broker_process_readiness = 57,
+    broker_draining = 58,
+    broker_shards = 59,
+    broker_startup_duration_seconds = 60,
+    broker_start_time_seconds = 61,
 };
 
 struct metric_descriptor final {
@@ -91,7 +96,7 @@ struct metric_descriptor final {
     bool operator==(const metric_descriptor&) const = default;
 };
 
-inline constexpr std::size_t metric_inventory_size{56};
+inline constexpr std::size_t metric_inventory_size{61};
 inline constexpr std::string_view metric_workload_label{"workload"};
 inline constexpr std::array<std::string_view, 8> metric_workload_label_values{
   "foreground_protocol",
@@ -105,7 +110,7 @@ inline constexpr std::array<std::string_view, 8> metric_workload_label_values{
 };
 inline constexpr std::size_t metric_workload_values
   = metric_workload_label_values.size();
-inline constexpr std::size_t metric_series_per_shard{84};
+inline constexpr std::size_t metric_series_per_shard{89};
 
 // Totals are plain unsigned 64-bit owner fields. Their overflow behavior is
 // the language-defined modulo-2^64 arithmetic, with no update-path branch.

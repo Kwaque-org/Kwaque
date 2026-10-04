@@ -4,6 +4,8 @@
 #include "src/storage/format_context.h"
 #include "src/storage/format_size.h"
 
+#include <seastar/util/noncopyable_function.hh>
+
 namespace kwaque::storage {
 namespace detail {
 class wal_codec;
@@ -149,6 +151,42 @@ encode_wal_prepare(
   byte_count parent_remaining,
   bytes::allocation_charge_fn charge,
   codec::field_context context = {});
+
+// The fixed fields of one PREPARE whose envelope integrity, versions and scalar
+// syntax were checked. They are what the bytes say, not independent context:
+// they may select context, never prove it.
+struct wal_prepare_claims final {
+    model::wal_incarnation_id incarnation;
+    runtime::file_position wal_position;
+    storage_alignment alignment;
+    replay_profile profile;
+    segment_context target;
+    model::range_routing_epoch routing_epoch;
+    model::segment_relative_end physical_begin;
+    runtime::file_position target_position;
+};
+
+// Returns the expectation for one PREPARE's claims, or a failure that the
+// resolving decode returns unchanged.
+using wal_prepare_resolver = seastar::noncopyable_function<seastar::future<
+  codec::result<wal_prepare_expectation>>(const wal_prepare_claims&)>;
+
+// As decode_wal_prepare, with the expectation chosen from the PREPARE's own
+// claims inside the same envelope transaction, so its body is read and
+// checksummed once. resolve runs once, after integrity and scalar syntax and
+// before any contextual comparison or child decode. Every field is then
+// compared with the returned expectation. Fields the resolver copies from the
+// claims stay claims: the child decode checks the routing epoch against the
+// child's own binding, and target placement is left to its reconciler.
+// resolve stays alive, unmoved and exclusive until joined completion.
+[[nodiscard]] seastar::future<codec::result<decoded_wal_prepare>>
+decode_wal_prepare_resolved(
+  bytes::fragmented_buffer_parser& input,
+  wal_prepare_resolver& resolve,
+  codec::decode_budget memory,
+  codec::cooperative_work& work,
+  codec::field_context context = {},
+  codec::input_boundary boundary = codec::input_boundary::open);
 
 // Decode one complete PREPARE under one outer envelope transaction. Input,
 // work and abort stay alive, unmoved and exclusive. Reserve the parent input

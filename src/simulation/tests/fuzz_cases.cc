@@ -9,6 +9,7 @@
 #include "src/runtime/fault.h"
 #include "src/runtime/file.h"
 #include "src/runtime/network.h"
+#include "src/runtime/testing/reactor_tasks.h"
 #include "src/runtime/testing/seastar_fuzz.h"
 #include "src/simulation/bandwidth.h"
 #include "src/simulation/determinism_version.h"
@@ -1189,6 +1190,10 @@ struct file_command_observation final {
               && files.pending_bytes().value() == 0 && matches;
     auto metadata_overflow = files.exists(fuzz_file_path(0));
     context.command_completed();
+    // Admission rejects without a simulated event, but its result is
+    // delivered by a reactor task. Draining runs that task and steps nothing,
+    // so an admitted lookup would still be pending.
+    runtime::testing::drain_reactor_tasks().get();
     matches = metadata_overflow.available() && matches;
     if (metadata_overflow.available()) {
         const auto rejected = std::move(metadata_overflow).get();

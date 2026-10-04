@@ -1,6 +1,7 @@
 #include "src/simulation/fake_file.h"
 
 #include "src/base/invariant.h"
+#include "src/base/units.h"
 #include "src/runtime/directory_cursor_internal.h"
 #include "src/runtime/file_error_internal.h"
 #include "src/simulation/storage_fault_key.h"
@@ -1201,7 +1202,7 @@ fake_file_system::validate_config(const fake_file_system_config& config) {
           || (policy.granule_bytes & (policy.granule_bytes - 1U)) != 0
           || policy.maximum_namespace_groups == 0
           || policy.maximum_namespace_groups > 4096
-          || policy.maximum_scratch_bytes.value() < 16U * 1024U
+          || policy.maximum_scratch_bytes.value() < 16_KiB
           || policy.maximum_scratch_bytes > maximum_fake_pending_bytes)
             return runtime::failure(file_error(errc::invalid_argument));
     }
@@ -3225,7 +3226,7 @@ fake_file_system::prepare_selective_crash(fake_operation_id active) {
                - scheduler_->executed_events())
         return runtime::failure(file_error(errc::resource_exhausted));
     auto state = std::make_unique<crash_state>(active, crash_epoch_ + 1U);
-    state->charge(16U * 1024U, policy.maximum_scratch_bytes.value());
+    state->charge(16_KiB, policy.maximum_scratch_bytes.value());
     auto ids = scheduler_->reserve_event_id(continuations);
     auto slot = scheduler_->reserve_event_slot();
     auto work_trace = scheduler_->reserve_trace(
@@ -3508,7 +3509,7 @@ fake_file_system::run_selective_crash(fake_operation_id active) {
                                  return value != std::byte{};
                              })) {
                         state.charge(
-                          8192, policy.maximum_scratch_bytes.value());
+                          8_KiB, policy.maximum_scratch_bytes.value());
                         chosen = seastar::make_lw_shared<page>(
                           std::move(mixed));
                     }

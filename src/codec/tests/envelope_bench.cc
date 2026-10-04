@@ -44,10 +44,9 @@ constexpr std::uint64_t object_generation = 0x1112131415161718ULL;
 constexpr envelope_expected_body expected{object_id, object_generation};
 constexpr field_context coordinates{.origin = 512, .family = 1, .field = 3};
 constexpr envelope_extent_limits extent_limits{
-  byte_count{16U * 1024U * 1024U}, byte_count{32U * 1024U * 1024U}};
+  byte_count{16_MiB}, byte_count{32_MiB}};
 constexpr byte_count frame_reservation = testing::execution_reservation;
-constexpr byte_count parent_remainder{
-  64U * 1024U * 1024U - frame_reservation.value()};
+constexpr byte_count parent_remainder{64_MiB - frame_reservation.value()};
 
 [[gnu::always_inline]] inline void clobber_memory() {
     // Symmetric compiler barrier; no machine instruction is emitted.
@@ -316,7 +315,7 @@ class envelope_fixture {
                  input,
                  limits::defaults(),
                  decode_budget{
-                   remaining, byte_count{1024U * 1024U}, native_capacity_bound},
+                   remaining, byte_count{1_MiB}, native_capacity_bound},
                  coordinates,
                  input_boundary::complete)
           .value();
@@ -444,7 +443,7 @@ class envelope_fixture {
                    limits::defaults(),
                    decode_budget{
                      qualification_remainder,
-                     byte_count{1024U * 1024U},
+                     byte_count{1_MiB},
                      native_capacity_bound},
                    coordinates,
                    input_boundary::complete)
@@ -466,7 +465,7 @@ class envelope_fixture {
                    limits::defaults(),
                    decode_budget{
                      qualification_remainder,
-                     byte_count{1024U * 1024U},
+                     byte_count{1_MiB},
                      native_capacity_bound},
                    coordinates,
                    input_boundary::complete)

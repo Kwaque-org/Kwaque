@@ -30,6 +30,14 @@ struct wal_group_member final {
 
 inline constexpr std::uint32_t maximum_wal_group_members = 64;
 
+// One member of a later offer, borrowed for a measurement or admission call.
+// The expectation's target position may be provisional: WAL geometry and
+// cost do not depend on it.
+struct wal_admission_member final {
+    const encoded_assigned_batch* child{nullptr};
+    const wal_child_expectation* expected{nullptr};
+};
+
 // Bounded offered membership, not a WAL reservation. Reserve its metadata
 // before adding exact, already admitted children. The consumer freezes this
 // owner by moving it; input aliases and their reservations stay with execution.

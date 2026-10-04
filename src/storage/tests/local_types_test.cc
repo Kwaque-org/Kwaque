@@ -1,3 +1,4 @@
+#include "src/base/units.h"
 #include "src/storage/local_metadata_layout.h"
 #include "src/storage/local_types.h"
 
@@ -93,7 +94,7 @@ TEST(LocalTypesTest, RootAndFooterKindsKeepDifferentPlacementRules) {
         local_root_kind::sealed_retry,
         sequence,
         runtime::file_position{},
-        byte_count{4096},
+        byte_count{4_KiB},
         pages,
         hash));
     EXPECT_FALSE(
@@ -104,14 +105,14 @@ TEST(LocalTypesTest, RootAndFooterKindsKeepDifferentPlacementRules) {
         local_root_kind::index,
         sequence,
         runtime::file_position{4096},
-        byte_count{4096},
+        byte_count{4_KiB},
         pages,
         hash));
     auto retry = local_root_reference::make(
                    local_root_kind::sealed_retry,
                    sequence,
                    runtime::file_position{4096},
-                   byte_count{4096},
+                   byte_count{4_KiB},
                    pages,
                    hash)
                    .value();
@@ -121,7 +122,7 @@ TEST(LocalTypesTest, RootAndFooterKindsKeepDifferentPlacementRules) {
         local_root_kind::sealed_retry,
         sequence,
         runtime::file_position{UINT64_MAX},
-        byte_count{4096},
+        byte_count{4_KiB},
         pages,
         hash));
     EXPECT_FALSE(
@@ -129,7 +130,7 @@ TEST(LocalTypesTest, RootAndFooterKindsKeepDifferentPlacementRules) {
         local_root_kind::index,
         {},
         runtime::file_position{},
-        byte_count{4096},
+        byte_count{4_KiB},
         pages,
         hash));
     EXPECT_EQ(parse_local_root_kind(6).error(), errc::unsupported_format);

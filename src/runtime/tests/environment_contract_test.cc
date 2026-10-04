@@ -10,6 +10,7 @@
 
 #include <boost/test/unit_test.hpp>
 
+#include <cstddef>
 #include <optional>
 #include <span>
 #include <string_view>
@@ -57,8 +58,14 @@ static_assert(
 static_assert(!exposes_fault_injector<production_backend>);
 static_assert(exposes_fault_injector<deterministic_backend>);
 static_assert(!exposes_random<timer_only_view>);
-static_assert(sizeof(timer_only_view) <= 32);
-static_assert(sizeof(kwaque::runtime::basic_runtime<production_backend>) <= 32);
+// A view or root adds two words to its lease: the owner shard and the
+// backend. The bound follows the lease, which Seastar's debug mode enlarges.
+constexpr std::size_t leased_handle_bytes = 2 * sizeof(void*)
+                                            + sizeof(seastar::gate::holder);
+static_assert(sizeof(timer_only_view) <= leased_handle_bytes);
+static_assert(
+  sizeof(kwaque::runtime::basic_runtime<production_backend>)
+  <= leased_handle_bytes);
 
 template<kwaque::runtime::runtime_backend Backend>
 seastar::future<> exercise_contract(Backend& backend) {
@@ -151,11 +158,15 @@ seastar::future<> exercise_contract(Backend& backend) {
 } // namespace
 
 SEASTAR_TEST_CASE(runtime_consumer_instantiates_for_both_backend_shapes) {
+    // The consumer held leases, so each lifetime is closed before its backend
+    // is destroyed: the destructor cannot wait for a close.
     production_backend production;
     co_await exercise_contract(production);
+    co_await production.lifetime().close();
 
     deterministic_backend deterministic;
     co_await exercise_contract(deterministic);
+    co_await deterministic.lifetime().close();
 }
 
 SEASTAR_TEST_CASE(

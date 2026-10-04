@@ -1,5 +1,7 @@
 #pragma once
 
+#include "src/base/units.h"
+
 #include <cstdint>
 #include <span>
 
@@ -12,7 +14,7 @@ struct envelope_fuzz_options final {
     bool cleanup_abort{false};
     bool exhaust_operation{false};
     bool exhaust_metadata{false};
-    std::uint64_t work_bytes{65536};
+    std::uint64_t work_bytes{64_KiB};
     std::uint64_t work_items{256};
     std::uint8_t layout{0};
     std::uint8_t checkpoint_depth{0};

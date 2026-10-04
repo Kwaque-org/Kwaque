@@ -1,3 +1,4 @@
+#include "src/base/units.h"
 #include "src/runtime/fault.h"
 #include "src/simulation/scheduler.h"
 #include "src/simulation/scheduler_test_support.h"
@@ -25,6 +26,7 @@
 #include <vector>
 
 namespace {
+using kwaque::literals::operator""_KiB;
 
 using kwaque::runtime::monotonic_time;
 using kwaque::simulation::event_id;
@@ -1100,8 +1102,8 @@ SEASTAR_TEST_CASE(
                            .maximum_deadline = monotonic_time{100}})
                           .value();
     const auto budget = trace_limits::make({.entries = 32,
-                                            .encoded_bytes = 16384,
-                                            .line_bytes = 1024})
+                                            .encoded_bytes = 16_KiB,
+                                            .line_bytes = 1_KiB})
                           .value();
     for (const bool traced : {false, true}) {
         event_trace trace{
@@ -1180,7 +1182,7 @@ SEASTAR_TEST_CASE(
                            .encoded_bytes = canonical_header_encoded_size
                                             + count
                                                 * canonical_entry_encoded_size,
-                           .line_bytes = 1024})
+                           .line_bytes = 1_KiB})
                           .value();
     event_trace trace{
       trace_header::current(
@@ -1232,7 +1234,8 @@ SEASTAR_TEST_CASE(
             bool reached = false;
             auto attempted = [&] {
                 auto& injector = seastar::memory::local_failure_injector();
-                auto reset = seastar::defer([&] { injector.cancel(); });
+                auto reset = seastar::defer(
+                  [&] noexcept { injector.cancel(); });
                 injector.fail_after(0);
                 auto future = event_trace::decode_cooperatively(
                   std::move(probe), budget, 32);

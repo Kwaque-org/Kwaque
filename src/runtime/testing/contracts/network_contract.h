@@ -1,6 +1,7 @@
 #ifndef KWAQUE_SRC_RUNTIME_TESTING_CONTRACTS_NETWORK_CONTRACT_H_
 #define KWAQUE_SRC_RUNTIME_TESTING_CONTRACTS_NETWORK_CONTRACT_H_
 
+#include "src/base/units.h"
 #include "src/bytes/fragmented_buffer_builder.h"
 #include "src/runtime/network.h"
 #include "src/runtime/testing/contracts/cleanup.h"
@@ -32,7 +33,7 @@ namespace kwaque::runtime::testing {
 
 inline constexpr std::size_t network_contract_clients{3};
 inline constexpr std::size_t network_contract_stream_chunks{1'000};
-inline constexpr std::size_t network_contract_stream_chunk_bytes{8U * 1024U};
+inline constexpr std::size_t network_contract_stream_chunk_bytes{8_KiB};
 
 // A watchdog cancels the scenario and joins its original future. Reporting a
 // timeout never detaches the resource-owning coroutine or its cleanup.
@@ -801,7 +802,7 @@ template<network_backend Backend>
 seastar::future<>
 saturation_and_abort_body(Backend& backend, scenario_owner<Backend>& owner) {
     const network_connection_limits limits{
-      .pending_write_bytes = byte_count{2U * 1024U * 1024U},
+      .pending_write_bytes = byte_count{2_MiB},
       .pending_writes = 2,
     };
     owner.listeners[0].start(backend.listen(
@@ -827,7 +828,7 @@ saturation_and_abort_body(Backend& backend, scenario_owner<Backend>& owner) {
     auto& server = owner.servers[0].get();
 
     owner.writes[0].emplace(
-      server.write(repeated_bytes(1024U * 1024U, 'a'), owner.write_aborts[0]));
+      server.write(repeated_bytes(1_MiB, 'a'), owner.write_aborts[0]));
     require(
       !owner.writes[0]->available(),
       "saturation active write completed too early");

@@ -1,8 +1,9 @@
 #include "src/model/batch_staging.h"
 
+#include "src/base/units.h"
+
 #include <algorithm>
 #include <cstdint>
-#include <limits>
 
 namespace kwaque::model::detail {
 namespace {
@@ -20,7 +21,7 @@ codec::result<batch_staging_shape> make_batch_staging(
         return codec::failure(at(anchor, errc::invalid_argument));
     const auto cap = policy.config();
     auto width = std::min(
-      {std::uint64_t{65536},
+      {64_KiB,
        cap.max_allocation_bytes.value(),
        cap.max_expanded_batch_bytes.value()});
     while (width != 0) {
@@ -74,19 +75,17 @@ codec::result<byte_count> admit_batch_staging(
     const auto tail = charge(shape.config.max_fragment_bytes);
     if (tail < shape.config.max_fragment_bytes)
         return codec::failure(at(anchor, errc::invalid_argument));
-    if (
-      !policy.validate_allocation(tail)
-      || tail.value() > std::numeric_limits<std::uint64_t>::max() / count)
+    const auto backing = tail.checked_mul(count);
+    if (!policy.validate_allocation(tail) || !backing)
         return codec::failure(at(anchor, errc::resource_exhausted));
-    const byte_count backing{count * tail.value()};
     if (!policy.validate_buffer(
           total,
-          backing,
+          *backing,
           item_count{count},
           policy.config().max_expanded_batch_bytes))
         return codec::failure(at(anchor, errc::resource_exhausted));
     const auto available = policy.remaining_operation_bytes(
-      {.staged_output = backing, .payload_bookkeeping = shape.descriptors},
+      {.staged_output = *backing, .payload_bookkeeping = shape.descriptors},
       remaining);
     if (!available) return codec::failure(at(anchor, errc::resource_exhausted));
     return *available;

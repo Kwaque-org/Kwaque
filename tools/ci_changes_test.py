@@ -90,10 +90,13 @@ class DocumentationSelectionTest(unittest.TestCase):
             root = Path(temporary)
             event, output = root / "event.json", root / "output"
             event.write_text("invalid json")
-            with mock.patch.dict(
-                os.environ,
-                {"GITHUB_EVENT_PATH": str(event), "GITHUB_OUTPUT": str(output)},
-            ), contextlib.redirect_stdout(io.StringIO()):
+            with (
+                mock.patch.dict(
+                    os.environ,
+                    {"GITHUB_EVENT_PATH": str(event), "GITHUB_OUTPUT": str(output)},
+                ),
+                contextlib.redirect_stdout(io.StringIO()),
+            ):
                 ci_changes.main()
             self.assertEqual(output.read_text(), "run_checks=true\n")
 
@@ -213,8 +216,9 @@ class GitChangeSelectionTest(unittest.TestCase):
             ({"before": self.base}, "f" * 40),
             ({"before": "--bad-option"}, self.base),
         ):
-            with self.subTest(event=event, head=head), contextlib.redirect_stdout(
-                io.StringIO()
+            with (
+                self.subTest(event=event, head=head),
+                contextlib.redirect_stdout(io.StringIO()),
             ):
                 self.assertTrue(
                     ci_changes.requires_checks("push", event, head, self.root)
@@ -225,18 +229,18 @@ class GitChangeSelectionTest(unittest.TestCase):
         head = self.commit()
         event, output = self.root / "event.json", self.root / "output"
         event.write_text(json.dumps({"before": self.base}))
-        with mock.patch.dict(
-            os.environ,
-            {
-                "GITHUB_EVENT_NAME": "push",
-                "GITHUB_EVENT_PATH": str(event),
-                "GITHUB_SHA": head,
-                "GITHUB_OUTPUT": str(output),
-            },
-        ), mock.patch.object(
-            ci_changes.Path, "cwd", return_value=self.root
-        ), contextlib.redirect_stdout(
-            io.StringIO()
+        with (
+            mock.patch.dict(
+                os.environ,
+                {
+                    "GITHUB_EVENT_NAME": "push",
+                    "GITHUB_EVENT_PATH": str(event),
+                    "GITHUB_SHA": head,
+                    "GITHUB_OUTPUT": str(output),
+                },
+            ),
+            mock.patch.object(ci_changes.Path, "cwd", return_value=self.root),
+            contextlib.redirect_stdout(io.StringIO()),
         ):
             ci_changes.main()
         self.assertEqual(output.read_text(), "run_checks=false\n")

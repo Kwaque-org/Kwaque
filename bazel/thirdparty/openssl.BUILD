@@ -54,9 +54,16 @@ configure_make(
         "@platforms//cpu:x86_64": ["linux-x86_64"],
     }) + [
         "--libdir=lib",
+        # Certificate lookups use the system store under OPENSSLDIR.
         "--openssldir=/etc/ssl",
         "--prefix=/",
+        # The broker links libcrypto and libssl statically and never reads a
+        # host openssl.cnf or loads provider modules: its cryptography does
+        # not depend on the host's OpenSSL installation.
+        "no-autoload-config",
         "no-docs",
+        "no-module",
+        "no-shared",
         "no-tests",
     ] + select({
         ":debug_mode": ["--debug"],
@@ -76,9 +83,10 @@ configure_make(
         "SOURCE_DATE_EPOCH": "0",
     },
     lib_source = ":srcs",
-    out_shared_libs = [
-        "libcrypto.so.3",
-        "libssl.so.3",
+    # libssl depends on libcrypto, so it precedes it on the link line.
+    out_static_libs = [
+        "libssl.a",
+        "libcrypto.a",
     ],
     toolchains = [":build_jobs"],
     visibility = ["//visibility:public"],

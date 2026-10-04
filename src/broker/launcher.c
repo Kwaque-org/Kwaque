@@ -1,6 +1,7 @@
 #define _POSIX_C_SOURCE 200809L
 
 #include "src/broker/cpu_features.h"
+#include "src/broker/exit_code.h"
 
 #include <errno.h>
 #include <limits.h>
@@ -8,7 +9,7 @@
 #include <string.h>
 #include <unistd.h>
 
-static int fail(const char* message) {
+static int fail_with(int status, const char* message) {
     size_t remaining = strlen(message);
     while (remaining != 0) {
         const ssize_t written = write(STDERR_FILENO, message, remaining);
@@ -21,7 +22,11 @@ static int fail(const char* message) {
         message += written;
         remaining -= (size_t)written;
     }
-    return 1;
+    return status;
+}
+
+static int fail(const char* message) {
+    return fail_with(KWAQUE_EXIT_FAILURE, message);
 }
 
 int main(int argc, char** argv) {
@@ -30,9 +35,12 @@ int main(int argc, char** argv) {
     // Check the CPU before loading the native broker and its shared libraries.
     if (!kwaque_cpu_supported()) {
 #if defined(__x86_64__)
-        return fail("kwaque: CPU lacks required westmere instructions\n");
+        return fail_with(
+          KWAQUE_EXIT_UNSUPPORTED_CPU,
+          "kwaque: CPU lacks required westmere instructions\n");
 #elif defined(__aarch64__)
-        return fail(
+        return fail_with(
+          KWAQUE_EXIT_UNSUPPORTED_CPU,
           "kwaque: CPU lacks required armv8-a+crc+crypto instructions\n");
 #endif
     }

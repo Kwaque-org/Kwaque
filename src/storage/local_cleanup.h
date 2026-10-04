@@ -1,5 +1,6 @@
 #pragma once
 
+#include "src/base/units.h"
 #include "src/storage/local_discovery.h"
 
 namespace kwaque::storage {
@@ -57,7 +58,7 @@ enumerate_local_cleanup(
   Visitor visit,
   local_discovery_limits bounds = {}) {
     static_assert(
-      sizeof(Resolver) + sizeof(References) + sizeof(Visitor) <= 8192);
+      sizeof(Resolver) + sizeof(References) + sizeof(Visitor) <= 8_KiB);
     auto observe = [&](const local_discovered_record& record)
       -> seastar::future<runtime::result<bool>> {
         auto facts = co_await references(record);

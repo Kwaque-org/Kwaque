@@ -28,6 +28,8 @@
 #include <vector>
 
 namespace {
+using kwaque::literals::operator""_KiB;
+using kwaque::literals::operator""_MiB;
 
 namespace codec = kwaque::codec;
 using kwaque::byte_count;
@@ -37,7 +39,7 @@ using kwaque::bytes::fragmented_buffer;
 using native_fragment = seastar::temporary_buffer<char>;
 using namespace std::literals;
 
-constexpr byte_count parent_budget{64U * 1024U * 1024U};
+constexpr byte_count parent_budget{64_MiB};
 constexpr codec::field_context context{.origin = 71, .family = 4, .field = 8};
 
 // Synthetic conservative served-capacity bound for these bounded fixtures.
@@ -159,7 +161,7 @@ TEST(
 
 TEST(
   CooperativeStagingTest, LargeDonationsPreserveBackingUnderSmallCopyLimits) {
-    native_fragment storage{128U * 1024U};
+    native_fragment storage{128_KiB};
     std::fill_n(storage.get_write(), storage.size(), 'z');
     auto payload = fragmented_buffer::copy_from_fragment(storage).value();
     const auto* original = payload.fragment_at(0)->data();
@@ -177,7 +179,7 @@ TEST(
     ASSERT_TRUE(result.has_value());
     ASSERT_EQ(result->fragment_count(), 1U);
     EXPECT_EQ(result->fragment_at(0)->data(), original);
-    EXPECT_EQ(result->size(), byte_count{128U * 1024U});
+    EXPECT_EQ(result->size(), byte_count{128_KiB});
 }
 
 TEST(CooperativeStagingTest, ThreeOwnersTransferInOrderAndRejectAliasedInputs) {
@@ -195,7 +197,7 @@ TEST(CooperativeStagingTest, ThreeOwnersTransferInOrderAndRejectAliasedInputs) {
                       work,
                       byte_count{32},
                       {},
-                      byte_count{1U << 20U},
+                      byte_count{1_MiB},
                       charge)
                       .get();
     EXPECT_FALSE(rejected);
@@ -211,7 +213,7 @@ TEST(CooperativeStagingTest, ThreeOwnersTransferInOrderAndRejectAliasedInputs) {
                     work,
                     byte_count{15},
                     {},
-                    byte_count{1U << 20U},
+                    byte_count{1_MiB},
                     charge)
                     .get();
     ASSERT_TRUE(result);
@@ -237,13 +239,10 @@ TEST(CooperativeStagingTest, MaximumPackingLayoutDoesNotBecomeOneLargeCopy) {
     seastar::abort_source abort;
     codec::cooperative_work work{codec::limits::defaults(), abort};
     const auto result = assemble(
-      fragmented_buffer{},
-      std::move(payload),
-      work,
-      byte_count{4U * 1024U * 1024U});
+      fragmented_buffer{}, std::move(payload), work, byte_count{4_MiB});
     ASSERT_TRUE(result.has_value());
     EXPECT_LE(result->fragment_count(), 1024U);
-    EXPECT_EQ(result->size(), byte_count{4U * 1024U * 1024U});
+    EXPECT_EQ(result->size(), byte_count{4_MiB});
     std::size_t offset = 0;
     bool matched = true;
     for (const auto fragment : *result) {

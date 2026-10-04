@@ -1,3 +1,4 @@
+#include "src/base/units.h"
 #include "src/bytes/fragmented_buffer.h"
 #include "src/runtime/fault.h"
 #include "src/runtime/testing/contracts/network_contract.h"
@@ -225,7 +226,7 @@ public:
     fault_construction_fixture()
       : budget_(
           trace_limits::make(
-            {.entries = 16, .encoded_bytes = 16384, .line_bytes = 1024})
+            {.entries = 16, .encoded_bytes = 16_KiB, .line_bytes = 1_KiB})
             .value())
       , trace_(
           trace_header::current(
@@ -289,7 +290,7 @@ public:
             {.entries = count,
              .encoded_bytes = canonical_header_encoded_size
                               + count * canonical_entry_encoded_size,
-             .line_bytes = 1024})
+             .line_bytes = 1_KiB})
             .value()) {
         event_trace trace{
           trace_header::current(

@@ -11,9 +11,8 @@
 namespace kwaque::broker {
 
 service_lifecycle::service_lifecycle(
-  seastar::abort_source& abort_source, bool rollback_on_start_failure) noexcept
-  : abort_source_(abort_source)
-  , rollback_on_start_failure_(rollback_on_start_failure) {}
+  seastar::abort_source& abort_source) noexcept
+  : abort_source_(abort_source) {}
 
 service_lifecycle::~service_lifecycle() {
     assert_current();
@@ -22,11 +21,6 @@ service_lifecycle::~service_lifecycle() {
       state_ == service_lifecycle_state::stopped
         || (state_ == service_lifecycle_state::open && started_.empty() && !operation_active_),
       "service lifecycle destroyed with active services");
-}
-
-seastar::future<>
-service_lifecycle::start_step(action start, action stop_action) {
-    return start_step("service", std::move(start), std::move(stop_action));
 }
 
 seastar::future<> service_lifecycle::start_step(
@@ -55,12 +49,6 @@ seastar::future<> service_lifecycle::start_step(
     }
     operation_active_ = false;
     if (startup_failure) {
-        if (rollback_on_start_failure_) {
-            try {
-                co_await stop();
-            } catch (...) {
-            }
-        }
         std::rethrow_exception(startup_failure);
     }
 }

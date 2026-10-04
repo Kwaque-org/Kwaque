@@ -20,7 +20,7 @@ namespace kwaque::bytes {
 
 namespace {
 
-constexpr std::size_t fragment_bytes = 4096;
+constexpr std::size_t fragment_bytes = 4_KiB;
 constexpr std::size_t fragment_total = 64;
 constexpr std::size_t tiny_append_total = 1024;
 constexpr std::size_t benchmark_inner_iterations = 1000;

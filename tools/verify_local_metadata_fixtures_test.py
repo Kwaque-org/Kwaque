@@ -13,7 +13,7 @@ class LocalMetadataFixtureTest(unittest.TestCase):
             Path(__file__).resolve().parents[1]
             / "src/storage/tests/testdata/local_metadata"
         )
-        for number, count in enumerate((24, 24, 24, 19), 1):
+        for number, count in enumerate((24, 25, 24, 19), 1):
             with self.subTest(manifest=number):
                 self.assertEqual(verify(root / f"manifest-{number:02}.json"), count)
 

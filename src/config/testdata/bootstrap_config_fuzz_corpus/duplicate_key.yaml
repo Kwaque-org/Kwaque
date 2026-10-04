@@ -1,4 +1,4 @@
 kwaque:
   schema_version: 1
-  node_id: 0
-  node_id: 1
+  developer_mode: true
+  developer_mode: false

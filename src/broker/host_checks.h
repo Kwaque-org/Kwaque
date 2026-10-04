@@ -16,6 +16,11 @@ namespace kwaque::broker {
 
 enum class host_check_severity : std::uint8_t { info, warning, error };
 
+// Below the minimum open-file limit a broker reports an error; below the
+// recommendation it reports a warning. Storage holds descriptors per segment.
+inline constexpr std::uint64_t minimum_descriptor_limit = 10'000;
+inline constexpr std::uint64_t recommended_descriptor_limit = 200'000;
+
 struct host_check_result final {
     std::string_view name;
     host_check_severity severity{host_check_severity::info};
@@ -75,5 +80,10 @@ evaluate_host_checks(const host_snapshot& snapshot);
   std::filesystem::path kernel_root = "/");
 
 void log_host_checks(const host_check_report& report, seastar::logger& logger);
+
+// Raises this process's soft open-file limit to its hard limit. Unlike host
+// tuning, this changes nothing outside the process; the descriptor check then
+// grades the result.
+void raise_descriptor_limit(seastar::logger& logger);
 
 } // namespace kwaque::broker

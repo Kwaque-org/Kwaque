@@ -19,6 +19,8 @@
 #include <utility>
 
 namespace {
+using kwaque::literals::operator""_KiB;
+using kwaque::literals::operator""_MiB;
 
 struct contract_directory_cursor {
     contract_directory_cursor(contract_directory_cursor&&) noexcept = default;
@@ -108,7 +110,7 @@ TEST(FileContractTest, DirectoryPagesHaveIndependentHardLimits) {
     using kwaque::runtime::directory_page_limits;
     EXPECT_TRUE(directory_page_limits{}.validate().has_value());
     EXPECT_TRUE((directory_page_limits{
-      kwaque::item_count{1024}, kwaque::byte_count{256U * 1024U}}
+      kwaque::item_count{1024}, kwaque::byte_count{256_KiB}}
                    .validate()
                    .has_value()));
     EXPECT_FALSE(
@@ -124,7 +126,7 @@ TEST(FileContractTest, DirectoryPagesHaveIndependentHardLimits) {
          .validate()
          .has_value()));
     EXPECT_FALSE((directory_page_limits{
-      kwaque::item_count{1}, kwaque::byte_count{256U * 1024U + 1U}}
+      kwaque::item_count{1}, kwaque::byte_count{256_KiB + 1U}}
                     .validate()
                     .has_value()));
 }
@@ -319,9 +321,9 @@ TEST(FileContractTest, SpaceSamplesCheckUnitsSentinelsAndOrdering) {
     const auto sample = file_system_space::from_blocks(
       4096, 256, 128, 64, true);
     ASSERT_TRUE(sample.has_value());
-    EXPECT_EQ(sample->capacity(), byte_count{1048576});
-    EXPECT_EQ(sample->free(), byte_count{524288});
-    EXPECT_EQ(sample->available(), byte_count{262144});
+    EXPECT_EQ(sample->capacity(), byte_count{1_MiB});
+    EXPECT_EQ(sample->free(), byte_count{512_KiB});
+    EXPECT_EQ(sample->available(), byte_count{256_KiB});
     EXPECT_TRUE(sample->read_only());
     EXPECT_TRUE(file_system_space::from_blocks(4096, 256, 0, 0, false));
     EXPECT_TRUE(file_system_space::make({}, {}, {}, true));

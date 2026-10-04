@@ -1,5 +1,6 @@
 #pragma once
 
+#include "src/base/units.h"
 #include "src/bytes/fragmented_buffer_builder.h"
 #include "src/bytes/test_allocation_profile.h"
 #include "src/runtime/environment.h"
@@ -77,7 +78,7 @@ public:
       , budget_(
           backend.resource_manager().acquire_workload(
             resource::workload_class::metadata),
-          {.tasks = 4, .bytes = byte_count{128U * 1024U}, .handles = 2},
+          {.tasks = 4, .bytes = byte_count{128_KiB}, .handles = 2},
           bytes::testing::charge)
       , scope_(budget_, [this] { return finish(); }) {}
 
@@ -112,7 +113,7 @@ public:
             ++wakes_;
         }));
         take(scope_.spawn(
-          byte_count{4096}, [this] -> seastar::future<runtime::result<void>> {
+          byte_count{4_KiB}, [this] -> seastar::future<runtime::result<void>> {
               co_await wake_.get_future();
               if (batch_timer_) {
                   auto waiting = std::move(*batch_timer_);
@@ -179,7 +180,7 @@ public:
           !backend.lifetime().acquire(),
           "early abort admitted a runtime lease");
         bool invoked = false;
-        const auto rejected = scope_.spawn(byte_count{4096}, [&invoked] {
+        const auto rejected = scope_.spawn(byte_count{4_KiB}, [&invoked] {
             invoked = true;
             return seastar::make_ready_future<runtime::result<void>>(
               runtime::result<void>{});

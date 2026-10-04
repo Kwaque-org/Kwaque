@@ -11,36 +11,12 @@ import sys
 import tempfile
 from pathlib import Path
 
-
-def resolve_runfile(value: str) -> Path:
-    path = Path(value)
-    candidates = [path] if path.is_absolute() else [Path.cwd() / path]
-    if not path.is_absolute() and (runfiles := os.environ.get("RUNFILES_DIR")):
-        candidates.append(Path(runfiles) / path)
-        if workspace := os.environ.get("TEST_WORKSPACE"):
-            candidates.append(Path(runfiles) / workspace / path)
-    for candidate in candidates:
-        if candidate.exists():
-            return candidate.resolve()
-    raise FileNotFoundError(f"runfile not found: {value}")
+from bazel.native_test_environment import normalized_environment, resolve_runfile
 
 
-def normalized_environment() -> dict[str, str]:
-    environment = dict(os.environ)
-    if symbolizer := environment.get("ASAN_SYMBOLIZER_PATH"):
-        environment["ASAN_SYMBOLIZER_PATH"] = str(resolve_runfile(symbolizer))
-    for variable in ("ASAN_OPTIONS", "LSAN_OPTIONS", "UBSAN_OPTIONS"):
-        options = environment.get(variable, "").split(":")
-        for index, option in enumerate(options):
-            key, separator, value = option.partition("=")
-            if (
-                separator
-                and key in {"suppressions", "external_symbolizer_path"}
-                and value
-            ):
-                options[index] = f"{key}={resolve_runfile(value)}"
-        environment[variable] = ":".join(options)
-    return environment
+# Each target bounds its own input with -max_len, sized to what it parses.
+# This ceiling only rejects a campaign whose inputs would not be bounded.
+MAXIMUM_INPUT_BYTES = 1 << 20
 
 
 def normalized_arguments(arguments: list[str]) -> list[str]:
@@ -118,7 +94,7 @@ def main(argv: list[str] | None = None) -> int:
     environment = normalized_environment()
     seconds = positive_limit(fuzzer_args, "max_total_time", 2, 600)
     input_timeout = positive_limit(fuzzer_args, "timeout", 15, 60)
-    maximum_length = positive_limit(fuzzer_args, "max_len", 4096, 16384)
+    maximum_length = positive_limit(fuzzer_args, "max_len", 4096, MAXIMUM_INPUT_BYTES)
     minimize_seconds = int(environment.get("KWAQUE_FUZZ_MINIMIZE_SECONDS", "0"))
     if not 0 <= minimize_seconds <= 60:
         raise ValueError("KWAQUE_FUZZ_MINIMIZE_SECONDS must be between 0 and 60")
@@ -135,8 +111,16 @@ def main(argv: list[str] | None = None) -> int:
     output_root = Path(environment.get("TEST_UNDECLARED_OUTPUTS_DIR") or work).resolve()
     output_root.mkdir(parents=True, exist_ok=True)
     artifacts = Path(tempfile.mkdtemp(prefix="fuzz-", dir=output_root))
-    corpus = work / "corpus"
-    corpus.mkdir()
+    if persistent := environment.get("KWAQUE_FUZZ_CORPUS_DIR"):
+        # A scheduled campaign continues from the corpus that earlier campaigns
+        # grew. The caller makes the directory writable and keeps it.
+        corpus = Path(persistent)
+        if not corpus.is_absolute():
+            raise ValueError("KWAQUE_FUZZ_CORPUS_DIR must be an absolute path")
+        corpus.mkdir(parents=True, exist_ok=True)
+    else:
+        corpus = work / "corpus"
+        corpus.mkdir()
     for index, source in enumerate(seeds):
         shutil.copyfile(source, corpus / f"{index:03d}-{source.name}")
 

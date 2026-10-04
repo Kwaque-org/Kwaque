@@ -1,3 +1,4 @@
+#include "src/base/units.h"
 #include "src/broker/application_internal.h"
 #include "src/broker/application_test_support.h"
 #include "src/broker/service_lifecycle.h"
@@ -27,6 +28,7 @@
 #include <vector>
 
 namespace {
+using kwaque::literals::operator""_MiB;
 
 seastar::future<> ready() { return seastar::make_ready_future<>(); }
 
@@ -73,7 +75,7 @@ application_config(std::filesystem::path data_directory, std::uint16_t port) {
     result.data_directory = std::move(data_directory);
     result.admin_port = port;
     result.developer_mode = true;
-    result.diagnostic_memory_per_shard_bytes = 134217728U;
+    result.diagnostic_memory_per_shard_bytes = 128_MiB;
     return result;
 }
 
@@ -104,7 +106,7 @@ SEASTAR_TEST_CASE(resource_configuration_uses_smallest_shard_allocator) {
 
 SEASTAR_TEST_CASE(
   broker_memory_profile_keeps_suitability_and_reserves_separate) {
-    constexpr std::uint64_t mebibyte{1024U * 1024U};
+    constexpr std::uint64_t mebibyte{1_MiB};
     constexpr std::uint64_t production_minimum{132U * mebibyte};
     const auto production = kwaque::broker::detail::broker_resource_config(
       kwaque::byte_count{production_minimum}, false);
@@ -201,6 +203,7 @@ SEASTAR_TEST_CASE(lifecycle_starts_in_order_and_stops_in_reverse) {
     std::vector<std::string> events;
 
     co_await lifecycle.start_step(
+      "step",
       [&events] {
           events.emplace_back("start:first");
           return ready();
@@ -210,6 +213,7 @@ SEASTAR_TEST_CASE(lifecycle_starts_in_order_and_stops_in_reverse) {
           return ready();
       });
     co_await lifecycle.start_step(
+      "step",
       [&events] {
           events.emplace_back("start:second");
           return ready();
@@ -226,12 +230,13 @@ SEASTAR_TEST_CASE(lifecycle_starts_in_order_and_stops_in_reverse) {
     BOOST_CHECK_EQUAL(lifecycle.running_steps(), 0U);
 }
 
-SEASTAR_TEST_CASE(lifecycle_rolls_back_after_start_failure) {
+SEASTAR_TEST_CASE(lifecycle_retains_cleanup_after_start_failure_until_stop) {
     seastar::abort_source abort_source;
     kwaque::broker::service_lifecycle lifecycle(abort_source);
     std::vector<std::string> events;
 
     co_await lifecycle.start_step(
+      "step",
       [&events] {
           events.emplace_back("start:first");
           return ready();
@@ -244,6 +249,7 @@ SEASTAR_TEST_CASE(lifecycle_rolls_back_after_start_failure) {
     bool failed = false;
     try {
         co_await lifecycle.start_step(
+          "step",
           [&events] {
               events.emplace_back("start:second");
               return seastar::make_exception_future<>(
@@ -258,6 +264,10 @@ SEASTAR_TEST_CASE(lifecycle_rolls_back_after_start_failure) {
     }
 
     BOOST_REQUIRE(failed);
+    // Cleanup for the failed step was registered before it ran; the owner
+    // decides when to roll back.
+    BOOST_CHECK_EQUAL(lifecycle.running_steps(), 2U);
+    co_await lifecycle.stop();
     const std::vector<std::string> expected{
       "start:first", "start:second", "stop:second", "stop:first"};
     BOOST_CHECK(events == expected);
@@ -271,6 +281,7 @@ SEASTAR_TEST_CASE(lifecycle_stop_is_idempotent_while_cleanup_is_pending) {
     unsigned stops = 0;
 
     co_await lifecycle.start_step(
+      "step",
       [] { return ready(); },
       [&release, &stops] -> seastar::future<> {
           ++stops;
@@ -290,12 +301,13 @@ SEASTAR_TEST_CASE(lifecycle_stop_is_idempotent_while_cleanup_is_pending) {
       lifecycle.state() == kwaque::broker::service_lifecycle_state::stopped);
 }
 
-SEASTAR_TEST_CASE(lifecycle_rolls_back_when_startup_is_interrupted) {
+SEASTAR_TEST_CASE(lifecycle_retains_cleanup_when_startup_is_interrupted) {
     seastar::abort_source abort_source;
     kwaque::broker::service_lifecycle lifecycle(abort_source);
     std::vector<std::string> events;
 
     co_await lifecycle.start_step(
+      "step",
       [&events] {
           events.emplace_back("start:first");
           return ready();
@@ -309,6 +321,7 @@ SEASTAR_TEST_CASE(lifecycle_rolls_back_when_startup_is_interrupted) {
     bool interrupted = false;
     try {
         co_await lifecycle.start_step(
+          "step",
           [&events] {
               events.emplace_back("start:second");
               return ready();
@@ -322,6 +335,8 @@ SEASTAR_TEST_CASE(lifecycle_rolls_back_when_startup_is_interrupted) {
     }
 
     BOOST_REQUIRE(interrupted);
+    BOOST_CHECK_EQUAL(lifecycle.running_steps(), 1U);
+    co_await lifecycle.stop();
     const std::vector<std::string> expected{"start:first", "stop:first"};
     BOOST_CHECK(events == expected);
     BOOST_CHECK_EQUAL(lifecycle.running_steps(), 0U);
@@ -333,12 +348,14 @@ SEASTAR_TEST_CASE(lifecycle_preserves_first_stop_failure_and_finishes_cleanup) {
     std::vector<std::string> events;
 
     co_await lifecycle.start_step(
+      "step",
       [] { return ready(); },
       [&events] {
           events.emplace_back("stop:first");
           return ready();
       });
     co_await lifecycle.start_step(
+      "step",
       [] { return ready(); },
       [&events] {
           events.emplace_back("stop:second");

@@ -5,6 +5,7 @@
 #include "proto/kwaque/control/v1/handshake.pb.h"
 #include "proto/kwaque/control/v1/redirect.pb.h"
 #include "src/base/allocation.h"
+#include "src/base/units.h"
 #include "src/bytes/test_allocation_profile.h"
 #include "src/codec/transaction.h"
 #include "src/protocol/control_memory.h"
@@ -103,8 +104,7 @@ void qualify(message id, const std::string& wire, bool accepted = true) {
       input.get(), static_cast<int>(input.size()));
     EXPECT_EQ(parsed, accepted);
     EXPECT_LE(value->SpaceUsedLong(), cost->generated_peak.value());
-    EXPECT_LE(
-      cost->generated_peak.value() + cost->input_copy.value(), 1U << 20U);
+    EXPECT_LE(cost->generated_peak.value() + cost->input_copy.value(), 1_MiB);
     EXPECT_LE(
       cost->largest_allocation.value(), maximum_contiguous_allocation_bytes);
     seastar::thread::maybe_yield();
@@ -113,12 +113,12 @@ void qualify(message id, const std::string& wire, bool accepted = true) {
 TEST(ControlMemoryTest, MaximumRootProofsFitTheAggregateAndContiguousCaps) {
     for (const auto id : roots) {
         const auto cost = detail::bound_control_parse(
-          id, byte_count{65536}, codec::limits::defaults(), charge);
+          id, byte_count{64_KiB}, codec::limits::defaults(), charge);
         ASSERT_TRUE(cost.has_value());
         EXPECT_GT(cost->generated_peak.value(), 0U);
-        EXPECT_EQ(cost->input_copy, charge(byte_count{65536}));
+        EXPECT_EQ(cost->input_copy, charge(byte_count{64_KiB}));
         EXPECT_LE(
-          cost->generated_peak.value() + cost->input_copy.value(), 1U << 20U);
+          cost->generated_peak.value() + cost->input_copy.value(), 1_MiB);
         EXPECT_LE(
           cost->largest_allocation.value(),
           maximum_contiguous_allocation_bytes);
@@ -299,7 +299,7 @@ TEST(ControlMemoryTest, LimitsAndParentResidualsCannotBeWidened) {
     const auto policy = codec::limits::defaults();
     const auto cost
       = detail::bound_control_parse(
-          message::handshake_request, byte_count{65536}, policy, charge)
+          message::handshake_request, byte_count{64_KiB}, policy, charge)
           .value();
     auto fewer = policy.config();
     fewer.max_control_fields = item_count{32};
@@ -307,7 +307,7 @@ TEST(ControlMemoryTest, LimitsAndParentResidualsCannotBeWidened) {
     fewer.max_nesting_depth = item_count{2};
     const auto smaller = detail::bound_control_parse(
       message::handshake_request,
-      byte_count{65536},
+      byte_count{64_KiB},
       codec::limits::make(fewer).value(),
       charge);
     ASSERT_TRUE(smaller.has_value());
@@ -330,7 +330,7 @@ TEST(ControlMemoryTest, LimitsAndParentResidualsCannotBeWidened) {
         const auto narrowed = codec::limits::make(config).value();
         expect_error(
           detail::bound_control_parse(
-            message::handshake_request, byte_count{65536}, narrowed, charge),
+            message::handshake_request, byte_count{64_KiB}, narrowed, charge),
           errc::resource_exhausted);
     }
     expect_error(
@@ -355,7 +355,7 @@ TEST(ControlMemoryTest, LimitsAndParentResidualsCannotBeWidened) {
       errc::invalid_argument);
     for (const bool zero_metadata : {false, true}) {
         codec::decode_budget parent{
-          byte_count{1U << 20U}, byte_count{1U << 20U}, charge};
+          byte_count{1_MiB}, byte_count{1_MiB}, charge};
         if (zero_metadata)
             parent.metadata_remaining = {};
         else

@@ -158,8 +158,10 @@ make_lifecycle_event(
 
 [[nodiscard]] runtime::operation_error
 resource_config_error(const std::error_code& error) noexcept {
+    // A code from another category must not be reinterpreted by number.
     return runtime::operation_error{
-      static_cast<errc>(error.value()), runtime::operation_kind::resource};
+      to_errc(error).value_or(errc::invalid_argument),
+      runtime::operation_kind::resource};
 }
 
 } // namespace

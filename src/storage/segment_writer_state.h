@@ -1,5 +1,6 @@
 #pragma once
 
+#include "src/base/units.h"
 #include "src/codec/envelope.h"
 #include "src/model/segment_state.h"
 #include "src/runtime/file.h"
@@ -182,9 +183,9 @@ struct segment_admission_limits final {
     std::uint32_t maximum_blocks{maximum_object_entries};
     std::uint32_t maximum_retry_entries{maximum_object_entries};
     std::uint32_t maximum_retry_pages{maximum_object_pages};
-    byte_count metadata_bytes{65536};
-    byte_count working_bytes{8U * 1024U * 1024U};
-    byte_count execution_bytes{65536};
+    byte_count metadata_bytes{64_KiB};
+    byte_count working_bytes{8_MiB};
+    byte_count execution_bytes{64_KiB};
     [[nodiscard]] runtime::result<void> validate() const noexcept;
 };
 enum class segment_capacity_decision : std::uint8_t {
@@ -267,6 +268,10 @@ struct segment_capacity_constants final {
     // Root bytes of a fresh segment's retry projection for this many batches,
     // absent when no projection fits.
     [[nodiscard]] std::optional<byte_count> fresh_root(std::size_t batches);
+    // Entries per retry page when sealing this many completed facts, absent
+    // when no projection fits.
+    [[nodiscard]] std::optional<std::uint32_t>
+    seal_page_entries(std::uint64_t entries) const;
 
     local_segment_descriptor descriptor;
     runtime::file_position data_start;
@@ -320,20 +325,29 @@ private:
       std::vector<detail::segment_plan_input> inputs,
       workload_reservation held,
       workload_reservation retries,
+      workload_reservation control,
+      byte_count retained,
       codec::limits policy)
       : held_(std::move(held))
       , retries_(std::move(retries))
+      , control_(std::move(control))
       , base_(std::move(base))
       , plan_(std::move(plan))
       , inputs_(std::move(inputs))
+      , retained_(retained)
       , policy_(policy) {}
     workload_reservation held_;
     // Retry facts can remain needed after the group's codec/write workspace
     // has been released. Never make their lifetime pin that larger allowance.
     workload_reservation retries_;
+    // The queue node the freeze installs, held so the freeze takes no fresh
+    // ordinary admission after its awaits.
+    workload_reservation control_;
     segment_captured_boundary base_;
     segment_capacity_plan plan_;
     std::vector<detail::segment_plan_input> inputs_;
+    // Staging plus the children's retained bytes the freeze adds as pending.
+    byte_count retained_;
     codec::limits policy_;
 };
 struct segment_group_preparation final {

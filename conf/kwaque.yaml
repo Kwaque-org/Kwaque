@@ -1,12 +1,12 @@
-# Safe defaults for running one local Kwaque broker.
+# Development example for running one local Kwaque broker from the source
+# tree. Production deployments start from kwaque.production.yaml instead.
 kwaque:
   schema_version: 1
-  node_id: 0
+  # Relative paths resolve against the directory the broker starts in.
   data_directory: "./data"
   admin:
     address: "127.0.0.1"
     port: 9644
-  log_level: info
   developer_mode: true
   # Cooperative workload budget for system-allocator diagnostic builds.
   # Native-allocator builds use their observed shard capacity instead.

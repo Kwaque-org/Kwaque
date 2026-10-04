@@ -1,3 +1,4 @@
+#include "src/base/units.h"
 #include "src/bytes/test_allocation_profile.h"
 #include "src/model/batch_builder.h"
 #include "src/model/batch_codec.h"
@@ -32,11 +33,13 @@ using kwaque::errc;
 using kwaque::item_count;
 using kwaque::bytes::fragmented_buffer;
 using kwaque::bytes::fragmented_buffer_parser;
+using kwaque::literals::operator""_KiB;
+using kwaque::literals::operator""_MiB;
 constexpr codec::field_context coordinates{.origin = 1234};
 
 using kwaque::bytes::testing::charge;
 codec::decode_budget memory() {
-    return {byte_count{32U << 20U}, byte_count{1U << 20U}, charge};
+    return {byte_count{32_MiB}, byte_count{1_MiB}, charge};
 }
 template<typename Id>
 Id id(std::uint8_t first) {
@@ -385,7 +388,7 @@ TEST(
 }
 
 TEST(BatchCompressionTest, FramingUsesCommonEncodedCapBeforeCodecIsTrusted) {
-    for (const auto claimed : {(8U << 20U) + 200U, (16U << 20U) + 1U}) {
+    for (const auto claimed : {8_MiB + 200U, 16_MiB + 1U}) {
         auto header = wire(false, true).substr(0, 32);
         oracle::put(header, 12, claimed, 4);
         oracle::repair_crc(header);
@@ -396,8 +399,7 @@ TEST(BatchCompressionTest, FramingUsesCommonEncodedCapBeforeCodecIsTrusted) {
         ASSERT_FALSE(result.has_value());
         EXPECT_EQ(
           result.error().code(),
-          claimed > (16U << 20U) ? errc::resource_exhausted
-                                 : errc::truncated_data);
+          claimed > 16_MiB ? errc::resource_exhausted : errc::truncated_data);
         EXPECT_EQ(input.bytes_consumed(), byte_count{});
     }
 }
@@ -433,7 +435,7 @@ TEST(BatchCompressionTest, IncompressibleMaximumRegionMayGrowOnTheWire) {
     seastar::abort_source abort;
     codec::cooperative_work work{codec::limits::defaults(), abort};
     const codec::decode_budget budget{
-      byte_count{63U << 20U}, byte_count{1U << 20U}, charge};
+      byte_count{63_MiB}, byte_count{1_MiB}, charge};
     const auto identity = model::batch_id::make(
                             id<model::producer_id>(1),
                             model::producer_epoch::make(2).value(),
@@ -448,10 +450,10 @@ TEST(BatchCompressionTest, IncompressibleMaximumRegionMayGrowOnTheWire) {
                            model::segment_generation::make(9).value())
                            .value();
     kwaque::bytes::fragmented_buffer_builder payload{
-      {.initial_fragment_bytes = byte_count{65536},
-       .max_fragment_bytes = byte_count{65536},
+      {.initial_fragment_bytes = byte_count{64_KiB},
+       .max_fragment_bytes = byte_count{64_KiB},
        .max_total_bytes = byte_count{1048565},
-       .max_retained_bytes = byte_count{1U << 20U},
+       .max_retained_bytes = byte_count{1_MiB},
        .max_fragments = 16}};
     payload.reserve_fragments(item_count{16}).value();
     std::array<char, 16384> chunk;
@@ -488,7 +490,7 @@ TEST(BatchCompressionTest, IncompressibleMaximumRegionMayGrowOnTheWire) {
           .value();
     auto batch
       = builder.finalize(work, budget.operation_remaining).get().value();
-    ASSERT_EQ(batch.records().size(), byte_count{8U << 20U});
+    ASSERT_EQ(batch.records().size(), byte_count{8_MiB});
     const auto digest = batch.fingerprint();
     auto encoded = model::encode_submitted_batch(
                      std::move(batch),
@@ -505,11 +507,11 @@ TEST(BatchCompressionTest, IncompressibleMaximumRegionMayGrowOnTheWire) {
         EXPECT_GT(
           oracle::little(
             std::string_view{fixed.data(), fixed.size()}, 32 + 160, 4),
-          8U << 20U);
+          8_MiB);
         EXPECT_EQ(
           oracle::little(
             std::string_view{fixed.data(), fixed.size()}, 32 + 164, 4),
-          8U << 20U);
+          8_MiB);
     }
     fragmented_buffer_parser input{std::move(*encoded)};
     const auto remaining
@@ -518,7 +520,7 @@ TEST(BatchCompressionTest, IncompressibleMaximumRegionMayGrowOnTheWire) {
       = model::decode_submitted_batch(input, expected(), remaining, work).get();
     ASSERT_TRUE(decoded.has_value());
     EXPECT_TRUE(input.at_end());
-    EXPECT_EQ(decoded->value.records().size(), byte_count{8U << 20U});
+    EXPECT_EQ(decoded->value.records().size(), byte_count{8_MiB});
     EXPECT_EQ(decoded->value.fingerprint(), digest);
 }
 
@@ -529,7 +531,7 @@ TEST(
     codec::cooperative_work work{codec::limits::defaults(), abort};
     fragmented_buffer_parser input{bytes(wire(false, true, 12000))};
     auto budget = reserve(input, work);
-    budget.operation_remaining = byte_count{4096};
+    budget.operation_remaining = byte_count{4_KiB};
     const auto result = decode(input, false, budget, work);
     ASSERT_FALSE(result.has_value());
     EXPECT_EQ(result.error().code(), errc::resource_exhausted);

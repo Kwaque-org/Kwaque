@@ -1,3 +1,4 @@
+#include "src/base/units.h"
 #include "src/codec/tests/benchmark_buffer.h"
 #include "src/codec/tests/qualification_profile.h"
 #include "src/codec/xxh3.h"
@@ -360,7 +361,7 @@ private:
     const model::batch_decode_expectation expected_
       = model::bench::expected_context();
     codec::decode_budget memory_{
-      codec::testing::residual, byte_count{1U << 20U}, capacity_bound};
+      codec::testing::residual, byte_count{1_MiB}, capacity_bound};
     std::optional<codec::semantic_batch_digest> digest_;
     std::optional<codec::content_digest> record_hash_;
 };

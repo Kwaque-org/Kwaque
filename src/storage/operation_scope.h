@@ -2,6 +2,7 @@
 #define KWAQUE_SRC_STORAGE_OPERATION_SCOPE_H_
 
 #include "src/base/invariant.h"
+#include "src/base/units.h"
 #include "src/runtime/first_failure.h"
 #include "src/runtime/task_scope.h"
 #include "src/storage/statistics.h"
@@ -51,7 +52,7 @@ public:
                seastar::future<runtime::result<void>>>
     [[nodiscard]] runtime::result<void> spawn(byte_count retained, Func task) {
         static_assert(
-          sizeof(Func) <= 8192,
+          sizeof(Func) <= 8_KiB,
           "large task captures require a bounded payload owner");
         assert_current();
         if (admission_closed_ || closing_ || first_.failed()) {
@@ -74,6 +75,8 @@ public:
         auto holder = admitted_.hold();
         auto metric = statistics_.accept();
         return tasks_.spawn(
+          // The task scope owns this callable until its future completes.
+          // NOLINTNEXTLINE(cppcoreguidelines-avoid-capturing-lambda-coroutines)
           [this,
            task = std::move(task),
            reservation = std::move(*reservation),

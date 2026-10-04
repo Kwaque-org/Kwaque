@@ -185,7 +185,7 @@ TEST(ControlFuzzCasesTest, MaximumFramesAndSerializationAllowControlProgress) {
         std::uint64_t ticks = 0;
         std::chrono::steady_clock::duration gap{};
         auto progress = observer(stop, ticks, gap);
-        auto joined = seastar::defer([&] {
+        auto joined = seastar::defer([&] noexcept {
             stop.request_abort();
             progress.get();
         });

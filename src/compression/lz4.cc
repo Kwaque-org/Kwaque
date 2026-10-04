@@ -1,6 +1,7 @@
 #include "src/compression/lz4.h"
 
 #include "src/base/invariant.h"
+#include "src/base/units.h"
 
 #include <algorithm>
 #include <cstdlib>
@@ -77,7 +78,7 @@ codec::result<lz4_plan> admit_lz4(
     // enforce the total even if a library's actual context layout changes.
     byte_count native;
     for (const auto request :
-         {byte_count{4096},
+         {byte_count{4_KiB},
           byte_count{
             compress ? static_cast<std::uint64_t>(LZ4_sizeofState())
                      : block_size + 4U},

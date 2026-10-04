@@ -1,3 +1,4 @@
+#include "src/base/units.h"
 #include "src/bytes/fragmented_buffer_builder.h"
 #include "src/compression/tests/test_support.h"
 
@@ -17,12 +18,12 @@ namespace kwaque::compression {
 namespace {
 using namespace testing;
 using bytes::fragmented_buffer;
-constexpr byte_count maximum{8U << 20U};
+constexpr byte_count maximum{8_MiB};
 
 fragmented_buffer maximum_input(char value = 'x') {
     bytes::fragmented_buffer_builder builder{
-      {.initial_fragment_bytes = byte_count{65536},
-       .max_fragment_bytes = byte_count{65536},
+      {.initial_fragment_bytes = byte_count{64_KiB},
+       .max_fragment_bytes = byte_count{64_KiB},
        .max_total_bytes = maximum,
        .max_retained_bytes = maximum,
        .max_fragments = 128}};
@@ -71,7 +72,7 @@ TEST(CompressionCooperationTest, ConcurrentOperationsKeepDistinctPayloads) {
             auto result = co_await (
               compress
                 ? compress_lz4(
-                    std::move(buffer), byte_count{16U << 20U}, work, budget())
+                    std::move(buffer), byte_count{16_MiB}, work, budget())
                 : decompress_lz4(std::move(buffer), maximum, work, budget()));
             buffer = std::move(result.value().value);
         };
@@ -104,7 +105,7 @@ TEST(
             auto pending
               = compress
                   ? compress_lz4(
-                      std::move(input), byte_count{16U << 20U}, work, budget())
+                      std::move(input), byte_count{16_MiB}, work, budget())
                   : decompress_lz4(std::move(input), maximum, work, budget());
             suspended = !pending.available();
             result.emplace(pending.get());
@@ -132,7 +133,7 @@ TEST(
     codec::cooperative_work build_work{codec::limits::defaults(), build_abort};
     auto raw = maximum_input();
     auto encoded = compress_lz4(
-                     raw.share(), byte_count{16U << 20U}, build_work, budget())
+                     raw.share(), byte_count{16_MiB}, build_work, budget())
                      .get()
                      .value();
     for (const bool compress : {true, false}) {
@@ -141,14 +142,11 @@ TEST(
         auto input = compress ? raw.share() : encoded.value.share();
         ASSERT_TRUE(preempt_requested());
         auto pending
-          = compress ? compress_lz4(
-                         std::move(input),
-                         byte_count{16U << 20U},
-                         work,
-                         budget(),
-                         context)
-                     : decompress_lz4(
-                         std::move(input), maximum, work, budget(), context);
+          = compress
+              ? compress_lz4(
+                  std::move(input), byte_count{16_MiB}, work, budget(), context)
+              : decompress_lz4(
+                  std::move(input), maximum, work, budget(), context);
         const bool suspended = !pending.available();
         abort.request_abort();
         const auto result = pending.get();

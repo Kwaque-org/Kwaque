@@ -45,10 +45,15 @@ coverage-out/
 coverage.xml
 htmlcov/
 test-results/
-BenchmarkDotNet.Artifacts/
-core
-core.*
+perf.data*
+/core
+/core.[0-9]*
 vgcore.*
+/crash-*
+/leak-*
+/oom-*
+/slow-unit-*
+/timeout-*
 
 # Packages and distributions
 /dist/

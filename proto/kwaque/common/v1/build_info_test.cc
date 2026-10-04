@@ -105,6 +105,9 @@ TEST(BuildInfoTest, DecodesStableWireFixture) {
       << "the build-info golden fixture contains invalid hex";
 
     const BuildInfo expected = expected_build_info();
+    // Protobuf serialization is not canonical, so byte equality only flags an
+    // encoder change after a dependency update. Decoding the fixture is the
+    // compatibility contract.
     EXPECT_EQ(*serialized, expected.SerializeAsString());
 
     const auto actual = parse_build_info(*serialized);

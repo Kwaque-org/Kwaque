@@ -1,3 +1,4 @@
+#include "src/base/units.h"
 #include "src/simulation/environment.h"
 #include "src/simulation/fake_file_test_support.h"
 #include "src/simulation/scheduler_driver.h"
@@ -29,9 +30,9 @@ environment_config config(
     values.scheduler.events_per_pump = 64;
     values.scheduler.total_events = 10000;
     values.trace.entries = 2048;
-    values.trace.encoded_bytes = 512U * 1024U;
+    values.trace.encoded_bytes = 512_KiB;
     values.event_log.entries = 32;
-    values.event_log.encoded_bytes = 32U * 1024U;
+    values.event_log.encoded_bytes = 32_KiB;
     values.file.maximum_objects = 64;
     values.file.maximum_open_handles = 8;
     values.file.maximum_pending_operations = 8;
@@ -53,7 +54,7 @@ environment_config config(
     values.network.stop_batch = 8;
     values.dns.maximum_records = 16;
     values.dns.maximum_answers = 32;
-    values.dns.maximum_name_bytes = byte_count{8U * 1024U};
+    values.dns.maximum_name_bytes = byte_count{8_KiB};
     values.dns.stop_batch = 8;
     values.dns.query_limits.maximum_waiters = 8;
     values.maximum_fault_rules = 16;

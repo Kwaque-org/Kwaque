@@ -1,3 +1,4 @@
+#include "src/base/units.h"
 #include "src/runtime/file.h"
 #include "src/runtime/testing/test_directory.h"
 
@@ -21,6 +22,7 @@
 #include <unistd.h>
 
 namespace {
+using kwaque::literals::operator""_KiB;
 std::atomic<int> watched_fd{-1};
 std::atomic<int> close_errno{0};
 std::atomic<int> truncate_errno{0};
@@ -54,7 +56,7 @@ class append_challenged_posix_file_test {
 public:
     static void set_slack(append_challenged_posix_file_impl& impl) {
         impl._logical_size = 1;
-        impl._committed_size = 4096;
+        impl._committed_size = 4_KiB;
     }
 };
 } // namespace seastar::testing
@@ -69,7 +71,7 @@ SEASTAR_TEST_CASE(
                   int fd = ::open(
                     (dir.get_path() / "close").c_str(), O_RDWR | O_CREAT, 0600);
                   BOOST_REQUIRE_GE(fd, 0);
-                  auto guard = seastar::defer([fd] { ::close(fd); });
+                  auto guard = seastar::defer([fd] noexcept { ::close(fd); });
                   seastar::shared_ptr<seastar::file_impl> impl;
                   if (append) {
                       guard.cancel();
@@ -95,7 +97,8 @@ SEASTAR_TEST_CASE(
                   close_errno = EIO;
                   truncate_errno = append ? ENOSPC : 0;
                   watched_fd = number;
-                  auto unwatch = seastar::defer([] { watched_fd = -1; });
+                  auto unwatch = seastar::defer(
+                    [] noexcept { watched_fd = -1; });
                   std::exception_ptr failure;
                   try {
                       if (checked)
@@ -175,7 +178,7 @@ SEASTAR_TEST_CASE(
               int fd = ::open(
                 (dir.get_path() / "submit").c_str(), O_RDWR | O_CREAT, 0600);
               BOOST_REQUIRE_GE(fd, 0);
-              auto guard = seastar::defer([fd] { ::close(fd); });
+              auto guard = seastar::defer([fd] noexcept { ::close(fd); });
               struct stat status{};
               BOOST_REQUIRE_EQUAL(::fstat(fd, &status), 0);
               seastar::file_open_options options;
@@ -187,7 +190,7 @@ SEASTAR_TEST_CASE(
               close_calls = 0;
               close_errno = 0;
               watched_fd = fd;
-              auto unwatch = seastar::defer([] { watched_fd = -1; });
+              auto unwatch = seastar::defer([] noexcept { watched_fd = -1; });
               auto& injector = seastar::memory::local_failure_injector();
               injector.fail_after(0);
               auto closing = checked ? file.close_checked() : file.close();
@@ -226,7 +229,7 @@ SEASTAR_TEST_CASE(
               struct stat status{};
               BOOST_REQUIRE_EQUAL(::fstat(fd, &status), 0);
               watched_fd = fd;
-              auto unwatch = seastar::defer([] { watched_fd = -1; });
+              auto unwatch = seastar::defer([] noexcept { watched_fd = -1; });
               close_calls = 0;
               close_errno = 0;
               truncate_errno = 0;
@@ -262,9 +265,10 @@ SEASTAR_TEST_CASE(
   native_partial_construction_failure_releases_the_borrowed_fd_once) {
     int descriptors[2];
     BOOST_REQUIRE_EQUAL(::pipe(descriptors), 0);
-    auto writer = seastar::defer([fd = descriptors[1]] { ::close(fd); });
+    auto writer = seastar::defer(
+      [fd = descriptors[1]] noexcept { ::close(fd); });
     watched_fd = descriptors[0];
-    auto unwatch = seastar::defer([] { watched_fd = -1; });
+    auto unwatch = seastar::defer([] noexcept { watched_fd = -1; });
     close_errno = 0;
     truncate_errno = 0;
     close_calls = 0;

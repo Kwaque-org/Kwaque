@@ -1,4 +1,5 @@
 #include "src/base/allocation.h"
+#include "src/base/units.h"
 #include "src/runtime/random.h"
 #include "src/runtime/testing/contracts/network_contract.h"
 #include "src/runtime/testing/contracts/network_contract_failure_cases.h"
@@ -39,6 +40,7 @@
 #include <vector>
 
 namespace {
+using kwaque::literals::operator""_GiB;
 
 using kwaque::simulation::testing::pump_until;
 
@@ -529,7 +531,7 @@ template<typename Function>
 seastar::future<> run_shared_case(
   Function function,
   kwaque::simulation::bandwidth_capacity egress_capacity
-  = kwaque::simulation::bandwidth_capacity::finite(1U << 30U)) {
+  = kwaque::simulation::bandwidth_capacity::finite(1_GiB)) {
     kwaque::simulation::scheduler events{scheduler_limits()};
     auto config = kwaque::simulation::fake_network_config{};
     config.egress_capacity = egress_capacity;
@@ -678,11 +680,11 @@ SEASTAR_TEST_CASE(fake_network_bounds_persistent_address_state) {
     auto network = std::move(*made);
 
     auto first = network->set_egress_capacity(
-      loopback, kwaque::simulation::bandwidth_capacity::finite(1U << 30U));
+      loopback, kwaque::simulation::bandwidth_capacity::finite(1_GiB));
     co_await pump_until(events, first);
     co_await require_ready_success(first);
     auto saturated = network->set_egress_capacity(
-      alternate, kwaque::simulation::bandwidth_capacity::finite(1U << 30U));
+      alternate, kwaque::simulation::bandwidth_capacity::finite(1_GiB));
     BOOST_REQUIRE(saturated.available());
     const auto rejected = saturated.get();
     BOOST_REQUIRE(!rejected.has_value());
@@ -4216,7 +4218,7 @@ SEASTAR_TEST_CASE(fake_network_contract_drains_every_failure_boundary) {
         kwaque::simulation::scheduler events{scheduler_limits()};
         auto config = kwaque::simulation::fake_network_config{};
         config.egress_capacity = kwaque::simulation::bandwidth_capacity::finite(
-          1U << 30U);
+          1_GiB);
         auto made = kwaque::simulation::fake_network::make(config, events);
         BOOST_REQUIRE(made.has_value());
         auto network = std::move(*made);

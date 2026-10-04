@@ -34,15 +34,10 @@ inline storage::coverage scope(
         runtime::file_position{b0}, runtime::file_position{b1})
         .value()};
 }
-inline std::string data_block(
-  std::uint64_t logical = 100,
-  std::uint64_t physical = 0,
-  std::uint64_t position = 512,
-  bool sparse = false,
-  std::uint8_t segment = 0x30,
-  std::uint64_t generation = 1,
-  bool compressed = false,
-  std::uint64_t a = 512) {
+// The assigned child data_block frames: one original request per logical
+// base.
+inline std::string data_child(
+  std::uint64_t logical = 100, bool sparse = false, bool compressed = false) {
     auto child = assigned_wire(compressed, 32, sparse);
     if (logical > 100) {
         // Distinct original requests, with an independently assembled semantic
@@ -66,8 +61,20 @@ inline std::string data_block(
     put(child, 32 + 168, logical, 8);
     put(child, 32 + 176, logical + (sparse ? 5U : 1U), 8);
     repair(child);
+    return child;
+}
+inline std::string data_block(
+  std::uint64_t logical = 100,
+  std::uint64_t physical = 0,
+  std::uint64_t position = 512,
+  bool sparse = false,
+  std::uint8_t segment = 0x30,
+  std::uint64_t generation = 1,
+  bool compressed = false,
+  std::uint64_t a = 512) {
     return block_wire(
-      child, block_expected(segment, generation, position, physical, a));
+      data_child(logical, sparse, compressed),
+      block_expected(segment, generation, position, physical, a));
 }
 inline void
 put_coverage(std::string& body, std::size_t at, const storage::coverage& c) {

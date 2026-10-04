@@ -1,5 +1,6 @@
 #pragma once
 
+#include "src/base/units.h"
 #include "src/storage/local_store_config.h"
 #include "src/storage/workload_budget.h"
 
@@ -102,7 +103,7 @@ seastar::future<runtime::result<local_inventory_progress>> walk_local_namespace(
   codec::cooperative_work& work,
   Visitor visit,
   local_discovery_limits bounds = {}) {
-    static_assert(sizeof(Visitor) <= 4096);
+    static_assert(sizeof(Visitor) <= 4_KiB);
     if (auto valid = validate_local_device_spec(spec); !valid)
         co_return runtime::failure(valid.error());
     if (auto valid = limits.validate(); !valid)
@@ -110,7 +111,7 @@ seastar::future<runtime::result<local_inventory_progress>> walk_local_namespace(
     if (auto valid = bounds.validate(); !valid)
         co_return runtime::failure(valid.error());
     auto held = budget.try_reserve(
-      byte_count{limits.execution_bytes.value() + 131072});
+      byte_count{limits.execution_bytes.value() + 128_KiB});
     if (!held) co_return runtime::failure(held.error());
     if (auto handles = held->try_acquire_handles(8); !handles)
         co_return runtime::failure(handles.error());
@@ -173,7 +174,7 @@ seastar::future<runtime::result<local_inventory_progress>> walk_local_namespace(
                 }
                 auto page = co_await current.cursor->next(
                   {.maximum_entries = item_count{16},
-                   .maximum_name_bytes = byte_count{4096}});
+                   .maximum_name_bytes = byte_count{4_KiB}});
                 if (!page) {
                     failed.observe(page);
                     break;

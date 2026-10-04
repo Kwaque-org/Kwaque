@@ -1,5 +1,6 @@
 #include "src/base/allocation.h"
 #include "src/base/metric_schema.h"
+#include "src/base/units.h"
 #include "src/bytes/test_allocation_profile.h"
 #include "src/resource/bounded_work_queue.h"
 #include "src/resource/resource_registry.h"
@@ -53,7 +54,7 @@ seastar::future<> with_budget(Func body) {
     co_await registry.stop();
     if (failure) std::rethrow_exception(failure);
 }
-workload_budget_limits limits() { return {4, byte_count{64U * 1024U}, 2}; }
+workload_budget_limits limits() { return {4, byte_count{64_KiB}, 2}; }
 
 seastar::future<> exercise_task_capture_lifetime(workload_budget& budget) {
     seastar::promise<> entered, release;
@@ -61,7 +62,7 @@ seastar::future<> exercise_task_capture_lifetime(workload_budget& budget) {
     operation_scope scope{budget, {}};
     auto lifetime = seastar::defer([&destroyed] noexcept { destroyed = true; });
     const auto accepted = scope.spawn(
-      byte_count{4096},
+      byte_count{4_KiB},
       [lifetime = std::move(lifetime), &entered, &release, &completed] mutable
         -> seastar::future<runtime::result<void>> {
           static_cast<void>(lifetime);
@@ -122,7 +123,7 @@ SEASTAR_TEST_CASE(
             auto full = seastar::try_get_units(
               observer.memory_admission(), available);
             BOOST_REQUIRE(full.has_value());
-            BOOST_CHECK(!budget.try_reserve(byte_count{1024}).has_value());
+            BOOST_CHECK(!budget.try_reserve(byte_count{1_KiB}).has_value());
             BOOST_CHECK_EQUAL(budget.snapshot().tasks, 0U);
             BOOST_CHECK_EQUAL(budget.snapshot().bytes, 0U);
             BOOST_CHECK_EQUAL(observer.memory_admission().waiters(), 0U);
@@ -174,7 +175,7 @@ SEASTAR_TEST_CASE(
             resource::bounded_work_queue<workload_reservation> queue{
               {item_count{1}, byte_count{1}}};
             seastar::abort_source abort;
-            auto admitted = budget.try_reserve(byte_count{4096});
+            auto admitted = budget.try_reserve(byte_count{4_KiB});
             BOOST_REQUIRE(admitted.has_value());
             BOOST_REQUIRE(admitted->try_acquire_handles(1).has_value());
             const auto charge = admitted->bytes().value();
@@ -209,7 +210,7 @@ SEASTAR_TEST_CASE(
         bool failed = false;
         injector.fail_after(0);
         try {
-            static_cast<void>(budget.try_reserve(byte_count{4096}));
+            static_cast<void>(budget.try_reserve(byte_count{4_KiB}));
         } catch (const std::bad_alloc&) {
             failed = true;
         }
@@ -243,7 +244,7 @@ SEASTAR_TEST_CASE(
                   errc::permission_denied, runtime::operation_kind::file});
           }};
         auto started = scope.spawn(
-          byte_count{4096}, [&] -> seastar::future<runtime::result<void>> {
+          byte_count{4_KiB}, [&] -> seastar::future<runtime::result<void>> {
               co_await release.get_future();
               finished = true;
               co_return runtime::failure(first);
@@ -291,7 +292,7 @@ SEASTAR_TEST_CASE(storage_scope_parent_abort_wakes_accepted_work_once) {
         });
         const auto duplicate = scope.bind_shutdown(parent, [] {});
         const auto started = scope.spawn(
-          byte_count{4096}, [&] -> seastar::future<runtime::result<void>> {
+          byte_count{4_KiB}, [&] -> seastar::future<runtime::result<void>> {
               co_await wake.get_future();
               finished = true;
               co_return runtime::result<void>{};
@@ -353,7 +354,8 @@ SEASTAR_TEST_CASE(
             seastar::memory::scoped_heap_profiling profiling{1};
             operation_scope scope{budget, {}};
             const auto accepted = scope.spawn(
-              byte_count{16384}, [&] -> seastar::future<runtime::result<void>> {
+              byte_count{16_KiB},
+              [&] -> seastar::future<runtime::result<void>> {
                   entered.set_value();
                   co_await release.get_future();
                   co_return runtime::result<void>{};
@@ -492,7 +494,7 @@ SEASTAR_TEST_CASE(
                   errc::io_failure, runtime::operation_kind::file});
           }};
         auto started = scope.spawn(
-          byte_count{4096}, [first] -> seastar::future<runtime::result<void>> {
+          byte_count{4_KiB}, [first] -> seastar::future<runtime::result<void>> {
               return seastar::make_exception_future<runtime::result<void>>(
                 first);
           });
@@ -573,7 +575,7 @@ SEASTAR_TEST_CASE(
           manager.acquire_workload(workload), limits(), bytes::testing::charge};
         workload_budget second{
           manager.acquire_workload(workload), limits(), bytes::testing::charge};
-        auto held = first.try_reserve(byte_count{4096});
+        auto held = first.try_reserve(byte_count{4_KiB});
         BOOST_REQUIRE(held.has_value());
         BOOST_CHECK(first.owns(*held));
         BOOST_CHECK(!second.owns(*held));
@@ -587,7 +589,7 @@ SEASTAR_TEST_CASE(
         BOOST_CHECK(held->exclusive());
         first.close_admission();
         const auto before = first.snapshot();
-        const auto cost = first.reservation_charge(byte_count{4096});
+        const auto cost = first.reservation_charge(byte_count{4_KiB});
         BOOST_REQUIRE(cost.has_value());
         BOOST_CHECK(*cost == held->bytes());
         BOOST_CHECK_EQUAL(first.snapshot().accepted, before.accepted);
@@ -605,25 +607,25 @@ SEASTAR_TEST_CASE(storage_adopted_grants_keep_one_task_and_their_allowance) {
         workload_budget second{
           manager.acquire_workload(workload), limits(), bytes::testing::charge};
         {
-            auto total = first.try_reserve(byte_count{4096});
+            auto total = first.try_reserve(byte_count{4_KiB});
             BOOST_REQUIRE(total.has_value());
             // Twice the task limit: each adopted grant returns its task unit
             // and control charge, keeping only its requested allowance.
             for (int i = 0; i != 8; ++i) {
-                auto grant = first.try_reserve(byte_count{1024});
+                auto grant = first.try_reserve(byte_count{1_KiB});
                 BOOST_REQUIRE(grant.has_value());
                 BOOST_REQUIRE(total->adopt(std::move(*grant)).has_value());
                 BOOST_CHECK_EQUAL(first.snapshot().tasks, 1U);
             }
             const auto merged = first.reservation_charge(
-              byte_count{4096 + 8 * 1024});
+              byte_count{4_KiB + 8_KiB});
             BOOST_REQUIRE(merged.has_value());
             BOOST_CHECK(total->bytes() == *merged);
-            BOOST_CHECK(total->retained_bytes() == byte_count{4096 + 8 * 1024});
+            BOOST_CHECK(total->retained_bytes() == byte_count{4_KiB + 8_KiB});
             BOOST_CHECK_EQUAL(first.snapshot().bytes, merged->value());
 
-            auto foreign = second.try_reserve(byte_count{1024});
-            auto own = first.try_reserve(byte_count{1024});
+            auto foreign = second.try_reserve(byte_count{1_KiB});
+            auto own = first.try_reserve(byte_count{1_KiB});
             BOOST_REQUIRE(foreign.has_value() && own.has_value());
             const auto before = first.snapshot();
             // NOLINTBEGIN(bugprone-use-after-move)

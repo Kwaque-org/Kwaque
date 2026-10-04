@@ -64,7 +64,7 @@ void application_state::construct_services(bool install_signal_handlers) {
     }
     stop_signal_->abort_source().check();
     lifecycle_ = std::make_unique<service_lifecycle>(
-      stop_signal_->abort_source(), false);
+      stop_signal_->abort_source());
     admin_server_ = std::make_unique<admin::admin_server>();
     resource_registry_ = std::make_unique<resource::resource_registry>();
     environments_ = std::make_unique<runtime::production::environment_owner>(

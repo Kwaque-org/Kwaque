@@ -1,5 +1,7 @@
 #include "src/storage/local_root.h"
 
+#include "src/base/units.h"
+
 namespace kwaque::storage {
 namespace detail {
 struct local_root_state final : runtime::shard_affine {
@@ -49,7 +51,7 @@ seastar::future<runtime::result<bytes::fragmented_buffer>> read_local_extent(
   byte_count length,
   codec::cooperative_work& work) {
     if (
-      length.value() == 0 || length.value() > 65536
+      length.value() == 0 || length.value() > 64_KiB
       || !position.checked_add(length))
         co_return runtime::failure(path_error(errc::invalid_argument));
     if (auto ready = co_await path_checkpoint(work); !ready)

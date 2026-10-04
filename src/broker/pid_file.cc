@@ -68,6 +68,11 @@ pid_file::pid_file(std::filesystem::path path)
             throw std::runtime_error(
               "PID file is not a regular file: " + path_.string());
         }
+        // Truncation would also empty every other name of a hard-linked file.
+        if (status.st_nlink != 1) {
+            throw std::runtime_error(
+              "PID file has other hard links: " + path_.string());
+        }
         device_ = static_cast<unsigned long long>(status.st_dev);
         inode_ = static_cast<unsigned long long>(status.st_ino);
 

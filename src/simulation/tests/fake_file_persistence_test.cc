@@ -1,3 +1,4 @@
+#include "src/base/units.h"
 #include "src/runtime/file.h"
 #include "src/simulation/fake_file.h"
 #include "src/simulation/fake_file_test_support.h"
@@ -61,13 +62,13 @@ trace_limits trace_budget(std::uint32_t entries = 65536) {
          .encoded_bytes = canonical_header_encoded_size
                           + static_cast<std::uint64_t>(entries)
                               * canonical_entry_encoded_size,
-         .line_bytes = 1024}));
+         .line_bytes = 1_KiB}));
 }
 fake_file_system_config config(
   std::optional<fake_crash_policy> policy = std::nullopt,
   std::uint64_t scope = 1) {
     fake_file_system_config result;
-    result.logical_capacity = byte_count{16U * 1024U * 1024U};
+    result.logical_capacity = byte_count{16_MiB};
     result.maximum_objects = 256;
     result.maximum_open_handles = 16;
     result.maximum_pending_operations = 16;
@@ -492,8 +493,7 @@ SEASTAR_TEST_CASE(
     for (const bool trace_pressure : {false, true}) {
         auto policy = fake_crash_policy{
           .data_percent = 100, .namespace_percent = 100, .eof_percent = 100};
-        if (!trace_pressure)
-            policy.maximum_scratch_bytes = byte_count{16U * 1024U};
+        if (!trace_pressure) policy.maximum_scratch_bytes = byte_count{16_KiB};
         fixture test{config(policy), {}, trace_pressure ? 32U : 65536U};
         stable_file(test, "file", 'a');
         test.write("file", 'b');
@@ -678,7 +678,7 @@ SEASTAR_TEST_CASE(
         fault_decision::make_file_failure(
           fault_action::file_failure_after_prefix,
           file_failure_detail::device_io,
-          byte_count{2048}))));
+          byte_count{2_KiB}))));
     fixture test{config(), std::move(rules)};
     stable_file(test, "file", 'a');
     auto owner = checked(

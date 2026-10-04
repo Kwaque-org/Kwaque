@@ -9,6 +9,9 @@ import tempfile
 import unittest
 from pathlib import Path
 
+# The test macros export the reactor backend selected for this build.
+REACTOR_BACKEND = os.environ.get("KWAQUE_REACTOR_BACKEND", "epoll")
+
 
 class QueueWorkerFailureTest(unittest.TestCase):
     def setUp(self) -> None:
@@ -26,7 +29,7 @@ class QueueWorkerFailureTest(unittest.TestCase):
             [
                 str(self.probe),
                 scenario,
-                "--reactor-backend=epoll",
+                f"--reactor-backend={REACTOR_BACKEND}",
                 "--memory=192MiB",
                 "--smp=1",
                 "--overprovisioned",

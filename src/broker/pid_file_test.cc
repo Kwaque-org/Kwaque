@@ -2,6 +2,7 @@
 
 #include <gtest/gtest.h>
 #include <sys/file.h>
+#include <sys/stat.h>
 #include <sys/wait.h>
 
 #include <cerrno>
@@ -108,6 +109,73 @@ TEST(PidFileTest, DoesNotRemoveAFileWhoseContentsChanged) {
         replaced << ::getpid() << "unexpected\n";
     }
 
+    EXPECT_TRUE(std::filesystem::exists(path));
+}
+
+TEST(PidFileTest, RejectsASymlinkWithoutTouchingItsTarget) {
+    temporary_directory directory;
+    const auto target = directory.path() / "target";
+    const auto path = directory.path() / "kwaque.pid";
+    {
+        std::ofstream output(target);
+        output << "keep\n";
+    }
+    std::filesystem::create_symlink(target, path);
+
+    try {
+        static_cast<void>(kwaque::broker::pid_file(path));
+        FAIL() << "a symlinked PID file was accepted";
+    } catch (const std::system_error& error) {
+        EXPECT_EQ(error.code().value(), ELOOP);
+    }
+    EXPECT_TRUE(std::filesystem::is_symlink(path));
+    std::ifstream input(target);
+    std::string contents;
+    std::getline(input, contents);
+    EXPECT_EQ(contents, "keep");
+}
+
+TEST(PidFileTest, RejectsANonRegularFile) {
+    temporary_directory directory;
+    const auto path = directory.path() / "kwaque.pid";
+    ASSERT_EQ(::mkfifo(path.c_str(), 0644), 0);
+
+    EXPECT_THROW(
+      static_cast<void>(kwaque::broker::pid_file(path)), std::runtime_error);
+    EXPECT_TRUE(std::filesystem::is_fifo(path));
+}
+
+TEST(PidFileTest, RejectsAHardLinkedFileWithoutTruncatingIt) {
+    temporary_directory directory;
+    const auto other = directory.path() / "other";
+    const auto path = directory.path() / "kwaque.pid";
+    {
+        std::ofstream output(other);
+        output << "keep\n";
+    }
+    std::filesystem::create_hard_link(other, path);
+
+    EXPECT_THROW(
+      static_cast<void>(kwaque::broker::pid_file(path)), std::runtime_error);
+    std::ifstream input(other);
+    std::string contents;
+    std::getline(input, contents);
+    EXPECT_EQ(contents, "keep");
+}
+
+TEST(PidFileTest, DoesNotRemoveAFileRenamedOverTheOwnedPath) {
+    temporary_directory directory;
+    const auto path = directory.path() / "kwaque.pid";
+    const auto replacement = directory.path() / "replacement";
+    {
+        kwaque::broker::pid_file owner(path);
+        {
+            std::ofstream output(replacement);
+            output << ::getpid() << '\n';
+        }
+        // Same contents, different inode: ownership is the inode, not text.
+        std::filesystem::rename(replacement, path);
+    }
     EXPECT_TRUE(std::filesystem::exists(path));
 }
 

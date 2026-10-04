@@ -116,12 +116,12 @@ void configure_allocation_failure_policy(
 void validate_broker_profile(const config::bootstrap_config& configuration) {
 #if defined(SEASTAR_DEFAULT_ALLOCATOR)
     if (!configuration.developer_mode) {
-        throw std::runtime_error(
+        throw configuration_error(
           "production broker requires the native Seastar allocator; "
           "set developer_mode=true for diagnostic use");
     }
     if (!configuration.diagnostic_memory_per_shard_bytes) {
-        throw std::runtime_error(
+        throw configuration_error(
           "system-allocator diagnostic broker requires "
           "diagnostic_memory_per_shard_bytes");
     }
@@ -258,7 +258,7 @@ std::string render_startup_policy(
     const std::string admin_exchange_seconds = std::to_string(
       admin::exchange_timeout.count());
     const std::string scrape_response_bytes = std::to_string(
-      admin::metrics_response_bytes);
+      admin::metrics_response_bytes(actual_shards));
     const std::string admin_shares = std::to_string(admin::scheduling_shares);
     const std::string_view io_properties_source = smp.io_properties_file
                                                     ? "file"

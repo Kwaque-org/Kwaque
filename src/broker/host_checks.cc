@@ -1,5 +1,7 @@
 #include "src/broker/host_checks.h"
 
+#include "src/base/units.h"
+
 #include <seastar/core/coroutine.hh>
 #include <seastar/core/file.hh>
 #include <seastar/core/io_queue.hh>
@@ -22,9 +24,9 @@
 namespace kwaque::broker {
 namespace {
 
-constexpr std::size_t host_file_limit = 16U * 1024U;
+constexpr std::size_t host_file_limit = 16_KiB;
 constexpr std::size_t cgroup_ancestor_limit = 32;
-constexpr std::uint64_t mib = 1024U * 1024U;
+constexpr std::uint64_t mib = 1_MiB;
 
 std::string_view trim(std::string_view text) noexcept {
     const auto start = text.find_first_not_of(" \t\r\n");
@@ -347,9 +349,7 @@ host_check_report evaluate_host_checks(const host_snapshot& state) {
                         : "unobserved",
        "xfs preferred; ext4 warning; other unsupported"},
       {"disk_free_bytes",
-       checked(
-         state.free_disk_bytes
-         && *state.free_disk_bytes >= 10ULL * 1024U * 1024U * 1024U),
+       checked(state.free_disk_bytes && *state.free_disk_bytes >= 10_GiB),
        observed(state.free_disk_bytes),
        ">=10 GiB warning only"},
       {"host_physical_memory_bytes",
@@ -382,10 +382,13 @@ host_check_report evaluate_host_checks(const host_snapshot& state) {
        bounded_text(state.cgroup_version),
        "bounded current membership and ancestor observations"},
       {"descriptor_limits",
-       checked(state.nofile_soft && state.nofile_hard),
+       !state.nofile_soft                                  ? severity::warning
+       : *state.nofile_soft < minimum_descriptor_limit     ? severity::error
+       : *state.nofile_soft < recommended_descriptor_limit ? severity::warning
+                                                           : severity::info,
        "soft=" + observed(state.nofile_soft)
          + " hard=" + observed(state.nofile_hard),
-       "native process limits; no automatic adjustment"},
+       "soft >=200000 recommended, <10000 error; raised to hard at start"},
       {"swap_bytes",
        checked(state.swap_bytes.has_value()),
        observed(state.swap_bytes),
@@ -602,6 +605,33 @@ void log_host_checks(const host_check_report& report, seastar::logger& logger) {
           check.observed,
           check.expected);
     }
+}
+
+void raise_descriptor_limit(seastar::logger& logger) {
+    struct rlimit limit{};
+    if (::getrlimit(RLIMIT_NOFILE, &limit) != 0) {
+        logger.warn(
+          "cannot read the open-file limit: {}",
+          std::error_code(errno, std::generic_category()).message());
+        return;
+    }
+    if (limit.rlim_cur >= limit.rlim_max) {
+        return;
+    }
+    const auto previous = limit.rlim_cur;
+    limit.rlim_cur = limit.rlim_max;
+    if (::setrlimit(RLIMIT_NOFILE, &limit) != 0) {
+        logger.warn(
+          "cannot raise the open-file soft limit from {} to {}: {}",
+          previous,
+          limit.rlim_max,
+          std::error_code(errno, std::generic_category()).message());
+        return;
+    }
+    logger.info(
+      "raised the open-file soft limit from {} to {}",
+      previous,
+      limit.rlim_cur);
 }
 
 } // namespace kwaque::broker

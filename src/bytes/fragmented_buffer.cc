@@ -1,6 +1,7 @@
 #include "src/bytes/fragmented_buffer.h"
 
 #include "src/base/error.h"
+#include "src/base/units.h"
 
 #include <seastar/core/deleter.hh>
 
@@ -56,7 +57,7 @@ add_would_overflow(std::uint64_t left, std::uint64_t right) noexcept {
 // capped at the process-wide contiguous-allocation ceiling.
 [[nodiscard]] constexpr std::uint64_t
 deep_copy_allocation_size(std::uint64_t remaining) noexcept {
-    constexpr std::uint64_t max_small_allocation = 16UL * 1024UL;
+    constexpr std::uint64_t max_small_allocation = 16_KiB;
     constexpr std::uint64_t max_chunk_size
       = maximum_contiguous_allocation_bytes;
     if (remaining <= max_small_allocation) {

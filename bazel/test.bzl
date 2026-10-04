@@ -12,9 +12,9 @@ _SANITIZER_DATA = [
 ]
 
 _TEST_ENV = {
-    "ASAN_OPTIONS": "abort_on_error=1:disable_coredump=0:symbolize=1",
+    "ASAN_OPTIONS": "abort_on_error=1:check_initialization_order=1:disable_coredump=0:symbolize=1",
     "ASAN_SYMBOLIZER_PATH": "$(rootpath @current_llvm_toolchain//:llvm-symbolizer)",
-    "KWAQUE_TEST_SEED": "1",
+    "BOOST_TEST_CATCH_SYSTEM_ERRORS": "no",
     "LSAN_OPTIONS": "suppressions=$(rootpath //:lsan_suppressions)",
     "UBSAN_OPTIONS": "abort_on_error=1:halt_on_error=1:print_stacktrace=1:report_error_type=1:suppressions=$(rootpath //:ubsan_suppressions):symbolize=1",
 }
@@ -24,16 +24,56 @@ def _merged_env(extra):
     result.update(extra)
     return result
 
-def kwaque_py_native_test(name, srcs = [], data = [], main = None, timeout = None, tags = [], deps = []):
-    """Defines a Python subprocess test with the native sanitizer environment."""
+def _test_env(extra):
+    """Returns the sanitizer environment plus the selected reactor backend.
+
+    Harnesses that start native processes read KWAQUE_REACTOR_BACKEND, so the
+    --//bazel:reactor_backend flag reaches them as it reaches C++ tests.
+    """
+    return select({
+        "//bazel:reactor_backend_io_uring": _merged_env(dict(extra, KWAQUE_REACTOR_BACKEND = "io_uring")),
+        "//bazel:reactor_backend_linux_aio": _merged_env(dict(extra, KWAQUE_REACTOR_BACKEND = "linux-aio")),
+        "//conditions:default": _merged_env(dict(extra, KWAQUE_REACTOR_BACKEND = "epoll")),
+    })
+
+def kwaque_py_native_test(
+        name,
+        srcs = [],
+        args = [],
+        data = [],
+        main = None,
+        size = "small",
+        timeout = None,
+        tags = [],
+        deps = []):
+    """Defines a Python test that runs native binaries.
+
+    Every test that starts a native process uses this macro, so the process
+    inherits the sanitizer options that make reports fatal and the selected
+    reactor backend. The options name files relative to the test's working
+    directory; a harness that starts a process elsewhere passes it
+    bazel.native_test_environment.normalized_environment().
+
+    Args:
+      name: Name of the test.
+      srcs: Python sources of the test.
+      args: Test arguments.
+      data: Runtime data, such as the native binaries the test starts.
+      main: Main Python source, when it differs from the test name.
+      size: Bazel test size.
+      timeout: Bazel test timeout.
+      tags: Test tags.
+      deps: Python libraries the test imports.
+    """
     py_test(
         name = name,
         srcs = srcs,
+        args = args,
         data = data + _SANITIZER_DATA,
-        deps = deps,
-        env = _merged_env({}),
+        deps = deps + ["//bazel:native_test_environment"],
+        env = _test_env({}),
         main = main,
-        size = "small",
+        size = size,
         tags = tags,
         timeout = timeout,
     )
@@ -70,12 +110,14 @@ def _reactor_args(cpu, memory, args, dash_dash):
     _parse_memory_mib(memory)
     if _has_reactor_resource_arg(args):
         fail("set reactor CPU and memory with the cpu and memory rule parameters")
-    backend = ["--reactor-backend=epoll"]
     for arg in args:
         if arg == "--reactor-backend" or arg.startswith("--reactor-backend="):
-            backend = []
-            break
-    result = backend + [
+            fail("select the reactor backend with --//bazel:reactor_backend")
+    result = select({
+        "//bazel:reactor_backend_io_uring": ["--reactor-backend=io_uring"],
+        "//bazel:reactor_backend_linux_aio": ["--reactor-backend=linux-aio"],
+        "//conditions:default": ["--reactor-backend=epoll"],
+    }) + [
         "--memory={}".format(memory),
         "--overprovisioned",
         "--smp={}".format(cpu),
@@ -115,7 +157,7 @@ def kwaque_cc_test(
             "@googletest//:gtest",
             "@googletest//:gtest_main",
         ],
-        env = _merged_env(env),
+        env = _test_env(env),
         features = ["layering_check"],
         local_defines = local_defines,
         size = size,
@@ -154,7 +196,7 @@ def kwaque_cc_seastar_gtest(
             "@googletest//:gtest",
             "@seastar",
         ],
-        env = _merged_env(env),
+        env = _test_env(env),
         features = ["layering_check"],
         local_defines = local_defines,
         size = size,
@@ -198,7 +240,7 @@ def kwaque_cc_seastar_test(
             "@seastar",
             "@seastar//:testing",
         ],
-        env = _merged_env(env),
+        env = _test_env(env),
         features = ["layering_check"],
         local_defines = local_defines + ["SEASTAR_TESTING_MAIN"],
         size = size,
@@ -216,8 +258,28 @@ def kwaque_cc_benchmark(
         linkopts = [],
         cpu = 1,
         memory = "128MiB",
+        native_allocator_only = False,
         tags = []):
-    """Defines a Seastar benchmark executable."""
+    """Defines a Seastar benchmark executable and a test that runs it once.
+
+    The `<name>_test` target runs every benchmark case for one iteration, so
+    ordinary test runs keep benchmark code compiling and executing without
+    taking measurements.
+
+    Args:
+      name: Name of the benchmark executable.
+      srcs: C++ sources of the benchmark.
+      deps: Dependencies of the benchmark.
+      args: Benchmark arguments, before the reactor arguments.
+      local_defines: Defines for the benchmark sources only.
+      linkopts: Additional linker options.
+      cpu: Reactor shards for the benchmark and its test.
+      memory: Reactor memory for the benchmark and its test.
+      native_allocator_only: Whether the fixtures budget memory against the
+        Seastar allocator. The test is then skipped in system-allocator
+        builds, such as sanitizer builds, where the same budgets are exceeded.
+      tags: Additional tags for both targets.
+    """
     benchmark_args = list(args)
     has_stall_threshold = False
     for arg in benchmark_args:
@@ -230,15 +292,44 @@ def kwaque_cc_benchmark(
         benchmark_args = ["--blocked-reactor-notify-ms=2000000"] + benchmark_args
     cc_binary(
         name = name,
-        srcs = srcs + ["//bazel:benchmark_policy.cc"],
+        srcs = srcs,
         args = _reactor_args(cpu, memory, benchmark_args, False),
         copts = kwaque_copts(),
-        deps = depset(deps + ["@seastar", "@seastar//:benchmark"]).to_list(),
+        deps = depset(deps + [
+            "//bazel:benchmark_policy",
+            "@seastar",
+            "@seastar//:benchmark",
+        ]).to_list(),
         features = ["layering_check"],
         local_defines = local_defines,
         linkopts = linkopts,
         tags = _resource_tags(cpu, memory) + ["benchmark"] + tags,
         testonly = True,
+    )
+    py_test(
+        name = name + "_test",
+        srcs = ["//bazel:benchmark_smoke.py"],
+        args = ["$(rootpath :{})".format(name)] + _reactor_args(
+            cpu,
+            memory,
+            benchmark_args + [
+                "--duration=0",
+                "--iterations=1",
+                "--no-perf-counters",
+                "--random-seed=1",
+                "--runs=1",
+            ],
+            False,
+        ),
+        data = [":" + name] + _SANITIZER_DATA,
+        env = _test_env({}),
+        main = "//bazel:benchmark_smoke.py",
+        size = "medium",
+        tags = _resource_tags(cpu, memory) + ["benchmark"] + tags,
+        target_compatible_with = select({
+            "//bazel:system_allocator": ["@platforms//:incompatible"],
+            "//conditions:default": [],
+        }) if native_allocator_only else [],
     )
 
 def kwaque_cc_fuzz_test(
@@ -290,12 +381,37 @@ def kwaque_cc_fuzz_test(
             for seed in corpus
         ] + ["--"] + args,
         data = [":" + runner_name] + corpus + data + _SANITIZER_DATA,
-        env = _merged_env(env),
+        deps = ["//bazel:native_test_environment"],
+        env = _test_env(env),
         main = "//bazel:fuzz_test_wrapper.py",
         size = "small",
         tags = ["fuzz"] + tags,
         timeout = "moderate",
         target_compatible_with = compatibility,
+    )
+
+    # Replays the empty input and the seed corpus in every ordinary build,
+    # including optimized and other-architecture builds that never fuzz.
+    cc_test(
+        name = name + "_replay",
+        srcs = srcs,
+        args = ["$(rootpath {})".format(seed) for seed in corpus],
+        copts = kwaque_copts(),
+        data = corpus + _SANITIZER_DATA,
+        deps = deps + ["//bazel:fuzz_corpus_replay"],
+        env = _test_env(env),
+        features = ["layering_check"],
+        size = "small",
+        # A manual target, such as a deliberate crash canary, stays manual.
+        tags = ["fuzz_replay"] + [
+            tag
+            for tag in tags
+            if tag == "manual" or tag.startswith("resources:")
+        ],
+        target_compatible_with = select({
+            "//bazel:fuzz_build": ["@platforms//:incompatible"],
+            "//conditions:default": [],
+        }),
     )
 
 def kwaque_fuzz_signal_canary_test(name, runner, seed):
@@ -308,7 +424,8 @@ def kwaque_fuzz_signal_canary_test(name, runner, seed):
         ],
         args = ["$(rootpath {})".format(runner), "$(rootpath {})".format(seed)],
         data = [runner, seed] + _SANITIZER_DATA,
-        env = _merged_env({}),
+        deps = ["//bazel:native_test_environment"],
+        env = _test_env({}),
         main = "//bazel:fuzz_signal_canary_test.py",
         size = "small",
         tags = ["fuzz", "resources:cpu:1", "resources:memory:256"],

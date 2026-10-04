@@ -10,6 +10,9 @@ import subprocess
 import unittest
 from pathlib import Path
 
+# The test macros export the reactor backend selected for this build.
+REACTOR_BACKEND = os.environ.get("KWAQUE_REACTOR_BACKEND", "epoll")
+
 SCENARIOS = (
     "observer-control",
     "crc-cold-32",
@@ -263,7 +266,7 @@ class MemoryQualificationTest(unittest.TestCase):
             command = [
                 str(selected),
                 f"--scenario={scenario}",
-                "--reactor-backend=epoll",
+                f"--reactor-backend={REACTOR_BACKEND}",
                 "--smp=1",
                 "--memory=256MiB",
                 "--overprovisioned",

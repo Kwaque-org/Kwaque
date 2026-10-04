@@ -27,6 +27,7 @@ from typing import Any
 ROUNDS = 3
 MINIMUM_RUNS = 7
 REGRESSION_RATIO = 1.05
+REACTOR_BACKENDS = ("epoll", "linux-aio", "io_uring")
 CASE_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)+")
 MAXIMUM_RESULT_BYTES = 2 * 1024 * 1024
 MAXIMUM_PROFILE_LOG_BYTES = 2 * 1024 * 1024
@@ -43,7 +44,6 @@ NATIVE_ARGUMENTS = (
     "--smp=1",
     "--memory=512MiB",
     "--overprovisioned",
-    "--reactor-backend=epoll",
     "--abort-on-seastar-bad-alloc",
     "--unsafe-bypass-fsync=false",
     "--kernel-page-cache=false",
@@ -330,11 +330,14 @@ def run_comparison(
     cpu: int | None = None,
     task_quota_ms: float | None = None,
     baseline_binary: Path | None = None,
+    reactor_backend: str = "epoll",
 ) -> dict[str, Any]:
     if isinstance(runs, bool) or not isinstance(runs, int) or runs < MINIMUM_RUNS:
         raise ComparisonError("runs must be an integer of at least seven")
     if isinstance(rounds, bool) or rounds != ROUNDS:
         raise ComparisonError("exactly three independent paired rounds are required")
+    if reactor_backend not in REACTOR_BACKENDS:
+        raise ComparisonError("reactor backend must be epoll, linux-aio, or io_uring")
     if (
         isinstance(seed, bool)
         or not isinstance(seed, int)
@@ -414,6 +417,7 @@ def run_comparison(
             "allowed_cpus": allowed_cpus,
             "thread_affinity": True,
             "task_quota_ms": task_quota_ms,
+            "reactor_backend": reactor_backend,
             "hardware_perf_counters": False,
             "regression_ratio": REGRESSION_RATIO,
             "native_overhead_warning_ratio": 0.1,
@@ -448,6 +452,7 @@ def run_comparison(
             log_name = stem + ".log"
             arguments = [
                 *NATIVE_ARGUMENTS,
+                f"--reactor-backend={reactor_backend}",
                 f"--cpuset={selected_cpu}",
                 "--thread-affinity=1",
                 "--mbind=0",
@@ -598,6 +603,12 @@ def main() -> int:
         type=float,
         help="override the native reactor task quota in milliseconds",
     )
+    parser.add_argument(
+        "--reactor-backend",
+        choices=REACTOR_BACKENDS,
+        default="epoll",
+        help="native reactor backend for every invocation",
+    )
     arguments = parser.parse_args()
     try:
         if arguments.case and not arguments.baseline_binary:
@@ -615,6 +626,7 @@ def main() -> int:
             timeout=arguments.timeout,
             cpu=arguments.cpu,
             task_quota_ms=arguments.task_quota_ms,
+            reactor_backend=arguments.reactor_backend,
         )
     except (ComparisonError, OSError) as error:
         message = error.strerror if isinstance(error, OSError) else str(error)

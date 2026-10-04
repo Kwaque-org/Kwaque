@@ -1,12 +1,15 @@
+#include "src/base/units.h"
 #include "src/broker/host_checks.h"
 
 #include <seastar/core/coroutine.hh>
 #include <seastar/testing/test_case.hh>
 
 #include <boost/test/unit_test.hpp>
+#include <sys/resource.h>
 
 #include <algorithm>
 #include <chrono>
+#include <cstdint>
 #include <filesystem>
 #include <fstream>
 #include <iterator>
@@ -17,6 +20,8 @@
 #include <utility>
 
 namespace {
+using kwaque::literals::operator""_KiB;
+using kwaque::literals::operator""_GiB;
 
 using kwaque::broker::host_check_report;
 using kwaque::broker::host_check_severity;
@@ -112,8 +117,8 @@ SEASTAR_TEST_CASE(host_checks_parse_bounded_cpu_ranges_and_reject_bad_input) {
 
 SEASTAR_TEST_CASE(host_checks_keep_host_memory_recommendation_separate) {
     host_snapshot snapshot;
-    snapshot.physical_memory_bytes = 16ULL * 1024U * 1024U * 1024U;
-    snapshot.cgroup_memory_bytes = 8ULL * 1024U * 1024U * 1024U;
+    snapshot.physical_memory_bytes = 16_GiB;
+    snapshot.cgroup_memory_bytes = 8_GiB;
     snapshot.cgroup_cpu_count = 4U;
     snapshot.cgroup_cpu_quota_millicores = 1000U;
     auto report = evaluate_host_checks(snapshot);
@@ -168,7 +173,7 @@ SEASTAR_TEST_CASE(
          {"swap_bytes", "swappiness", "aio_max_nr", "transparent_hugepages"}) {
         BOOST_CHECK(find(report, name).severity == host_check_severity::info);
     }
-    snapshot.swap_bytes = 1024;
+    snapshot.swap_bytes = 1_KiB;
     snapshot.swappiness = 60;
     snapshot.aio_max_nr = 65536;
     snapshot.hugepages = "always madvise [never]";
@@ -181,6 +186,52 @@ SEASTAR_TEST_CASE(
           find(report, name).severity == host_check_severity::warning);
     }
     co_return;
+}
+
+SEASTAR_TEST_CASE(descriptor_limit_is_graded_against_minimum_and_recommended) {
+    host_snapshot snapshot;
+    BOOST_CHECK(
+      find(evaluate_host_checks(snapshot), "descriptor_limits").severity
+      == host_check_severity::warning);
+    snapshot.nofile_hard = 1'048'576;
+    for (const auto& [soft, expected] :
+         {std::pair{std::uint64_t{1024}, host_check_severity::error},
+          std::pair{
+            kwaque::broker::minimum_descriptor_limit - 1U,
+            host_check_severity::error},
+          std::pair{
+            kwaque::broker::minimum_descriptor_limit,
+            host_check_severity::warning},
+          std::pair{
+            kwaque::broker::recommended_descriptor_limit - 1U,
+            host_check_severity::warning},
+          std::pair{
+            kwaque::broker::recommended_descriptor_limit,
+            host_check_severity::info}}) {
+        snapshot.nofile_soft = soft;
+        BOOST_CHECK(
+          find(evaluate_host_checks(snapshot), "descriptor_limits").severity
+          == expected);
+    }
+    co_return;
+}
+
+SEASTAR_TEST_CASE(descriptor_soft_limit_is_raised_to_the_hard_limit) {
+    struct rlimit original{};
+    BOOST_REQUIRE_EQUAL(::getrlimit(RLIMIT_NOFILE, &original), 0);
+    if (original.rlim_max <= 64U) {
+        co_return;
+    }
+    struct rlimit lowered = original;
+    lowered.rlim_cur = 64;
+    BOOST_REQUIRE_EQUAL(::setrlimit(RLIMIT_NOFILE, &lowered), 0);
+    seastar::logger logger{"kwaque-host-checks-test"};
+    kwaque::broker::raise_descriptor_limit(logger);
+    struct rlimit raised{};
+    BOOST_REQUIRE_EQUAL(::getrlimit(RLIMIT_NOFILE, &raised), 0);
+    BOOST_CHECK_EQUAL(raised.rlim_cur, original.rlim_max);
+    BOOST_CHECK_EQUAL(raised.rlim_max, original.rlim_max);
+    BOOST_REQUIRE_EQUAL(::setrlimit(RLIMIT_NOFILE, &original), 0);
 }
 
 SEASTAR_TEST_CASE(host_checks_readonly_fixture_has_bounded_file_reads) {

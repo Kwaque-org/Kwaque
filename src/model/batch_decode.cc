@@ -1,4 +1,5 @@
 #include "src/base/invariant.h"
+#include "src/base/units.h"
 #include "src/codec/envelope_decode.h"
 #include "src/model/batch_codec.h"
 #include "src/model/batch_decode_body.h"
@@ -338,7 +339,7 @@ seastar::future<codec::result<fixed_fields<Assigned>>> read_body(
     }
     if (
       auto ready = co_await work.admit(
-        byte_count{2048}, item_count{64}, anchor);
+        byte_count{2_KiB}, item_count{64}, anchor);
       !ready)
         co_return codec::failure(ready.error());
     if (auto ready = work.poll(anchor); !ready)

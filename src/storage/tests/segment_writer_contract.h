@@ -1,5 +1,6 @@
 #pragma once
 
+#include "src/base/units.h"
 #include "src/codec/crc32c.h"
 #include "src/storage/segment_writer.h"
 #include "src/storage/tests/local_installation_contract.h"
@@ -64,7 +65,7 @@ seastar::future<> creation(
         auto wide = description;
         wide.alignment = alignment(65536);
         auto narrow = configuration();
-        narrow.metadata.operation_bytes = byte_count{65536};
+        narrow.metadata.operation_bytes = byte_count{64_KiB};
         auto unsupported = writer_type::make_new(
           files, owner, spec, 0, wide, resources, narrow);
         const bool rejected = !unsupported
@@ -449,10 +450,10 @@ seastar::future<> reserved_publication(
                        local_root_kind::sealed_retry,
                        local_object_sequence::make(45).value(),
                        runtime::file_position{16384},
-                       byte_count{4096},
+                       byte_count{4_KiB},
                        page_count::make(1).value(),
                        installation::literal_digest(
-                         "982e762d646470ca20d637b68cbcf8a4"))
+                         "23f26dfc1ea13edbe500c410124c229c"))
                        .value();
     const footer_expectation context{
       {installation::segment(),
@@ -495,7 +496,7 @@ seastar::future<> reserved_publication(
     try {
         take(
           co_await drive.lifecycle(
-            publisher.prepare(byte_count{262144}, work)));
+            publisher.prepare(byte_count{256_KiB}, work)));
         const auto slash = pointer_path.value().rfind('/');
         pointer.emplace(
           files,
@@ -510,16 +511,17 @@ seastar::future<> reserved_publication(
             runtime::file_rename_policy::replace,
             local_publication_generation::make(1).value()});
         take(
-          co_await drive.lifecycle(pointer->prepare(byte_count{262144}, work)));
+          co_await drive.lifecycle(
+            pointer->prepare(byte_count{256_KiB}, work)));
         data.emplace(take(
           co_await drive.lifecycle(files.open(
             data_path,
             {.access = runtime::file_access::read_write,
              .close_policy = runtime::file_close_policy::checked}))));
         completion.emplace(take(completion_resources::make(resources, *data)));
-        auto grant = take(resources.try_reserve(byte_count{1U << 20U}));
+        auto grant = take(resources.try_reserve(byte_count{1_MiB}));
         auto insufficient = take(resources.try_reserve(byte_count{1}));
-        auto seal_grant = take(resources.try_reserve(byte_count{1U << 20U}));
+        auto seal_grant = take(resources.try_reserve(byte_count{1_MiB}));
         auto root = co_await installation::buffer_async(
           local_fixture::read("sealed_a"));
         auto sealed = co_await installation::buffer_async(
@@ -605,7 +607,7 @@ seastar::future<> reserved_publication(
         auto written = take(
           co_await drive.lifecycle(
             data->write(runtime::file_position{16384}, std::move(sealed))));
-        require(written == byte_count{4096}, "sealed root was short-written");
+        require(written == byte_count{4_KiB}, "sealed root was short-written");
         take(co_await drive.lifecycle(data->flush(completion->metadata())));
         const auto generation = local_publication_generation::make(2).value();
         const auto header = local_metadata_header::make(
@@ -624,7 +626,7 @@ seastar::future<> reserved_publication(
           {header, spec.identity.metadata_alignment, alignment(4096)},
           payload,
           work,
-          byte_count{262144},
+          byte_count{256_KiB},
           store_contract::limits().charge);
         require(encoded.has_value(), "prepared publication encoding failed");
         auto installed = co_await drive.lifecycle(pointer->publish(
@@ -643,7 +645,7 @@ seastar::future<> reserved_publication(
           {next_header, spec.identity.metadata_alignment, alignment(4096)},
           payload,
           work,
-          byte_count{262144},
+          byte_count{256_KiB},
           store_contract::limits().charge);
         require(next.has_value(), "second publication fixture encoding failed");
         auto blocked = co_await drive.lifecycle(pointer->publish(
@@ -738,7 +740,7 @@ seastar::future<> execution(
       files, owner, spec, resources, work, drive);
     auto config = configuration();
     config.maximum_groups = 2;
-    config.admission.working_bytes = byte_count{1U << 20U};
+    config.admission.working_bytes = byte_count{1_MiB};
     auto writer = take(
       writer_type::make_new(
         files, owner, spec, 0, descriptor(), resources, config));
@@ -894,7 +896,7 @@ seastar::future<> grouped_execution(
       files, owner, spec, resources, work, drive);
     auto config = configuration();
     config.maximum_groups = 1;
-    config.admission.working_bytes = byte_count{1U << 20U};
+    config.admission.working_bytes = byte_count{1_MiB};
     auto writer = take(
       writer_type::make_new(
         files, owner, spec, 0, descriptor(), resources, config));
@@ -1054,16 +1056,16 @@ seastar::future<> preallocated_execution(
   Driver drive) {
     using writer_type = segment_writer<Backend, Owner, Clock>;
     constexpr bool crashable = requires(Backend& backend) { backend.crash(); };
-    constexpr std::uint64_t window = 49152;
+    constexpr std::uint64_t window = 48_KiB;
     seastar::abort_source abort;
     codec::cooperative_work work{codec::limits::defaults(), abort};
     co_await installation::bootstrap(
       files, owner, spec, resources, work, drive);
     auto config = configuration();
     config.maximum_groups = 1;
-    config.admission.working_bytes = byte_count{1U << 20U};
+    config.admission.working_bytes = byte_count{1_MiB};
     config.preallocation_bytes = byte_count{window};
-    config.synchronous_write_bytes = byte_count{16384};
+    config.synchronous_write_bytes = byte_count{16_KiB};
     auto writer = take(
       writer_type::make_new(
         files, owner, spec, 0, descriptor(), resources, config));
@@ -1184,16 +1186,16 @@ seastar::future<> concurrent_execution(
     using writer_type = segment_writer<Backend, Owner, Clock>;
     constexpr bool crashable = requires(Backend& backend) { backend.crash(); };
     constexpr std::uint32_t groups = 4;
-    constexpr std::uint64_t window = 65536;
+    constexpr std::uint64_t window = 64_KiB;
     seastar::abort_source abort;
     codec::cooperative_work work{codec::limits::defaults(), abort};
     co_await installation::bootstrap(
       files, owner, spec, resources, work, drive);
     auto config = configuration();
     config.maximum_groups = groups;
-    config.admission.working_bytes = byte_count{1U << 20U};
+    config.admission.working_bytes = byte_count{1_MiB};
     config.preallocation_bytes = byte_count{window};
-    config.synchronous_write_bytes = byte_count{16384};
+    config.synchronous_write_bytes = byte_count{16_KiB};
     config.concurrent_writes = groups;
     auto writer = take(
       writer_type::make_new(
@@ -1321,17 +1323,17 @@ seastar::future<> extended_execution(
     using writer_type = segment_writer<Backend, Owner, Clock>;
     constexpr bool crashable = requires(Backend& backend) { backend.crash(); };
     constexpr std::uint32_t groups = 5;
-    constexpr std::uint64_t window = 32768;
+    constexpr std::uint64_t window = 32_KiB;
     seastar::abort_source abort;
     codec::cooperative_work work{codec::limits::defaults(), abort};
     co_await installation::bootstrap(
       files, owner, spec, resources, work, drive);
     auto config = configuration();
     config.maximum_groups = 1;
-    config.admission.working_bytes = byte_count{1U << 20U};
+    config.admission.working_bytes = byte_count{1_MiB};
     config.preallocation_bytes = byte_count{window};
     config.preallocation_extension_bytes = byte_count{window};
-    config.synchronous_write_bytes = byte_count{16384};
+    config.synchronous_write_bytes = byte_count{16_KiB};
     auto writer = take(
       writer_type::make_new(
         files, owner, spec, 0, descriptor(), resources, config));
@@ -1530,7 +1532,7 @@ seastar::future<> seal_lifecycle(
     co_await installation::bootstrap(
       files, owner, spec, resources, work, drive);
     auto config = configuration();
-    config.admission.working_bytes = byte_count{1U << 20U};
+    config.admission.working_bytes = byte_count{1_MiB};
     auto writer = take(
       writer_type::make_new(
         files, owner, spec, 0, descriptor(), resources, config));
@@ -1582,7 +1584,7 @@ seastar::future<> seal_lifecycle(
           "obligations");
         if (unresolved) facts.clear();
         const auto count = static_cast<std::uint32_t>(facts.size());
-        auto source_grant = take(resources.try_reserve(byte_count{4096}));
+        auto source_grant = take(resources.try_reserve(byte_count{4_KiB}));
         const auto before = resources.snapshot();
         if (saturated) resources.close_admission();
         auto sealed = co_await drive.lifecycle(writer->seal(
@@ -1855,7 +1857,7 @@ seastar::future<> immutable_import(
        description.alignment},
       local_metadata_payload{publication},
       work,
-      byte_count{262144},
+      byte_count{256_KiB},
       charge);
     require(encoded.has_value(), "immutable publication fixture rejected");
     co_await store_contract::write_bytes(
@@ -1871,7 +1873,7 @@ seastar::future<> immutable_import(
       codec::extent_digest{exact_digest(raw)},
       runtime::file_position{complete.size()}};
     auto config = read_configuration();
-    config.admission.working_bytes = byte_count{1U << 20U};
+    config.admission.working_bytes = byte_count{1_MiB};
     require(
       !(co_await drive.lifecycle(
         writer_type::open_existing(

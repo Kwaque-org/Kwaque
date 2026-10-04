@@ -1,3 +1,4 @@
+#include "src/base/units.h"
 #include "src/model/record_scan.h"
 
 #include <seastar/core/abort_source.hh>
@@ -26,6 +27,8 @@ using kwaque::errc;
 using kwaque::item_count;
 using kwaque::bytes::fragmented_buffer;
 using kwaque::bytes::fragmented_buffer_parser;
+using kwaque::literals::operator""_KiB;
+using kwaque::literals::operator""_MiB;
 
 constexpr auto null_record = "\x06\x00\x00\x00\x01\x01\x00"sv;
 constexpr auto full_record
@@ -48,9 +51,9 @@ byte_count charge(byte_count request) noexcept {
 codec::decode_budget memory() {
     // Other live fixture owners and native/frame reservations occupy the
     // unclaimed half; this is not a measurement of whole-operation memory.
-    return {byte_count{32U << 20U}, byte_count{1U << 20U}, charge};
+    return {byte_count{32_MiB}, byte_count{1_MiB}, charge};
 }
-fragmented_buffer bytes(std::string_view raw, std::size_t width = 65536) {
+fragmented_buffer bytes(std::string_view raw, std::size_t width = 64_KiB) {
     std::vector<seastar::temporary_buffer<char>> parts;
     for (std::size_t at = 0; at < raw.size(); at += width) {
         const auto piece = raw.substr(at, width);
@@ -363,7 +366,7 @@ TEST(
     seastar::abort_source abort;
     codec::cooperative_work work{codec::limits::defaults(), abort};
     auto budget = memory();
-    budget.metadata_remaining = byte_count{65536};
+    budget.metadata_remaining = byte_count{64_KiB};
     auto scanner = model::record_region_scanner::make(
                      bytes(wire, 4096), expected(4096, 4096), budget, work)
                      .get()

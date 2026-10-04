@@ -1,3 +1,4 @@
+#include "src/base/units.h"
 #include "src/codec/tests/qualification_profile.h"
 #include "src/codec/xxh3.h"
 #include "src/model/tests/model_bench_fixture.h"
@@ -188,7 +189,7 @@ private:
         reported_output_ = true;
     }
     codec::decode_budget memory() const {
-        return {remaining_, byte_count{1U << 20U}, capacity_bound};
+        return {remaining_, byte_count{1_MiB}, capacity_bound};
     }
     template<bool Assigned, bool Sparse>
     seastar::future<> initialize() {
@@ -229,8 +230,7 @@ private:
         const auto retained = cost.backing.value() + cost.descriptors.value()
                               + cost.share_controls.value();
         remaining_ = byte_count{
-          ((64U << 20U) - codec::testing::execution_reservation.value())
-          - retained};
+          (64_MiB - codec::testing::execution_reservation.value()) - retained};
         fmt::print(
           "kwaque-compressed-batch-v1 kind={} original_records={} "
           "retained_records={} pattern={} "
@@ -257,7 +257,7 @@ private:
     std::optional<codec::content_digest> retained_digest_;
     byte_count expanded_;
     byte_count remaining_{
-      (64U << 20U) - codec::testing::execution_reservation.value()};
+      64_MiB - codec::testing::execution_reservation.value()};
     bool initialized_{false};
     bool reported_output_{false};
 };

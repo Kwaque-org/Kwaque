@@ -1,6 +1,7 @@
 #include "src/codec/tests/benchmark_buffer.h"
 
 #include "src/base/allocation.h"
+#include "src/base/units.h"
 #include "src/bytes/fragmented_buffer_builder.h"
 #include "src/bytes/test_allocation_profile.h"
 
@@ -165,7 +166,7 @@ seastar::future<fragmented_buffer> patterned_buffer(
   cooperative_work& work,
   byte_count remaining) {
     if (size == 0) co_return fragmented_buffer{};
-    require(size <= (8U << 20U), "benchmark payload exceeds maximum region");
+    require(size <= 8_MiB, "benchmark payload exceeds maximum region");
     const auto width = std::min(
       size, std::max(requested_width, (size + 511U) / 512U));
     require(width != 0 && width <= 65536, "invalid benchmark fragment width");

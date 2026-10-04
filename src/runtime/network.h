@@ -108,11 +108,9 @@ private:
     std::uint16_t port_;
 };
 
-inline constexpr byte_count maximum_network_operation_bytes{
-  64U * 1024U * 1024U};
-inline constexpr byte_count maximum_socket_buffer_bytes{16U * 1024U * 1024U};
-inline constexpr byte_count maximum_pending_network_write_bytes{
-  64U * 1024U * 1024U};
+inline constexpr byte_count maximum_network_operation_bytes{64_MiB};
+inline constexpr byte_count maximum_socket_buffer_bytes{16_MiB};
+inline constexpr byte_count maximum_pending_network_write_bytes{64_MiB};
 inline constexpr std::uint32_t maximum_pending_network_writes = 96;
 inline constexpr std::uint32_t maximum_listen_backlog = 65535;
 
@@ -122,7 +120,7 @@ struct network_connection_limits final {
     // larger than the byte capacity is out_of_range; temporary saturation fails
     // immediately with queue_full. Rejected payload is released rather than
     // retained in an unbounded waiter list.
-    byte_count pending_write_bytes{16U * 1024U * 1024U};
+    byte_count pending_write_bytes{16_MiB};
     std::uint32_t pending_writes{64};
 
     [[nodiscard]] result<void> validate() const noexcept;

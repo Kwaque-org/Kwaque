@@ -1,3 +1,4 @@
+#include "src/base/units.h"
 #include "src/runtime/file.h"
 #include "src/runtime/fragmented_buffer_internal.h"
 
@@ -35,7 +36,7 @@ namespace kwaque::runtime {
 namespace {
 
 constexpr unsigned dma_alignment = 4096;
-constexpr std::size_t backing_size = 8192;
+constexpr std::size_t backing_size = 8_KiB;
 
 struct benchmark_file_state final {
     std::vector<char> storage = std::vector<char>(backing_size, 'b');
@@ -605,7 +606,7 @@ private:
     std::uint64_t append_alignment_;
     std::uint64_t native_limit_;
     std::uint64_t position_{0};
-    std::size_t write_size_{4096};
+    std::size_t write_size_{4_KiB};
     file_state owner_state_{file_state::open};
     bool abort_requested_{false};
 };
@@ -693,7 +694,7 @@ public:
         if (
           !validate_file_read_request(file_position{0}, byte_count{4096})
           || owner_state_ != file_state::open || abort_requested_
-          || byte_count{4096} > limits_.pending_read_bytes) {
+          || byte_count{4_KiB} > limits_.pending_read_bytes) {
             std::terminate();
         }
         auto operation = seastar::try_get_units(read_operation_units_, 1);
@@ -719,7 +720,7 @@ public:
                     auto data = detail::fragmented_buffer_io_access::adopt(
                       std::move(native), retained);
                     return file_read_result::make(
-                      std::move(data), false, byte_count{4096});
+                      std::move(data), false, byte_count{4_KiB});
                 } catch (const std::bad_alloc&) {
                     throw;
                 } catch (...) {

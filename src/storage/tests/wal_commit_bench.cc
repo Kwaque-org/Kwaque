@@ -1,3 +1,4 @@
+#include "src/base/units.h"
 #include "src/codec/xxh3.h"
 #include "src/resource/resource_registry.h"
 #include "src/runtime/production/clocks.h"
@@ -132,8 +133,8 @@ struct wal_commit_bench {
       std::uint64_t TargetBytes = runtime::maximum_file_io_bytes.value(),
       std::uint32_t Capacity = 8>
     seastar::future<std::size_t> measure() {
-        constexpr std::size_t count = Size >= (8U << 20U)                 ? 2
-                                      : Size >= (4U << 20U)               ? 8
+        constexpr std::size_t count = Size >= 8_MiB                       ? 2
+                                      : Size >= 4_MiB                     ? 8
                                       : Profile == arrival_profile::paced ? 128
                                                                           : 32;
         constexpr std::size_t window = std::min<std::size_t>(4, count);
@@ -168,9 +169,8 @@ struct wal_commit_bench {
           !zero_written || Profile != arrival_profile::rotation,
           "rotation uses growing files");
         constexpr std::uint64_t zero_window = std::min<std::uint64_t>(
-          128U << 20U,
-          ((8192 + count * (Size + 65536) + (2U << 20U) - 1) / (2U << 20U))
-            * (2U << 20U));
+          128_MiB,
+          ((8192 + count * (Size + 64_KiB) + 2_MiB - 1) / 2_MiB) * 2_MiB);
         const bool foreground_probe = std::getenv("KWAQUE_WAL_FOREGROUND_PROBE")
                                       != nullptr;
         const auto configuration = resource::resource_config::from_total_memory(
@@ -203,16 +203,15 @@ struct wal_commit_bench {
                       manager.acquire_workload(
                         resource::workload_class::metadata),
                       {.tasks = 512,
-                       .bytes = byte_count{96U << 20U},
+                       .bytes = byte_count{96_MiB},
                        .handles = 32},
                       charge};
                     auto writer_config = wal_writer_contract::configuration();
-                    writer_config.capacity_bytes = byte_count{128U << 20U};
+                    writer_config.capacity_bytes = byte_count{128_MiB};
                     if (zero_written)
                         writer_config.preallocation_bytes = byte_count{
                           zero_window};
-                    writer_config.children.working_bytes = byte_count{
-                      16U << 20U};
+                    writer_config.children.working_bytes = byte_count{16_MiB};
                     co_await wal_append_contract::with_writer(
                       files,
                       owner,
@@ -229,13 +228,13 @@ struct wal_commit_bench {
                                   std::move(child).release_bytes(),
                                   257,
                                   work,
-                                  byte_count{32U << 20U},
+                                  byte_count{32_MiB},
                                   1020);
                               child = (co_await validate_encoded_assigned_batch(
                                          std::move(fragmented),
                                          batch_expected(),
-                                         {byte_count{32U << 20U},
-                                          byte_count{1U << 20U},
+                                         {byte_count{32_MiB},
+                                          byte_count{1_MiB},
                                           charge},
                                          work))
                                         .value();
@@ -274,10 +273,9 @@ struct wal_commit_bench {
                                 .value()
                                 .encoded_bytes();
                           const auto setup_extent
-                            = ((8192 + count * encoded_size.value()
-                                + (2U << 20U) - 1)
-                               / (2U << 20U))
-                              * (2U << 20U);
+                            = ((8192 + count * encoded_size.value() + 2_MiB - 1)
+                               / 2_MiB)
+                              * 2_MiB;
                           require(
                             !zero_written || setup_extent <= zero_window,
                             "zero-written window does not cover the workload");
@@ -822,8 +820,8 @@ struct wal_commit_bench {
                               if (!requests[i].accepted) continue;
                               auto alias
                                 = co_await verification_child.batch.share(
-                                  {byte_count{32U << 20U},
-                                   byte_count{1U << 20U},
+                                  {byte_count{32_MiB},
+                                   byte_count{1_MiB},
                                    charge},
                                   work);
                               auto bytes = co_await encode_wal_prepare(
@@ -840,7 +838,7 @@ struct wal_commit_bench {
                                  expected.profile,
                                  expected.target_profile},
                                 work,
-                                byte_count{32U << 20U},
+                                byte_count{32_MiB},
                                 charge);
                               auto encoded = std::move(bytes).value();
                               for (auto fragment : encoded) {
@@ -874,7 +872,7 @@ struct wal_commit_bench {
                                   while (offset != encoded.size().value()) {
                                       const auto length = byte_count{
                                         std::min<std::uint64_t>(
-                                          65536,
+                                          64_KiB,
                                           encoded.size().value() - offset)};
                                       auto read = take(
                                         co_await file.read(
@@ -1097,10 +1095,10 @@ struct wal_commit_bench {
         return (measure<true, Size, Fragmented, 0, arrival_profile::fixed>()); \
     }
 COMMIT_FIXED(tiny, 0, false)
-COMMIT_FIXED(aligned, 131072, false)
-COMMIT_FIXED(fragmented, 131072, true)
-COMMIT_FIXED(m4, 4U << 20U, false)
-COMMIT_FIXED(maximum, 8U << 20U, false)
+COMMIT_FIXED(aligned, 128_KiB, false)
+COMMIT_FIXED(fragmented, 128_KiB, true)
+COMMIT_FIXED(m4, 4_MiB, false)
+COMMIT_FIXED(maximum, 8_MiB, false)
 #undef COMMIT_FIXED
 #define COMMIT_ARRIVAL(Name, Profile)                                          \
     PERF_TEST_F(wal_commit_bench, zero_##Name) {                               \
@@ -1117,10 +1115,10 @@ COMMIT_ARRIVAL(retained, retained)
 COMMIT_ARRIVAL(timeout, timeout)
 #undef COMMIT_ARRIVAL
 PERF_TEST_F(wal_commit_bench, writer_rotation) {
-    return (measure<false, 131072, false, 0, arrival_profile::rotation>());
+    return (measure<false, 128_KiB, false, 0, arrival_profile::rotation>());
 }
 PERF_TEST_F(wal_commit_bench, coordinator_rotation) {
-    return (measure<true, 131072, false, 0, arrival_profile::rotation>());
+    return (measure<true, 128_KiB, false, 0, arrival_profile::rotation>());
 }
 PERF_TEST_F(wal_commit_bench, default_burst) {
     return (measure<
@@ -1130,7 +1128,7 @@ PERF_TEST_F(wal_commit_bench, default_burst) {
             1'000'000,
             arrival_profile::burst,
             32,
-            4U << 20U,
+            4_MiB,
             2>());
 }
 PERF_TEST_F(wal_commit_bench, default_paced) {
@@ -1141,21 +1139,21 @@ PERF_TEST_F(wal_commit_bench, default_paced) {
             1'000'000,
             arrival_profile::paced,
             32,
-            4U << 20U,
+            4_MiB,
             2>());
 }
 PERF_TEST_F(wal_commit_bench, byte_target_zero) {
     return (
-      measure<true, 131072, false, 0, arrival_profile::burst, 32, 262144>());
+      measure<true, 128_KiB, false, 0, arrival_profile::burst, 32, 256_KiB>());
 }
 PERF_TEST_F(wal_commit_bench, byte_target_delayed) {
     return (measure<
             true,
-            131072,
+            128_KiB,
             false,
             1'000'000,
             arrival_profile::burst,
             32,
-            262144>());
+            256_KiB>());
 }
 } // namespace kwaque::storage::testing

@@ -1,3 +1,4 @@
+#include "src/base/units.h"
 #include "src/bytes/test_allocation_profile.h"
 #include "src/model/checkpoint_codec.h"
 #include "src/model/tests/lineage_test_support.h"
@@ -28,12 +29,13 @@ using kwaque::errc;
 using kwaque::bytes::fragmented_buffer;
 using kwaque::bytes::fragmented_buffer_parser;
 using kwaque::bytes::testing::charge;
+using kwaque::literals::operator""_MiB;
 constexpr codec::field_context context{.origin = 71, .family = 10};
 
 codec::decode_budget memory() {
     // The other half reserves fixtures, small model snapshots, native CRC
     // state and coroutine frames. Each codec call carries its actual residual.
-    return {byte_count{32U << 20U}, byte_count{1U << 20U}, charge};
+    return {byte_count{32_MiB}, byte_count{1_MiB}, charge};
 }
 
 std::string save(const lineage_frontier& before) {

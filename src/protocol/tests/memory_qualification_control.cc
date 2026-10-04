@@ -1,5 +1,6 @@
 #include "src/protocol/tests/memory_qualification_control.h"
 
+#include "src/base/units.h"
 #include "src/codec/tests/memory_qualification_support.h"
 #include "src/codec/tests/prepared_abort_source.h"
 #include "src/protocol/control_frame_codec.h"
@@ -66,7 +67,7 @@ byte_count string_cost(const std::string& value) {
 codec::decode_budget memory(byte_count other) {
     return {
       observation::residual.checked_sub(other).value(),
-      byte_count{1U << 20U},
+      byte_count{1_MiB},
       observed_charge};
 }
 
@@ -157,10 +158,10 @@ control_capabilities owning_capabilities(bool maximum) {
       {},
       {},
       {},
-      byte_count{16777216},
-      byte_count{8388608},
-      byte_count{4096},
-      byte_count{1048576},
+      byte_count{16_MiB},
+      byte_count{8_MiB},
+      byte_count{4_KiB},
+      byte_count{1_MiB},
       item_count{4096}};
     if (maximum) {
         for (std::uint16_t i = 1; i <= 16; ++i)
