@@ -70,6 +70,12 @@ jobs:
           path: ${{ steps.corpus.outputs.directory }}
           key: ${{ steps.corpus.outputs.key }}-${{ github.run_id }}
           restore-keys: ${{ steps.corpus.outputs.key }}-
+      # A target's first campaign has no corpus to restore, and the sandbox
+      # refuses every action when a writable path does not exist.
+      - name: Make sure the corpus directory exists
+        env:
+          CORPUS: ${{ steps.corpus.outputs.directory }}
+        run: mkdir -p "${CORPUS}"
       - name: Run a bounded fuzz campaign
         id: tests
         env:
