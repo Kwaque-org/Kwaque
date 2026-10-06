@@ -51,6 +51,17 @@ class Endpoint:
         return f"http://{self.address}:{self.port}{path}"
 
 
+def _lease(address: str) -> bool:
+    lease = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        lease.bind(f"\0kwaque-test-endpoint-{address}")
+    except OSError:
+        lease.close()
+        return False
+    _leases.append(lease)
+    return True
+
+
 def lease_loopback_endpoint() -> Endpoint:
     """Return an admin endpoint that no concurrent test uses.
 
@@ -66,15 +77,24 @@ def lease_loopback_endpoint() -> Endpoint:
         address = "127.{}.{}.{}".format(
             random.randrange(1, 255), random.randrange(0, 256), random.randrange(1, 255)
         )
-        lease = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        try:
-            lease.bind(f"\0kwaque-test-endpoint-{address}")
-        except OSError:
-            lease.close()
-            continue
-        _leases.append(lease)
-        return Endpoint(address, ADMIN_PORT)
+        if _lease(address):
+            return Endpoint(address, ADMIN_PORT)
     raise RuntimeError("unable to lease a loopback endpoint")
+
+
+def wait_for_loopback_endpoint(address: str, timeout: float = 45.0) -> Endpoint:
+    """Lease the admin endpoint at an address the test cannot choose.
+
+    A committed configuration names one address, so concurrent tests that run
+    it take turns: each waits here until the test holding the lease exits.
+    The wait leaves a short test the rest of its minute to run.
+    """
+    deadline = time.monotonic() + timeout
+    while not _lease(address):
+        if time.monotonic() >= deadline:
+            raise RuntimeError(f"unable to lease the loopback endpoint {address}")
+        time.sleep(0.05)
+    return Endpoint(address, ADMIN_PORT)
 
 
 def test_directory() -> tempfile.TemporaryDirectory[str]:

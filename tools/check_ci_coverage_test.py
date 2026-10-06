@@ -755,6 +755,10 @@ class CiCoverageTest(unittest.TestCase):
             self.assertEqual(len(builds), 1, name)
             self.assertIn("//bazel/packaging:kwaque_tar", builds[0].split())
             output_bases.add(re.search(r"--output_base=(\S+)", builds[0]).group(1))
+            # The package rule also links the archive under its own name; a
+            # second copy of the archive cannot be compared as one.
+            self.assertIn("/bazel/packaging/kwaque-*.tar.gz\n", jobs[name])
+            self.assertNotIn("/*.tar.gz", jobs[name])
         self.assertEqual(len(output_bases), 2)
         self.assertIn("path: relocated/kwaque", jobs["reproducible-package-b"])
         compare = jobs["reproducible-package"]
@@ -762,6 +766,7 @@ class CiCoverageTest(unittest.TestCase):
             "needs: [reproducible-package-a, reproducible-package-b]", compare
         )
         self.assertIn('cmp -s "${first[0]}" "${second[0]}"', compare)
+        self.assertNotIn("/*.tar.gz", compare)
 
     def test_analysis_covers_ordinary_and_fuzz_sources(self) -> None:
         self.assertEqual(analysis_coverage_errors(self.workflow), [])
