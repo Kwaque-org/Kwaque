@@ -267,6 +267,7 @@ class MemoryQualificationTest(unittest.TestCase):
                 str(selected),
                 f"--scenario={scenario}",
                 f"--reactor-backend={REACTOR_BACKEND}",
+                "--max-networking-io-control-blocks=1000",
                 "--smp=1",
                 "--memory=256MiB",
                 "--overprovisioned",

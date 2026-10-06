@@ -13,6 +13,7 @@
 
 #include <seastar/core/condition-variable.hh>
 #include <seastar/core/shared_ptr.hh>
+#include <seastar/util/noncopyable_function.hh>
 
 #include <array>
 #include <cstdint>
@@ -141,6 +142,20 @@ struct segment_barrier_outcome final {
 struct segment_block_layout final {
     coverage records;
     aligned_envelope_layout envelope;
+};
+// Follows a segment's blocks, on the owner's shard, for state derived from
+// them. Neither call may throw and neither can fail the segment: nothing a
+// caller derives here is part of an append's result. Both run inside the
+// owner's own steps and must not call back into it.
+struct segment_block_observer final {
+    // The blocks of one written group, in file order. Their bytes are in the
+    // file and may not be durable yet. Borrowed for the call.
+    seastar::noncopyable_function<void(
+      std::span<const segment_block_layout>) noexcept>
+      written;
+    // Every block that begins below this position is durable.
+    seastar::noncopyable_function<void(runtime::file_position) noexcept>
+      durable;
 };
 // The eventual frozen handoff binds all blocks and the footer to one captured
 // owner. A prospective capacity check does not mint this value.

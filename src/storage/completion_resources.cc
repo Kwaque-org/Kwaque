@@ -49,7 +49,7 @@ runtime::result<completion_resources> completion_resources::make(
     auto scratch = seastar::temporary_buffer<char>::aligned(
       static_cast<std::size_t>(alignment), static_cast<std::size_t>(size));
     std::fill_n(scratch.get_write(), scratch.size(), char{});
-    const auto handles = reservation->try_acquire_handles(1);
+    const auto handles = reservation->try_acquire_handles(completion_handles);
     if (!handles) return runtime::failure(handles.error());
     auto metadata = file.try_reserve_metadata();
     if (!metadata) return runtime::failure(metadata.error());

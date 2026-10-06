@@ -89,7 +89,8 @@ private:
 
 // Borrows the frozen root for one joined stream. Existing index/retry walkers
 // retain their exact cross-page ordering checks; local pages carry the previous
-// full BID/cursor through the same contextual decoder used elsewhere.
+// full BID or checkpoint entry through the same contextual decoder used
+// elsewhere.
 class local_bundle_verifier final {
 public:
     local_bundle_verifier(const local_bundle&, codec::limits);
@@ -104,10 +105,25 @@ private:
     std::optional<sparse_index_verifier> index_;
     std::optional<retry_summary_verifier> retry_;
     std::optional<model::batch_id> previous_retry_;
-    std::optional<local_wal_cursor> previous_checkpoint_;
+    std::optional<local_checkpoint_entry> previous_checkpoint_;
     std::uint32_t next_{0};
     bool failed_{false};
 };
+
+namespace detail {
+// Why bytes that did not decode as the index object a digest pins are
+// refused. `input` stands at the object's first byte, where its decoder left
+// it, with `encoded` bytes of it ahead. Bytes that are not the pinned ones
+// are damage, whatever their decoder met first: corrupt_data, which an index
+// is built again for. The pinned bytes that this reader cannot decode keep
+// the decoder's reason, and so does a check that could not be finished.
+[[nodiscard]] seastar::future<runtime::operation_error> undecoded_index_error(
+  bytes::fragmented_buffer_parser& input,
+  byte_count encoded,
+  codec::immutable_object_digest pinned,
+  errc why,
+  codec::cooperative_work&);
+} // namespace detail
 
 struct local_bundle_publication final {
     local_publication_outcome publication;

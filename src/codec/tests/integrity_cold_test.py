@@ -205,6 +205,7 @@ class IntegrityColdTest(unittest.TestCase):
                     self.binary,
                     f"--scenario={scenario}",
                     f"--reactor-backend={REACTOR_BACKEND}",
+                    "--max-networking-io-control-blocks=1000",
                     "--smp=1",
                     "--memory=64MiB",
                     "--overprovisioned",

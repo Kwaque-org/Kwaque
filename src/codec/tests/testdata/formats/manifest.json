@@ -2523,13 +2523,13 @@
           "name": "body_crc32c",
           "offset": 24,
           "width": 4,
-          "le": 3456010107
+          "le": 2923663759
         },
         {
           "name": "header_crc32c",
           "offset": 28,
           "width": 4,
-          "le": 544921648
+          "le": 1330952152
         },
         {
           "name": "body",
@@ -2663,7 +2663,7 @@
               "name": "padding_bytes",
               "offset": 164,
               "width": 4,
-              "le": 264
+              "le": 256
             },
             {
               "name": "page_ref",
@@ -2716,9 +2716,15 @@
               ]
             },
             {
-              "name": "alignment_padding",
+              "name": "first_anchor",
               "offset": 216,
-              "width": 264,
+              "width": 8,
+              "le": 100
+            },
+            {
+              "name": "alignment_padding",
+              "offset": 224,
+              "width": 256,
               "zero": true
             }
           ]
@@ -5668,7 +5674,7 @@
           ]
         }
       ],
-      "expected": "7b87fecd",
+      "expected": "8f9143ae",
       "stored": {
         "fixture": "index_root",
         "offset": 24
@@ -5692,7 +5698,7 @@
           ]
         }
       ],
-      "expected": "30d87a20",
+      "expected": "d8b7544f",
       "stored": {
         "fixture": "index_root",
         "offset": 28
@@ -6454,7 +6460,7 @@
           ]
         }
       ],
-      "expected": "a3e1baf8ae5bae500f97ea4e373ca7d8"
+      "expected": "9dbee9ba77b561991dde6e7d6918943c"
     },
     {
       "name": "manifest_page_exact",

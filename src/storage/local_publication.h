@@ -91,6 +91,10 @@ struct local_publication_request final {
     local_publication_generation generation;
     std::optional<local_publication_generation> expected_current;
 };
+// The handle credits one publication holds: its temporary's, and its parent
+// directory's.
+inline constexpr std::uint32_t publication_handles = 2;
+
 struct local_publication_limits final {
     byte_count maximum_bytes{64_KiB};
     // Caller-qualified frame/control allowance in addition to payload,
@@ -130,7 +134,8 @@ public:
 
     // Reserve before accepting work that must later publish. The namespace
     // owner keeps this parent stable until joined close. In addition to memory
-    // and handle credits, retain the backend's actual directory-cursor slot.
+    // and handle credits, keep the parent directory open, so its sync after
+    // the rename needs no admission of any kind.
     // A returned outcome keeps the allowance occupied until it is released;
     // later publications cannot multiply retained metadata using one grant.
     [[nodiscard]] seastar::future<runtime::result<void>>
@@ -167,7 +172,9 @@ public:
             working_bytes.value() + limits_.execution_bytes.value()
             + write_credit.value() + paths->value()});
         if (!held) co_return runtime::failure(held.error());
-        if (auto handles = held->try_acquire_handles(2); !handles)
+        if (
+          auto handles = held->try_acquire_handles(publication_handles);
+          !handles)
             co_return runtime::failure(handles.error());
         auto holder = operations_.hold();
         busy_ = true;
@@ -230,7 +237,10 @@ public:
                                    + write_backing->value() + paths->value()});
         if (!reservation) return reject(reservation.error());
         if (!prepared_) {
-            if (auto handles = reservation->try_acquire_handles(2); !handles)
+            if (
+              auto handles = reservation->try_acquire_handles(
+                publication_handles);
+              !handles)
                 return reject(handles.error());
         }
         const auto size = payload.size();
@@ -286,7 +296,10 @@ public:
                                    + backing->value() + paths->value()});
         if (!reservation) return reject(reservation.error());
         if (!prepared_) {
-            if (auto handles = reservation->try_acquire_handles(2); !handles)
+            if (
+              auto handles = reservation->try_acquire_handles(
+                publication_handles);
+              !handles)
                 return reject(handles.error());
         }
         return publish_owned(

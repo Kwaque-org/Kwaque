@@ -2651,13 +2651,13 @@
           "name": "body_crc",
           "offset": 24,
           "width": 4,
-          "hex": "61e963d9"
+          "hex": "27abe421"
         },
         {
           "name": "header_crc",
           "offset": 28,
           "width": 4,
-          "hex": "dec63226"
+          "hex": "b900b9b7"
         },
         {
           "name": "body",
@@ -2710,18 +2710,18 @@
               "name": "payload_bytes",
               "offset": 64,
               "width": 4,
-              "le": 512
+              "le": 440
             },
             {
               "name": "padding_bytes",
               "offset": 68,
               "width": 4,
-              "le": 3480
+              "le": 3552
             },
             {
               "name": "payload",
               "offset": 72,
-              "width": 512,
+              "width": 440,
               "fields": [
                 {
                   "name": "checkpoint_sequence",
@@ -2750,15 +2750,217 @@
                 {
                   "name": "entries",
                   "offset": 20,
-                  "width": 492,
-                  "hex": "0000000000000000000000000000000100100000000000000000000000000000000000000000000100200000000000001111111111111111111111111111111110101010101010101010101010101010202020202020202020202020202020203030303030303030303030303030303001000000000000000100000033000000000000009eb28fb146c7e6e658b38622138aad8d00000000000000000000000000000000000000000000000000000000000000010020000000000000000000000000000000000000000000010030000000000000111111111111111111111111111111111010101010101010101010101010101021212121212121212121212121212121313131313131313131313131313131310200000000000000030000003f000000000000009d806b207e618d86da36e4b922114016000000000000000000000000000000000000000000000000000000000000000100300000000000000000000000000000000000000000000100400000000000001111111111111111111111111111111110101010101010101010101010101010202020202020202020202020202020203030303030303030303030303030303001000000000000000100000033000000000000009eb28fb146c7e6e658b38622138aad8d00000000000000000000000000000000"
+                  "width": 420,
+                  "fields": [
+                    {
+                      "name": "entry_0",
+                      "offset": 0,
+                      "width": 140,
+                      "fields": [
+                        {
+                          "name": "SC",
+                          "offset": 0,
+                          "width": 72,
+                          "hex": "111111111111111111111111111111111010101010101010101010101010101020202020202020202020202020202020303030303030303030303030303030300100000000000000"
+                        },
+                        {
+                          "name": "disposition",
+                          "offset": 72,
+                          "width": 2,
+                          "le": 1
+                        },
+                        {
+                          "name": "reserved",
+                          "offset": 74,
+                          "width": 2,
+                          "le": 0
+                        },
+                        {
+                          "name": "data_device",
+                          "offset": 76,
+                          "width": 16,
+                          "hex": "44444444444444444444444444444444"
+                        },
+                        {
+                          "name": "locator",
+                          "offset": 92,
+                          "width": 8,
+                          "le": 12288
+                        },
+                        {
+                          "name": "bytes",
+                          "offset": 100,
+                          "width": 4,
+                          "le": 4096
+                        },
+                        {
+                          "name": "family",
+                          "offset": 104,
+                          "width": 2,
+                          "le": 6
+                        },
+                        {
+                          "name": "reserved2",
+                          "offset": 106,
+                          "width": 2,
+                          "le": 0
+                        },
+                        {
+                          "name": "digest",
+                          "offset": 108,
+                          "width": 16,
+                          "hex": "c156c15a2d7d3870d7d6d8d16d52ba64"
+                        },
+                        {
+                          "name": "digest_reserved",
+                          "offset": 124,
+                          "width": 16,
+                          "zero": true
+                        }
+                      ]
+                    },
+                    {
+                      "name": "entry_1",
+                      "offset": 140,
+                      "width": 140,
+                      "fields": [
+                        {
+                          "name": "SC",
+                          "offset": 0,
+                          "width": 72,
+                          "hex": "111111111111111111111111111111111010101010101010101010101010101021212121212121212121212121212121313131313131313131313131313131310200000000000000"
+                        },
+                        {
+                          "name": "disposition",
+                          "offset": 72,
+                          "width": 2,
+                          "le": 1
+                        },
+                        {
+                          "name": "reserved",
+                          "offset": 74,
+                          "width": 2,
+                          "le": 0
+                        },
+                        {
+                          "name": "data_device",
+                          "offset": 76,
+                          "width": 16,
+                          "hex": "55555555555555555555555555555555"
+                        },
+                        {
+                          "name": "locator",
+                          "offset": 92,
+                          "width": 8,
+                          "le": 8192
+                        },
+                        {
+                          "name": "bytes",
+                          "offset": 100,
+                          "width": 4,
+                          "le": 4096
+                        },
+                        {
+                          "name": "family",
+                          "offset": 104,
+                          "width": 2,
+                          "le": 6
+                        },
+                        {
+                          "name": "reserved2",
+                          "offset": 106,
+                          "width": 2,
+                          "le": 0
+                        },
+                        {
+                          "name": "digest",
+                          "offset": 108,
+                          "width": 16,
+                          "hex": "26379b17a9588439bcd93421bbe88ca4"
+                        },
+                        {
+                          "name": "digest_reserved",
+                          "offset": 124,
+                          "width": 16,
+                          "zero": true
+                        }
+                      ]
+                    },
+                    {
+                      "name": "entry_2",
+                      "offset": 280,
+                      "width": 140,
+                      "fields": [
+                        {
+                          "name": "SC",
+                          "offset": 0,
+                          "width": 72,
+                          "hex": "111111111111111111111111111111111010101010101010101010101010101021212121212121212121212121212121313131313131313131313131313131310200000000000000"
+                        },
+                        {
+                          "name": "disposition",
+                          "offset": 72,
+                          "width": 2,
+                          "le": 3
+                        },
+                        {
+                          "name": "reserved",
+                          "offset": 74,
+                          "width": 2,
+                          "le": 0
+                        },
+                        {
+                          "name": "data_device",
+                          "offset": 76,
+                          "width": 16,
+                          "zero": true
+                        },
+                        {
+                          "name": "locator",
+                          "offset": 92,
+                          "width": 8,
+                          "le": 63
+                        },
+                        {
+                          "name": "bytes",
+                          "offset": 100,
+                          "width": 4,
+                          "le": 4096
+                        },
+                        {
+                          "name": "family",
+                          "offset": 104,
+                          "width": 2,
+                          "le": 0
+                        },
+                        {
+                          "name": "reserved2",
+                          "offset": 106,
+                          "width": 2,
+                          "le": 0
+                        },
+                        {
+                          "name": "digest",
+                          "offset": 108,
+                          "width": 16,
+                          "hex": "9d806b207e618d86da36e4b922114016"
+                        },
+                        {
+                          "name": "digest_reserved",
+                          "offset": 124,
+                          "width": 16,
+                          "zero": true
+                        }
+                      ]
+                    }
+                  ]
                 }
               ]
             },
             {
               "name": "alignment_padding",
-              "offset": 584,
-              "width": 3480,
+              "offset": 512,
+              "width": 3552,
               "zero": true
             }
           ]
@@ -2816,13 +3018,13 @@
           "name": "body_crc",
           "offset": 24,
           "width": 4,
-          "hex": "824c9c67"
+          "hex": "340d9aeb"
         },
         {
           "name": "header_crc",
           "offset": 28,
           "width": 4,
-          "hex": "b55832c5"
+          "hex": "a4066dfb"
         },
         {
           "name": "body",
@@ -2916,7 +3118,7 @@
                   "name": "pages",
                   "offset": 56,
                   "width": 48,
-                  "hex": "000000000000000003000000001000001fe7f29187842fe11415c25d3ae5a03500000000000000000000000000000000"
+                  "hex": "00000000000000000300000000100000509a088ac0272b6c5982dfb08efd38e400000000000000000000000000000000"
                 }
               ]
             },
@@ -3348,13 +3550,13 @@
           "name": "body_crc",
           "offset": 24,
           "width": 4,
-          "hex": "a1751f58"
+          "hex": "bcfc149b"
         },
         {
           "name": "header_crc",
           "offset": 28,
           "width": 4,
-          "hex": "98bf7745"
+          "hex": "104e217d"
         },
         {
           "name": "body",
@@ -3460,7 +3662,7 @@
                   "name": "checkpoint",
                   "offset": 44,
                   "width": 60,
-                  "hex": "0300000046000000000000000000000000000000001000000100000086b813b9ac8abb528465817af6e1534800000000000000000000000000000000"
+                  "hex": "030000004600000000000000000000000000000000100000010000000d622f91ae31c4950ca3f49b54cbbdda00000000000000000000000000000000"
                 },
                 {
                   "name": "wal_head_present",
@@ -3537,13 +3739,13 @@
           "name": "body_crc",
           "offset": 24,
           "width": 4,
-          "hex": "19f1fbf6"
+          "hex": "0478f035"
         },
         {
           "name": "header_crc",
           "offset": 28,
           "width": 4,
-          "hex": "9b4db2ef"
+          "hex": "13bce4d7"
         },
         {
           "name": "body",
@@ -3649,7 +3851,7 @@
                   "name": "checkpoint",
                   "offset": 44,
                   "width": 60,
-                  "hex": "0300000046000000000000000000000000000000001000000100000086b813b9ac8abb528465817af6e1534800000000000000000000000000000000"
+                  "hex": "030000004600000000000000000000000000000000100000010000000d622f91ae31c4950ca3f49b54cbbdda00000000000000000000000000000000"
                 },
                 {
                   "name": "wal_head_present",
@@ -3751,13 +3953,13 @@
           "name": "body_crc",
           "offset": 24,
           "width": 4,
-          "hex": "e52c6d6b"
+          "hex": "f8a566a8"
         },
         {
           "name": "header_crc",
           "offset": 28,
           "width": 4,
-          "hex": "6b6361f2"
+          "hex": "e39237ca"
         },
         {
           "name": "body",
@@ -3863,7 +4065,7 @@
                   "name": "checkpoint",
                   "offset": 44,
                   "width": 60,
-                  "hex": "0300000046000000000000000000000000000000001000000100000086b813b9ac8abb528465817af6e1534800000000000000000000000000000000"
+                  "hex": "030000004600000000000000000000000000000000100000010000000d622f91ae31c4950ca3f49b54cbbdda00000000000000000000000000000000"
                 },
                 {
                   "name": "wal_head_present",
@@ -5051,7 +5253,7 @@
           ]
         }
       ],
-      "expected": "61e963d9",
+      "expected": "27abe421",
       "stored": {
         "fixture": "checkpoint_page",
         "offset": 24
@@ -5075,7 +5277,7 @@
           ]
         }
       ],
-      "expected": "dec63226",
+      "expected": "b900b9b7",
       "stored": {
         "fixture": "checkpoint_page",
         "offset": 28
@@ -5093,7 +5295,7 @@
           ]
         }
       ],
-      "expected": "1fe7f29187842fe11415c25d3ae5a035"
+      "expected": "509a088ac0272b6c5982dfb08efd38e4"
     },
     {
       "name": "checkpoint_root_body_crc",
@@ -5107,7 +5309,7 @@
           ]
         }
       ],
-      "expected": "824c9c67",
+      "expected": "340d9aeb",
       "stored": {
         "fixture": "checkpoint_root",
         "offset": 24
@@ -5131,7 +5333,7 @@
           ]
         }
       ],
-      "expected": "b55832c5",
+      "expected": "a4066dfb",
       "stored": {
         "fixture": "checkpoint_root",
         "offset": 28
@@ -5149,7 +5351,7 @@
           ]
         }
       ],
-      "expected": "86b813b9ac8abb528465817af6e15348"
+      "expected": "0d622f91ae31c4950ca3f49b54cbbdda"
     },
     {
       "name": "checkpoint_empty_body_crc",
@@ -5275,7 +5477,7 @@
           ]
         }
       ],
-      "expected": "a1751f58",
+      "expected": "bcfc149b",
       "stored": {
         "fixture": "control_checkpoint",
         "offset": 24
@@ -5299,7 +5501,7 @@
           ]
         }
       ],
-      "expected": "98bf7745",
+      "expected": "104e217d",
       "stored": {
         "fixture": "control_checkpoint",
         "offset": 28
@@ -5317,7 +5519,7 @@
           ]
         }
       ],
-      "expected": "20bbf31ce31a3d5c9579e0d81447543f"
+      "expected": "dbcbff97178d5ff20516a7f38bd97c06"
     },
     {
       "name": "control_both_body_crc",
@@ -5331,7 +5533,7 @@
           ]
         }
       ],
-      "expected": "19f1fbf6",
+      "expected": "0478f035",
       "stored": {
         "fixture": "control_both",
         "offset": 24
@@ -5355,7 +5557,7 @@
           ]
         }
       ],
-      "expected": "9b4db2ef",
+      "expected": "13bce4d7",
       "stored": {
         "fixture": "control_both",
         "offset": 28
@@ -5373,7 +5575,7 @@
           ]
         }
       ],
-      "expected": "85879c999849e4dd45995791ba07eb19"
+      "expected": "80cfd316c7678250847669ae86d0f4bb"
     },
     {
       "name": "control_checkpoint_head9_body_crc",
@@ -5387,7 +5589,7 @@
           ]
         }
       ],
-      "expected": "e52c6d6b",
+      "expected": "f8a566a8",
       "stored": {
         "fixture": "control_checkpoint_head9",
         "offset": 24
@@ -5411,7 +5613,7 @@
           ]
         }
       ],
-      "expected": "6b6361f2",
+      "expected": "e39237ca",
       "stored": {
         "fixture": "control_checkpoint_head9",
         "offset": 28
@@ -5429,7 +5631,7 @@
           ]
         }
       ],
-      "expected": "6ff4f18e947ad278b8f900c71f6c3bf2"
+      "expected": "fba1b3980fa8c1da4edaaad288677c15"
     },
     {
       "name": "publication_empty_body_crc",

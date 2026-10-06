@@ -283,6 +283,15 @@ directory_cursor::next(directory_page_limits limits) {
     if (state.busy || !reservation)
         return reject(make_file_error(
           errc::queue_full, file_failure_detail::admission_not_dispatched));
+    // The first page takes the cursor's listing slot, kept until the cursor
+    // and every page it returned are gone.
+    if (state.memory->handle.count() == 0) {
+        auto slot = seastar::try_get_units(*state.memory->pool, 1);
+        if (!slot)
+            return reject(make_file_error(
+              errc::queue_full, file_failure_detail::admission_not_dispatched));
+        state.memory->handle = std::move(*slot);
+    }
     auto holder = state.operations.hold();
     return state.read_page(limits, std::move(*reservation), std::move(holder));
 }
@@ -334,15 +343,12 @@ file_system::open_directory(file_path path, file_close_policy policy) {
       && policy != file_close_policy::checked)
         co_return failure(file_system_error(errc::invalid_argument));
     assert_current();
-    auto slot = seastar::try_get_units(*cursor_slots_, 1);
-    if (!slot) {
-        statistics_->reject();
-        co_return failure(make_file_error(
-          errc::queue_full, file_failure_detail::admission_not_dispatched));
-    }
     [[maybe_unused]] auto metric = statistics_->accept();
+    // Opening takes no listing slot: see directory_cursor_memory. An open
+    // directory is a descriptor like any open file, bounded by the handle
+    // credits of whoever holds it and by the process.
     auto memory = seastar::make_lw_shared<detail::directory_cursor_memory>(
-      cursor_slots_, std::move(*slot));
+      cursor_slots_);
     auto state = std::make_unique<directory_cursor::state>(
       std::move(memory), statistics_owner_);
     state->close_policy = policy;

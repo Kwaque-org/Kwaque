@@ -70,6 +70,9 @@ class local_namespace_scan final {
         std::uint16_t seen{0};
         std::optional<local_wal_head> head;
         local_wal_high wal_high;
+        // The WAL file the shard's durable checkpoint ends in: names below
+        // it are no longer part of the chain.
+        std::optional<model::wal_incarnation_id> wal_floor;
     };
 
 public:
@@ -251,6 +254,7 @@ private:
                                 : std::nullopt;
         next.head = parent ? parent->head : std::nullopt;
         next.wal_high = parent ? parent->wal_high : local_wal_high{};
+        next.wal_floor = parent ? parent->wal_floor : std::nullopt;
         if (kind == node::shard && spec_.controls()) {
             auto control_path = paths_.control(next.shard);
             if (!control_path) co_return runtime::failure(control_path.error());
@@ -311,6 +315,10 @@ private:
                             missing_ = true;
                         else
                             co_return runtime::failure(checkpoint.error());
+                    } else {
+                        next.wal_floor = std::get<local_checkpoint_root>(
+                                           checkpoint->value.payload())
+                                           .end.incarnation();
                     }
                 }
             }
@@ -490,6 +498,11 @@ private:
             if (local_wal_high::from_incarnation(*id).value() > frame.wal_high)
                 co_return runtime::failure(path_error(errc::wrong_context));
             if (frame.head && frame.head->incarnation == *id)
+                co_return runtime::result<void>{};
+            // A name below the durable cutoff's file is a reclaimed file
+            // whose removal was undone or is owed. Nothing reads it, so what
+            // it holds decides nothing here; the reopen removes it unread.
+            if (frame.wal_floor && id->canonical_less(*frame.wal_floor))
                 co_return runtime::result<void>{};
             auto loaded_file = co_await read_local_metadata_file(
               files_,

@@ -70,6 +70,19 @@ public:
     validate_expected(const segment_context& expected) const noexcept;
     bool operator==(const segment_context&) const noexcept = default;
 
+    // Canonical collection order: opaque identity octets from the cluster
+    // down, then the generation. It implies no creation or append order.
+    [[nodiscard]] bool
+    canonical_less(const segment_context& other) const noexcept {
+        if (cluster_ != other.cluster_)
+            return cluster_.canonical_less(other.cluster_);
+        if (topic_ != other.topic_) return topic_.canonical_less(other.topic_);
+        if (range_ != other.range_) return range_.canonical_less(other.range_);
+        if (segment_ != other.segment_)
+            return segment_.canonical_less(other.segment_);
+        return generation_ < other.generation_;
+    }
+
 private:
     segment_context(
       model::cluster_id cluster,

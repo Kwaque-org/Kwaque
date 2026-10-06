@@ -22,6 +22,8 @@ struct local_root_state;
 }
 class local_root_owner;
 struct local_root_page;
+struct local_index_page;
+struct local_retry_page;
 
 // An owning read lifetime. Metadata views never outlive this pin; sharing is
 // explicit, bounded and admitted. Existing pins can finish after retirement.
@@ -40,6 +42,18 @@ public:
       position(page_ordinal) const;
     [[nodiscard]] seastar::future<runtime::result<local_root_page>>
     read(page_ordinal, codec::cooperative_work&) const;
+    // One page of an index, decoded once from its exact bytes under the
+    // reference the root pins it with. Any other root is wrong_context. An
+    // index is opened by its root alone, so this is where a page is first
+    // read and verified.
+    [[nodiscard]] seastar::future<runtime::result<local_index_page>>
+    read_index(page_ordinal, codec::cooperative_work&) const;
+    // One page of a sealed retry summary or a completed-retry snapshot,
+    // decoded once from its exact bytes under the reference the root pins it
+    // with. Any other root is wrong_context. Order across pages is the
+    // caller's to check: a page is read on its own.
+    [[nodiscard]] seastar::future<runtime::result<local_retry_page>>
+    read_retries(page_ordinal, codec::cooperative_work&) const;
 
 private:
     friend class local_root_owner;
@@ -59,6 +73,24 @@ struct local_root_page final {
     bytes::fragmented_buffer bytes;
 };
 
+// The anchors of one verified index page. The page keeps its root pinned for
+// as long as it lives.
+struct local_index_page final {
+    workload_reservation reservation;
+    local_root_pin pin;
+    sparse_index_page value;
+};
+
+// The completed-retry entries of one verified page, in batch identity order.
+// The page keeps its root pinned for as long as it lives.
+struct local_retry_page final {
+    workload_reservation reservation;
+    local_root_pin pin;
+    std::variant<retry_page, local_metadata_record> value;
+    [[nodiscard]] std::span<const completed_retry> entries() const& noexcept;
+    std::span<const completed_retry> entries() const&& = delete;
+};
+
 // One immutable opened root with its exact page file (and, for sealed retry,
 // its separate data-file footer). Retirement stops new pins, close drains all
 // pin/operation descendants before checked file close. Close never unlinks.
@@ -70,6 +102,9 @@ public:
     local_root_owner& operator=(const local_root_owner&) = delete;
     ~local_root_owner();
     [[nodiscard]] runtime::result<local_root_pin> pin();
+    // Pins alive now, shared descendants included. With none, nothing reads
+    // through this root and close() has nothing to wait for.
+    [[nodiscard]] std::uint32_t pins() const noexcept;
     void retire() noexcept;
     [[nodiscard]] seastar::future<runtime::result<void>> close();
     [[nodiscard]] local_root_reference reference() const;
@@ -225,44 +260,50 @@ local_root_owner::open(
                 failed.observe(detail::path_error(errc::malformed_data));
                 break;
             }
-            local_bundle_verifier verifier{*bundle, work.policy()};
-            runtime::file_position at{
-              reference.kind() == local_root_kind::sealed_retry
-                ? 0
-                : reference.bytes().value()};
-            for (const auto& ref : bundle->pages()) {
-                if (ref.encoded_bytes() > limits.operation_bytes) {
-                    failed.observe(
-                      detail::path_error(errc::resource_exhausted));
-                    break;
+            // An index is opened by its root alone: the root's digest is
+            // pinned, it names every page by digest, and the file is as long
+            // as the pages it names. Each page is verified when it is read.
+            // Every other root has all of its pages read and checked here.
+            if (reference.kind() != local_root_kind::index) {
+                local_bundle_verifier verifier{*bundle, work.policy()};
+                runtime::file_position at{
+                  reference.kind() == local_root_kind::sealed_retry
+                    ? 0
+                    : reference.bytes().value()};
+                for (const auto& ref : bundle->pages()) {
+                    if (ref.encoded_bytes() > limits.operation_bytes) {
+                        failed.observe(
+                          detail::path_error(errc::resource_exhausted));
+                        break;
+                    }
+                    auto raw_page = co_await detail::read_local_extent(
+                      *page_file, at, ref.encoded_bytes(), work);
+                    if (!raw_page) {
+                        failed.observe(raw_page);
+                        break;
+                    }
+                    valid = co_await verifier.next(*raw_page, work);
+                    if (!valid) {
+                        failed.observe(valid);
+                        break;
+                    }
+                    at = at.checked_add(ref.encoded_bytes()).value();
                 }
-                auto raw_page = co_await detail::read_local_extent(
-                  *page_file, at, ref.encoded_bytes(), work);
-                if (!raw_page) {
-                    failed.observe(raw_page);
-                    break;
-                }
-                valid = co_await verifier.next(*raw_page, work);
+                if (failed.failed()) break;
+                valid = verifier.finish(work);
                 if (!valid) {
                     failed.observe(valid);
                     break;
                 }
-                at = at.checked_add(ref.encoded_bytes()).value();
-            }
-            if (failed.failed()) break;
-            valid = verifier.finish(work);
-            if (!valid) {
-                failed.observe(valid);
-                break;
-            }
-            size = co_await page_file->size();
-            if (!size) {
-                failed.observe(size);
-                break;
-            }
-            if (*size != at.value()) {
-                failed.observe(detail::path_error(errc::wrong_context));
-                break;
+                size = co_await page_file->size();
+                if (!size) {
+                    failed.observe(size);
+                    break;
+                }
+                if (*size != at.value()) {
+                    failed.observe(detail::path_error(errc::wrong_context));
+                    break;
+                }
             }
             valid = co_await ownership.validate(spec);
             if (!valid) {

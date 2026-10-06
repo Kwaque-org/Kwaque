@@ -118,6 +118,7 @@ class ValueAllocationTest(unittest.TestCase):
             command = [
                 str(binary),
                 f"--reactor-backend={REACTOR_BACKEND}",
+                "--max-networking-io-control-blocks=1000",
                 "--smp=1",
                 "--memory=64MiB",
                 "--overprovisioned",

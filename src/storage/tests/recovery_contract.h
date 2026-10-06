@@ -4,6 +4,7 @@
 #include "src/storage/recovery_plan.h"
 #include "src/storage/recovery_publication.h"
 #include "src/storage/recovery_seal.h"
+#include "src/storage/sparse_index.h"
 #include "src/storage/tests/retry_test_support.h"
 #include "src/storage/tests/segment_scan_contract.h"
 #include "src/storage/tests/wal_test_support.h"
@@ -1006,7 +1007,8 @@ template<
   runtime::monotonic_clock Clock,
   typename Backend,
   typename Owner,
-  typename Driver>
+  typename Driver,
+  typename Index = segment_no_index>
 seastar::future<runtime::result<recovered_seal_outcome>> execute_seal(
   Backend& files,
   Owner& owner,
@@ -1015,7 +1017,8 @@ seastar::future<runtime::result<recovered_seal_outcome>> execute_seal(
   recovery_decision_pin decision,
   std::uint64_t retry,
   Driver drive,
-  local_object_state state = local_object_state::active) {
+  local_object_state state = local_object_state::active,
+  Index index = {}) {
     seastar::abort_source abort;
     codec::cooperative_work work{codec::limits::defaults(), abort};
     const std::array specs{spec};
@@ -1035,7 +1038,8 @@ seastar::future<runtime::result<recovered_seal_outcome>> execute_seal(
         no_facts{},
         0,
         0,
-        work));
+        work,
+        std::move(index)));
 }
 
 // Resolves a supplied seal on the single device `spec` whose end the store
@@ -1478,14 +1482,46 @@ seastar::future<> recovered_seal(
           message);
         co_await segment_scan_contract::close_generation(generation, drive);
     };
-    auto sealed = take(co_await execute(at_footer, 50));
+    // The walk that verifies the extent also feeds the segment's index, so
+    // the recovered segment is read once and sealed with an index.
+    auto index = take(active_sparse_index::make({byte_count{0}}, 16, budget));
+    auto sealed = take(
+      co_await execute_seal<Clock>(
+        files,
+        owner,
+        spec,
+        budget,
+        at_footer,
+        50,
+        drive,
+        local_object_state::active,
+        sparse_index_seal{&index, local_object_sequence::make(90).value()}));
     require(
       !sealed.already_sealed && sealed.seal.boundary
         && sealed.seal.boundary->position().value() == 16384
         && sealed.seal.retry && sealed.seal.retry->sequence().value() == 50
         && sealed.blocks == 0 && sealed.footers == 0,
       "the recovered seal did not report its root");
+    require(
+      sealed.seal.index && sealed.seal.index->sequence().value() == 90
+        && index.frozen() && index.size() == 2 && index.skipped() == 0
+        && index[0].logical_anchor().value() == 100
+        && index[0].block_position().value() == 4096
+        && index[1].logical_anchor().value() == 101
+        && index[1].block_position().value() == 8192,
+      "the recovered seal's walk did not index the extent it sealed");
     co_await expect_sealed("the recovered seal left a tail or wrong root");
+    {
+        // The sealed publication names that index, and its root opens.
+        auto generation = co_await segment_scan_contract::open_generation(
+          files, owner, spec, budget, drive);
+        require(
+          !generation.publication.roots.empty()
+            && generation.publication.roots.front() == *sealed.seal.index
+            && !generation.index_rebuild,
+          "the recovered seal's index is not named, or does not open");
+        co_await segment_scan_contract::close_generation(generation, drive);
+    }
     require(
       (co_await read_bytes(
          files,
@@ -1493,9 +1529,12 @@ seastar::future<> recovered_seal(
          drive))
         .empty(),
       "the retry bundle of an empty completion set is not empty");
-    // Repeating the decision finds it done.
+    // Repeating the decision finds it done, with the index it named.
     sealed = take(co_await execute(at_footer, 51));
-    require(sealed.already_sealed, "a completed seal ran again");
+    require(
+      sealed.already_sealed && sealed.seal.index
+        && sealed.seal.index->sequence().value() == 90,
+      "a completed seal ran again, or lost the index it named");
     co_await expect_sealed("a completed seal changed bytes");
 
     // A crash after the root but before truncation, or after truncation but

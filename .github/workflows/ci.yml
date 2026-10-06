@@ -20,6 +20,10 @@ concurrency:
 jobs:
   workflow-lint:
     name: Workflow syntax
+    # A pull request opened by Dependabot waits for a maintainer: the first
+    # attempt of its run checks nothing, and "Re-run all jobs" on that run
+    # starts every check. Every other job needs this one.
+    if: github.event.pull_request.user.login != 'dependabot[bot]' || github.run_attempt != '1'
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     outputs:
@@ -475,6 +479,7 @@ jobs:
     # The one required status check. GitHub counts a skipped required job as
     # passing, so a failure that skips its dependents must fail here instead:
     # https://docs.github.com/en/repositories/configuring-branches-and-merges-in-your-repository/managing-protected-branches/about-protected-branches#require-status-checks-before-merging
+    # A held Dependabot run skips every other job, and fails here the same way.
     name: CI result
     if: always()
     needs:
@@ -494,7 +499,9 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
-      - if: ${{ !(contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled')) }}
+      - if: ${{ needs.workflow-lint.result == 'skipped' }}
+        run: echo "::error::Checks on a Dependabot pull request wait for a maintainer; choose 'Re-run all jobs' on this run to start them."
+      - if: ${{ !(contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled') || needs.workflow-lint.result != 'success') }}
         run: exit 0
-      - if: ${{ contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled') }}
+      - if: ${{ contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled') || needs.workflow-lint.result != 'success' }}
         run: exit 1

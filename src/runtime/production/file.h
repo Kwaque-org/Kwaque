@@ -121,6 +121,7 @@ public:
 private:
     operation_statistics_owner statistics_owner_;
     operation_statistics* statistics_;
+    // Cursors that hold a listing page at once; see directory_cursor_memory.
     seastar::lw_shared_ptr<seastar::semaphore> cursor_slots_
       = seastar::make_lw_shared<seastar::semaphore>(64);
     verified_directories verified_;

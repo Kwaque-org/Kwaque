@@ -32,6 +32,7 @@ from tests.smoke.broker_test_support import (
 
 REACTOR_ARGUMENTS = (
     f"--reactor-backend={REACTOR_BACKEND}",
+    "--max-networking-io-control-blocks=1000",
     "--smp=2",
     "--memory=384M",
     "--overprovisioned",

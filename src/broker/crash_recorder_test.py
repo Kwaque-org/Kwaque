@@ -46,6 +46,7 @@ class CrashRecorderTest(unittest.TestCase):
                     f"--scenario={scenario}",
                     f"--directory={directory}",
                     f"--reactor-backend={REACTOR_BACKEND}",
+                    "--max-networking-io-control-blocks=1000",
                     f"--smp={shards}",
                     f"--memory={96 * shards}MiB",
                     "--overprovisioned",

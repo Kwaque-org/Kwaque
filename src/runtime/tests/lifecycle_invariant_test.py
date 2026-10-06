@@ -33,6 +33,7 @@ class LifecycleInvariantTest(unittest.TestCase):
                         str(probe),
                         scenario,
                         f"--reactor-backend={REACTOR_BACKEND}",
+                        "--max-networking-io-control-blocks=1000",
                         "--memory=256MiB",
                         "--smp=2",
                         "--overprovisioned",

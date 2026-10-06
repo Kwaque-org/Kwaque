@@ -380,7 +380,7 @@ inline local_root_reference checkpoint_reference() {
              runtime::file_position{},
              byte_count{4_KiB},
              page_count::make(1).value(),
-             literal_digest("86b813b9ac8abb528465817af6e15348"))
+             literal_digest("0d622f91ae31c4950ca3f49b54cbbdda"))
       .value();
 }
 inline local_metadata_expectation
@@ -538,7 +538,7 @@ seastar::future<> segment_bundles(
             byte_count{4_KiB},
             page_count::make(1).value(),
             literal_digest(
-              is_index ? "c45f8294b5f3a284ad000102abfd778f"
+              is_index ? "8e20d4aa0f5e9fea105fab317cf06154"
                        : "58032fdff862aa9a3dc5869021e05dfc")));
         const auto index_context
           = sparse_index_context::make(

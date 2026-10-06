@@ -156,7 +156,7 @@ TEST(LocalTypesTest, LayoutUsesActualHeaderAndIndependentPageEquations) {
       local_metadata_page_capacity(
         local_metadata_kind::checkpoint_page, byte_count{32}, alignment, policy)
         .value(),
-      398U);
+      467U);
     EXPECT_EQ(
       local_metadata_page_capacity(
         local_metadata_kind::completed_retry_page,
@@ -168,7 +168,7 @@ TEST(LocalTypesTest, LayoutUsesActualHeaderAndIndependentPageEquations) {
     EXPECT_EQ(
       local_metadata_layout(
         local_metadata_kind::checkpoint_page,
-        byte_count{20 + 399 * 164},
+        byte_count{20 + 468 * 140},
         byte_count{32},
         alignment,
         policy)

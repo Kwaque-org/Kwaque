@@ -12,6 +12,7 @@
 
 #include <boost/test/unit_test.hpp>
 
+#include <algorithm>
 #include <optional>
 #include <type_traits>
 #include <utility>
@@ -23,8 +24,11 @@ using namespace kwaque::storage;
 using namespace kwaque::storage::testing::store_contract;
 namespace contract = kwaque::storage::testing::local_append_contract;
 
-environment_config config(std::vector<fault_rule> faults = {}) {
+environment_config config(
+  std::vector<fault_rule> faults = {},
+  std::optional<fake_crash_policy> crash = std::nullopt) {
     environment_config_values values;
+    values.file.crash_policy = crash;
     values.resource_total_memory = byte_count{256_MiB};
     values.scheduler.pending_events = 256;
     values.scheduler.events_per_pump = 64;
@@ -92,10 +96,30 @@ struct ordered_driver final {
     }
 };
 
-template<typename Func>
-seastar::future<>
-with_local_store(Func function, std::vector<fault_rule> faults = {}) {
-    auto target = take(environment::make(config(std::move(faults))));
+// Advances a pending operation by one scheduler event; false once it has
+// completed or nothing is left to run.
+struct one_event final {
+    scheduler* events;
+    template<typename T>
+    seastar::future<bool> operator()(seastar::future<T>& pending) const {
+        co_await runtime::testing::drain_reactor_tasks();
+        if (pending.available() || events->pending_events() == 0)
+            co_return false;
+        simulation::testing::scheduler_driver_detail::run_next_batch(
+          *events, 1);
+        co_return true;
+    }
+};
+
+// Reserved: the body also takes a second budget, which funds what the
+// appends must not be able to starve: the control owner and whoever reclaims
+// the WAL.
+template<bool Reserved, typename Func>
+seastar::future<> with_store(
+  Func function,
+  std::vector<fault_rule> faults = {},
+  std::optional<fake_crash_policy> crash = std::nullopt) {
+    auto target = take(environment::make(config(std::move(faults), crash)));
     ordered_driver drive{target->event_scheduler()};
     co_await target->start();
     std::exception_ptr first;
@@ -114,7 +138,23 @@ with_local_store(Func function, std::vector<fault_rule> faults = {}) {
         const auto spec = specification(root, {1, 1}, 68);
         const std::array specs{spec};
         ownership_input owner{specs};
-        co_await function(files, owner, spec, budget, drive, target->timer());
+        if constexpr (Reserved) {
+            auto lease = target->resource_manager().acquire_workload(
+              resource::workload_class::metadata);
+            const auto share = std::min<std::uint64_t>(
+              lease.hard_budget().value(), 8_MiB);
+            workload_budget reserve{
+              std::move(lease),
+              {.tasks = 64, .bytes = byte_count{share}, .handles = 16},
+              bytes::testing::charge};
+            co_await function(
+              files, owner, spec, budget, reserve, drive, target->timer());
+            BOOST_CHECK_EQUAL(reserve.snapshot().tasks, 0U);
+            BOOST_CHECK_EQUAL(reserve.snapshot().bytes, 0U);
+        } else {
+            co_await function(
+              files, owner, spec, budget, drive, target->timer());
+        }
         BOOST_CHECK_EQUAL(
           fake_file_test_access::open_handles(target->file_system()), 0U);
         BOOST_CHECK_EQUAL(target->file_system().pending_operations(), 0U);
@@ -125,6 +165,18 @@ with_local_store(Func function, std::vector<fault_rule> faults = {}) {
     }
     co_await drive.lifecycle(target->stop());
     if (first) std::rethrow_exception(first);
+}
+template<typename Func>
+seastar::future<> with_local_store(
+  Func function,
+  std::vector<fault_rule> faults = {},
+  std::optional<fake_crash_policy> crash = std::nullopt) {
+    return with_store<false, Func>(
+      std::move(function), std::move(faults), crash);
+}
+template<typename Func>
+seastar::future<> with_reserved_store(Func function) {
+    return with_store<true, Func>(std::move(function));
 }
 
 // A file of the fixture and the flushes it has had once the fixture is
@@ -277,12 +329,128 @@ SEASTAR_TEST_CASE(local_append_fake_rotation_before_freeze) {
     });
 }
 
+SEASTAR_TEST_CASE(local_append_fake_segment_handle_budget) {
+    co_await with_local_store([](auto&&... shared) {
+        return contract::segment_handle_budget<simulation::monotonic_clock>(
+          shared...);
+    });
+}
+
 SEASTAR_TEST_CASE(local_recovered_successor_fake) {
     co_await with_local_store([](auto& files, auto&&... shared) {
         return storage::testing::recovery_successor_contract::
           recovered_successor<simulation::monotonic_clock>(
             files, shared..., flush_count{&files});
     });
+}
+
+SEASTAR_TEST_CASE(local_checkpoint_fake_regressions) {
+    co_await with_local_store([](auto&&... shared) {
+        return storage::testing::recovery_successor_contract::
+          checkpoint_regressions<simulation::monotonic_clock>(shared...);
+    });
+}
+
+SEASTAR_TEST_CASE(local_checkpoint_fake_detached_boundary_pinned) {
+    co_await with_local_store([](auto&&... shared) {
+        return storage::testing::recovery_successor_contract::
+          detached_boundary_pinned<simulation::monotonic_clock>(shared...);
+    });
+}
+
+SEASTAR_TEST_CASE(local_checkpoint_fake_reclaims_within_the_retained_limit) {
+    co_await with_reserved_store([](auto&&... shared) {
+        return storage::testing::recovery_successor_contract::
+          retained_wal_reclaimed<simulation::monotonic_clock>(shared...);
+    });
+}
+
+SEASTAR_TEST_CASE(local_checkpoint_fake_retained_limit_pressure) {
+    co_await with_reserved_store([](auto&&... shared) {
+        return storage::testing::recovery_successor_contract::
+          retained_wal_pressure<simulation::monotonic_clock>(shared...);
+    });
+}
+
+// A checkpoint run cut after every number of scheduler events, once with
+// unsynced names reverting at the crash and once with all of them surviving.
+// Each cut is its own store, so no history depends on the one before it.
+SEASTAR_TEST_CASE(local_checkpoint_fake_crash_at_every_cut) {
+    for (const auto survive : {false, true}) {
+        const auto crash = survive ? std::optional{fake_crash_policy{
+                                       .namespace_percent = 100}}
+                                   : std::nullopt;
+        // Every cut where names revert, the ordinary crash; every second
+        // one where they all survive.
+        const std::uint32_t stride = survive ? 2 : 1;
+        bool finished = false;
+        std::uint32_t cut = 0;
+        for (; !finished && cut < 2048; cut += stride)
+            co_await with_local_store(
+              [cut, &finished](
+                auto& files,
+                auto& owner,
+                auto& spec,
+                auto& budget,
+                auto drive,
+                auto& timer) -> seastar::future<> {
+                  finished
+                    = co_await storage::testing::recovery_successor_contract::
+                      checkpoint_crash<simulation::monotonic_clock>(
+                        files,
+                        owner,
+                        spec,
+                        budget,
+                        drive,
+                        timer,
+                        cut,
+                        one_event{&drive.events});
+              },
+              {},
+              crash);
+        BOOST_REQUIRE(finished);
+        // Several operations lie between the first and the last effect.
+        BOOST_CHECK(cut > 8);
+    }
+}
+
+// The same sweep over a completed-retry snapshot cut that replaces another.
+SEASTAR_TEST_CASE(local_retry_snapshot_fake_crash_at_every_cut) {
+    for (const auto survive : {false, true}) {
+        const auto crash = survive ? std::optional{fake_crash_policy{
+                                       .namespace_percent = 100}}
+                                   : std::nullopt;
+        // Every cut where names revert, the ordinary crash; every second
+        // one where they all survive.
+        const std::uint32_t stride = survive ? 2 : 1;
+        bool finished = false;
+        std::uint32_t cut = 0;
+        for (; !finished && cut < 2048; cut += stride)
+            co_await with_local_store(
+              [cut, &finished](
+                auto& files,
+                auto& owner,
+                auto& spec,
+                auto& budget,
+                auto drive,
+                auto& timer) -> seastar::future<> {
+                  finished
+                    = co_await storage::testing::recovery_successor_contract::
+                      retry_snapshot_crash<simulation::monotonic_clock>(
+                        files,
+                        owner,
+                        spec,
+                        budget,
+                        drive,
+                        timer,
+                        cut,
+                        one_event{&drive.events});
+              },
+              {},
+              crash);
+        BOOST_REQUIRE(finished);
+        BOOST_CHECK(cut > 8);
+    }
 }
 
 SEASTAR_TEST_CASE(local_recovery_repeated_restarts_fake) {

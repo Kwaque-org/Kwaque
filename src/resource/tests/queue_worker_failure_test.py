@@ -30,6 +30,7 @@ class QueueWorkerFailureTest(unittest.TestCase):
                 str(self.probe),
                 scenario,
                 f"--reactor-backend={REACTOR_BACKEND}",
+                "--max-networking-io-control-blocks=1000",
                 "--memory=192MiB",
                 "--smp=1",
                 "--overprovisioned",

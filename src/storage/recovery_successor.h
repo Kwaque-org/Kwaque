@@ -8,7 +8,9 @@
 #include <seastar/core/coroutine.hh>
 #include <seastar/core/when_all.hh>
 
+#include <cstdint>
 #include <exception>
+#include <limits>
 #include <span>
 #include <utility>
 
@@ -29,10 +31,22 @@ seastar::future<runtime::result<void>> activate_recovered_wal(
         co_return runtime::failure(detail::path_error(errc::wrong_context));
     const auto& wal = plan.wal();
     if (
-      wal.action != recovery_plan_action::activate_successor
-      || !wal.predecessor)
+      wal.action != recovery_plan_action::activate_successor || !wal.predecessor
+      || wal.chain.empty())
         co_return runtime::failure(detail::path_error(errc::invalid_argument));
-    co_return co_await writer.activate_recovered(*wal.predecessor, work);
+    // The files the scan found are the ones the shard still holds, and the
+    // writer continues that chain by name. One it cannot name in full has
+    // more files than a shard may hold: what pins them is resolved first.
+    if (wal.chain.files() != wal.chain_files) {
+        auto refused = detail::path_error(errc::resource_exhausted);
+        static_cast<void>(refused.add_context(
+          runtime::operation_context_key::limit, maximum_retained_wal_files));
+        static_cast<void>(refused.add_context(
+          runtime::operation_context_key::actual, wal.chain_files));
+        co_return runtime::failure(refused);
+    }
+    co_return co_await writer.activate_recovered(
+      *wal.predecessor, wal.chain, work);
 }
 
 // Everything a ready plan establishes before the shard is ready, at once:

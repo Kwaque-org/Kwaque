@@ -76,7 +76,7 @@ inline local_root_reference index_ref() {
         runtime::file_position{},
         byte_count{4_KiB},
         page_count::make(1).value(),
-        literal_digest("c45f8294b5f3a284ad000102abfd778f")));
+        literal_digest("8e20d4aa0f5e9fea105fab317cf06154")));
 }
 inline segment_history_context history() {
     return {
@@ -225,12 +225,16 @@ seastar::future<> root_lifetime(
           work,
           {.maximum_pins = 2})));
     std::optional<local_root_pin> pin;
+    const auto unpinned = root->pins();
     pin.emplace(take(root->pin()));
     std::optional<local_root_page> page;
     runtime::first_failure failed;
     root->retire();
     auto closing = root->close();
     try {
+        require(
+          unpinned == 0 && root->pins() == 1,
+          "a root does not count the pins it gave out");
         require(!root->pin(), "retired root admitted reader");
         require(!closing.available(), "close ignored parked root pin");
         page.emplace(take(
@@ -250,8 +254,12 @@ seastar::future<> root_lifetime(
               .entry_count
             == 3,
           "root metadata lifetime was lost");
+        require(
+          root->pins() == 2, "a page does not count as a pin of its root");
         pin.reset();
         require(!closing.available(), "returned page lost root lifetime");
+        page.reset();
+        require(root->pins() == 0, "a root counts a pin nothing holds");
     } catch (...) {
         failed.observe(std::current_exception());
     }

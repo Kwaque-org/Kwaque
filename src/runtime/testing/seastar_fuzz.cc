@@ -68,14 +68,34 @@ void unblock_fuzzer_signals() noexcept {
     }
 }
 
+std::string reactor_backend_argument() {
+    // The test macros export the reactor backend selected for this build.
+    // Left to itself the reactor picks linux-aio wherever it works, whatever
+    // the build selected.
+    const char* backend = std::getenv("KWAQUE_REACTOR_BACKEND");
+    return std::string{"--reactor-backend="}
+           + (backend != nullptr ? backend : "epoll");
+}
+
 void ensure_runner_started() {
     static std::once_flag once;
     std::call_once(once, [] {
         save_crash_handlers();
-        static std::array<std::string, 3> arguments{
-          "kwaque-fuzz", "-c1", "--overprovisioned"};
-        static std::array<char*, 3> argument_pointers{
-          arguments[0].data(), arguments[1].data(), arguments[2].data()};
+        // A linux-aio shard is bounded as the test macros bound it: a fuzz
+        // input opens no socket, and ten thousand control blocks a process
+        // are a sixth of what a host allows all of its processes together.
+        static std::array<std::string, 5> arguments{
+          "kwaque-fuzz",
+          "-c1",
+          "--overprovisioned",
+          reactor_backend_argument(),
+          "--max-networking-io-control-blocks=1000"};
+        static std::array<char*, 5> argument_pointers{
+          arguments[0].data(),
+          arguments[1].data(),
+          arguments[2].data(),
+          arguments[3].data(),
+          arguments[4].data()};
         if (!seastar::testing::global_test_runner().start(
               static_cast<int>(argument_pointers.size()),
               argument_pointers.data())) {

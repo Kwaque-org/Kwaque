@@ -8,8 +8,10 @@
 
 #include <algorithm>
 #include <array>
+#include <optional>
 #include <span>
 #include <string>
+#include <vector>
 
 namespace kwaque::storage::testing::store_contract {
 using publication_contract::identity;
@@ -255,6 +257,11 @@ seastar::future<> exercise(
     seastar::promise<runtime::result<void>> proceed;
     bool released = false;
     std::optional<seastar::future<local_publication_outcome>> pending;
+    // Updates that wait their turn behind `pending`, and the order they ran.
+    std::array<std::optional<seastar::future<local_publication_outcome>>, 2>
+      queued;
+    std::vector<int> order;
+    order.reserve(2);
     try {
         auto before = take(control->snapshot());
         pending.emplace(control->update(
@@ -266,18 +273,43 @@ seastar::future<> exercise(
               return proceed.get_future();
           },
           work));
+        // Updates take turns in call order. Two wait behind the one in
+        // flight without their edits running; one more is rejected with no
+        // effect, as untouched admission pressure.
+        queued[0].emplace(control->update(
+          [&order](local_shard_control& next) -> runtime::result<void> {
+              order.push_back(0);
+              next.decision_high = local_decision_high{8};
+              return {};
+          },
+          work));
+        queued[1].emplace(control->update(
+          [&order](local_shard_control& next) -> runtime::result<void> {
+              order.push_back(1);
+              // Each edit sees the fields current when its turn starts.
+              if (
+                next.object_high.value() != 16
+                || next.decision_high.value() != 8)
+                  return runtime::failure(
+                    detail::path_error(errc::wrong_context));
+              next.deletion_high = local_deletion_high{4};
+              return {};
+          },
+          work));
         bool overlapped = false;
-        auto second = co_await drive.lifecycle(control->update(
+        auto excess = co_await drive.lifecycle(control->update(
           [&overlapped](local_shard_control&) -> runtime::result<void> {
               overlapped = true;
               return {};
           },
           work));
         require(
-          second.failure.error()
-            && second.failure.error()->code() == errc::queue_full
-            && !overlapped,
-          "overlapping control edit was admitted");
+          excess.failure.error()
+            && excess.failure.error()->code() == errc::queue_full
+            && excess.admission_rejected && !overlapped && order.empty()
+            && control->waiting() == maximum_control_waiters,
+          "a control edit past the waiting bound was admitted, or one ran "
+          "before its turn");
         require(
           take(control->snapshot()).generation == before.generation,
           "control installed before publication");
@@ -289,22 +321,24 @@ seastar::future<> exercise(
             auto done = co_await drive.lifecycle(std::move(waiting));
             take(done.failure.outcome());
         }
-        {
-            auto done = co_await drive.lifecycle(control->update(
-              [](local_shard_control& next) -> runtime::result<void> {
-                  next.decision_high = local_decision_high{8};
-                  return {};
-              },
-              work));
+        for (auto& waiting : queued) {
+            auto turn = std::move(*waiting);
+            waiting.reset();
+            auto done = co_await drive.lifecycle(std::move(turn));
             take(done.failure.outcome());
         }
+        require(
+          order.size() == 2 && order[0] == 0 && order[1] == 1
+            && control->waiting() == 0,
+          "waiting control edits did not run in call order");
         const auto current = take(control->snapshot());
         require(
           current.fields.object_high.value() == 16
-            && current.fields.decision_high.value() == 8,
+            && current.fields.decision_high.value() == 8
+            && current.fields.deletion_high.value() == 4,
           "serialized update lost another field");
         require(
-          current.generation.value() == before.generation.value() + 2,
+          current.generation.value() == before.generation.value() + 3,
           "control generation did not advance exactly");
         auto reset = co_await drive.lifecycle(control->update(
           [](local_shard_control& next) -> runtime::result<void> {
@@ -329,6 +363,15 @@ seastar::future<> exercise(
             failed.observe(std::current_exception());
         }
         pending.reset();
+    }
+    for (auto& waiting : queued) {
+        if (!waiting) continue;
+        try {
+            static_cast<void>(co_await drive.lifecycle(std::move(*waiting)));
+        } catch (...) {
+            failed.observe(std::current_exception());
+        }
+        waiting.reset();
     }
     take(co_await drive.lifecycle(control->close()));
     require(

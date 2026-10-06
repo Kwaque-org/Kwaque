@@ -16,6 +16,7 @@
 #include <array>
 #include <bit>
 #include <cstdint>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <string>
@@ -95,6 +96,15 @@ struct options final {
     seastar::abort_source* wal_shutdown{nullptr};
     // Every segment's alignment, independent of the WAL's 8 KiB.
     std::uint64_t segment_alignment{8192};
+    // The most WAL files the shard may hold; zero does not bound them.
+    std::uint32_t retained_files{0};
+    // Records each rotation the retained limit refused, as the owner
+    // reports it.
+    std::vector<local_retention_pressure>* pressure{nullptr};
+    // Funds the control owner and its allocator, apart from the appends.
+    workload_budget* control_budget{nullptr};
+    // Receives the handle credits the segments hold once all are created.
+    std::uint64_t* segment_handles{nullptr};
 };
 
 // The durable local path: one WAL writer with its group commit, one or two
@@ -132,6 +142,8 @@ seastar::future<> with_local_append(
     try {
         co_await installation::bootstrap(
           files, owner, spec, budget, work, drive);
+        auto& controlling = chosen.control_budget ? *chosen.control_budget
+                                                  : budget;
         control = take(
           co_await drive.lifecycle(
             control_type::open(
@@ -140,12 +152,13 @@ seastar::future<> with_local_append(
               spec,
               0,
               false,
-              budget,
+              controlling,
               store_contract::limits(),
               work)));
-        ids = take(allocator_type::make(*control, budget, 4));
+        ids = take(allocator_type::make(*control, controlling, 4));
         auto wal = wal_writer_contract::configuration();
         wal.capacity_bytes = chosen.wal_capacity;
+        wal.retained_files = chosen.retained_files;
         writer = take(
           writer_type::make(
             *control, *ids, budget, wal, wal_start_intent::known_unactivated));
@@ -157,6 +170,11 @@ seastar::future<> with_local_append(
         if (chosen.wal_shutdown)
             take(commit->bind_shutdown(*chosen.wal_shutdown));
         take(commit->template start<Clock>(timer));
+        // As a shard does before it starts: the budget must be able to hold
+        // every configured segment open at once.
+        take(validate_segment_handles(
+          budget, segment::configuration(), {.segments = chosen.segments}));
+        const auto handles_before = budget.snapshot().handles;
         for (std::uint32_t i = 0; i != chosen.segments; ++i) {
             auto config = segment::configuration();
             config.retry_object = local_object_sequence::make(45 + i).value();
@@ -169,6 +187,9 @@ seastar::future<> with_local_append(
                 files, owner, spec, 0, description, budget, config));
             take(co_await drive.lifecycle(segments[i]->create_new(work)));
         }
+        if (chosen.segment_handles)
+            *chosen.segment_handles = budget.snapshot().handles
+                                      - handles_before;
         local_failure_sink sink;
         if (chosen.failures) {
             chosen.failures->reserve(4);
@@ -178,12 +199,46 @@ seastar::future<> with_local_append(
                 if (append->storage_failure()) failures->push_back(failure);
             };
         }
+        local_retention_sink refused;
+        if (chosen.pressure) {
+            chosen.pressure->reserve(8);
+            refused = [reports = chosen.pressure](
+                        const local_retention_pressure& report) noexcept {
+                reports->push_back(report);
+            };
+        }
         append = take(
-          append_type::make(budget, *commit, *writer, {}, std::move(sink)));
+          append_type::make(
+            budget, *commit, *writer, {}, std::move(sink), std::move(refused)));
         std::array<std::optional<local_append_target>, 2> targets;
         for (std::uint32_t i = 0; i != chosen.segments; ++i)
             targets[i] = take(append->attach(*segments[i]));
-        co_await body(*append, *writer, segments, targets, work);
+        // A body may also take the control owner the WAL writer updates,
+        // and the allocator beside it.
+        if constexpr (
+          std::invocable<
+            Func&,
+            append_type&,
+            writer_type&,
+            decltype(segments)&,
+            decltype(targets)&,
+            codec::cooperative_work&,
+            control_type&,
+            allocator_type&>)
+            co_await body(
+              *append, *writer, segments, targets, work, *control, *ids);
+        else if constexpr (
+          std::invocable<
+            Func&,
+            append_type&,
+            writer_type&,
+            decltype(segments)&,
+            decltype(targets)&,
+            codec::cooperative_work&,
+            control_type&>)
+            co_await body(*append, *writer, segments, targets, work, *control);
+        else
+            co_await body(*append, *writer, segments, targets, work);
     } catch (...) {
         failed.observe(std::current_exception());
     }
@@ -221,6 +276,84 @@ seastar::future<> with_local_append(
     if (control) co_await close(control->close());
     control.reset();
     take(failed.outcome());
+}
+
+// What a shard checks before it starts, and the count that check rests on.
+// Two created segments hold exactly the handle credits
+// segment_writer_handles() gives for their configuration, so the count is
+// the code's and not an estimate. The budget is then accepted for every
+// number of segments it can hold beside a reserve and what those in creation
+// need, and refused for one more with its limit and what was expected of it.
+template<
+  runtime::monotonic_clock Clock,
+  typename Backend,
+  typename Owner,
+  typename Driver,
+  typename Timer>
+seastar::future<> segment_handle_budget(
+  Backend& files,
+  Owner& owner,
+  const local_device_spec& spec,
+  workload_budget& budget,
+  Driver drive,
+  Timer& timer) {
+    std::uint64_t held = 0;
+    co_await with_local_append<Clock>(
+      files,
+      owner,
+      spec,
+      budget,
+      drive,
+      timer,
+      {.segments = 2, .segment_handles = &held},
+      [](auto&, auto&, auto&, auto&, auto&) -> seastar::future<> {
+          co_return;
+      });
+    const auto config = segment::configuration();
+    const auto each = segment_writer_handles(config);
+    auto zero_written = config;
+    zero_written.preallocation_bytes = byte_count{64_KiB};
+    require(
+      held == 2 * std::uint64_t{each}
+        && segment_writer_handles(zero_written) == each + 1,
+      "created segments do not hold the handle credits their "
+      "configuration is counted for");
+    const auto limit = budget.limits().handles;
+    const auto creating = segment_creation_handles;
+    require(
+      limit >= creating + 2 * each, "the handle budget holds no two segments");
+    const auto most = (limit - creating) / each;
+    const auto spare = (limit - creating) % each;
+    const auto refused = [&](segment_handle_demand demand) {
+        const auto checked = validate_segment_handles(budget, config, demand);
+        if (
+          checked || checked.error().code() != errc::resource_exhausted
+          || checked.error().context_size() != 2)
+            return false;
+        const auto has = *checked.error().context_at(0);
+        const auto wants = *checked.error().context_at(1);
+        return has.key == runtime::operation_context_key::limit
+               && has.value == limit
+               && wants.key == runtime::operation_context_key::expected
+               && wants.value
+                    == std::uint64_t{demand.segments} * each
+                         + std::uint64_t{std::min(
+                             demand.creating, demand.segments)}
+                             * creating
+                         + demand.reserved;
+    };
+    require(
+      validate_segment_handles(budget, config, {.reserved = limit})
+        && validate_segment_handles(
+          budget, config, {.segments = most, .reserved = spare}),
+      "a segment count the handle budget holds was refused");
+    const auto all = std::numeric_limits<std::uint32_t>::max();
+    require(
+      refused({.segments = most + 1}) && refused({.reserved = limit + 1})
+        && refused({.segments = most, .reserved = spare + 1})
+        && refused({.segments = most, .creating = 2, .reserved = spare})
+        && refused({.segments = all, .creating = all, .reserved = all}),
+      "a segment count the handle budget cannot hold was accepted");
 }
 
 template<typename Driver>
@@ -782,8 +915,13 @@ seastar::future<> rotation_before_freeze(
       drive,
       timer,
       {.wal_capacity = byte_count{24_KiB}},
-      [&](auto& append, auto& writer, auto& segments, auto& targets, auto& work)
-        -> seastar::future<> {
+      [&](
+        auto& append,
+        auto& writer,
+        auto& segments,
+        auto& targets,
+        auto& work,
+        auto& control) -> seastar::future<> {
           const auto initial = writer.progress()->reserved.incarnation();
           std::optional<local_append_receipt> last;
           for (std::uint64_t logical = 100; logical != 104; ++logical) {
@@ -813,6 +951,112 @@ seastar::future<> rotation_before_freeze(
             !(current == initial) && append.reclaimable(initial)
               && !append.reclaimable(current),
             "WAL reclamation ignored the file's state");
+          // With every group durable, the discharged prefix and the durable
+          // end are positions in the current file: nothing still names the
+          // rotated file's end.
+          const auto snapshot = take(
+            append.obligations([](const local_obligation&) {}));
+          require(
+            snapshot.obligations == 0
+              && snapshot.discharged == writer.progress()->reserved
+              && snapshot.wal_durable == writer.progress()->durable
+              && snapshot.wal_durable.incarnation() == current,
+            "the discharged prefix stayed in a rotated WAL file");
+          // The segment's newest durable footer is the last group's.
+          std::vector<local_durable_boundary> newest;
+          append.durable_boundaries(
+            [&newest](const local_durable_boundary& one) {
+                newest.push_back(one);
+            });
+          const auto& cut = last->segment.boundary();
+          require(
+            newest.size() == 1 && newest[0].device == spec.owner.device()
+              && newest[0].history == cut.history()
+              && newest[0].covered == cut.covered()
+              && newest[0].footer == *cut.footer()
+              && newest[0].footer.end()
+                   == segments[0]->progress()->durable.bytes,
+            "the newest durable footer was not the last group's");
+
+          // A rotation that is only refused for pressure is retried, never
+          // latched. Every turn of the control is taken: one edit in flight
+          // and as many waiting as may wait. The request that needs the next
+          // WAL file is then refused with no effect, and the owner stays
+          // healthy.
+          seastar::promise<runtime::result<void>> proceed;
+          std::array<
+            std::optional<seastar::future<local_publication_outcome>>,
+            1 + maximum_control_waiters>
+            edits;
+          edits[0].emplace(control.update(
+            [](local_shard_control&) -> runtime::result<void> { return {}; },
+            [&proceed](const auto&, const auto&, auto&) {
+                return proceed.get_future();
+            },
+            work));
+          for (std::size_t i = 1; i != edits.size(); ++i)
+              edits[i].emplace(control.update(
+                [](local_shard_control&) -> runtime::result<void> {
+                    return {};
+                },
+                work));
+          runtime::first_failure failed;
+          std::uint64_t logical = 104;
+          try {
+              require(
+                control.waiting() == maximum_control_waiters,
+                "control edits did not wait their turn");
+              std::optional<local_append_outcome> refused;
+              for (; logical != 112 && !refused; ++logical) {
+                  auto outcome = co_await settle(
+                    append.append(
+                      *targets[0],
+                      co_await request(child_wire(logical), budget, work),
+                      work),
+                    drive);
+                  if (outcome.status == local_append_status::durable)
+                      last = *outcome.receipt;
+                  else
+                      refused.emplace(std::move(outcome));
+              }
+              require(
+                refused && refused->status == local_append_status::not_written
+                  && refused->failure.error()
+                  && refused->failure.error()->code() == errc::queue_full
+                  && !append.failure().failed() && !writer.failure().failed()
+                  && !append.storage_failure(),
+                "a rotation refused for pressure failed the append owner");
+          } catch (...) {
+              failed.observe(std::current_exception());
+          }
+          proceed.set_value(runtime::result<void>{});
+          for (auto& edit : edits) {
+              try {
+                  auto done = co_await drive.lifecycle(std::move(*edit));
+                  failed.observe(done.failure.outcome());
+              } catch (...) {
+                  failed.observe(std::current_exception());
+              }
+              edit.reset();
+          }
+          take(failed.outcome());
+          // With the control free again the same rotation resumes: the
+          // refused batch is appended after the last durable one, in a new
+          // WAL file.
+          const auto rotations = writer.statistics().rotations;
+          auto resumed = co_await settle(
+            append.append(
+              *targets[0],
+              co_await request(child_wire(logical - 1), budget, work),
+              work),
+            drive);
+          const auto& receipt = durable(resumed);
+          require(
+            receipt.block.records.bytes().begin()
+                == last->segment.boundary().end().bytes
+              && writer.statistics().rotations == rotations + 1
+              && !append.failure().failed(),
+            "a rotation refused for pressure did not resume");
       });
 }
 
@@ -1346,7 +1590,22 @@ seastar::future<> completed_retry_facts(
           require(
             !beyond && beyond.error().code() == errc::resource_exhausted,
             "a fact beyond the reserved capacity was recorded");
-          auto snapshot = take(append.detach(*targets[0]));
+          // A completion fact is no WAL obligation.
+          require(
+            take(append.obligations([](const local_obligation&) {})).obligations
+              == 0,
+            "a completed-retry fact opened a WAL obligation");
+          auto detached = take(append.detach(*targets[0]));
+          // The attachment's newest durable footer leaves with it.
+          const auto& last = durable(second).segment.boundary();
+          require(
+            detached.boundary
+              && detached.boundary->device == spec.owner.device()
+              && detached.boundary->history == last.history()
+              && detached.boundary->covered == last.covered()
+              && detached.boundary->footer == *last.footer(),
+            "detach lost the attachment's newest durable footer");
+          auto& snapshot = detached.retry;
           const auto& facts = snapshot.facts();
           const auto slice = take(
             co_await drive.lifecycle(snapshot.read(0, 2, work)));
@@ -1395,7 +1654,7 @@ seastar::future<> obligations_track_segments(
       drive,
       timer,
       {.outstanding = 1, .segments = 2},
-      [&](auto& append, auto& writer, auto&, auto& targets, auto& work)
+      [&](auto& append, auto& writer, auto& segments, auto& targets, auto& work)
         -> seastar::future<> {
           const auto start = writer.progress()->reserved;
           const auto file = start.incarnation();
@@ -1429,6 +1688,11 @@ seastar::future<> obligations_track_segments(
               && early[0].pinned == 0 && during.discharged == start
               && !append.reclaimable(file),
             "an in-flight group's obligation was not open");
+          // No barrier has covered a group yet: nothing to pin.
+          std::uint32_t reported = 0;
+          append.durable_boundaries(
+            [&reported](const local_durable_boundary&) { ++reported; });
+          require(reported == 0, "a footer was reported before its barrier");
           static_cast<void>(
             durable(co_await drive.lifecycle(std::move(blocker.result))));
           static_cast<void>(
@@ -1441,6 +1705,20 @@ seastar::future<> obligations_track_segments(
               && after.discharged == writer.progress()->reserved
               && after.wal_durable == writer.progress()->durable,
             "segment-durable groups left obligations open");
+          // Each attachment reports its own newest durable footer.
+          std::vector<local_durable_boundary> newest;
+          append.durable_boundaries(
+            [&newest](const local_durable_boundary& one) {
+                newest.push_back(one);
+            });
+          require(newest.size() == 2, "an attachment's footer is missing");
+          for (std::uint32_t i = 0; i != 2; ++i)
+              require(
+                newest[i].history.segment == context(i + 1)
+                  && newest[i].device == spec.owner.device()
+                  && newest[i].footer.end()
+                       == segments[i]->progress()->durable.bytes,
+                "a reported footer is not its segment's durable end");
       });
 }
 
@@ -1553,11 +1831,16 @@ seastar::future<> barrier_order(
           require(
             !stages.result.available(),
             "a request was published before both barriers");
+          // Segment-durable first: the obligation is discharged past the
+          // group while the WAL-durable end is still before it, so the
+          // discharged prefix alone is no bound for dropping WAL.
           if (wal_slow)
               require(
                 segments[0]->progress()->durable.blocks == 1
                   && wal.durable == start && open.empty()
-                  && snapshot.discharged == wal.reserved,
+                  && snapshot.discharged == wal.reserved
+                  && snapshot.wal_durable == start
+                  && !(snapshot.discharged == start),
                 "the segment barrier did not finish first or left its "
                 "obligation open");
           else

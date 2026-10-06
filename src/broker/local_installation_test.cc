@@ -7,6 +7,7 @@
 #include "src/storage/tests/local_installation_contract.h"
 #include "src/storage/tests/segment_qualification_contract.h"
 #include "src/storage/tests/segment_writer_contract.h"
+#include "src/storage/tests/sparse_index_contract.h"
 
 #include <seastar/core/memory.hh>
 #include <seastar/core/preempt.hh>
@@ -218,6 +219,123 @@ SEASTAR_TEST_CASE(segment_writer_native_grouped_execution) {
       68,
       [](auto& files, auto& owner, const auto& spec, auto& budget, auto drive) {
           return storage::testing::segment_writer_contract::grouped_execution<
+            runtime::production::monotonic_clock>(
+            files, owner, spec, budget, drive);
+      },
+      byte_count{48_MiB},
+      resource::workload_class::foreground_protocol,
+      64);
+}
+
+SEASTAR_TEST_CASE(sparse_index_native_active_feed) {
+    co_await with_installation(
+      68,
+      [](auto& files, auto& owner, const auto& spec, auto& budget, auto drive) {
+          return storage::testing::sparse_index_contract::active_feed<
+            runtime::production::monotonic_clock>(
+            files, owner, spec, budget, drive);
+      },
+      byte_count{48_MiB},
+      resource::workload_class::foreground_protocol,
+      64);
+}
+
+SEASTAR_TEST_CASE(sparse_index_native_sealed_index) {
+    co_await with_installation(
+      68,
+      [](auto& files, auto& owner, const auto& spec, auto& budget, auto drive) {
+          return storage::testing::sparse_index_contract::sealed_index<
+            runtime::production::monotonic_clock>(
+            files, owner, spec, budget, drive, false);
+      },
+      byte_count{48_MiB},
+      resource::workload_class::foreground_protocol,
+      64);
+}
+
+SEASTAR_TEST_CASE(sparse_index_native_empty_extent) {
+    co_await with_installation(
+      68,
+      [](auto& files, auto& owner, const auto& spec, auto& budget, auto drive) {
+          return storage::testing::sparse_index_contract::empty_extent<
+            runtime::production::monotonic_clock>(
+            files, owner, spec, budget, drive);
+      },
+      byte_count{48_MiB},
+      resource::workload_class::foreground_protocol,
+      64);
+}
+
+SEASTAR_TEST_CASE(sparse_index_native_index_named_after_seal) {
+    co_await with_installation(
+      68,
+      [](auto& files, auto& owner, const auto& spec, auto& budget, auto drive) {
+          return storage::testing::sparse_index_contract::sealed_index<
+            runtime::production::monotonic_clock>(
+            files, owner, spec, budget, drive, true);
+      },
+      byte_count{48_MiB},
+      resource::workload_class::foreground_protocol,
+      64);
+}
+
+SEASTAR_TEST_CASE(sparse_index_native_owed_index) {
+    co_await with_installation(
+      68,
+      [](auto& files, auto& owner, const auto& spec, auto& budget, auto drive) {
+          return storage::testing::sparse_index_contract::owed_index<
+            runtime::production::monotonic_clock>(
+            files, owner, spec, budget, drive);
+      },
+      byte_count{48_MiB},
+      resource::workload_class::foreground_protocol,
+      64);
+}
+
+SEASTAR_TEST_CASE(sparse_index_native_resident_roots) {
+    co_await with_installation(
+      68,
+      [](auto& files, auto& owner, const auto& spec, auto& budget, auto drive) {
+          return storage::testing::sparse_index_contract::resident_roots<
+            runtime::production::monotonic_clock>(
+            files, owner, spec, budget, drive);
+      },
+      byte_count{48_MiB},
+      resource::workload_class::foreground_protocol,
+      64);
+}
+
+SEASTAR_TEST_CASE(sparse_index_native_scanned_lookups) {
+    co_await with_installation(
+      68,
+      [](auto& files, auto& owner, const auto& spec, auto& budget, auto drive) {
+          return storage::testing::sparse_index_contract::scanned_lookups<
+            runtime::production::monotonic_clock>(
+            files, owner, spec, budget, drive);
+      },
+      byte_count{48_MiB},
+      resource::workload_class::foreground_protocol,
+      64);
+}
+
+SEASTAR_TEST_CASE(sparse_index_native_replaced_under_readers) {
+    co_await with_installation(
+      68,
+      [](auto& files, auto& owner, const auto& spec, auto& budget, auto drive) {
+          return storage::testing::sparse_index_contract::
+            replaced_under_readers<runtime::production::monotonic_clock>(
+              files, owner, spec, budget, drive);
+      },
+      byte_count{48_MiB},
+      resource::workload_class::foreground_protocol,
+      64);
+}
+
+SEASTAR_TEST_CASE(sparse_index_native_paged_lookups) {
+    co_await with_installation(
+      68,
+      [](auto& files, auto& owner, const auto& spec, auto& budget, auto drive) {
+          return storage::testing::sparse_index_contract::paged_lookups<
             runtime::production::monotonic_clock>(
             files, owner, spec, budget, drive);
       },

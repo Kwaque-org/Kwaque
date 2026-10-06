@@ -448,10 +448,12 @@ void verify_metadata(
         EXPECT_EQ(refs[i].digest().bytes(), exact_digest(pages[i]));
     }
     {
+        const auto firsts = testing::index::anchors({100, 105});
         auto encoded = encode_sparse_index_root(
                          index_context,
                          2,
                          refs,
+                         firsts,
                          work,
                          operation_budget().operation_remaining,
                          charge)
@@ -875,6 +877,7 @@ TEST(FormatIntegrationTest, FullRemovalRetainsOnlyCoverageAndCompletedResults) {
             auto encoded = encode_sparse_index_root(
                              context,
                              0,
+                             {},
                              {},
                              work,
                              operation_budget().operation_remaining,

@@ -4,6 +4,7 @@
 #include "src/codec/transaction.h"
 #include "src/storage/local_discovery.h"
 #include "src/storage/page_internal.h"
+#include "src/storage/retained_wal.h"
 #include "src/storage/storage_scan.h"
 #include "src/storage/wal_format.h"
 
@@ -106,6 +107,11 @@ struct wal_scan_result final {
     // False when a visitor stopped the scan early.
     bool complete{false};
     std::uint64_t files{0}, prepares{0}, unresolved{0};
+    // The chain's files by name, oldest first: all of them, or the oldest
+    // that fit when the chain has more than a shard may hold.
+    retained_wal chain;
+    // How many files the chain has.
+    std::uint64_t chain_files{0};
     // The end of the head's content; a successor's predecessor cursor names
     // exactly this. Absent for a store whose WAL was never activated.
     std::optional<local_wal_cursor> content_end;
@@ -310,6 +316,10 @@ seastar::future<runtime::result<wal_scan_result>> scan_local_wal(
         output.complete = true;
         co_return output;
     }
+    // The walk ran from the head down; the names go oldest first.
+    output.chain_files = chain.size();
+    for (std::size_t named = chain.size(); named != 0; --named)
+        if (!output.chain.extend(chain[named - 1].incarnation)) break;
     const auto paths = local_paths::make(spec.root);
     if (!paths) co_return runtime::failure(paths.error());
     detail::wal_resolution state{

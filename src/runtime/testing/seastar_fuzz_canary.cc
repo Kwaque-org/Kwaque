@@ -29,11 +29,12 @@ std::string reactor_backend_argument() {
 void configure_native_runner(bool fail_startup) {
     // The native runner owns only pointers to these arguments until lazy
     // startup. Keep them alive through every bridge call and finalization.
-    static std::array<std::string, 7> arguments{
+    static std::array<std::string, 8> arguments{
       "kwaque-fuzz-canary",
       "--smp=1",
       "--memory=128MiB",
       reactor_backend_argument(),
+      "--max-networking-io-control-blocks=1000",
       "--overprovisioned",
       "--random-seed=1",
       "--invalid-canary-option",
@@ -46,6 +47,7 @@ void configure_native_runner(bool fail_startup) {
       arguments[4].data(),
       arguments[5].data(),
       arguments[6].data(),
+      arguments[7].data(),
     };
     require(
       seastar::testing::global_test_runner().start(

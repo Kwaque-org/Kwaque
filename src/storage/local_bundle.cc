@@ -1,8 +1,21 @@
 #include "src/storage/local_bundle.h"
 
 #include "src/base/units.h"
+#include "src/storage/page_internal.h"
 
 namespace kwaque::storage {
+namespace detail {
+seastar::future<runtime::operation_error> undecoded_index_error(
+  bytes::fragmented_buffer_parser& input,
+  byte_count encoded,
+  codec::immutable_object_digest pinned,
+  errc why,
+  codec::cooperative_work& work) {
+    const auto actual = co_await hash_exact(input, encoded, work, {});
+    co_return path_error(
+      actual && *actual != pinned ? errc::corrupt_data : why);
+}
+} // namespace detail
 namespace {
 std::span<const page_ref> root_pages(const local_bundle_root& root) {
     return std::visit(
@@ -71,7 +84,12 @@ seastar::future<runtime::result<local_bundle>> local_bundle::make(
           codec::input_boundary::complete);
         if (!decoded)
             co_return runtime::failure(
-              detail::path_error(decoded.error().code()));
+              co_await detail::undecoded_index_error(
+                input,
+                reference.bytes(),
+                reference.digest(),
+                decoded.error().code(),
+                work));
         root.emplace(std::move(decoded->value));
     } else if (const auto* retry = std::get_if<footer_expectation>(&context)) {
         if (
@@ -285,31 +303,20 @@ seastar::future<runtime::result<void>> local_bundle_verifier::next(
         expected.encoded_bytes = reference.encoded_bytes();
         expected.page = reference;
         expected.previous_retry = previous_retry_;
-        expected.previous_checkpoint_end = previous_checkpoint_;
+        expected.previous_checkpoint = previous_checkpoint_;
         auto page = co_await decode_local_metadata(
           input, expected, *memory, work, {}, codec::input_boundary::complete);
         if (!page)
             co_return runtime::failure(detail::path_error(page.error().code()));
-        if (checkpoint) {
-            const auto& entries
-              = std::get<local_checkpoint_page>(page->value.payload()).entries;
-            const auto& root = std::get<local_checkpoint_root>(
-              std::get<local_metadata_record>(bundle_.root_).payload());
-            if (next_ == 0 && entries.front().begin != root.begin)
-                co_return runtime::failure(
-                  detail::path_error(errc::wrong_context));
-            auto order = entries.back().end.compare(
-              expected.header.owner(), root.end, expected.header.owner());
-            if (!order || *order > 0)
-                co_return runtime::failure(
-                  detail::path_error(errc::wrong_context));
-            previous_checkpoint_ = entries.back().end;
-        } else {
+        if (checkpoint)
+            previous_checkpoint_ = std::get<local_checkpoint_page>(
+                                     page->value.payload())
+                                     .entries.back();
+        else
             previous_retry_ = std::get<local_completed_retry_page>(
                                 page->value.payload())
                                 .entries.back()
                                 .id();
-        }
     }
     if (!input.at_end())
         co_return runtime::failure(detail::path_error(errc::malformed_data));
@@ -330,13 +337,6 @@ local_bundle_verifier::finish(codec::cooperative_work& work) {
         auto done = retry_->finish(work);
         if (!done)
             return runtime::failure(detail::path_error(done.error().code()));
-    } else if (bundle_.reference_.kind() == local_root_kind::checkpoint) {
-        const auto& root = std::get<local_checkpoint_root>(
-          std::get<local_metadata_record>(bundle_.root_).payload());
-        if (
-          previous_checkpoint_ ? *previous_checkpoint_ != root.end
-                               : root.begin != root.end)
-            return runtime::failure(detail::path_error(errc::wrong_context));
     }
     if (auto ready = work.poll(); !ready)
         return runtime::failure(detail::path_error(ready.error().code()));

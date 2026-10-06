@@ -23,11 +23,13 @@
 #include <new>
 #include <optional>
 #include <set>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <system_error>
 #include <unistd.h>
 #include <utility>
+#include <vector>
 
 namespace {
 using kwaque::literals::operator""_KiB;
@@ -447,6 +449,58 @@ SEASTAR_TEST_CASE(production_directory_cursor_can_close_before_first_next) {
               auto closed = co_await opened->close();
               BOOST_REQUIRE(closed.has_value());
           }
+      });
+}
+
+// A directory kept open to be synced takes no listing slot: more of them
+// stay open and sync than may list at once. A cursor takes its slot with its
+// first page and gives it back only once it and that page are gone.
+SEASTAR_TEST_CASE(
+  production_directory_cursor_takes_its_slot_with_the_first_page) {
+    return seastar::tmp_dir::do_with(
+      kwaque::runtime::testing::test_directory_template(),
+      [](seastar::tmp_dir& directory) -> seastar::future<> {
+          constexpr std::size_t listing = 64;
+          kwaque::runtime::production::file_system files;
+          std::vector<kwaque::runtime::production::directory_cursor> held;
+          std::vector<std::optional<kwaque::runtime::directory_page>> pages(
+            listing);
+          held.reserve(listing + 2);
+          std::exception_ptr failure;
+          try {
+              for (std::size_t count = 0; count != listing + 2; ++count) {
+                  auto opened = co_await files.open_directory(
+                    path_of(directory.get_path()));
+                  BOOST_REQUIRE(opened.has_value());
+                  held.push_back(std::move(*opened));
+                  BOOST_REQUIRE((co_await held.back().sync()).has_value());
+              }
+              for (std::size_t count = 0; count != listing; ++count) {
+                  auto page = co_await held[count].next({});
+                  BOOST_REQUIRE(page.has_value());
+                  pages[count].emplace(std::move(*page));
+              }
+              auto refused = co_await held[listing].next({});
+              BOOST_REQUIRE(!refused.has_value());
+              BOOST_CHECK(refused.error().code() == kwaque::errc::queue_full);
+              // The refusal latched nothing, and syncing needs no slot.
+              BOOST_CHECK((co_await held[listing].sync()).has_value());
+              // A closed cursor's page still holds its slot.
+              BOOST_REQUIRE((co_await held[0].close()).has_value());
+              BOOST_CHECK(!(co_await held[listing].next({})).has_value());
+              pages[0].reset();
+              BOOST_CHECK((co_await held[listing].next({})).has_value());
+          } catch (...) {
+              failure = std::current_exception();
+          }
+          pages.clear();
+          for (auto& cursor : held) {
+              auto closed = co_await cursor.close();
+              if (!failure && !closed.has_value())
+                  failure = std::make_exception_ptr(
+                    std::runtime_error("a directory cursor did not close"));
+          }
+          if (failure) std::rethrow_exception(failure);
       });
 }
 

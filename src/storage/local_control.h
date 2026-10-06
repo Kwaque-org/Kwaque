@@ -3,7 +3,11 @@
 #include "src/base/units.h"
 #include "src/storage/local_store_bootstrap.h"
 
+#include <seastar/core/semaphore.hh>
+#include <seastar/util/defer.hh>
+
 #include <memory>
+#include <optional>
 #include <type_traits>
 
 namespace kwaque::storage {
@@ -15,6 +19,9 @@ struct local_control_snapshot final {
     local_publication_generation generation;
     local_shard_control fields;
 };
+// Updates that may wait behind the one in flight: one for each other owner of
+// the control, which are the WAL writer, the ID allocator and the checkpoint.
+inline constexpr std::uint32_t maximum_control_waiters = 2;
 namespace detail {
 inline runtime::result<void> control_progress(
   const local_shard_control& before, const local_shard_control& after) {
@@ -125,10 +132,13 @@ public:
               files, spec, shard, *fields.wal_head, budget, limits, work);
             if (!head) co_return runtime::failure(head.error());
         }
+        std::optional<local_wal_cursor> checkpoint_end;
         if (fields.checkpoint) {
             auto root = co_await load_local_checkpoint_root(
               files, spec, shard, *fields.checkpoint, budget, limits, work);
             if (!root) co_return runtime::failure(root.error());
+            checkpoint_end
+              = std::get<local_checkpoint_root>(root->value.payload()).end;
         }
         // Reconcile a selected, validated record using fresh joined handles.
         // Generation/counters are preserved; this does not activate append or
@@ -156,6 +166,7 @@ public:
           budget,
           limits,
           {loaded->value.header().generation(), fields},
+          checkpoint_end,
           std::move(*held),
           std::move(parent))};
     }
@@ -174,9 +185,21 @@ public:
             return runtime::failure(detail::path_error(errc::closed));
         return current_;
     }
+    // Where the durable checkpoint ends; absent before the first.
+    [[nodiscard]] std::optional<local_wal_cursor>
+    checkpoint_end() const noexcept {
+        assert_current();
+        return checkpoint_end_;
+    }
     // The edit is synchronous and changes only a candidate copy. It runs after
     // nonwaiting admission, under serialization through directory sync and
     // in-memory installation. Caller-owned captures/pins are already admitted.
+    // Updates take turns in call order: one that finds another in flight
+    // waits, and its edit then runs against the fields current when its turn
+    // starts. Each owner of the control has at most one update outstanding,
+    // so at most maximum_control_waiters wait; one more is rejected with no
+    // effect, as untouched admission pressure. An update still waiting when
+    // the owner closes or fences is rejected as closed.
     template<typename Edit>
     requires std::same_as<
                std::invoke_result_t<Edit&, local_shard_control&>,
@@ -192,6 +215,8 @@ public:
     // success asserts independent durable installation/full proof obligations
     // owned by the WAL/checkpoint producer. Read-only header/root checks below
     // corroborate identity and extent; they cannot manufacture that authority.
+    // A new checkpoint must continue the durable one: its root begins where
+    // that one ended. With the root's own order, the end never moves back.
     template<typename Edit, typename Dependencies>
     requires std::same_as<
                std::invoke_result_t<Edit&, local_shard_control&>,
@@ -219,7 +244,9 @@ public:
         };
         if (closing_ || closed_ || fenced_)
             return reject(detail::path_error(errc::closed));
-        if (busy_)
+        // A free turn is taken now; it never passes an update already waiting.
+        auto turn = seastar::try_get_units(turn_, 1);
+        if (!turn && waiting_ == maximum_control_waiters)
             return reject(
               runtime::make_file_error(
                 errc::queue_full,
@@ -228,7 +255,16 @@ public:
           byte_count{
             limits_.operation_bytes.value() + limits_.execution_bytes.value()});
         if (!reservation) return reject(reservation.error());
-        return update_owned(
+        if (turn)
+            return update_owned(
+              std::move(edit),
+              std::move(dependencies),
+              work,
+              std::move(*reservation),
+              operations_.hold(),
+              std::move(*turn));
+        ++waiting_;
+        return update_queued(
           std::move(edit),
           std::move(dependencies),
           work,
@@ -255,6 +291,17 @@ public:
         assert_current();
         return fenced_;
     }
+    // Updates waiting for their turn behind the one in flight.
+    [[nodiscard]] std::uint32_t waiting() const noexcept {
+        assert_current();
+        return waiting_;
+    }
+    // What every update is admitted against: the record it encodes, the
+    // dependencies it loads and its publication.
+    [[nodiscard]] const workload_budget& budget() const noexcept {
+        assert_current();
+        return budget_;
+    }
 
 private:
     friend class local_id_allocator<Backend, Owner>;
@@ -267,6 +314,7 @@ private:
       workload_budget& budget,
       local_store_io_limits limits,
       local_control_snapshot current,
+      std::optional<local_wal_cursor> checkpoint_end,
       workload_reservation held,
       runtime::file_path parent)
       : state_reservation_(std::move(held))
@@ -277,6 +325,7 @@ private:
       , budget_(budget)
       , limits_(limits)
       , current_(current)
+      , checkpoint_end_(checkpoint_end)
       , publisher_(
           files,
           budget,
@@ -286,17 +335,46 @@ private:
            runtime::file_name::make("control").value(),
            runtime::file_rename_policy::replace,
            current.generation}) {}
+    // Waits for the turn in call order, then runs as any other update.
+    template<typename Edit, typename Dependencies>
+    seastar::future<local_publication_outcome> update_queued(
+      Edit edit,
+      Dependencies dependencies,
+      codec::cooperative_work& work,
+      workload_reservation reservation,
+      seastar::gate::holder holder) {
+        std::optional<seastar::semaphore_units<>> turn;
+        {
+            auto waited = seastar::defer([this] noexcept { --waiting_; });
+            turn.emplace(co_await seastar::get_units(turn_, 1));
+        }
+        if (closing_ || closed_ || fenced_) {
+            local_publication_outcome output{std::move(reservation)};
+            output.failure.observe(detail::path_error(errc::closed));
+            co_return output;
+        }
+        co_return co_await update_owned(
+          std::move(edit),
+          std::move(dependencies),
+          work,
+          std::move(reservation),
+          std::move(holder),
+          std::move(*turn));
+    }
     template<typename Edit, typename Dependencies>
     seastar::future<local_publication_outcome> update_owned(
       Edit edit,
       Dependencies dependencies,
       codec::cooperative_work& work,
       workload_reservation reservation,
-      seastar::gate::holder holder) {
+      seastar::gate::holder holder,
+      seastar::semaphore_units<> turn) {
         busy_ = true;
         auto idle = seastar::defer([this] noexcept { busy_ = false; });
         static_cast<void>(holder);
+        static_cast<void>(turn);
         local_publication_outcome output{std::move(reservation)};
+        std::optional<local_wal_cursor> checkpoint_end;
         try {
             do {
                 auto generation = current_.generation.checked_successor();
@@ -357,6 +435,14 @@ private:
                         output.failure.observe(root);
                         break;
                     }
+                    const auto& next = std::get<local_checkpoint_root>(
+                      root->value.payload());
+                    if (checkpoint_end_ && next.begin != *checkpoint_end_) {
+                        output.failure.observe(
+                          detail::path_error(errc::wrong_context));
+                        break;
+                    }
+                    checkpoint_end = next.end;
                 }
                 const auto header = local_metadata_header::make(
                                       local_metadata_kind::shard_control,
@@ -385,8 +471,11 @@ private:
                   std::move(encoded->bytes),
                   work);
                 if (
-                  output.disposition == local_publication_disposition::durable)
+                  output.disposition
+                  == local_publication_disposition::durable) {
                     current_ = {*generation, std::move(candidate)};
+                    if (checkpoint_end) checkpoint_end_ = checkpoint_end;
+                }
                 if (
                   publisher_.fenced()
                   || output.disposition
@@ -408,8 +497,13 @@ private:
     workload_budget& budget_;
     local_store_io_limits limits_;
     local_control_snapshot current_;
+    // Where the durable checkpoint ends, from its root.
+    std::optional<local_wal_cursor> checkpoint_end_;
     local_file_publisher<Backend> publisher_;
     seastar::gate operations_;
+    // One update at a time, in call order.
+    seastar::semaphore turn_{1};
+    std::uint32_t waiting_{0};
     bool id_allocator_active_{false};
     bool wal_writer_active_{false};
     bool busy_{false}, closing_{false}, closed_{false}, fenced_{false};

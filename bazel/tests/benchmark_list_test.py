@@ -11,6 +11,7 @@ from pathlib import Path
 CASE = "build_conventions.empty"
 REACTOR_ARGUMENTS = (
     f"--reactor-backend={os.environ.get('KWAQUE_REACTOR_BACKEND', 'epoll')}",
+    "--max-networking-io-control-blocks=1000",
     "--smp=1",
     "--memory=128M",
     "--overprovisioned",

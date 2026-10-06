@@ -37,6 +37,7 @@ class FailurePolicyTest(unittest.TestCase):
                     self.binary,
                     f"--scenario={scenario}",
                     f"--reactor-backend={REACTOR_BACKEND}",
+                    "--max-networking-io-control-blocks=1000",
                     f"--smp={shards}",
                     f"--memory={64 * shards}MiB",
                     "--overprovisioned",

@@ -207,6 +207,7 @@ TEST(
                          context,
                          1,
                          root.pages(),
+                         root.first_anchors(),
                          work,
                          budget().operation_remaining,
                          charge)

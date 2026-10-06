@@ -35,6 +35,11 @@ SHIPPED_FLAGS = (
 )
 GATE_FAILURE = (
     "contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled')"
+    " || needs.workflow-lint.result != 'success'"
+)
+DEPENDABOT_HOLD = (
+    "github.event.pull_request.user.login != 'dependabot[bot]'"
+    " || github.run_attempt != '1'"
 )
 FUZZ_WORKFLOW = (
     Path(sys.argv[2]) if WORKFLOW_ARGUMENTS else WORKFLOW.with_name("fuzz.yml")
@@ -450,7 +455,10 @@ def gate_errors(workflow: str) -> list[str]:
         errors.append("ci-ok must depend on every other job")
     failing = re.search(r"      - if: \$\{\{ (.+) \}\}\n        run: exit 1\n", gate)
     if failing is None or failing.group(1) != GATE_FAILURE:
-        errors.append("ci-ok must fail when any job fails or is cancelled")
+        errors.append(
+            "ci-ok must fail when any job fails or is cancelled, "
+            "or the change check did not succeed"
+        )
     return errors
 
 
@@ -645,10 +653,17 @@ class CiCoverageTest(unittest.TestCase):
             gate.replace("      - sanitizer\n", ""),
             gate.replace("    if: always()\n", ""),
             gate.replace(" || contains(needs.*.result, 'cancelled')", ""),
+            gate.replace(" || needs.workflow-lint.result != 'success'", ""),
         ):
             with self.subTest(changed=changed):
                 self.assertNotEqual(changed, gate)
                 self.assertTrue(gate_errors(self.workflow.replace(gate, changed)))
+
+    def test_dependabot_pull_requests_wait_for_a_maintainer(self) -> None:
+        # The change check alone is held: every other job needs it, and the
+        # result job fails unless it succeeded, so a held run never passes.
+        jobs = jobs_section(self.workflow)
+        self.assertIn(f"    if: {DEPENDABOT_HOLD}\n", jobs["workflow-lint"])
 
     def test_runs_on_main_are_never_cancelled(self) -> None:
         self.assertIn(

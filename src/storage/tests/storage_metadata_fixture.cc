@@ -121,7 +121,14 @@ std::string metadata_fixture::root_wire(std::span<const page_ref> refs) const {
     if (is_manifest)
         return manifest::expected_root(
           manifest_header, refs, alignment.bytes().value(), header);
-    return index::root_wire(refs, index_context, header);
+    // A page begins with the entry its reference counts from.
+    std::vector<model::range_logical_offset> firsts;
+    firsts.reserve(refs.size());
+    for (const auto& ref : refs)
+        firsts.push_back(
+          index::entry(logical_base + stride * ref.first_entry(), 0)
+            .logical_anchor());
+    return index::root_wire(refs, index_context, header, firsts);
 }
 
 storage_observation observe_metadata(

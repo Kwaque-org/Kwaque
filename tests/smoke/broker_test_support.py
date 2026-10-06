@@ -17,10 +17,12 @@ from typing import Any, Iterable
 
 from bazel.native_test_environment import normalized_environment
 
-# The test macros export the reactor backend selected for this build.
+# The test macros export the reactor backend selected for this build, and
+# bound a reactor's networking control blocks as these arguments do.
 REACTOR_BACKEND = os.environ.get("KWAQUE_REACTOR_BACKEND", "epoll")
 REACTOR_ARGUMENTS = (
     f"--reactor-backend={REACTOR_BACKEND}",
+    "--max-networking-io-control-blocks=1000",
     "--smp=1",
     "--memory=128M",
     "--overprovisioned",

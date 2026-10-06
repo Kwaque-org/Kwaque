@@ -194,11 +194,12 @@ std::vector<record_case> cases() {
          local_object_sequence::make(70).value(),
          page_ordinal::make(0).value(),
          0,
-         {{cursor(4096),
-           cursor(8192),
-           sc(),
+         {{sc(),
            local_checkpoint_disposition::segment_boundary,
-           51,
+           id<device_store_id>(0x44),
+           8192,
+           byte_count{4096},
+           6,
            digest()}}},
        70},
       {local_metadata_kind::deletion_intent,
@@ -959,6 +960,153 @@ TEST(
         local_metadata_kind::store_identity,
         store_owner(true),
         local_publication_generation::make(2).value()));
+}
+
+// A checkpoint entry is a pin, not a WAL interval: a segment's durable footer
+// on a named data device, or a discard decision on the control device. A page
+// holds them in canonical order with one boundary per segment.
+TEST(LocalMetadataTest, CheckpointEntriesArePinsInCanonicalOrder) {
+    seastar::abort_source abort;
+    codec::cooperative_work work{codec::limits::defaults(), abort};
+    const auto boundary
+      = std::get<local_checkpoint_page>(cases()[6].payload).entries[0];
+    const local_checkpoint_entry discard{
+      boundary.segment,
+      local_checkpoint_disposition::authorized_discard,
+      device_store_id{},
+      63,
+      byte_count{4096},
+      0,
+      digest()};
+    const auto encode = [&](std::vector<local_checkpoint_entry> entries) {
+        const local_metadata_payload payload{local_checkpoint_page{
+          local_object_sequence::make(70).value(),
+          page_ordinal::make(0).value(),
+          0,
+          std::move(entries)}};
+        return encode_local_metadata(
+                 {record_header(local_metadata_kind::checkpoint_page, 70),
+                  alignment(4096),
+                  {}},
+                 payload,
+                 work,
+                 budget().operation_remaining,
+                 charge)
+          .get();
+    };
+    const auto rejected =
+      [&](std::vector<local_checkpoint_entry> entries, errc expected) {
+          const auto encoded = encode(std::move(entries));
+          return !encoded && encoded.error().code() == expected;
+      };
+    auto later = discard;
+    later.locator = 64;
+    ASSERT_TRUE(encode({boundary, discard, later}));
+    // Order, duplicates and a second boundary for one segment.
+    EXPECT_TRUE(rejected({discard, boundary}, errc::malformed_data));
+    EXPECT_TRUE(rejected({boundary, later, discard}, errc::malformed_data));
+    EXPECT_TRUE(rejected({boundary, discard, discard}, errc::malformed_data));
+    auto moved = boundary;
+    moved.locator = 12288;
+    EXPECT_TRUE(rejected({boundary, moved}, errc::malformed_data));
+    // A boundary is a durable footer's reference on a named device.
+    for (const auto edit : {0, 1, 2, 3}) {
+        auto wrong = boundary;
+        if (edit == 0) wrong.device = device_store_id{};
+        if (edit == 1) wrong.family = 7;
+        if (edit == 2) wrong.locator = 0;
+        if (edit == 3) wrong.bytes = byte_count{16};
+        EXPECT_TRUE(rejected({wrong}, errc::malformed_data)) << edit;
+    }
+    // A discard names a decision record, no device and no footer family.
+    for (const auto edit : {0, 1, 2, 3}) {
+        auto wrong = discard;
+        if (edit == 0) wrong.device = boundary.device;
+        if (edit == 1) wrong.family = 6;
+        if (edit == 2) wrong.locator = 0;
+        if (edit == 3) wrong.bytes = byte_count{4097};
+        EXPECT_TRUE(rejected({wrong}, errc::malformed_data)) << edit;
+    }
+    auto foreign = boundary;
+    foreign.segment = segment_context::make(
+                        id<model::cluster_id>(0x51),
+                        boundary.segment.topic(),
+                        boundary.segment.range(),
+                        boundary.segment.segment(),
+                        boundary.segment.generation())
+                        .value();
+    EXPECT_TRUE(rejected({foreign}, errc::malformed_data));
+
+    // The order and the one boundary per segment hold across pages, and a
+    // relocated candidate is unsupported to read as well as to write.
+    const auto page = encode({discard});
+    ASSERT_TRUE(page);
+    const auto decode = [&](
+                          std::optional<local_checkpoint_entry> previous,
+                          encoded_local_metadata wire,
+                          std::uint32_t first) {
+        local_metadata_expectation e{
+          record_header(local_metadata_kind::checkpoint_page, 70),
+          alignment(4096)};
+        e.digest = wire.digest;
+        e.encoded_bytes = wire.bytes.size();
+        e.page = page_ref::make(
+                   page_ordinal::make(first == 0 ? 0 : 1).value(),
+                   first,
+                   1,
+                   wire.bytes.size(),
+                   wire.digest)
+                   .value();
+        e.previous_checkpoint = previous;
+        fragmented_buffer_parser input{wire.bytes.share()};
+        return decode_local_metadata(input, e, reserve(input, work), work)
+          .get();
+    };
+    const auto second = [&](local_checkpoint_entry entry) {
+        const local_metadata_payload payload{local_checkpoint_page{
+          local_object_sequence::make(70).value(),
+          page_ordinal::make(1).value(),
+          1,
+          {entry}}};
+        return encode_local_metadata(
+                 {record_header(local_metadata_kind::checkpoint_page, 70),
+                  alignment(4096),
+                  {}},
+                 payload,
+                 work,
+                 budget().operation_remaining,
+                 charge)
+          .get()
+          .value();
+    };
+    EXPECT_TRUE(decode(boundary, second(discard), 1));
+    const auto repeated = decode(discard, second(discard), 1);
+    ASSERT_FALSE(repeated);
+    EXPECT_EQ(repeated.error().code(), errc::malformed_data);
+    const auto doubled = decode(boundary, second(moved), 1);
+    ASSERT_FALSE(doubled);
+    EXPECT_EQ(doubled.error().code(), errc::malformed_data);
+
+    // A root's end never precedes its begin; with pins instead of intervals
+    // the cursors and the entry count are otherwise independent.
+    const auto root = [&](local_wal_cursor begin, local_wal_cursor end) {
+        const local_metadata_payload payload{
+          local_checkpoint_root{begin, end, 0, {}}};
+        return encode_local_metadata(
+                 {record_header(local_metadata_kind::checkpoint_root, 69),
+                  alignment(4096),
+                  {}},
+                 payload,
+                 work,
+                 budget().operation_remaining,
+                 charge)
+          .get();
+    };
+    EXPECT_TRUE(root(cursor(4096), cursor(4096)));
+    EXPECT_TRUE(root(cursor(4096), cursor(8192)));
+    const auto backwards = root(cursor(8192), cursor(4096));
+    ASSERT_FALSE(backwards);
+    EXPECT_EQ(backwards.error().code(), errc::malformed_data);
 }
 
 TEST(

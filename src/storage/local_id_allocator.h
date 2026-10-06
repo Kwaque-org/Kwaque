@@ -121,15 +121,17 @@ private:
         };
         if (closing_ || closed_)
             return reject(detail::path_error(errc::closed));
-        if (busy_) return reject(detail::path_error(errc::queue_full));
         // Cached IDs remain reserved, but a fenced/closed control cannot admit
         // further work, including the allocation fast path.
         if (auto state = control_.snapshot(); !state)
             return reject(state.error());
         if (auto ready = work.poll(); !ready)
             return reject(detail::path_error(ready.error().code()));
+        // A range with IDs left serves them while another range refills:
+        // the refill edits its own high mark only. One refill at a time.
         if (range.remaining != 0)
             return seastar::make_ready_future<result_type>(serve(range));
+        if (busy_) return reject(detail::path_error(errc::queue_full));
         return refill(range, member, work, operations_.hold());
     }
     template<typename High>

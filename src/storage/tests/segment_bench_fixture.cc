@@ -170,6 +170,15 @@ bytes::fragmented_buffer join(
 }
 } // namespace
 
+seastar::future<encoded_assigned_batch> make_batch(
+  const shape& selected,
+  const segment_context& segment,
+  model::range_logical_end logical,
+  std::uint64_t sequence,
+  codec::cooperative_work& work) {
+    return make_child(selected, segment, logical, sequence, work);
+}
+
 codec::limits policy(const shape& selected) {
     auto limits = codec::limits::defaults().config();
     limits.max_page_bytes = byte_count{selected.page_bytes};

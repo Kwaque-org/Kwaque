@@ -19,6 +19,8 @@ class sparse_index_codec;
 inline constexpr byte_count sparse_index_root_fixed_bytes{168};
 inline constexpr byte_count sparse_index_page_fixed_bytes{172};
 inline constexpr byte_count sparse_index_entry_wire_bytes{16};
+// One root entry: a page's reference, then the anchor that page begins with.
+inline constexpr byte_count sparse_index_root_entry_wire_bytes{56};
 
 // Independently pinned target extent and layout. This checked representation
 // does not establish that data was supplied or persisted. There is no index
@@ -87,8 +89,8 @@ private:
 };
 
 // One exact-digest-pinned root; its named pages and target data are not
-// verified by parsing this envelope. Only its at-most-256 PageRefs remain
-// allocated.
+// verified by parsing this envelope. Only its at-most-256 PageRefs and their
+// first anchors remain allocated.
 class sparse_index_root final {
 public:
     sparse_index_root(sparse_index_root&&) noexcept = default;
@@ -109,6 +111,18 @@ public:
     [[nodiscard]] std::size_t page_capacity() const noexcept {
         return pages_.capacity();
     }
+    // The logical anchor each page begins with, in page order and strictly
+    // increasing. The page whose first anchor is the last one at or below a
+    // key is the only page that can hold that key's nearest preceding anchor.
+    [[nodiscard]] std::span<const model::range_logical_offset>
+    first_anchors() const& noexcept {
+        return first_anchors_;
+    }
+    std::span<const model::range_logical_offset>
+    first_anchors() const&& = delete;
+    [[nodiscard]] std::size_t first_anchor_capacity() const noexcept {
+        return first_anchors_.capacity();
+    }
     [[nodiscard]] byte_count encoded_bytes() const noexcept { return bytes_; }
 
 private:
@@ -118,16 +132,19 @@ private:
       codec::immutable_object_digest digest,
       std::uint32_t count,
       std::vector<page_ref>&& pages,
+      std::vector<model::range_logical_offset>&& first_anchors,
       byte_count bytes) noexcept
       : context_(context)
       , digest_(digest)
       , count_(count)
       , pages_(std::move(pages))
+      , first_anchors_(std::move(first_anchors))
       , bytes_(bytes) {}
     sparse_index_context context_;
     codec::immutable_object_digest digest_;
     std::uint32_t count_;
     std::vector<page_ref> pages_;
+    std::vector<model::range_logical_offset> first_anchors_;
     byte_count bytes_;
 };
 
@@ -191,7 +208,10 @@ struct encoded_sparse_index_page final {
 [[nodiscard]] codec::result<void> validate_sparse_index_extent(
   const sparse_index_root&, const verified_extent&, codec::field_context = {});
 
-// Borrow one ordered page or at most 256 root refs until joined completion.
+// Borrow one ordered page, or at most 256 root refs and as many first anchors,
+// until joined completion. A root takes one first anchor per ref: inside the
+// logical coverage and strictly increasing. That each equals its page's first
+// entry is checked by the page walk, not here.
 // parent_remaining excludes those inputs and other live/native/frame costs;
 // new output/staging is admitted here. work and abort stay alive and exclusive.
 // These are representation writers; they do not select stride or prove that
@@ -214,6 +234,7 @@ encode_sparse_index_root(
   sparse_index_context,
   std::uint32_t entry_count,
   std::span<const page_ref>,
+  std::span<const model::range_logical_offset> first_anchors,
   codec::cooperative_work&,
   byte_count parent_remaining,
   bytes::allocation_charge_fn,
@@ -266,7 +287,8 @@ private:
 // One active call and one returned page at a time; drop or separately reserve
 // that page before next(). No history is retained. Every entered failure closes
 // the walk. next() needs three free parser marks. Only finish() proves that all
-// pages were supplied; previously returned pages remain partial results.
+// pages were supplied; previously returned pages remain partial results. Each
+// page must begin with the first anchor its root names for it.
 class sparse_index_verifier final {
 public:
     sparse_index_verifier(

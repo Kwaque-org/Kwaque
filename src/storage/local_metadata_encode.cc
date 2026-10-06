@@ -91,7 +91,7 @@ public:
         store<80>(fixed_, value.ordinal.value());
         store<84>(fixed_, value.first_entry);
         store<88>(fixed_, static_cast<std::uint32_t>(value.entries.size()));
-        return finish<92, 164>(
+        return finish<92, 140>(
           std::span<const local_checkpoint_entry>{value.entries},
           detail::write_local_checkpoint_entry);
     }

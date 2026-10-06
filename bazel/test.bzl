@@ -28,7 +28,8 @@ def _test_env(extra):
     """Returns the sanitizer environment plus the selected reactor backend.
 
     Harnesses that start native processes read KWAQUE_REACTOR_BACKEND, so the
-    --//bazel:reactor_backend flag reaches them as it reaches C++ tests.
+    --//bazel:reactor_backend flag reaches them as it reaches C++ tests. They
+    bound a reactor's networking control blocks as _reactor_args does.
     """
     return select({
         "//bazel:reactor_backend_io_uring": _merged_env(dict(extra, KWAQUE_REACTOR_BACKEND = "io_uring")),
@@ -104,6 +105,16 @@ def _has_reactor_resource_arg(args):
                 return True
     return False
 
+# A linux-aio shard asks the kernel for 10,000 networking control blocks
+# unless told otherwise, beside 1,026 of its own, out of one allowance the
+# whole host shares (fs.aio-max-nr, 65,536 unless raised). Six such shards use
+# it up: the reactor that finds too few left takes every one that remains, and
+# the next process to start a reactor, on any backend, fails before its first
+# task. No test holds a thousand sockets on a shard, so each asks for a
+# thousand and a parallel run fits the allowance a host has by default.
+# Whatever starts a reactor for a test passes the same bound.
+_LINUX_AIO_NETWORKING_BOUND = "--max-networking-io-control-blocks=1000"
+
 def _reactor_args(cpu, memory, args, dash_dash):
     if type(cpu) != "int" or cpu <= 0:
         fail("cpu must be a positive integer")
@@ -115,7 +126,10 @@ def _reactor_args(cpu, memory, args, dash_dash):
             fail("select the reactor backend with --//bazel:reactor_backend")
     result = select({
         "//bazel:reactor_backend_io_uring": ["--reactor-backend=io_uring"],
-        "//bazel:reactor_backend_linux_aio": ["--reactor-backend=linux-aio"],
+        "//bazel:reactor_backend_linux_aio": [
+            "--reactor-backend=linux-aio",
+            _LINUX_AIO_NETWORKING_BOUND,
+        ],
         "//conditions:default": ["--reactor-backend=epoll"],
     }) + [
         "--memory={}".format(memory),
