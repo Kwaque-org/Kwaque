@@ -3,6 +3,12 @@
 #include "src/base/units.h"
 #include "src/storage/tests/wal_append_contract.h"
 
+#include <array>
+#include <cstdint>
+#include <initializer_list>
+#include <optional>
+#include <type_traits>
+
 namespace kwaque::storage::testing::wal_rotation_contract {
 using store_contract::require;
 using store_contract::take;
@@ -242,8 +248,13 @@ seastar::future<> pressure(
           for (auto& slot : held)
               slot.reset();
 
-          // Hold an unrelated current-state edit across successor preparation.
-          // It must not block accepted-work completion or be overwritten later.
+          // Hold an unrelated current-state edit across successor preparation,
+          // and two more waiting behind it, so every turn of the control is
+          // taken. They must not block accepted-work completion or be
+          // overwritten later.
+          std::
+            array<std::optional<seastar::future<local_publication_outcome>>, 2>
+              queued;
           seastar::promise<> entered, release;
           auto entered_future = entered.get_future();
           seastar::abort_source edit_abort;
@@ -267,6 +278,15 @@ seastar::future<> pressure(
           std::optional<local_wal_head> pending;
           try {
               co_await drive.lifecycle(std::move(entered_future));
+              for (auto& waiting : queued)
+                  waiting.emplace(control.update(
+                    [](local_shard_control&) -> runtime::result<void> {
+                        return {};
+                    },
+                    edit_work));
+              require(
+                control.waiting() == maximum_control_waiters,
+                "control edits did not wait their turn");
               rejected = co_await drive.lifecycle(
                 writer.rotate(cut, byte_count{8_KiB}, work));
               pending = writer.successor_head();
@@ -308,6 +328,16 @@ seastar::future<> pressure(
           release.set_value();
           auto updated = co_await drive.lifecycle(std::move(update));
           failed.observe(updated.failure.outcome());
+          for (auto& waiting : queued) {
+              if (!waiting) continue;
+              try {
+                  auto done = co_await drive.lifecycle(std::move(*waiting));
+                  failed.observe(done.failure.outcome());
+              } catch (...) {
+                  failed.observe(std::current_exception());
+              }
+              waiting.reset();
+          }
           take(failed.outcome());
           const auto marks = take(control.snapshot()).fields;
           if (abandon) {
@@ -340,6 +370,111 @@ seastar::future<> pressure(
               && writer.statistics().flush_calls == 1,
             "retry lost a current edit, reissued an ID, or reflushed a "
             "certified cut");
+      });
+}
+
+// The retained-file limit. A rotation that would add a file past it is
+// refused before anything is allocated or published, as often as it is
+// asked; the written group stays written; a removal reported to the writer
+// lets the same rotation through. The head is never counted as removed, and
+// a limit that could never rotate, or lies above the ceiling, is refused at
+// construction.
+template<typename Backend, typename Owner, typename Driver>
+seastar::future<> retention(
+  Backend& files,
+  Owner& ownership,
+  const local_device_spec& spec,
+  workload_budget& budget,
+  Driver drive) {
+    auto config = wal_writer_contract::configuration();
+    config.retained_files = 2;
+    co_await append::with_writer(
+      files,
+      ownership,
+      spec,
+      budget,
+      drive,
+      config,
+      [&](auto& writer, auto& control, auto& ids, auto& work)
+        -> seastar::future<> {
+          for (const std::uint32_t limit :
+               {std::uint32_t{1}, maximum_retained_wal_files + 1}) {
+              auto invalid = config;
+              invalid.retained_files = limit;
+              auto made = std::remove_reference_t<decltype(writer)>::make(
+                control,
+                ids,
+                budget,
+                invalid,
+                wal_start_intent::known_unactivated);
+              require(
+                !made && made.error().code() == errc::invalid_argument,
+                "a retained limit that cannot hold was accepted");
+          }
+          require(
+            writer.retention() == wal_retention{1, 2}
+              && !writer.retention().full(),
+            "a bootstrapped head is not the one file the shard holds");
+          auto first = co_await submit_one(
+            writer, budget, spec.owner.cluster(), work);
+          auto first_done = co_await drive.lifecycle(std::move(first.written));
+          take(first_done.failure.outcome());
+          take(
+            co_await drive.lifecycle(
+              writer.rotate(first.boundary, byte_count{8_KiB}, work)));
+          require(
+            writer.retention() == wal_retention{2, 2}
+              && writer.retention().full(),
+            "a rotation did not count its successor");
+          auto second = co_await submit_one(
+            writer, budget, spec.owner.cluster(), work);
+          auto second_done = co_await drive.lifecycle(
+            std::move(second.written));
+          take(second_done.failure.outcome());
+          const auto head = writer.prepared_head();
+          const auto before = take(control.snapshot());
+          for (int asked = 0; asked != 2; ++asked) {
+              auto refused = co_await drive.lifecycle(
+                writer.rotate(second.boundary, byte_count{8_KiB}, work));
+              require(
+                !refused && refused.error().code() == errc::resource_exhausted,
+                "a rotation past the retained limit was not refused");
+              require(
+                !writer.rotation_pending() && !writer.successor_head()
+                  && !writer.failure().failed()
+                  && writer.prepared_head() == head
+                  && take(control.snapshot()).generation == before.generation
+                  && writer.retention() == wal_retention{2, 2}
+                  && writer.statistics().rotations == 1,
+                "a refused rotation prepared a file, took an ID or latched");
+          }
+          require(
+            writer.progress()->write_complete == second.boundary.cursor(),
+            "the refusal disturbed the group already written");
+          // The writer names the two files it made the head, oldest first.
+          require(
+            writer.retained().files() == 2
+              && writer.retained().newest()
+                   == writer.progress()->reserved.incarnation()
+              && writer.retained().oldest() != writer.retained().newest(),
+            "the files the shard holds are not named as they became the "
+            "head");
+          // More removals than it holds besides the head never drop the head.
+          for (std::uint32_t i = 0; i != 5; ++i)
+              writer.release_oldest();
+          require(
+            writer.retention() == wal_retention{1, 2}
+              && writer.retained().oldest()
+                   == writer.progress()->reserved.incarnation(),
+            "a reported removal did not leave exactly the head");
+          take(
+            co_await drive.lifecycle(
+              writer.rotate(second.boundary, byte_count{8_KiB}, work)));
+          require(
+            writer.retention() == wal_retention{2, 2}
+              && writer.statistics().rotations == 2
+              && writer.prepared_head() != head,
+            "the rotation did not go through once a file was removed");
       });
 }
 } // namespace kwaque::storage::testing::wal_rotation_contract

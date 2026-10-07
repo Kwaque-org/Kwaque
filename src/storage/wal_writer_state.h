@@ -5,6 +5,7 @@
 #include "src/runtime/file.h"
 #include "src/runtime/first_failure.h"
 #include "src/storage/local_types.h"
+#include "src/storage/retained_wal.h"
 #include "src/storage/wal_group.h"
 #include "src/storage/workload_budget.h"
 

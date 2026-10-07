@@ -36,6 +36,9 @@ inline constexpr std::uint32_t maximum_local_append_requests = 256;
 
 struct local_append_config final {
     // Attached writable segments; each keeps at most one forming group.
+    // Every one of them holds handle credits for as long as it is open, so a
+    // shard checks this count against the budget that funds its segment
+    // writers with validate_segment_handles() before it starts.
     std::uint32_t maximum_segments{64};
     // Accepted requests whose outcome is not yet published.
     std::uint32_t maximum_requests{64};
@@ -140,6 +143,20 @@ struct completed_retry_ingest final {
     // The fact stored for this identity.
     completed_retry stored;
 };
+// The first field, in fact order, where an offered fact differs from the one
+// stored under its identity; exists when none does.
+[[nodiscard]] inline completed_retry_status completed_retry_difference(
+  const completed_retry& offered, const completed_retry& stored) noexcept {
+    if (offered.submitted_digest() != stored.submitted_digest())
+        return completed_retry_status::exists_with_different_submitted_digest;
+    if (offered.original_binding() != stored.original_binding())
+        return completed_retry_status::exists_with_different_original_binding;
+    if (offered.returned_span() != stored.returned_span())
+        return completed_retry_status::exists_with_different_returned_span;
+    if (offered.ack_generation() != stored.ack_generation())
+        return completed_retry_status::exists_with_different_ack_generation;
+    return completed_retry_status::exists;
+}
 
 // The completed-retry facts of one detached attachment, in canonical batch
 // identity order, with the storage its appends admitted for them, in chunks
@@ -220,11 +237,41 @@ struct local_obligation_snapshot final {
     // The WAL's durable end.
     local_wal_cursor wal_durable;
     // Every group that begins before this cursor is segment-durable. It is
-    // where the oldest open or pinned obligation begins, or the reserved WAL
-    // end when there is none.
+    // where the oldest open or pinned obligation begins, a group the WAL is
+    // still accepting included, or the reserved WAL end when there is none.
+    // It can lie past wal_durable: a group's segment barrier may settle first.
     local_wal_cursor discharged;
     // Obligations visited.
     std::uint32_t obligations{0};
+};
+
+// The newest durable group footer of one attachment: every group its segment
+// barrier covered ends at or before it. Plain facts; holding one keeps nothing
+// of the segment alive.
+struct local_durable_boundary final {
+    // The data device the segment was opened on.
+    device_store_id device;
+    segment_history_context history;
+    // What the footer covers, and where its own bytes lie.
+    storage::coverage covered;
+    model::file_byte_span footer;
+    bool operator==(const local_durable_boundary&) const noexcept = default;
+};
+// What a completed-retry snapshot of one attachment is cut from: the facts
+// recorded for it so far, in canonical batch identity order, and its newest
+// durable footer. The facts are borrowed until the next call into the owner.
+struct local_retry_state final {
+    const seastar::chunked_vector<completed_retry>* facts;
+    std::optional<local_durable_boundary> boundary;
+};
+// What a detached attachment leaves behind.
+struct local_detached final {
+    // Its completed-retry facts: the seal source.
+    local_retry_snapshot retry;
+    // Its newest durable footer, final for this attachment. A bound
+    // checkpoint owner already keeps it until the segment's own publication
+    // covers it.
+    std::optional<local_durable_boundary> boundary;
 };
 
 // The first storage failure of the WAL or of one segment owner.
@@ -242,6 +289,61 @@ struct local_storage_failure final {
 // throw. Stopping admission, isolating or stopping is the caller's policy.
 using local_failure_sink
   = seastar::noncopyable_function<void(const local_storage_failure&) noexcept>;
+
+// A rotation the retained-WAL limit refused, after a checkpoint had its
+// chance to remove a file. The requests then forming were rejected unwritten;
+// accepted work, which holds its WAL extent, completes. Storage never
+// resolves what holds the WAL itself: it drops no candidate, invalidates no
+// pin and expires nothing. So whoever can resolve it is told at every
+// refusal, for as long as the limit holds.
+struct local_retention_pressure final {
+    // WAL files the shard holds, and the most it may.
+    std::uint32_t retained{0}, limit{0};
+    // The oldest PREPARE that someone must still resolve and that keeps a
+    // closed WAL file: its segment, and where it begins. Absent when nothing
+    // unresolved lies below the head's file, so something else keeps the
+    // files: a held cutoff, or what `reclaim` says.
+    std::optional<segment_context> segment;
+    std::optional<local_wal_cursor> first;
+    // Why the checkpoint asked for removed nothing more, when it failed to:
+    // nobody reclaims this WAL (closed), the run failed, or a file below the
+    // cutoff could not be removed.
+    std::optional<runtime::operation_error> reclaim;
+};
+// Receives every such refusal, on the owner's shard, after the owner's state
+// is consistent, so it may call back into the owner. It must not throw.
+using local_retention_sink = seastar::noncopyable_function<void(
+  const local_retention_pressure&) noexcept>;
+
+// Whoever checkpoints the shard and removes the WAL below the cutoff, as
+// this owner needs it. All are called on the owner's shard and must not
+// throw.
+struct local_checkpointer final {
+    // A segment is detaching: its newest durable footer, which a checkpoint
+    // must pin until the segment's own publication covers it. A refusal
+    // leaves the segment attached.
+    seastar::noncopyable_function<runtime::result<void>(
+      const local_durable_boundary&) noexcept>
+      detaching;
+    // A discard decision is about to release its PREPARE or, with the
+    // flag, has. Refused unless the decision is held there and has released
+    // nothing yet: a checkpoint that passes the PREPARE must carry the
+    // decision that resolved it.
+    seastar::noncopyable_function<runtime::result<void>(
+      const local_recovery_decision&, bool) noexcept>
+      discharging;
+    // The budgets its runs draw on.
+    std::array<const workload_budget*, 2> reserve{};
+    // The oldest obligation moved to a later WAL file, so a closed file may
+    // go. Not awaited: a run it starts must not need the caller to return.
+    seastar::noncopyable_function<void() noexcept> reclaimable;
+    // A rotation met the retained limit: runs a checkpoint that starts after
+    // this call and resolves once it has removed what it could, each file
+    // reported through wal_released() as it goes.
+    seastar::noncopyable_function<
+      seastar::future<runtime::result<void>>() noexcept>
+      relieve;
+};
 
 // One attachment of a writable segment owner; stale after detach.
 class local_append_target final {
@@ -327,7 +429,8 @@ public:
       wal_group_commit& commit,
       wal_type& writer,
       local_append_config config,
-      local_failure_sink sink = {}) {
+      local_failure_sink sink = {},
+      local_retention_sink pressure = {}) {
         if (auto valid = config.validate(); !valid)
             return runtime::failure(valid.error());
         auto instance = budget.allocation_charge(
@@ -355,7 +458,13 @@ public:
             + (config.maximum_segments + 1U) * config.execution_bytes.value()});
         if (!held) return runtime::failure(held.error());
         return std::unique_ptr<local_append>{new local_append(
-          budget, commit, writer, config, std::move(*held), std::move(sink))};
+          budget,
+          commit,
+          writer,
+          config,
+          std::move(*held),
+          std::move(sink),
+          std::move(pressure))};
     }
     local_append(const local_append&) = delete;
     local_append& operator=(const local_append&) = delete;
@@ -388,10 +497,13 @@ public:
             if (!slots_[i].writer && !slots_[i].looping && !free) free = i;
         }
         if (!free) return runtime::failure(error(errc::queue_full));
+        if (reclaiming_ && reserved_from(segment.budget()))
+            return runtime::failure(error(errc::invalid_argument));
         const auto index = static_cast<std::uint32_t>(*free);
         auto& slot = slots_[index];
         slot.writer = &segment;
         slot.segment.emplace(boundary->context());
+        slot.device = segment.device();
         slot.stop = false;
         slot.looping = true;
         // A native allocation failure throws, with the slot left free.
@@ -425,9 +537,12 @@ public:
     // Only an idle attachment detaches: no forming request and no group in
     // flight or waiting for its barrier. Its barrier loop then returns. The
     // completed-retry facts recorded for it move to the returned snapshot,
-    // which a seal of the segment reads. Open obligations stay in the table.
-    // The segment owner itself is unchanged.
-    [[nodiscard]] runtime::result<local_retry_snapshot>
+    // which a seal of the segment reads, and its newest durable footer is
+    // returned with them. A bound checkpoint owner is handed that footer
+    // here, and a detach it cannot take is refused with the segment still
+    // attached. Open obligations stay in the table. The segment owner
+    // itself is unchanged.
+    [[nodiscard]] runtime::result<local_detached>
     detach(local_append_target target) {
         assert_current();
         auto slot = find(target);
@@ -437,18 +552,26 @@ public:
           owned.forming != 0 || owned.groups != 0 || owned.freezing
           || owned.head)
             return runtime::failure(error(errc::queue_full));
-        local_retry_snapshot snapshot{
-          std::move(owned.retry_memory),
-          std::move(owned.facts),
-          owned.retry_capacity};
+        // The checkpoint owner takes the final footer first: a checkpoint
+        // cut after this must still pin it.
+        if (checkpointer_ && owned.durable)
+            if (auto kept = checkpointer_->detaching(*owned.durable); !kept)
+                return runtime::failure(kept.error());
+        local_detached detached{
+          local_retry_snapshot{
+            std::move(owned.retry_memory),
+            std::move(owned.facts),
+            owned.retry_capacity},
+          owned.durable};
         owned.retry_memory.reset();
         owned.facts = {};
         owned.retry_capacity = 0;
         owned.writer = nullptr;
         owned.segment.reset();
+        owned.durable.reset();
         owned.prepared.reset();
         stop_loop(owned);
-        return snapshot;
+        return detached;
     }
 
     // Records a completed-retry fact supplied by the completed-request owner.
@@ -480,7 +603,8 @@ public:
               return stored.id().canonical_less(id);
           });
         if (at != owned.facts.end() && at->id() == fact.id())
-            return completed_retry_ingest{compare(fact, *at), *at};
+            return completed_retry_ingest{
+              completed_retry_difference(fact, *at), *at};
         if (owned.facts.size() >= owned.retry_capacity)
             return runtime::failure(error(errc::resource_exhausted));
         const auto position = at - owned.facts.begin();
@@ -491,6 +615,17 @@ public:
           owned.facts.end() - 1,
           owned.facts.end());
         return completed_retry_ingest{completed_retry_status::created, fact};
+    }
+
+    // The facts recorded for an attachment and its newest durable footer.
+    // Nothing is copied and nothing changes: recording stays the only way a
+    // fact enters, and a fact never leaves before the attachment detaches.
+    [[nodiscard]] runtime::result<local_retry_state>
+    completed_retries(local_append_target target) {
+        assert_current();
+        auto slot = find(target);
+        if (!slot) return runtime::failure(slot.error());
+        return local_retry_state{&(**slot).facts, (**slot).durable};
     }
 
     // The WAL-durable end and the discharged prefix; visit sees every open or
@@ -510,20 +645,25 @@ public:
                 *row.wal, *row.segment, row.pending, row.pinned});
             ++written;
         }
-        // The oldest open group, then the oldest pinned one, in WAL order.
-        std::optional<std::pair<std::uint64_t, local_wal_cursor>> oldest;
+        // The oldest of the first open group, a group whose WAL answer is not
+        // installed yet, and every pinned row. Cursor order is WAL order.
+        std::optional<local_wal_cursor> oldest;
         for (const auto* group : accepted_)
             if (group->open != 0) {
-                oldest.emplace(group->sequence, *group->wal_begin);
+                oldest.emplace(*group->wal_begin);
                 break;
             }
-        for (const auto& row : rows_)
-            if (
-              row.pinned != 0 && row.pinned_begin
-              && (!oldest || row.first_pinned < oldest->first))
-                oldest.emplace(row.first_pinned, *row.pinned_begin);
+        if (submitting_) {
+            auto kept = keep_older(oldest, *submitting_, wal->owner);
+            if (!kept) return runtime::failure(kept.error());
+        }
+        for (const auto& row : rows_) {
+            if (row.pinned == 0 || !row.pinned_begin) continue;
+            auto kept = keep_older(oldest, *row.pinned_begin, wal->owner);
+            if (!kept) return runtime::failure(kept.error());
+        }
         return local_obligation_snapshot{
-          wal->durable, oldest ? oldest->second : wal->reserved, written};
+          wal->durable, oldest ? *oldest : wal->reserved, written};
     }
     // Before any request: installs the obligations recovery rebuilt after a
     // restart. Each pins its WAL file exactly as a failed group's does, older
@@ -592,9 +732,107 @@ public:
         sequences_ = restored.size();
         return {};
     }
-    // Whether a WAL file may be deleted: it is no longer the file being
-    // written, which a rotation flushes before leaving, and no open or pinned
-    // obligation names it.
+    // Releases pinned PREPAREs of one segment that a durable discard decision
+    // resolves. The caller holds the decision's durable record and supplies
+    // the segment's unresolved PREPAREs once it applies, from the pass that
+    // validated it: `remaining` of them, the oldest beginning at `first`.
+    // They replace the segment's pinned rows with one. The decision must
+    // discard a PREPARE at or after the segment's oldest pinned one, and it
+    // releases exactly that PREPARE: a decision names one, so every other
+    // pinned PREPARE of the segment is still unresolved. A discharge that
+    // would release none or more than one, a repeated one, or one for a
+    // segment with nothing pinned, is rejected with no effect. So is one
+    // that would move the segment's oldest pinned PREPARE while discarding a
+    // later one, one for a segment with a group pinned in this process
+    // (such a group counts once whatever PREPAREs it holds, so a decision
+    // cannot account for it: the segment's publication or a restart resolves
+    // it), and, with a checkpoint owner bound, one whose decision that owner
+    // does not hold or has already seen released.
+    [[nodiscard]] runtime::result<void> discharge_pinned(
+      const local_recovery_decision& decision,
+      std::uint32_t remaining,
+      std::optional<local_wal_cursor> first) {
+        assert_current();
+        if (closing_ || closed_) return runtime::failure(error(errc::closed));
+        const auto wal = writer_.positions();
+        if (!wal) return runtime::failure(wal.error());
+        if (
+          decision.action != local_recovery_action::discard
+          || (remaining == 0) != !first)
+            return runtime::failure(error(errc::invalid_argument));
+        const auto held = pinned_of(decision.segment, wal->owner);
+        if (!held) return runtime::failure(held.error());
+        if (held->count == 0 || !held->oldest)
+            return runtime::failure(error(errc::not_found));
+        const auto wrong = [] {
+            return runtime::failure(error(errc::wrong_context));
+        };
+        const auto discarded = decision.prepare.compare(
+          wal->owner, *held->oldest, wal->owner);
+        if (
+          !discarded || *discarded == std::strong_ordering::less
+          || remaining + 1 != held->count || held->live != 0)
+            return wrong();
+        if (first) {
+            const auto kept = first->compare(
+              wal->owner, *held->oldest, wal->owner);
+            if (
+              !kept || *kept == std::strong_ordering::less
+              || *first == decision.prepare)
+                return wrong();
+        }
+        // A later PREPARE leaves the oldest unresolved, where it was.
+        if (
+          *discarded == std::strong_ordering::greater
+          && (!first || *first != *held->oldest))
+            return wrong();
+        if (checkpointer_)
+            if (
+              auto known = checkpointer_->discharging(decision, false); !known)
+                return known;
+        auto released = replace_pinned(decision.segment, remaining, first);
+        if (!released) return released;
+        if (checkpointer_)
+            static_cast<void>(checkpointer_->discharging(decision, true));
+        offer_reclaim();
+        return released;
+    }
+    // Releases every pinned PREPARE of one segment: its durable sealed or
+    // deleting publication resolves all of them. The caller holds that
+    // publication. A segment still attached or with a group in flight has no
+    // such publication, and one with nothing pinned has nothing to release;
+    // both are rejected with no effect.
+    [[nodiscard]] runtime::result<void>
+    discharge_pinned(const local_object_publication& publication) {
+        assert_current();
+        if (closing_ || closed_) return runtime::failure(error(errc::closed));
+        const auto wal = writer_.positions();
+        if (!wal) return runtime::failure(wal.error());
+        if (
+          publication.state != local_object_state::sealed
+          && publication.state != local_object_state::deleting)
+            return runtime::failure(error(errc::invalid_argument));
+        const auto& segment = publication.segment;
+        for (const auto& slot : slots_)
+            if (slot.writer && *slot.segment == segment)
+                return runtime::failure(error(errc::wrong_context));
+        for (const auto& row : rows_)
+            if (
+              row.segment && *row.segment == segment
+              && (row.reserved != 0 || row.pending != 0))
+                return runtime::failure(error(errc::wrong_context));
+        const auto held = pinned_of(segment, wal->owner);
+        if (!held) return runtime::failure(held.error());
+        if (held->count == 0) return runtime::failure(error(errc::not_found));
+        auto released = replace_pinned(segment, 0, std::nullopt);
+        if (released) offer_reclaim();
+        return released;
+    }
+    // Whether a WAL file is no longer being written, which a rotation flushes
+    // before leaving, and no obligation row names it. A diagnostic, not a
+    // deletion rule: WAL files are deleted only as a prefix below a durable
+    // checkpoint cutoff, and a segment's pinned PREPAREs in later files can be
+    // counted on the row of its oldest one.
     [[nodiscard]] bool reclaimable(model::wal_incarnation_id file) const {
         assert_current();
         const auto wal = writer_.progress();
@@ -603,6 +841,14 @@ public:
           rows_.begin(), rows_.end(), [&file](const auto& row) {
               return row.wal && *row.wal == file;
           });
+    }
+    // Each attachment's newest durable footer, for those that have one: what
+    // a checkpoint pins for the segment. visit must not call into this owner.
+    template<std::invocable<const local_durable_boundary&> Visit>
+    void durable_boundaries(Visit&& visit) const {
+        assert_current();
+        for (const auto& slot : slots_)
+            if (slot.writer && slot.durable) visit(*slot.durable);
     }
 
     // The first storage failure of the WAL or of an attached segment, also
@@ -614,6 +860,92 @@ public:
     }
     const std::optional<local_storage_failure>&
     storage_failure() const&& = delete;
+
+    // The WAL files the shard holds, and the most it may.
+    [[nodiscard]] wal_retention retention() const noexcept {
+        assert_current();
+        return writer_.retention();
+    }
+    // Whether the WAL was taken over from a recovered head: the shard
+    // restarted, and what recovery published covers the WAL it read.
+    [[nodiscard]] bool wal_recovered() const noexcept {
+        assert_current();
+        return writer_.recovered();
+    }
+    // The newest rotation the retained limit refused, also reported through
+    // the sink at every refusal. It stands while the limit holds.
+    [[nodiscard]] const std::optional<local_retention_pressure>&
+    retention_pressure() const& noexcept {
+        assert_current();
+        return pressure_;
+    }
+    const std::optional<local_retention_pressure>&
+    retention_pressure() const&& = delete;
+    // Binds the shard's checkpoint owner, one at a time. From then on a
+    // detaching segment's last footer and a discharging decision go through
+    // it, so no checkpoint passes a PREPARE without what covers it. It
+    // unbinds before it closes, and outlives the wait of a rotation it is
+    // relieving.
+    [[nodiscard]] runtime::result<void> can_bind_checkpointer() const noexcept {
+        assert_current();
+        if (closing_ || closed_) return runtime::failure(error(errc::closed));
+        if (checkpointer_) return runtime::failure(error(errc::already_exists));
+        return {};
+    }
+    [[nodiscard]] runtime::result<void>
+    bind_checkpointer(local_checkpointer checkpointer) {
+        if (auto free = can_bind_checkpointer(); !free) return free;
+        if (
+          !checkpointer.detaching || !checkpointer.discharging
+          || !checkpointer.reclaimable || !checkpointer.relieve
+          || !checkpointer.reserve[0] || !checkpointer.reserve[1])
+            return runtime::failure(error(errc::invalid_argument));
+        checkpointer_.emplace(std::move(checkpointer));
+        reclaiming_ = false;
+        return {};
+    }
+    void unbind_checkpointer() noexcept {
+        assert_current();
+        checkpointer_.reset();
+        reclaiming_ = false;
+    }
+    // Lets the bound checkpoint owner reclaim on its own: it is told when a
+    // closed WAL file may go, and a rotation that meets the retained limit
+    // waits for the one checkpoint it asks of it before it is refused.
+    // Checkpoints then start unasked. Refused when anything the append path
+    // draws on shares admission with a budget those runs draw on: the one
+    // thing that frees the WAL would then wait on the appends it relieves.
+    // A segment attached later is held to the same.
+    [[nodiscard]] runtime::result<void> start_reclaiming() {
+        assert_current();
+        if (closing_ || closed_) return runtime::failure(error(errc::closed));
+        if (!checkpointer_) return runtime::failure(error(errc::wrong_context));
+        if (reclaiming_) return runtime::failure(error(errc::already_exists));
+        if (
+          reserved_from(budget_) || reserved_from(writer_.budget())
+          || reserved_from(commit_.budget()))
+            return runtime::failure(error(errc::invalid_argument));
+        for (const auto& slot : slots_)
+            if (slot.writer && reserved_from(slot.writer->budget()))
+                return runtime::failure(error(errc::invalid_argument));
+        reclaiming_ = true;
+        reclaim_floor_.reset();
+        return {};
+    }
+    // Their names, oldest first, as the WAL writer made each the head.
+    [[nodiscard]] const storage::retained_wal& retained_wal() const& noexcept {
+        assert_current();
+        return writer_.retained();
+    }
+    const storage::retained_wal& retained_wal() const&& = delete;
+    // The reclaimer removed the oldest of those files. Nothing forms here: a
+    // rotation waiting for the reclaimer goes on when its run resolves, and
+    // a refused one left no request forming.
+    void wal_released() noexcept {
+        assert_current();
+        writer_.release_oldest();
+        if (!writer_.retention().full()) pressure_.reset();
+    }
 
     // Binds the environment's early stop notification. When it fires,
     // admission closes and forming requests form now; accepted work is not
@@ -780,9 +1112,12 @@ private:
     using branch_ptr = seastar::lw_shared_ptr<branch>;
     struct segment_slot final {
         segment_type* writer{nullptr};
-        // The attached segment's context, fixed at attach.
+        // The attached segment's context and data device, fixed at attach.
         std::optional<segment_context> segment;
+        device_store_id device;
         std::uint64_t attachment{0};
+        // The footer of the newest group a barrier of this attachment covered.
+        std::optional<local_durable_boundary> durable;
         // Completed-retry facts in canonical batch order, at most one per
         // retry entry the attachment's appends reserved, and the storage
         // those appends admitted for them.
@@ -839,7 +1174,11 @@ private:
         std::optional<model::wal_incarnation_id> wal;
         std::optional<segment_context> segment;
         std::uint32_t reserved{0}, pending{0}, pinned{0};
-        // The oldest pinned group: its WAL order and where it begins.
+        // How many of the pinned are groups pinned in this process, each
+        // counted once whatever PREPAREs of the segment it holds.
+        std::uint32_t live{0};
+        // The oldest pinned group: its order among this owner's groups and
+        // where it begins. A restored or replaced pin precedes every group.
         std::uint64_t first_pinned{0};
         std::optional<local_wal_cursor> pinned_begin;
     };
@@ -853,7 +1192,8 @@ private:
       wal_type& writer,
       local_append_config config,
       workload_reservation held,
-      local_failure_sink sink)
+      local_failure_sink sink,
+      local_retention_sink pressure)
       : budget_(budget)
       , commit_(commit)
       , writer_(writer)
@@ -864,6 +1204,7 @@ private:
       , execution_(config.policy, abort_)
       , preparation_(config.policy, abort_)
       , sink_(std::move(sink))
+      , pressure_sink_(std::move(pressure))
       , tasks_([this](std::exception_ptr failure) noexcept {
           first_.observe(std::move(failure));
       }) {
@@ -891,23 +1232,6 @@ private:
           || slots_[target.slot_].attachment != target.attachment_)
             return runtime::failure(error(errc::wrong_context));
         return &slots_[target.slot_];
-    }
-
-    // The first field, in fact order, where two facts with one identity
-    // differ; exists when none does.
-    static completed_retry_status
-    compare(const completed_retry& offered, const completed_retry& stored) {
-        if (offered.submitted_digest() != stored.submitted_digest())
-            return completed_retry_status::
-              exists_with_different_submitted_digest;
-        if (offered.original_binding() != stored.original_binding())
-            return completed_retry_status::
-              exists_with_different_original_binding;
-        if (offered.returned_span() != stored.returned_span())
-            return completed_retry_status::exists_with_different_returned_span;
-        if (offered.ack_generation() != stored.ack_generation())
-            return completed_retry_status::exists_with_different_ack_generation;
-        return completed_retry_status::exists;
     }
 
     void request_stop() noexcept {
@@ -941,6 +1265,12 @@ private:
         if (!failed.failed()) return;
         detail::merge_failure(first_, failed);
         observe_storage(local_storage_path::wal, std::nullopt, failed);
+    }
+    bool
+    rotation_pressure(const runtime::operation_error& refused) const noexcept {
+        return (refused.code() == errc::queue_full
+                || refused.code() == errc::resource_exhausted)
+               && !commit_.failure().failed() && !writer_.failure().failed();
     }
     void observe_segment(const segment_slot& slot) noexcept {
         if (slot.writer && slot.writer->failure().failed())
@@ -980,6 +1310,89 @@ private:
             row.segment.reset();
             row.pinned_begin.reset();
         }
+    }
+    // Keeps the older of two WAL positions under their checked order.
+    static runtime::result<void> keep_older(
+      std::optional<local_wal_cursor>& oldest,
+      const local_wal_cursor& begin,
+      const local_store_context& owner) {
+        if (oldest) {
+            const auto order = begin.compare(owner, *oldest, owner);
+            if (!order) return runtime::failure(error(errc::wrong_context));
+            if (*order != std::strong_ordering::less) return {};
+        }
+        oldest.emplace(begin);
+        return {};
+    }
+    // One segment's pinned PREPAREs across its rows, and where the oldest
+    // begins.
+    struct pinned_total final {
+        std::uint64_t count{0}, live{0};
+        std::optional<local_wal_cursor> oldest;
+    };
+    runtime::result<pinned_total> pinned_of(
+      const segment_context& segment, const local_store_context& owner) const {
+        pinned_total output;
+        for (const auto& row : rows_) {
+            if (!row.segment || *row.segment != segment || row.pinned == 0)
+                continue;
+            output.count += row.pinned;
+            output.live += row.live;
+            if (!row.pinned_begin) continue;
+            if (
+              auto kept = keep_older(output.oldest, *row.pinned_begin, owner);
+              !kept)
+                return runtime::failure(kept.error());
+        }
+        return output;
+    }
+    // Replaces a segment's pinned rows by one holding `remaining` PREPAREs,
+    // the oldest beginning at `first`, or by none. What remains is older than
+    // every group, so no later pin moves its beginning. The row is the
+    // segment's in that WAL file, else one this releases, else a free one;
+    // without any, nothing changes.
+    runtime::result<void> replace_pinned(
+      const segment_context& segment,
+      std::uint32_t remaining,
+      const std::optional<local_wal_cursor>& first) {
+        std::optional<std::size_t> home;
+        if (first) {
+            std::optional<std::size_t> released, free;
+            for (std::size_t i = 0; i != rows_.size() && !home; ++i) {
+                const auto& row = rows_[i];
+                if (!row.segment) {
+                    if (!free) free = i;
+                } else if (*row.segment != segment) {
+                    continue;
+                } else if (*row.wal == first->incarnation()) {
+                    home = i;
+                } else if (
+                  !released && row.pinned != 0 && row.reserved == 0
+                  && row.pending == 0) {
+                    released = i;
+                }
+            }
+            if (!home) home = released ? released : free;
+            if (!home) return runtime::failure(error(errc::resource_exhausted));
+        }
+        for (auto& row : rows_) {
+            if (!row.segment || *row.segment != segment || row.pinned == 0)
+                continue;
+            row.pinned = 0;
+            row.live = 0;
+            row.first_pinned = 0;
+            row.pinned_begin.reset();
+            free_row_if_unused(row);
+        }
+        if (first) {
+            auto& row = rows_[*home];
+            row.wal.emplace(first->incarnation());
+            row.segment.emplace(segment);
+            row.pinned = remaining;
+            row.first_pinned = 0;
+            row.pinned_begin.emplace(*first);
+        }
+        return {};
     }
     // The forming group did not open its obligation.
     void unreserve(branch& part) noexcept {
@@ -1421,11 +1834,159 @@ private:
           forming_, [index](const auto& item) { return item->slot == index; });
     }
 
+    // Whether `budget` shares admission with one the checkpoint owner's runs
+    // draw on.
+    [[nodiscard]] bool
+    reserved_from(const workload_budget& budget) const noexcept {
+        return std::ranges::any_of(
+          checkpointer_->reserve, [&budget](const workload_budget* reserve) {
+              return budget.shares_admission_with(*reserve);
+          });
+    }
+    // Tells whoever reclaims the WAL that a closed file may go: the oldest
+    // obligation lies in a later file than when it was last told, or nothing
+    // is open below the head. It is asked only while the shard holds a file
+    // besides the head, and once per file the obligation moves to.
+    void offer_reclaim() noexcept {
+        if (!reclaiming_ || writer_.retention().files < 2) return;
+        const auto held = obligations([](const local_obligation&) {});
+        if (!held) return;
+        const auto floor = held->discharged.incarnation();
+        if (reclaim_floor_ && *reclaim_floor_ == floor) return;
+        reclaim_floor_.emplace(floor);
+        checkpointer_->reclaimable();
+    }
+    // Has whoever reclaims the WAL run one checkpoint, and waits for it. The
+    // error is why that run removed nothing more; with nobody to reclaim,
+    // nothing can remove a file and there is nothing to wait for.
+    seastar::future<std::optional<runtime::operation_error>>
+    relieve_retention() {
+        using output = std::optional<runtime::operation_error>;
+        if (!reclaiming_) co_return output{error(errc::closed)};
+        try {
+            const auto relieved = co_await checkpointer_->relieve();
+            if (!relieved) co_return output{relieved.error()};
+        } catch (...) {
+            co_return output{error(errc::io_failure)};
+        }
+        co_return output{};
+    }
+    // What keeps the shard's closed WAL files from going, as far as this
+    // owner knows: the oldest pinned PREPARE below the head's file, which
+    // someone must resolve; or, with none, whether a group still in flight
+    // has its PREPAREs there, which settles by itself.
+    struct closed_file_holder final {
+        std::optional<segment_context> segment;
+        std::optional<local_wal_cursor> first;
+        bool settling{false};
+    };
+    [[nodiscard]] closed_file_holder closed_files_held() const {
+        closed_file_holder held;
+        const auto wal = writer_.progress();
+        if (!wal) return held;
+        const auto head = wal->reserved.incarnation();
+        for (const auto& row : rows_) {
+            if (
+              row.pinned == 0 || !row.pinned_begin
+              || row.pinned_begin->incarnation() == head)
+                continue;
+            const auto before = held.first;
+            if (!keep_older(held.first, *row.pinned_begin, wal->owner))
+                continue;
+            if (held.first != before) held.segment = row.segment;
+        }
+        if (held.first) return held;
+        for (const auto* group : accepted_) {
+            if (group->open == 0) continue;
+            held.settling = group->wal_begin
+                            && !(group->wal_begin->incarnation() == head);
+            break;
+        }
+        return held;
+    }
+    // The rotation stays refused: the forming requests are rejected
+    // unwritten with the retained count and limit, and whoever can resolve
+    // what holds the WAL is told which segment that is and where its oldest
+    // unresolved PREPARE begins. Nothing is latched; the next request tries
+    // again.
+    void refuse_retention(
+      const closed_file_holder& holder,
+      std::optional<runtime::operation_error> reclaim) {
+        const auto held = writer_.retention();
+        auto refused = error(errc::resource_exhausted);
+        static_cast<void>(refused.add_context(
+          runtime::operation_context_key::limit, held.most()));
+        static_cast<void>(refused.add_context(
+          runtime::operation_context_key::actual, held.files));
+        pressure_.emplace(
+          local_retention_pressure{
+            held.files,
+            held.most(),
+            holder.segment,
+            holder.first,
+            std::move(reclaim)});
+        fail_forming(reason(refused));
+        if (pressure_sink_) pressure_sink_(*pressure_);
+    }
+
     // One group: segments in the order of their oldest forming member, and
     // as many whole forming sets as the current WAL file and group bounds
     // admit. A set never splits: its one preparation reserves one footer.
+    // Moves the WAL to its next file. retry: it moved. blocked: the rotation
+    // was refused while both WAL owners stayed healthy, as when the
+    // control's turns are taken, or the retained limit holds only until a
+    // group in flight settles; that is pressure, and the attempt is made
+    // again. idle: it failed, and so has this owner; or the retained limit
+    // held it, the forming requests were rejected and nothing failed.
+    seastar::future<formation> rotate(byte_count required) {
+        // A new file at the retained limit. Only a checkpoint can remove
+        // one, so whoever reclaims the WAL runs one first; the rotation is
+        // refused only when the limit still holds after it. A rotation the
+        // WAL writer keeps pending owns its successor already.
+        if (!writer_.rotation_pending() && writer_.retention().full()) {
+            auto reclaim = co_await relieve_retention();
+            if (forming_.empty()) co_return formation::idle;
+            if (writer_.retention().full()) {
+                const auto holder = closed_files_held();
+                // Only a group still in flight keeps the oldest closed file.
+                // Its barrier settles without anyone's decision, so the
+                // forming requests wait for it as they wait for any
+                // pressure a completion clears.
+                if (holder.settling && groups_ != 0)
+                    co_return formation::blocked;
+                refuse_retention(holder, std::move(reclaim));
+                co_return formation::idle;
+            }
+        }
+        auto rotated = co_await commit_.rotate(writer_, required, execution_);
+        if (rotated) {
+            rotation_bytes_.reset();
+            pressure_.reset();
+            offer_reclaim();
+            co_return formation::retry;
+        }
+        if (rotation_pressure(rotated.error())) {
+            rotation_bytes_ = required;
+            co_return formation::blocked;
+        }
+        first_.observe(rotated.error());
+        fail_forming(reason(rotated.error()));
+        observe_wal();
+        co_return formation::idle;
+    }
+
     seastar::future<formation> form_once() {
         if (forming_.empty()) co_return formation::idle;
+        // A rotation the WAL writer keeps pending is finished first, with
+        // the size it was first asked with: the file it is leaving takes
+        // nothing more, whatever would still fit there.
+        if (!writer_.rotation_pending()) {
+            rotation_bytes_.reset();
+        } else if (rotation_bytes_) {
+            const auto resumed = co_await rotate(*rotation_bytes_);
+            if (resumed != formation::retry) co_return resumed;
+            if (forming_.empty()) co_return formation::idle;
+        }
         std::array<wal_admission_member, maximum_wal_group_members> members{};
         std::vector<std::uint32_t> chosen;
         std::size_t count = 0;
@@ -1472,17 +2033,8 @@ private:
                 continue;
             }
             if (!chosen.empty()) break;
-            if (measured->decision == wal_admission_decision::rotate_required) {
-                auto rotated = co_await commit_.rotate(
-                  writer_, measured->encoded_bytes, execution_);
-                if (!rotated) {
-                    first_.observe(rotated.error());
-                    fail_forming(reason(rotated.error()));
-                    observe_wal();
-                    co_return formation::idle;
-                }
-                co_return formation::retry;
-            }
+            if (measured->decision == wal_admission_decision::rotate_required)
+                co_return co_await rotate(measured->encoded_bytes);
             fail_segment(index, reason(error(errc::resource_exhausted)));
             co_return formation::retry;
         }
@@ -1723,6 +2275,9 @@ private:
                 refused.observe(wal.error());
             else if (!refused.failed() && offer.size() != 0) {
                 group.wal_begin.emplace(wal->reserved);
+                // The WAL may hold these PREPAREs before its answer is
+                // installed below; until then the snapshot counts them open.
+                submitting_.emplace(wal->reserved);
                 try {
                     auto accepted = co_await commit_.template submit<Clock>(
                       writer_,
@@ -1790,6 +2345,7 @@ private:
                 }
             }
         }
+        submitting_.reset();
         for (auto& part : group.branches)
             if (!part->queued) publish_branch(group, *part);
         // Reported once every decision above is installed.
@@ -1820,6 +2376,7 @@ private:
       std::uint64_t sequence,
       const std::optional<local_wal_cursor>& begin) noexcept {
         ++row.pinned;
+        ++row.live;
         if (begin && (!row.pinned_begin || sequence < row.first_pinned)) {
             row.first_pinned = sequence;
             row.pinned_begin.emplace(*begin);
@@ -2031,6 +2588,7 @@ private:
             }
             settle_front(slot, last, outcome);
             if (outcome && outcome->failure.failed()) observe_segment(slot);
+            offer_reclaim();
         }
         slot.looping = false;
     }
@@ -2041,6 +2599,13 @@ private:
       segment_slot& slot,
       const branch* last,
       const std::optional<segment_barrier_outcome>& outcome) noexcept {
+        if (outcome && !outcome->failure.failed() && outcome->receipt) {
+            const auto& cut = outcome->receipt->boundary();
+            if (cut.footer())
+                slot.durable.emplace(
+                  local_durable_boundary{
+                    slot.device, cut.history(), cut.covered(), *cut.footer()});
+        }
         while (slot.head && slot.head->ready) {
             auto* part = std::exchange(slot.head, slot.head->next);
             part->next = nullptr;
@@ -2138,6 +2703,12 @@ private:
     std::vector<obligation_row> rows_;
     // Groups the WAL accepted and that are not yet released, in WAL order.
     std::vector<group_state*> accepted_;
+    // Where the group being submitted to the WAL begins, until its answer is
+    // installed. Submissions are serialized, so there is at most one.
+    std::optional<local_wal_cursor> submitting_;
+    // The size a rotation refused for pressure was asked with, while the WAL
+    // writer keeps that rotation pending.
+    std::optional<byte_count> rotation_bytes_;
     std::uint64_t sequences_{0};
     // Accepted requests not yet in a group, in acceptance order.
     std::vector<detail::local_append_item_ptr> forming_;
@@ -2151,6 +2722,15 @@ private:
     codec::cooperative_work execution_, preparation_;
     local_failure_sink sink_;
     std::optional<local_storage_failure> storage_failure_;
+    local_retention_sink pressure_sink_;
+    // The newest rotation the retained limit refused, while the limit holds.
+    std::optional<local_retention_pressure> pressure_;
+    // The shard's checkpoint owner, while bound; whether it reclaims the WAL
+    // on its own; and the WAL file the oldest obligation lay in when it was
+    // last told a closed file may go.
+    std::optional<local_checkpointer> checkpointer_;
+    bool reclaiming_{false};
+    std::optional<model::wal_incarnation_id> reclaim_floor_;
     seastar::optimized_optional<seastar::abort_source::subscription>
       shutdown_subscription_;
     runtime::first_failure first_, close_outcome_;

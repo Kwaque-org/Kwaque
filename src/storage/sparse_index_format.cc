@@ -13,9 +13,15 @@ public:
       codec::immutable_object_digest digest,
       std::uint32_t count,
       std::vector<page_ref>&& pages,
+      std::vector<model::range_logical_offset>&& first_anchors,
       byte_count bytes) noexcept {
         return sparse_index_root{
-          context, digest, count, std::move(pages), bytes};
+          context,
+          digest,
+          count,
+          std::move(pages),
+          std::move(first_anchors),
+          bytes};
     }
     static sparse_index_page
     page(page_ref ref, std::vector<sparse_index_entry>&& entries) noexcept {
@@ -29,6 +35,9 @@ using detail::page_error;
 using detail::store;
 constexpr auto index_family = codec::format_family::sparse_index;
 constexpr auto empty_digest = codec::xxh3_128_empty;
+constexpr std::size_t root_entry_bytes = 56;
+static_assert(root_entry_bytes == sparse_index_root_entry_wire_bytes.value());
+static_assert(root_entry_bytes == page_ref_wire_bytes.value() + 8);
 
 template<typename Span>
 bool contains_span(Span outer, Span inner) noexcept {
@@ -101,6 +110,15 @@ void write_scope(
     detail::write_coverage<76>(fixed, context.coverage());
     detail::write_digest<124>(fixed, context.digest());
 }
+// A page's first anchor in its root: an anchor of the covered extent, after
+// the one before it.
+bool valid_first_anchor(
+  const sparse_index_context& context,
+  model::range_logical_offset anchor,
+  std::span<const model::range_logical_offset> previous) noexcept {
+    return context.coverage().logical().contains(anchor)
+           && (previous.empty() || previous.back() < anchor);
+}
 void write_entry(
   std::array<char, 16>& out, const sparse_index_entry& entry) noexcept {
     store<0>(out, entry.logical_anchor().value());
@@ -113,6 +131,7 @@ struct root_reader final {
     std::uint64_t start;
     codec::decode_budget original;
     std::vector<page_ref> pages;
+    std::vector<model::range_logical_offset> firsts;
 
     seastar::future<codec::result<decoded_sparse_index_root>> operator()(
       bytes::fragmented_buffer_parser& input,
@@ -147,7 +166,8 @@ struct root_reader final {
           aligned_envelope_layout::make(
             {byte_count{c.origin - start},
              sparse_index_root_fixed_bytes,
-             byte_count{static_cast<std::uint64_t>(count->value()) * 48U}},
+             byte_count{
+               static_cast<std::uint64_t>(count->value()) * root_entry_bytes}},
             expected.alignment(),
             work.policy(),
             {work.policy().config().max_page_bytes,
@@ -159,19 +179,23 @@ struct root_reader final {
           input.total_bytes() != layout->body_bytes()
           || load<164, std::uint32_t>(fixed) != layout->padding_bytes().value())
             co_return codec::failure(page_error(errc::malformed_data, c, 164));
-        const auto remaining = detail::reserve_entries(
+        const auto refs_admitted = detail::reserve_entries(
           pages, count->value(), memory, work.policy(), c);
+        if (!refs_admitted) co_return codec::failure(refs_admitted.error());
+        const auto remaining = detail::reserve_entries(
+          firsts, count->value(), *refs_admitted, work.policy(), c);
         if (!remaining) co_return codec::failure(remaining.error());
         const byte_count retained_metadata{
           memory.metadata_remaining.value()
           - remaining->metadata_remaining.value()};
         std::uint32_t first = 0;
         for (std::uint32_t ordinal = 0; ordinal < count->value(); ++ordinal) {
+            std::array<char, root_entry_bytes> entry{};
             std::array<char, 48> raw{};
             auto entry_context = c;
             entry_context.origin += input.bytes_consumed().value();
             if (
-              auto read = co_await detail::read_fixed(input, raw, work, c);
+              auto read = co_await detail::read_fixed(input, entry, work, c);
               !read)
                 co_return codec::failure(read.error());
             if (
@@ -181,6 +205,7 @@ struct root_reader final {
                 co_return codec::failure(ready.error());
             if (auto ready = work.poll(anchor); !ready)
                 co_return codec::failure(ready.error());
+            std::copy_n(entry.begin(), raw.size(), raw.begin());
             const auto ref = detail::read_page_ref(raw, entry_context);
             if (!ref) co_return codec::failure(ref.error());
             if (
@@ -201,7 +226,16 @@ struct root_reader final {
             if (first > total)
                 co_return codec::failure(
                   page_error(errc::malformed_data, entry_context));
+            const auto begins = detail::page_wire(
+              model::range_logical_offset::make(load<48, std::uint64_t>(entry)),
+              entry_context,
+              48);
+            if (!begins) co_return codec::failure(begins.error());
+            if (!valid_first_anchor(expected, *begins, firsts))
+                co_return codec::failure(
+                  page_error(errc::malformed_data, entry_context, 48));
             pages.push_back(*ref);
+            firsts.push_back(*begins);
         }
         if (first != total)
             co_return codec::failure(page_error(errc::malformed_data, c, 156));
@@ -220,7 +254,12 @@ struct root_reader final {
           "admitted root metadata exceeded its enclosing reservation");
         co_return decoded_sparse_index_root{
           detail::sparse_index_codec::root(
-            expected, digest, total, std::move(pages), layout->encoded_bytes()),
+            expected,
+            digest,
+            total,
+            std::move(pages),
+            std::move(firsts),
+            layout->encoded_bytes()),
           *retained};
     }
 };
@@ -574,6 +613,7 @@ encode_sparse_index_root(
   sparse_index_context context,
   std::uint32_t total,
   std::span<const page_ref> refs,
+  std::span<const model::range_logical_offset> firsts,
   codec::cooperative_work& work,
   byte_count remaining,
   bytes::allocation_charge_fn charge,
@@ -591,6 +631,8 @@ encode_sparse_index_root(
       auto valid = check_counts(context, total, refs.size(), work.policy(), c);
       !valid)
         co_return codec::failure(valid.error());
+    if (firsts.size() != refs.size())
+        co_return codec::failure(page_error(errc::invalid_argument, c));
     std::uint32_t first = 0;
     for (std::uint32_t i = 0; i < refs.size(); ++i) {
         if (
@@ -612,6 +654,8 @@ encode_sparse_index_root(
             c);
           !valid)
             co_return codec::failure(valid.error());
+        if (!valid_first_anchor(context, firsts[i], firsts.first(i)))
+            co_return codec::failure(page_error(errc::invalid_argument, c));
         first += refs[i].entry_count();
     }
     if (first != total)
@@ -619,7 +663,7 @@ encode_sparse_index_root(
     const auto layout = aligned_envelope_layout::make(
       {byte_count{32},
        sparse_index_root_fixed_bytes,
-       byte_count{refs.size() * 48U}},
+       byte_count{refs.size() * root_entry_bytes}},
       context.alignment(),
       work.policy(),
       {work.policy().config().max_page_bytes,
@@ -637,10 +681,26 @@ encode_sparse_index_root(
     store<160>(fixed, static_cast<std::uint32_t>(refs.size()));
     store<164>(
       fixed, static_cast<std::uint32_t>(layout->padding_bytes().value()));
-    auto output = co_await detail::encode_page_object<48>(
+    // The borrowed spans outlive this joined child.
+    const auto write_root_entry = [base = refs.data(), firsts](
+                                    std::array<char, root_entry_bytes>& out,
+                                    const page_ref& ref) noexcept {
+        std::array<char, 48> page{};
+        detail::write_page_ref(page, ref);
+        std::copy(page.begin(), page.end(), out.begin());
+        // Each reference is handed over where it lies in the span, which is
+        // what places its first anchor beside it.
+        const auto at = static_cast<std::size_t>(&ref - base);
+        KWAQUE_INVARIANT(
+          invariant_id{"KQ-INDEX-ROOT-ENTRY"},
+          at < firsts.size(),
+          "index root entry written from outside its references");
+        store<48>(out, firsts[at].value());
+    };
+    auto output = co_await detail::encode_page_object<root_entry_bytes>(
       fixed,
       refs,
-      detail::write_page_ref,
+      write_root_entry,
       *layout,
       index_family,
       work,
@@ -753,7 +813,12 @@ sparse_index_verifier::next(
             c,
             boundary,
             last_));
-        if (!output->has_value()) failed = output->error();
+        if (!output->has_value())
+            failed = output->error();
+        else if (
+          (*output)->value.entries().front().logical_anchor()
+          != root_.first_anchors()[next_])
+            failed = page_error(errc::malformed_data, c);
         if (!failed) {
             if (auto valid = work.poll(page_error(errc::success, c)); !valid)
                 failed = valid.error();

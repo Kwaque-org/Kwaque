@@ -127,9 +127,9 @@ read_local_footer(const std::array<char, N>& raw, codec::field_context c) {
       Offset);
 }
 [[nodiscard]] codec::result<local_checkpoint_entry>
-read_local_checkpoint_entry(const std::array<char, 164>&, codec::field_context);
+read_local_checkpoint_entry(const std::array<char, 140>&, codec::field_context);
 void write_local_checkpoint_entry(
-  std::array<char, 164>&, const local_checkpoint_entry&) noexcept;
+  std::array<char, 140>&, const local_checkpoint_entry&) noexcept;
 [[nodiscard]] codec::result<local_deletion_object>
 read_local_deletion_object(const std::array<char, 12>&, codec::field_context);
 void write_local_deletion_object(

@@ -165,6 +165,10 @@ runtime::result<local_root_pin> local_root_owner::pin() {
     if (!held) return runtime::failure(held.error());
     return local_root_pin{std::move(*held), state_, state_->readers.hold()};
 }
+std::uint32_t local_root_owner::pins() const noexcept {
+    assert_current();
+    return static_cast<std::uint32_t>(state_->readers.get_count());
+}
 void local_root_owner::retire() noexcept {
     assert_current();
     state_->retired = true;
@@ -241,6 +245,158 @@ seastar::future<runtime::result<local_root_page>> read_root_page(
       std::move(held), std::move(pin), reference, at, std::move(*raw)};
 }
 } // namespace
+namespace {
+seastar::future<runtime::result<local_retry_page>> read_retry_page(
+  local_root_pin pin,
+  seastar::lw_shared_ptr<detail::local_root_state> state,
+  page_ordinal ordinal,
+  workload_reservation held,
+  codec::cooperative_work& work) {
+    const auto at = state->offsets[ordinal.value()];
+    const auto reference = state->bundle.pages()[ordinal.value()];
+    auto raw = co_await detail::read_local_extent(
+      state->page_file, at, reference.encoded_bytes(), work);
+    if (!raw) co_return runtime::failure(raw.error());
+    bytes::fragmented_buffer_parser input{std::move(*raw)};
+    auto memory = detail::metadata_file_budget(
+      input, state->bundle.limits(), work);
+    if (!memory)
+        co_return runtime::failure(detail::path_error(memory.error().code()));
+    if (
+      const auto* summary = std::get_if<sealed_footer>(&state->bundle.root())) {
+        auto page = co_await decode_retry_page(
+          input,
+          *summary,
+          ordinal,
+          *memory,
+          work,
+          {},
+          codec::input_boundary::complete);
+        if (!page)
+            co_return runtime::failure(detail::path_error(page.error().code()));
+        if (!input.at_end())
+            co_return runtime::failure(
+              detail::path_error(errc::malformed_data));
+        co_return local_retry_page{
+          std::move(held), std::move(pin), std::move(page->value)};
+    }
+    auto expected = std::get<local_metadata_expectation>(
+      state->bundle.context());
+    expected.header = local_metadata_header::make(
+                        local_metadata_kind::completed_retry_page,
+                        expected.header.owner(),
+                        expected.header.generation())
+                        .value();
+    expected.digest = reference.digest();
+    expected.encoded_bytes = reference.encoded_bytes();
+    expected.page = reference;
+    auto page = co_await decode_local_metadata(
+      input, expected, *memory, work, {}, codec::input_boundary::complete);
+    if (!page)
+        co_return runtime::failure(detail::path_error(page.error().code()));
+    if (!input.at_end())
+        co_return runtime::failure(detail::path_error(errc::malformed_data));
+    co_return local_retry_page{
+      std::move(held), std::move(pin), std::move(page->value)};
+}
+} // namespace
+namespace {
+seastar::future<runtime::result<local_index_page>> read_index_page(
+  local_root_pin pin,
+  seastar::lw_shared_ptr<detail::local_root_state> state,
+  page_ordinal ordinal,
+  workload_reservation held,
+  codec::cooperative_work& work) {
+    const auto at = state->offsets[ordinal.value()];
+    const auto reference = state->bundle.pages()[ordinal.value()];
+    auto raw = co_await detail::read_local_extent(
+      state->page_file, at, reference.encoded_bytes(), work);
+    if (!raw) co_return runtime::failure(raw.error());
+    bytes::fragmented_buffer_parser input{std::move(*raw)};
+    auto memory = detail::metadata_file_budget(
+      input, state->bundle.limits(), work);
+    if (!memory)
+        co_return runtime::failure(detail::path_error(memory.error().code()));
+    auto page = co_await decode_sparse_index_page(
+      input,
+      std::get<sparse_index_root>(state->bundle.root()),
+      ordinal,
+      *memory,
+      work,
+      {},
+      codec::input_boundary::complete);
+    if (!page)
+        co_return runtime::failure(
+          co_await detail::undecoded_index_error(
+            input,
+            reference.encoded_bytes(),
+            reference.digest(),
+            page.error().code(),
+            work));
+    if (!input.at_end())
+        co_return runtime::failure(detail::path_error(errc::malformed_data));
+    co_return local_index_page{
+      std::move(held), std::move(pin), std::move(page->value)};
+}
+} // namespace
+seastar::future<runtime::result<local_index_page>> local_root_pin::read_index(
+  page_ordinal ordinal, codec::cooperative_work& work) const {
+    state_->assert_current();
+    auto reject = [](runtime::operation_error error) {
+        return seastar::make_ready_future<runtime::result<local_index_page>>(
+          runtime::failure(error));
+    };
+    if (state_->bundle.reference().kind() != local_root_kind::index)
+        return reject(detail::path_error(errc::wrong_context));
+    if (auto at = position(ordinal); !at) return reject(at.error());
+    const auto limits = state_->bundle.limits();
+    // A root is opened without its pages, so this is where a page longer
+    // than the operation's budget is refused, before it is read.
+    if (
+      state_->bundle.pages()[ordinal.value()].encoded_bytes()
+      > limits.operation_bytes)
+        return reject(detail::path_error(errc::resource_exhausted));
+    // The read buffer and the decoder each have a full operation budget.
+    auto held = state_->budget.try_reserve(
+      byte_count{
+        2U * limits.operation_bytes.value() + limits.execution_bytes.value()});
+    if (!held) return reject(held.error());
+    auto pin = share();
+    if (!pin) return reject(pin.error());
+    return read_index_page(
+      std::move(*pin), state_, ordinal, std::move(*held), work);
+}
+std::span<const completed_retry> local_retry_page::entries() const& noexcept {
+    if (const auto* summary = std::get_if<retry_page>(&value))
+        return summary->entries();
+    return std::get<local_completed_retry_page>(
+             std::get<local_metadata_record>(value).payload())
+      .entries;
+}
+seastar::future<runtime::result<local_retry_page>> local_root_pin::read_retries(
+  page_ordinal ordinal, codec::cooperative_work& work) const {
+    state_->assert_current();
+    auto reject = [](runtime::operation_error error) {
+        return seastar::make_ready_future<runtime::result<local_retry_page>>(
+          runtime::failure(error));
+    };
+    const auto kind = state_->bundle.reference().kind();
+    if (
+      kind != local_root_kind::sealed_retry
+      && kind != local_root_kind::completed_retry_snapshot)
+        return reject(detail::path_error(errc::wrong_context));
+    if (auto at = position(ordinal); !at) return reject(at.error());
+    const auto limits = state_->bundle.limits();
+    // The read buffer and the decoder each have a full operation budget.
+    auto held = state_->budget.try_reserve(
+      byte_count{
+        2U * limits.operation_bytes.value() + limits.execution_bytes.value()});
+    if (!held) return reject(held.error());
+    auto pin = share();
+    if (!pin) return reject(pin.error());
+    return read_retry_page(
+      std::move(*pin), state_, ordinal, std::move(*held), work);
+}
 seastar::future<runtime::result<local_root_page>> local_root_pin::read(
   page_ordinal ordinal, codec::cooperative_work& work) const {
     state_->assert_current();

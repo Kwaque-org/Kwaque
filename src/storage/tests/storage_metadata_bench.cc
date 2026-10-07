@@ -230,6 +230,7 @@ private:
                   source_->index_context,
                   count_,
                   root_->pages(),
+                  root_->first_anchors(),
                   work,
                   memory_.operation_remaining,
                   capacity_bound);

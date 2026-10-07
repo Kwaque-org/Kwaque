@@ -3,6 +3,10 @@
 #include "src/storage/sparse_index_format.h"
 #include "src/storage/tests/footer_test_support.h"
 
+#include <initializer_list>
+#include <span>
+#include <vector>
+
 namespace kwaque::storage::testing::index {
 using bytes::fragmented_buffer_parser;
 inline codec::content_digest digest_of(std::string_view wire) {
@@ -85,14 +89,40 @@ inline page_ref page_reference(
              codec::immutable_object_digest{digest_of(wire)})
       .value();
 }
+inline std::vector<model::range_logical_offset>
+anchors(std::initializer_list<std::uint64_t> values) {
+    std::vector<model::range_logical_offset> output;
+    output.reserve(values.size());
+    for (const auto value : values)
+        output.push_back(model::range_logical_offset::make(value).value());
+    return output;
+}
+// Where each page of an index without gaps begins: entry i is the coverage's
+// base plus i, so a page begins at the base plus the entries before it. A
+// test whose pages hold other anchors names each page's first one itself.
+inline std::vector<model::range_logical_offset> first_anchors(
+  std::span<const page_ref> refs, sparse_index_context context = target()) {
+    std::vector<model::range_logical_offset> output;
+    output.reserve(refs.size());
+    for (const auto& r : refs)
+        output.push_back(
+          model::range_logical_offset::make(
+            context.coverage().logical().begin().value() + r.first_entry())
+            .value());
+    return output;
+}
 inline std::string root_wire(
   std::span<const page_ref> refs,
   sparse_index_context context = target(),
-  std::size_t header = 32) {
+  std::size_t header = 32,
+  std::span<const model::range_logical_offset> firsts = {}) {
     auto body = fixed_scope(168, context, 1);
     std::uint32_t count = 0;
-    for (const auto& r : refs) {
-        std::string item(48, '\0');
+    const auto dense = first_anchors(refs, context);
+    if (firsts.empty()) firsts = dense;
+    for (std::size_t n = 0; n < refs.size(); ++n) {
+        const auto& r = refs[n];
+        std::string item(56, '\0');
         put(item, 0, r.ordinal().value(), 4);
         put(item, 4, r.first_entry(), 4);
         put(item, 8, r.entry_count(), 4);
@@ -100,6 +130,7 @@ inline std::string root_wire(
         const auto digest = r.digest().bytes();
         for (std::size_t i = 0; i < digest.size(); ++i)
             item[16 + i] = std::bit_cast<char>(digest[i]);
+        put(item, 48, firsts[n].value(), 8);
         body += item;
         count += r.entry_count();
     }
@@ -128,7 +159,12 @@ inline codec::decode_budget page_memory(
   codec::cooperative_work& work) {
     auto memory = reserve(input, work);
     const auto cost = charge(
-      byte_count{root.page_capacity() * sizeof(page_ref)});
+                        byte_count{root.page_capacity() * sizeof(page_ref)})
+                        .checked_add(charge(
+                          byte_count{
+                            root.first_anchor_capacity()
+                            * sizeof(model::range_logical_offset)}))
+                        .value();
     memory.operation_remaining
       = memory.operation_remaining.checked_sub(cost).value();
     memory.metadata_remaining

@@ -5,6 +5,8 @@
 #include "src/storage/retry_format.h"
 #include "src/storage/segment_immutable.h"
 
+#include <concepts>
+
 namespace kwaque::storage {
 struct segment_seal_outcome final {
     runtime::first_failure failure;
@@ -13,6 +15,10 @@ struct segment_seal_outcome final {
     std::optional<local_footer_reference> boundary;
     std::optional<local_root_reference> retry;
     std::optional<segment_immutable_expectation> extent;
+    // The index root the sealed publication names. Absent when the seal was
+    // given no index, the extent is empty, or the index could not be
+    // published: the segment is sealed all the same and is indexed later.
+    std::optional<local_root_reference> index;
     // The caller's snapshot/WAL-retention owner continues to own these facts.
     // An empty completed summary never discharges unresolved obligations.
     std::uint32_t unresolved{0};
@@ -25,7 +31,39 @@ struct segment_seal_progress final {
     std::optional<local_footer_reference> boundary_candidate;
     std::optional<local_root_reference> retry_candidate;
     local_publication_outcome retry, pointer;
+    // Why the seal published no index although it was given one.
+    runtime::first_failure index;
 };
+
+// A seal given this publishes no index.
+struct segment_no_index final {};
+// Anything else a seal is given as its index source is asked once, after the
+// sealed root is durable and before the sealed publication:
+//
+//   publish(files, ownership, spec, shard, context, budget, limits, work)
+//     -> future<runtime::result<local_root_reference>>
+//
+// with the sealed coverage and extent digest as the context. It publishes one
+// immutable index bundle and returns its root, which the seal then names in
+// its one publication. An index is derived: a refusal, a failure or an
+// exception here is recorded and never fails the seal, and what a source
+// leaves behind unnamed is an object nothing references.
+//
+// A recovered segment was not written by this process, so nothing reported
+// its blocks. A source that also has
+//
+//   block(const complete_block_descriptor&) noexcept
+//
+// is given every block of the walk that verifies the extent before a
+// recovered seal, in file order, so the extent is read once for both. A walk
+// that fails has still offered the blocks before its failure, so a source is
+// good for one attempt.
+//
+// What a source refers to is borrowed until the seal is joined, which the
+// segment's close does even when the seal's caller stopped waiting.
+template<typename Index>
+inline constexpr bool segment_seal_indexes
+  = !std::same_as<Index, segment_no_index>;
 
 namespace detail {
 // The supplied source owns an immutable, already charged finite snapshot.

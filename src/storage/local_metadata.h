@@ -132,19 +132,38 @@ struct local_object_publication final {
     std::vector<local_root_reference> roots;
     bool operator==(const local_object_publication&) const = default;
 };
+// The WAL below `end` is no longer needed. `begin` is the previous
+// checkpoint's end, or where the first one started.
 struct local_checkpoint_root final {
     local_wal_cursor begin, end;
     std::uint32_t entry_count;
     std::vector<page_ref> pages;
     bool operator==(const local_checkpoint_root&) const = default;
 };
+// One pin a checkpoint carries in place of the WAL below its end: a segment's
+// durable footer, or a discard decision. It names no WAL interval.
 struct local_checkpoint_entry final {
-    local_wal_cursor begin, end;
     segment_context segment;
     local_checkpoint_disposition disposition;
-    std::uint64_t evidence_sequence;
-    codec::immutable_object_digest evidence_digest;
+    // The data device that holds a boundary's segment; nil for a discard.
+    device_store_id device;
+    // A boundary's footer position, or a discard's decision sequence.
+    std::uint64_t locator;
+    byte_count bytes;
+    // The durable footer family for a boundary; zero for a discard.
+    std::uint16_t family;
+    // Of the footer's or the decision record's exact bytes.
+    codec::immutable_object_digest digest;
     bool operator==(const local_checkpoint_entry&) const = default;
+    // Canonical order: segment, then disposition, then locator.
+    [[nodiscard]] bool
+    canonical_less(const local_checkpoint_entry& other) const noexcept {
+        if (segment != other.segment)
+            return segment.canonical_less(other.segment);
+        if (disposition != other.disposition)
+            return disposition < other.disposition;
+        return locator < other.locator;
+    }
 };
 struct local_checkpoint_page final {
     local_object_sequence sequence;
@@ -236,7 +255,8 @@ struct local_metadata_expectation final {
     std::optional<byte_count> encoded_bytes;
     std::optional<page_ref> page;
     std::optional<model::batch_id> previous_retry;
-    std::optional<local_wal_cursor> previous_checkpoint_end;
+    // The last entry of the page before a checkpoint page.
+    std::optional<local_checkpoint_entry> previous_checkpoint;
 };
 namespace detail {
 class local_metadata_codec;

@@ -98,9 +98,11 @@ jobs:
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: reproducible-package-first-${{ github.run_attempt }}
+          # Only the named archive: the directory also holds the package
+          # rule's own link to it, which would be kept as a second copy.
           path: |
-            bazel-bin/bazel/packaging/*.tar.gz
-            bazel-bin/bazel/packaging/*.tar.gz.sha256
+            bazel-bin/bazel/packaging/kwaque-*.tar.gz
+            bazel-bin/bazel/packaging/kwaque-*.tar.gz.sha256
           retention-days: 7
           if-no-files-found: error
 
@@ -125,8 +127,8 @@ jobs:
         with:
           name: reproducible-package-second-${{ github.run_attempt }}
           path: |
-            relocated/kwaque/bazel-bin/bazel/packaging/*.tar.gz
-            relocated/kwaque/bazel-bin/bazel/packaging/*.tar.gz.sha256
+            relocated/kwaque/bazel-bin/bazel/packaging/kwaque-*.tar.gz
+            relocated/kwaque/bazel-bin/bazel/packaging/kwaque-*.tar.gz.sha256
           retention-days: 7
           if-no-files-found: error
 
@@ -144,9 +146,13 @@ jobs:
       - name: Compare the archives byte for byte
         run: |
           set -euo pipefail
-          first=(builds/reproducible-package-first-*/*.tar.gz)
-          second=(builds/reproducible-package-second-*/*.tar.gz)
-          [[ ${#first[@]} -eq 1 && ${#second[@]} -eq 1 ]]
+          shopt -s nullglob
+          first=(builds/reproducible-package-first-*/kwaque-*.tar.gz)
+          second=(builds/reproducible-package-second-*/kwaque-*.tar.gz)
+          if [[ ${#first[@]} -ne 1 || ${#second[@]} -ne 1 ]]; then
+            echo "expected one archive from each build: ${first[*]} ${second[*]}" >&2
+            exit 1
+          fi
           sha256sum "${first[0]}" "${second[0]}"
           if cmp -s "${first[0]}" "${second[0]}"; then
             exit 0

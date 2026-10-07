@@ -7,12 +7,11 @@ import unittest
 from pathlib import Path
 
 from tests.smoke.broker_test_support import (
-    ADMIN_PORT,
     BrokerProcess,
-    Endpoint,
     assert_clean_shutdown,
     log_path,
     test_directory,
+    wait_for_loopback_endpoint,
 )
 
 
@@ -26,6 +25,9 @@ class DefaultConfigSmokeTest(unittest.TestCase):
         """
         binary = Path(sys.argv[1])
         example = Path(sys.argv[2])
+        # The example names one fixed endpoint, which no other test may use
+        # while this broker runs.
+        endpoint = wait_for_loopback_endpoint("127.0.0.1")
         with test_directory() as directory:
             root = Path(directory).resolve()
             (root / "conf").mkdir()
@@ -34,7 +36,13 @@ class DefaultConfigSmokeTest(unittest.TestCase):
                 binary, None, log_path(root, "default-config.log"), cwd=root
             )
             try:
-                broker.wait_until_ready(Endpoint("127.0.0.1", ADMIN_PORT))
+                # This broker's own listener: a process outside the tests
+                # could answer on the endpoint in its place.
+                broker.wait_for(
+                    "startup stage=admin state=ready"
+                    f" address={endpoint.address} port={endpoint.port}"
+                )
+                broker.wait_until_ready(endpoint)
                 self.assertTrue((root / "data" / "kwaque.pid").exists())
                 output = broker.stop(signal.SIGTERM)
                 assert_clean_shutdown(output)

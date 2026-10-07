@@ -556,6 +556,11 @@ public:
     }
     [[nodiscard]] std::size_t queued_groups() const noexcept;
     [[nodiscard]] std::uint32_t retained_groups() const noexcept;
+    // The budget that funds this owner.
+    [[nodiscard]] const workload_budget& budget() const noexcept {
+        assert_current();
+        return budget_;
+    }
     [[nodiscard]] const runtime::first_failure& failure() const& noexcept {
         assert_current();
         return first_;

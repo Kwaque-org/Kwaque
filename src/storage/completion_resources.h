@@ -13,6 +13,9 @@
 
 namespace kwaque::storage {
 
+// The handle credits one completion reserve holds for its file.
+inline constexpr std::uint32_t completion_handles = 1;
+
 struct completion_resource_limits final {
     byte_count scratch_bytes{4_KiB};
     // Caller-qualified served memory for retained control/work frames and

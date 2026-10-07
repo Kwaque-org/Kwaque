@@ -6,12 +6,15 @@
 #include "src/storage/tests/local_installation_contract.h"
 #include "src/storage/tests/retry_test_support.h"
 
+#include <algorithm>
 #include <array>
 #include <optional>
+#include <span>
 #include <string>
 #include <string_view>
 #include <type_traits>
 #include <utility>
+#include <vector>
 
 namespace kwaque::storage::testing::segment_writer_contract {
 using store_contract::require;
@@ -351,6 +354,87 @@ seastar::future<> creation(
       "unknown stored profile became an empty segment");
 }
 
+// What a created segment costs its budget in handle credits, against the
+// budget's own limit. With exactly segment_writer_handles() and
+// segment_creation_handles free a creation succeeds and afterwards holds the
+// first; with one credit fewer it is refused for handle pressure.
+template<
+  runtime::monotonic_clock Clock,
+  typename Backend,
+  typename Owner,
+  typename Driver>
+seastar::future<> creation_handles(
+  Backend& files,
+  Owner& owner,
+  const local_device_spec& spec,
+  workload_budget& resources,
+  Driver drive) {
+    using writer_type = segment_writer<Backend, Owner, Clock>;
+    seastar::abort_source abort;
+    codec::cooperative_work work{codec::limits::defaults(), abort};
+    co_await installation::bootstrap(
+      files, owner, spec, resources, work, drive);
+    const auto config = configuration();
+    const auto each = segment_writer_handles(config);
+    const auto limit = std::uint64_t{resources.limits().handles};
+    const auto idle = resources.snapshot().handles;
+    require(
+      limit > idle + each + segment_creation_handles,
+      "the handle budget is too small to measure a creation");
+    auto filler = take(resources.try_reserve(byte_count{1}));
+    take(filler.try_acquire_handles(
+      static_cast<std::uint32_t>(
+        limit - idle - each - segment_creation_handles)));
+    const auto first = descriptor();
+    auto second = first;
+    second.segment = segment_context::make(
+                       first.segment.cluster(),
+                       first.segment.topic(),
+                       first.segment.range(),
+                       first.segment.segment(),
+                       model::segment_generation::make(2).value())
+                       .value();
+    auto created = take(
+      writer_type::make_new(files, owner, spec, 0, first, resources, config));
+    std::unique_ptr<writer_type> starved;
+    std::optional<workload_reservation> one;
+    runtime::first_failure failed;
+    try {
+        take(co_await drive.lifecycle(created->create_new(work)));
+        require(
+          resources.snapshot().handles == limit - segment_creation_handles,
+          "an open segment does not hold the handle credits it is counted "
+          "for");
+        one.emplace(take(resources.try_reserve(byte_count{1})));
+        take(one->try_acquire_handles(1));
+        starved = take(
+          writer_type::make_new(
+            files, owner, spec, 0, second, resources, config));
+        const auto refused = co_await drive.lifecycle(
+          starved->create_new(work));
+        require(
+          !refused && refused.error().code() == errc::queue_full,
+          "a creation one handle credit short was not refused for it");
+    } catch (...) {
+        failed.observe(std::current_exception());
+    }
+    if (starved) {
+        try {
+            static_cast<void>(co_await drive.lifecycle(starved->close()));
+        } catch (...) {
+            failed.observe(std::current_exception());
+        }
+        starved.reset();
+    }
+    try {
+        failed.observe(co_await drive.lifecycle(created->close()));
+    } catch (...) {
+        failed.observe(std::current_exception());
+    }
+    created.reset();
+    take(failed.outcome());
+}
+
 template<
   runtime::monotonic_clock Clock,
   typename Backend,
@@ -492,7 +576,8 @@ seastar::future<> reserved_publication(
     std::optional<local_file_publisher<Backend>> pointer;
     std::optional<runtime::file> data;
     std::optional<completion_resources> completion;
-    std::array<std::optional<runtime::directory_page>, 64> cursor_pressure;
+    // One more than the cursors the native backend lets list at once.
+    std::array<std::optional<runtime::directory_page>, 65> cursor_pressure;
     try {
         take(
           co_await drive.lifecycle(
@@ -528,7 +613,9 @@ seastar::future<> reserved_publication(
           local_fixture::read("sealed_a"));
         // Retained pages keep the cursor admission slot after their native
         // handles close. Saturate directory admission without consuming the
-        // temporary-file handles needed by publication.
+        // temporary-file handles needed by publication. A backend refuses the
+        // cursor itself or, when it bounds only those that list, the
+        // cursor's first page.
         bool saturated = false;
         for (auto& retained : cursor_pressure) {
             auto opened = co_await drive.lifecycle(files.open_directory(
@@ -542,10 +629,15 @@ seastar::future<> reserved_publication(
             }
             runtime::first_failure page_failure;
             try {
-                retained.emplace(take(
-                  co_await drive.lifecycle(opened->next(
-                    {.maximum_entries = item_count{1},
-                     .maximum_name_bytes = byte_count{255}}))));
+                auto page = co_await drive.lifecycle(opened->next(
+                  {.maximum_entries = item_count{1},
+                   .maximum_name_bytes = byte_count{255}}));
+                if (page)
+                    retained.emplace(std::move(*page));
+                else if (page.error().code() == errc::queue_full)
+                    saturated = true;
+                else
+                    page_failure.observe(page);
             } catch (...) {
                 page_failure.observe(std::current_exception());
             }
@@ -555,6 +647,7 @@ seastar::future<> reserved_publication(
                 page_failure.observe(std::current_exception());
             }
             take(page_failure.outcome());
+            if (saturated) break;
         }
         require(saturated, "directory cursor admission was not saturated");
         resources.close_admission();
@@ -704,6 +797,27 @@ execution_child(std::uint64_t logical, codec::cooperative_work& work) {
       .value();
 }
 
+// What a writer reported to its block observer. Kept alive past the
+// writer's close, and sized so that recording never allocates.
+struct block_trace final {
+    block_trace() {
+        written.reserve(8);
+        durable.reserve(8);
+    }
+    [[nodiscard]] segment_block_observer observer() {
+        return {
+          [this](std::span<const segment_block_layout> blocks) noexcept {
+              for (const auto& block : blocks)
+                  written.push_back(block.records);
+          },
+          [this](runtime::file_position end) noexcept {
+              durable.push_back(end);
+          }};
+    }
+    std::vector<storage::coverage> written;
+    std::vector<runtime::file_position> durable;
+};
+
 template<typename Writer>
 seastar::future<segment_frozen_group> freeze_child(
   Writer& writer,
@@ -741,6 +855,7 @@ seastar::future<> execution(
     auto config = configuration();
     config.maximum_groups = 2;
     config.admission.working_bytes = byte_count{1_MiB};
+    block_trace trace;
     auto writer = take(
       writer_type::make_new(
         files, owner, spec, 0, descriptor(), resources, config));
@@ -748,6 +863,11 @@ seastar::future<> execution(
     try {
         take(co_await drive.lifecycle(writer->create_new(work)));
         const auto empty = writer->progress()->durable;
+        take(writer->observe_blocks(trace.observer()));
+        const auto twice = writer->observe_blocks(trace.observer());
+        require(
+          !twice && twice.error().code() == errc::wrong_context,
+          "a second block observer replaced the first");
         auto first = co_await freeze_child(
           *writer, co_await child(work, 4096), resources, work);
         const auto first_cut = first.layout().boundary();
@@ -795,6 +915,9 @@ seastar::future<> execution(
         require(
           first.layout().boundary() == first_cut,
           "later group mutated a frozen layout");
+        const std::array frozen{
+          first.layout().blocks()[0].records,
+          second.layout().blocks()[0].records};
         const auto first_block = flat(first.blocks()[0].bytes());
         const auto second_block = flat(second.blocks()[0].bytes());
         const auto first_footer = footer_wire(
@@ -830,6 +953,10 @@ seastar::future<> execution(
             && writer->progress()->written == second_cut.end()
             && writer->progress()->durable == empty,
           "write completion fabricated a durable segment cut");
+        require(
+          std::ranges::equal(trace.written, frozen) && trace.durable.empty(),
+          "written blocks were not reported once, in file order, or a "
+          "write was reported durable");
         if (synchronize) {
             const auto admission = resources.snapshot();
             resources.close_admission();
@@ -846,6 +973,10 @@ seastar::future<> execution(
             require(
               again.receipt && again.receipt->boundary() == first_cut,
               "repeated barrier changed its captured receipt");
+            require(
+              trace.durable.size() == 1
+                && trace.durable[0] == first_cut.end().bytes,
+              "a barrier reported more or less than the cut it made durable");
             const auto second_sync = co_await drive.lifecycle(
               writer->barrier(second_cut));
             take(second_sync.failure.outcome());
@@ -856,6 +987,11 @@ seastar::future<> execution(
                 && resources.snapshot().accepted == admission.accepted
                 && resources.snapshot().rejected == admission.rejected,
               "segment barrier reacquired ordinary admission or lost its cut");
+            require(
+              trace.durable.size() == 2
+                && trace.durable[1] == second_cut.end().bytes
+                && trace.written.size() == frozen.size(),
+              "the later barrier did not report its own cut");
         }
         take(co_await drive.lifecycle(writer->close()));
         const auto stored = co_await store_contract::read_bytes(
@@ -920,9 +1056,19 @@ seastar::future<> grouped_execution(
               admitted_wal_batch::make(
                 std::move(batch), std::move(held), charge)));
         }
+        const auto unset = writer->observe_blocks({});
+        require(
+          !unset && unset.error().code() == errc::invalid_argument,
+          "an observer with no calls was bound");
         auto group = take(
           co_await writer->freeze_group(
             std::move(*prepared.prepared), std::move(children), work));
+        block_trace late;
+        const auto missed = writer->observe_blocks(late.observer());
+        require(
+          !missed && missed.error().code() == errc::wrong_context
+            && !writer->failure().failed(),
+          "an observer was bound after a block it would never see");
         const auto cut = group.layout().boundary();
         const auto layout = group.layout().blocks();
         require(
@@ -1423,12 +1569,16 @@ seastar::future<> abandoned_group(
     codec::cooperative_work work{codec::limits::defaults(), abort};
     co_await installation::bootstrap(
       files, owner, spec, resources, work, drive);
+    // What the owner reports of its blocks: a group that is never written
+    // is never reported, and nothing of it becomes durable.
+    block_trace trace, late;
     auto writer = take(
       writer_type::make_new(
         files, owner, spec, 0, descriptor(), resources, configuration()));
     runtime::first_failure failed;
     try {
         take(co_await drive.lifecycle(writer->create_new(work)));
+        take(writer->observe_blocks(trace.observer()));
         const auto before = writer->progress()->reserved;
         auto first = co_await freeze_child(
           *writer, co_await child(work), resources, work);
@@ -1467,6 +1617,12 @@ seastar::future<> abandoned_group(
           !closed && closed.error().code() == errc::aborted,
           "close lost an unexecuted reservation or waited for its missing "
           "caller");
+        const auto unbound = writer->observe_blocks(late.observer());
+        require(
+          trace.written.empty() && trace.durable.empty() && !unbound
+            && unbound.error().code() == errc::closed,
+          "a group that was never written was reported, or a closed owner "
+          "took an observer");
     } catch (...) {
         failed.observe(std::current_exception());
     }
@@ -1533,6 +1689,7 @@ seastar::future<> seal_lifecycle(
       files, owner, spec, resources, work, drive);
     auto config = configuration();
     config.admission.working_bytes = byte_count{1_MiB};
+    block_trace trace;
     auto writer = take(
       writer_type::make_new(
         files, owner, spec, 0, descriptor(), resources, config));
@@ -1542,10 +1699,12 @@ seastar::future<> seal_lifecycle(
         require(
           !(co_await drive.lifecycle(writer->evict_read_handle())),
           "active writable descriptor was evicted");
+        take(writer->observe_blocks(trace.observer()));
         std::uint32_t calls = 0;
         std::vector<completed_retry> facts;
         std::string extent_bytes;
         std::optional<storage::coverage> last;
+        std::optional<runtime::file_position> data_end;
         if (!empty) {
             auto batch = co_await child(work);
             const auto info = batch.info();
@@ -1563,6 +1722,7 @@ seastar::future<> seal_lifecycle(
             take(co_await writer->encode_group(group, work));
             last = group.layout().blocks()[0].records;
             const auto cut = group.layout().boundary();
+            data_end = cut.end().bytes;
             extent_bytes = flat(group.blocks()[0].bytes());
             extent_bytes += footer_wire(
               {cut.covered(), cut.end().blocks, last, crc(extent_bytes)},
@@ -1582,6 +1742,12 @@ seastar::future<> seal_lifecycle(
             && calls == 0,
           "incomplete completion snapshot changed admission or discharged "
           "obligations");
+        require(
+          trace.durable.empty()
+            && (empty ? trace.written.empty()
+                      : trace.written.size() == 1 && trace.written[0] == *last),
+          "a refused seal reported durable blocks, or the written block "
+          "was not reported");
         if (unresolved) facts.clear();
         const auto count = static_cast<std::uint32_t>(facts.size());
         auto source_grant = take(resources.try_reserve(byte_count{4_KiB}));
@@ -1599,6 +1765,11 @@ seastar::future<> seal_lifecycle(
           sealed.failure.failed() == changed_source
             && repeated.failure.error() == sealed.failure.error(),
           "repeated seal reran or changed the retained attempt");
+        // No barrier covered the group: the seal's own data sync did.
+        require(
+          empty ? trace.durable.empty()
+                : trace.durable.size() == 1 && trace.durable[0] == *data_end,
+          "the seal did not report the blocks its data sync made durable");
         require(
           calls == (empty || unresolved ? 0U : 2U),
           "seal did not use one deterministic pair of page passes");

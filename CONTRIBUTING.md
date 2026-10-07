@@ -30,7 +30,8 @@ clang-tidy with a fresh debug compilation database, then ordinary clang-tidy for
 the separate fuzz configuration. Every enabled clang-tidy check is an error, in
 headers as well as sources. Keep commands using the same configuration together.
 Merging requires the `CI result` check, which passes only when every CI job
-passes.
+passes. A pull request opened by Dependabot is not checked, and fails
+`CI result`, until a maintainer chooses "Re-run all jobs" on its CI run.
 
 Changes to real adapters or environment ownership must also pass the ten-run
 sandboxed contract suite. The scheduled stateful fuzz campaigns retain crash

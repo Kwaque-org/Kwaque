@@ -6,8 +6,10 @@
 #include "src/storage/completion_resources.h"
 #include "src/storage/extent_verifier.h"
 #include "src/storage/local_generation.h"
+#include "src/storage/local_publication.h"
 #include "src/storage/segment_group.h"
 #include "src/storage/segment_seal.h"
+#include "src/storage/workload_budget.h"
 #include "src/storage/zero_fill.h"
 
 #include <seastar/core/shared_future.hh>
@@ -57,9 +59,72 @@ struct segment_writer_config final {
     // are revalidated under it before freezing; it never changes during growth.
     codec::limits policy{codec::limits::defaults()};
 };
-struct segment_creation_progress final {
-    local_publication_outcome descriptor, data, publication;
+// The handle credits one writable segment holds while it is open: its data
+// file's, and a second for the synchronized-write handle of a zero-written
+// one; its completion reserve's; and those of the two publications its seal
+// has prepared. A segment opened instead of created holds fewer.
+[[nodiscard]] constexpr std::uint32_t
+segment_writer_handles(const segment_writer_config& config) noexcept {
+    return (config.preallocation_bytes.value() != 0 ? 2U : 1U)
+           + completion_handles + 2 * publication_handles;
+}
+
+// What a segment holds beyond that while it is being created: its first
+// pointer is published after its seal's publications are prepared, so that
+// no segment becomes visible that could not later be sealed.
+inline constexpr std::uint32_t segment_creation_handles = publication_handles;
+
+// What a shard asks of the budget that funds its segment writers.
+struct segment_handle_demand final {
+    // Segments open at once.
+    std::uint32_t segments{0};
+    // How many of them may be in creation at once.
+    std::uint32_t creating{1};
+    // Handle credits for whatever else draws on the budget: the WAL writer,
+    // restart work, readers.
+    std::uint32_t reserved{0};
 };
+
+// Whether the budget can hold that demand. A shard checks its configured
+// counts with this before it creates any owner. A count the budget cannot
+// hold is then a configuration error at start, carrying the limit and what
+// the configuration expects of it, and not a refusal at the first segment
+// that no longer fits.
+[[nodiscard]] inline runtime::result<void> validate_segment_handles(
+  const workload_budget& budget,
+  const segment_writer_config& config,
+  segment_handle_demand demand) noexcept {
+    const auto limit = std::uint64_t{budget.limits().handles};
+    const auto expected
+      = std::uint64_t{demand.segments} * segment_writer_handles(config)
+        + std::uint64_t{std::min(demand.creating, demand.segments)}
+            * segment_creation_handles
+        + demand.reserved;
+    if (expected <= limit) return {};
+    runtime::operation_error refused{
+      errc::resource_exhausted, runtime::operation_kind::resource};
+    static_cast<void>(
+      refused.add_context(runtime::operation_context_key::limit, limit));
+    static_cast<void>(
+      refused.add_context(runtime::operation_context_key::expected, expected));
+    return runtime::failure(refused);
+}
+
+namespace detail {
+// Whether `completed` is every fact `source` holds, for a source that says
+// how many it has.
+template<typename Source>
+[[nodiscard]] bool
+seals_whole_source(const Source& source, std::uint32_t completed) noexcept {
+    if constexpr (requires {
+                      {
+                          source.completed()
+                      } -> std::convertible_to<std::uint64_t>;
+                  })
+        return std::uint64_t{source.completed()} == completed;
+    return true;
+}
+} // namespace detail
 
 // Owns one supplied SC/descriptor and its handles. Directory ownership,
 // backend and budget outlive joined close. Creation never resumes an existing
@@ -319,11 +384,6 @@ public:
         return lifetime_->failure;
     }
     const runtime::first_failure& failure() const&& = delete;
-    [[nodiscard]] const segment_creation_progress& creation() const& noexcept {
-        assert_current();
-        return creation_;
-    }
-    const segment_creation_progress& creation() const&& = delete;
     [[nodiscard]] const std::optional<segment_writer_positions>&
     progress() const& noexcept {
         assert_current();
@@ -334,6 +394,32 @@ public:
     publication_generation() const noexcept {
         assert_current();
         return publication_;
+    }
+    // The data device this segment was opened on.
+    [[nodiscard]] device_store_id device() const noexcept {
+        assert_current();
+        return spec_.owner.device();
+    }
+    // The budget that funds this owner.
+    [[nodiscard]] const workload_budget& budget() const noexcept {
+        assert_current();
+        return budget_;
+    }
+    // Reports this segment's blocks to `observer` from now on. It is bound
+    // once and before the first group freezes, so that no block is missed; a
+    // recovered segment is never written and has none to report. Whatever
+    // the observer refers to outlives this owner's joined close.
+    [[nodiscard]] runtime::result<void>
+    observe_blocks(segment_block_observer observer) {
+        assert_current();
+        if (closing_ || closed_)
+            return runtime::failure(detail::path_error(errc::closed));
+        if (!observer.written || !observer.durable)
+            return runtime::failure(detail::path_error(errc::invalid_argument));
+        if (observer_ || recovered_ || first_acceptance_)
+            return runtime::failure(detail::path_error(errc::wrong_context));
+        observer_.emplace(std::move(observer));
+        return {};
     }
     [[nodiscard]] runtime::result<segment_captured_boundary> capture() const {
         assert_current();
@@ -921,6 +1007,280 @@ public:
         return barrier_owned(std::move(cut), operations_.hold());
     }
 
+    // Publishes this segment's pointer again with a completed-retry snapshot
+    // of `facts` facts, beside the durable boundary it was cut against. The
+    // caller made the snapshot durable as its own immutable bundle. Every
+    // other root the pointer carries is carried forward; only an earlier
+    // snapshot root is replaced. A refusal before any effect changes
+    // nothing. After an uncertain effect the pointer's durable state is
+    // unknown, so this owner fails, as it does for its own publications.
+    //
+    // While the segment is appended to, the boundary is a durable footer of
+    // this owner, read back for its digest, and never moves back. Appends
+    // continue meanwhile; a seal waits for this to return, and none starts
+    // after one began.
+    //
+    // For a sealed or recovering segment the boundary is the one its
+    // publication already pins, unchanged: a snapshot there holds facts
+    // supplied later, and never rewrites the root or footer. No read may
+    // overlap it; later readers reopen under the new publication.
+    [[nodiscard]] seastar::future<runtime::result<void>> publish_retry_snapshot(
+      local_footer_reference boundary,
+      local_root_reference snapshot,
+      std::uint32_t facts,
+      codec::cooperative_work& work) {
+        assert_current();
+        if (closing_ || closed_ || !publication_ || lifetime_->failure.failed())
+            co_return runtime::failure(detail::path_error(errc::closed));
+        if (
+          facts == 0
+          || snapshot.kind() != local_root_kind::completed_retry_snapshot
+          || !snapshot.validate_alignment(spec_.identity.metadata_alignment)
+          || !boundary.validate_alignment(descriptor_.alignment))
+            co_return runtime::failure(
+              detail::path_error(errc::invalid_argument));
+        if (publication_->value() == UINT64_MAX)
+            co_return runtime::failure(detail::path_error(errc::out_of_range));
+        const auto next = local_publication_generation::make(
+          publication_->value() + 1);
+        if (!next)
+            co_return runtime::failure(detail::path_error(errc::out_of_range));
+        if (auto ready = work.poll(); !ready)
+            co_return runtime::failure(
+              detail::path_error(ready.error().code()));
+        const bool settled
+          = read_publication_
+            && (append_ == model::append_state::sealed || (append_ == model::append_state::active && recovered_ && !recovered_seal_ && !seal_started_ && !positions_));
+        if (settled) {
+            if (
+              snapshot_busy_ || read_busy_ || read_operations_.get_count() != 0)
+                co_return runtime::failure(
+                  detail::path_error(errc::queue_full));
+            if (read_publication_->boundary != std::optional{boundary})
+                co_return runtime::failure(
+                  detail::path_error(errc::wrong_context));
+            auto held = budget_.try_reserve(
+              byte_count{
+                config_.metadata.operation_bytes.value()
+                + config_.metadata.execution_bytes.value()});
+            if (!held) co_return runtime::failure(held.error());
+            auto holder = read_operations_.hold();
+            read_busy_ = snapshot_busy_ = true;
+            auto idle = seastar::defer(
+              [this] noexcept { read_busy_ = snapshot_busy_ = false; });
+            runtime::result<void> published{};
+            try {
+                published = co_await publish_settled_snapshot(
+                  snapshot, *next, work);
+            } catch (...) {
+                // Kept as the owner's failure; this entrance returns a
+                // result.
+                lifetime_->failure.observe(std::current_exception());
+                published = runtime::failure(
+                  detail::path_error(errc::io_failure));
+            }
+            co_await close_publishers();
+            if (lifetime_->failure.failed()) lifetime_->changed.broadcast();
+            co_return published;
+        }
+        if (
+          recovered_ || seal_started_ || !positions_ || !pointer_publisher_
+          || append_ != model::append_state::active)
+            co_return runtime::failure(detail::path_error(errc::closed));
+        if (snapshot_busy_)
+            co_return runtime::failure(detail::path_error(errc::queue_full));
+        const auto end = boundary.position().checked_add(boundary.bytes());
+        if (
+          boundary.family()
+            != static_cast<std::uint16_t>(
+              codec::format_family::durable_boundary_footer)
+          || boundary.position() < data_start_ || !end
+          || positions_->durable.bytes < *end
+          || facts > positions_->reserved.retry_entries)
+            co_return runtime::failure(
+              detail::path_error(errc::invalid_argument));
+        if (
+          snapshot_boundary_
+          && (boundary.position() < snapshot_boundary_->position()
+              || (boundary.position() == snapshot_boundary_->position() && boundary != *snapshot_boundary_)))
+            co_return runtime::failure(detail::path_error(errc::wrong_context));
+        auto held = budget_.try_reserve(
+          byte_count{
+            config_.metadata.operation_bytes.value()
+            + config_.metadata.execution_bytes.value()});
+        if (!held) co_return runtime::failure(held.error());
+        // A seal closes this gate before it publishes, so it waits here.
+        auto holder = operations_.hold();
+        snapshot_busy_ = true;
+        auto idle = seastar::defer([this] noexcept { snapshot_busy_ = false; });
+        const local_object_publication publication{
+          descriptor_.segment,
+          local_object_state::active,
+          boundary,
+          {snapshot}};
+        auto pointer = co_await encode_pointer(publication, *next, work);
+        if (!pointer) co_return runtime::failure(pointer.error());
+        if (auto valid = co_await owner_.validate(spec_); !valid)
+            co_return valid;
+        runtime::result<void> published{};
+        {
+            // Released before returning: the seal's publication needs the
+            // prepared allowance whole.
+            const auto outcome = co_await pointer_publisher_->publish(
+              {spec_.shard_owner(shard_).value(), *next, publication_},
+              std::move(*pointer),
+              work);
+            published = pointer_outcome(outcome);
+        }
+        if (!published) {
+            // A publication that failed before its rename changed nothing
+            // durable, but its publisher takes no further request, and the
+            // seal publishes through that publisher. It is replaced here:
+            // an owner that cannot prepare another has failed now, and not
+            // when it seals with its root already written.
+            if (!lifetime_->failure.failed() && pointer_publisher_->fenced())
+                lifetime_->failure.observe(
+                  co_await renew_pointer_publisher(work));
+            if (lifetime_->failure.failed()) lifetime_->changed.broadcast();
+            co_return published;
+        }
+        publication_ = *next;
+        snapshot_boundary_ = boundary;
+        snapshot_root_ = snapshot;
+        snapshot_facts_ = facts;
+        co_return runtime::result<void>{};
+    }
+
+    // Names an index in a sealed segment's publication after its seal: for a
+    // segment sealed without one, or one whose index was built again. The
+    // source publishes its bundle as it does for a seal, under the sealed
+    // coverage and digest, and only a durable bundle is named; the pointer
+    // is then replaced once, an earlier index root giving way to this one.
+    //
+    // Reads go on meanwhile and keep the handles they use: the new
+    // publication adds a root or replaces the index root, the data and every
+    // other root stay as they are, and a later reopen finds the new
+    // publication. Only a read that would have to reopen is asked to come
+    // back. A refusal or a failed bundle changes nothing; after an uncertain
+    // pointer effect this owner fails, as it does for its other publications.
+    //
+    // The bundle an earlier publication named is removed once this one is
+    // durable, and this one when the pointer was not touched; a reader that
+    // still has either open reads on to its end. A bundle whose removal
+    // fails, or that was written and could not be named for another reason,
+    // is named by nothing and is left for the next open's reconciliation.
+    // The source's sequence is one nothing was given: under the sequence of
+    // the root being replaced the bundle just named would be the one
+    // removed, so that one is kept.
+    template<typename Index>
+    [[nodiscard]] seastar::future<runtime::result<local_root_reference>>
+    publish_index(Index index, codec::cooperative_work& work) {
+        static_assert(sizeof(Index) <= 8_KiB);
+        assert_current();
+        if (
+          closing_ || closed_ || lifetime_->failure.failed() || !immutable_
+          || !publication_ || !read_publication_
+          || append_ != model::append_state::sealed)
+            co_return runtime::failure(detail::path_error(errc::closed));
+        if (snapshot_busy_ || read_busy_)
+            co_return runtime::failure(detail::path_error(errc::queue_full));
+        if (
+          work.policy() != config_.policy
+          || immutable_->coverage.physical().empty()
+          || read_roots_.size() != read_publication_->roots.size())
+            co_return runtime::failure(
+              detail::path_error(errc::invalid_argument));
+        if (publication_->value() == UINT64_MAX)
+            co_return runtime::failure(detail::path_error(errc::out_of_range));
+        const auto next = local_publication_generation::make(
+          publication_->value() + 1);
+        const auto context = index_scope(
+          immutable_->coverage, immutable_->digest);
+        if (!next || !context)
+            co_return runtime::failure(detail::path_error(errc::out_of_range));
+        if (auto ready = work.poll(); !ready)
+            co_return runtime::failure(
+              detail::path_error(ready.error().code()));
+        auto held = budget_.try_reserve(
+          byte_count{
+            config_.metadata.operation_bytes.value()
+            + config_.metadata.execution_bytes.value()});
+        if (!held) co_return runtime::failure(held.error());
+        // Joined by close; an eviction is refused meanwhile, as during a
+        // read.
+        auto holder = read_operations_.hold();
+        snapshot_busy_ = true;
+        auto idle = seastar::defer([this] noexcept { snapshot_busy_ = false; });
+        // The pointer's publisher is prepared before the bundle is written,
+        // as a seal's is: a pointer that cannot be admitted then costs no
+        // bundle.
+        pointer_publisher_.emplace(
+          files_,
+          budget_,
+          target(
+            path(local_segment_file::published),
+            runtime::file_rename_policy::replace,
+            publication_));
+        runtime::first_failure refused;
+        std::optional<local_root_reference> root;
+        try {
+            if (
+              auto prepared = co_await pointer_publisher_->prepare(
+                config_.metadata.operation_bytes, work);
+              !prepared)
+                refused.observe(prepared);
+            else
+                root = index_root(
+                  co_await index.publish(
+                    files_,
+                    owner_,
+                    spec_,
+                    shard_,
+                    *context,
+                    budget_,
+                    config_.metadata,
+                    work),
+                  refused);
+        } catch (...) {
+            refused.observe(std::current_exception());
+        }
+        if (!root) {
+            co_await close_publishers();
+            if (lifetime_->failure.failed()) lifetime_->changed.broadcast();
+            co_return runtime::failure(
+              refused.error() ? *refused.error()
+                              : detail::path_error(errc::io_failure));
+        }
+        const auto& named = read_publication_->roots;
+        const auto replaced = !named.empty()
+                                  && named.front().kind()
+                                       == local_root_kind::index
+                                ? std::optional{named.front()}
+                                : std::nullopt;
+        runtime::result<void> published{};
+        try {
+            published = co_await publish_indexed(*root, *context, *next, work);
+        } catch (...) {
+            // Kept as the owner's failure; this entrance returns a result.
+            lifetime_->failure.observe(std::current_exception());
+            published = runtime::failure(detail::path_error(errc::io_failure));
+        }
+        co_await close_publishers();
+        if (published) {
+            // Only now that the publication replacing it is durable, and
+            // never the bundle that publication names.
+            if (replaced && replaced->sequence() != root->sequence())
+                co_await remove_unnamed(*replaced);
+        } else if (!lifetime_->failure.failed()) {
+            // A pointer that was not touched leaves the new bundle named by
+            // nothing, so it goes; after anything else it may be current.
+            co_await remove_unnamed(*root);
+        }
+        if (lifetime_->failure.failed()) lifetime_->changed.broadcast();
+        if (!published) co_return runtime::failure(published.error());
+        co_return *root;
+    }
+
     // Observation only: waits until every written group is included in the
     // extent digest, or the owner failed. Receipts never wait for this;
     // sealing joins the digest itself.
@@ -952,13 +1312,14 @@ public:
     // that slice as result<vector<completed_retry>>, without fresh workload
     // admission, and can replay it. Its retained facts are already charged.
     // Future completions remain with the supplied snapshot/WAL-retention owner.
-    template<typename Source>
+    template<typename Source, typename Index = segment_no_index>
     [[nodiscard]] seastar::future<segment_seal_outcome> seal(
       Source source,
       std::uint32_t completed,
       std::uint32_t unresolved,
-      codec::cooperative_work& admission) {
-        static_assert(sizeof(Source) <= 8_KiB);
+      codec::cooperative_work& admission,
+      Index index = {}) {
+        static_assert(sizeof(Source) + sizeof(Index) <= 8_KiB);
         assert_current();
         if (seal_done_) co_return seal_result_;
         if (seal_waiters_ == maximum_control_waiters) {
@@ -982,10 +1343,21 @@ public:
             rejected.failure.observe(detail::path_error(errc::closed));
             co_return rejected;
         }
+        // A cut still publishing may yet raise what the durable snapshot
+        // holds; the seal waits for the caller to ask again after it.
+        if (snapshot_busy_) {
+            rejected.failure.observe(detail::path_error(errc::queue_full));
+            co_return rejected;
+        }
+        // The sealed publication drops the snapshot root, so the source must
+        // hold every fact the durable snapshot does, and the seal must read
+        // all of them: it writes exactly `completed`.
         if (
           admission.policy() != config_.policy
           || std::uint64_t{completed} + unresolved
-               != positions_->reserved.retry_entries) {
+               != positions_->reserved.retry_entries
+          || completed < snapshot_facts_
+          || !detail::seals_whole_source(source, completed)) {
             rejected.failure.observe(
               detail::path_error(errc::invalid_argument));
             co_return rejected;
@@ -1008,8 +1380,8 @@ public:
                 lifetime_->failure.observe(
                   co_await seastar::with_scheduling_group(
                     budget_.scheduling_group(),
-                    [this, &source, completed, &work] {
-                        return seal_owned(source, completed, work);
+                    [this, &source, completed, &index, &work] {
+                        return seal_owned(source, completed, index, work);
                     }));
             }
         } catch (...) {
@@ -1083,14 +1455,15 @@ public:
     // failure or crash anywhere leaves the earlier publication and every byte
     // below the end, and the same decision resumes the seal. No reader may
     // overlap it. Source and the counts are as for seal().
-    template<typename Source>
+    template<typename Source, typename Index = segment_no_index>
     [[nodiscard]] seastar::future<segment_seal_outcome> seal_recovered(
       verified_extent extent,
       Source source,
       std::uint32_t completed,
       std::uint32_t unresolved,
-      codec::cooperative_work& admission) {
-        static_assert(sizeof(Source) <= 8_KiB);
+      codec::cooperative_work& admission,
+      Index index = {}) {
+        static_assert(sizeof(Source) + sizeof(Index) <= 8_KiB);
         assert_current();
         if (seal_done_) co_return seal_result_;
         if (seal_waiters_ == maximum_control_waiters) {
@@ -1125,6 +1498,34 @@ public:
               detail::path_error(errc::invalid_argument));
             co_return rejected;
         }
+        // The sealed publication drops a snapshot root the current one
+        // carries, so only a source that says it merged exactly that
+        // snapshot may seal: a durable fact is never dropped silently.
+        if (
+          const auto pinned = read_publication_
+                                ? snapshot_of(*read_publication_)
+                                : std::nullopt) {
+            bool merged = false;
+            if constexpr (requires(Source& merging) {
+                              {
+                                  merging.merged_snapshot()
+                              } -> std::convertible_to<
+                                std::optional<local_root_reference>>;
+                          })
+                merged = source.merged_snapshot() == pinned;
+            if (!merged) {
+                rejected.failure.observe(
+                  detail::path_error(errc::wrong_context));
+                co_return rejected;
+            }
+        }
+        // The seal writes exactly `completed` facts and then drops the
+        // snapshot, so a count short of the source would lose the rest.
+        if (!detail::seals_whole_source(source, completed)) {
+            rejected.failure.observe(
+              detail::path_error(errc::invalid_argument));
+            co_return rejected;
+        }
         if (auto ready = admission.poll(); !ready) {
             rejected.failure.observe(detail::path_error(ready.error().code()));
             co_return rejected;
@@ -1139,9 +1540,9 @@ public:
             lifetime_->failure.observe(
               co_await seastar::with_scheduling_group(
                 budget_.scheduling_group(),
-                [this, &source, &extent, completed, &work] {
+                [this, &source, &extent, completed, &index, &work] {
                     return seal_recovered_owned(
-                      source, extent, completed, work);
+                      source, extent, completed, index, work);
                 }));
         } catch (...) {
             lifetime_->failure.observe(std::current_exception());
@@ -1221,8 +1622,10 @@ public:
           !immutable_ || closing_ || closed_ || lifetime_->failure.failed()
           || append_ != model::append_state::sealed)
             co_return runtime::failure(detail::path_error(errc::closed));
+        // A pointer publication in flight leaves open handles to their
+        // readers; only a read that would reopen under it waits.
         if (
-          read_busy_
+          read_busy_ || (snapshot_busy_ && !data_)
           || read_operations_.get_count()
                >= runtime::maximum_pending_file_reads)
             co_return runtime::failure(detail::path_error(errc::queue_full));
@@ -1303,7 +1706,7 @@ public:
           closing_ || closed_ || lifetime_->failure.failed() || writable_
           || (!immutable_ && !(recovered_ && append_ == model::append_state::active)))
             co_return runtime::failure(detail::path_error(errc::closed));
-        if (read_busy_)
+        if (read_busy_ || (snapshot_busy_ && !data_))
             co_return runtime::failure(detail::path_error(errc::queue_full));
         if (auto ready = work.poll(); !ready)
             co_return runtime::failure(
@@ -1459,6 +1862,236 @@ private:
         }
     }
 
+    // What an index of this segment's sealed extent is bound to.
+    std::optional<sparse_index_context> index_scope(
+      const storage::coverage& coverage,
+      codec::extent_digest digest) const noexcept {
+        const auto context = sparse_index_context::make(
+          descriptor_.segment,
+          coverage,
+          digest,
+          descriptor_.alignment,
+          descriptor_.profile);
+        if (!context) return std::nullopt;
+        return *context;
+    }
+    // The root an index source returned, when it can be named in this
+    // segment's publication; otherwise why not.
+    std::optional<local_root_reference> index_root(
+      const runtime::result<local_root_reference>& published,
+      runtime::first_failure& reason) const noexcept {
+        if (!published) {
+            reason.observe(published.error());
+            return std::nullopt;
+        }
+        if (
+          published->kind() != local_root_kind::index
+          || !published->validate_alignment(descriptor_.alignment)) {
+            reason.observe(detail::path_error(errc::wrong_context));
+            return std::nullopt;
+        }
+        return *published;
+    }
+
+    // The encoded pointer of `publication` at generation `next`.
+    seastar::future<runtime::result<bytes::fragmented_buffer>> encode_pointer(
+      const local_object_publication& publication,
+      local_publication_generation next,
+      codec::cooperative_work& work) {
+        const auto metadata_header = local_metadata_header::make(
+                                       local_metadata_kind::object_publication,
+                                       spec_.shard_owner(shard_).value(),
+                                       next)
+                                       .value();
+        auto pointer = co_await encode_local_metadata(
+          {metadata_header,
+           spec_.identity.metadata_alignment,
+           descriptor_.alignment},
+          local_metadata_payload{publication},
+          work,
+          config_.metadata.operation_bytes,
+          config_.metadata.charge);
+        if (!pointer)
+            co_return runtime::failure(
+              detail::path_error(pointer.error().code()));
+        co_return std::move(pointer->bytes);
+    }
+    // What a pointer publication did. Anything but an untouched refusal that
+    // is not durable leaves the pointer's durable state unknown: the owner
+    // fails.
+    runtime::result<void>
+    pointer_outcome(const local_publication_outcome& outcome) {
+        runtime::result<void> published{};
+        if (outcome.failure.failed())
+            published = outcome.failure.outcome();
+        else if (outcome.disposition != local_publication_disposition::durable)
+            published = runtime::failure(detail::path_error(errc::io_failure));
+        if (
+          !published
+          && outcome.disposition != local_publication_disposition::untouched)
+            lifetime_->failure.observe(published);
+        return published;
+    }
+    // The snapshot root a publication carries, if it has one.
+    static std::optional<local_root_reference>
+    snapshot_of(const local_object_publication& publication) {
+        for (const auto& root : publication.roots)
+            if (root.kind() == local_root_kind::completed_retry_snapshot)
+                return root;
+        return std::nullopt;
+    }
+    // The context a reader independently expects of a snapshot root of this
+    // segment: nothing is taken from the root's bytes.
+    runtime::result<local_bundle_context>
+    snapshot_context(const local_root_reference& snapshot) const {
+        const auto generation = local_publication_generation::make(
+          snapshot.sequence().value());
+        if (!generation)
+            return runtime::failure(detail::path_error(errc::wrong_context));
+        const auto header = local_metadata_header::make(
+          local_metadata_kind::completed_retry_root,
+          spec_.shard_owner(shard_).value(),
+          *generation);
+        if (!header)
+            return runtime::failure(detail::path_error(errc::wrong_context));
+        local_metadata_expectation expected{
+          *header, spec_.identity.metadata_alignment};
+        expected.segment = descriptor_.segment;
+        expected.segment_alignment = descriptor_.alignment;
+        expected.digest = snapshot.digest();
+        expected.encoded_bytes = snapshot.bytes();
+        return local_bundle_context{std::move(expected)};
+    }
+    // The sealed publication again, with `root` as its index root, through
+    // the pointer's prepared publisher. Handles stay as they are: the data
+    // and every other root are unchanged.
+    seastar::future<runtime::result<void>> publish_indexed(
+      local_root_reference root,
+      sparse_index_context context,
+      local_publication_generation next,
+      codec::cooperative_work& work) {
+        // Roots stay in kind order, and each keeps its context beside it.
+        auto publication = *read_publication_;
+        auto contexts = read_roots_;
+        if (
+          !publication.roots.empty()
+          && publication.roots.front().kind() == local_root_kind::index) {
+            publication.roots.front() = root;
+            contexts.front() = context;
+        } else {
+            publication.roots.insert(publication.roots.begin(), root);
+            contexts.insert(contexts.begin(), context);
+        }
+        if (publication.roots.size() > 4)
+            co_return runtime::failure(
+              detail::path_error(errc::resource_exhausted));
+        auto pointer = co_await encode_pointer(publication, next, work);
+        if (!pointer) co_return runtime::failure(pointer.error());
+        if (auto valid = co_await owner_.validate(spec_); !valid)
+            co_return valid;
+        runtime::result<void> published{};
+        {
+            const auto outcome = co_await pointer_publisher_->publish(
+              {spec_.shard_owner(shard_).value(), next, publication_},
+              std::move(*pointer),
+              work);
+            published = pointer_outcome(outcome);
+        }
+        if (!published) co_return published;
+        publication_ = next;
+        read_publication_ = std::move(publication);
+        read_roots_ = std::move(contexts);
+        // What the segment's seal is asked for again names the index too.
+        seal_result_.index = root;
+        co_return lifetime_->failure.outcome();
+    }
+
+    // A sealed or recovering segment's pointer with `snapshot` in place of
+    // any earlier snapshot root, every other root and the boundary carried.
+    seastar::future<runtime::result<void>> publish_settled_snapshot(
+      local_root_reference snapshot,
+      local_publication_generation next,
+      codec::cooperative_work& work) {
+        auto context = snapshot_context(snapshot);
+        if (!context) co_return runtime::failure(context.error());
+        if (read_roots_.size() != read_publication_->roots.size())
+            co_return runtime::failure(detail::path_error(errc::wrong_context));
+        // Roots stay in kind order, and each keeps its context beside it.
+        auto publication = *read_publication_;
+        auto contexts = read_roots_;
+        const auto place = std::find_if(
+          publication.roots.begin(),
+          publication.roots.end(),
+          [](const local_root_reference& root) {
+              return root.kind() >= local_root_kind::completed_retry_snapshot;
+          });
+        const auto index = static_cast<std::size_t>(
+          place - publication.roots.begin());
+        if (
+          place != publication.roots.end()
+          && place->kind() == local_root_kind::completed_retry_snapshot) {
+            *place = snapshot;
+            contexts[index] = std::move(*context);
+        } else {
+            publication.roots.insert(place, snapshot);
+            contexts.insert(
+              contexts.begin() + static_cast<std::ptrdiff_t>(index),
+              std::move(*context));
+        }
+        if (publication.roots.size() > 4)
+            co_return runtime::failure(
+              detail::path_error(errc::resource_exhausted));
+        auto pointer = co_await encode_pointer(publication, next, work);
+        if (!pointer) co_return runtime::failure(pointer.error());
+        pointer_publisher_.emplace(
+          files_,
+          budget_,
+          target(
+            path(local_segment_file::published),
+            runtime::file_rename_policy::replace,
+            publication_));
+        if (
+          auto prepared = co_await pointer_publisher_->prepare(
+            config_.metadata.operation_bytes, work);
+          !prepared)
+            co_return prepared;
+        if (auto valid = co_await owner_.validate(spec_); !valid)
+            co_return valid;
+        runtime::result<void> published{};
+        {
+            const auto outcome = co_await pointer_publisher_->publish(
+              {spec_.shard_owner(shard_).value(), next, publication_},
+              std::move(*pointer),
+              work);
+            published = pointer_outcome(outcome);
+        }
+        if (!published) co_return published;
+        publication_ = next;
+        read_publication_ = std::move(publication);
+        read_roots_ = std::move(contexts);
+        // Later readers reopen under the new publication.
+        co_await close_handles();
+        handle_ = lifetime_->failure.failed() ? segment_handle_state::closed
+                                              : segment_handle_state::evicted;
+        co_return lifetime_->failure.outcome();
+    }
+    // Unlinks a bundle this segment's publication does not name, with no
+    // directory sync. One that survives is referenced by nothing.
+    seastar::future<> remove_unnamed(local_root_reference bundle) {
+        const auto object = local_paths::make(spec_.root)
+                              ->object(
+                                shard_,
+                                {descriptor_.segment.segment(),
+                                 descriptor_.segment.generation()},
+                                bundle.sequence());
+        if (!object) co_return;
+        try {
+            static_cast<void>(co_await files_.remove_file(*object));
+        } catch (...) {
+            // Left as debris for the next open's reconciliation.
+        }
+    }
+
     seastar::future<> close_publishers() {
         if (bundle_publisher_) {
             try {
@@ -1573,9 +2206,12 @@ private:
         co_return runtime::result<void>{};
     }
 
-    template<typename Source>
+    template<typename Source, typename Index>
     seastar::future<runtime::result<void>> seal_owned(
-      Source& source, std::uint32_t completed, codec::cooperative_work& work) {
+      Source& source,
+      std::uint32_t completed,
+      Index& index,
+      codec::cooperative_work& work) {
         const auto end = positions_->reserved;
         if (positions_->written != end)
             co_return runtime::failure(detail::path_error(errc::wrong_context));
@@ -1589,6 +2225,7 @@ private:
                 flushed_plain_writes_ = covered;
             }
             positions_->durable = end;
+            if (observer_) observer_->durable(end.bytes);
         }
         sealing_.data_synced = true;
         // Execution has stopped, so the digest has hashed every written
@@ -1618,6 +2255,7 @@ private:
           completed,
           prezeroed_end_,
           std::move(dependencies),
+          index,
           work);
     }
 
@@ -1783,11 +2421,12 @@ private:
         co_return runtime::result<void>{};
     }
 
-    template<typename Source>
+    template<typename Source, typename Index>
     seastar::future<runtime::result<void>> seal_recovered_owned(
       Source& source,
       const verified_extent& extent,
       std::uint32_t completed,
+      Index& index,
       codec::cooperative_work& work) {
         // The seal's writable handle replaces every read handle.
         co_await close_handles();
@@ -1864,15 +2503,23 @@ private:
             co_return runtime::result<void>{};
         };
         co_return co_await seal_root(
-          source, extent, end, completed, *size, std::move(dependencies), work);
+          source,
+          extent,
+          end,
+          completed,
+          *size,
+          std::move(dependencies),
+          index,
+          work);
     }
 
     // The retry bundle, then the sealed root at `end`; every byte past the
     // root is removed in the same durable step, one flush covers the extent
     // and the root, and only then is the sealed publication the first
     // published change. `file_bytes` is the file's size before the root,
-    // through any zero-written or recovered tail.
-    template<typename Source, typename Dependencies>
+    // through any zero-written or recovered tail. With the root durable an
+    // index source publishes its bundle, and the publication names it too.
+    template<typename Source, typename Dependencies, typename Index>
     seastar::future<runtime::result<void>> seal_root(
       Source& source,
       const verified_extent& finished,
@@ -1880,6 +2527,7 @@ private:
       std::uint32_t completed,
       std::uint64_t file_bytes,
       Dependencies dependencies,
+      Index& index,
       codec::cooperative_work& work) {
         const footer_expectation location{
           {descriptor_.segment,
@@ -2012,6 +2660,36 @@ private:
         auto synced = co_await data_->flush(completion_->metadata());
         if (!synced) co_return runtime::failure(synced.error());
         sealing_.root_synced = true;
+        // Derived state: whatever its publication does, the seal goes on.
+        // An extent without a record has no index.
+        std::optional<local_root_reference> indexed;
+        std::optional<sparse_index_context> index_context;
+        if constexpr (segment_seal_indexes<Index>) {
+            if (!finished.boundary().coverage.physical().empty()) {
+                try {
+                    index_context = index_scope(
+                      finished.boundary().coverage, *finished.digest());
+                    if (!index_context)
+                        sealing_.index.observe(
+                          detail::path_error(errc::wrong_context));
+                    else
+                        indexed = index_root(
+                          co_await index.publish(
+                            files_,
+                            owner_,
+                            spec_,
+                            shard_,
+                            *index_context,
+                            budget_,
+                            config_.metadata,
+                            work),
+                          sealing_.index);
+                } catch (...) {
+                    sealing_.index.observe(std::current_exception());
+                }
+            }
+        } else
+            static_cast<void>(index);
         if (publication_->value() == UINT64_MAX)
             co_return runtime::failure(detail::path_error(errc::out_of_range));
         auto next = local_publication_generation::make(
@@ -2023,11 +2701,18 @@ private:
                                        spec_.shard_owner(shard_).value(),
                                        *next)
                                        .value();
-        const local_object_publication publication{
-          descriptor_.segment,
-          local_object_state::sealed,
-          *footer,
-          {*reference}};
+        // Roots stay in kind order, and each keeps its context beside it.
+        local_object_publication publication{
+          descriptor_.segment, local_object_state::sealed, *footer, {}};
+        std::vector<local_bundle_context> contexts;
+        publication.roots.reserve(2);
+        contexts.reserve(2);
+        if (indexed) {
+            publication.roots.push_back(*indexed);
+            contexts.emplace_back(*index_context);
+        }
+        publication.roots.push_back(*reference);
+        contexts.emplace_back(location);
         auto pointer = co_await encode_local_metadata(
           {metadata_header,
            spec_.identity.metadata_alignment,
@@ -2051,20 +2736,32 @@ private:
           sealing_.pointer.disposition
           != local_publication_disposition::durable)
             co_return runtime::failure(detail::path_error(errc::io_failure));
+        // The sealed summary holds what a snapshot the earlier publication
+        // carried held; that snapshot is referenced by nothing from here on.
+        const auto superseded = snapshot_root_ ? snapshot_root_
+                                : read_publication_
+                                  ? snapshot_of(*read_publication_)
+                                  : std::nullopt;
         publication_ = *next;
         append_ = model::append_state::sealed;
         immutable_ = segment_immutable_expectation{
           finished.boundary().coverage, *finished.digest(), *file_end};
-        read_publication_ = publication;
-        read_roots_.assign(1, location);
+        read_publication_ = std::move(publication);
+        read_roots_ = std::move(contexts);
+        snapshot_root_.reset();
+        snapshot_boundary_.reset();
+        snapshot_facts_ = 0;
         co_await close_publishers();
         co_await close_handles();
         handle_ = lifetime_->failure.failed() ? segment_handle_state::closed
                                               : segment_handle_state::evicted;
+        // Only now that the publication replacing it is durable.
+        if (superseded) co_await remove_unnamed(*superseded);
         if (lifetime_->failure.failed()) co_return lifetime_->failure.outcome();
         seal_result_.boundary = *footer;
         seal_result_.retry = *reference;
         seal_result_.extent = immutable_;
+        seal_result_.index = indexed;
         co_return runtime::result<void>{};
     }
 
@@ -2241,8 +2938,10 @@ private:
                         flushed_plain_writes_ = std::max(
                           flushed_plain_writes_, covered);
                 }
-                if (!lifetime_->failure.failed())
+                if (!lifetime_->failure.failed()) {
                     positions_->durable = cut.end();
+                    if (observer_) observer_->durable(cut.end().bytes);
+                }
             }
             if (!lifetime_->failure.failed())
                 result.receipt = segment_durable_receipt{std::move(cut)};
@@ -2343,8 +3042,10 @@ private:
                 // that caller's byte owner; its own release ends the borrow.
                 if (front->failure.failed())
                     prefix_failed_ = true;
-                else if (!prefix_failed_)
+                else if (!prefix_failed_) {
                     positions_->written = front->layout.boundary().end();
+                    if (observer_) observer_->written(front->layout.blocks());
+                }
                 if (!digest) release_pending(*front);
                 inflight_.pop_front();
                 // State and the reusable slot are visible before notification.
@@ -2605,9 +3306,6 @@ private:
           bundle_memory_->bytes(),
           bundle_publisher_->prepared_bytes(),
           pointer_publisher_->prepared_bytes(),
-          creation_.descriptor.charged_bytes(),
-          creation_.data.charged_bytes(),
-          creation_.publication.charged_bytes(),
           zero_memory_ ? zero_memory_->bytes() : byte_count{}};
         const bool retained = include_retained && retry_memory_;
         byte_count total = retained ? retry_memory_->bytes() : byte_count{};
@@ -2820,6 +3518,26 @@ private:
           policy,
           current};
     }
+    // Replaces a pointer publisher that fenced itself with a prepared one
+    // for the same target, under the publication that still stands.
+    seastar::future<runtime::result<void>>
+    renew_pointer_publisher(codec::cooperative_work& work) {
+        try {
+            // Whatever its close reports, the failed publication reported.
+            static_cast<void>(co_await pointer_publisher_->close());
+            pointer_publisher_.emplace(
+              files_,
+              budget_,
+              target(
+                path(local_segment_file::published),
+                runtime::file_rename_policy::replace,
+                *publication_));
+            co_return co_await pointer_publisher_->prepare(
+              config_.metadata.operation_bytes, work);
+        } catch (...) {
+            co_return runtime::failure(detail::path_error(errc::io_failure));
+        }
+    }
     seastar::future<local_publication_outcome> publish_new(
       local_segment_file kind,
       bytes::fragmented_buffer payload,
@@ -2954,17 +3672,20 @@ private:
             lifetime_->failure.observe(existing);
             co_return;
         }
-        creation_.descriptor = co_await publish_local_segment_descriptor(
-          files_,
-          owner_,
-          spec_,
-          shard_,
-          descriptor_,
-          header_,
-          budget_,
-          config_.metadata,
-          work);
-        lifetime_->failure.observe(creation_.descriptor.failure.outcome());
+        // A creation publication's outcome ends where its failure is taken:
+        // kept, it would hold that publication's allowance, handle credits
+        // included, for as long as the segment is open.
+        lifetime_->failure.observe((co_await publish_local_segment_descriptor(
+                                      files_,
+                                      owner_,
+                                      spec_,
+                                      shard_,
+                                      descriptor_,
+                                      header_,
+                                      budget_,
+                                      config_.metadata,
+                                      work))
+                                     .failure.outcome());
         if (lifetime_->failure.failed()) co_return;
         auto header = co_await encode_segment_header(
           header_,
@@ -2976,9 +3697,10 @@ private:
               detail::path_error(header.error().code()));
             co_return;
         }
-        creation_.data = co_await publish_new(
-          local_segment_file::data, std::move(*header), work);
-        lifetime_->failure.observe(creation_.data.failure.outcome());
+        lifetime_->failure.observe(
+          (co_await publish_new(
+             local_segment_file::data, std::move(*header), work))
+            .failure.outcome());
         if (lifetime_->failure.failed()) co_return;
         lifetime_->failure.observe(co_await open_data(true, work));
         if (lifetime_->failure.failed()) co_return;
@@ -3057,9 +3779,10 @@ private:
               detail::path_error(encoded.error().code()));
             co_return;
         }
-        creation_.publication = co_await publish_new(
-          local_segment_file::published, std::move(encoded->bytes), work);
-        lifetime_->failure.observe(creation_.publication.failure.outcome());
+        lifetime_->failure.observe(
+          (co_await publish_new(
+             local_segment_file::published, std::move(encoded->bytes), work))
+            .failure.outcome());
         if (lifetime_->failure.failed() || closing_) co_return;
         const segment_writer_position initial{
           descriptor_.logical_origin, descriptor_.physical_origin, data_start_};
@@ -3268,7 +3991,6 @@ private:
     std::optional<local_file_publisher<Backend>> bundle_publisher_,
       pointer_publisher_;
     std::unique_ptr<local_generation_owner> generation_;
-    segment_creation_progress creation_;
     std::optional<local_publication_generation> publication_;
     // The startup seal execution allowance covers the native hash state for
     // this walk's lifetime; per-group workspace covers parser/codec
@@ -3315,12 +4037,20 @@ private:
     std::uint32_t retry_page_entries_{1};
     bool execution_stopped_{false}, seal_started_{false}, seal_done_{false};
     bool read_busy_{false}, writable_{false};
+    // A completed-retry snapshot publication in flight, and the durable
+    // footer the last one pinned.
+    bool snapshot_busy_{false};
+    std::optional<local_footer_reference> snapshot_boundary_;
+    // While appended to: the snapshot the pointer carries and its facts.
+    std::optional<local_root_reference> snapshot_root_;
+    std::uint32_t snapshot_facts_{0};
     segment_seal_progress sealing_;
     segment_seal_outcome seal_result_;
     std::optional<segment_immutable_expectation> immutable_;
     std::optional<local_object_publication> read_publication_;
     std::vector<local_bundle_context> read_roots_;
     bool freezing_{false}, prefix_failed_{false}, barrier_busy_{false};
+    std::optional<segment_block_observer> observer_;
     std::optional<runtime::monotonic_time> first_acceptance_;
     runtime::file_position data_start_{};
     std::optional<detail::segment_capacity_constants> capacity_;

@@ -14,6 +14,7 @@
 #include <seastar/core/when_all.hh>
 #include <seastar/core/with_scheduling_group.hh>
 
+#include <algorithm>
 #include <array>
 #include <exception>
 #include <span>
@@ -53,6 +54,12 @@ struct wal_writer_config final {
     byte_count maximum_pending_bytes{runtime::maximum_file_io_bytes};
     completion_resource_limits completion{};
     wal_child_limits children{};
+    // The most WAL files the shard may hold: its chain from the oldest file
+    // not yet removed to the head. A rotation that would add one past it is
+    // refused before anything is allocated, until whoever reclaims the WAL
+    // has removed a file. Zero sets no limit below the most a shard can
+    // hold, which bounds every writer; one could never rotate.
+    std::uint32_t retained_files{default_retained_wal_files};
 };
 struct wal_writer_statistics final {
     std::uint64_t accepted_groups{0}, encoded_groups{0}, write_calls{0},
@@ -132,7 +139,9 @@ public:
           || config.preallocation_extension_bytes > config.capacity_bytes
           || (config.preallocation_extension_bytes.value() != 0
               && config.preallocation_bytes.value() == 0)
-          || config.synchronous_write_bytes > runtime::maximum_file_io_bytes)
+          || config.synchronous_write_bytes > runtime::maximum_file_io_bytes
+          || config.retained_files == 1
+          || config.retained_files > maximum_retained_wal_files)
             return runtime::failure(detail::path_error(errc::invalid_argument));
         if (
           auto profile = parse_replay_profile(
@@ -265,15 +274,28 @@ public:
     // after that fresh barrier. Bytes after the content end stay in the old
     // file as slack, never written or truncated. One attempt, as for
     // bootstrap(): a failure is latched and never retried here.
+    // `chain` names the files of the chain the restart found still there,
+    // oldest first and the recovered head last: what the shard holds besides
+    // the successor. The successor is activated whatever the configured
+    // limit, which then holds the next rotation; but a chain that leaves no
+    // room for one more file among the most a shard can hold is refused, so
+    // repeated restarts under something that pins the WAL cannot add files
+    // without bound.
     [[nodiscard]] seastar::future<runtime::result<void>> activate_recovered(
-      local_wal_cursor content_end, codec::cooperative_work& admission) {
+      local_wal_cursor content_end,
+      const retained_wal& chain,
+      codec::cooperative_work& admission) {
         assert_current();
-        if (intent_ != wal_start_intent::recovered_head)
+        if (
+          intent_ != wal_start_intent::recovered_head || chain.empty()
+          || *chain.newest() != content_end.incarnation())
             return reject(errc::invalid_argument);
         if (started_ || admission_stopped_ || closing_ || closed_)
             return reject(errc::closed);
+        if (chain.full()) return reject(errc::resource_exhausted);
         if (auto ready = admission.poll(); !ready)
             return reject(ready.error().code());
+        retained_ = chain;
         return activate_owned(
           content_end, admission.policy(), operations_.hold());
     }
@@ -372,6 +394,16 @@ public:
         assert_current();
         return current_file().head;
     }
+    // The budget that funds this owner.
+    [[nodiscard]] const workload_budget& budget() const noexcept {
+        assert_current();
+        return budget_;
+    }
+    // Whether this owner continues a recovered head: the shard restarted.
+    [[nodiscard]] bool recovered() const noexcept {
+        assert_current();
+        return intent_ == wal_start_intent::recovered_head;
+    }
     [[nodiscard]] const runtime::first_failure& failure() const& noexcept {
         assert_current();
         return first_;
@@ -416,6 +448,25 @@ public:
     [[nodiscard]] bool rotation_pending() const noexcept {
         assert_current();
         return rotation_.has_value();
+    }
+    // The WAL files the shard holds, the head included, and the most it may.
+    // A successor prepared for a rotation still pending is not one of them
+    // until it is the head.
+    [[nodiscard]] wal_retention retention() const noexcept {
+        assert_current();
+        return {retained_.files(), config_.retained_files};
+    }
+    // Their names, oldest first.
+    [[nodiscard]] const retained_wal& retained() const& noexcept {
+        assert_current();
+        return retained_;
+    }
+    const retained_wal& retained() const&& = delete;
+    // Whoever reclaims the WAL removed the oldest of those files. The head
+    // is never removed, so this never takes the last name.
+    void release_oldest() noexcept {
+        assert_current();
+        retained_.drop_oldest();
     }
     [[nodiscard]] std::optional<local_wal_head>
     successor_head() const noexcept {
@@ -485,6 +536,10 @@ private:
         if (
           !end || *end > config_.capacity_bytes
           || required_bytes > config_.maximum_pending_bytes)
+            return reject(errc::resource_exhausted);
+        // A new file at the retained limit. A rotation already pending owns
+        // its successor and finishes.
+        if (!rotation_ && retention().full())
             return reject(errc::resource_exhausted);
         return rotate_owned(
           std::move(cut),
@@ -1826,6 +1881,12 @@ private:
                 rotation_.reset();
                 clear_slot(successor_file());
                 ++statistics_.rotations;
+                // The limit left room for it, and its incarnation is newer.
+                if (
+                  auto named = retained_.extend(cursor.incarnation()); !named) {
+                    first_.observe(named.error());
+                    co_return runtime::failure(named.error());
+                }
                 co_return runtime::result<void>{};
             } while (false);
         } catch (...) {
@@ -1940,6 +2001,11 @@ private:
                               current_file().descriptor->incarnation,
                               current_file().descriptor->data_start)
                               .value();
+        // The file that is now the head joins the files the shard holds.
+        if (auto named = retained_.extend(cursor.incarnation()); !named) {
+            first_.observe(named.error());
+            co_return false;
+        }
         positions_.emplace(owner, cursor, cursor, cursor);
         dispatcher_.emplace(
           seastar::with_scheduling_group(
@@ -2360,6 +2426,8 @@ private:
     bool dispatcher_stopping_{false}, barrier_busy_{false},
       prefix_failed_{false};
     wal_start_intent intent_{wal_start_intent::known_unactivated};
+    // Chain files the shard holds; see retention().
+    retained_wal retained_;
     // The recovered head's fresh barrier completed.
     bool recovered_flushed_{false};
 };

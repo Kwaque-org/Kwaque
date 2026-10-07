@@ -12,6 +12,7 @@
 #include "src/storage/tests/segment_qualification_contract.h"
 #include "src/storage/tests/segment_scan_contract.h"
 #include "src/storage/tests/segment_writer_contract.h"
+#include "src/storage/tests/sparse_index_contract.h"
 #include "src/storage/tests/wal_scan_contract.h"
 
 #include <seastar/testing/test_case.hh>
@@ -1977,6 +1978,25 @@ SEASTAR_TEST_CASE(segment_writer_fake_creation) {
       resource::workload_class::foreground_protocol);
 }
 
+SEASTAR_TEST_CASE(segment_writer_fake_creation_handles) {
+    co_await with_store_environment(
+      config(),
+      [](auto& env, auto& budget, auto drive) -> seastar::future<> {
+          auto& files = env.file_system();
+          const auto root = take(runtime::file_path::make("/kwaque/store"));
+          take(co_await drive.lifecycle(files.create_directories(root)));
+          stabilize(files, take(runtime::file_path::make("/kwaque")));
+          const auto spec = specification(root, {1, 1}, 68);
+          const std::array specs{spec};
+          ownership_input owner{specs};
+          co_await storage::testing::segment_writer_contract::creation_handles<
+            simulation::monotonic_clock>(files, owner, spec, budget, drive);
+      },
+      byte_count{18_MiB},
+      resource::workload_class::foreground_protocol,
+      64);
+}
+
 SEASTAR_TEST_CASE(segment_writer_fake_admission) {
     co_await with_store_environment(
       config(),
@@ -2118,6 +2138,180 @@ SEASTAR_TEST_CASE(segment_writer_fake_grouped_execution) {
           const std::array specs{spec};
           ownership_input owner{specs};
           co_await storage::testing::segment_writer_contract::grouped_execution<
+            simulation::monotonic_clock>(files, owner, spec, budget, drive);
+      },
+      byte_count{18_MiB},
+      resource::workload_class::foreground_protocol,
+      64);
+}
+
+SEASTAR_TEST_CASE(sparse_index_fake_active_feed) {
+    co_await with_store_environment(
+      config(),
+      [](auto& env, auto& budget, auto drive) -> seastar::future<> {
+          auto& files = env.file_system();
+          const auto root = take(runtime::file_path::make("/kwaque/store"));
+          take(co_await drive.lifecycle(files.create_directories(root)));
+          stabilize(files, take(runtime::file_path::make("/kwaque")));
+          const auto spec = specification(root, {1, 1}, 68);
+          const std::array specs{spec};
+          ownership_input owner{specs};
+          co_await storage::testing::sparse_index_contract::active_feed<
+            simulation::monotonic_clock>(files, owner, spec, budget, drive);
+      },
+      byte_count{18_MiB},
+      resource::workload_class::foreground_protocol,
+      64);
+}
+
+SEASTAR_TEST_CASE(sparse_index_fake_sealed_index) {
+    co_await with_store_environment(
+      config(),
+      [](auto& env, auto& budget, auto drive) -> seastar::future<> {
+          auto& files = env.file_system();
+          const auto root = take(runtime::file_path::make("/kwaque/store"));
+          take(co_await drive.lifecycle(files.create_directories(root)));
+          stabilize(files, take(runtime::file_path::make("/kwaque")));
+          const auto spec = specification(root, {1, 1}, 68);
+          const std::array specs{spec};
+          ownership_input owner{specs};
+          co_await storage::testing::sparse_index_contract::sealed_index<
+            simulation::monotonic_clock>(
+            files, owner, spec, budget, drive, false);
+      },
+      byte_count{18_MiB},
+      resource::workload_class::foreground_protocol,
+      64);
+}
+
+SEASTAR_TEST_CASE(sparse_index_fake_empty_extent) {
+    co_await with_store_environment(
+      config(),
+      [](auto& env, auto& budget, auto drive) -> seastar::future<> {
+          auto& files = env.file_system();
+          const auto root = take(runtime::file_path::make("/kwaque/store"));
+          take(co_await drive.lifecycle(files.create_directories(root)));
+          stabilize(files, take(runtime::file_path::make("/kwaque")));
+          const auto spec = specification(root, {1, 1}, 68);
+          const std::array specs{spec};
+          ownership_input owner{specs};
+          co_await storage::testing::sparse_index_contract::empty_extent<
+            simulation::monotonic_clock>(files, owner, spec, budget, drive);
+      },
+      byte_count{18_MiB},
+      resource::workload_class::foreground_protocol,
+      64);
+}
+
+SEASTAR_TEST_CASE(sparse_index_fake_index_named_after_seal) {
+    co_await with_store_environment(
+      config(),
+      [](auto& env, auto& budget, auto drive) -> seastar::future<> {
+          auto& files = env.file_system();
+          const auto root = take(runtime::file_path::make("/kwaque/store"));
+          take(co_await drive.lifecycle(files.create_directories(root)));
+          stabilize(files, take(runtime::file_path::make("/kwaque")));
+          const auto spec = specification(root, {1, 1}, 68);
+          const std::array specs{spec};
+          ownership_input owner{specs};
+          co_await storage::testing::sparse_index_contract::sealed_index<
+            simulation::monotonic_clock>(
+            files, owner, spec, budget, drive, true);
+      },
+      byte_count{18_MiB},
+      resource::workload_class::foreground_protocol,
+      64);
+}
+
+SEASTAR_TEST_CASE(sparse_index_fake_owed_index) {
+    co_await with_store_environment(
+      config(),
+      [](auto& env, auto& budget, auto drive) -> seastar::future<> {
+          auto& files = env.file_system();
+          const auto root = take(runtime::file_path::make("/kwaque/store"));
+          take(co_await drive.lifecycle(files.create_directories(root)));
+          stabilize(files, take(runtime::file_path::make("/kwaque")));
+          const auto spec = specification(root, {1, 1}, 68);
+          const std::array specs{spec};
+          ownership_input owner{specs};
+          co_await storage::testing::sparse_index_contract::owed_index<
+            simulation::monotonic_clock>(files, owner, spec, budget, drive);
+      },
+      byte_count{18_MiB},
+      resource::workload_class::foreground_protocol,
+      64);
+}
+
+SEASTAR_TEST_CASE(sparse_index_fake_resident_roots) {
+    co_await with_store_environment(
+      config(),
+      [](auto& env, auto& budget, auto drive) -> seastar::future<> {
+          auto& files = env.file_system();
+          const auto root = take(runtime::file_path::make("/kwaque/store"));
+          take(co_await drive.lifecycle(files.create_directories(root)));
+          stabilize(files, take(runtime::file_path::make("/kwaque")));
+          const auto spec = specification(root, {1, 1}, 68);
+          const std::array specs{spec};
+          ownership_input owner{specs};
+          co_await storage::testing::sparse_index_contract::resident_roots<
+            simulation::monotonic_clock>(files, owner, spec, budget, drive);
+      },
+      byte_count{18_MiB},
+      resource::workload_class::foreground_protocol,
+      64);
+}
+
+SEASTAR_TEST_CASE(sparse_index_fake_scanned_lookups) {
+    co_await with_store_environment(
+      config(),
+      [](auto& env, auto& budget, auto drive) -> seastar::future<> {
+          auto& files = env.file_system();
+          const auto root = take(runtime::file_path::make("/kwaque/store"));
+          take(co_await drive.lifecycle(files.create_directories(root)));
+          stabilize(files, take(runtime::file_path::make("/kwaque")));
+          const auto spec = specification(root, {1, 1}, 68);
+          const std::array specs{spec};
+          ownership_input owner{specs};
+          co_await storage::testing::sparse_index_contract::scanned_lookups<
+            simulation::monotonic_clock>(files, owner, spec, budget, drive);
+      },
+      byte_count{18_MiB},
+      resource::workload_class::foreground_protocol,
+      64);
+}
+
+SEASTAR_TEST_CASE(sparse_index_fake_replaced_under_readers) {
+    co_await with_store_environment(
+      config(),
+      [](auto& env, auto& budget, auto drive) -> seastar::future<> {
+          auto& files = env.file_system();
+          const auto root = take(runtime::file_path::make("/kwaque/store"));
+          take(co_await drive.lifecycle(files.create_directories(root)));
+          stabilize(files, take(runtime::file_path::make("/kwaque")));
+          const auto spec = specification(root, {1, 1}, 68);
+          const std::array specs{spec};
+          ownership_input owner{specs};
+          co_await storage::testing::sparse_index_contract::
+            replaced_under_readers<simulation::monotonic_clock>(
+              files, owner, spec, budget, drive);
+      },
+      byte_count{18_MiB},
+      resource::workload_class::foreground_protocol,
+      64);
+}
+
+SEASTAR_TEST_CASE(sparse_index_fake_paged_lookups) {
+    co_await with_store_environment(
+      config(),
+      [](auto& env, auto& budget, auto drive) -> seastar::future<> {
+          auto& files = env.file_system();
+          const auto root = take(runtime::file_path::make("/kwaque/store"));
+          take(co_await drive.lifecycle(files.create_directories(root)));
+          stabilize(files, take(runtime::file_path::make("/kwaque")));
+          const auto spec = specification(root, {1, 1}, 68);
+          const std::array specs{spec};
+          ownership_input owner{specs};
+          co_await storage::testing::sparse_index_contract::paged_lookups<
             simulation::monotonic_clock>(files, owner, spec, budget, drive);
       },
       byte_count{18_MiB},
@@ -4075,6 +4269,370 @@ SEASTAR_TEST_CASE(
             }
         }
     }
+}
+
+namespace {
+struct index_history_steps final {
+    // Storage steps before the index's own work began, and in all.
+    std::size_t began{0}, total{0};
+};
+
+// One sealed segment's index through a crash. The seal publishes the index,
+// or with `late` the segment is sealed without one and the index is named
+// afterwards. The process is cut after `cut` storage steps, or runs to its
+// end, and the device crashes. What a restart then finds must be a
+// publication that opens: still active, or sealed over the whole extent, and
+// a sealed one either names an index that is whole or names none, in which
+// case the data builds it again. Whatever was returned before the cut is
+// found. A bundle the crash left unnamed goes at the next open.
+seastar::future<index_history_steps> index_crash_history(
+  environment& env,
+  workload_budget& resources,
+  simulation::testing::scheduler_driver drive,
+  std::optional<std::size_t> cut,
+  bool late) {
+    namespace contract = storage::testing::segment_writer_contract;
+    namespace indexes = storage::testing::sparse_index_contract;
+    using namespace storage::testing;
+    using writer_type = segment_writer<
+      crash_file_session,
+      ownership_input,
+      simulation::monotonic_clock>;
+    auto& files = env.file_system();
+    const auto root = take(runtime::file_path::make("/kwaque/store"));
+    take(co_await drive.lifecycle(files.create_directories(root)));
+    stabilize(files, take(runtime::file_path::make("/kwaque")));
+    const auto spec = specification(root, {1, 1}, 68);
+    const std::array specs{spec};
+    ownership_input owner{specs};
+    seastar::abort_source caller;
+    codec::cooperative_work work{codec::limits::defaults(), caller};
+    co_await installation_contract::bootstrap(
+      files, owner, spec, resources, work, drive);
+    const auto description = contract::descriptor();
+    auto options = contract::configuration();
+    options.maximum_groups = 2;
+    options.admission.working_bytes = byte_count{1_MiB};
+    options.admission.maximum_blocks = 16;
+    const sparse_index_stride stride{byte_count{0}};
+    const auto object = local_object_sequence::make(46).value();
+    auto index = take(
+      active_sparse_index::make(
+        stride,
+        sparse_index_capacity(
+          stride,
+          description.maximum_data_bytes,
+          options.admission.maximum_blocks),
+        resources));
+    crash_file_session session{files};
+    auto writer = take(
+      writer_type::make_new(
+        session, owner, spec, 0, description, resources, options));
+    std::vector<complete_block_descriptor> blocks;
+    blocks.reserve(2);
+    bool began = false, sealed_returned = false, named_returned = false;
+    auto activity = [&]() -> seastar::future<runtime::first_failure> {
+        runtime::first_failure outcome;
+        try {
+            outcome.observe(co_await writer->create_new(work));
+            if (outcome.failed()) co_return outcome;
+            outcome.observe(writer->observe_blocks(index.observer()));
+            if (outcome.failed()) co_return outcome;
+            for (std::uint32_t i = 0; i < 2; ++i) {
+                std::optional<encoded_assigned_batch> batch;
+                if (i == 0)
+                    batch.emplace(co_await contract::child(work));
+                else
+                    batch.emplace(
+                      co_await contract::execution_child(101, work));
+                auto group = co_await contract::freeze_child(
+                  *writer, std::move(*batch), resources, work);
+                outcome.observe(co_await writer->encode_group(group, work));
+                if (outcome.failed()) co_return outcome;
+                blocks.push_back(group.blocks()[0].descriptor());
+                auto submission = take(writer->submit(std::move(group), work));
+                auto written = co_await std::move(submission.written);
+                outcome = written.failure;
+                if (outcome.failed()) co_return outcome;
+            }
+            std::uint32_t calls = 0;
+            began = !late;
+            auto sealed = co_await writer->seal(
+              contract::completed_source{{}, {}, &calls},
+              0,
+              2,
+              work,
+              sparse_index_seal{
+                &index, late ? local_object_sequence{} : object});
+            outcome = sealed.failure;
+            if (outcome.failed()) co_return outcome;
+            sealed_returned = sealed.boundary && sealed.retry && sealed.extent;
+            named_returned = sealed.index.has_value();
+            if (late) {
+                began = true;
+                const auto named = co_await writer->publish_index(
+                  sparse_index_seal{&index, object}, work);
+                outcome.observe(named);
+                named_returned = named.has_value();
+            }
+        } catch (...) {
+            outcome.observe(std::current_exception());
+        }
+        co_return outcome;
+    };
+    std::optional<seastar::future<runtime::first_failure>> pending{activity()};
+    std::optional<seastar::future<runtime::result<void>>> closing;
+    runtime::first_failure failed, completed;
+    index_history_steps steps;
+    bool marked = false;
+    try {
+        while ((!cut || steps.total < *cut) && steps.total < 1024) {
+            if (began && !marked) {
+                steps.began = steps.total;
+                marked = true;
+            }
+            const auto boundary = co_await history_step(
+              env.event_scheduler(), *pending);
+            if (boundary != history_boundary::stepped) break;
+            ++steps.total;
+        }
+        if (began && !marked) {
+            steps.began = steps.total;
+            marked = true;
+        }
+        require(steps.total < 1024, "index history exceeded its event bound");
+        if (!cut) {
+            require(
+              pending->available(), "index history parked without an event");
+            auto waiting = std::move(*pending);
+            pending.reset();
+            completed = co_await std::move(waiting);
+            take(completed.outcome());
+            require(
+              marked && sealed_returned && named_returned,
+              "an uninterrupted index history did not seal and name its "
+              "index");
+        }
+        // Fence the old process before crashing, then join all its children.
+        session.stop();
+        caller.request_abort();
+        closing.emplace(writer->close());
+        take(co_await drive.lifecycle(files.crash()));
+        if (pending) {
+            auto waiting = std::move(*pending);
+            pending.reset();
+            completed = co_await drive.lifecycle(std::move(waiting));
+        }
+        auto waiting = std::move(*closing);
+        closing.reset();
+        static_cast<void>(co_await drive.lifecycle(std::move(waiting)));
+    } catch (...) {
+        failed.observe(std::current_exception());
+    }
+    session.stop();
+    if (pending) {
+        caller.request_abort();
+        static_cast<void>(co_await drive.lifecycle(files.crash()));
+        static_cast<void>(co_await drive.lifecycle(std::move(*pending)));
+        pending.reset();
+    }
+    if (closing) {
+        static_cast<void>(co_await drive.lifecycle(std::move(*closing)));
+        closing.reset();
+    }
+    static_cast<void>(co_await drive.lifecycle(writer->close()));
+    writer.reset();
+    take(failed.outcome());
+
+    // All a restart has is what the device holds now.
+    seastar::abort_source recovered_abort;
+    codec::cooperative_work recovered_work{
+      codec::limits::defaults(), recovered_abort};
+    crash_file_session recovered{files};
+    const auto reopen = [&] {
+        return drive.lifecycle(open_recovery_generation(
+          recovered,
+          owner,
+          spec,
+          0,
+          description,
+          resources,
+          limits(),
+          recovered_work));
+    };
+    auto found = co_await reopen();
+    require(found.has_value(), "a crash left a publication that does not open");
+    auto generation = std::move(*found);
+    const auto publication = generation.publication;
+    const bool sealed = publication.state == local_object_state::sealed;
+    const bool indexed = std::ranges::any_of(
+      publication.roots, [](const local_root_reference& named) {
+          return named.kind() == local_root_kind::index;
+      });
+    runtime::first_failure checked;
+    try {
+        require(
+          sealed || publication.state == local_object_state::active,
+          "a crash produced a publication no seal makes");
+        require(
+          (sealed || (!sealed_returned && !late))
+            && (indexed || !named_returned),
+          "a seal or an index that was returned did not survive the crash");
+        require(
+          !generation.index_rebuild && (sealed || !indexed),
+          "a publication names an index that is not whole");
+        if (sealed) {
+            auto pin = take(generation.owner->pin());
+            const auto& footer = std::get<sealed_footer>(*pin.boundary());
+            const auto context = take(
+              sparse_index_context::make(
+                description.segment,
+                footer.coverage(),
+                footer.extent_digest(),
+                description.alignment));
+            if (indexed) {
+                // It answers for every block, and the whole of it agrees
+                // with the data, which the same walk verifies.
+                auto named = take(pin.root(local_root_kind::index));
+                for (const auto& block : blocks) {
+                    const auto answer = take(
+                      co_await drive.lifecycle(find_published_anchor(
+                        named,
+                        model::range_logical_offset::make(
+                          block.coverage().logical().begin().value())
+                          .value(),
+                        recovered_work)));
+                    require(
+                      answer
+                        && validate_sparse_index_anchor(
+                             context, answer->anchor, block)
+                             .has_value(),
+                      "a named index does not lead to its blocks");
+                }
+                require(
+                  !take(
+                    co_await drive.lifecycle(scrub_published_index(
+                      recovered,
+                      owner,
+                      spec,
+                      0,
+                      generation.history,
+                      named,
+                      resources,
+                      indexes::scan_limits(),
+                      recovered_work))),
+                  "a named index is not the index of its data");
+            } else {
+                // Owed: the sealed data builds it, block for block.
+                const auto rebuilt = take(
+                  co_await drive.lifecycle(rebuild_sparse_index(
+                    recovered,
+                    owner,
+                    spec,
+                    0,
+                    generation.history,
+                    context,
+                    stride,
+                    resources,
+                    indexes::scan_limits(),
+                    recovered_work)));
+                require(
+                  rebuilt.size() == blocks.size(),
+                  "the data did not build its index again");
+                for (std::uint32_t i = 0; i < rebuilt.size(); ++i)
+                    require(
+                      validate_sparse_index_anchor(
+                        context, rebuilt[i], blocks[i])
+                        .has_value(),
+                      "an index built again does not name its blocks");
+            }
+        }
+    } catch (...) {
+        checked.observe(std::current_exception());
+    }
+    const auto release = [&drive](local_recovery_generation& opened)
+      -> seastar::future<runtime::result<void>> {
+        if (!opened.owner) co_return runtime::result<void>{};
+        opened.owner->retire();
+        auto closed = co_await drive.lifecycle(opened.owner->close());
+        opened.owner.reset();
+        co_return closed;
+    };
+    try {
+        checked.observe(co_await release(generation));
+    } catch (...) {
+        checked.observe(std::current_exception());
+    }
+    take(checked.outcome());
+    // The next open removes whatever the crash left unnamed, and nothing a
+    // publication names.
+    static_cast<void>(take(
+      co_await drive.lifecycle(remove_unreferenced_objects(
+        recovered, owner, spec, 0, publication, recovered_work))));
+    const auto bundle = take(
+      take(local_paths::make(root))
+        .object(
+          0,
+          {description.segment.segment(), description.segment.generation()},
+          object));
+    require(
+      take(co_await drive.lifecycle(files.exists(bundle))) == indexed,
+      "an index bundle that nothing names was left, or a named one removed");
+    take(co_await drive.lifecycle(files.crash()));
+    auto again = co_await reopen();
+    require(again.has_value(), "a second crash left nothing that opens");
+    const bool same = again->publication == publication
+                      && !again->index_rebuild;
+    take(co_await release(*again));
+    require(same, "a second crash changed the publication a restart finds");
+    co_return steps;
+}
+
+seastar::future<> index_crash_histories(bool late) {
+    for (unsigned mask = 0; mask < 8; ++mask) {
+        const fake_crash_policy survival{
+          .data_percent = static_cast<std::uint8_t>((mask & 1U) ? 100 : 0),
+          .namespace_percent = static_cast<std::uint8_t>((mask & 2U) ? 100 : 0),
+          .eof_percent = static_cast<std::uint8_t>((mask & 4U) ? 100 : 0)};
+        index_history_steps whole;
+        co_await with_store_environment(
+          config({}, runtime::fault_action::error, 1, {}, survival),
+          [&](auto& env, auto& budget, auto drive) -> seastar::future<> {
+              whole = co_await index_crash_history(
+                env, budget, drive, {}, late);
+          },
+          byte_count{18_MiB},
+          resource::workload_class::foreground_protocol,
+          64);
+        require(
+          whole.began != 0 && whole.began < whole.total,
+          "the index history had no storage boundaries of its own");
+        for (std::size_t cut = whole.began; cut <= whole.total; ++cut) {
+            BOOST_TEST_CONTEXT("survival=" << mask << " cut=" << cut) {
+                co_await with_store_environment(
+                  config({}, runtime::fault_action::error, 1, {}, survival),
+                  [cut, late](
+                    auto& env, auto& budget, auto drive) -> seastar::future<> {
+                      static_cast<void>(co_await index_crash_history(
+                        env, budget, drive, cut, late));
+                  },
+                  byte_count{18_MiB},
+                  resource::workload_class::foreground_protocol,
+                  64);
+            }
+        }
+    }
+}
+} // namespace
+
+// A crash at every storage step of a seal that publishes its segment's index.
+SEASTAR_TEST_CASE(sparse_index_fake_seal_every_crash_boundary) {
+    co_await index_crash_histories(false);
+}
+
+// A crash at every storage step of naming an index after the seal.
+SEASTAR_TEST_CASE(sparse_index_fake_naming_every_crash_boundary) {
+    co_await index_crash_histories(true);
 }
 
 SEASTAR_TEST_CASE(

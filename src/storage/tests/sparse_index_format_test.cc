@@ -136,7 +136,7 @@ TEST(SparseIndexFormatTest, IndependentRootAndPageBytesKeepEveryField) {
       hex("4b5142460800010001002000e001000000000000000000008cb2c2b031115438"));
     EXPECT_EQ(
       wire.substr(0, 32),
-      hex("4b5142460800010001002000e001000000000000000000008b8244350c498aa0"));
+      hex("4b5142460800010001002000e001000000000000000000007f94f956e426a4cf"));
     EXPECT_TRUE(
       std::ranges::equal(
         std::bit_cast<std::array<char, 16>>(digest_of(page)),
@@ -144,7 +144,7 @@ TEST(SparseIndexFormatTest, IndependentRootAndPageBytesKeepEveryField) {
     EXPECT_TRUE(
       std::ranges::equal(
         std::bit_cast<std::array<char, 16>>(digest_of(wire)),
-        hex("4141ef84a656419ebc437de276295207")));
+        hex("038e51ea37f8c7f31b0ff7269fa12531")));
     const auto encoded_page = encode_sparse_index_page(
                                 entries,
                                 context,
@@ -157,10 +157,15 @@ TEST(SparseIndexFormatTest, IndependentRootAndPageBytesKeepEveryField) {
     ASSERT_TRUE(encoded_page.has_value());
     EXPECT_EQ(flat(encoded_page->bytes), page);
     EXPECT_EQ(encoded_page->reference, refs[0]);
-    const auto encoded_root
-      = encode_sparse_index_root(
-          context, 2, refs, work, budget().operation_remaining, charge)
-          .get();
+    const auto encoded_root = encode_sparse_index_root(
+                                context,
+                                2,
+                                refs,
+                                first_anchors(refs, context),
+                                work,
+                                budget().operation_remaining,
+                                charge)
+                                .get();
     ASSERT_TRUE(encoded_root.has_value());
     EXPECT_EQ(flat(encoded_root->bytes), wire);
     EXPECT_EQ(encoded_root->digest.bytes(), digest_of(wire));
@@ -365,7 +370,7 @@ TEST(SparseIndexFormatTest, EmptyAndRemovedExtentsNeedNoSyntheticAnchor) {
         codec::cooperative_work work{codec::limits::defaults(), abort};
         const auto encoded
           = encode_sparse_index_root(
-              context, 0, {}, work, budget().operation_remaining, charge)
+              context, 0, {}, {}, work, budget().operation_remaining, charge)
               .get();
         ASSERT_TRUE(encoded.has_value());
         const auto wire = root_wire({}, context);
@@ -556,16 +561,29 @@ TEST(SparseIndexFormatTest, DiagnosticEndIsNotAnIndexFilePosition) {
     ASSERT_TRUE(root.has_value());
     EXPECT_TRUE(input.at_end());
     EXPECT_EQ(root->value.encoded_bytes().value(), wire.size());
-    const auto encoded
-      = encode_sparse_index_root(
-          target(), 1, refs, work, budget().operation_remaining, charge, exact)
-          .get();
+    const auto encoded = encode_sparse_index_root(
+                           target(),
+                           1,
+                           refs,
+                           first_anchors(refs),
+                           work,
+                           budget().operation_remaining,
+                           charge,
+                           exact)
+                           .get();
     ASSERT_TRUE(encoded.has_value());
     EXPECT_EQ(flat(encoded->bytes), wire);
     const codec::field_context overflow{.origin = exact.origin + 1U};
     error(
       encode_sparse_index_root(
-        target(), 1, refs, work, budget().operation_remaining, charge, overflow)
+        target(),
+        1,
+        refs,
+        first_anchors(refs),
+        work,
+        budget().operation_remaining,
+        charge,
+        overflow)
         .get(),
       errc::out_of_range);
 }
@@ -696,8 +714,14 @@ TEST(
            change{172, 1, errc::malformed_data},
            change{176, 0, errc::malformed_data},
            change{180, 511, errc::malformed_data},
-           change{168 + 48, 0, errc::malformed_data},
-           change{172 + 48, 0, errc::malformed_data}}) {
+           change{168 + 56, 0, errc::malformed_data},
+           change{172 + 56, 0, errc::malformed_data},
+           // A page's first anchor: outside the coverage, or not after the
+           // page before it.
+           change{168 + 48, 99, errc::malformed_data},
+           change{168 + 48, 103, errc::malformed_data},
+           change{168 + 48 + 56, 100, errc::malformed_data},
+           change{168 + 48 + 56, 103, errc::malformed_data}}) {
         SCOPED_TRACE(test.offset);
         auto bad = wire;
         put(bad, 32 + test.offset, test.value, 4);
@@ -711,12 +735,18 @@ TEST(
     }
     error(
       encode_sparse_index_root(
-        target(), 0, {}, work, budget().operation_remaining, charge)
+        target(), 0, {}, {}, work, budget().operation_remaining, charge)
         .get(),
       errc::malformed_data);
     error(
       encode_sparse_index_root(
-        target(), 3, refs, work, budget().operation_remaining, charge)
+        target(),
+        3,
+        refs,
+        first_anchors(refs),
+        work,
+        budget().operation_remaining,
+        charge)
         .get(),
       errc::invalid_argument);
 }
@@ -853,6 +883,111 @@ TEST(SparseIndexFormatTest, FamilySubkindReservedBytesAndPaddingReject) {
     }
 }
 
+TEST(SparseIndexFormatTest, RootNamesEachPagesFirstAnchorAndTheWalkChecksIt) {
+    seastar::abort_source abort;
+    codec::cooperative_work work{codec::limits::defaults(), abort};
+    const auto context = target(8);
+    const std::array a{entry(100, 512), entry(102, 1536)};
+    const std::array b{entry(104, 2560), entry(106, 3584)};
+    const auto first = page_wire(a, context);
+    const auto second = page_wire(b, context, 1, 2);
+    const std::array refs{
+      page_reference(first, 2), page_reference(second, 2, 1, 2)};
+    const auto firsts = anchors({100, 104});
+    const auto wire = root_wire(refs, context, 32, firsts);
+    const auto root = pin(wire, context, work);
+    EXPECT_TRUE(std::ranges::equal(root.first_anchors(), firsts));
+    EXPECT_EQ(root.first_anchors().size(), root.pages().size());
+    const auto encode = [&](std::span<const model::range_logical_offset> at) {
+        return encode_sparse_index_root(
+                 context,
+                 4,
+                 refs,
+                 at,
+                 work,
+                 budget().operation_remaining,
+                 charge)
+          .get();
+    };
+    const auto encoded = encode(firsts);
+    ASSERT_TRUE(encoded.has_value());
+    EXPECT_EQ(flat(encoded->bytes), wire);
+    // One per page, inside the logical coverage, each after the last.
+    for (const auto& bad :
+         {anchors({100}),
+          anchors({100, 100}),
+          anchors({104, 100}),
+          anchors({99, 104}),
+          anchors({100, 108})})
+        error(encode(bad), errc::invalid_argument);
+    // A root may name an anchor its page does not begin with: both are the
+    // bytes their digests pin. The walk over the pages is what rejects it.
+    const auto wrong = pin(
+      root_wire(refs, context, 32, anchors({100, 103})), context, work);
+    sparse_index_verifier walk{wrong, work.policy()};
+    fragmented_buffer_parser one{buffer(first)};
+    ASSERT_TRUE(walk.next(one, page_memory(one, wrong, work), work).get());
+    fragmented_buffer_parser two{buffer(second)};
+    error(
+      walk.next(two, page_memory(two, wrong, work), work).get(),
+      errc::malformed_data);
+    EXPECT_EQ(two.bytes_consumed().value(), 0U);
+    EXPECT_TRUE(walk.closed());
+    fragmented_buffer_parser alone{buffer(second)};
+    EXPECT_TRUE(decode_sparse_index_page(
+                  alone,
+                  wrong,
+                  page_ordinal::make(1).value(),
+                  page_memory(alone, wrong, work),
+                  work)
+                  .get());
+}
+
+TEST(SparseIndexFormatTest, OriginalLogicalExtentSurvivesRemovedSlots) {
+    seastar::abort_source abort;
+    codec::cooperative_work work{codec::limits::defaults(), abort};
+    // Six records survive of an extent whose original span is 100..300:
+    // blocks at 100 and 110, then one at 200.
+    const auto context = sparse_index_context::make(
+                           sc(),
+                           scope(100, 300, 0, 6, 512, 2048),
+                           codec::extent_digest{digest_of("extent")},
+                           alignment())
+                           .value();
+    const std::array a{entry(100, 512), entry(110, 1024)};
+    const std::array b{entry(200, 1536)};
+    const auto first = page_wire(a, context);
+    const auto second = page_wire(b, context, 1, 2);
+    const std::array refs{
+      page_reference(first, 2), page_reference(second, 1, 1, 2)};
+    const auto root = pin(
+      root_wire(refs, context, 32, anchors({100, 200})), context, work);
+    EXPECT_TRUE(root.context().coverage() == context.coverage());
+    EXPECT_EQ(root.context().coverage().logical().count().value(), 200U);
+    EXPECT_EQ(root.context().coverage().physical().count().value(), 6U);
+    EXPECT_EQ(root.entry_count(), 3U);
+    sparse_index_verifier walk{root, work.policy()};
+    for (const auto& wire : {first, second}) {
+        fragmented_buffer_parser input{buffer(wire)};
+        ASSERT_TRUE(
+          walk.next(input, page_memory(input, root, work), work).get());
+    }
+    EXPECT_TRUE(walk.finish(work));
+    // An anchor is a base inside the original span, however few survive.
+    const std::array outside{entry(300, 512)};
+    error(
+      encode_sparse_index_page(
+        outside,
+        context,
+        page_ordinal::make(0).value(),
+        0,
+        work,
+        budget().operation_remaining,
+        charge)
+        .get(),
+      errc::invalid_argument);
+}
+
 TEST(SparseIndexFormatTest, SequentialPagesCheckBothColumnEdgesAndCompletion) {
     seastar::abort_source abort;
     codec::cooperative_work work{codec::limits::defaults(), abort};
@@ -863,7 +998,8 @@ TEST(SparseIndexFormatTest, SequentialPagesCheckBothColumnEdgesAndCompletion) {
     const auto second = page_wire(b, context, 1, 2);
     const std::array refs{
       page_reference(first, 2), page_reference(second, 2, 1, 2)};
-    const auto root = pin(root_wire(refs, context), context, work);
+    const auto root = pin(
+      root_wire(refs, context, 32, anchors({100, 104})), context, work);
     sparse_index_verifier verifier{root, work.policy()};
     for (const auto& wire : {first, second}) {
         fragmented_buffer_parser input{buffer("p" + wire + "suffix")};
@@ -892,7 +1028,14 @@ TEST(SparseIndexFormatTest, SequentialPagesCheckBothColumnEdgesAndCompletion) {
         const auto bad_second = page_wire(invalid, context, 1, 2);
         const std::array bad_refs{
           page_reference(first, 2), page_reference(bad_second, 2, 1, 2)};
-        const auto bad_root = pin(root_wire(bad_refs, context), context, work);
+        const auto bad_root = pin(
+          root_wire(
+            bad_refs,
+            context,
+            32,
+            anchors({100, invalid[0].logical_anchor().value()})),
+          context,
+          work);
         // Each page is valid alone; the edge is the rejected condition.
         fragmented_buffer_parser standalone{buffer(bad_second)};
         ASSERT_TRUE(decode_sparse_index_page(
@@ -1051,10 +1194,15 @@ TEST(SparseIndexFormatTest, RootFitsMaximumPageCountAndEmptyPageIsRejected) {
             byte_count{512},
             codec::immutable_object_digest{digest_of("page")})
             .value());
-    const auto encoded
-      = encode_sparse_index_root(
-          context, 256, refs, work, budget().operation_remaining, charge)
-          .get();
+    const auto encoded = encode_sparse_index_root(
+                           context,
+                           256,
+                           refs,
+                           first_anchors(refs, context),
+                           work,
+                           budget().operation_remaining,
+                           charge)
+                           .get();
     ASSERT_TRUE(encoded.has_value());
     const auto root = pin(root_wire(refs, context), context, work);
     EXPECT_EQ(root.pages().size(), 256U);
@@ -1173,8 +1321,15 @@ TEST(SparseIndexFormatTest, RealSuspensionCancellationDrainsAndRestoresCursor) {
             error(pending.get(), errc::aborted);
             EXPECT_TRUE(suspended);
         } else {
+            const auto firsts = first_anchors(refs);
             auto pending = encode_sparse_index_root(
-              target(), 2, refs, work, budget().operation_remaining, charge);
+              target(),
+              2,
+              refs,
+              firsts,
+              work,
+              budget().operation_remaining,
+              charge);
             const bool suspended = !pending.available();
             abort.request_abort();
             error(pending.get(), errc::aborted);
@@ -1197,6 +1352,7 @@ TEST(
     const std::array refs{page_reference(page, 2)};
     const auto wire = root_wire(refs);
     const auto context = target();
+    const auto firsts = first_anchors(refs, context);
     const codec::immutable_object_digest digest{digest_of(wire)};
     const auto root = pin(wire, context, setup);
     for (const unsigned operation : {0U, 1U, 2U, 3U}) {
@@ -1241,6 +1397,7 @@ TEST(
                                   context,
                                   2,
                                   refs,
+                                  firsts,
                                   work,
                                   budget().operation_remaining,
                                   charge)

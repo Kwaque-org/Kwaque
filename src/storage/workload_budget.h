@@ -89,6 +89,10 @@ public:
     reservation_charge(byte_count retained) const;
     [[nodiscard]] workload_budget_limits limits() const noexcept;
     [[nodiscard]] bool owns(const workload_reservation&) const noexcept;
+    // Whether what one admits can keep the other from admitting: the same
+    // budget, or two cut from one workload class, whose memory they share.
+    [[nodiscard]] bool
+    shares_admission_with(const workload_budget&) const noexcept;
     [[nodiscard]] runtime::result<workload_reservation> try_reserve_buffer(
       const bytes::fragmented_buffer& buffer, byte_count additional = {});
     // New alias descriptor/control storage must be admitted separately before

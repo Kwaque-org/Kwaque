@@ -233,6 +233,13 @@ bool workload_budget::owns(
     if (reservation.state_) reservation.state_->assert_current();
     return reservation.state_ && reservation.state_->owner == state_;
 }
+bool workload_budget::shares_admission_with(
+  const workload_budget& other) const noexcept {
+    assert_current();
+    other.assert_current();
+    return state_ == other.state_
+           || state_->workload_memory == other.state_->workload_memory;
+}
 runtime::result<byte_count>
 workload_budget::reservation_charge(byte_count retained) const {
     assert_current();

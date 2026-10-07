@@ -107,7 +107,7 @@ runtime::result<void> validate_discovery_expectation(
     if (expected.select_current &&
         (record.digest || record.encoded_bytes || record.page || record.wal_incarnation
          || record.data_device || record.data_metadata_alignment || record.previous_retry
-         || record.previous_checkpoint_end
+         || record.previous_checkpoint
          || (kind == local_entry_kind::control && (record.segment || record.segment_alignment))))
         return runtime::failure(detail::path_error(errc::invalid_argument));
     if (

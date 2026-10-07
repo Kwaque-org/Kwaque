@@ -353,7 +353,7 @@ public:
             value_.emplace(
               local_checkpoint_page{
                 *sequence, *ordinal, load<12, std::uint32_t>(*raw), {}});
-            co_return co_await entries<164>(
+            co_return co_await entries<140>(
               std::get<local_checkpoint_page>(*value_).entries,
               load<16, std::uint32_t>(*raw),
               static_cast<std::uint32_t>(std::min<std::uint64_t>(

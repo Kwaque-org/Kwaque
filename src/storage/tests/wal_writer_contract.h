@@ -16,6 +16,9 @@ inline wal_writer_config configuration() {
     wal_writer_config config{alignment(8192), byte_count{1_MiB}};
     config.children.working_bytes = byte_count{2_MiB};
     config.children.charge = charge;
+    // These contracts run the writer with nothing that reclaims its files;
+    // one that bounds them says so.
+    config.retained_files = 0;
     return config;
 }
 

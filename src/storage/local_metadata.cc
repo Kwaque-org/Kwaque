@@ -54,7 +54,7 @@ local_payload_bytes(const local_metadata_payload& payload) noexcept {
               cap = maximum_object_pages;
           } else if constexpr (std::is_same_v<T, local_checkpoint_page>) {
               fixed = 20;
-              width = 164;
+              width = 140;
               count = value.entries.size();
               cap = maximum_object_entries;
           } else if constexpr (std::is_same_v<T, local_deletion_intent>) {
@@ -132,6 +132,8 @@ codec::result<void> check_local_page_fields(
     return {};
 }
 namespace {
+constexpr std::uint16_t durable_footer_family = static_cast<std::uint16_t>(
+  codec::format_family::durable_boundary_footer);
 codec::result<void> scalar_code(
   std::uint64_t value, std::uint64_t maximum, codec::field_context c) {
     if (value == 0) return codec::failure(page_error(errc::malformed_data, c));
@@ -415,8 +417,10 @@ seastar::future<codec::result<void>> validate_local_payload(
         if (checkpoint_root) {
             auto order = checkpoint_root->begin.compare(
               header.owner(), checkpoint_root->end, header.owner());
-            if (!order || *order > 0 || ((*order == 0) != (total == 0)))
-                co_return bad();
+            // The end never precedes the begin. Entries are pins, not WAL
+            // intervals, so a table can change while the cursors stand still
+            // and the cursors can move while the table is empty.
+            if (!order || *order > 0) co_return bad();
         } else if (
           auto valid = local_wire(
             retry_root->footer.validate_alignment(data_alignment), c);
@@ -436,7 +440,7 @@ seastar::future<codec::result<void>> validate_local_payload(
               ordinal++,
               first,
               checkpoint_root ? 92 : 164,
-              checkpoint_root ? 164 : 160,
+              checkpoint_root ? 140 : 160,
               layout.alignment(),
               work.policy(),
               c);
@@ -468,7 +472,7 @@ seastar::future<codec::result<void>> validate_local_payload(
             c);
           !valid)
             co_return valid;
-        std::optional<local_wal_cursor> previous;
+        const local_checkpoint_entry* previous = nullptr;
         std::optional<model::batch_id> previous_id;
         for (std::size_t i = 0; i < count; ++i) {
             if (
@@ -481,28 +485,46 @@ seastar::future<codec::result<void>> validate_local_payload(
             if (checkpoint) {
                 const auto& entry = checkpoint->entries[i];
                 if (
-                  writing
-                  && entry.disposition
-                       == local_checkpoint_disposition::preserved_candidate)
-                    co_return codec::failure(
-                      page_error(errc::unsupported_format, c));
-                if (
                   auto code = scalar_code(
                     static_cast<std::uint16_t>(entry.disposition), 3, c);
                   !code)
                     co_return code;
-                auto order = entry.begin.compare(
-                  header.owner(), entry.end, header.owner());
+                // A relocated candidate is a recognized code with no reader
+                // or writer yet.
                 if (
-                  !order || *order >= 0 || !entry.evidence_sequence
-                  || entry.segment.cluster() != header.owner().cluster())
+                  entry.disposition
+                  == local_checkpoint_disposition::preserved_candidate)
+                    co_return codec::failure(
+                      page_error(errc::unsupported_format, c));
+                if (entry.segment.cluster() != header.owner().cluster())
                     co_return bad();
-                if (previous) {
-                    auto gap = previous->compare(
-                      header.owner(), entry.begin, header.owner());
-                    if (!gap || *gap > 0) co_return bad();
-                }
-                previous = entry.end;
+                if (
+                  entry.disposition
+                  == local_checkpoint_disposition::segment_boundary) {
+                    // The inline reference of a durable footer on a named
+                    // data device. A segment has one, first among its
+                    // entries.
+                    if (
+                      entry.device.is_nil()
+                      || entry.family != durable_footer_family
+                      || !local_footer_reference::make(
+                        runtime::file_position{entry.locator},
+                        entry.bytes,
+                        entry.family,
+                        entry.digest)
+                      || (previous && previous->segment == entry.segment))
+                        co_return bad();
+                } else if (
+                  // A decision record on this device, by its sequence.
+                  !entry.device.is_nil() || entry.family != 0
+                  || entry.locator == 0 || entry.bytes.value() < 32
+                  || entry.bytes > local_metadata_max_bytes
+                  || entry.bytes.value() % layout.alignment().bytes().value()
+                       != 0)
+                    co_return bad();
+                if (previous && !previous->canonical_less(entry))
+                    co_return bad();
+                previous = &entry;
             } else {
                 const auto& entry = retries->entries[i];
                 if (
@@ -554,7 +576,7 @@ codec::result<void> validate_local_expectation(
       || e.digest.has_value() != e.encoded_bytes.has_value()
       || (pinned && !e.digest) || page != e.page.has_value()
       || (e.previous_retry && kind != local_metadata_kind::completed_retry_page)
-      || (e.previous_checkpoint_end && kind != local_metadata_kind::checkpoint_page))
+      || (e.previous_checkpoint && kind != local_metadata_kind::checkpoint_page))
         return codec::failure(page_error(errc::invalid_argument, c));
     if (e.segment && e.segment->cluster() != e.header.owner().cluster())
         return codec::failure(page_error(errc::invalid_argument, c));
@@ -562,7 +584,7 @@ codec::result<void> validate_local_expectation(
         || e.encoded_bytes->value() % e.alignment.bytes().value() != 0))
         return codec::failure(page_error(errc::invalid_argument, c));
     if (e.page && (e.page->digest() != *e.digest || e.page->encoded_bytes() != *e.encoded_bytes
-        || (e.page->ordinal().value() == 0 && (e.previous_retry || e.previous_checkpoint_end))))
+        || (e.page->ordinal().value() == 0 && (e.previous_retry || e.previous_checkpoint))))
         return codec::failure(page_error(errc::invalid_argument, c));
     return {};
 }
@@ -609,12 +631,14 @@ codec::result<void> match_local_expectation(
               || checkpoint.first_entry != e.page->first_entry()
               || checkpoint.entries.size() != e.page->entry_count())
                 return wrong();
-            if (e.previous_checkpoint_end) {
-                const auto order = e.previous_checkpoint_end->compare(
-                  header.owner(),
-                  checkpoint.entries.front().begin,
-                  header.owner());
-                if (!order || *order > 0)
+            // Order and the one boundary per segment hold across pages.
+            if (e.previous_checkpoint) {
+                const auto& first = checkpoint.entries.front();
+                if (
+                  !e.previous_checkpoint->canonical_less(first)
+                  || (first.disposition
+                        == local_checkpoint_disposition::segment_boundary
+                      && e.previous_checkpoint->segment == first.segment))
                     return codec::failure(page_error(errc::malformed_data, c));
             }
         }
@@ -656,34 +680,43 @@ void write_local_root(
     write_digest<28>(out, ref.digest());
 }
 codec::result<local_checkpoint_entry> read_local_checkpoint_entry(
-  const std::array<char, 164>& raw, codec::field_context c) {
-    const auto begin = read_local_cursor<0>(raw, c);
-    const auto end = read_local_cursor<24>(raw, c);
-    const auto segment = read_local_segment<48>(raw, c);
-    if (!begin) return codec::failure(begin.error());
-    if (!end) return codec::failure(end.error());
+  const std::array<char, 140>& raw, codec::field_context c) {
+    const auto segment = read_local_segment<0>(raw, c);
     if (!segment) return codec::failure(segment.error());
-    if (load<122, std::uint16_t>(raw) != 0)
-        return codec::failure(page_error(errc::malformed_data, c, 122));
-    const auto digest = read_digest<132>(raw);
+    for (const std::size_t reserved : {74U, 106U})
+        if (raw[reserved] != 0 || raw[reserved + 1] != 0)
+            return codec::failure(
+              page_error(errc::malformed_data, c, reserved));
+    const auto digest = read_digest<108>(raw);
     if (!digest)
-        return codec::failure(page_error(errc::malformed_data, c, 148));
+        return codec::failure(page_error(errc::malformed_data, c, 124));
+    // A discard names no device, so nil is a value here.
+    device_store_id device;
+    if (std::any_of(raw.begin() + 76, raw.begin() + 92, [](char octet) {
+            return octet != 0;
+        })) {
+        const auto named = read_id<76, device_store_id>(raw, c);
+        if (!named) return codec::failure(named.error());
+        device = *named;
+    }
     return local_checkpoint_entry{
-      *begin,
-      *end,
       *segment,
-      static_cast<local_checkpoint_disposition>(load<120, std::uint16_t>(raw)),
-      load<124, std::uint64_t>(raw),
+      static_cast<local_checkpoint_disposition>(load<72, std::uint16_t>(raw)),
+      device,
+      load<92, std::uint64_t>(raw),
+      byte_count{load<100, std::uint32_t>(raw)},
+      load<104, std::uint16_t>(raw),
       codec::immutable_object_digest{*digest}};
 }
 void write_local_checkpoint_entry(
-  std::array<char, 164>& out, const local_checkpoint_entry& entry) noexcept {
-    write_local_cursor<0>(out, entry.begin);
-    write_local_cursor<24>(out, entry.end);
-    write_sc<48>(out, entry.segment);
-    store<120>(out, static_cast<std::uint16_t>(entry.disposition));
-    store<124>(out, entry.evidence_sequence);
-    write_digest<132>(out, entry.evidence_digest);
+  std::array<char, 140>& out, const local_checkpoint_entry& entry) noexcept {
+    write_sc<0>(out, entry.segment);
+    store<72>(out, static_cast<std::uint16_t>(entry.disposition));
+    write_id<76>(out, entry.device);
+    store<92>(out, entry.locator);
+    store<100>(out, static_cast<std::uint32_t>(entry.bytes.value()));
+    store<104>(out, entry.family);
+    write_digest<108>(out, entry.digest);
 }
 codec::result<local_deletion_object> read_local_deletion_object(
   const std::array<char, 12>& raw, codec::field_context c) {

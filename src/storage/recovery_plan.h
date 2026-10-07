@@ -53,6 +53,14 @@ struct recovery_wal_plan final {
     recovery_plan_reason reason{recovery_plan_reason::none};
     // The successor's predecessor cursor.
     std::optional<local_wal_cursor> predecessor;
+    // Chain files the scan read, from the file it began in to the head.
+    std::uint64_t files{0};
+    // The WAL files the shard still holds, oldest first: the chain from the
+    // file the scan began in to the head, and how many it has. The names
+    // fall short of that count when the chain has more files than a shard
+    // may hold.
+    retained_wal chain;
+    std::uint64_t chain_files{0};
     // PREPAREs without an independent target; the WAL holding them stays.
     std::uint64_t unresolved{0};
     // Rotated files with nonzero bytes after their sealed end.

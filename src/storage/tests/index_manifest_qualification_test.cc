@@ -75,11 +75,24 @@ void check_page(
       before.metadata_remaining.value() - after.metadata_remaining.value(),
       served.value());
 }
+// What a decoded root keeps allocated: its references, and for an index the
+// first anchor of each page as well.
+template<typename Root>
+byte_count root_cost(const Root& root) {
+    auto cost = charge(byte_count{root.page_capacity() * sizeof(page_ref)});
+    if constexpr (std::same_as<Root, sparse_index_root>)
+        cost = cost
+                 .checked_add(charge(
+                   byte_count{
+                     root.first_anchor_capacity()
+                     * sizeof(model::range_logical_offset)}))
+                 .value();
+    return cost;
+}
 template<typename Root>
 void check_root(
   const Root& root, codec::decode_budget before, codec::decode_budget after) {
-    const auto served = charge(
-      byte_count{root.page_capacity() * sizeof(page_ref)});
+    const auto served = root_cost(root);
     EXPECT_LE(root.page_capacity(), 256U);
     EXPECT_LE(root.encoded_bytes().value(), 65536U);
     EXPECT_LE(served.value(), 131072U);
@@ -159,6 +172,7 @@ void qualify_index(std::size_t h, std::uint64_t a, bool underfilled) {
                                    context,
                                    65536,
                                    refs,
+                                   ix::first_anchors(refs, context),
                                    work,
                                    writer_memory(work, vector_cost(refs), wire),
                                    charge)
@@ -185,6 +199,11 @@ void qualify_index(std::size_t h, std::uint64_t a, bool underfilled) {
       = vector_cost(refs)
           .checked_add(
             charge(byte_count{root.page_capacity() * sizeof(page_ref)}))
+          .value()
+          .checked_add(charge(
+            byte_count{
+              root.first_anchor_capacity()
+              * sizeof(model::range_logical_offset)}))
           .value();
     for (const auto& ref : root.pages()) {
         const auto entries = index_entries(

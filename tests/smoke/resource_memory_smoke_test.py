@@ -28,6 +28,7 @@ CONFIGURED_MEMORY_METRIC = "kwaque_resource_manager_memory_configured_bytes"
 def reactor_arguments(shards: int) -> tuple[str, ...]:
     return (
         f"--reactor-backend={REACTOR_BACKEND}",
+        "--max-networking-io-control-blocks=1000",
         f"--smp={shards}",
         "--memory=128M",
         "--overprovisioned",

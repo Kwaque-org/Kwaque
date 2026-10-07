@@ -100,6 +100,7 @@ struct fixture final {
             first += count;
             seastar::thread::maybe_yield();
         }
+        if (type == kind::index) firsts = ix::first_anchors(refs, context);
         root_wire = type == kind::retry ? sealed_wire(
                                             evidence.boundary(),
                                             evidence.digest()->bytes(),
@@ -135,6 +136,7 @@ struct fixture final {
     std::optional<range_manifest_root_header> manifest_header;
     std::uint32_t total{0};
     std::vector<page_ref> refs;
+    std::vector<model::range_logical_offset> firsts;
     std::vector<fragmented_buffer> cache;
     std::vector<completed_retry> retries;
     std::vector<sparse_index_entry> indexes;
@@ -143,6 +145,15 @@ struct fixture final {
     std::optional<codec::immutable_object_digest> root_digest;
 };
 
+byte_count with_root(byte_count held, const sparse_index_root& root) {
+    return held
+      .checked_add(charge(byte_count{root.page_capacity() * sizeof(page_ref)}))
+      .value()
+      .checked_add(charge(
+        byte_count{
+          root.first_anchor_capacity() * sizeof(model::range_logical_offset)}))
+      .value();
+}
 template<typename Root>
 byte_count with_root(byte_count held, const Root& root) {
     return held
@@ -236,6 +247,7 @@ void encode(std::string_view name, fixture& f, codec::cooperative_work& work) {
                          f.context,
                          f.total,
                          f.refs,
+                         f.firsts,
                          work,
                          available(held),
                          charge)

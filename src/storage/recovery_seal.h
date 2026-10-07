@@ -675,11 +675,18 @@ resolve_recovered_seal(
 // attempt's bundle is left for reconciliation. `wal.target` is the segment's
 // verified descriptor and header, `wal.devices` include `data`. Source and
 // the counts are as for segment_writer::seal().
+//
+// An index source is given every block of the verifying walk and then the
+// seal. An attempt uses it up whatever its outcome: its walk has offered
+// blocks, so another attempt is given a source nothing was offered to. An
+// attempt that finds the segment already sealed offers it nothing, and
+// reports the index root the publication names.
 template<
   runtime::monotonic_clock Clock,
   runtime::file_system_backend Backend,
   local_directory_owner Owner,
-  typename Source>
+  typename Source,
+  typename Index = segment_no_index>
 seastar::future<runtime::result<recovered_seal_outcome>> execute_recovered_seal(
   Backend& files,
   Owner& ownership,
@@ -694,7 +701,8 @@ seastar::future<runtime::result<recovered_seal_outcome>> execute_recovered_seal(
   Source source,
   std::uint32_t completed,
   std::uint32_t unresolved,
-  codec::cooperative_work& work) {
+  codec::cooperative_work& work,
+  Index index = {}) {
     using writer_type = segment_writer<Backend, Owner, Clock>;
     const auto& descriptor = wal.target.descriptor;
     const auto& header = wal.target.header;
@@ -743,9 +751,12 @@ seastar::future<runtime::result<recovered_seal_outcome>> execute_recovered_seal(
             recovered_seal_outcome done;
             done.already_sealed = true;
             done.seal.boundary = publication.boundary;
-            for (const auto& root : publication.roots)
+            for (const auto& root : publication.roots) {
                 if (root.kind() == local_root_kind::sealed_retry)
                     done.seal.retry = root;
+                if (root.kind() == local_root_kind::index)
+                    done.seal.index = root;
+            }
             done.seal.unresolved = unresolved;
             co_return done;
         }
@@ -845,6 +856,16 @@ seastar::future<runtime::result<recovered_seal_outcome>> execute_recovered_seal(
             // Every byte below the end, from the data start, with its digest.
             // A pinned footer below the end must be exactly the one found
             // there.
+            // An index source is given each block as it is verified, so the
+            // extent is not read again to index it. One that has a `block`
+            // the walk cannot call would be left unfed without a word.
+            static_assert(
+              !requires { &Index::block; }
+                || requires(
+                  Index& fed,
+                  const complete_block_descriptor&
+                    described) { fed.block(described); },
+              "an index source's block() takes one verified block descriptor");
             bool seen = false;
             auto extent = co_await verify_local_segment_extent(
               files,
@@ -856,7 +877,16 @@ seastar::future<runtime::result<recovered_seal_outcome>> execute_recovered_seal(
               budget,
               limits,
               work,
-              detail::recovered_seal_pin{pin, &seen});
+              [&index, pinned = detail::recovered_seal_pin{pin, &seen}](
+                const segment_scanned_object& object) {
+                  if constexpr (requires {
+                                    index.block(object.block->descriptor());
+                                }) {
+                      if (object.block) index.block(object.block->descriptor());
+                  } else
+                      static_cast<void>(index);
+                  return pinned(object);
+              });
             if (!extent) {
                 failed.observe(extent);
                 break;
@@ -870,7 +900,8 @@ seastar::future<runtime::result<recovered_seal_outcome>> execute_recovered_seal(
               std::move(source),
               completed,
               unresolved,
-              work);
+              work,
+              std::move(index));
             failed = output.seal.failure;
         } while (false);
     } catch (...) {

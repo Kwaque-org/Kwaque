@@ -75,7 +75,8 @@ TEST(StorageFuzzCasesTest, MalformedPaddingRejectsAcrossFragmentLayouts) {
                                           : page;
             const std::size_t fixed = is_manifest ? (is_root ? 88U : 92U)
                                                   : (is_root ? 168U : 172U);
-            const std::size_t tail = is_root ? 48U
+            // An index root follows each reference with a first anchor.
+            const std::size_t tail = is_root ? (is_manifest ? 48U : 56U)
                                              : fixture.entries
                                                  * (is_manifest ? 104U : 16U);
             const auto padding_begin = 32U + fixed + tail;
@@ -146,16 +147,16 @@ TEST(StorageFuzzCasesTest, MetadataIndependentFixedBytesAndExactHashes) {
         false,
         32,
         "4b5142460800010001002000e001000000000000000000001733694086360e8c",
-        "4b5142460800010001002000e00100000000000000000000ec0bed6cd1805ccd",
+        "4b5142460800010001002000e00100000000000000000000181d500f39ef72a2",
         "9a80b14ad14fb36c79d8e1eb3a0d87f3",
-        "ee2c54a72d47091731a5d53a07015ca4"},
+        "616956846c718b3ffec79c82690d553f"},
       golden{
         false,
         4096,
         "4b5142460800020001000010000200000000000000000000c504de3d2e65c58f",
-        "4b5142460800020001000010000200000000000000000000263dc9bb5187d5ba",
+        "4b51424608000200010000100002000000000000000000000679a106b73f0d96",
         "54b6ad14b069fcb1241158c65bd62e0e",
-        "a488a0539ccc311a37feae0a6bb59f22"},
+        "243e962d4c522343c31e05c6a5d9d66d"},
       golden{
         true,
         32,

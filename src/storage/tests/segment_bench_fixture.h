@@ -62,6 +62,16 @@ struct extent_input final {
 };
 
 [[nodiscard]] codec::limits policy(const shape&);
+// One child batch of the shape, assigned at `logical` in `segment`: what
+// every extent here is made of. `sequence` is its place in its producer's
+// stream and repeats nowhere in one store. The inputs are borrowed until the
+// batch is returned.
+[[nodiscard]] seastar::future<encoded_assigned_batch> make_batch(
+  const shape&,
+  const segment_context&,
+  model::range_logical_end logical,
+  std::uint64_t sequence,
+  codec::cooperative_work&);
 [[nodiscard]] seastar::future<extent_input>
 make_extent(const shape&, std::uint32_t segment, codec::cooperative_work&);
 [[nodiscard]] byte_count retained_bound(const extent_input&);

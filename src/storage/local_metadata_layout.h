@@ -14,7 +14,7 @@ inline constexpr byte_count local_metadata_first_read_bytes{16_KiB};
 inline constexpr byte_count local_root_reference_bytes{60};
 inline constexpr byte_count local_footer_reference_bytes{48};
 inline constexpr byte_count local_wal_cursor_bytes{24};
-inline constexpr byte_count local_checkpoint_entry_bytes{164};
+inline constexpr byte_count local_checkpoint_entry_bytes{140};
 inline constexpr byte_count local_deletion_object_bytes{12};
 inline constexpr std::uint32_t local_deletion_objects_max = 512;
 
@@ -52,7 +52,7 @@ inline constexpr std::array local_metadata_descriptors{
   local_metadata_descriptor{
     local_metadata_kind::checkpoint_root, 56, 56, 48, 256},
   local_metadata_descriptor{
-    local_metadata_kind::checkpoint_page, 20, 20, 164, 65536},
+    local_metadata_kind::checkpoint_page, 20, 20, 140, 65536},
   local_metadata_descriptor{
     local_metadata_kind::deletion_intent, 96, 96, 12, 512},
   local_metadata_descriptor{

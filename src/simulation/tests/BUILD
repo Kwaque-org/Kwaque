@@ -783,7 +783,8 @@ kwaque_cc_seastar_test(
 
 kwaque_cc_seastar_test(
     name = "local_append_test",
-    timeout = "moderate",
+    # Two crash sweeps run one store per cut.
+    timeout = "long",
     srcs = ["local_append_test.cc"],
     data = ["//src/storage/tests:local_metadata_fixture_data"],
     memory = "256MiB",
@@ -845,6 +846,7 @@ kwaque_cc_seastar_test(
         "//src/storage/tests:segment_qualification_contract",
         "//src/storage/tests:segment_scan_contract",
         "//src/storage/tests:segment_writer_contract",
+        "//src/storage/tests:sparse_index_contract",
         "//src/storage/tests:wal_scan_contract",
     ],
 )

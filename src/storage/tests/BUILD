@@ -296,6 +296,31 @@ kwaque_cc_seastar_gtest(
     ],
 )
 
+kwaque_cc_seastar_test(
+    name = "sparse_index_test",
+    srcs = ["sparse_index_test.cc"],
+    memory = "256MiB",
+    deps = [
+        "//src/base",
+        "//src/base:error",
+        "//src/bytes:allocation_test_profile",
+        "//src/codec:limits",
+        "//src/model:position",
+        "//src/resource:resource_config",
+        "//src/resource:resource_manager",
+        "//src/resource:resource_registry",
+        "//src/resource:workload_class",
+        "//src/runtime:error",
+        "//src/runtime:file_position",
+        "//src/storage:format_context",
+        "//src/storage:local_store_config",
+        "//src/storage:page_ref",
+        "//src/storage:sparse_index",
+        "//src/storage:sparse_index_format",
+        "//src/storage:workload_budget",
+    ],
+)
+
 kwaque_cc_seastar_gtest(
     name = "range_manifest_format_test",
     srcs = [
@@ -971,7 +996,24 @@ kwaque_cc_library(
         ":segment_scan_contract",
         ":storage_test_support",
         "//src/storage:recovery",
+        "//src/storage:sparse_index",
         "@seastar",
+    ],
+)
+
+kwaque_cc_library(
+    name = "checkpoint_coverage_oracle",
+    testonly = True,
+    hdrs = ["checkpoint_coverage_oracle.h"],
+    visibility = [
+        "//src/broker:__pkg__",
+        "//src/simulation/tests:__pkg__",
+    ],
+    deps = [
+        "//src/runtime:file_position",
+        "//src/storage:format_context",
+        "//src/storage:local_metadata",
+        "//src/storage:local_types",
     ],
 )
 
@@ -984,10 +1026,87 @@ kwaque_cc_library(
         "//src/simulation/tests:__pkg__",
     ],
     deps = [
+        ":checkpoint_coverage_oracle",
         ":local_append_contract",
         "//src/base",
+        "//src/storage:checkpoint",
         "//src/storage:recovery",
+        "//src/storage:retry_lookup",
+        "//src/storage:retry_snapshot",
+        "//src/storage:wal_reclaimer",
         "@seastar",
+    ],
+)
+
+kwaque_cc_seastar_test(
+    name = "checkpoint_test",
+    srcs = ["checkpoint_test.cc"],
+    memory = "256MiB",
+    deps = [
+        ":checkpoint_coverage_oracle",
+        "//src/base",
+        "//src/base:error",
+        "//src/bytes:allocation_test_profile",
+        "//src/codec:cooperative",
+        "//src/codec:digest",
+        "//src/codec:limits",
+        "//src/model:epoch",
+        "//src/model:identity",
+        "//src/model:position",
+        "//src/resource:resource_config",
+        "//src/resource:resource_manager",
+        "//src/resource:resource_registry",
+        "//src/resource:workload_class",
+        "//src/runtime:error",
+        "//src/runtime:file_position",
+        "//src/storage:checkpoint",
+        "//src/storage:footer_format",
+        "//src/storage:format_context",
+        "//src/storage:local_append",
+        "//src/storage:local_bundle",
+        "//src/storage:local_metadata",
+        "//src/storage:local_metadata_layout",
+        "//src/storage:local_store_config",
+        "//src/storage:local_types",
+        "//src/storage:page_ref",
+        "//src/storage:recovery",
+        "//src/storage:wal_reclaimer",
+        "//src/storage:workload_budget",
+    ],
+)
+
+kwaque_cc_seastar_test(
+    name = "retry_snapshot_test",
+    srcs = ["retry_snapshot_test.cc"],
+    memory = "256MiB",
+    deps = [
+        "//src/base",
+        "//src/base:error",
+        "//src/bytes:allocation_test_profile",
+        "//src/codec:cooperative",
+        "//src/codec:digest",
+        "//src/codec:limits",
+        "//src/model:batch_identity",
+        "//src/model:epoch",
+        "//src/model:identity",
+        "//src/model:position",
+        "//src/resource:resource_config",
+        "//src/resource:resource_manager",
+        "//src/resource:resource_registry",
+        "//src/resource:workload_class",
+        "//src/runtime:error",
+        "//src/runtime:file_position",
+        "//src/storage:completed_retry",
+        "//src/storage:format_context",
+        "//src/storage:local_bundle",
+        "//src/storage:local_metadata",
+        "//src/storage:local_metadata_layout",
+        "//src/storage:local_store_config",
+        "//src/storage:local_types",
+        "//src/storage:page_ref",
+        "//src/storage:retry_lookup",
+        "//src/storage:retry_snapshot",
+        "//src/storage:workload_budget",
     ],
 )
 
@@ -1540,6 +1659,48 @@ kwaque_cc_library(
     ],
 )
 
+kwaque_cc_library(
+    name = "sparse_index_contract",
+    testonly = True,
+    hdrs = ["sparse_index_contract.h"],
+    visibility = [
+        "//src/broker:__pkg__",
+        "//src/simulation/tests:__pkg__",
+    ],
+    deps = [
+        ":local_installation_contract",
+        ":local_store_contract",
+        ":segment_writer_contract",
+        "//src/base",
+        "//src/base:error",
+        "//src/codec:cooperative",
+        "//src/codec:digest",
+        "//src/runtime:file",
+        "//src/runtime:file_position",
+        "//src/runtime:first_failure",
+        "//src/storage:footer_format",
+        "//src/storage:local_bundle",
+        "//src/storage:local_generation",
+        "//src/storage:local_metadata",
+        "//src/storage:local_paths",
+        "//src/storage:local_root",
+        "//src/storage:local_types",
+        "//src/storage:page_ref",
+        "//src/storage:recovery",
+        "//src/storage:retry_snapshot",
+        "//src/storage:segment_format",
+        "//src/storage:segment_group",
+        "//src/storage:segment_writer",
+        "//src/storage:segment_writer_state",
+        "//src/storage:sparse_index",
+        "//src/storage:sparse_index_format",
+        "//src/storage:sparse_index_owner",
+        "//src/storage:storage_scan",
+        "//src/storage:workload_budget",
+        "@seastar",
+    ],
+)
+
 kwaque_cc_seastar_test(
     name = "segment_writer_state_test",
     srcs = ["segment_writer_state_test.cc"],
@@ -1915,6 +2076,96 @@ kwaque_cc_benchmark(
     local_defines = ["KWAQUE_STORAGE_RECOVERY_TIMING_ONLY"],
     memory = "1GiB",
     deps = _STORAGE_RECOVERY_BENCH_DEPS,
+)
+
+kwaque_cc_benchmark(
+    name = "checkpoint_bench",
+    srcs = ["checkpoint_bench.cc"],
+    # Its largest store keeps 32 segments open: the append benchmark's
+    # sizing for that many needs more than the produce class has at 1 GiB.
+    memory = "2GiB",
+    deps = _STORAGE_RECOVERY_BENCH_DEPS + [
+        "//src/storage:checkpoint",
+        "//src/storage:wal_writer_state",
+    ],
+)
+
+_INDEX_BENCH_DEPS = [
+    ":local_installation_contract",
+    ":local_storage_bench_file",
+    ":local_store_contract",
+    ":segment_bench_fixture",
+    ":segment_bench_observer_api",
+    ":segment_writer_contract",
+    "//src/base",
+    "//src/base:error",
+    "//src/bytes:allocation_test_profile",
+    "//src/bytes:fragmented_buffer",
+    "//src/bytes:fragmented_buffer_builder",
+    "//src/codec:cooperative",
+    "//src/codec:limits",
+    "//src/codec/tests:allocation_observer",
+    "//src/model:position",
+    "//src/resource:resource_manager",
+    "//src/resource:resource_registry",
+    "//src/resource:workload_class",
+    "//src/runtime:error",
+    "//src/runtime:file",
+    "//src/runtime:file_position",
+    "//src/runtime:first_failure",
+    "//src/runtime/production:clocks",
+    "//src/runtime/testing:test_directory",
+    "//src/storage:local_bundle",
+    "//src/storage:local_paths",
+    "//src/storage:local_root",
+    "//src/storage:segment_writer",
+    "//src/storage:sparse_index",
+    "//src/storage:sparse_index_owner",
+    "//src/storage:storage_scan",
+    "//src/storage:workload_budget",
+    "@crc32c",
+]
+
+_INDEX_BENCH_SRCS = [
+    "index_bench.cc",
+    "index_bench_resident.h",
+]
+
+kwaque_cc_benchmark(
+    name = "index_bench",
+    srcs = _INDEX_BENCH_SRCS,
+    linkopts = ALLOCATION_OBSERVER_LINKOPTS + [
+        "-Wl,--wrap=LZ4F_decompress",
+        "-Wl,--wrap=_ZN4absl12lts_2026052612crc_internal20ExtendCrc32cInternalENS0_8crc32c_tENSt3__117basic_string_viewIcNS3_11char_traitsIcEEEE",
+    ] + select({
+        "@platforms//cpu:x86_64": ["-Wl,--wrap=XXH3_128bits_update_dispatch"],
+        "//conditions:default": ["-Wl,--wrap=XXH3_128bits_update"],
+    }),
+    memory = "1GiB",
+    deps = _INDEX_BENCH_DEPS + [":segment_bench_observer"],
+)
+
+kwaque_cc_benchmark(
+    name = "index_timing_bench",
+    srcs = _INDEX_BENCH_SRCS,
+    local_defines = ["KWAQUE_INDEX_BENCH_TIMING_ONLY"],
+    memory = "1GiB",
+    deps = _INDEX_BENCH_DEPS,
+)
+
+py_binary(
+    name = "index_bench_report",
+    srcs = ["index_bench_report.py"],
+    main = "index_bench_report.py",
+)
+
+py_test(
+    name = "index_bench_report_test",
+    srcs = [
+        "index_bench_report.py",
+        "index_bench_report_test.py",
+    ],
+    main = "index_bench_report_test.py",
 )
 
 py_binary(

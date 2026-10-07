@@ -112,6 +112,9 @@ plan_recovery_segment(const recovery_segment_report& report) {
 recovery_wal_plan
 plan_recovery_wal(const wal_scan_result& scan, bool corrupt_region) noexcept {
     recovery_wal_plan plan;
+    plan.files = scan.files;
+    plan.chain = scan.chain;
+    plan.chain_files = scan.chain_files;
     if (scan.verdict == wal_scan_verdict::corrupt || corrupt_region) {
         plan.action = recovery_plan_action::stop;
         plan.reason = recovery_plan_reason::corruption;

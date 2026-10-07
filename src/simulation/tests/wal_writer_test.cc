@@ -854,6 +854,20 @@ SEASTAR_TEST_CASE(wal_writer_fake_rotation_publication_pressure) {
       });
 }
 
+SEASTAR_TEST_CASE(wal_writer_fake_rotation_retained_limit) {
+    co_await with_wal_environment(
+      config(), [](auto& env, auto& budget, auto drive) -> seastar::future<> {
+          auto& files = env.file_system();
+          const auto spec = specification(
+            take(runtime::file_path::make("/kwaque/store")), {1, 1});
+          const std::array specs{spec};
+          ownership_input owner{specs};
+          take(co_await drive.lifecycle(files.create_directories(spec.root)));
+          co_await storage::testing::wal_rotation_contract::retention(
+            files, owner, spec, budget, drive);
+      });
+}
+
 namespace {
 namespace rotation_contract = kwaque::storage::testing::wal_rotation_contract;
 struct rotation_fault_targets final {

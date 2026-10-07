@@ -47,7 +47,14 @@ public:
     [[nodiscard]] const std::optional<local_boundary_metadata>&
     boundary() const&;
     const std::optional<local_boundary_metadata>& boundary() const&& = delete;
+    // not_found for a root the generation does not hold open. An index root
+    // the publication names is not held when it did not open: damaged, as
+    // index_rebuild_reason() then says, or kept from opening by something
+    // that is not the root's, which whoever opens it next meets again.
     [[nodiscard]] runtime::result<local_root_pin> root(local_root_kind) const;
+    // Why the index root the publication names is owed: it is missing or
+    // damaged. Never a reason to fail the generation, whose data is read
+    // without it.
     [[nodiscard]] std::optional<runtime::operation_error>
     index_rebuild_reason() const;
 
@@ -249,12 +256,19 @@ local_generation_owner::open(
                   work,
                   readers);
                 if (!opened) {
+                    // An index is derived: whatever keeps its root from
+                    // opening, the data is read without it. Damage is owed
+                    // and reported. Anything else is met again by the
+                    // index's own owner, which opens the root itself. Only
+                    // a caller that gave this open up ends it here.
                     if (
                       expected.publication.roots[i].kind()
                         == local_root_kind::index
-                      && detail::rebuildable_local_index_error(
-                        opened.error().code())) {
-                        index_rebuild = opened.error();
+                      && opened.error().code() != errc::aborted) {
+                        if (
+                          detail::rebuildable_local_index_error(
+                            opened.error().code()))
+                            index_rebuild = opened.error();
                         continue;
                     }
                     failed.observe(opened);
