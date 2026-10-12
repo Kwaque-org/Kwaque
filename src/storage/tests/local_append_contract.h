@@ -1113,6 +1113,90 @@ seastar::future<> close_drains_accepted(
       });
 }
 
+// One attachment's admission closes while its requests are in flight. The
+// wait ends only when what was accepted is durable through both barriers and
+// the attachment detaches at once; a request that arrives after is rejected
+// as closed and reserves nothing; the other attachment's requests are
+// accepted and durable meanwhile and afterwards; a second wait ends with the
+// first, and a wait for the detached attachment is refused.
+template<
+  runtime::monotonic_clock Clock,
+  typename Backend,
+  typename Owner,
+  typename Driver,
+  typename Timer>
+seastar::future<> quiesce_drains_one_attachment(
+  Backend& files,
+  Owner& owner,
+  const local_device_spec& spec,
+  workload_budget& budget,
+  Driver drive,
+  Timer& timer) {
+    co_await with_local_append<Clock>(
+      files,
+      owner,
+      spec,
+      budget,
+      drive,
+      timer,
+      {.outstanding = 1, .segments = 2},
+      [&](auto& append, auto&, auto& segments, auto& targets, auto& work)
+        -> seastar::future<> {
+          std::vector<local_append_stages> pending;
+          for (std::uint64_t logical : {100U, 101U})
+              pending.push_back(append.append(
+                *targets[0],
+                co_await request(child_wire(logical), budget, work),
+                work));
+          for (auto& stages : pending)
+              require(
+                (co_await drive.lifecycle(std::move(stages.accepted)))
+                  .accepted(),
+                "request rejected before its attachment was quiesced");
+          auto quiet = append.quiesce(*targets[0]);
+          auto joined = append.quiesce(*targets[0]);
+          auto late = append.append(
+            *targets[0], co_await request(child_wire(102), budget, work), work);
+          const auto refused = co_await drive.lifecycle(
+            std::move(late.accepted));
+          const auto meanwhile = co_await settle(
+            append.append(
+              *targets[1],
+              co_await request(child_wire(100, 2), budget, work),
+              work),
+            drive);
+          take(co_await drive.lifecycle(std::move(quiet)));
+          // Idle, so both accepted requests are behind their barriers.
+          const auto drained = segments[0]->progress()->durable.blocks;
+          take(co_await drive.lifecycle(std::move(joined)));
+          const auto detached = take(append.detach(*targets[0]));
+          const auto stale = co_await drive.lifecycle(
+            append.quiesce(*targets[0]));
+          for (auto& stages : pending)
+              static_cast<void>(
+                durable(co_await drive.lifecycle(std::move(stages.result))));
+          static_cast<void>(co_await drive.lifecycle(std::move(late.result)));
+          const auto afterwards = co_await settle(
+            append.append(
+              *targets[1],
+              co_await request(child_wire(101, 2), budget, work),
+              work),
+            drive);
+          static_cast<void>(durable(meanwhile));
+          static_cast<void>(durable(afterwards));
+          require(
+            drained == 2 && detached.boundary && detached.retry.reserved() == 2,
+            "the wait ended before what was accepted was durable, or the "
+            "attachment did not detach whole");
+          require(
+            !refused.accepted() && refused.failure.error()
+              && refused.failure.error()->code() == errc::closed && !stale
+              && stale.error().code() == errc::wrong_context,
+            "a quiesced attachment took a request, or a stale one was "
+            "waited for");
+      });
+}
+
 // Groups submitted while a segment's barrier runs are covered together by
 // its next barrier: one receipt, while each group keeps its own footer.
 // Needs I/O that acceptance cannot overtake.

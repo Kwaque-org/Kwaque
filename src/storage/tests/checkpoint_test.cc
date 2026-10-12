@@ -442,6 +442,94 @@ SEASTAR_TEST_CASE(checkpoint_pins_leave_with_the_segments_publication) {
     });
 }
 
+// The durable checkpoint carries a segment's entries until a cut taken after
+// its publication covered them is adopted. Until then a restart would look
+// for the segment, whatever the table still holds of it: the table lets an
+// entry go at once, the checkpoint on the device only with its successor.
+SEASTAR_TEST_CASE(checkpoint_pins_name_a_segment_until_a_later_cut) {
+    co_await with_budget([](workload_budget& budget) {
+        const auto shard = owner();
+        auto pins = checkpoint_pins::make(budget, {}).value();
+        // Before the first cut is durable no checkpoint names anything.
+        ok(pins.observe(boundary(1, 8192)));
+        ok(pins.observe(boundary(2, 8192)));
+        BOOST_CHECK(!pins.names(segment(1)) && !pins.names(segment(2)));
+        auto cut = pins.capture(shard, at(1, 8192)).value();
+        install_all(cut, 1);
+        ok(pins.adopt(std::move(cut)));
+        BOOST_CHECK(
+          pins.names(segment(1)) && pins.names(segment(2))
+          && !pins.names(segment(3)));
+
+        // Covered: out of the table, and in the durable checkpoint still,
+        // which is what a cut at the same cutoff is then written for.
+        BOOST_CHECK(!pins.lingering());
+        ok(pins.cover(published(1, local_object_state::deleting)));
+        BOOST_CHECK(
+          pins.entries().size() == 1 && pins.names(segment(1))
+          && pins.lingering());
+        ok(pins.cover(published(1, local_object_state::deleting)));
+        auto later = pins.capture(shard, at(1, 8192)).value();
+        BOOST_CHECK(pins.names(segment(1)));
+        install_all(later, 1);
+        ok(pins.adopt(std::move(later)));
+        BOOST_CHECK(
+          !pins.names(segment(1)) && pins.names(segment(2))
+          && !pins.lingering());
+
+        // Covered while the cut that carries it is being published: that
+        // cut is the durable checkpoint once adopted, and carries it.
+        auto racing = pins.capture(shard, at(1, 8192)).value();
+        ok(pins.cover(published(2, local_object_state::sealed)));
+        install_all(racing, 1);
+        ok(pins.adopt(std::move(racing)));
+        BOOST_CHECK(pins.entries().empty() && pins.names(segment(2)));
+        auto last = pins.capture(shard, at(1, 8192)).value();
+        install_all(last, 1);
+        ok(pins.adopt(std::move(last)));
+        BOOST_CHECK(!pins.names(segment(2)));
+
+        // A footer no cut took is in no checkpoint. One that the cut being
+        // published took may be in the next.
+        ok(pins.observe(boundary(3, 8192)));
+        ok(pins.cover(published(3, local_object_state::sealed)));
+        BOOST_CHECK(!pins.names(segment(3)));
+        ok(pins.observe(boundary(4, 8192)));
+        auto open = pins.capture(shard, at(1, 8192)).value();
+        ok(pins.cover(published(4, local_object_state::deleting)));
+        BOOST_CHECK(pins.names(segment(4)));
+        install_all(open, 1);
+        ok(pins.adopt(std::move(open)));
+        BOOST_CHECK(pins.entries().empty() && pins.names(segment(4)));
+        auto empty = pins.capture(shard, at(1, 8192)).value();
+        install_all(empty, 1);
+        ok(pins.adopt(std::move(empty)));
+        BOOST_CHECK(!pins.names(segment(4)));
+
+        // More covered segments than are counted: every segment is taken
+        // to be named until the next cut is adopted.
+        auto few = checkpoint_pins::make(
+                     budget, {.segments = 1, .decisions = 1})
+                     .value();
+        ok(few.observe(boundary(1, 8192)));
+        ok(few.hold(discard(1, 3, at(1, 8192))));
+        auto both = few.capture(shard, at(1, 16384)).value();
+        install_all(both, 1);
+        ok(few.adopt(std::move(both)));
+        BOOST_REQUIRE_EQUAL(few.entries().size(), 2U);
+        ok(few.cover(published(1, local_object_state::sealed)));
+        BOOST_CHECK(few.names(segment(1)) && !few.names(segment(9)));
+        ok(few.cover(published(3, local_object_state::sealed)));
+        BOOST_CHECK(few.names(segment(3)) && few.names(segment(9)));
+        auto none = few.capture(shard, at(1, 16384)).value();
+        install_all(none, 1);
+        ok(few.adopt(std::move(none)));
+        BOOST_CHECK(
+          !few.names(segment(1)) && !few.names(segment(3))
+          && !few.names(segment(9)));
+    });
+}
+
 // A discard decision is carried once the cutoff has passed the PREPARE it
 // names, and until its segment's sealed or deleting publication.
 SEASTAR_TEST_CASE(checkpoint_pins_carry_passed_discards) {

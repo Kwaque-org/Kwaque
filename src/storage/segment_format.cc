@@ -637,6 +637,175 @@ struct block_reader final {
         co_return *result;
     }
 };
+
+// Everything block_reader checks of the block itself, and of its child only
+// what the child's fixed header says against the block. The envelope's body
+// checksum, verified before this runs, covers the child's exact bytes.
+struct block_checker final {
+    segment_block_expectation expected;
+    std::uint64_t start;
+    seastar::future<codec::result<checked_segment_block>> operator()(
+      fragmented_buffer_parser& input,
+      codec::field_context context,
+      codec::input_boundary,
+      codec::decode_budget,
+      codec::cooperative_work& work) {
+        const auto anchor = at(errc::success, context);
+        std::array<char, 120> fixed{};
+        if (
+          auto read = co_await detail::read_fixed(input, fixed, work, context);
+          !read)
+            co_return codec::failure(read.error());
+        if (
+          auto ready = co_await work.admit(
+            byte_count{1_KiB}, item_count{64}, anchor);
+          !ready)
+            co_return codec::failure(ready.error());
+        if (auto ready = work.poll(anchor); !ready)
+            co_return codec::failure(ready.error());
+        if (
+          auto identity = check_context(
+            fixed, expected.location.segment(), context);
+          !identity)
+            co_return codec::failure(identity.error());
+        if (
+          load<72, std::uint64_t>(fixed)
+          != expected.location.position().value())
+            co_return codec::failure(at(
+              errc::wrong_context, context, segment_field::block_position, 72));
+        if (
+          load<80, std::uint64_t>(fixed)
+          != expected.location.physical_begin().value())
+            co_return codec::failure(at(
+              errc::wrong_context, context, segment_field::physical_begin, 80));
+        const byte_count child_bytes{load<112, std::uint32_t>(fixed)};
+        if (child_bytes.value() == 0)
+            co_return codec::failure(at(
+              errc::malformed_data,
+              context,
+              segment_field::assigned_bytes,
+              112));
+        const byte_count header_bytes{context.origin - start};
+        const auto layout = from_wire(
+          aligned_envelope_layout::make(
+            {header_bytes, segment_block_fixed_bytes, child_bytes},
+            expected.location.alignment(),
+            work.policy(),
+            block_limits(work.policy())),
+          context,
+          segment_field::assigned_bytes,
+          112);
+        if (!layout) co_return codec::failure(layout.error());
+        if (
+          layout->body_bytes() != input.total_bytes()
+          || load<116, std::uint32_t>(fixed) != layout->padding_bytes().value())
+            co_return codec::failure(
+              at(errc::malformed_data, context, segment_field::padding, 116));
+        const auto extent = from_wire(
+          layout->at(expected.location.position()),
+          context,
+          segment_field::block_position,
+          72);
+        if (!extent) co_return codec::failure(extent.error());
+
+        // The child, where the block says it lies: its prefix names an
+        // assigned batch of exactly the stated length, and its fixed header
+        // is the first thing in its body.
+        auto child_context = context;
+        child_context.origin = context.origin + 120U;
+        child_context.field = static_cast<std::uint16_t>(
+          segment_field::assigned_batch);
+        const auto malformed_child = [&child_context](std::uint64_t offset) {
+            return codec::failure(at(
+              errc::malformed_data,
+              child_context,
+              segment_field::assigned_batch,
+              offset));
+        };
+        const auto prefix = codec::peek_envelope_prefix(
+          input,
+          work.policy(),
+          {child_bytes, child_bytes},
+          child_context,
+          codec::input_boundary::open);
+        if (!prefix) co_return codec::failure(prefix.error());
+        if (
+          prefix->family
+            != static_cast<std::uint16_t>(codec::format_family::assigned_batch)
+          || prefix->encoded_bytes() != child_bytes
+          || prefix->body_bytes < model::assigned_batch_fixed_bytes.value())
+            co_return malformed_child(0);
+        if (!input.skip(byte_count{prefix->header_bytes}))
+            co_return malformed_child(0);
+        std::array<char, model::assigned_batch_fixed_bytes.value()> child{};
+        auto body_context = child_context;
+        body_context.origin = child_context.origin + prefix->header_bytes;
+        if (
+          auto read = co_await detail::read_fixed(
+            input, child, work, body_context);
+          !read)
+            co_return codec::failure(read.error());
+        const auto topic = read_id<40, model::topic_id>(
+          child, body_context, segment_field::topic);
+        const auto range = read_id<56, model::range_id>(
+          child, body_context, segment_field::range);
+        if (!topic) co_return codec::failure(topic.error());
+        if (!range) co_return codec::failure(range.error());
+        if (*topic != expected.batch.topic || *range != expected.batch.range)
+            co_return codec::failure(at(
+              errc::wrong_context,
+              body_context,
+              segment_field::assigned_batch,
+              40));
+        const auto physical = from_wire(
+          model::segment_relative_span::from_count(
+            expected.location.physical_begin(),
+            model::segment_record_count{load<148, std::uint32_t>(child)}),
+          context,
+          segment_field::physical_end,
+          88);
+        if (!physical) co_return codec::failure(physical.error());
+        if (load<88, std::uint64_t>(fixed) != physical->end().value())
+            co_return codec::failure(at(
+              errc::malformed_data, context, segment_field::physical_end, 88));
+        if (load<96, std::uint64_t>(fixed) != load<168, std::uint64_t>(child))
+            co_return codec::failure(at(
+              errc::malformed_data, context, segment_field::logical_begin, 96));
+        if (load<104, std::uint64_t>(fixed) != load<176, std::uint64_t>(child))
+            co_return codec::failure(at(
+              errc::malformed_data, context, segment_field::logical_end, 104));
+        const auto logical = from_wire(
+          model::range_logical_span::make(
+            model::range_logical_end{load<96, std::uint64_t>(fixed)},
+            model::range_logical_end{load<104, std::uint64_t>(fixed)}),
+          context,
+          segment_field::logical_end,
+          104);
+        if (!logical) co_return codec::failure(logical.error());
+        // A block holds at least one record, so its span is not empty.
+        if (logical->empty() || physical->empty())
+            co_return codec::failure(at(
+              errc::malformed_data, context, segment_field::logical_end, 104));
+        const byte_count walked{
+          prefix->header_bytes + model::assigned_batch_fixed_bytes.value()};
+        if (!input.skip(byte_count{child_bytes.value() - walked.value()}))
+            co_return malformed_child(walked.value());
+        auto padding_context = context;
+        padding_context.field = static_cast<std::uint16_t>(
+          segment_field::padding);
+        if (
+          auto padding = co_await detail::read_padding(
+            input, layout->padding_bytes(), work, padding_context);
+          !padding)
+            co_return codec::failure(padding.error());
+        if (auto ready = work.poll(anchor); !ready)
+            co_return codec::failure(ready.error());
+        co_return checked_segment_block{
+          storage::coverage{*logical, *physical, *extent},
+          byte_count{header_bytes.value() + 120U},
+          child_bytes};
+    }
+};
 } // namespace
 
 seastar::future<codec::result<segment_block>> encode_segment_block(
@@ -875,5 +1044,32 @@ seastar::future<codec::result<decoded_segment_block>> decode_segment_block(
       detail::segment_codec::pair(
         std::move(*bytes), **descriptor, expected, work.policy()),
       *retained};
+}
+
+seastar::future<codec::result<checked_segment_block>> check_segment_block(
+  fragmented_buffer_parser& input,
+  segment_block_expectation expected,
+  codec::decode_budget memory,
+  codec::cooperative_work& work,
+  codec::field_context context,
+  codec::input_boundary boundary) {
+    context.family = static_cast<std::uint16_t>(
+      codec::format_family::segment_batch_block);
+    const auto start = codec::detail::integer_read_start(
+      input, context, boundary);
+    if (!start) co_return codec::failure(start.error());
+    if (auto ready = work.poll(at(errc::success, context)); !ready)
+        co_return codec::failure(ready.error());
+    if (auto valid = check_expectation(expected, context); !valid)
+        co_return codec::failure(valid.error());
+    co_return co_await codec::decode_envelope<checked_segment_block>(
+      input,
+      codec::format_family::segment_batch_block,
+      block_limits(work.policy()),
+      memory,
+      work,
+      block_checker{expected, *start},
+      context,
+      boundary);
 }
 } // namespace kwaque::storage

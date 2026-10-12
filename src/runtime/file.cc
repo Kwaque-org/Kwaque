@@ -267,7 +267,7 @@ public:
       file_position position,
       bytes::fragmented_buffer data,
       seastar::gate::holder holder,
-      operation_statistics::reservation metric)
+      file_operation metric)
       : owner_(owner)
       , data_(std::move(data))
       , initial_position_(position.value())
@@ -499,7 +499,7 @@ public:
       std::size_t completed,
       std::uint64_t write_alignment,
       std::uint64_t memory_alignment,
-      operation_statistics::reservation metric) {
+      file_operation metric) {
         static_cast<void>(holder);
         static_cast<void>(data);
         static_cast<void>(serialization);
@@ -771,7 +771,7 @@ private:
     std::uint64_t initial_position_;
     std::uint64_t total_bytes_;
     seastar::gate::holder holder_;
-    operation_statistics::reservation metric_;
+    file_operation metric_;
     std::uint64_t original_size_{0};
     std::uint64_t final_size_{0};
     std::uint64_t physical_end_{0};
@@ -903,9 +903,11 @@ file::file(
   seastar::file&& native_file,
   file_io_limits limits,
   operation_statistics_owner statistics,
-  file_close_policy close_policy)
+  file_close_policy close_policy,
+  file_flight_ptr flight)
   : statistics_owner_(std::move(statistics))
   , statistics_(&statistics_owner_.get())
+  , flight_(std::move(flight))
   , limits_(validated_file_io_limits(limits))
   , native_file_(require_open_file(std::move(native_file), close_policy))
   , read_operation_units_(limits_.pending_reads)
@@ -975,6 +977,7 @@ file::file(file&& other) noexcept
   : owner_(prepare_move(other))
   , statistics_owner_(std::move(other.statistics_owner_))
   , statistics_(&statistics_owner_.get())
+  , flight_(std::move(other.flight_))
   , limits_(other.limits_)
   , native_file_(std::move(other.native_file_))
   , io_intent_(std::move(other.io_intent_))
@@ -1145,7 +1148,7 @@ seastar::future<result<void>> file::flush(metadata_reservation& reservation) {
     reservation.active_ = true;
     auto active = seastar::defer(
       [&reservation] noexcept { reservation.active_ = false; });
-    [[maybe_unused]] auto metric = statistics_->accept();
+    [[maybe_unused]] auto metric = admit();
     try {
         co_await native_file_.flush();
         if (first_failure_.failed()) co_return first_failure_.outcome();
@@ -1225,7 +1228,7 @@ seastar::future<result<void>> file::flush() {
       file_gate_invariant,
       holder.has_value(),
       "open file rejected operation gate entry");
-    [[maybe_unused]] auto metric = statistics_->accept();
+    [[maybe_unused]] auto metric = admit();
     try {
         co_await native_file_.flush();
         if (first_failure_.failed()) co_return first_failure_.outcome();
@@ -1250,7 +1253,7 @@ file::read_validated(file_position position, byte_count maximum_bytes) {
       file_gate_invariant,
       holder.has_value(),
       "open file rejected operation gate entry");
-    auto metric = statistics_->accept();
+    auto metric = admit();
     const auto native_request = bounded_native_bulk_read(
       position.value(), maximum_bytes.value(), disk_read_dma_alignment_);
     if (native_request.bytes != maximum_bytes.value()) {
@@ -1301,7 +1304,7 @@ seastar::future<result<file_read_result>> file::read_chunked(
   byte_count maximum_bytes,
   admission_reservation admission,
   seastar::gate::holder holder,
-  operation_statistics::reservation metric) {
+  file_operation metric) {
     static_cast<void>(admission);
     static_cast<void>(holder);
     bytes::fragmented_buffer data;
@@ -1368,7 +1371,7 @@ file::write_validated(file_position position, bytes::fragmented_buffer&& data) {
             if (close_policy_ == file_close_policy::checked) {
                 holder = seastar::gate::holder{operations_};
             }
-            auto metric = statistics_->accept();
+            auto metric = admit();
             seastar::temporary_buffer<char> fragment;
             if (has_one_fragment && aligned_front) {
                 auto consumer = detail::fragmented_buffer_io_access::consume(
@@ -1490,7 +1493,7 @@ seastar::future<result<byte_count>> file::write_general(
       file_gate_invariant,
       holder.has_value(),
       "open file rejected operation gate entry");
-    auto metric = statistics_->accept();
+    auto metric = admit();
     return writer::run(
       writer{
         *this,
@@ -1525,7 +1528,7 @@ seastar::future<result<void>> file::truncate(std::uint64_t size) {
       file_gate_invariant,
       holder.has_value(),
       "open file rejected operation gate entry");
-    [[maybe_unused]] auto metric = statistics_->accept();
+    [[maybe_unused]] auto metric = admit();
     try {
         if (!serialization) {
             serialization.emplace(
@@ -1571,7 +1574,7 @@ file::allocate(file_position position, byte_count length) {
       file_gate_invariant,
       holder.has_value(),
       "open file rejected operation gate entry");
-    [[maybe_unused]] auto metric = statistics_->accept();
+    [[maybe_unused]] auto metric = admit();
     try {
         if (!serialization) {
             serialization.emplace(
@@ -1617,7 +1620,7 @@ seastar::future<result<std::uint64_t>> file::size() {
       file_gate_invariant,
       holder.has_value(),
       "open file rejected operation gate entry");
-    [[maybe_unused]] auto metric = statistics_->accept();
+    [[maybe_unused]] auto metric = admit();
     try {
         co_return co_await native_file_.size();
     } catch (const std::bad_alloc&) {
@@ -1664,7 +1667,7 @@ seastar::future<result<void>> file::close() {
     state_ = file_state::closing;
     abort_requested_ = true;
     io_intent_.cancel();
-    auto metric = statistics_->accept();
+    auto metric = admit();
     auto completion = close_once().then_wrapped(
       [this, metric = std::move(metric)](
         seastar::future<result<void>> closed) mutable {
@@ -1684,7 +1687,7 @@ seastar::future<result<void>> file::close_checked_once() {
     // The coroutine frame is obtained before admission changes. No shared
     // promise or unbounded close-waiter list is created during shutdown.
     state_ = file_state::closing;
-    [[maybe_unused]] auto metric = statistics_->accept();
+    [[maybe_unused]] auto metric = admit();
     co_await operations_.close();
     // Checked direct writes retain the gate through short-write recovery too.
     // Draining it leaves the serializer free without allocating a close waiter.

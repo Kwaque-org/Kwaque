@@ -10,6 +10,7 @@
 #include "src/storage/tests/local_store_contract.h"
 #include "src/storage/tests/recovery_contract.h"
 #include "src/storage/tests/segment_qualification_contract.h"
+#include "src/storage/tests/segment_reader_contract.h"
 #include "src/storage/tests/segment_scan_contract.h"
 #include "src/storage/tests/segment_writer_contract.h"
 #include "src/storage/tests/sparse_index_contract.h"
@@ -297,6 +298,204 @@ SEASTAR_TEST_CASE(local_store_checks_all_devices_before_mutating_any) {
             work));
           BOOST_CHECK(denied.failure.failed());
           BOOST_CHECK(!denied.mutation_attempted);
+      });
+}
+
+// A store that was used gains a data device only by the intent that says
+// so and names it. Opened as the store that must exist, or as a first
+// store, the device that holds nothing refuses the start and nothing is
+// written to it. The intent to add never makes a first store, never takes a
+// device that holds something else, and never takes one it does not name:
+// a device the store had and lost holds nothing either.
+SEASTAR_TEST_CASE(local_store_adds_a_device_only_by_explicit_intent) {
+    co_await with_store_environment(
+      config(), [](auto& env, auto& budget, auto drive) -> seastar::future<> {
+          auto& files = env.file_system();
+          const auto a = specification(
+            take(runtime::file_path::make("/kwaque/a")), {1, 1});
+          const auto b = specification(
+            take(runtime::file_path::make("/kwaque/b")),
+            {1, 2},
+            0x44,
+            local_device_role::data);
+          const std::array first{a};
+          const std::array grown{a, b};
+          ownership_input owns_first{first};
+          ownership_input owns_grown{grown};
+          for (const auto& spec : grown)
+              take(
+                co_await drive.lifecycle(files.create_directories(spec.root)));
+          stabilize(files, take(runtime::file_path::make("/kwaque")));
+          seastar::abort_source abort;
+          codec::cooperative_work work{codec::limits::defaults(), abort};
+          const auto b_identity
+            = take(local_paths::make(b.root)).store().value();
+          const std::array named{b.owner.device()};
+          const auto open = [&](
+                              auto& owner,
+                              std::span<const local_device_spec> specs,
+                              local_store_intent intent,
+                              std::span<const device_store_id> added = {}) {
+              return drive.lifecycle(initialize_local_stores(
+                files,
+                owner,
+                specs,
+                {intent, false, added},
+                budget,
+                limits(),
+                work));
+          };
+          {
+              // Nothing to extend: adding is no way to a first store.
+              const auto none = co_await open(
+                owns_grown, grown, local_store_intent::add_devices, named);
+              BOOST_REQUIRE(none.failure.error().has_value());
+              BOOST_CHECK(none.failure.error()->code() == errc::not_found);
+              BOOST_CHECK(!none.mutation_attempted);
+          }
+          take((co_await open(
+                  owns_first, first, local_store_intent::create_or_resume))
+                 .failure.outcome());
+          {
+              // The store is used: its control record is no longer the
+              // one a bootstrap wrote.
+              using control_type
+                = local_control_owner<fake_file_system, ownership_input>;
+              using allocator_type
+                = local_id_allocator<fake_file_system, ownership_input>;
+              auto control = take(
+                co_await drive.lifecycle(
+                  control_type::open(
+                    files, owns_first, a, 0, false, budget, limits(), work)));
+              auto allocator = take(allocator_type::make(*control, budget, 4));
+              runtime::first_failure failed;
+              try {
+                  static_cast<void>(take(
+                    co_await drive.lifecycle(
+                      allocator->allocate_object(work))));
+              } catch (...) {
+                  failed.observe(std::current_exception());
+              }
+              take(co_await drive.lifecycle(allocator->close()));
+              allocator.reset();
+              take(co_await drive.lifecycle(control->close()));
+              control.reset();
+              take(failed.outcome());
+          }
+          for (const auto intent :
+               {local_store_intent::must_exist,
+                local_store_intent::create_or_resume}) {
+              const auto refused = co_await open(owns_grown, grown, intent);
+              BOOST_REQUIRE(refused.failure.error().has_value());
+              BOOST_CHECK(refused.failure.error()->code() == errc::not_found);
+              BOOST_CHECK(!refused.mutation_attempted);
+              BOOST_CHECK(
+                refused.reports[0].state == local_store_state::existing);
+              BOOST_CHECK(
+                refused.reports[1].state == local_store_state::pristine);
+              BOOST_CHECK(
+                !take(co_await drive.lifecycle(files.exists(b_identity))));
+          }
+          {
+              // A device that holds nothing and is not named as added is
+              // one the store had and lost, not a new one; and a name that
+              // is no configured data device adds nothing.
+              const auto lost = co_await open(
+                owns_grown, grown, local_store_intent::add_devices);
+              BOOST_REQUIRE(lost.failure.error().has_value());
+              BOOST_CHECK(lost.failure.error()->code() == errc::wrong_context);
+              BOOST_CHECK(!lost.mutation_attempted);
+              const std::array control{a.owner.device()};
+              const auto misnamed = co_await open(
+                owns_grown, grown, local_store_intent::add_devices, control);
+              BOOST_REQUIRE(misnamed.failure.error().has_value());
+              BOOST_CHECK(
+                misnamed.failure.error()->code() == errc::invalid_argument);
+              BOOST_CHECK(!misnamed.mutation_attempted);
+              BOOST_CHECK(
+                !take(co_await drive.lifecycle(files.exists(b_identity))));
+          }
+          {
+              // A device that holds something else is not taken.
+              const auto unknown = take(local_child_path(
+                b.root, take(runtime::file_name::make("unexpected"))));
+              seed_bytes(files, unknown, "keep");
+              const auto polluted = co_await open(
+                owns_grown, grown, local_store_intent::add_devices, named);
+              BOOST_CHECK(polluted.failure.failed());
+              BOOST_CHECK(!polluted.mutation_attempted);
+              BOOST_CHECK(
+                !take(co_await drive.lifecycle(files.exists(b_identity))));
+              take(co_await drive.lifecycle(files.remove_file(unknown)));
+          }
+          {
+              const auto added = co_await open(
+                owns_grown, grown, local_store_intent::add_devices, named);
+              take(added.failure.outcome());
+              BOOST_CHECK(added.mutation_attempted);
+              BOOST_CHECK(added.stages[0] == local_bootstrap_stage::complete);
+              BOOST_CHECK(added.stages[1] == local_bootstrap_stage::complete);
+              BOOST_CHECK(
+                take(co_await drive.lifecycle(files.exists(b_identity))));
+          }
+          {
+              // The store is now the one with both devices, and the intent
+              // to add, left set with or without its name, changes nothing.
+              const auto whole = co_await open(
+                owns_grown, grown, local_store_intent::must_exist);
+              take(whole.failure.outcome());
+              BOOST_CHECK(!whole.mutation_attempted);
+              const auto again = co_await open(
+                owns_grown, grown, local_store_intent::add_devices);
+              take(again.failure.outcome());
+              BOOST_CHECK(!again.mutation_attempted);
+          }
+      });
+}
+
+// A segment's directory under its deleting name is a removal that a crash or
+// a stop left unfinished. A start knows it by that name and does not look
+// inside: the same directory under the segment's own name, with one of its
+// three files, would be a store with a gap.
+SEASTAR_TEST_CASE(local_store_knows_a_segment_being_removed_by_its_name) {
+    co_await with_store_environment(
+      config(), [](auto& env, auto& budget, auto drive) -> seastar::future<> {
+          auto& files = env.file_system();
+          const auto a = specification(
+            take(runtime::file_path::make("/kwaque/a")), {1, 1});
+          const std::array devices{a};
+          ownership_input owns{devices};
+          take(co_await drive.lifecycle(files.create_directories(a.root)));
+          stabilize(files, take(runtime::file_path::make("/kwaque")));
+          seastar::abort_source abort;
+          codec::cooperative_work work{codec::limits::defaults(), abort};
+          const auto open = [&](local_store_intent intent) {
+              return drive.lifecycle(initialize_local_stores(
+                files, owns, devices, {intent, false}, budget, limits(), work));
+          };
+          take((co_await open(local_store_intent::create_or_resume))
+                 .failure.outcome());
+
+          std::array<std::uint8_t, 16> id{};
+          id.fill(0x21);
+          const local_segment_name name{
+            model::segment_id::make(id).value(),
+            model::segment_generation::make(7).value()};
+          const auto paths = take(local_paths::make(a.root));
+          const auto deleting = take(paths.deleting(0, name));
+          take(co_await drive.lifecycle(files.create_directories(deleting)));
+          seed_bytes(
+            files,
+            take(local_child_path(
+              deleting, take(runtime::file_name::make("data")))),
+            "what a removal left");
+
+          const auto found = co_await open(local_store_intent::must_exist);
+          take(found.failure.outcome());
+          BOOST_CHECK(found.reports[0].state == local_store_state::existing);
+          BOOST_CHECK(found.reports[0].has_payload);
+          BOOST_CHECK_EQUAL(found.reports[0].deleting_segments, 1U);
+          BOOST_CHECK_EQUAL(found.reports[0].interrupted_creations, 0U);
       });
 }
 
@@ -2317,6 +2516,493 @@ SEASTAR_TEST_CASE(sparse_index_fake_paged_lookups) {
       byte_count{18_MiB},
       resource::workload_class::foreground_protocol,
       64);
+}
+
+SEASTAR_TEST_CASE(sparse_index_fake_cached_lookups) {
+    co_await with_store_environment(
+      config(),
+      [](auto& env, auto& budget, auto drive) -> seastar::future<> {
+          auto& files = env.file_system();
+          const auto root = take(runtime::file_path::make("/kwaque/store"));
+          take(co_await drive.lifecycle(files.create_directories(root)));
+          stabilize(files, take(runtime::file_path::make("/kwaque")));
+          const auto spec = specification(root, {1, 1}, 68);
+          const std::array specs{spec};
+          ownership_input owner{specs};
+          co_await storage::testing::sparse_index_contract::cached_lookups<
+            simulation::monotonic_clock>(files, owner, spec, budget, drive);
+      },
+      byte_count{18_MiB},
+      resource::workload_class::foreground_protocol,
+      64);
+}
+
+SEASTAR_TEST_CASE(sparse_index_fake_located_index) {
+    co_await with_store_environment(
+      config(),
+      [](auto& env, auto& budget, auto drive) -> seastar::future<> {
+          auto& files = env.file_system();
+          const auto root = take(runtime::file_path::make("/kwaque/store"));
+          take(co_await drive.lifecycle(files.create_directories(root)));
+          stabilize(files, take(runtime::file_path::make("/kwaque")));
+          const auto spec = specification(root, {1, 1}, 68);
+          const std::array specs{spec};
+          ownership_input owner{specs};
+          co_await storage::testing::sparse_index_contract::located_index<
+            simulation::monotonic_clock>(files, owner, spec, budget, drive);
+      },
+      byte_count{18_MiB},
+      resource::workload_class::foreground_protocol,
+      64);
+}
+
+SEASTAR_TEST_CASE(sparse_index_fake_sealed_data) {
+    co_await with_store_environment(
+      config(),
+      [](auto& env, auto& budget, auto drive) -> seastar::future<> {
+          auto& files = env.file_system();
+          const auto root = take(runtime::file_path::make("/kwaque/store"));
+          take(co_await drive.lifecycle(files.create_directories(root)));
+          stabilize(files, take(runtime::file_path::make("/kwaque")));
+          const auto spec = specification(root, {1, 1}, 68);
+          const std::array specs{spec};
+          ownership_input owner{specs};
+          co_await storage::testing::sparse_index_contract::sealed_data<
+            simulation::monotonic_clock>(files, owner, spec, budget, drive);
+      },
+      byte_count{18_MiB},
+      resource::workload_class::foreground_protocol,
+      64);
+}
+
+SEASTAR_TEST_CASE(segment_writer_fake_data_pins) {
+    co_await with_store_environment(
+      config(),
+      [](auto& env, auto& budget, auto drive) -> seastar::future<> {
+          auto& files = env.file_system();
+          const auto root = take(runtime::file_path::make("/kwaque/store"));
+          take(co_await drive.lifecycle(files.create_directories(root)));
+          stabilize(files, take(runtime::file_path::make("/kwaque")));
+          const auto spec = specification(root, {1, 1}, 68);
+          const std::array specs{spec};
+          ownership_input owner{specs};
+          co_await storage::testing::segment_writer_contract::data_pins<
+            simulation::monotonic_clock>(files, owner, spec, budget, drive);
+      },
+      byte_count{18_MiB},
+      resource::workload_class::foreground_protocol,
+      64);
+}
+
+SEASTAR_TEST_CASE(segment_reader_fake_run_checks) {
+    co_await with_store_environment(
+      config(),
+      [](auto& env, auto& budget, auto drive) -> seastar::future<> {
+          auto& files = env.file_system();
+          const auto root = take(runtime::file_path::make("/kwaque/store"));
+          take(co_await drive.lifecycle(files.create_directories(root)));
+          stabilize(files, take(runtime::file_path::make("/kwaque")));
+          const auto spec = specification(root, {1, 1}, 68);
+          const std::array specs{spec};
+          ownership_input owner{specs};
+          co_await storage::testing::segment_reader_contract::run_checks<
+            simulation::monotonic_clock>(files, owner, spec, budget, drive);
+      },
+      byte_count{18_MiB},
+      resource::workload_class::foreground_protocol,
+      64);
+}
+
+SEASTAR_TEST_CASE(segment_reader_fake_sealed_reads) {
+    co_await with_store_environment(
+      config(),
+      [](auto& env, auto& budget, auto drive) -> seastar::future<> {
+          auto& files = env.file_system();
+          const auto root = take(runtime::file_path::make("/kwaque/store"));
+          take(co_await drive.lifecycle(files.create_directories(root)));
+          stabilize(files, take(runtime::file_path::make("/kwaque")));
+          const auto spec = specification(root, {1, 1}, 68);
+          const std::array specs{spec};
+          ownership_input owner{specs};
+          co_await storage::testing::segment_reader_contract::sealed_reads<
+            simulation::monotonic_clock>(files, owner, spec, budget, drive);
+      },
+      byte_count{18_MiB},
+      resource::workload_class::foreground_protocol,
+      64);
+}
+
+SEASTAR_TEST_CASE(segment_reader_fake_prefetched_runs) {
+    co_await with_store_environment(
+      config(),
+      [](auto& env, auto& budget, auto drive) -> seastar::future<> {
+          auto& files = env.file_system();
+          const auto root = take(runtime::file_path::make("/kwaque/store"));
+          take(co_await drive.lifecycle(files.create_directories(root)));
+          stabilize(files, take(runtime::file_path::make("/kwaque")));
+          const auto spec = specification(root, {1, 1}, 68);
+          const std::array specs{spec};
+          ownership_input owner{specs};
+          co_await storage::testing::segment_reader_contract::prefetched_runs<
+            simulation::monotonic_clock>(files, owner, spec, budget, drive);
+      },
+      byte_count{18_MiB},
+      resource::workload_class::foreground_protocol,
+      64);
+}
+
+SEASTAR_TEST_CASE(segment_reader_fake_ahead_reads) {
+    co_await with_store_environment(
+      config(),
+      [](auto& env, auto& budget, auto drive) -> seastar::future<> {
+          auto& files = env.file_system();
+          const auto root = take(runtime::file_path::make("/kwaque/store"));
+          take(co_await drive.lifecycle(files.create_directories(root)));
+          stabilize(files, take(runtime::file_path::make("/kwaque")));
+          const auto spec = specification(root, {1, 1}, 68);
+          const std::array specs{spec};
+          ownership_input owner{specs};
+          co_await storage::testing::segment_reader_contract::ahead_reads<
+            simulation::monotonic_clock>(files, owner, spec, budget, drive);
+      },
+      byte_count{18_MiB},
+      resource::workload_class::foreground_protocol,
+      64);
+}
+
+SEASTAR_TEST_CASE(segment_reader_fake_sealed_tail) {
+    co_await with_store_environment(
+      config(),
+      [](auto& env, auto& budget, auto drive) -> seastar::future<> {
+          auto& files = env.file_system();
+          const auto root = take(runtime::file_path::make("/kwaque/store"));
+          take(co_await drive.lifecycle(files.create_directories(root)));
+          stabilize(files, take(runtime::file_path::make("/kwaque")));
+          const auto spec = specification(root, {1, 1}, 68);
+          const std::array specs{spec};
+          ownership_input owner{specs};
+          co_await storage::testing::segment_reader_contract::sealed_tail<
+            simulation::monotonic_clock>(files, owner, spec, budget, drive);
+      },
+      byte_count{18_MiB},
+      resource::workload_class::foreground_protocol,
+      64);
+}
+
+SEASTAR_TEST_CASE(segment_reader_fake_moved_sessions) {
+    co_await with_store_environment(
+      config(),
+      [](auto& env, auto& budget, auto drive) -> seastar::future<> {
+          auto& files = env.file_system();
+          const auto root = take(runtime::file_path::make("/kwaque/store"));
+          take(co_await drive.lifecycle(files.create_directories(root)));
+          stabilize(files, take(runtime::file_path::make("/kwaque")));
+          const auto spec = specification(root, {1, 1}, 68);
+          const std::array specs{spec};
+          ownership_input owner{specs};
+          co_await storage::testing::segment_reader_contract::moved_sessions<
+            simulation::monotonic_clock>(files, owner, spec, budget, drive);
+      },
+      byte_count{18_MiB},
+      resource::workload_class::foreground_protocol,
+      64);
+}
+
+SEASTAR_TEST_CASE(segment_reader_fake_fed_tail) {
+    co_await with_store_environment(
+      config(),
+      [](auto& env, auto& budget, auto drive) -> seastar::future<> {
+          auto& files = env.file_system();
+          const auto root = take(runtime::file_path::make("/kwaque/store"));
+          take(co_await drive.lifecycle(files.create_directories(root)));
+          stabilize(files, take(runtime::file_path::make("/kwaque")));
+          const auto spec = specification(root, {1, 1}, 68);
+          const std::array specs{spec};
+          ownership_input owner{specs};
+          co_await storage::testing::segment_reader_contract::fed_tail<
+            simulation::monotonic_clock>(files, owner, spec, budget, drive);
+      },
+      byte_count{18_MiB},
+      resource::workload_class::foreground_protocol,
+      64);
+}
+
+SEASTAR_TEST_CASE(segment_reader_fake_read_edges) {
+    co_await with_store_environment(
+      config(),
+      [](auto& env, auto& budget, auto drive) -> seastar::future<> {
+          auto& files = env.file_system();
+          const auto root = take(runtime::file_path::make("/kwaque/store"));
+          take(co_await drive.lifecycle(files.create_directories(root)));
+          stabilize(files, take(runtime::file_path::make("/kwaque")));
+          const auto spec = specification(root, {1, 1}, 68);
+          const std::array specs{spec};
+          ownership_input owner{specs};
+          co_await storage::testing::segment_reader_contract::read_edges<
+            simulation::monotonic_clock>(files, owner, spec, budget, drive);
+      },
+      byte_count{18_MiB},
+      resource::workload_class::foreground_protocol,
+      64);
+}
+
+SEASTAR_TEST_CASE(segment_reader_fake_empty_reads) {
+    co_await with_store_environment(
+      config(),
+      [](auto& env, auto& budget, auto drive) -> seastar::future<> {
+          auto& files = env.file_system();
+          const auto root = take(runtime::file_path::make("/kwaque/store"));
+          take(co_await drive.lifecycle(files.create_directories(root)));
+          stabilize(files, take(runtime::file_path::make("/kwaque")));
+          const auto spec = specification(root, {1, 1}, 68);
+          const std::array specs{spec};
+          ownership_input owner{specs};
+          co_await storage::testing::segment_reader_contract::empty_reads<
+            simulation::monotonic_clock>(files, owner, spec, budget, drive);
+      },
+      byte_count{18_MiB},
+      resource::workload_class::foreground_protocol,
+      64);
+}
+
+SEASTAR_TEST_CASE(segment_reader_fake_damaged_runs) {
+    co_await with_store_environment(
+      config(),
+      [](auto& env, auto& budget, auto drive) -> seastar::future<> {
+          auto& files = env.file_system();
+          const auto root = take(runtime::file_path::make("/kwaque/store"));
+          take(co_await drive.lifecycle(files.create_directories(root)));
+          stabilize(files, take(runtime::file_path::make("/kwaque")));
+          const auto spec = specification(root, {1, 1}, 68);
+          const std::array specs{spec};
+          ownership_input owner{specs};
+          co_await storage::testing::segment_reader_contract::damaged_runs<
+            simulation::monotonic_clock>(files, owner, spec, budget, drive);
+      },
+      byte_count{18_MiB},
+      resource::workload_class::foreground_protocol,
+      64);
+}
+
+SEASTAR_TEST_CASE(segment_reader_fake_mixed_batches) {
+    co_await with_store_environment(
+      config(),
+      [](auto& env, auto& budget, auto drive) -> seastar::future<> {
+          auto& files = env.file_system();
+          const auto root = take(runtime::file_path::make("/kwaque/store"));
+          take(co_await drive.lifecycle(files.create_directories(root)));
+          stabilize(files, take(runtime::file_path::make("/kwaque")));
+          const auto spec = specification(root, {1, 1}, 68);
+          const std::array specs{spec};
+          ownership_input owner{specs};
+          co_await storage::testing::segment_reader_contract::mixed_batches<
+            simulation::monotonic_clock>(files, owner, spec, budget, drive);
+      },
+      byte_count{18_MiB},
+      resource::workload_class::foreground_protocol,
+      64);
+}
+
+SEASTAR_TEST_CASE(segment_reader_fake_fed_bounds) {
+    co_await with_store_environment(
+      config(),
+      [](auto& env, auto& budget, auto drive) -> seastar::future<> {
+          auto& files = env.file_system();
+          const auto root = take(runtime::file_path::make("/kwaque/store"));
+          take(co_await drive.lifecycle(files.create_directories(root)));
+          stabilize(files, take(runtime::file_path::make("/kwaque")));
+          const auto spec = specification(root, {1, 1}, 68);
+          const std::array specs{spec};
+          ownership_input owner{specs};
+          co_await storage::testing::segment_reader_contract::fed_bounds<
+            simulation::monotonic_clock>(files, owner, spec, budget, drive);
+      },
+      byte_count{18_MiB},
+      resource::workload_class::foreground_protocol,
+      64);
+}
+
+SEASTAR_TEST_CASE(segment_reader_fake_fed_limit) {
+    co_await with_store_environment(
+      config(),
+      [](auto& env, auto& budget, auto drive) -> seastar::future<> {
+          auto& files = env.file_system();
+          const auto root = take(runtime::file_path::make("/kwaque/store"));
+          take(co_await drive.lifecycle(files.create_directories(root)));
+          stabilize(files, take(runtime::file_path::make("/kwaque")));
+          const auto spec = specification(root, {1, 1}, 68);
+          const std::array specs{spec};
+          ownership_input owner{specs};
+          co_await storage::testing::segment_reader_contract::fed_limit<
+            simulation::monotonic_clock>(files, owner, spec, budget, drive);
+      },
+      byte_count{18_MiB},
+      resource::workload_class::foreground_protocol,
+      64);
+}
+
+SEASTAR_TEST_CASE(segment_reader_fake_crowded_reads) {
+    co_await with_store_environment(
+      config(),
+      [](auto& env, auto& budget, auto drive) -> seastar::future<> {
+          auto& files = env.file_system();
+          const auto root = take(runtime::file_path::make("/kwaque/store"));
+          take(co_await drive.lifecycle(files.create_directories(root)));
+          stabilize(files, take(runtime::file_path::make("/kwaque")));
+          const auto spec = specification(root, {1, 1}, 68);
+          const std::array specs{spec};
+          ownership_input owner{specs};
+          // The reads the fake device has had of the segment's data.
+          const auto reads = [&files, &spec] {
+              const auto path
+                = storage::testing::sparse_index_contract::data_path(spec);
+              const auto found = take(
+                fake_file_test_access::lookup(
+                  files,
+                  take(fake_file_test_access::resolve(files, path.value()))));
+              return std::optional{take(
+                fake_file_test_access::occurrences(
+                  files, found, runtime::builtin_fault_point::file_read))};
+          };
+          co_await storage::testing::segment_reader_contract::crowded_reads<
+            simulation::monotonic_clock>(
+            files, owner, spec, budget, drive, reads);
+      },
+      byte_count{18_MiB},
+      resource::workload_class::foreground_protocol,
+      64);
+}
+
+namespace {
+// What the fake device says of one file: the object it is, and the reads it
+// has had.
+storage::testing::segment_reader_contract::device_probe
+probe_file(fake_file_system& files, const runtime::file_path& path) {
+    const auto found = take(
+      fake_file_test_access::lookup(
+        files, take(fake_file_test_access::resolve(files, path.value()))));
+    return {
+      found.value(),
+      take(
+        fake_file_test_access::occurrences(
+          files, found, runtime::builtin_fault_point::file_read))};
+}
+// One store on the fake device for the two cases below, each of which runs
+// once to learn what to fail and once more with that failing.
+template<typename Case>
+seastar::future<>
+with_reader_store(environment_config configuration, Case run) {
+    co_await with_store_environment(
+      std::move(configuration),
+      [&run](auto& env, auto& budget, auto drive) -> seastar::future<> {
+          auto& files = env.file_system();
+          const auto root = take(runtime::file_path::make("/kwaque/store"));
+          take(co_await drive.lifecycle(files.create_directories(root)));
+          stabilize(files, take(runtime::file_path::make("/kwaque")));
+          const auto spec = specification(root, {1, 1}, 68);
+          const std::array specs{spec};
+          ownership_input owner{specs};
+          co_await run(files, owner, spec, budget, drive);
+      },
+      byte_count{18_MiB},
+      resource::workload_class::foreground_protocol,
+      64);
+}
+} // namespace
+
+SEASTAR_TEST_CASE(segment_reader_fake_failed_reads) {
+    using storage::testing::segment_reader_contract::device_probe;
+    device_probe learned;
+    for (const bool faulted : {false, true}) {
+        device_probe seen;
+        // The second read of the segment's data, which is its second run's.
+        co_await with_reader_store(
+          faulted ? config(
+                      runtime::builtin_fault_point::file_read,
+                      runtime::fault_action::file_failure_before_effect,
+                      learned.reads + 2,
+                      runtime::fault_object_key::from_u64(learned.object))
+                  : config(),
+          [faulted, &seen](
+            auto& files,
+            auto& owner,
+            const auto& spec,
+            auto& budget,
+            auto drive) {
+              return storage::testing::segment_reader_contract::failed_reads<
+                simulation::monotonic_clock>(
+                files,
+                owner,
+                spec,
+                budget,
+                drive,
+                faulted,
+                seen,
+                [&files](const runtime::file_path& path) {
+                    return probe_file(files, path);
+                });
+          });
+        // The fake device is the same from one run to the next.
+        BOOST_REQUIRE(
+          !faulted
+          || (seen.object == learned.object && seen.reads == learned.reads));
+        learned = seen;
+    }
+}
+
+SEASTAR_TEST_CASE(segment_reader_fake_starved_index) {
+    using storage::testing::segment_reader_contract::device_probe;
+    device_probe learned;
+    for (const bool faulted : {false, true}) {
+        device_probe seen;
+        std::optional<fault_rule> starving;
+        if (faulted)
+            // The next three reads of the index's bundle.
+            starving.emplace(take(
+              fault_rule::make(
+                take(fault_rule_id::make(2)),
+                runtime::builtin_fault_point::file_read,
+                runtime::fault_object_key::from_u64(learned.object),
+                take(runtime::fault_occurrence::make(learned.reads + 1)),
+                take(runtime::fault_occurrence::make(learned.reads + 3)),
+                fault_selector::bounded_range(),
+                take(
+                  runtime::fault_decision::make_file_failure(
+                    runtime::fault_action::file_failure_before_effect,
+                    runtime::file_failure_detail::device_io,
+                    byte_count{0})))));
+        co_await with_reader_store(
+          config(
+            std::nullopt,
+            runtime::fault_action::file_failure_before_effect,
+            1,
+            std::nullopt,
+            std::nullopt,
+            std::move(starving)),
+          [faulted, &seen](
+            auto& files,
+            auto& owner,
+            const auto& spec,
+            auto& budget,
+            auto drive) {
+              return storage::testing::segment_reader_contract::starved_index<
+                simulation::monotonic_clock>(
+                files,
+                owner,
+                spec,
+                budget,
+                drive,
+                faulted,
+                seen,
+                [&files](const runtime::file_path& path) {
+                    return probe_file(files, path);
+                });
+          });
+        BOOST_REQUIRE(
+          !faulted
+          || (seen.object == learned.object && seen.reads == learned.reads));
+        learned = seen;
+    }
 }
 
 SEASTAR_TEST_CASE(segment_writer_fake_preallocated_execution) {

@@ -283,6 +283,9 @@ struct local_storage_failure final {
     runtime::first_failure failure;
     // From the file failure; unknown when the failure carries none.
     runtime::file_failure_detail detail{runtime::file_failure_detail::unknown};
+    // The data device the failed segment is on. None for the WAL, which is
+    // on the control device.
+    std::optional<device_store_id> device{};
 };
 // Receives the first storage failure once, on the owner's shard, after the
 // owner's state is consistent, so it may call back into the owner. It must not
@@ -505,6 +508,7 @@ public:
         slot.segment.emplace(boundary->context());
         slot.device = segment.device();
         slot.stop = false;
+        slot.quiet = false;
         slot.looping = true;
         // A native allocation failure throws, with the slot left free.
         std::optional<seastar::future<>> loop;
@@ -534,6 +538,42 @@ public:
         return local_append_target{index, slot.attachment};
     }
 
+    // Closes one attachment's admission and resolves once it is idle, which
+    // is what detach() asks for. A request for it that has not joined its
+    // forming group is rejected as closed, with no effect. What was forming
+    // forms now, or is rejected unwritten where pressure would reject it,
+    // and every group of the attachment in flight settles through both
+    // barriers: nothing accepted is failed or abandoned. No other attachment
+    // waits or is refused anything. The attachment stays attached and takes
+    // no request again; detach() follows. Calls made while one waits wait
+    // with it. Refused with wrong_context for a target that is stale, also
+    // when it becomes so while this waits, and with closed when the owner's
+    // close ends the wait before the attachment is idle.
+    [[nodiscard]] seastar::future<runtime::result<void>>
+    quiesce(local_append_target target) {
+        assert_current();
+        if (closed_ || unquiet_)
+            co_return runtime::failure(error(errc::closed));
+        if (auto slot = find(target); !slot)
+            co_return runtime::failure(slot.error());
+        else
+            (*slot)->quiet = true;
+        ++quiescing_;
+        const auto counted = seastar::defer([this] noexcept {
+            --quiescing_;
+            drained_.broadcast();
+        });
+        // Nothing more joins what is forming, so it need not wait for more.
+        maybe_form();
+        for (;;) {
+            const auto slot = find(target);
+            if (!slot) co_return runtime::failure(slot.error());
+            if (idle(**slot)) co_return runtime::result<void>{};
+            if (unquiet_) co_return runtime::failure(error(errc::closed));
+            co_await quiet_.when();
+        }
+    }
+
     // Only an idle attachment detaches: no forming request and no group in
     // flight or waiting for its barrier. Its barrier loop then returns. The
     // completed-retry facts recorded for it move to the returned snapshot,
@@ -548,10 +588,7 @@ public:
         auto slot = find(target);
         if (!slot) return runtime::failure(slot.error());
         auto& owned = **slot;
-        if (
-          owned.forming != 0 || owned.groups != 0 || owned.freezing
-          || owned.head)
-            return runtime::failure(error(errc::queue_full));
+        if (!idle(owned)) return runtime::failure(error(errc::queue_full));
         // The checkpoint owner takes the final footer first: a checkpoint
         // cut after this must still pin it.
         if (checkpointer_ && owned.durable)
@@ -828,6 +865,15 @@ public:
         if (released) offer_reclaim();
         return released;
     }
+    // Where the WAL ends as reserved: every PREPARE accepted so far begins
+    // below it. A segment that is detached gets no further PREPARE, so each
+    // of its own lies below what this says from then on.
+    [[nodiscard]] runtime::result<local_wal_cursor> wal_end() const {
+        assert_current();
+        const auto wal = writer_.progress();
+        if (!wal) return runtime::failure(error(errc::closed));
+        return wal->reserved;
+    }
     // Whether a WAL file is no longer being written, which a rotation flushes
     // before leaving, and no obligation row names it. A diagnostic, not a
     // deletion rule: WAL files are deleted only as a prefix below a durable
@@ -1042,6 +1088,14 @@ public:
         } catch (...) {
             close_outcome_.observe(std::current_exception());
         }
+        // Whoever waits for an attachment to be idle finds it so, and leaves.
+        unquiet_ = true;
+        try {
+            quiet_.broadcast();
+            co_await drained_.wait([this] { return quiescing_ == 0; });
+        } catch (...) {
+            close_outcome_.observe(std::current_exception());
+        }
         for (auto& slot : slots_)
             stop_loop(slot);
         try {
@@ -1137,6 +1191,8 @@ private:
         // The barrier loop waits here; only it waits, so a signal targets it.
         seastar::condition_variable wake;
         bool looping{false}, stop{false};
+        // quiesce() closed this attachment's admission.
+        bool quiet{false};
     };
     struct group_state final {
         group_state(
@@ -1234,6 +1290,17 @@ private:
         return &slots_[target.slot_];
     }
 
+    // Nothing of the attachment is forming, in flight or waiting for its
+    // barrier.
+    static bool idle(const segment_slot& slot) noexcept {
+        return slot.forming == 0 && slot.groups == 0 && !slot.freezing
+               && !slot.head;
+    }
+    // An attachment may have become idle: whoever waits for one looks again.
+    void settled() noexcept {
+        if (quiescing_ != 0) quiet_.broadcast();
+    }
+
     void request_stop() noexcept {
         stopped_ = true;
         maybe_form();
@@ -1244,7 +1311,8 @@ private:
     void observe_storage(
       local_storage_path path,
       const std::optional<segment_context>& segment,
-      const runtime::first_failure& failure) noexcept {
+      const runtime::first_failure& failure,
+      std::optional<device_store_id> device = std::nullopt) noexcept {
         if (!failure.failed() || storage_failure_) return;
         auto detail = runtime::file_failure_detail::unknown;
         if (failure.error()) {
@@ -1252,7 +1320,7 @@ private:
                 detail = *found;
         }
         storage_failure_.emplace(
-          local_storage_failure{path, segment, failure, detail});
+          local_storage_failure{path, segment, failure, detail, device});
         if (sink_) sink_(*storage_failure_);
     }
     // The WAL owners latch their own storage failures; this owner reports the
@@ -1277,7 +1345,8 @@ private:
             observe_storage(
               local_storage_path::segment,
               slot.segment,
-              slot.writer->failure());
+              slot.writer->failure(),
+              slot.writer->device());
     }
 
     // Reserves the obligation row of a WAL file and segment for a forming
@@ -1557,6 +1626,8 @@ private:
             co_return reject(error(errc::closed));
         if (auto attached = find(target); !attached)
             co_return reject(attached.error());
+        else if ((*attached)->quiet)
+            co_return reject(error(errc::closed));
         if (admission.policy() != config_.policy)
             co_return reject(error(errc::invalid_argument));
         if (auto over = ended()) co_return reject(*over);
@@ -1588,6 +1659,7 @@ private:
             co_return reject(error(errc::closed));
         auto slot = find(target);
         if (!slot) co_return reject(slot.error());
+        if ((*slot)->quiet) co_return reject(error(errc::closed));
         if (auto over = ended()) co_return reject(*over);
         auto child = admitted_wal_batch::make(
           std::move(request.batch),
@@ -1612,6 +1684,7 @@ private:
                 co_return reject(error(errc::closed));
             slot = find(target);
             if (!slot) co_return reject(slot.error());
+            if ((*slot)->quiet) co_return reject(error(errc::closed));
             if (!(*slot)->freezing) break;
             co_await (*slot)->frozen.when();
         }
@@ -1814,6 +1887,7 @@ private:
             slot.forming = 0;
             slot.prepared.reset();
         }
+        settled();
         // Waking only schedules the waiters, so forming_ stays unchanged
         // until it is cleared; clearing keeps its admitted capacity.
         for (auto& item : forming_)
@@ -1826,6 +1900,7 @@ private:
       std::uint32_t index, const runtime::first_failure& failure) noexcept {
         slots_[index].forming = 0;
         slots_[index].prepared.reset();
+        settled();
         for (auto& item : forming_)
             if (item->slot == index) install(*item, not_written(failure));
         for (auto& item : forming_)
@@ -2191,6 +2266,7 @@ private:
     // Nothing froze: every member is not_written, and formation continues.
     void
     unwind_group(group_state& group, const runtime::first_failure& failure) {
+        settled();
         for (auto& part : group.branches) {
             auto& slot = slots_[part->slot];
             slot.freezing = false;
@@ -2304,6 +2380,7 @@ private:
                 slot.frozen.broadcast();
             }
         }
+        settled();
         if (ticket) {
             // The result observer uses the group's pre-admitted slot.
             auto observed = ticket->observe();
@@ -2618,6 +2695,7 @@ private:
             if (part->group->wal_settled) publish_branch(*part->group, *part);
             if (part == last) break;
         }
+        settled();
     }
 
     void stop_loop(segment_slot& slot) noexcept {
@@ -2635,6 +2713,7 @@ private:
             install(*item, outcome(*item, part, group));
         --slots_[part.slot].groups;
         --group.unpublished;
+        settled();
         for (const auto& item : part.items)
             wake(*item);
         if (group.unpublished == 0) group.published.set_value();
@@ -2717,6 +2796,11 @@ private:
     seastar::gate operations_;
     // Close waits here for formations and groups to drain.
     seastar::condition_variable drained_;
+    // quiesce() waits here for its attachment to be idle, while any does.
+    seastar::condition_variable quiet_;
+    std::uint32_t quiescing_{0};
+    // Close ended those waits.
+    bool unquiet_{false};
     // Accepted work never uses a caller's abort source.
     seastar::abort_source abort_;
     codec::cooperative_work execution_, preparation_;

@@ -162,6 +162,17 @@ struct decoded_segment_block final {
     codec::decode_budget remaining;
 };
 
+// What check_segment_block() leaves of a block: where it lies, what it
+// covers, and where in it its child envelope lies. It owns no bytes and
+// proves nothing about a buffer other than the one that was checked.
+struct checked_segment_block final {
+    storage::coverage coverage;
+    // From the block's first byte to its child's.
+    byte_count child_offset;
+    byte_count child_bytes;
+    bool operator==(const checked_segment_block&) const noexcept = default;
+};
+
 // Pure initial-append check, separate from relocation/format acceptance.
 // Requires dense original data and matching original/current topic, range,
 // segment and generation. It neither grants a lease nor performs an append.
@@ -218,6 +229,29 @@ encode_segment_block(
 // success during cleanup.
 [[nodiscard]] seastar::future<codec::result<decoded_segment_block>>
 decode_segment_block(
+  kwaque::bytes::fragmented_buffer_parser& input,
+  segment_block_expectation expected,
+  codec::decode_budget memory,
+  codec::cooperative_work& work,
+  codec::field_context context = {},
+  codec::input_boundary boundary = codec::input_boundary::open);
+
+// Checks one block where it lies, for bytes read back below a boundary their
+// segment's owner pinned: bytes that owner validated before it wrote them.
+// The envelope's header and body checksums, which cover the child's exact
+// bytes; the segment, the position and the physical begin against what the
+// caller independently expects; the child's length and the zero padding; and
+// the child's own fixed header against the block: its topic and range, its
+// logical span, and its retained count against the block's physical span. No
+// record is walked and nothing is decompressed, so this is not what decodes
+// bytes whose history is unknown: decode_segment_block() is.
+//
+// The same borrow, reservation and transaction contract as
+// decode_segment_block(), with nothing retained: success consumes exactly
+// this block and returns no alias of it, and failure restores the cursor and
+// its marks.
+[[nodiscard]] seastar::future<codec::result<checked_segment_block>>
+check_segment_block(
   kwaque::bytes::fragmented_buffer_parser& input,
   segment_block_expectation expected,
   codec::decode_budget memory,

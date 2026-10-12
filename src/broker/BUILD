@@ -582,6 +582,7 @@ kwaque_cc_seastar_test(
         "//src/storage:workload_budget",
         "//src/storage/tests:local_installation_contract",
         "//src/storage/tests:segment_qualification_contract",
+        "//src/storage/tests:segment_reader_contract",
         "//src/storage/tests:segment_writer_contract",
         "//src/storage/tests:sparse_index_contract",
     ],
@@ -608,6 +609,7 @@ kwaque_cc_seastar_test(
         "//src/storage:workload_budget",
         "//src/storage/tests:local_append_contract",
         "//src/storage/tests:recovery_successor_contract",
+        "//src/storage/tests:segment_lifecycle_contract",
     ],
 )
 

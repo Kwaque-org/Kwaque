@@ -1,14 +1,18 @@
 #ifndef KWAQUE_SRC_RUNTIME_PRODUCTION_FILE_H_
 #define KWAQUE_SRC_RUNTIME_PRODUCTION_FILE_H_
 
+#include "src/runtime/error.h"
 #include "src/runtime/file.h"
+#include "src/runtime/file_flight.h"
 #include "src/runtime/operation_statistics.h"
 #include "src/runtime/shard_affinity.h"
+#include "src/runtime/time.h"
 
 #include <array>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <string_view>
 #include <utility>
 
@@ -118,9 +122,36 @@ public:
         return statistics_->snapshot();
     }
 
+    // Keeps the operations under `root` in the order they started, apart
+    // from every other device's: files opened under it from here on, and
+    // this file system's own calls on paths under it. Called for each
+    // device before anything on it is opened. See file_flight_watch.
+    [[nodiscard]] result<void>
+    watch_device(const file_path& root, file_flight_watch watching) {
+        assert_current();
+        return flights_.watch(root.value(), watching);
+    }
+    // When the oldest operation in flight under a watched root started;
+    // none when nothing is in flight there.
+    [[nodiscard]] std::optional<monotonic_time>
+    oldest_operation(const file_path& root) const noexcept {
+        assert_current();
+        return flights_.oldest(root.value());
+    }
+
+    // Whether the runtime schedules the device with this number on an I/O
+    // queue of its own. A device it has no queue for shares one that has
+    // no limits, where no scheduling share holds.
+    [[nodiscard]] bool device_queue(std::uint64_t device) const noexcept;
+
 private:
+    [[nodiscard]] file_operation admit(const file_path& path) noexcept {
+        return file_operation{*statistics_, flights_.under(path.value()).get()};
+    }
+
     operation_statistics_owner statistics_owner_;
     operation_statistics* statistics_;
+    file_flights flights_;
     // Cursors that hold a listing page at once; see directory_cursor_memory.
     seastar::lw_shared_ptr<seastar::semaphore> cursor_slots_
       = seastar::make_lw_shared<seastar::semaphore>(64);

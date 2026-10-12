@@ -5031,7 +5031,8 @@ fake_file_system::apply_open(metadata_operation& metadata, bool& open_slot) {
     return pending_open{
       std::move(native),
       std::move(statistics),
-      metadata.open_options.close_policy};
+      metadata.open_options.close_policy,
+      flights_.under(metadata.path->bytes())};
 }
 
 void fake_file_system::observe_file_effect(std::uint64_t bytes, bool applied) {

@@ -65,9 +65,25 @@ kwaque_cc_library(
         "//src/runtime:error",
         "//src/runtime:file",
         "//src/runtime:file_error_internal",
+        "//src/runtime:file_flight",
         "//src/runtime:operation_statistics",
         "//src/runtime:shard_affinity",
+        "//src/runtime:time",
         "@seastar",
+    ],
+)
+
+kwaque_cc_library(
+    name = "stall_judge",
+    srcs = ["stall_judge.cc"],
+    hdrs = ["stall_judge.h"],
+    visibility = [
+        "//src/broker:__pkg__",
+        "//src/runtime/tests:__pkg__",
+    ],
+    deps = [
+        "//src/runtime:error",
+        "//src/runtime:stall_watch",
     ],
 )
 

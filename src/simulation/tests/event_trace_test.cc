@@ -1150,8 +1150,13 @@ TEST(EventTraceTest, ValidatesTypedFileEffectAndReceiptAsSeparateRecords) {
     auto no_effect_bytes = effect;
     no_effect_bytes.result = 0;
     EXPECT_FALSE(trace.observe(no_effect_bytes).has_value());
+    // The newest detail a file failure carries, eight, is recorded, and
+    // the first value past it is not.
+    auto newest_detail = returned;
+    newest_detail.result = UINT32_C(0x10808);
+    EXPECT_TRUE(trace.observe(newest_detail).has_value());
     auto unknown_detail = returned;
-    unknown_detail.result = UINT32_C(0x10808);
+    unknown_detail.result = UINT32_C(0x10908);
     EXPECT_FALSE(trace.observe(unknown_detail).has_value());
     auto exceptional_code = returned;
     exceptional_code.result = UINT32_C(0x30001);

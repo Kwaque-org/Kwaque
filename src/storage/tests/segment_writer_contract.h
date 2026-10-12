@@ -1183,6 +1183,155 @@ seastar::future<std::pair<segment_captured_boundary, std::string>> write_group(
     co_return std::pair{submitted.boundary, std::move(bytes)};
 }
 
+// A reader's pin of a segment that is still written. Readers share one
+// read-only handle, opened when the first asks and apart from the handle the
+// writer writes through. Each is told how far it may read, the durable
+// position as it stood, and reads the exact stored bytes below it: nothing
+// before a barrier, the whole group after it. A bound is a snapshot: a read
+// past it is refused whatever was appended since, and the reader that wants
+// more asks again. A refused read is that read's outcome and fails nothing.
+// A read outlives the pin it was asked through, and close waits for pins.
+template<
+  runtime::monotonic_clock Clock,
+  typename Backend,
+  typename Owner,
+  typename Driver>
+seastar::future<> data_pins(
+  Backend& files,
+  Owner& owner,
+  const local_device_spec& spec,
+  workload_budget& resources,
+  Driver drive) {
+    using writer_type = segment_writer<Backend, Owner, Clock>;
+    seastar::abort_source abort;
+    codec::cooperative_work work{codec::limits::defaults(), abort};
+    co_await installation::bootstrap(
+      files, owner, spec, resources, work, drive);
+    auto config = configuration();
+    config.maximum_groups = 2;
+    config.admission.working_bytes = byte_count{1_MiB};
+    auto writer = take(
+      writer_type::make_new(
+        files, owner, spec, 0, descriptor(), resources, config));
+    runtime::first_failure failed;
+    try {
+        take(co_await drive.lifecycle(writer->create_new(work)));
+        const auto start = writer->progress()->durable.bytes;
+        const auto unit = descriptor().alignment.bytes();
+        const auto before = resources.snapshot();
+        // The first reader: the handle is opened for it, at the cost of one
+        // handle and one admission.
+        std::optional<segment_data_view> first{
+          take(co_await drive.lifecycle(writer->pin_data(work)))};
+        const auto opened = resources.snapshot();
+        require(
+          first->durable == start
+            && first->history.segment == descriptor().segment
+            && first->history.data_start == start
+            && opened.handles == before.handles + 1
+            && opened.tasks == before.tasks + 1,
+          "the first reader was not given the durable position, or its "
+          "handle is not one handle");
+        {
+            // Nothing is durable: nothing is readable.
+            const auto unread = co_await drive.lifecycle(
+              first->pin.read(start, unit, first->durable));
+            require(
+              !unread && unread.error().code() == errc::out_of_range,
+              "a reader read past the durable position");
+        }
+        codec::crc32c checksum;
+        std::vector<encoded_assigned_batch> batches;
+        batches.push_back(co_await child(work, 4096));
+        batches.push_back(co_await execution_child(101, work));
+        const auto [cut, stored] = co_await write_group(
+          *writer, std::move(batches), resources, work, drive, checksum);
+        const byte_count length{cut.end().bytes.value() - start.value()};
+        require(
+          stored.size() == length.value()
+            && writer->progress()->written == cut.end()
+            && writer->progress()->durable.bytes == start,
+          "the group to read was not written, or is durable already");
+        {
+            // Written and not durable: a reader that asks now is told the
+            // same position, and reads nothing of the group.
+            const auto early = take(
+              co_await drive.lifecycle(writer->pin_data(work)));
+            const auto unread = co_await drive.lifecycle(
+              early.pin.read(start, length, early.durable));
+            require(
+              early.durable == start && !unread
+                && unread.error().code() == errc::out_of_range
+                && resources.snapshot().handles == opened.handles,
+              "written bytes that are not durable were readable, or a second "
+              "reader took a handle of its own");
+        }
+        const auto synced = co_await drive.lifecycle(writer->barrier(cut));
+        take(synced.failure.outcome());
+        std::optional<segment_data_view> second{
+          take(co_await drive.lifecycle(writer->pin_data(work)))};
+        require(
+          second->durable == cut.end().bytes
+            && resources.snapshot().handles == opened.handles,
+          "a reader that asked after the barrier was not told its position");
+        {
+            const auto whole = take(
+              co_await drive.lifecycle(
+                second->pin.read(start, length, second->durable)));
+            require(
+              flat(whole) == stored,
+              "the durable group read through a pin is not what was written");
+        }
+        {
+            // The first reader's bound is where it stood: it reads no
+            // further, though the bytes are durable now. The pin is the
+            // handle, not the bound: under the newer bound it reads them.
+            const auto bounded = co_await drive.lifecycle(
+              first->pin.read(start, length, first->durable));
+            const auto asked_again = take(
+              co_await drive.lifecycle(
+                first->pin.read(start, length, second->durable)));
+            require(
+              !bounded && bounded.error().code() == errc::out_of_range
+                && flat(asked_again) == stored && !writer->failure().failed(),
+              "a bound moved with later appends, or a refused read failed "
+              "its segment");
+        }
+        {
+            // A read outlives the pin it was asked through, and a share of
+            // a pin is another pin.
+            auto shared = second->pin.share();
+            auto reading = second->pin.read(start, length, second->durable);
+            const auto bound = second->durable;
+            second.reset();
+            first.reset();
+            const auto whole = take(
+              co_await drive.lifecycle(std::move(reading)));
+            const auto again = take(
+              co_await drive.lifecycle(shared.read(start, length, bound)));
+            require(
+              flat(whole) == stored && flat(again) == stored,
+              "a read did not complete once its pin was let go");
+        }
+        // Every pin is let go: close has nothing to wait for, closes the
+        // handle, and gives its credit back.
+        take(co_await drive.lifecycle(writer->close()));
+        const auto refused = co_await drive.lifecycle(writer->pin_data(work));
+        require(
+          !refused && refused.error().code() == errc::closed,
+          "a closed segment gave out a reader's pin");
+    } catch (...) {
+        failed.observe(std::current_exception());
+    }
+    try {
+        failed.observe(co_await drive.lifecycle(writer->close()));
+    } catch (...) {
+        failed.observe(std::current_exception());
+    }
+    writer.reset();
+    take(failed.outcome());
+}
+
 // A zero-written segment. Creation extends the file with durable zeros. A
 // group above the synchronized limit takes an ordinary write and its
 // barrier's flush; a small group inside the zero-written range takes a

@@ -14,6 +14,7 @@
 #include "src/storage/tests/wal_writer_contract.h"
 #include "src/storage/wal_format.h"
 
+#include <seastar/core/condition-variable.hh>
 #include <seastar/core/coroutine.hh>
 #include <seastar/core/reactor.hh>
 #include <seastar/core/seastar.hh>
@@ -1260,8 +1261,9 @@ private:
               observed.peak_admission, s.budget.snapshot().bytes);
             return stages;
         };
-        // A rejection names its typed pressure or failure; the cases are sized
-        // so that none occurs.
+        // A rejection names its typed pressure or failure. A held burst is
+        // sized so that none occurs; arrivals that do not wait for their
+        // result are held back at the owner's own bound, below.
         const auto admitted = [](const local_append_acceptance& acceptance) {
             take(acceptance.failure.outcome());
             require(
@@ -1305,6 +1307,15 @@ private:
             const auto arrival_start = std::chrono::steady_clock::now();
             std::vector<std::optional<seastar::future<>>> pending_results(
               count);
+            // Requests offered whose result is not in. The owner refuses a
+            // request while as many as one WAL group holds wait to form,
+            // which a device slower than the arrivals brings about. A
+            // producer waits then, and so does this one: an arrival is held
+            // back until a result is in, and what it waited shows between
+            // the time it was planned for and the time it started. No
+            // request is dropped for a stall, and none is refused.
+            std::size_t outstanding = 0;
+            seastar::condition_variable drained;
             runtime::first_failure failed;
             try {
                 for (std::size_t i = 0; i < count; ++i) {
@@ -1318,11 +1329,19 @@ private:
                       due > now)
                         co_await seastar::sleep<std::chrono::steady_clock>(
                           due - now);
+                    while (outstanding >= maximum_wal_group_members)
+                        co_await drained.wait();
                     samples[i].started = measurement_time();
-                    if (selected.profile == arrival::isolated)
+                    if (selected.profile == arrival::isolated) {
                         co_await observe(i, offer(i));
-                    else
-                        pending_results[i].emplace(observe(i, offer(i)));
+                        continue;
+                    }
+                    ++outstanding;
+                    pending_results[i].emplace(
+                      observe(i, offer(i)).finally([&outstanding, &drained] {
+                          --outstanding;
+                          drained.signal();
+                      }));
                 }
             } catch (...) {
                 failed.observe(std::current_exception());

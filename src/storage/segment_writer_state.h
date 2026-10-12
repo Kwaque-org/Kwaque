@@ -1,6 +1,7 @@
 #pragma once
 
 #include "src/base/units.h"
+#include "src/bytes/fragmented_buffer.h"
 #include "src/codec/envelope.h"
 #include "src/model/segment_state.h"
 #include "src/runtime/file.h"
@@ -9,6 +10,7 @@
 #include "src/storage/encoded_batch.h"
 #include "src/storage/local_metadata.h"
 #include "src/storage/retry_format.h"
+#include "src/storage/segment_data.h"
 #include "src/storage/workload_budget.h"
 
 #include <seastar/core/condition-variable.hh>
@@ -58,6 +60,18 @@ struct segment_writer_position final {
 };
 struct segment_writer_positions final {
     segment_writer_position reserved, written, durable;
+};
+
+// What a reader of a segment that is still written is given: the right to
+// read its data, the segment it is of, and how far it may read. `durable` is
+// where the segment's durable bytes ended when this was asked for: a
+// snapshot, which later appends do not move. Bytes below it never change,
+// so they are read without their writer and stay readable when the segment
+// is sealed. A reader that wants what was appended since asks again.
+struct segment_data_view final {
+    segment_data_pin pin;
+    segment_history_context history;
+    runtime::file_position durable;
 };
 
 // Captured by one owner, not constructible from caller-selected coordinates.
@@ -156,6 +170,16 @@ struct segment_block_observer final {
     // Every block that begins below this position is durable.
     seastar::noncopyable_function<void(runtime::file_position) noexcept>
       durable;
+    // The bytes of the group `written` was just told of, its blocks and the
+    // footer after them as they lie in the file from the position given, for
+    // whoever keeps what was just written for those reading behind the
+    // writer. Called only while `*wanted` is true, which costs a segment
+    // nobody reads one branch. The bytes are borrowed for the call and may
+    // be shared: nothing here waits, copies or fails.
+    seastar::noncopyable_function<void(
+      runtime::file_position, bytes::fragmented_buffer&) noexcept>
+      fed{};
+    const bool* wanted{nullptr};
 };
 // The eventual frozen handoff binds all blocks and the footer to one captured
 // owner. A prospective capacity check does not mint this value.
@@ -208,6 +232,83 @@ enum class segment_capacity_decision : std::uint8_t {
     roll_required,
     impossible
 };
+// Why a segment that is appended to takes a request no more, so that
+// whoever owns the segments follows it with another. A request an empty
+// segment could not take either is impossible, and has none of these.
+enum class segment_roll_reason : std::uint8_t {
+    // Its extent has no room for the group, the footer after it and the
+    // root its seal writes.
+    size,
+    // Its blocks, footers or records are as many as a segment holds.
+    count,
+    // Its completed-retry facts are as many as its seal can publish, or as
+    // its budget holds beside the group.
+    retry_state,
+    // Its lifetime ended.
+    age,
+    // A restart found it: it is never appended again.
+    recovered,
+    // Its device is short of space, stalled or failed.
+    device,
+};
+// Any of them together.
+class segment_roll_reasons final {
+public:
+    constexpr segment_roll_reasons() noexcept = default;
+    constexpr explicit segment_roll_reasons(segment_roll_reason one) noexcept
+      : bits_(bit(one)) {}
+    [[nodiscard]] constexpr bool empty() const noexcept { return bits_ == 0; }
+    [[nodiscard]] constexpr bool has(segment_roll_reason one) const noexcept {
+        return (bits_ & bit(one)) != 0;
+    }
+    constexpr segment_roll_reasons& add(segment_roll_reason one) noexcept {
+        bits_ = static_cast<std::uint8_t>(bits_ | bit(one));
+        return *this;
+    }
+    constexpr segment_roll_reasons& add(segment_roll_reasons more) noexcept {
+        bits_ = static_cast<std::uint8_t>(bits_ | more.bits_);
+        return *this;
+    }
+    // These, less those of `other`.
+    [[nodiscard]] constexpr segment_roll_reasons
+    without(segment_roll_reasons other) const noexcept {
+        segment_roll_reasons rest;
+        rest.bits_ = static_cast<std::uint8_t>(bits_ & ~other.bits_);
+        return rest;
+    }
+    bool operator==(const segment_roll_reasons&) const noexcept = default;
+
+private:
+    [[nodiscard]] static constexpr std::uint8_t
+    bit(segment_roll_reason one) noexcept {
+        return static_cast<std::uint8_t>(1U << static_cast<unsigned>(one));
+    }
+    std::uint8_t bits_{0};
+};
+// What a segment that is appended to still has room for. Whoever owns the
+// segments reads it to make the successor before the room is gone. Nothing
+// here is reserved: a request is decided when it is made.
+struct segment_left final {
+    // Encoded bytes of blocks its next group may hold, after the footer
+    // that follows them and the root its seal writes. A group of one block
+    // of exactly this size is taken, and one byte more is not; a group of
+    // more blocks may find less, since the root grows with their facts.
+    byte_count bytes;
+    // Blocks it may still take, by its counts and its completed-retry
+    // facts; none when it has no byte for one.
+    std::uint32_t blocks{0};
+    // When its lifetime ends. None before its first accepted group.
+    std::optional<runtime::monotonic_time> deadline;
+};
+// What a segment's owner is told of it that no append's outcome says.
+// Neither call may throw, and neither may call back into the writer: both
+// run inside its own steps.
+struct segment_roll_observer final {
+    // Its first group was accepted: its lifetime runs, and ends then.
+    seastar::noncopyable_function<void(runtime::monotonic_time) noexcept> aging;
+    // A request was refused as roll-required, for these.
+    seastar::noncopyable_function<void(segment_roll_reasons) noexcept> refused;
+};
 struct segment_disk_obligation final {
     // Total projected data file, including its header, group footer and root.
     byte_count data;
@@ -227,6 +328,8 @@ struct segment_capacity_plan final {
     // admission; finalizer PageRefs are covered by the held seal working set.
     byte_count retry_metadata;
     segment_disk_obligation disk{};
+    // Every reason a roll_required decision has; none otherwise.
+    segment_roll_reasons reasons{};
 };
 
 // Pure, bounded lookahead. Borrow exact children only for this call. Neither
@@ -242,6 +345,19 @@ struct segment_capacity_plan final {
   const codec::limits&,
   bytes::allocation_charge_fn,
   storage_alignment metadata_alignment,
+  byte_count finalization_bytes);
+
+// The most a segment of this descriptor may come to hold on its device: its
+// whole extent, and the retry bundle of a seal that holds as many facts as
+// its extent has room for blocks. A segment is admitted against this before
+// it is created, so that the space it was promised is there when it writes.
+// What else it writes is small and is the device's floor's: its descriptor,
+// its pointers, its index bundle and temporaries.
+[[nodiscard]] runtime::result<byte_count> segment_disk_bound(
+  const local_segment_descriptor&,
+  segment_admission_limits,
+  const codec::limits&,
+  bytes::allocation_charge_fn,
   byte_count finalization_bytes);
 
 namespace detail {
@@ -287,6 +403,9 @@ struct segment_capacity_constants final {
     // when no projection fits.
     [[nodiscard]] std::optional<std::uint32_t>
     seal_page_entries(std::uint64_t entries) const;
+    // Root bytes of a segment sealed with this many completed facts, absent
+    // when no projection fits. The answer for the count last asked is kept.
+    [[nodiscard]] std::optional<byte_count> sealed_root(std::uint64_t entries);
 
     local_segment_descriptor descriptor;
     runtime::file_position data_start;
@@ -309,6 +428,8 @@ struct segment_capacity_constants final {
     std::array<std::optional<byte_count>, maximum_segment_group_blocks + 1>
       fresh_roots{};
     std::array<bool, maximum_segment_group_blocks + 1> fresh_known{};
+    std::optional<std::uint64_t> root_asked;
+    std::optional<byte_count> root_kept;
 };
 [[nodiscard]] runtime::result<segment_capacity_plan> plan_segment_capacity(
   segment_capacity_constants&,
@@ -368,5 +489,7 @@ private:
 struct segment_group_preparation final {
     segment_capacity_decision decision;
     std::optional<segment_prepared_group> prepared;
+    // Every reason a roll_required decision has; none otherwise.
+    segment_roll_reasons reasons{};
 };
 } // namespace kwaque::storage

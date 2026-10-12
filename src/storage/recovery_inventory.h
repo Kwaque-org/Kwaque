@@ -1,5 +1,6 @@
 #pragma once
 
+#include "src/base/allocation.h"
 #include "src/base/units.h"
 #include "src/storage/local_discovery.h"
 #include "src/storage/local_metadata_file.h"
@@ -7,6 +8,7 @@
 #include "src/storage/page_internal.h"
 #include "src/storage/recovery_decision.h"
 #include "src/storage/recovery_pins.h"
+#include "src/storage/retention.h"
 
 #include <seastar/core/coroutine.hh>
 
@@ -345,6 +347,10 @@ discover_recovery_decisions(
 struct recovery_catalog_entry final {
     local_segment_descriptor descriptor;
     segment_header header;
+    // For a segment its owner marks as expiring: the authorization its
+    // removal was accepted with, supplied again at every start, so that a
+    // removal a restart resumes is checked as the first request was.
+    std::optional<deletion_authorization> expiring{};
 };
 enum class recovery_entry_state : std::uint8_t {
     // Active, recovering or sealed, its pins opened: the merge reconciles it.
@@ -354,9 +360,14 @@ enum class recovery_entry_state : std::uint8_t {
     // the pins are not opened and the merge must not read it: the recovered
     // seal resumes first.
     sealing,
-    // Its publication is deleting: deletion reconciliation owns it, and the
-    // merge never reads it.
+    // Being removed: its directory is under its deleting name, its
+    // publication is deleting, or its owner marks it expiring with an
+    // authorization that names what the device holds. Whoever owns removals
+    // goes on with it, and the merge never reads it.
     deleting,
+    // Its owner marks it expiring and no device holds it under either name:
+    // a removal that finished. Reported again, and nothing is read.
+    gone,
 };
 // One catalog segment as restart found it, from its fixed publication and the
 // pins it carries. Only values are kept; nothing stays open.
@@ -369,6 +380,19 @@ struct recovery_entry final {
     std::optional<runtime::operation_error> index_rebuild;
     // The decision a sealing entry's recovered seal resumes.
     std::optional<recovery_decision_pin> pending_seal;
+    // Found under its deleting name. Nothing inside such a directory is
+    // read, so of this entry only the state, the device and the segment
+    // are known. A marked segment its owner still lists as retained is
+    // removed all the same, and whoever starts the shard says so.
+    bool marked{false};
+    // What the catalog marks it expiring with, as supplied.
+    std::optional<deletion_authorization> expiring;
+    // For an expiring segment found whole under its own name: the sealed
+    // extent the device holds of it, when it is sealed, and what its
+    // authorization was refused with when it does not name that. A refused
+    // one changes nothing: the segment is kept and read as any other.
+    std::optional<segment_immutable_expectation> sealed;
+    std::optional<authorization_verdict> refused;
 };
 struct recovery_inventory final {
     // Holds the charge for both vectors.
@@ -468,6 +492,73 @@ seastar::future<runtime::result<recovery_found>> find_recovery_segment(
   workload_budget& budget,
   local_store_io_limits limits,
   codec::cooperative_work& work) {
+    const auto unread = [&item](
+                          recovery_entry_state state, device_store_id device) {
+        recovery_found output{
+          {state,
+           device,
+           segment_history_context{
+             item.descriptor.segment,
+             item.descriptor.alignment,
+             runtime::file_position{},
+             item.descriptor.logical_origin,
+             item.descriptor.physical_origin,
+             item.descriptor.profile},
+           {},
+           local_object_publication{
+             item.descriptor.segment,
+             local_object_state::deleting,
+             std::nullopt,
+             {}},
+           {},
+           {}},
+          {}};
+        output.entry.expiring = item.expiring;
+        return output;
+    };
+    // Where its directory is decides before anything inside it is read.
+    const auto place = co_await find_segment_directory(
+      files, ownership, devices, shard, item.descriptor.segment, work);
+    if (!place) co_return runtime::failure(place.error());
+    // Under neither name: lost, unless its owner says it expires.
+    if (!*place) {
+        if (item.expiring)
+            co_return unread(recovery_entry_state::gone, device_store_id{});
+        co_return runtime::failure(path_error(errc::not_found));
+    }
+    // Under the deleting name it is being removed whatever it holds and
+    // whatever the catalog says of the segment.
+    if ((*place)->marked) {
+        auto output = unread(recovery_entry_state::deleting, (*place)->device);
+        output.entry.marked = true;
+        co_return output;
+    }
+    // Under its own name. One its owner discards as not sealed is decided by
+    // what is published of it, before anything else of it is read or
+    // resumed: a creation that was interrupted published nothing, and what
+    // it left goes as what it is. A sealed one is kept, below.
+    if (
+      item.expiring
+      && authorize_deletion(
+           *item.expiring,
+           {item.descriptor.segment,
+            segment_holding::unsealed,
+            std::nullopt,
+            std::nullopt})
+           == authorization_verdict::authorized) {
+        const auto on = std::find_if(
+          devices.begin(), devices.end(), [&place](const auto& value) {
+              return value.owner.device() == (*place)->device;
+          });
+        if (on == devices.end())
+            co_return runtime::failure(path_error(errc::invariant_violation));
+        const auto published = co_await select_recovery_publication(
+          files, *on, shard, item.descriptor, budget, limits, work);
+        if (!published && published.error().code() != errc::not_found)
+            co_return runtime::failure(published.error());
+        if (!published || published->second.state != local_object_state::sealed)
+            co_return unread(recovery_entry_state::deleting, (*place)->device);
+    }
     // Only the placement is kept, not the reservations that read it.
     std::optional<wal_target> placement;
     {
@@ -481,6 +572,7 @@ seastar::future<runtime::result<recovery_found>> find_recovery_segment(
           budget,
           limits,
           work);
+        // Its directory is there: a file of it that is not is damage.
         if (!located) co_return runtime::failure(located.error());
         placement = make_wal_target(*located);
     }
@@ -513,6 +605,7 @@ seastar::future<runtime::result<recovery_found>> find_recovery_segment(
       {}};
     auto& entry = output.entry;
     const auto& publication = entry.publication;
+    entry.expiring = item.expiring;
     if (publication.state == local_object_state::deleting) {
         entry.state = recovery_entry_state::deleting;
         co_return output;
@@ -539,12 +632,45 @@ seastar::future<runtime::result<recovery_found>> find_recovery_segment(
       limits,
       work);
     if (!opened) co_return runtime::failure(opened.error());
+    // An expiring segment is checked as the first request for its removal
+    // was: against what the device holds it to be.
+    std::optional<authorization_verdict> verdict;
+    if (item.expiring) {
+        segment_held held{
+          item.descriptor.segment,
+          segment_holding::unsealed,
+          std::nullopt,
+          std::nullopt};
+        if (publication.state == local_object_state::sealed) {
+            held.holding = segment_holding::sealed;
+            if (opened->owner) {
+                if (const auto pinned = opened->owner->pin()) {
+                    const auto& boundary = pinned->boundary();
+                    const auto* root = boundary ? std::get_if<sealed_footer>(
+                                                    &*boundary)
+                                                : nullptr;
+                    if (root)
+                        held.extent = segment_immutable_expectation{
+                          root->coverage(),
+                          root->extent_digest(),
+                          root->encoded_extent().end()};
+                }
+            }
+        }
+        entry.sealed = held.extent;
+        verdict = authorize_deletion(*item.expiring, held);
+    }
     if (opened->owner) {
         opened->owner->retire();
         auto closed = co_await opened->owner->close();
         opened->owner.reset();
         if (!closed) co_return runtime::failure(closed.error());
     }
+    if (verdict == authorization_verdict::authorized) {
+        entry.state = recovery_entry_state::deleting;
+        co_return output;
+    }
+    entry.refused = verdict;
     entry.index_rebuild = opened->index_rebuild;
     output.target = recovery_target{
       item.descriptor,
@@ -566,18 +692,30 @@ recovery_admission_refused(const runtime::operation_error& error) noexcept {
 }
 } // namespace detail
 
+// The most segments one catalog may list: the inventory's working array is
+// one allocation, less what a charge profile adds to it. A shard that could
+// leave more than this unsealed or being removed could not be started again.
+inline constexpr std::size_t maximum_recovery_catalog
+  = (maximum_contiguous_allocation_bytes - 64)
+    / sizeof(std::optional<runtime::result<detail::recovery_found>>);
+
 // Locates and opens every catalog segment as restart must see it before the
 // merge: on the one device that holds it, under its fixed publication and the
-// pins it carries, each opened owner closed again at once. A deleting segment
-// is set aside. A durable seal decision (from discover_recovery_decisions)
-// that the segment's publication has not carried out supersedes its pins, as
-// it does for the recovered seal: the segment is sealing, its pins are not
-// opened, and the caller resumes that seal first and opens the inventory
-// again. A listed segment found nowhere is an error, never an empty one.
-// Up to `jobs` segments are found at once, each with its own cooperative
-// work; one refused admission beside other jobs is found again alone, so the
-// outcome, including which failure is returned, is the one-at-a-time outcome.
-// Each target carries the placement found for it. Reads only.
+// pins it carries, each opened owner closed again at once. A segment that is
+// being removed is set aside for whoever owns removals: one whose directory
+// is under its deleting name, whatever is inside it and whatever the catalog
+// says; one whose publication is deleting; and one its owner marks expiring
+// with an authorization that names what the device holds. An expiring
+// segment no device holds is gone, and is reported so. A durable seal decision
+// (from discover_recovery_decisions) that the segment's publication has not
+// carried out supersedes its pins, as it does for the recovered seal: the
+// segment is sealing, its pins are not opened, and the caller resumes that seal
+// first and opens the inventory again. A listed segment found nowhere is an
+// error, never an empty one, unless its owner marks it expiring. Up to `jobs`
+// segments are found at once, each with its own cooperative work; one refused
+// admission beside other jobs is found again alone, so the outcome, including
+// which failure is returned, is the one-at-a-time outcome. Each target carries
+// the placement found for it. Reads only.
 template<runtime::file_system_backend Backend, local_directory_owner Owner>
 seastar::future<runtime::result<recovery_inventory>> open_recovery_inventory(
   Backend& files,
@@ -594,11 +732,18 @@ seastar::future<runtime::result<recovery_inventory>> open_recovery_inventory(
         co_return runtime::failure(valid.error());
     if (jobs == 0 || jobs > maximum_recovery_jobs)
         co_return runtime::failure(detail::path_error(errc::invalid_argument));
-    for (std::size_t i = 0; i < catalog.size(); ++i)
+    for (std::size_t i = 0; i < catalog.size(); ++i) {
+        // An entry says once which segment it is.
+        if (
+          catalog[i].expiring
+          && catalog[i].expiring->segment != catalog[i].descriptor.segment)
+            co_return runtime::failure(
+              detail::path_error(errc::invalid_argument));
         for (std::size_t j = 0; j < i; ++j)
             if (catalog[i].descriptor.segment == catalog[j].descriptor.segment)
                 co_return runtime::failure(
                   detail::path_error(errc::invalid_argument));
+    }
     using found_type = std::optional<runtime::result<detail::recovery_found>>;
     byte_count total;
     for (const auto bytes :

@@ -15,6 +15,7 @@
 #include "src/storage/local_root.h"
 #include "src/storage/local_store_config.h"
 #include "src/storage/local_types.h"
+#include "src/storage/page_cache.h"
 #include "src/storage/segment_scan.h"
 #include "src/storage/sparse_index.h"
 #include "src/storage/sparse_index_format.h"
@@ -35,13 +36,66 @@
 #include <array>
 #include <cstdint>
 #include <memory>
+#include <new>
 #include <optional>
+#include <span>
 #include <utility>
+#include <vector>
 
 namespace kwaque::storage {
 
 template<runtime::file_system_backend Backend, local_directory_owner Owner>
 class sealed_sparse_index;
+
+// What a lookup routes by: the part of an index root a lookup reads, copied
+// out of the root when it is first read through. Kept by a cache, it lets a
+// later lookup route without an open root.
+struct sparse_index_routes final {
+    // The root these were read through.
+    local_root_reference reference;
+    // Where the extent it indexes ends: the scan's end after the last anchor
+    // of a page.
+    runtime::file_position end;
+    // The anchor each page begins with, and how many anchors each holds.
+    std::vector<model::range_logical_offset> first_anchors;
+    std::vector<std::uint32_t> entries;
+};
+
+// One page of anchors, verified when it was read, and the routes that lead to
+// it. While a page is kept, what routes to it is kept too.
+struct sparse_index_anchors final {
+    cache_ref<sparse_index_routes> routes;
+    sparse_index_page page;
+};
+
+// What a reader is told: the nearest anchor at or before its offset, or none
+// when the offset lies before the first, and the root that was read through
+// to find it. No root for an answer from an index held in memory. A reader
+// that follows the anchor to a block with another base or position reports
+// the answer it was given, so that its report is about the index it read and
+// not about one that replaced it meanwhile.
+//
+// `next` is the offset the anchor after that one begins with, when there is
+// one: where the run after the reader's begins, for a reader that reads
+// ahead. Nothing without a position.
+struct sparse_index_answer final {
+    std::optional<sparse_index_position> position;
+    std::optional<local_root_reference> through;
+    std::optional<model::range_logical_offset> next{};
+    bool operator==(const sparse_index_answer&) const = default;
+};
+
+// Where a reader stands in a sealed segment's index: the page of anchors its
+// last answer came from, held. A lookup that falls in the same page is
+// answered from it with no read and no wait, whatever the cache keeps by
+// then; one that falls in another page takes that page and lets this one go.
+// A page the cache has no room for lives for as long as a reader stands in
+// it, under the budget of the index's readers. Empty before the first
+// answer, and for an index that answers from memory.
+struct sparse_index_place final {
+    cache_ref<sparse_index_anchors> page;
+    std::uint32_t ordinal{0};
+};
 
 namespace detail {
 // One open index root in its shard's list.
@@ -158,9 +212,17 @@ enum class sparse_index_source : std::uint8_t {
 // given up, so the next root opens beside a root still read through. With a
 // root read through in both, the next reader is refused until one lets go.
 //
-// The files, the directory owner, both budgets and both shard limits outlive
-// joined close(). Whoever holds a pin or a page from here releases it before
-// close() returns.
+// A reader asks locate(). Given a cache, the owner keeps there what a lookup
+// reads of a root, and each page of anchors a lookup reads, verified once
+// when it is read: a lookup that finds both opens no file, holds no handle
+// and waits for nothing, so open roots bound the indexes being read and not
+// the indexes in use. What the cache holds is of the root named now, and
+// goes when that root is replaced or its index is owed. find() is one lookup
+// read through the root, with nothing kept.
+//
+// The files, the directory owner, both budgets, both shard limits and the
+// cache outlive joined close(). Whoever holds a pin or a page from here
+// releases it before close() returns.
 template<runtime::file_system_backend Backend, local_directory_owner Owner>
 class sealed_sparse_index final : public runtime::shard_affine {
 public:
@@ -175,7 +237,8 @@ public:
     // `rebuilding` funds a rebuild's walk and the index it builds, and the
     // rebuild runs in its scheduling group. Limits that cannot decode a page
     // or name an index of this extent are refused here, so that no lookup
-    // meets them later.
+    // meets them later. `cache`, when there is one, keeps what locate()
+    // reads; without one every lookup reads through the root.
     [[nodiscard]] static runtime::result<std::unique_ptr<sealed_sparse_index>>
     make(
       Backend& files,
@@ -193,7 +256,8 @@ public:
       workload_budget& rebuilding,
       local_store_io_limits limits,
       segment_scan_limits scan,
-      codec::limits policy) {
+      codec::limits policy,
+      page_cache* cache = nullptr) {
         if (auto valid = limits.validate(); !valid)
             return runtime::failure(valid.error());
         if (auto valid = scan.validate(); !valid)
@@ -231,7 +295,8 @@ public:
           rebuilding,
           limits,
           scan,
-          policy}};
+          policy,
+          cache}};
     }
     sealed_sparse_index(const sealed_sparse_index&) = delete;
     sealed_sparse_index& operator=(const sealed_sparse_index&) = delete;
@@ -289,6 +354,7 @@ public:
           || index[index.size() - 1].block_position() >= covered.bytes().end())
             return runtime::failure(detail::path_error(errc::invalid_argument));
         memory_.emplace(std::move(index));
+        unwalkable_.reset();
         return {};
     }
 
@@ -352,9 +418,8 @@ public:
                 if (owed_ || named_ != std::optional{reference}) give_up();
             } else if (named_ == std::optional{reference}) {
                 outcome = runtime::failure(opened.error());
-                if (
-                  detail::rebuildable_local_index_error(opened.error().code()))
-                    owe(reference, opened.error());
+                // Counted here, once, however many wait for this open.
+                fault(reference, opened.error());
             }
             // Otherwise the root that did not open was replaced meanwhile,
             // which says nothing of the one named now: everyone looks again.
@@ -401,6 +466,187 @@ public:
         co_return found;
     }
 
+    // The nearest anchor at or before an offset, for a reader. With a cache
+    // it is answered from the page the reader stands in, when the offset
+    // falls there, and otherwise from what the cache holds of the root named
+    // now; what is missing is read once, as the cache's own work, for
+    // everyone who asks meanwhile. What the cache has no room for is read
+    // all the same, under the budget of the index's readers, for those who
+    // stand in it: `at`, when given, is where this reader stands, and is
+    // moved to the page that answered. Only when that cannot be funded
+    // either does a lookup read through the root and keep nothing. While the
+    // index is owed the caller waits, with everyone else who asks, for the
+    // one rebuild, and is then answered from memory: no reader walks the
+    // data for itself. `caller` releases this caller alone, with `aborted`.
+    //
+    // A read that fails is that lookup's outcome. Damage makes the index
+    // owed at once, and so does an index object that could not be read
+    // sparse_index_read_failures times running. An owed index whose data
+    // could not be walked fails every lookup with what the walk found, and
+    // is not walked again. A lookup may also be refused, with queue_full,
+    // while the rebuilds of the shard or the waiters of this one are at
+    // their bound.
+    [[nodiscard]] seastar::future<runtime::result<sparse_index_answer>> locate(
+      model::range_logical_offset target,
+      seastar::abort_source& caller,
+      sparse_index_place* at = nullptr) {
+        using output = runtime::result<sparse_index_answer>;
+        assert_current();
+        if (closing_) co_return output{runtime::failure(error(errc::closed))};
+        if (caller.abort_requested())
+            co_return output{runtime::failure(error(errc::aborted))};
+        const auto holder = operations_.hold();
+        for (;;) {
+            if (closing_)
+                co_return output{runtime::failure(error(errc::closed))};
+            if (answering()) co_return output{remembered(target)};
+            if (owed_) {
+                if (unwalkable_)
+                    co_return output{runtime::failure(*unwalkable_)};
+                if (auto rebuilt = co_await rebuild(caller); !rebuilt)
+                    co_return output{runtime::failure(rebuilt.error())};
+                continue;
+            }
+            // An extent without a record has no index and nothing to find.
+            if (!named_) co_return output{sparse_index_answer{}};
+            const auto reference = *named_;
+            // A root without a page has nothing a cache could be charged
+            // for.
+            if (cache_ == nullptr || reference.pages().value() == 0) {
+                auto read = co_await read_through(target, caller);
+                if (moved_on(reference)) continue;
+                co_return read;
+            }
+            // Shared with this frame: it is looked into again after each
+            // wait, and may no longer be the index's own by then.
+            const auto held = cached();
+            if (!held)
+                co_return output{
+                  runtime::failure(error(errc::resource_exhausted))};
+            const bool standing = at != nullptr && at->page
+                                  && at->page->routes->reference == reference;
+            auto routes = standing ? at->page->routes : held->routes.get();
+            if (!routes) {
+                auto loaded = co_await routes_of(held, reference, caller);
+                if (moved_on(reference)) continue;
+                if (!loaded) {
+                    if (!unkept(loaded.error().code()))
+                        co_return output{runtime::failure(loaded.error())};
+                    auto read = co_await read_through(target, caller);
+                    if (moved_on(reference)) continue;
+                    co_return read;
+                }
+                routes = std::move(*loaded);
+            }
+            const auto page = find_sparse_index_page(
+              routes->first_anchors, target);
+            if (!page) co_return output{sparse_index_answer{{}, reference}};
+            auto anchors = standing && at->ordinal == *page
+                             ? at->page
+                             : cache_ref<sparse_index_anchors>{};
+            if (!anchors) {
+                auto loaded = co_await anchors_of(held, routes, *page, caller);
+                if (moved_on(reference)) continue;
+                if (!loaded) {
+                    if (!unkept(loaded.error().code()))
+                        co_return output{runtime::failure(loaded.error())};
+                    auto read = co_await read_through(target, caller);
+                    if (moved_on(reference)) continue;
+                    co_return read;
+                }
+                anchors = std::move(*loaded);
+            }
+            auto found = find_in(
+              *routes, anchors->page.entries(), *page, target);
+            // A page's last anchor is followed by the first of the next
+            // page: a reader's run ends where that one's block begins, not
+            // where the extent does.
+            if (found.edge) {
+                const auto following = co_await anchors_of(
+                  held, routes, *page + 1, caller);
+                if (moved_on(reference)) continue;
+                if (!following) {
+                    if (!unkept(following.error().code()))
+                        co_return output{runtime::failure(following.error())};
+                    auto read = co_await read_through(target, caller);
+                    if (moved_on(reference)) continue;
+                    co_return read;
+                }
+                found.position->end
+                  = (*following)->page.entries().front().block_position();
+            }
+            if (at != nullptr)
+                *at = sparse_index_place{
+                  std::move(anchors), static_cast<std::uint32_t>(*page)};
+            co_return output{
+              sparse_index_answer{found.position, reference, found.next}};
+        }
+    }
+
+    // What locate() would answer for `target`, when that takes no wait and
+    // no read: from the index in memory, or from the routes and the pages
+    // the cache holds of the root named now. Nothing when the index is
+    // owed or closing, or when any of it would have to be read. For a
+    // reader that asks about a run it does not read yet: what is not here
+    // is not waited for, and whether a lookup would have answered at once
+    // is not a thing its future says, since a wait for the shard looks the
+    // same as a wait for the device.
+    //
+    // `at`, when given, is where the reader that asks stands: what it holds
+    // answers as what the cache holds does.
+    [[nodiscard]] std::optional<sparse_index_answer> peek(
+      model::range_logical_offset target,
+      const sparse_index_place* at = nullptr) noexcept {
+        assert_current();
+        if (closing_) return std::nullopt;
+        if (answering()) return remembered(target);
+        if (owed_ || !named_) return std::nullopt;
+        const bool standing = at != nullptr && at->page
+                              && at->page->routes->reference == *named_;
+        const bool kept = cached_ && cached_->reference == *named_;
+        const auto routes = standing ? at->page->routes
+                            : kept   ? cached_->routes.get()
+                                     : cache_ref<sparse_index_routes>{};
+        if (!routes) return std::nullopt;
+        const auto page = find_sparse_index_page(routes->first_anchors, target);
+        if (!page) return sparse_index_answer{{}, *named_};
+        const auto anchors = standing && at->ordinal == *page ? at->page
+                             : kept ? cached_->pages[*page].get()
+                                    : cache_ref<sparse_index_anchors>{};
+        if (!anchors) return std::nullopt;
+        auto found = find_in(*routes, anchors->page.entries(), *page, target);
+        // As in locate(): the run of a page's last anchor ends where the
+        // next page's first anchor's block begins, which that page says.
+        if (found.edge) {
+            const auto following = kept ? cached_->pages[*page + 1].get()
+                                        : cache_ref<sparse_index_anchors>{};
+            if (!following) return std::nullopt;
+            found.position->end
+              = following->page.entries().front().block_position();
+        }
+        return sparse_index_answer{found.position, *named_, found.next};
+    }
+
+    // What a reader reports of an answer its data did not bear out: the
+    // block where the anchor points has another base or position. The index
+    // that gave the answer is owed from then on; see owe().
+    //
+    // A report is a reader's word that a block which is whole is not the one
+    // its anchor names. While the segment's data cannot be walked nothing
+    // better than the root named now can be had, so a report changes
+    // nothing then, and the read that made it is that reader's own failure.
+    void report(
+      const sparse_index_answer& given, runtime::operation_error why) noexcept {
+        if (!given.through) {
+            owe(why);
+            return;
+        }
+        if (unwalkable_) return;
+        const bool before = owed_.has_value();
+        owe(*given.through, why);
+        if (!before && owed_) reported_ = true;
+    }
+
     // The root `seen` gave an answer its data did not bear out, or could not
     // be read: a reader that followed an anchor read through it to a block
     // with another base or position reports it here, as does whoever checked
@@ -413,7 +659,9 @@ public:
         assert_current();
         if (closing_ || owed_ || named_ != std::optional{seen}) return;
         owed_ = why;
+        faults_.succeeded();
         give_up();
+        forget();
     }
     // The same for an answer find() gave to a caller that holds no root: the
     // index that answers now is owed, whatever it answers from. A caller
@@ -423,7 +671,9 @@ public:
         assert_current();
         if (closing_) return;
         if (!owed_) owed_ = why;
+        faults_.succeeded();
         give_up();
+        forget();
         if (!memory_) return;
         // A publication in flight is encoding it; it goes when that ends.
         if (publishing_)
@@ -487,9 +737,12 @@ public:
         if (!named) co_return output{runtime::failure(named.error())};
         // The pointer names it now, whatever was reported of it meanwhile.
         give_up();
+        forget();
         named_ = *named;
+        faults_.succeeded();
         if (!distrusted_) {
             owed_.reset();
+            reported_ = false;
             memory_.reset();
         }
         co_return *named;
@@ -505,6 +758,7 @@ public:
         abort_.request_abort();
         co_await rebuilder_.stop();
         co_await operations_.close();
+        forget();
         for (auto& held : roots_)
             if (held.root) observe(co_await residency_.release(held));
         memory_.reset();
@@ -513,6 +767,29 @@ public:
     }
 
 private:
+    // What the cache holds of one index root: its routes, and a place for
+    // each of its pages. Lookups in flight share it, so it stays where it is
+    // until the last of them has returned, whatever becomes of its index
+    // meanwhile.
+    struct cached_root final {
+        explicit cached_root(local_root_reference root)
+          : reference(root)
+          , pages(
+              std::make_unique<cache_slot<sparse_index_anchors>[]>(
+                root.pages().value())) {}
+        // Lets every value go. One that is held lives on with whoever holds
+        // it.
+        void drop() noexcept {
+            for (std::uint32_t page = 0; page < reference.pages().value();
+                 ++page)
+                pages[page].drop();
+            routes.drop();
+        }
+        local_root_reference reference;
+        cache_slot<sparse_index_routes> routes;
+        std::unique_ptr<cache_slot<sparse_index_anchors>[]> pages;
+    };
+
     sealed_sparse_index(
       Backend& files,
       Owner& ownership,
@@ -529,7 +806,8 @@ private:
       workload_budget& rebuilding,
       local_store_io_limits limits,
       segment_scan_limits scan,
-      codec::limits policy)
+      codec::limits policy,
+      page_cache* cache)
       : files_(files)
       , ownership_(ownership)
       , device_(device)
@@ -549,6 +827,7 @@ private:
       , rebuilding_(rebuilding)
       , limits_(limits)
       , scan_(scan)
+      , cache_(cache)
       , execution_(policy, abort_) {}
 
     static runtime::operation_error error(errc code) noexcept {
@@ -573,6 +852,291 @@ private:
     // and only kept for the publication that is encoding it.
     [[nodiscard]] bool answering() const noexcept {
         return memory_.has_value() && !distrusted_;
+    }
+
+    // Whether the index a lookup began with is no longer the one that
+    // answers: the lookup then begins again.
+    [[nodiscard]] bool
+    moved_on(const local_root_reference& began) const noexcept {
+        return closing_ || owed_ || named_ != std::optional{began};
+    }
+    // Whether a load ended without a value because the cache had no room for
+    // it: that lookup reads through the root.
+    [[nodiscard]] static bool unkept(errc code) noexcept {
+        return code == errc::queue_full || code == errc::out_of_range;
+    }
+
+    // What the cache holds of the root named now, made when first asked for.
+    // Nothing when it cannot be made.
+    [[nodiscard]] seastar::lw_shared_ptr<cached_root> cached() {
+        if (!cached_ || cached_->reference != *named_) {
+            forget();
+            try {
+                cached_ = seastar::make_lw_shared<cached_root>(*named_);
+            } catch (const std::bad_alloc&) {
+                return nullptr;
+            }
+        }
+        return cached_;
+    }
+    // Lets go of what the cache holds of this index: its root was replaced,
+    // or gave an answer nobody may be given again.
+    void forget() noexcept {
+        if (!cached_) return;
+        cached_->drop();
+        cached_ = nullptr;
+    }
+    // What the cache is charged for the routes of a root of `pages` pages.
+    [[nodiscard]] runtime::result<byte_count>
+    routes_charge(std::uint32_t pages) const noexcept {
+        const auto anchors = cache_->allocation_charge(
+          byte_count{
+            std::uint64_t{pages} * sizeof(model::range_logical_offset)});
+        const auto counts = cache_->allocation_charge(
+          byte_count{std::uint64_t{pages} * sizeof(std::uint32_t)});
+        if (!anchors) return runtime::failure(anchors.error());
+        if (!counts) return runtime::failure(counts.error());
+        const auto both = anchors->checked_add(*counts);
+        if (!both) return runtime::failure(error(errc::out_of_range));
+        return *both;
+    }
+
+    // The anchors of one page of the root `routes` were read through, held:
+    // what the cache keeps of it, or read once as the cache's own work for
+    // everyone who asks meanwhile. `held` is shared with this frame, which
+    // stands on one of its slots while it waits.
+    seastar::future<runtime::result<cache_ref<sparse_index_anchors>>>
+    anchors_of(
+      seastar::lw_shared_ptr<cached_root> held,
+      cache_ref<sparse_index_routes> routes,
+      std::uint32_t page,
+      seastar::abort_source& caller) {
+        using output = runtime::result<cache_ref<sparse_index_anchors>>;
+        if (auto kept = held->pages[page].get())
+            co_return output{std::move(kept)};
+        const auto charge = cache_->allocation_charge(
+          byte_count{
+            std::uint64_t{routes->entries[page]} * sizeof(sparse_index_entry)});
+        if (!charge) co_return output{runtime::failure(charge.error())};
+        auto loaded = co_await held->pages[page].fetch(
+          *cache_, *charge, anchors_loader(routes, page), caller);
+        if (loaded || !unkept(loaded.error().code())) co_return loaded;
+        // No room for it in the cache: read all the same, for whoever asks
+        // meanwhile and for as long as one of them holds it.
+        const auto funding = lent(*charge);
+        if (!funding) co_return loaded;
+        co_return co_await held->pages[page].fetch(
+          *cache_, *charge, anchors_loader(routes, page), caller, &*funding);
+    }
+    // The routes of the root `reference`, held, in the same way.
+    seastar::future<runtime::result<cache_ref<sparse_index_routes>>> routes_of(
+      seastar::lw_shared_ptr<cached_root> held,
+      local_root_reference reference,
+      seastar::abort_source& caller) {
+        using output = runtime::result<cache_ref<sparse_index_routes>>;
+        const auto charge = routes_charge(reference.pages().value());
+        if (!charge) co_return output{runtime::failure(charge.error())};
+        auto loaded = co_await held->routes.fetch(
+          *cache_, *charge, routes_loader(reference), caller);
+        if (loaded || !unkept(loaded.error().code())) co_return loaded;
+        const auto funding = lent(*charge);
+        if (!funding) co_return loaded;
+        co_return co_await held->routes.fetch(
+          *cache_, *charge, routes_loader(reference), caller, &*funding);
+    }
+    // What funds a value of `charge` bytes that the cache has no room for,
+    // and the entry that holds it: taken from what readers of the index are
+    // funded by, afresh for each such value, and held by the value alone.
+    // The entry itself is charged less than this allows for it.
+    static constexpr std::uint64_t lent_entry_bytes = 4096;
+    [[nodiscard]] runtime::result<workload_reservation>
+    lent(byte_count charge) noexcept {
+        try {
+            return budget_.try_reserve(
+              byte_count{charge.value() + lent_entry_bytes});
+        } catch (const std::bad_alloc&) {
+            return runtime::failure(error(errc::resource_exhausted));
+        }
+    }
+
+    // What a lookup finds in one page of anchors: the anchor at or before
+    // the offset, the offset the anchor after it begins with (in the page,
+    // or the next page's first, which the routes hold), and whether it is
+    // the page's last anchor with another page after it, whose run ends
+    // where that page's first block begins.
+    struct found_anchor final {
+        std::optional<sparse_index_position> position;
+        std::optional<model::range_logical_offset> next;
+        bool edge{false};
+    };
+    [[nodiscard]] static found_anchor find_in(
+      const sparse_index_routes& routes,
+      std::span<const sparse_index_entry> entries,
+      std::size_t page,
+      model::range_logical_offset target) noexcept {
+        found_anchor found{
+          find_sparse_index_anchor(entries, target, routes.end), {}, false};
+        if (!found.position) return found;
+        found.next = next_anchor(entries, target);
+        if (!found.next && page + 1 < routes.first_anchors.size())
+            found.next = routes.first_anchors[page + 1];
+        found.edge = page + 1 < routes.entries.size()
+                     && found.position->anchor == entries.back();
+        return found;
+    }
+
+    // The answer of the index held in memory.
+    [[nodiscard]] sparse_index_answer
+    remembered(model::range_logical_offset target) const noexcept {
+        const auto found = memory_->find(
+          target, context_.coverage().bytes().end());
+        std::optional<model::range_logical_offset> next;
+        if (found)
+            if (const auto after = memory_->after(target))
+                next = after->logical_anchor();
+        return sparse_index_answer{found, std::nullopt, next};
+    }
+
+    // The offset the first of `anchors` above `target` begins with.
+    [[nodiscard]] static std::optional<model::range_logical_offset> next_anchor(
+      std::span<const sparse_index_entry> anchors,
+      model::range_logical_offset target) noexcept {
+        const auto after = std::ranges::upper_bound(
+          anchors, target, {}, &sparse_index_entry::logical_anchor);
+        if (after == anchors.end()) return std::nullopt;
+        return after->logical_anchor();
+    }
+
+    // An index object could not be read through `seen`: see
+    // sparse_index_read_faults for when that makes its index owed.
+    void fault(
+      const local_root_reference& seen, runtime::operation_error why) noexcept {
+        if (faults_.failed(why.code()) == sparse_index_fault::owed)
+            owe(seen, why);
+    }
+
+    // One lookup read through the root, with nothing kept.
+    seastar::future<runtime::result<sparse_index_answer>> read_through(
+      model::range_logical_offset target, seastar::abort_source& caller) {
+        using output = runtime::result<sparse_index_answer>;
+        codec::cooperative_work work{execution_.policy(), caller};
+        auto pinned = co_await pin(work);
+        if (!pinned) co_return output{runtime::failure(pinned.error())};
+        const auto reference = pinned->reference();
+        const auto routed = route_published_anchor(*pinned, target);
+        if (!routed) co_return output{runtime::failure(routed.error())};
+        if (!*routed) co_return output{sparse_index_answer{{}, reference}};
+        auto page = co_await pinned->read_index(**routed, work);
+        auto found = page
+                       ? search_published_page(*pinned, **routed, *page, target)
+                       : runtime::result<std::optional<sparse_index_position>>{
+                           runtime::failure(page.error())};
+        if (!found) {
+            fault(reference, found.error());
+            co_return output{runtime::failure(found.error())};
+        }
+        // As in locate(): the run of a page's last anchor ends where the
+        // next page's first anchor's block begins.
+        const auto* root = std::get_if<sparse_index_root>(&pinned->metadata());
+        const auto following = (*routed)->value() + 1U;
+        std::optional<model::range_logical_offset> after;
+        if (*found) {
+            after = next_anchor(page->value.entries(), target);
+            if (
+              !after && root != nullptr
+              && following < root->first_anchors().size())
+                after = root->first_anchors()[following];
+        }
+        if (
+          *found && root != nullptr && following < root->pages().size()
+          && (*found)->anchor == page->value.entries().back()) {
+            const auto next = co_await pinned->read_index(
+              page_ordinal::make(following).value(), work);
+            if (!next) {
+                fault(reference, next.error());
+                co_return output{runtime::failure(next.error())};
+            }
+            (*found)->end = next->value.entries().front().block_position();
+        }
+        faults_.succeeded();
+        co_return output{sparse_index_answer{*found, reference, after}};
+    }
+
+    // What the cache runs to read the routes of `reference`, and one page of
+    // anchors that `routes` lead to. Each owns what it reads through: the
+    // index is not closed while one runs, and no caller's leaving ends it.
+    [[nodiscard]] auto routes_loader(local_root_reference reference) {
+        return [this, reference, joined = operations_.hold()](
+                 seastar::abort_source& stop) {
+            return load_routes(reference, stop);
+        };
+    }
+    [[nodiscard]] auto
+    anchors_loader(cache_ref<sparse_index_routes> routes, std::uint32_t page) {
+        return
+          [this, routes = std::move(routes), page, joined = operations_.hold()](
+            seastar::abort_source& stop) {
+              return load_anchors(routes, page, stop);
+          };
+    }
+    seastar::future<runtime::result<sparse_index_routes>>
+    load_routes(local_root_reference reference, seastar::abort_source& stop) {
+        using output = runtime::result<sparse_index_routes>;
+        codec::cooperative_work work{execution_.policy(), stop};
+        auto pinned = co_await pin(work);
+        if (!pinned) co_return output{runtime::failure(pinned.error())};
+        const auto* root = std::get_if<sparse_index_root>(&pinned->metadata());
+        // The index moved on while this was asked for, or the root is not
+        // the one its reference was admitted for: whoever waits looks again.
+        if (
+          !root || pinned->reference() != reference
+          || root->pages().size() != reference.pages().value()
+          || root->first_anchors().size() != root->pages().size())
+            co_return output{runtime::failure(error(errc::wrong_context))};
+        sparse_index_routes routes{
+          reference, root->context().coverage().bytes().end(), {}, {}};
+        try {
+            routes.first_anchors.assign(
+              root->first_anchors().begin(), root->first_anchors().end());
+            routes.entries.reserve(root->pages().size());
+            for (const auto& page : root->pages())
+                routes.entries.push_back(page.entry_count());
+        } catch (const std::bad_alloc&) {
+            co_return output{runtime::failure(error(errc::resource_exhausted))};
+        }
+        faults_.succeeded();
+        co_return output{std::move(routes)};
+    }
+    seastar::future<runtime::result<sparse_index_anchors>> load_anchors(
+      cache_ref<sparse_index_routes> routes,
+      std::uint32_t ordinal,
+      seastar::abort_source& stop) {
+        using output = runtime::result<sparse_index_anchors>;
+        codec::cooperative_work work{execution_.policy(), stop};
+        const auto reference = routes->reference;
+        auto pinned = co_await pin(work);
+        if (!pinned) co_return output{runtime::failure(pinned.error())};
+        if (pinned->reference() != reference)
+            co_return output{runtime::failure(error(errc::wrong_context))};
+        // The read's allowance and its pin of the root end with this frame:
+        // what is kept is the anchors alone.
+        auto page = co_await pinned->read_index(
+          page_ordinal::make(ordinal).value(), work);
+        if (!page) {
+            fault(reference, page.error());
+            co_return output{runtime::failure(page.error())};
+        }
+        // The root routed here by the anchor this page begins with.
+        if (
+          page->value.entries().front().logical_anchor()
+          != routes->first_anchors[ordinal]) {
+            const auto wrong = error(errc::malformed_data);
+            owe(reference, wrong);
+            co_return output{runtime::failure(wrong)};
+        }
+        faults_.succeeded();
+        co_return output{
+          sparse_index_anchors{std::move(routes), std::move(page->value)}};
     }
 
     // Stops reading through the open root. Those reading through it go on;
@@ -644,8 +1208,19 @@ private:
           rebuilding_,
           scan_,
           walking);
-        if (!built) co_return runtime::failure(built.error());
+        if (!built) {
+            // What the walk found in the data it will find again. An index
+            // owed on a reader's word goes back to the root that is named,
+            // which answers everything the data does not contradict; any
+            // other stays owed, and is not walked for again.
+            if (detail::rebuildable_local_index_error(built.error().code())) {
+                unwalkable_ = built.error();
+                if (std::exchange(reported_, false)) owed_.reset();
+            }
+            co_return runtime::failure(built.error());
+        }
         memory_.emplace(std::move(*built));
+        reported_ = false;
         co_return runtime::result<void>{};
     }
 
@@ -673,6 +1248,15 @@ private:
     workload_budget& rebuilding_;
     local_store_io_limits limits_;
     segment_scan_limits scan_;
+    page_cache* cache_;
+    // What the cache holds of the root named now.
+    seastar::lw_shared_ptr<cached_root> cached_;
+    sparse_index_read_faults faults_;
+    // Why the segment's data could not be walked for an index, once a walk
+    // found that out.
+    std::optional<runtime::operation_error> unwalkable_;
+    // The index is owed on a reader's word alone: its root still reads.
+    bool reported_{false};
     // An open never uses a caller's abort source: others wait for it.
     seastar::abort_source abort_;
     codec::cooperative_work execution_;

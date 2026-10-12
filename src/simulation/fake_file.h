@@ -4,7 +4,9 @@
 #include "src/base/units.h"
 #include "src/runtime/error.h"
 #include "src/runtime/file.h"
+#include "src/runtime/file_flight.h"
 #include "src/runtime/shard_affinity.h"
+#include "src/runtime/time.h"
 #include "src/simulation/fault_schedule.h"
 #include "src/simulation/scheduler.h"
 
@@ -290,6 +292,25 @@ public:
         assert_current();
         return pending_writes_;
     }
+    // Keeps the operations of files opened under `root` from here on in
+    // the order they started, apart from every other device's, as the
+    // native file system does. This file system's own calls on paths are
+    // not kept in it. See runtime::file_flight_watch.
+    [[nodiscard]] runtime::result<void> watch_device(
+      const runtime::file_path& root, runtime::file_flight_watch watching) {
+        assert_current();
+        return flights_.watch(root.value(), watching);
+    }
+    [[nodiscard]] std::optional<runtime::monotonic_time>
+    oldest_operation(const runtime::file_path& root) const noexcept {
+        assert_current();
+        return flights_.oldest(root.value());
+    }
+    // The model schedules every device apart.
+    [[nodiscard]] bool device_queue(std::uint64_t) const noexcept {
+        assert_current();
+        return true;
+    }
 
 private:
     friend class fake_file_test_access;
@@ -480,13 +501,15 @@ private:
         runtime::operation_statistics_owner statistics;
         runtime::file_close_policy close_policy{
           runtime::file_close_policy::legacy};
+        runtime::file_flight_ptr flight{};
 
         [[nodiscard]] runtime::file publish() && {
             return runtime::file{
               std::move(native),
               runtime::file_io_limits{},
               std::move(statistics),
-              close_policy};
+              close_policy,
+              std::move(flight)};
         }
     };
 
@@ -872,6 +895,7 @@ private:
     collect_unreachable_from(seastar::chunked_vector<std::uint64_t> pending);
 
     fake_file_system_config config_;
+    runtime::file_flights flights_;
     canonical_fake_path root_;
     inode_map objects_;
     byte_count retained_capacity_;

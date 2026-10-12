@@ -5,8 +5,10 @@
 #include "src/simulation/scheduler_driver.h"
 #include "src/simulation/virtual_time.h"
 #include "src/storage/tests/local_append_contract.h"
+#include "src/storage/tests/local_engine_contract.h"
 #include "src/storage/tests/local_store_contract.h"
 #include "src/storage/tests/recovery_successor_contract.h"
+#include "src/storage/tests/segment_lifecycle_contract.h"
 
 #include <seastar/testing/test_case.hh>
 
@@ -175,8 +177,9 @@ seastar::future<> with_local_store(
       std::move(function), std::move(faults), crash);
 }
 template<typename Func>
-seastar::future<> with_reserved_store(Func function) {
-    return with_store<true, Func>(std::move(function));
+seastar::future<> with_reserved_store(
+  Func function, std::optional<fake_crash_policy> crash = std::nullopt) {
+    return with_store<true, Func>(std::move(function), {}, crash);
 }
 
 // A file of the fixture and the flushes it has had once the fixture is
@@ -464,6 +467,217 @@ SEASTAR_TEST_CASE(local_append_fake_close_drains_accepted) {
     co_await with_local_store([](auto&&... shared) {
         return contract::close_drains_accepted<simulation::monotonic_clock>(
           shared...);
+    });
+}
+
+SEASTAR_TEST_CASE(segment_lifecycle_fake_sealed_under_readers) {
+    co_await with_local_store([](auto&&... shared) {
+        return storage::testing::segment_lifecycle_contract::
+          sealed_under_readers<simulation::monotonic_clock>(shared...);
+    });
+}
+
+SEASTAR_TEST_CASE(segment_lifecycle_fake_sealed_on_demand) {
+    co_await with_local_store([](auto&&... shared) {
+        return storage::testing::segment_lifecycle_contract::sealed_on_demand<
+          simulation::monotonic_clock>(shared...);
+    });
+}
+
+SEASTAR_TEST_CASE(segment_lifecycle_fake_one_transition_at_a_time) {
+    co_await with_local_store([](auto&&... shared) {
+        return storage::testing::segment_lifecycle_contract::
+          one_transition_at_a_time<simulation::monotonic_clock>(shared...);
+    });
+}
+
+SEASTAR_TEST_CASE(segment_lifecycle_fake_roll_reported) {
+    co_await with_local_store([](auto&&... shared) {
+        return storage::testing::segment_lifecycle_contract::roll_reported<
+          simulation::monotonic_clock>(shared...);
+    });
+}
+
+SEASTAR_TEST_CASE(segment_lifecycle_fake_age_reported) {
+    co_await with_local_store([](auto&&... shared) {
+        return storage::testing::segment_lifecycle_contract::age_reported<
+          simulation::monotonic_clock>(shared...);
+    });
+}
+
+SEASTAR_TEST_CASE(segment_lifecycle_fake_created_ahead) {
+    co_await with_local_store([](auto&&... shared) {
+        return storage::testing::segment_lifecycle_contract::created_ahead<
+          simulation::monotonic_clock>(shared...);
+    });
+}
+
+SEASTAR_TEST_CASE(segment_lifecycle_fake_device_watched) {
+    co_await with_local_store([](auto&&... shared) {
+        return storage::testing::segment_lifecycle_contract::device_watched<
+          simulation::monotonic_clock>(shared...);
+    });
+}
+
+SEASTAR_TEST_CASE(segment_lifecycle_fake_placed_by_share) {
+    co_await with_local_store([](auto&&... shared) {
+        return storage::testing::segment_lifecycle_contract::placed_by_share<
+          simulation::monotonic_clock>(shared...);
+    });
+}
+
+SEASTAR_TEST_CASE(segment_lifecycle_fake_kept_until_authorized) {
+    co_await with_local_store([](auto&&... shared) {
+        return storage::testing::segment_lifecycle_contract::
+          kept_until_authorized<simulation::monotonic_clock>(shared...);
+    });
+}
+
+SEASTAR_TEST_CASE(segment_lifecycle_fake_removed_when_authorized) {
+    co_await with_local_store([](auto&&... shared) {
+        return storage::testing::segment_lifecycle_contract::
+          removed_when_authorized<simulation::monotonic_clock>(shared...);
+    });
+}
+
+SEASTAR_TEST_CASE(segment_lifecycle_fake_failed_segment_discarded) {
+    co_await with_local_store([](auto&&... shared) {
+        return storage::testing::segment_lifecycle_contract::
+          failed_segment_discarded<simulation::monotonic_clock>(shared...);
+    });
+}
+
+SEASTAR_TEST_CASE(segment_lifecycle_fake_removal_resumed) {
+    co_await with_local_store([](auto&&... shared) {
+        return storage::testing::segment_lifecycle_contract::removal_resumed<
+          simulation::monotonic_clock>(shared...);
+    });
+}
+
+SEASTAR_TEST_CASE(local_engine_fake_started_and_restarted) {
+    co_await with_reserved_store([](auto&&... shared) {
+        return storage::testing::local_engine_contract::started_and_restarted<
+          simulation::monotonic_clock>(shared...);
+    });
+}
+
+SEASTAR_TEST_CASE(segment_lifecycle_fake_removal_against_transitions) {
+    co_await with_local_store([](auto&&... shared) {
+        return storage::testing::segment_lifecycle_contract::
+          removal_against_transitions<simulation::monotonic_clock>(shared...);
+    });
+}
+
+SEASTAR_TEST_CASE(segment_lifecycle_fake_revoked_in_flight) {
+    co_await with_local_store([](auto&&... shared) {
+        return storage::testing::segment_lifecycle_contract::revoked_in_flight<
+          simulation::monotonic_clock>(shared...);
+    });
+}
+
+// The unlink of the segment's data file fails once. A first environment
+// finds the file: creation order is deterministic, so the later ones make
+// it the same object. Once for a segment the table had let go, whose
+// removal is found again by its name, and once for one it still held.
+SEASTAR_TEST_CASE(segment_lifecycle_fake_removal_retried) {
+    std::uint64_t object = 0;
+    co_await with_local_store(
+      [&object](
+        auto& files,
+        auto& owner,
+        const auto& spec,
+        auto& budget,
+        auto drive,
+        auto& timer) -> seastar::future<> {
+          co_await storage::testing::segment_lifecycle_contract::
+            removal_retried<simulation::monotonic_clock>(
+              files,
+              owner,
+              spec,
+              budget,
+              drive,
+              timer,
+              false,
+              false,
+              [&](const runtime::file_path& data) {
+                  object = take(
+                             fake_file_test_access::lookup(
+                               files,
+                               take(
+                                 fake_file_test_access::resolve(
+                                   files, data.value()))))
+                             .value();
+              });
+      });
+    BOOST_REQUIRE(object != 0);
+    const auto first = take(runtime::fault_occurrence::make(1));
+    for (const bool held : {false, true}) {
+        std::vector<fault_rule> faults;
+        faults.push_back(take(
+          fault_rule::make(
+            take(fault_rule_id::make(1)),
+            runtime::builtin_fault_point::file_remove,
+            runtime::fault_object_key::from_u64(object),
+            first,
+            first,
+            fault_selector::once(),
+            runtime::fault_decision::make_error())));
+        co_await with_local_store(
+          [held](auto&&... shared) {
+              return storage::testing::segment_lifecycle_contract::
+                removal_retried<simulation::monotonic_clock>(
+                  shared..., true, held, [](const runtime::file_path&) {});
+          },
+          std::move(faults));
+    }
+}
+
+// A removal cut after every number of scheduler events, once with unsynced
+// names reverting at the crash and once with all of them surviving. Each
+// cut is its own store, started three times.
+SEASTAR_TEST_CASE(local_engine_fake_removal_crash_at_every_cut) {
+    for (const auto survive : {false, true}) {
+        const auto crash = survive ? std::optional{fake_crash_policy{
+                                       .namespace_percent = 100}}
+                                   : std::nullopt;
+        // Every cut where names revert, the ordinary crash; every third
+        // one where they all survive.
+        const std::uint32_t stride = survive ? 3 : 1;
+        bool finished = false;
+        std::uint32_t cut = 0;
+        for (; !finished && cut < 2048; cut += stride)
+            co_await with_reserved_store(
+              [cut, &finished](
+                auto& files,
+                auto& owner,
+                auto& spec,
+                auto& budget,
+                auto& reserve,
+                auto drive,
+                auto& timer) -> seastar::future<> {
+                  finished = co_await storage::testing::local_engine_contract::
+                    removal_crash<simulation::monotonic_clock>(
+                      files,
+                      owner,
+                      spec,
+                      budget,
+                      reserve,
+                      drive,
+                      timer,
+                      cut,
+                      one_event{&drive.events});
+              },
+              crash);
+        BOOST_REQUIRE(finished);
+        // Several operations lie between the first and the last effect.
+        BOOST_CHECK(cut > 8);
+    }
+}
+
+SEASTAR_TEST_CASE(local_append_fake_quiesce_drains_one_attachment) {
+    co_await with_local_store([](auto&&... shared) {
+        return contract::quiesce_drains_one_attachment<
+          simulation::monotonic_clock>(shared...);
     });
 }
 

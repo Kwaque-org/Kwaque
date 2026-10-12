@@ -751,5 +751,117 @@ TEST(
         EXPECT_EQ(input.checkpoint_depth(), 1U);
     }
 }
+
+// The check made of a block read back below a pinned boundary: everything the
+// decoder checks of the block itself, the same answers, and of its child only
+// the fixed header. The body checksum is what covers the child's bytes; its
+// records are not walked.
+TEST(SegmentFormatTest, IntegrityCheckAgreesWithTheDecoderAndWalksNoRecord) {
+    constexpr std::uint64_t generation = 7;
+    constexpr std::uint64_t position = 8192;
+    constexpr std::uint64_t physical = 40;
+    constexpr std::uint64_t logical = 900;
+    constexpr std::size_t header = 40;
+    constexpr std::size_t inner = 4096;
+    auto child_wire = assigned_wire(false, inner, true);
+    put(child_wire, inner + 168, logical, 8);
+    put(child_wire, inner + 176, logical + 5U, 8);
+    repair(child_wire);
+    const auto expected = block_expected(0x80, generation, position, physical);
+    const auto literal = block_wire(child_wire, expected, header);
+    seastar::abort_source abort;
+    codec::cooperative_work work{codec::limits::defaults(), abort};
+    // A block is consumed whole or not at all.
+    const auto check = [&work](
+                         const std::string& wire,
+                         const segment_block_expectation& against) {
+        fragmented_buffer_parser input{buffer(wire)};
+        const auto checked = check_segment_block(
+                               input, against, reserve(input, work), work)
+                               .get();
+        EXPECT_EQ(
+          input.bytes_consumed(), byte_count{checked ? wire.size() : 0U});
+        return checked;
+    };
+    const auto decode = [&work, &expected](const std::string& wire) {
+        fragmented_buffer_parser input{buffer(wire)};
+        return decode_segment_block(input, expected, reserve(input, work), work)
+          .get();
+    };
+
+    const auto decoded = decode(literal);
+    const auto checked = check(literal, expected);
+    ASSERT_TRUE(decoded.has_value());
+    ASSERT_TRUE(checked.has_value());
+    EXPECT_EQ(checked->coverage, decoded->value.descriptor().coverage());
+    EXPECT_EQ(checked->child_offset, byte_count{header + 120U});
+    EXPECT_EQ(checked->child_bytes, byte_count{child_wire.size()});
+    EXPECT_EQ(
+      literal.substr(
+        checked->child_offset.value(), checked->child_bytes.value()),
+      child_wire);
+
+    // One byte of the child changed: the block's body checksum says so.
+    auto flipped = literal;
+    flipped[header + 120U + inner + 100U] ^= 1;
+    const auto damaged = check(flipped, expected);
+    ASSERT_FALSE(damaged.has_value());
+    EXPECT_EQ(damaged.error().code(), errc::corrupt_data);
+
+    // The same byte changed under a block whose own checksums were written
+    // over it: only the child's own checksum knows, and that is the
+    // decoder's to read.
+    repair(flipped);
+    EXPECT_FALSE(decode(flipped).has_value());
+    EXPECT_TRUE(check(flipped, expected).has_value());
+
+    // The block's spans against its child's fixed header.
+    for (const auto [offset, value] :
+         {std::pair<std::size_t, std::uint64_t>{88, physical + 3U},
+          std::pair<std::size_t, std::uint64_t>{96, logical + 1U},
+          std::pair<std::size_t, std::uint64_t>{104, logical + 6U}}) {
+        auto disagreeing = literal;
+        put(disagreeing, header + offset, value, 8);
+        repair(disagreeing);
+        const auto refused = check(disagreeing, expected);
+        ASSERT_FALSE(refused.has_value()) << offset;
+        EXPECT_EQ(refused.error().code(), errc::malformed_data) << offset;
+    }
+
+    // Where the block lies and what precedes it are the caller's to say.
+    for (const auto& elsewhere :
+         {block_expected(0x80, generation, position + 512U, physical),
+          block_expected(0x80, generation, position, physical + 1U),
+          block_expected(0x80, generation + 1U, position, physical),
+          block_expected(0x81, generation, position, physical)}) {
+        const auto refused = check(literal, elsewhere);
+        ASSERT_FALSE(refused.has_value());
+        EXPECT_EQ(refused.error().code(), errc::wrong_context);
+    }
+
+    // A child of another topic under this segment's block.
+    auto foreign_child = child_wire;
+    foreign_child[inner + 40U] ^= 1;
+    repair(foreign_child);
+    const auto foreign = check(
+      block_wire(foreign_child, expected, header), expected);
+    ASSERT_FALSE(foreign.has_value());
+    EXPECT_EQ(foreign.error().code(), errc::wrong_context);
+
+    // A child that is not as long as the block says, and a block whose
+    // child is not an assigned batch.
+    auto shorter = literal;
+    put(shorter, header + 120U + 12U, get(child_wire, 12, 4) - 1U, 4);
+    repair(shorter);
+    const auto cut = check(shorter, expected);
+    ASSERT_FALSE(cut.has_value());
+    EXPECT_EQ(cut.error().code(), errc::malformed_data);
+    auto another = literal;
+    put(another, header + 120U + 4U, 3, 2);
+    repair(another);
+    const auto misnamed = check(another, expected);
+    ASSERT_FALSE(misnamed.has_value());
+    EXPECT_EQ(misnamed.error().code(), errc::malformed_data);
+}
 } // namespace
 } // namespace kwaque::storage

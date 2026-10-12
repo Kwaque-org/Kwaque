@@ -4,6 +4,7 @@
 #include "src/storage/local_publication.h"
 #include "src/storage/local_store_inspection.h"
 
+#include <algorithm>
 #include <array>
 #include <optional>
 #include <span>
@@ -254,6 +255,14 @@ struct local_bootstrap_outcome final {
 // prefix across the complete device set. Any failure requires a fresh
 // classified startup attempt; no data/ID admission follows this outcome's
 // failure.
+//
+// add_devices extends the store that is there: its control device must
+// exist, every other device either exists or is a data device the options
+// name as added that holds nothing but the bootstrap prefix of itself, and
+// only those are initialized. With no store to extend it is refused
+// not_found; with a device that is neither the store's nor empty, or that
+// is empty and not named, wrong_context; with a name that is no configured
+// data device, invalid_argument. Nothing is written in any of them.
 template<runtime::file_system_backend Backend, local_directory_owner Owner>
 seastar::future<local_bootstrap_outcome> initialize_local_stores(
   Backend& files,
@@ -288,7 +297,27 @@ seastar::future<local_bootstrap_outcome> initialize_local_stores(
                 co_return output;
             }
         }
+        const bool adding = options.intent == local_store_intent::add_devices;
+        const auto named = [&options](const local_device_spec& spec) {
+            return std::find(
+                     options.added.begin(),
+                     options.added.end(),
+                     spec.owner.device())
+                   != options.added.end();
+        };
+        if (adding)
+            for (const auto& added : options.added)
+                if (
+                  std::none_of(
+                    specs.begin(), specs.end(), [&added](const auto& spec) {
+                        return !spec.controls() && spec.owner.device() == added;
+                    })) {
+                    output.failure.observe(
+                      detail::path_error(errc::invalid_argument));
+                    co_return output;
+                }
         bool all_existing = true, compatible = true;
+        bool extended = false, addable = true;
         for (std::size_t i = 0; i < specs.size(); ++i) {
             auto report = co_await inspect_local_store(
               files, owner, specs[i], options, budget, limits, work);
@@ -299,9 +328,15 @@ seastar::future<local_bootstrap_outcome> initialize_local_stores(
             output.reports[i] = *report;
             ++output.inspected;
             output.stages[i] = local_bootstrap_stage::classified;
-            all_existing = all_existing
-                           && report->state == local_store_state::existing;
+            const bool exists = report->state == local_store_state::existing;
+            all_existing = all_existing && exists;
             compatible = compatible && report->bootstrap_compatible;
+            extended = extended || (exists && specs[i].controls());
+            // A device that holds nothing and is not named as added is one
+            // the store had and lost.
+            addable
+              = addable
+                && (exists || (!specs[i].controls() && report->bootstrap_compatible && named(specs[i])));
             if (
               report->state == local_store_state::unsupported
               || report->state == local_store_state::corrupt) {
@@ -310,7 +345,19 @@ seastar::future<local_bootstrap_outcome> initialize_local_stores(
                 co_return output;
             }
         }
-        if (
+        if (adding) {
+            if (!extended || !addable) {
+                output.failure.observe(
+                  detail::path_error(
+                    extended ? errc::wrong_context : errc::not_found));
+                co_return output;
+            }
+            if (all_existing) {
+                for (std::size_t i = 0; i < specs.size(); ++i)
+                    output.stages[i] = local_bootstrap_stage::complete;
+                co_return output;
+            }
+        } else if (
           options.intent == local_store_intent::must_exist
           || options.require_wal_head || !compatible) {
             if (!all_existing)
@@ -328,6 +375,13 @@ seastar::future<local_bootstrap_outcome> initialize_local_stores(
         }
         for (std::size_t i = 0; i < specs.size(); ++i) {
             const auto& spec = specs[i];
+            // What is the store's already is left as it is.
+            if (
+              adding
+              && output.reports[i].state == local_store_state::existing) {
+                output.stages[i] = local_bootstrap_stage::complete;
+                continue;
+            }
             auto owned = co_await owner.validate(spec);
             if (!owned) {
                 output.failure.observe(owned);

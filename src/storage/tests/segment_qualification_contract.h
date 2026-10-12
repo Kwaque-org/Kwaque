@@ -107,6 +107,10 @@ seastar::future<> age_boundaries(
     config.admission.working_bytes = byte_count{1_MiB};
     auto description = contract::descriptor();
     description.maximum_lifetime = runtime::monotonic_duration{10};
+    // What the segment tells of itself; outlives its close.
+    std::optional<runtime::monotonic_time> ends;
+    segment_roll_reasons refused;
+    std::uint32_t refusals = 0;
     co_await with_segment<controlled_clock>(
       files,
       owner,
@@ -116,8 +120,17 @@ seastar::future<> age_boundaries(
       config,
       description,
       [&](auto& writer, auto& work) -> seastar::future<> {
+          take(writer.observe_roll(
+            {[&ends](runtime::monotonic_time deadline) noexcept {
+                 ends = deadline;
+             },
+             [&refused, &refusals](segment_roll_reasons why) noexcept {
+                 refused.add(why);
+                 ++refusals;
+             }}));
           require(
-            !writer.first_acceptance() && !take(writer.roll_required()),
+            !writer.first_acceptance() && !take(writer.roll_required())
+              && !take(writer.left()).deadline && !ends,
             "empty segment started age before acceptance");
           controlled_clock::current = runtime::monotonic_time{1000};
           auto batch = co_await contract::child(work);
@@ -149,6 +162,11 @@ seastar::future<> age_boundaries(
             writer.first_acceptance() == first && !take(writer.roll_required())
               && writer.progress()->written.bytes == cut.history().data_start,
             "age did not start at acceptance before encoding/write completion");
+          require(
+            ends && ends == first.checked_add(description.maximum_lifetime)
+              && take(writer.left()).deadline == ends && refusals == 0,
+            "the lifetime's end was not told at acceptance, or is not what "
+            "the segment says is left");
           take(co_await writer.encode_group(group, work));
           auto submitted = take(writer.submit(std::move(group), work));
           auto next = co_await contract::execution_child(101, work);
@@ -190,6 +208,11 @@ seastar::future<> age_boundaries(
             roll.decision == segment_capacity_decision::roll_required
               && !roll.prepared,
             "expired active owner admitted another group");
+          require(
+            roll.reasons == segment_roll_reasons{segment_roll_reason::age}
+              && refusals == 1 && refused == roll.reasons,
+            "an expired segment did not say its age is why it takes no "
+            "more");
           if (overflow) {
               take(co_await drive.lifecycle(writer.close()));
               controlled_clock::current = runtime::monotonic_time{};
@@ -224,10 +247,15 @@ seastar::future<> age_boundaries(
                       reopened->reopen_read_handle(work)));
                   const auto need_roll = take(
                     reopened->prepare_group(std::span{&later, 1}, work));
+                  const auto nothing = take(reopened->left());
                   require(
                     need_roll.decision
                         == segment_capacity_decision::roll_required
-                      && !reopened->first_acceptance(),
+                      && need_roll.reasons
+                           == segment_roll_reasons{segment_roll_reason::
+                                                     recovered}
+                      && nothing.bytes.value() == 0 && nothing.blocks == 0
+                      && !nothing.deadline && !reopened->first_acceptance(),
                     "recovered idle reopen restored append or manufactured "
                     "age");
               } catch (...) {

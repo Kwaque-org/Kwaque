@@ -8,7 +8,7 @@
 #include <concepts>
 
 namespace kwaque::storage {
-struct segment_seal_outcome final {
+struct segment_seal_outcome {
     runtime::first_failure failure;
     // Present together only after durable sealed-pointer publication. These
     // are segment installation facts, not a combined local append result.

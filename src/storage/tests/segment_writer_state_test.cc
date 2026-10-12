@@ -92,6 +92,7 @@ SEASTAR_TEST_CASE(
                          byte_count{256_KiB})
                          .value();
     BOOST_CHECK(exact.decision == segment_capacity_decision::fits);
+    BOOST_CHECK(exact.reasons.empty());
     description.maximum_data_bytes = byte_count{6143};
     const auto impossible = plan_segment_capacity(
                               description,
@@ -105,6 +106,8 @@ SEASTAR_TEST_CASE(
                               byte_count{256_KiB})
                               .value();
     BOOST_CHECK(impossible.decision == segment_capacity_decision::impossible);
+    // Too large for an empty segment is no reason to roll.
+    BOOST_CHECK(impossible.reasons.empty());
     description.maximum_data_bytes = byte_count{6_KiB};
     auto with_footer = empty;
     with_footer.bytes = runtime::file_position{1024};
@@ -121,6 +124,8 @@ SEASTAR_TEST_CASE(
                         byte_count{256_KiB})
                         .value();
     BOOST_CHECK(roll.decision == segment_capacity_decision::roll_required);
+    BOOST_CHECK(
+      roll.reasons == segment_roll_reasons{segment_roll_reason::size});
 }
 
 SEASTAR_TEST_CASE(
@@ -160,6 +165,8 @@ SEASTAR_TEST_CASE(
                   byte_count{256_KiB})
                   .value();
     BOOST_CHECK(plan.decision == segment_capacity_decision::roll_required);
+    BOOST_CHECK(
+      plan.reasons == segment_roll_reasons{segment_roll_reason::retry_state});
     full = empty;
     full.blocks = UINT32_MAX;
     plan = plan_segment_capacity(
@@ -174,6 +181,8 @@ SEASTAR_TEST_CASE(
              byte_count{256_KiB})
              .value();
     BOOST_CHECK(plan.decision == segment_capacity_decision::roll_required);
+    BOOST_CHECK(
+      plan.reasons == segment_roll_reasons{segment_roll_reason::count});
     full = empty;
     full.footers = UINT32_MAX;
     plan = plan_segment_capacity(
@@ -188,6 +197,47 @@ SEASTAR_TEST_CASE(
              byte_count{256_KiB})
              .value();
     BOOST_CHECK(plan.decision == segment_capacity_decision::roll_required);
+    BOOST_CHECK(
+      plan.reasons == segment_roll_reasons{segment_roll_reason::count});
+    // Reasons that hold together are each given.
+    full = empty;
+    full.blocks = UINT32_MAX;
+    full.retry_entries = 1;
+    plan = plan_segment_capacity(
+             description,
+             runtime::file_position{512},
+             full,
+             input,
+             limits,
+             work.policy(),
+             charge,
+             alignment(4096),
+             byte_count{256_KiB})
+             .value();
+    BOOST_CHECK(plan.decision == segment_capacity_decision::roll_required);
+    BOOST_CHECK(
+      plan.reasons
+      == segment_roll_reasons{segment_roll_reason::count}.add(
+        segment_roll_reason::retry_state));
+    full = empty;
+    full.blocks = UINT32_MAX;
+    full.bytes = runtime::file_position{1_MiB - 512};
+    plan = plan_segment_capacity(
+             description,
+             runtime::file_position{512},
+             full,
+             input,
+             limits,
+             work.policy(),
+             charge,
+             alignment(4096),
+             byte_count{256_KiB})
+             .value();
+    BOOST_CHECK(plan.decision == segment_capacity_decision::roll_required);
+    BOOST_CHECK(
+      plan.reasons
+      == segment_roll_reasons{segment_roll_reason::size}.add(
+        segment_roll_reason::count));
     limits.metadata_bytes = byte_count{1};
     plan = plan_segment_capacity(
              description,
@@ -245,6 +295,8 @@ SEASTAR_TEST_CASE(segment_capacity_honors_page_count_and_terminal_logical_end) {
                         byte_count{256_KiB})
                         .value();
     BOOST_CHECK(full.decision == segment_capacity_decision::roll_required);
+    BOOST_CHECK(
+      full.reasons == segment_roll_reasons{segment_roll_reason::retry_state});
     limits.maximum_retry_pages = 2;
     const auto fits = plan_segment_capacity(
                         description,
@@ -258,6 +310,7 @@ SEASTAR_TEST_CASE(segment_capacity_honors_page_count_and_terminal_logical_end) {
                         byte_count{256_KiB})
                         .value();
     BOOST_CHECK(fits.decision == segment_capacity_decision::fits);
+    BOOST_CHECK(fits.reasons.empty());
     BOOST_CHECK_EQUAL(fits.retry_pages, 2U);
     const std::array terminal{co_await child(work, false, UINT64_MAX - 1)};
     description.logical_origin = model::range_logical_end{UINT64_MAX - 1};
@@ -382,6 +435,8 @@ SEASTAR_TEST_CASE(segment_capacity_full_summary_and_ref_memory_intersections) {
       byte_count{256_KiB});
     BOOST_REQUIRE(over.has_value());
     BOOST_CHECK(over->decision == segment_capacity_decision::roll_required);
+    BOOST_CHECK(
+      over->reasons == segment_roll_reasons{segment_roll_reason::retry_state});
     limits.metadata_bytes = byte_count{8_KiB};
     const auto refs = plan_segment_capacity(
       description,
@@ -395,6 +450,8 @@ SEASTAR_TEST_CASE(segment_capacity_full_summary_and_ref_memory_intersections) {
       byte_count{256_KiB});
     BOOST_REQUIRE(refs.has_value());
     BOOST_CHECK(refs->decision == segment_capacity_decision::roll_required);
+    BOOST_CHECK(
+      refs->reasons == segment_roll_reasons{segment_roll_reason::retry_state});
     limits.metadata_bytes = byte_count{1_MiB};
     limits.maximum_retry_pages = 1;
     const auto pages = plan_segment_capacity(
@@ -409,4 +466,6 @@ SEASTAR_TEST_CASE(segment_capacity_full_summary_and_ref_memory_intersections) {
       byte_count{256_KiB});
     BOOST_REQUIRE(pages.has_value());
     BOOST_CHECK(pages->decision == segment_capacity_decision::roll_required);
+    BOOST_CHECK(
+      pages->reasons == segment_roll_reasons{segment_roll_reason::retry_state});
 }

@@ -288,9 +288,16 @@ storage_observation observe_metadata(
                 require(
                   result->value.entry_count()
                   == get(candidate, header + 156U, 4));
+                // A page begins with whatever anchor its root gives it,
+                // inside the covered extent and after the page before: the
+                // root is rebuilt with the anchors that were decoded, not
+                // with the ones an index without gaps would have.
                 record_body(
                   index::root_wire(
-                    result->value.pages(), result->value.context(), header));
+                    result->value.pages(),
+                    result->value.context(),
+                    header,
+                    result->value.first_anchors()));
             }
         } else {
             const auto result = decode_sparse_index_page(

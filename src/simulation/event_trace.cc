@@ -397,7 +397,7 @@ effect_position_is_valid(const trace_entry& entry) noexcept {
               || entry.context[0].key != trace_context_key::detail
               || entry.context[1].key != trace_context_key::limit
               || entry.context[0].value > static_cast<std::uint8_t>(
-                   runtime::file_failure_detail::quota))
+                   runtime::file_failure_detail::device_gone))
                 return invalid_trace(errc::malformed_data);
             auto decision = runtime::fault_decision::make_file_failure(
               action,
@@ -613,7 +613,7 @@ effect_position_is_valid(const trace_entry& entry) noexcept {
             if (
               code > static_cast<std::uint32_t>(errc_last)
               || detail > static_cast<std::uint8_t>(
-                   runtime::file_failure_detail::quota)
+                   runtime::file_failure_detail::device_gone)
               || receipt == 0 || receipt > 3 || (code == 0 && detail != 0)
               || (receipt == 3 && (code != 0 || detail != 0)))
                 return invalid_trace(errc::malformed_data);

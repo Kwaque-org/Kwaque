@@ -54,6 +54,40 @@ TEST(StorageFuzzCasesTest, MetadataObjectsRepairChecksumsAndIndependentPins) {
         }
     }
 }
+// An index root gives each page the anchor it begins with. A root whose
+// anchor was changed to another one inside the covered extent, with its
+// checksums repaired and its digest pinned again, is another valid root: it
+// is decoded, and what was decoded is the root that was read. One changed to
+// an anchor outside the extent is refused. Every bit of the first page's
+// anchor, at each header length; first the two inputs a campaign found.
+TEST(StorageFuzzCasesTest, AnIndexRootIsRebuiltWithTheAnchorsItCarries) {
+    exercise_storage_case(
+      std::array<std::uint8_t, 14>{7, 2, 64, 3, 0, 7, 0, 7, 2, 64, 3, 0, 7, 0});
+    exercise_storage_case(std::array<std::uint8_t, 8>{7, 2, 64, 3, 0, 3, 0, 7});
+    for (const auto variant : std::array<std::uint8_t, 3>{0, 4, 8}) {
+        const std::size_t header = (variant & 8U) != 0   ? 4096U
+                                   : (variant & 4U) != 0 ? 40U
+                                                         : 32U;
+        // The fixed part of a root, then the first page's reference, whose
+        // last eight bytes are its anchor.
+        const auto anchor = header + 168U + 48U;
+        for (std::size_t byte = 0; byte < 8; ++byte)
+            for (std::uint8_t bit = 0; bit < 8; ++bit) {
+                const auto at = anchor + byte;
+                exercise_storage_case(
+                  std::array<std::uint8_t, 8>{
+                    7,
+                    2,
+                    64,
+                    3,
+                    static_cast<std::uint8_t>(at & 0xffU),
+                    static_cast<std::uint8_t>(at >> 8U),
+                    bit,
+                    variant});
+                seastar::thread::maybe_yield();
+            }
+    }
+}
 TEST(
   StorageFuzzCasesTest, MetadataWalksRequireEveryOrderedPageBeforeCompletion) {
     for (std::uint8_t kind = 11; kind <= 12; ++kind)

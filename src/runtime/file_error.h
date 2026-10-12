@@ -18,6 +18,8 @@ enum class file_failure_detail : std::uint8_t {
     // No native attempt; this does not restore a consuming call's arguments.
     admission_not_dispatched = 6,
     quota = 7,
+    // The device under the file is gone: no later call on it can succeed.
+    device_gone = 8,
 };
 
 [[nodiscard]] inline result<file_failure_detail>
@@ -28,7 +30,9 @@ file_detail(const operation_error& error) noexcept {
     for (std::size_t index = 0; index < error.context_size(); ++index) {
         const auto field = *error.context_at(index);
         if (field.key != operation_context_key::detail) continue;
-        if (field.value > static_cast<std::uint8_t>(file_failure_detail::quota))
+        if (
+          field.value
+          > static_cast<std::uint8_t>(file_failure_detail::device_gone))
             return failure(
               operation_error{errc::malformed_data, operation_kind::file});
         return static_cast<file_failure_detail>(field.value);
@@ -59,6 +63,7 @@ file_failure_code(file_failure_detail detail) noexcept {
         return errc::queue_full;
     case file_failure_detail::unknown:
     case file_failure_detail::device_io:
+    case file_failure_detail::device_gone:
         return errc::io_failure;
     }
     return errc::io_failure;

@@ -3,6 +3,7 @@
 #include "src/base/units.h"
 #include "src/storage/local_root.h"
 #include "src/storage/local_segment.h"
+#include "src/storage/segment_data.h"
 
 namespace kwaque::storage {
 using local_boundary_metadata = std::variant<durable_footer, sealed_footer>;
@@ -57,6 +58,25 @@ public:
     // without it.
     [[nodiscard]] std::optional<runtime::operation_error>
     index_rebuild_reason() const;
+    // Where the data its publication pins ends: the end of a sealed extent,
+    // or of what the durable footer of a segment that was not sealed covers.
+    // A reader of this generation takes its bound from here. Nothing for a
+    // publication that pins no boundary.
+    [[nodiscard]] std::optional<runtime::file_position> data_end() const;
+    // Reads the segment's data below `bound`, through the one handle the
+    // generation holds on it and without its writer's owner; see
+    // read_segment_data(). Opening the generation checked its descriptor,
+    // its publication and the footer or sealed root that publication pins,
+    // and walked no extent: each block read here is checked where it lies,
+    // by whoever reads it. A bound past a sealed extent's end is refused with
+    // out_of_range, and so is any read of a generation that holds no data
+    // handle, which one without a boundary does not. The read keeps the
+    // generation open by itself, and its failure fails nothing but itself.
+    [[nodiscard]] seastar::future<runtime::result<bytes::fragmented_buffer>>
+    read_data(
+      runtime::file_position position,
+      byte_count length,
+      runtime::file_position bound) const;
 
 private:
     friend class local_generation_owner;
