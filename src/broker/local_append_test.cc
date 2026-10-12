@@ -7,6 +7,7 @@
 #include "src/runtime/testing/test_directory.h"
 #include "src/storage/tests/local_append_contract.h"
 #include "src/storage/tests/recovery_successor_contract.h"
+#include "src/storage/tests/segment_lifecycle_contract.h"
 
 #include <seastar/core/memory.hh>
 #include <seastar/core/seastar.hh>
@@ -136,6 +137,110 @@ SEASTAR_TEST_CASE(local_recovery_repeated_restarts_native) {
 SEASTAR_TEST_CASE(local_append_native_close_drains_accepted) {
     co_await with_local_store([](auto&&... shared) {
         return contract::close_drains_accepted<clock_type>(shared...);
+    });
+}
+
+SEASTAR_TEST_CASE(segment_lifecycle_native_sealed_under_readers) {
+    co_await with_local_store([](auto&&... shared) {
+        return storage::testing::segment_lifecycle_contract::
+          sealed_under_readers<clock_type>(shared...);
+    });
+}
+
+SEASTAR_TEST_CASE(segment_lifecycle_native_sealed_on_demand) {
+    co_await with_local_store([](auto&&... shared) {
+        return storage::testing::segment_lifecycle_contract::sealed_on_demand<
+          clock_type>(shared...);
+    });
+}
+
+SEASTAR_TEST_CASE(segment_lifecycle_native_one_transition_at_a_time) {
+    co_await with_local_store([](auto&&... shared) {
+        return storage::testing::segment_lifecycle_contract::
+          one_transition_at_a_time<clock_type>(shared...);
+    });
+}
+
+SEASTAR_TEST_CASE(segment_lifecycle_native_roll_reported) {
+    co_await with_local_store([](auto&&... shared) {
+        return storage::testing::segment_lifecycle_contract::roll_reported<
+          clock_type>(shared...);
+    });
+}
+
+SEASTAR_TEST_CASE(segment_lifecycle_native_age_reported) {
+    co_await with_local_store([](auto&&... shared) {
+        return storage::testing::segment_lifecycle_contract::age_reported<
+          clock_type>(shared...);
+    });
+}
+
+SEASTAR_TEST_CASE(segment_lifecycle_native_created_ahead) {
+    co_await with_local_store([](auto&&... shared) {
+        return storage::testing::segment_lifecycle_contract::created_ahead<
+          clock_type>(shared...);
+    });
+}
+
+SEASTAR_TEST_CASE(segment_lifecycle_native_device_watched) {
+    co_await with_local_store([](auto&&... shared) {
+        return storage::testing::segment_lifecycle_contract::device_watched<
+          clock_type>(shared...);
+    });
+}
+
+SEASTAR_TEST_CASE(segment_lifecycle_native_placed_by_share) {
+    co_await with_local_store([](auto&&... shared) {
+        return storage::testing::segment_lifecycle_contract::placed_by_share<
+          clock_type>(shared...);
+    });
+}
+
+SEASTAR_TEST_CASE(segment_lifecycle_native_kept_until_authorized) {
+    co_await with_local_store([](auto&&... shared) {
+        return storage::testing::segment_lifecycle_contract::
+          kept_until_authorized<clock_type>(shared...);
+    });
+}
+
+SEASTAR_TEST_CASE(segment_lifecycle_native_removed_when_authorized) {
+    co_await with_local_store([](auto&&... shared) {
+        return storage::testing::segment_lifecycle_contract::
+          removed_when_authorized<clock_type>(shared...);
+    });
+}
+
+SEASTAR_TEST_CASE(segment_lifecycle_native_failed_segment_discarded) {
+    co_await with_local_store([](auto&&... shared) {
+        return storage::testing::segment_lifecycle_contract::
+          failed_segment_discarded<clock_type>(shared...);
+    });
+}
+
+SEASTAR_TEST_CASE(segment_lifecycle_native_removal_resumed) {
+    co_await with_local_store([](auto&&... shared) {
+        return storage::testing::segment_lifecycle_contract::removal_resumed<
+          clock_type>(shared...);
+    });
+}
+
+SEASTAR_TEST_CASE(segment_lifecycle_native_removal_against_transitions) {
+    co_await with_local_store([](auto&&... shared) {
+        return storage::testing::segment_lifecycle_contract::
+          removal_against_transitions<clock_type>(shared...);
+    });
+}
+
+SEASTAR_TEST_CASE(segment_lifecycle_native_revoked_in_flight) {
+    co_await with_local_store([](auto&&... shared) {
+        return storage::testing::segment_lifecycle_contract::revoked_in_flight<
+          clock_type>(shared...);
+    });
+}
+
+SEASTAR_TEST_CASE(local_append_native_quiesce_drains_one_attachment) {
+    co_await with_local_store([](auto&&... shared) {
+        return contract::quiesce_drains_one_attachment<clock_type>(shared...);
     });
 }
 

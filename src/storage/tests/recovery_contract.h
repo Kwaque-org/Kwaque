@@ -2357,6 +2357,91 @@ seastar::future<> interruptions(
              drive))
              == deleting,
       "restart changed a leftover, the WAL or a deleting segment");
+
+    // What a restart finds of a removal, by where the segment's directory
+    // is and what its owner's catalog says of it.
+    const auto own = take(paths.segment(0, name));
+    const auto marked = take(paths.deleting(0, name));
+    const auto asked = [](std::optional<segment_immutable_expectation> sealed) {
+        return std::array{
+          recovery_catalog_entry{
+            descriptor(),
+            segment_head(),
+            deletion_authorization{segment(), sealed}},
+          recovery_catalog_entry{descriptor_b(), segment_head_b()}};
+    };
+    std::optional<segment_immutable_expectation> identity;
+    {
+        // Expiring, and named as not sealed. It is sealed here: nothing
+        // changes for it, and the restart says what the device holds.
+        const auto wrong = asked(std::nullopt);
+        const auto kept = take(
+          co_await inventory(files, owner, spec, budget, wrong, found, drive));
+        require(
+          kept.entries[0].state == recovery_entry_state::target
+            && kept.entries[0].refused == authorization_verdict::sealed_here
+            && kept.entries[0].sealed && !kept.entries[0].marked
+            && kept.targets.size() == 1,
+          "a removal was started for an authorization that does not name "
+          "what the device holds");
+        identity = kept.entries[0].sealed;
+    }
+    const auto exact = asked(identity);
+    {
+        // Named as what it is, whole under its own name: its removal
+        // starts, and the merge is not given it.
+        const auto starts = take(
+          co_await inventory(files, owner, spec, budget, exact, found, drive));
+        require(
+          starts.entries[0].state == recovery_entry_state::deleting
+            && !starts.entries[0].marked && !starts.entries[0].refused
+            && starts.entries[0].device == spec.owner.device()
+            && starts.entries[0].expiring == exact[0].expiring
+            && starts.targets.empty(),
+          "an expiring segment the device holds as authorized is not "
+          "being removed");
+    }
+    // Under its deleting name it is being removed whatever the catalog
+    // says, and nothing inside is read.
+    take(
+      co_await drive.lifecycle(
+        files.rename(own, marked, runtime::file_rename_policy::no_replace)));
+    for (const bool expires : {false, true}) {
+        const auto listed = expires ? exact : catalog;
+        const auto resumed = take(
+          co_await inventory(files, owner, spec, budget, listed, found, drive));
+        require(
+          resumed.entries.size() == 2
+            && resumed.entries[0].state == recovery_entry_state::deleting
+            && resumed.entries[0].marked
+            && resumed.entries[0].device == spec.owner.device()
+            && resumed.entries[0].expiring.has_value() == expires
+            && resumed.entries[1].state == recovery_entry_state::deleting
+            && !resumed.entries[1].marked && resumed.targets.empty(),
+          "a directory under its deleting name is not a removal to go on "
+          "with");
+    }
+    // Under neither name: lost when its owner lists it as retained, and a
+    // removal that finished when its owner says it expires.
+    take(
+      co_await drive.lifecycle(files.rename(
+        marked,
+        take(runtime::file_path::make(spec.root.value() + "/elsewhere")),
+        runtime::file_rename_policy::no_replace)));
+    {
+        const auto lost = co_await inventory(
+          files, owner, spec, budget, catalog, found, drive);
+        const auto gone = take(
+          co_await inventory(files, owner, spec, budget, exact, found, drive));
+        require(
+          !lost && lost.error().code() == errc::not_found
+            && gone.entries.size() == 2
+            && gone.entries[0].state == recovery_entry_state::gone
+            && gone.entries[0].device == device_store_id{}
+            && !gone.entries[0].marked && gone.targets.empty(),
+          "a segment no device holds was not lost, or one that expires "
+          "was not reported gone");
+    }
 }
 
 // Before restart changes anything every configured device must be an

@@ -1,5 +1,6 @@
 #pragma once
 
+#include "src/base/allocation.h"
 #include "src/base/invariant.h"
 #include "src/base/units.h"
 #include "src/runtime/task_scope.h"
@@ -59,6 +60,14 @@ fold_pinned_obligations(
 inline constexpr std::uint32_t maximum_checkpoint_segments
   = 2 * maximum_local_append_segments;
 inline constexpr std::uint32_t maximum_checkpoint_decisions = 1024;
+// The most segments a pin table counts as covered since the durable
+// checkpoint was cut. They are held in one allocation made with the table,
+// so that covering a segment and adopting a cut allocate nothing; with more
+// of them every segment is taken to be named until the next cut is adopted.
+inline constexpr std::uint32_t maximum_covered_segments = 1024;
+static_assert(
+  std::uint64_t{maximum_covered_segments} * sizeof(segment_context)
+  <= maximum_contiguous_allocation_bytes);
 struct checkpoint_pin_limits final {
     // Unsealed segments pinned or waiting for a pin: every attachment, and
     // each one detached until its own publication covers it.
@@ -196,6 +205,18 @@ public:
     entries() const&& = delete;
     // Segments with a durable footer newer than the one their entry pins.
     [[nodiscard]] std::size_t stale() const noexcept { return pending_.size(); }
+    // Whether the durable checkpoint may carry an entry for `segment`: one
+    // in the table, or one a publication has covered since that checkpoint
+    // was cut, which leaves it only when a later cut is adopted. A restart
+    // resolves every entry against its segment, so a segment this names is
+    // still looked for.
+    [[nodiscard]] bool names(const segment_context& segment) const noexcept;
+    // Whether the durable checkpoint carries an entry the table has let go
+    // of: a segment covered since that checkpoint was cut. Only a later
+    // cut, adopted, drops it, whether or not the cutoff has moved.
+    [[nodiscard]] bool lingering() const noexcept {
+        return !covered_.empty() || uncounted_;
+    }
 
     // Records an unsealed segment's newest durable footer: from the append
     // owner while it is attached, and its last one when it detaches. A
@@ -262,10 +283,15 @@ private:
     checkpoint_pins(
       workload_budget& budget,
       checkpoint_pin_limits limits,
-      workload_reservation held) noexcept
+      workload_reservation held,
+      std::vector<segment_context> covered) noexcept
       : held_(std::move(held))
       , budget_(&budget)
-      , limits_(limits) {}
+      , limits_(limits)
+      , covered_(std::move(covered)) {}
+    // The table lets go of entries of `segment` that the durable checkpoint
+    // carries, or that the cut being published does.
+    void linger(const segment_context& segment) noexcept;
 
     // Declared first: released after the tables they admitted. The second
     // came with the adopted cut and covers the table.
@@ -281,6 +307,13 @@ private:
     // Segments with a boundary entry or a pending footer, and discards held
     // or carried.
     std::uint32_t segments_{0}, decisions_{0};
+    // Segments a publication covered whose entries the durable checkpoint
+    // still carries, until a later cut is adopted. Reserved when the owner
+    // is made, for its limit of segments and at most
+    // maximum_covered_segments; with more of them than it holds, every
+    // segment is taken to be one.
+    std::vector<segment_context> covered_;
+    bool uncounted_{false};
     // The latest cut issued, and whether it is still to be adopted.
     std::uint64_t cut_{0};
     bool cut_open_{false};
@@ -752,7 +785,8 @@ private:
 // referenced by nothing, and removed again at the next open.
 // An uncertain head update fences the control, and this owner with it.
 //
-// Runs are asked for, never timed. request() is an explicit demand, and a
+// Runs are asked for, never timed. request() is an explicit demand, let_go()
+// one that also writes for entries a publication has covered, and a
 // graceful stop is one made after the appends have drained: an ordinary
 // checkpoint that ends at the WAL-durable end, so the next start scans
 // nothing, and never a flag that skips recovery. Once bind_retention() is
@@ -931,6 +965,22 @@ public:
         return pins_.cover(publication);
     }
 
+    // Whether a restart of this shard would still look for a segment that
+    // is appended to no more: the durable checkpoint carries an entry for
+    // it, or ends before `below`, under which every PREPARE of the segment
+    // lies in the WAL. Its caller has covered the segment's entries with
+    // its publication first. Until this says no, the segment's directory
+    // stays where a restart finds it.
+    [[nodiscard]] runtime::result<bool>
+    names(const segment_context& segment, const local_wal_cursor& below) const {
+        assert_current();
+        if (pins_.names(segment)) return true;
+        const auto end = head_.checkpoint_end().value_or(origin_);
+        const auto order = end.compare(owner_, below, owner_);
+        if (!order) return runtime::failure(error(errc::wrong_context));
+        return *order == std::strong_ordering::less;
+    }
+
     // After a restart, before the first request: recovery's publications
     // are durable. Each recovered segment's boundary is then pinned by its
     // own publication, which is what lets a cut pass the WAL that recovery
@@ -987,6 +1037,17 @@ public:
     // group.
     [[nodiscard]] seastar::future<output> request() {
         assert_current();
+        return ask(false);
+    }
+    // The same, for whoever waits for the durable checkpoint to let go of a
+    // segment its publication has covered: the run that serves this is
+    // published though the cutoff stands still, when the durable checkpoint
+    // carries such an entry. The table changed while the cursors did not,
+    // and only a checkpoint that is written says so on the device. With no
+    // such entry it is request().
+    [[nodiscard]] seastar::future<output> let_go() {
+        assert_current();
+        if (!closing_ && !closed_ && !first_.failed()) letting_go_ = true;
         return ask(false);
     }
 
@@ -1183,6 +1244,9 @@ private:
     }
 
     seastar::future<output> run() {
+        // Whoever asked for covered entries to be let go is served by the
+        // run that starts after it asked.
+        const bool letting_go = std::exchange(letting_go_, false);
         if (first_.failed()) co_return runtime::failure(error(errc::closed));
         // The cut, in one synchronous step: the cutoff, each attachment's
         // newest durable footer and the table as it stands.
@@ -1213,7 +1277,10 @@ private:
             co_return runtime::failure(observed.outcome().error());
         // The cutoff stands still: what the durable checkpoint pins already
         // covers everything below it. Removals still owed are tried again.
-        if (*end == begin) {
+        // Unless it also carries what a publication has covered since, and
+        // someone waits for that to go: then the table is published as it
+        // is, from and to the same cutoff.
+        if (*end == begin && !(letting_go && pins_.lingering())) {
             co_await settle_debts();
             checkpoint_outcome idle{begin, false, 0, unretired()};
             co_await reclaim(idle);
@@ -1415,6 +1482,8 @@ private:
     runtime::first_failure first_;
     std::optional<segment_context> unpinned_;
     bool running_{false}, publishing_{false}, closing_{false}, closed_{false};
+    // A run was asked for that publishes for covered entries alone.
+    bool letting_go_{false};
     // Recovery's publications were handed over; see recovered().
     bool recovered_{false};
     // The runs; joined by close().

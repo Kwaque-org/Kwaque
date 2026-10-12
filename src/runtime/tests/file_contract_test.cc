@@ -405,7 +405,7 @@ TEST(FileContractTest, FileFailureDetailsPreserveRealCausesWithoutGuessing) {
     kwaque::runtime::operation_error invalid{
       kwaque::errc::io_failure, kwaque::runtime::operation_kind::file};
     ASSERT_TRUE(
-      invalid.add_context(kwaque::runtime::operation_context_key::detail, 8));
+      invalid.add_context(kwaque::runtime::operation_context_key::detail, 9));
     EXPECT_FALSE(kwaque::runtime::file_detail(invalid).has_value());
     auto bounded = kwaque::runtime::make_file_error(
       kwaque::errc::io_failure, file_failure_detail::device_io);

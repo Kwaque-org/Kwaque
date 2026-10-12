@@ -50,6 +50,37 @@ TEST(LocalPathsTest, FixedNamesAndBothBucketRulesRoundTrip) {
       UINT64_MAX);
     EXPECT_EQ(parse_local_shard_name("fffffffe").value(), UINT32_MAX - 1);
 }
+// A segment's directory is renamed in place when its removal begins: the
+// same directory above, the same name with its separator changed. Neither
+// name reads as the other.
+TEST(LocalPathsTest, ADeletingNameIsTheSegmentsOwnWithOneCharacterChanged) {
+    auto paths
+      = local_paths::make(runtime::file_path::make("/data").value()).value();
+    const local_segment_name segment{
+      identity<model::segment_id>(0x34, 0xcd),
+      model::segment_generation::make(7).value()};
+    const std::string live
+      = "340000000000000000000000000000cd-0000000000000007";
+    const std::string deleting
+      = "340000000000000000000000000000cd~0000000000000007";
+    const std::string above = "/data/shards/00000002/segments/34";
+    EXPECT_EQ(paths.segment_bucket(2, segment.segment)->value(), above);
+    EXPECT_EQ(paths.segment(2, segment)->value(), above + "/" + live);
+    EXPECT_EQ(paths.deleting(2, segment)->value(), above + "/" + deleting);
+    EXPECT_EQ(parse_local_deleting_name(deleting, 0x34).value(), segment);
+    EXPECT_FALSE(parse_local_deleting_name(live, 0x34));
+    EXPECT_FALSE(parse_local_segment_name(deleting, 0x34));
+    // The bucket rule and the generation's are the segment name's own.
+    EXPECT_EQ(
+      parse_local_deleting_name(deleting, 0x35).error().code(),
+      errc::wrong_context);
+    EXPECT_FALSE(parse_local_deleting_name(
+      "340000000000000000000000000000cd~0000000000000000", 0x34));
+    EXPECT_FALSE(parse_local_deleting_name(deleting + "x", 0x34));
+    EXPECT_FALSE(paths.deleting(
+      2, {model::segment_id{}, model::segment_generation::make(7).value()}));
+}
+
 TEST(LocalPathsTest, NoncanonicalZeroWrongBucketAndTrailingBytesReject) {
     for (auto name :
          {"1.wal",

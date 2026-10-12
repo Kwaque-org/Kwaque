@@ -138,9 +138,14 @@ parse_local_wal_name(std::string_view name, std::uint8_t bucket) {
         return runtime::failure(detail::path_error(errc::wrong_context));
     return *id;
 }
-runtime::result<local_segment_name>
-parse_local_segment_name(std::string_view name, std::uint8_t bucket) {
-    if (name.size() != 49 || name[32] != '-')
+namespace {
+// A segment directory's name: its identity and generation around one
+// separator, which says whether the segment is being removed.
+constexpr char segment_separator = '-';
+constexpr char deleting_separator = '~';
+runtime::result<local_segment_name> parse_segment_directory(
+  std::string_view name, std::uint8_t bucket, char separator) {
+    if (name.size() != 49 || name[32] != separator)
         return runtime::failure(detail::path_error(errc::invalid_argument));
     auto id = parse_id<model::segment_id>(name.substr(0, 32));
     auto generation = parse_hex(name.substr(33), 16);
@@ -151,6 +156,15 @@ parse_local_segment_name(std::string_view name, std::uint8_t bucket) {
         return runtime::failure(detail::path_error(errc::wrong_context));
     return local_segment_name{
       *id, model::segment_generation::make(*generation).value()};
+}
+} // namespace
+runtime::result<local_segment_name>
+parse_local_segment_name(std::string_view name, std::uint8_t bucket) {
+    return parse_segment_directory(name, bucket, segment_separator);
+}
+runtime::result<local_segment_name>
+parse_local_deleting_name(std::string_view name, std::uint8_t bucket) {
+    return parse_segment_directory(name, bucket, deleting_separator);
 }
 runtime::result<std::uint64_t>
 parse_local_sequence_name(std::string_view name, bool metadata) {
@@ -204,15 +218,30 @@ local_paths::wal(std::uint32_t n, model::wal_incarnation_id id) const {
     return append(*bucket, hex_id(id) + ".wal");
 }
 runtime::result<runtime::file_path>
-local_paths::segment(std::uint32_t n, local_segment_name name) const {
-    if (name.segment.is_nil() || !name.generation.is_valid())
+local_paths::segment_bucket(std::uint32_t n, model::segment_id segment) const {
+    if (segment.is_nil())
         return runtime::failure(detail::path_error(errc::invalid_argument));
     auto base = buckets(n, local_bucket_kind::segment);
     if (!base) return runtime::failure(base.error());
-    auto bucket = append(*base, hex(name.segment.bytes()[0], 2));
+    return append(*base, hex(segment.bytes()[0], 2));
+}
+runtime::result<runtime::file_path> local_paths::segment_directory(
+  std::uint32_t n, local_segment_name name, char separator) const {
+    if (!name.generation.is_valid())
+        return runtime::failure(detail::path_error(errc::invalid_argument));
+    auto bucket = segment_bucket(n, name.segment);
     if (!bucket) return runtime::failure(bucket.error());
     return append(
-      *bucket, hex_id(name.segment) + "-" + hex(name.generation.value(), 16));
+      *bucket,
+      hex_id(name.segment) + separator + hex(name.generation.value(), 16));
+}
+runtime::result<runtime::file_path>
+local_paths::segment(std::uint32_t n, local_segment_name name) const {
+    return segment_directory(n, name, segment_separator);
+}
+runtime::result<runtime::file_path>
+local_paths::deleting(std::uint32_t n, local_segment_name name) const {
+    return segment_directory(n, name, deleting_separator);
 }
 runtime::result<runtime::file_path> local_paths::segment_file(
   std::uint32_t n, local_segment_name name, local_segment_file file) const {

@@ -8,8 +8,12 @@
 #include "src/runtime/production/clocks.h"
 #include "src/runtime/testing/test_directory.h"
 #include "src/storage/local_bundle.h"
+#include "src/storage/local_generation.h"
 #include "src/storage/local_paths.h"
 #include "src/storage/local_root.h"
+#include "src/storage/page_cache.h"
+#include "src/storage/segment_reader.h"
+#include "src/storage/segment_run.h"
 #include "src/storage/segment_scan.h"
 #include "src/storage/segment_writer.h"
 #include "src/storage/sparse_index.h"
@@ -324,6 +328,11 @@ struct sealed final {
     std::optional<segment_history_context> history;
     std::optional<sparse_index_context> context;
     std::optional<local_root_reference> index;
+    // What its publication names beside the index, for whoever opens its
+    // generation to read it.
+    std::optional<local_publication_generation> generation;
+    std::optional<local_footer_reference> boundary;
+    std::optional<local_root_reference> retry;
     // The index its writer fed, frozen by the seal.
     std::unique_ptr<active_sparse_index> memory;
     std::unique_ptr<segment_type> writer;
@@ -483,6 +492,9 @@ seastar::future<sealed> write_segment(
             outcome.extent->digest,
             out.descriptor.alignment));
         out.index = outcome.index;
+        out.generation = writer->publication_generation();
+        out.boundary = outcome.boundary;
+        out.retry = outcome.retry;
     } catch (...) {
         failed.observe(std::current_exception());
     }
@@ -828,9 +840,12 @@ private:
 // measured over, so that no number is read against another dataset.
 class row final {
 public:
-    row(const char* name, const char* side) {
-        std::printf(
-          "index_bench_v1 {\"case\":\"%s\",\"side\":\"%s\"", name, side);
+    // `family` names what reads the row: the index's report by default.
+    row(
+      const char* name,
+      const char* side,
+      const char* family = "index_bench_v1") {
+        std::printf("%s {\"case\":\"%s\",\"side\":\"%s\"", family, name, side);
         flag("timing_only", timing_only);
 #if defined(NDEBUG)
         flag("ndebug", true);
@@ -2004,4 +2019,879 @@ PERF_TEST_F(resident_index, rebuild) {
       [](environment env) { return rebuild_case(env, side::resident); });
 }
 } // namespace resident_cases
+
+// The read path over what the cases above write: a cache, a segment's runs
+// and a reader's sessions. Its rows are a family of their own, with a report
+// of their own.
+namespace read_cases {
+constexpr const char* family = "read_bench_v1";
+
+struct read_settings final {
+    // Blocks of a sealed segment that is read, 4 KiB each. The default
+    // keeps a run of every case short and still holds a few runs at the
+    // widest stride.
+    std::uint32_t blocks{512};
+    // Groups appended to the segment whose tail is read, eight blocks each.
+    std::uint32_t groups{48};
+    // What the cache of the tail cases may hold.
+    std::uint64_t tail_cache_bytes{1_MiB};
+};
+read_settings chosen_reads() {
+    read_settings out;
+    out.blocks = chosen_count(
+      "KWAQUE_READ_BENCH_BLOCKS", out.blocks, 64, maximum_object_entries);
+    out.groups = chosen_count("KWAQUE_READ_BENCH_GROUPS", out.groups, 16, 4096);
+    out.tail_cache_bytes = std::uint64_t{chosen_count(
+                             "KWAQUE_READ_BENCH_TAIL_CACHE_KIB",
+                             static_cast<std::uint32_t>(
+                               out.tail_cache_bytes / 1_KiB),
+                             256,
+                             16 * 1024)}
+                           * 1_KiB;
+    return out;
+}
+// Seeks of one unit of work.
+constexpr std::uint32_t seeks = 256;
+// What the cache of a sealed segment's cases may hold: ten of the widest
+// runs of the sweep, with room to spare, or half of what funds it.
+byte_count sealed_cache(const environment& env) {
+    return byte_count{
+      std::min<std::uint64_t>(16_MiB, env.indexing.limits().bytes.value() / 2)};
+}
+// The strides of the sweep as a read unit, in bytes.
+constexpr std::array<std::uint64_t, 6> read_strides{
+  32_KiB, 64_KiB, 128_KiB, 256_KiB, 512_KiB, 1_MiB};
+
+segment_run_limits run_limits() { return {.charge = charge}; }
+// Whether this allocator profile can price a read as long as one whole
+// contiguous allocation: a run that long is not readable where it cannot.
+bool prices_whole_chunks() {
+    return charge(byte_count{maximum_contiguous_allocation_bytes}).value()
+           <= maximum_contiguous_allocation_bytes;
+}
+
+// A sealed segment opened to be read: its generation and its index over a
+// cache, and its runs.
+struct read_world final {
+    sparse_index_residency residency;
+    sparse_index_rebuild_limit rebuilds;
+    // The cache, when this world made it.
+    std::unique_ptr<page_cache> owned;
+    page_cache* cache{nullptr};
+    std::unique_ptr<local_generation_owner> generation;
+    std::unique_ptr<index_type> index;
+    std::optional<local_generation_pin> pin;
+    std::unique_ptr<segment_runs> runs;
+    runtime::file_position bound;
+    model::range_logical_end last;
+};
+seastar::future<> close_world(read_world& world) {
+    runtime::first_failure failed;
+    if (world.runs) {
+        try {
+            failed.observe(co_await world.runs->close());
+        } catch (...) {
+            failed.observe(std::current_exception());
+        }
+        world.runs.reset();
+    }
+    try {
+        co_await close_index(world.index);
+    } catch (...) {
+        failed.observe(std::current_exception());
+    }
+    world.pin.reset();
+    if (world.generation) {
+        try {
+            failed.observe(co_await world.generation->close());
+        } catch (...) {
+            failed.observe(std::current_exception());
+        }
+        world.generation.reset();
+    }
+    if (world.owned) {
+        try {
+            co_await world.owned->stop();
+        } catch (...) {
+            failed.observe(std::current_exception());
+        }
+        world.owned.reset();
+    }
+    take(failed.outcome());
+}
+// `shared` is the cache to read through, or nothing for one of `capacity`
+// that the world makes and stops.
+seastar::future<std::unique_ptr<read_world>> open_world(
+  const environment& env,
+  const sealed& segment,
+  page_cache* shared,
+  byte_count capacity,
+  codec::cooperative_work& work) {
+    auto made = std::make_unique<read_world>();
+    runtime::first_failure failed;
+    try {
+        if (shared != nullptr) {
+            made->cache = shared;
+        } else {
+            made->owned = take(
+              page_cache::make(env.indexing, {.capacity = capacity}));
+            made->cache = made->owned.get();
+        }
+        const std::array<local_bundle_context, 2> contexts{
+          *segment.context,
+          footer_expectation{*segment.history, segment.boundary->position()}};
+        const local_generation_expectation expected{
+          *segment.generation,
+          {segment.descriptor.segment,
+           local_object_state::sealed,
+           *segment.boundary,
+           {*segment.index, *segment.retry}},
+          segment.descriptor,
+          contexts};
+        made->generation = take(
+          co_await local_generation_owner::open(
+            env.files,
+            env.owner,
+            env.spec,
+            0,
+            expected,
+            env.indexing,
+            store_contract::limits(),
+            work));
+        made->pin.emplace(take(made->generation->pin()));
+        made->index = take(
+          index_type::make(
+            env.files,
+            env.owner,
+            env.spec,
+            0,
+            *segment.history,
+            *segment.context,
+            segment.stride,
+            segment.index,
+            std::nullopt,
+            made->residency,
+            made->rebuilds,
+            env.indexing,
+            env.indexing,
+            store_contract::limits(),
+            scan_limits(),
+            work.policy(),
+            made->cache));
+        made->runs = take(
+          segment_runs::make(
+            *made->cache,
+            env.indexing,
+            *segment.history,
+            {.limits = run_limits()}));
+        made->bound = made->pin->data_end().value();
+        made->last = segment.context->coverage().logical().end();
+    } catch (...) {
+        failed.observe(std::current_exception());
+    }
+    if (failed.failed()) {
+        try {
+            co_await close_world(*made);
+        } catch (...) {
+        }
+        take(failed.outcome());
+    }
+    co_return made;
+}
+// A session that may read all of a sealed segment.
+segment_reader session(
+  read_world& world,
+  const environment& env,
+  segment_reader_config config = {}) {
+    return take(
+      segment_reader::open(
+        *world.runs,
+        segment_data_source{take(world.pin->share())},
+        {.durable = world.bound, .sealed = world.last, .visible = world.last},
+        sealed_read_index(*world.index),
+        env.indexing,
+        config));
+}
+
+// What some reads came to.
+struct reads_done final {
+    std::uint64_t reads{0}, batches{0}, bytes{0};
+};
+// Reads from `from` to the end of a sealed segment, `limit` bytes a read.
+seastar::future<reads_done> read_through(
+  segment_reader& reader,
+  model::range_logical_end from,
+  byte_count limit,
+  seastar::abort_source& asking) {
+    reads_done done;
+    segment_read_position at{from, std::nullopt};
+    for (;;) {
+        const auto got = co_await reader.read({at, limit, true}, asking);
+        ++done.reads;
+        done.batches += got.batches.size();
+        done.bytes += got.bytes.value();
+        require(
+          got.stop == segment_read_stop::limit
+            || got.stop == segment_read_stop::end_of_segment,
+          "a read of a sealed segment stopped for no reason of its own");
+        if (got.stop != segment_read_stop::limit) break;
+        at = got.next;
+    }
+    co_return done;
+}
+
+// What a read row says of the cache between two looks at it.
+void cache_fields(
+  row& out, const page_cache_snapshot& then, const page_cache_snapshot& now) {
+    out.number("cache_capacity", now.capacity)
+      .number("cache_bytes", now.bytes)
+      .number("cache_loads", now.loads - then.loads)
+      .number("cache_waits", now.waits - then.waits)
+      .number("cache_uncached", now.uncached - then.uncached)
+      .number("cache_refused", now.refused - then.refused)
+      .number("cache_evicted", now.evicted - then.evicted);
+}
+
+// Seeks to offsets blocks begin with, each answered with the one batch that
+// holds it. Cold, nothing of the segment is in memory when the interval
+// starts: it holds the index's root and page, and each run once. Warm, the
+// same seeks were made before it starts: it reads no file.
+seastar::future<std::size_t> seek_case(environment env, bool cold) {
+    const auto chosen = chosen_reads();
+    seastar::abort_source abort;
+    codec::cooperative_work work{codec::limits::defaults(), abort};
+    auto segment = co_await write_segment(env, {.blocks = chosen.blocks}, work);
+    const auto blocks = co_await scan_blocks(env, segment, work);
+    choices drawn{0x5eed};
+    std::vector<std::size_t> wanted;
+    wanted.reserve(seeks);
+    for (std::uint32_t q = 0; q < seeks; ++q)
+        wanted.push_back(drawn.uniform(blocks.size()));
+    auto world = co_await open_world(
+      env, segment, nullptr, sealed_cache(env), work);
+    measurement timed;
+    reads_done done;
+    page_cache_snapshot before, after;
+    runtime::first_failure failed;
+    try {
+        seastar::abort_source asking;
+        // Seeks go anywhere: nothing is asked for ahead of them.
+        auto reader = session(*world, env, {.read_ahead = 0});
+        const auto pass = [&]() -> seastar::future<> {
+            for (const auto at : wanted) {
+                const auto& block = blocks[at];
+                const auto got = co_await reader.read(
+                  model::range_logical_offset::make(block.base).value(),
+                  byte_count{1},
+                  asking);
+                require(
+                  got.batches.size() == 1
+                    && got.batches[0].logical.begin().value() == block.base
+                    && got.batches[0].logical.end().value() == block.next,
+                  "a seek did not return the batch that holds its offset");
+                ++done.reads;
+                ++done.batches;
+                done.bytes += got.bytes.value();
+            }
+        };
+        const auto unit = [&]() -> seastar::future<> {
+            if (!cold) co_await pass();
+            done = {};
+            before = world->cache->snapshot();
+            measure_scope scope{env.files, timed};
+            co_await pass();
+        };
+        co_await seastar::with_scheduling_group(
+          env.indexing.scheduling_group(), [&unit] { return unit(); });
+        after = world->cache->snapshot();
+        require(
+          cold || (timed.data.reads == 0 && timed.index.reads == 0),
+          "a seek whose run and index page are kept read a file");
+    } catch (...) {
+        failed.observe(std::current_exception());
+    }
+    try {
+        co_await close_world(*world);
+    } catch (...) {
+        failed.observe(std::current_exception());
+    }
+    take(failed.outcome());
+    {
+        row out{"read_seek", cold ? "cold" : "warm", family};
+        out.data(segment, blocks)
+          .number("seeks", done.reads)
+          .number("returned_bytes", done.bytes)
+          .measured("", timed);
+        cache_fields(out, before, after);
+    }
+    co_return seeks;
+}
+
+// One segment at each stride of the sweep, read from its first offset to
+// its end by one session that reads ahead, and then sought into with
+// nothing in memory. The stride is the read unit: what a seek reads to
+// return one batch, and how many reads a scan makes.
+seastar::future<std::size_t> read_stride_case(environment env) {
+    const auto chosen = chosen_reads();
+    seastar::abort_source abort;
+    codec::cooperative_work work{codec::limits::defaults(), abort};
+    std::uint32_t nth = 0;
+    for (const auto bytes : read_strides) {
+        const auto ordinal = nth++;
+        // A run of this stride holds a whole contiguous allocation.
+        if (
+          bytes >= maximum_contiguous_allocation_bytes
+          && !prices_whole_chunks()) {
+            row out{"read_stride", "skipped", family};
+            out.number("stride_bytes", bytes);
+            continue;
+        }
+        auto segment = co_await write_segment(
+          env,
+          {.ordinal = ordinal,
+           .blocks = chosen.blocks,
+           .stride = sparse_index_stride{byte_count{bytes}, 0}},
+          work);
+        const auto blocks = co_await scan_blocks(env, segment, work);
+        choices drawn{0x5eed + bytes};
+        for (const bool scanned : {true, false}) {
+            auto world = co_await open_world(
+              env, segment, nullptr, sealed_cache(env), work);
+            measurement timed;
+            reads_done done;
+            page_cache_snapshot before, after;
+            runtime::first_failure failed;
+            try {
+                seastar::abort_source asking;
+                // A scan reads ahead as a session does when nothing is
+                // said: the bytes it asks for ahead are its window's, at
+                // every stride, past the first run. Seeks go anywhere and
+                // ask for nothing.
+                auto reader = session(
+                  *world,
+                  env,
+                  scanned ? segment_reader_config{}
+                          : segment_reader_config{.read_ahead = 0});
+                const auto unit = [&]() -> seastar::future<> {
+                    before = world->cache->snapshot();
+                    measure_scope scope{env.files, timed};
+                    if (scanned) {
+                        done = co_await read_through(
+                          reader,
+                          segment.descriptor.logical_origin,
+                          byte_count{1_MiB},
+                          asking);
+                        co_return;
+                    }
+                    for (std::uint32_t q = 0; q < seeks; ++q) {
+                        const auto& block
+                          = blocks[drawn.uniform(blocks.size())];
+                        const auto got = co_await reader.read(
+                          model::range_logical_offset::make(block.base).value(),
+                          byte_count{1},
+                          asking);
+                        require(
+                          got.batches.size() == 1
+                            && got.batches[0].logical.begin().value()
+                                 == block.base,
+                          "a seek did not return the batch that holds its "
+                          "offset");
+                        ++done.reads;
+                        ++done.batches;
+                        done.bytes += got.bytes.value();
+                    }
+                };
+                co_await seastar::with_scheduling_group(
+                  env.indexing.scheduling_group(), [&unit] { return unit(); });
+                after = world->cache->snapshot();
+                require(
+                  !scanned || done.batches == segment.blocks,
+                  "a scan did not return every batch of its segment");
+            } catch (...) {
+                failed.observe(std::current_exception());
+            }
+            try {
+                co_await close_world(*world);
+            } catch (...) {
+                failed.observe(std::current_exception());
+            }
+            take(failed.outcome());
+            row out{"read_stride", scanned ? "scan" : "seek", family};
+            out.data(segment, blocks)
+              .number("reads", done.reads)
+              .number("batches", done.batches)
+              .number("returned_bytes", done.bytes)
+              .measured("", timed);
+            cache_fields(out, before, after);
+        }
+    }
+    co_return read_strides.size();
+}
+
+// One segment read from its first offset to its end, with nothing of it in
+// memory, by a session that looks from none to four runs ahead of itself,
+// and by one that begins with one run and looks further each time it had to
+// wait.
+seastar::future<std::size_t> ahead_case(environment env) {
+    const auto chosen = chosen_reads();
+    seastar::abort_source abort;
+    codec::cooperative_work work{codec::limits::defaults(), abort};
+    auto segment = co_await write_segment(env, {.blocks = chosen.blocks}, work);
+    const auto blocks = co_await scan_blocks(env, segment, work);
+    struct depth final {
+        std::uint32_t runs;
+        bool grows;
+    };
+    constexpr std::array<depth, 6> depths{
+      {{0, false}, {1, false}, {2, false}, {3, false}, {4, false}, {4, true}}};
+    for (const auto ahead : depths) {
+        auto world = co_await open_world(
+          env, segment, nullptr, sealed_cache(env), work);
+        measurement timed;
+        reads_done done;
+        page_cache_snapshot before, after;
+        std::uint64_t asked = 0;
+        runtime::first_failure failed;
+        try {
+            seastar::abort_source asking;
+            auto reader = session(
+              *world,
+              env,
+              {.read_ahead = ahead.runs, .read_ahead_grows = ahead.grows});
+            const auto unit = [&]() -> seastar::future<> {
+                before = world->cache->snapshot();
+                measure_scope scope{env.files, timed};
+                // A consumer's fetch: a few batches at a time.
+                done = co_await read_through(
+                  reader,
+                  segment.descriptor.logical_origin,
+                  byte_count{16_KiB},
+                  asking);
+            };
+            co_await seastar::with_scheduling_group(
+              env.indexing.scheduling_group(), [&unit] { return unit(); });
+            after = world->cache->snapshot();
+            asked = world->runs->prefetches();
+            require(
+              done.batches == segment.blocks,
+              "a read to the end did not return every batch");
+        } catch (...) {
+            failed.observe(std::current_exception());
+        }
+        try {
+            co_await close_world(*world);
+        } catch (...) {
+            failed.observe(std::current_exception());
+        }
+        take(failed.outcome());
+        row out{"read_ahead", ahead.grows ? "growing" : "fixed", family};
+        out.data(segment, blocks)
+          .number("depth", ahead.runs)
+          .number("reads", done.reads)
+          .number("batches", done.batches)
+          .number("returned_bytes", done.bytes)
+          .number("asked_ahead", asked)
+          .measured("", timed);
+        cache_fields(out, before, after);
+    }
+    co_return depths.size();
+}
+
+// One segment read from its first offset to its end through a cache every
+// byte of which is taken and held: each run is refused and read for its
+// reader alone, under its reader's budget, and each lookup reads its index
+// page through the root. Beside it, the same read through a cache that has
+// room: the batches a read returns keep their runs, so room is room for
+// every run of one read's batches at once.
+seastar::future<std::size_t> held_case(environment env, bool held) {
+    const auto chosen = chosen_reads();
+    seastar::abort_source abort;
+    codec::cooperative_work work{codec::limits::defaults(), abort};
+    auto segment = co_await write_segment(env, {.blocks = chosen.blocks}, work);
+    const auto blocks = co_await scan_blocks(env, segment, work);
+    // Held: room for a few runs and no more, so that filling it is quick.
+    auto world = co_await open_world(
+      env,
+      segment,
+      nullptr,
+      held ? byte_count{1_MiB} : sealed_cache(env),
+      work);
+    std::vector<std::unique_ptr<cache_slot<std::uint64_t>>> ballast;
+    std::vector<cache_ref<std::uint64_t>> weights;
+    measurement timed;
+    reads_done done;
+    page_cache_snapshot before, after;
+    runtime::first_failure failed;
+    try {
+        seastar::abort_source asking;
+        if (held) {
+            for (const std::uint64_t backing : {64_KiB, 1_KiB})
+                for (;;) {
+                    auto slot = std::make_unique<cache_slot<std::uint64_t>>();
+                    auto led = slot->lead(*world->cache, byte_count{backing});
+                    if (!led) break;
+                    std::move(*led).publish(0);
+                    weights.push_back(slot->get());
+                    ballast.push_back(std::move(slot));
+                }
+        }
+        auto reader = session(*world, env, {.read_ahead = 0});
+        const auto unit = [&]() -> seastar::future<> {
+            before = world->cache->snapshot();
+            measure_scope scope{env.files, timed};
+            done = co_await read_through(
+              reader,
+              segment.descriptor.logical_origin,
+              byte_count{1_MiB},
+              asking);
+        };
+        co_await seastar::with_scheduling_group(
+          env.indexing.scheduling_group(), [&unit] { return unit(); });
+        after = world->cache->snapshot();
+        require(
+          done.batches == segment.blocks
+            && (!held || after.uncached - before.uncached
+                           == after.loads - before.loads),
+          "a read through a cache with no room did not return every batch, "
+          "or was kept");
+    } catch (...) {
+        failed.observe(std::current_exception());
+    }
+    weights.clear();
+    ballast.clear();
+    try {
+        co_await close_world(*world);
+    } catch (...) {
+        failed.observe(std::current_exception());
+    }
+    take(failed.outcome());
+    {
+        row out{"read_held", held ? "held" : "kept", family};
+        out.data(segment, blocks)
+          .number("reads", done.reads)
+          .number("batches", done.batches)
+          .number("returned_bytes", done.bytes)
+          .measured("", timed);
+        cache_fields(out, before, after);
+    }
+    co_return 1;
+}
+
+// How a segment that is written is fed to the cache: not at all, for as
+// long as it was read lately, or for the readers its owner says read it.
+enum class feeding : std::uint8_t { unfed, untold, told };
+const char* feeding_name(feeding how) noexcept {
+    return how == feeding::unfed    ? "unfed"
+           : how == feeding::untold ? "untold"
+                                    : "told";
+}
+// Blocks to a group, and how many groups behind the tail each reader is.
+constexpr std::uint32_t group_blocks = 8;
+constexpr std::array<std::uint32_t, 3> lags{0, 2, 8};
+
+// A segment that is appended to, a group and a barrier at a time, with a
+// reader at each of three distances behind its tail that reads each group
+// once it is that far behind. With `scanned`, a session also reads a sealed
+// segment nothing has in memory, one run for each group appended, through
+// the same cache. A read that no file was read for is a hit. The append's
+// own time is reported apart from the reads'.
+seastar::future<std::size_t>
+tail_case(environment env, feeding how, bool scanned) {
+    const auto chosen = chosen_reads();
+    seastar::abort_source abort;
+    codec::cooperative_work work{codec::limits::defaults(), abort};
+    const auto blocks = chosen.groups * group_blocks;
+    std::optional<sealed> cold;
+    if (scanned)
+        cold.emplace(
+          co_await write_segment(env, {.ordinal = 1, .blocks = blocks}, work));
+    auto cache = take(
+      page_cache::make(
+        env.indexing, {.capacity = byte_count{chosen.tail_cache_bytes}}));
+    std::unique_ptr<read_world> beside;
+    const auto descriptor = describe(0, byte_count{1_GiB});
+    const sparse_index_stride stride{};
+    auto config = segments::configuration();
+    config.retry_object = local_object_sequence::make(1000).value();
+    config.policy = work.policy();
+    config.admission.working_bytes = byte_count{1_MiB};
+    config.admission.maximum_blocks = blocks;
+    std::unique_ptr<active_sparse_index> index;
+    std::unique_ptr<segment_type> writer;
+    std::unique_ptr<segment_runs> runs;
+    struct lagging final {
+        std::uint64_t reads{0}, hits{0}, device_reads{0}, batches{0};
+    };
+    std::array<lagging, lags.size()> readers{};
+    measurement timed;
+    std::uint64_t append_ns = 0, read_ns = 0, scan_ns = 0, scanned_batches = 0;
+    std::uint64_t dropped = 0;
+    page_cache_snapshot after;
+    foreground probe;
+    std::optional<seastar::future<>> turning;
+    runtime::first_failure failed;
+    try {
+        if (scanned)
+            beside = co_await open_world(
+              env, *cold, cache.get(), byte_count{}, work);
+        index = std::make_unique<active_sparse_index>(take(
+          active_sparse_index::make(
+            stride,
+            sparse_index_capacity(stride, byte_count{1_GiB}, blocks),
+            env.writing)));
+        writer = take(
+          segment_type::make_new(
+            env.files,
+            env.owner,
+            env.spec,
+            0,
+            descriptor,
+            env.writing,
+            config));
+        take(
+          co_await seastar::with_scheduling_group(
+            env.writing.scheduling_group(),
+            [&writer, &work] { return writer->create_new(work); }));
+        const auto history = take(co_await writer->pin_data(work)).history;
+        segment_runs_config fed{.limits = run_limits()};
+        if (how == feeding::untold)
+            fed.now = []() noexcept {
+                return runtime::monotonic_time{measurement_time()};
+            };
+        runs = take(
+          segment_runs::make(*cache, env.indexing, history, std::move(fed)));
+        take(writer->observe_blocks(runs->observer(*index)));
+        if (how == feeding::told)
+            runs->establish(static_cast<std::uint32_t>(lags.size()));
+        seastar::abort_source asking;
+        std::optional<segment_reader> scanning;
+        segment_read_position scan_at{
+          scanned ? cold->descriptor.logical_origin
+                  : model::range_logical_end{},
+          std::nullopt};
+        if (scanned) scanning.emplace(session(*beside, env));
+        // Where each group begins and ends, in offsets.
+        std::vector<std::uint64_t> begins, ends;
+        begins.reserve(chosen.groups);
+        ends.reserve(chosen.groups);
+        const fixture::shape shape{.name = "index"};
+        auto logical = descriptor.logical_origin;
+        std::uint64_t sequence = 0;
+        if (env.chosen.foreground) turning.emplace(foreground_loop(probe));
+        {
+            measure_scope scope{env.files, timed};
+            for (std::uint32_t g = 0; g < chosen.groups; ++g) {
+                // The append: one group, and its barrier.
+                std::vector<encoded_assigned_batch> batches;
+                batches.reserve(group_blocks);
+                auto next = logical;
+                std::uint64_t appended_bytes = 0;
+                for (std::uint32_t b = 0; b < group_blocks; ++b) {
+                    auto child = co_await fixture::make_batch(
+                      shape, descriptor.segment, next, sequence++, work);
+                    next = child.info().context.logical_span().end();
+                    appended_bytes += child.bytes().size().value();
+                    batches.push_back(std::move(child));
+                }
+                const auto appending = measurement_time();
+                std::optional<runtime::result<segment_group_preparation>>
+                  preparation;
+                preparation.emplace(
+                  writer->prepare_group(std::span{batches}, work));
+                if (
+                  !*preparation
+                  && preparation->error().code() == errc::queue_full) {
+                    take(co_await writer->digest_caught_up());
+                    preparation.emplace(
+                      writer->prepare_group(std::span{batches}, work));
+                }
+                auto prepared = take(std::move(*preparation));
+                require(
+                  prepared.prepared.has_value(),
+                  "the segment whose tail is read filled");
+                std::vector<admitted_wal_batch> children;
+                children.reserve(batches.size());
+                for (auto& batch : batches) {
+                    auto backing = take(
+                      env.writing.try_reserve_buffer(batch.bytes()));
+                    children.push_back(take(
+                      admitted_wal_batch::make(
+                        std::move(batch), std::move(backing), charge)));
+                }
+                auto group = take(
+                  co_await writer->freeze_group(
+                    std::move(*prepared.prepared), std::move(children), work));
+                take(co_await writer->encode_group(group, work));
+                auto accepted = take(writer->submit(std::move(group), work));
+                const auto written = co_await std::move(accepted.written);
+                take(written.failure.outcome());
+                const auto barrier = co_await writer->barrier(
+                  accepted.boundary);
+                take(barrier.failure.outcome());
+                append_ns += measurement_time() - appending;
+                begins.push_back(logical.value());
+                ends.push_back(next.value());
+                logical = next;
+                // What the writer handed over is copied off its path: the
+                // readers come once that is done.
+                co_await runs->settled();
+                // Each reader reads the group it is now behind by its lag.
+                const auto reading = measurement_time();
+                for (std::size_t r = 0; r < lags.size(); ++r) {
+                    if (g < lags[r]) continue;
+                    const auto wanted = g - lags[r];
+                    auto view = take(co_await writer->pin_data(work));
+                    auto reader = take(
+                      segment_reader::open(
+                        *runs,
+                        segment_data_source{std::move(view.pin)},
+                        {.durable = view.durable,
+                         .sealed = std::nullopt,
+                         .visible = model::range_logical_end{ends[wanted]}},
+                        active_read_index(*index, view.durable),
+                        env.indexing));
+                    const auto then = counted(
+                      env.files.sample, file_kind::data);
+                    const auto got = co_await reader.read(
+                      model::range_logical_offset::make(begins[wanted]).value(),
+                      byte_count{1_MiB},
+                      asking);
+                    const auto read
+                      = counted(env.files.sample, file_kind::data).reads
+                        - then.reads;
+                    require(
+                      got.batches.size() == group_blocks
+                        && got.stop != segment_read_stop::failed,
+                      "a reader behind the tail was not given its group");
+                    auto& mine = readers[r];
+                    ++mine.reads;
+                    mine.batches += got.batches.size();
+                    mine.device_reads += read;
+                    if (read == 0) ++mine.hits;
+                }
+                read_ns += measurement_time() - reading;
+                if (scanned) {
+                    const auto scanning_from = measurement_time();
+                    // As many bytes of batches as were just appended.
+                    const auto got = co_await scanning->read(
+                      {scan_at, byte_count{appended_bytes}, true}, asking);
+                    scan_at = got.next;
+                    scanned_batches += got.batches.size();
+                    scan_ns += measurement_time() - scanning_from;
+                }
+            }
+        }
+        after = cache->snapshot();
+        dropped = runs->dropped();
+    } catch (...) {
+        failed.observe(std::current_exception());
+    }
+    probe.stop = true;
+    if (turning) {
+        try {
+            co_await std::move(*turning);
+        } catch (...) {
+            failed.observe(std::current_exception());
+        }
+    }
+    if (runs) {
+        try {
+            failed.observe(co_await runs->close());
+        } catch (...) {
+            failed.observe(std::current_exception());
+        }
+    }
+    if (writer) {
+        try {
+            failed.observe(co_await writer->close());
+        } catch (...) {
+            failed.observe(std::current_exception());
+        }
+    }
+    // The writer's observer refers to the runs and the index until here.
+    writer.reset();
+    runs.reset();
+    if (beside) {
+        try {
+            co_await close_world(*beside);
+        } catch (...) {
+            failed.observe(std::current_exception());
+        }
+    }
+    try {
+        co_await cache->stop();
+    } catch (...) {
+        failed.observe(std::current_exception());
+    }
+    take(failed.outcome());
+    {
+        row out{
+          scanned ? "read_tail_scanned" : "read_tail",
+          feeding_name(how),
+          family};
+        out.number("groups", chosen.groups)
+          .number("group_blocks", group_blocks)
+          .number("stride_bytes", stride.bytes.value())
+          .number("append_ns", append_ns)
+          .number("read_ns", read_ns)
+          .number("scan_ns", scan_ns)
+          .number("scanned_batches", scanned_batches)
+          .number("feed_dropped", dropped)
+          .number("foreground_turns", probe.turns)
+          .number("longest_wait_ns", probe.longest);
+        for (std::size_t r = 0; r < lags.size(); ++r) {
+            const auto label = [r](const char* what) {
+                return std::string{"lag"} + std::to_string(lags[r]) + "_"
+                       + what;
+            };
+            out.number(label("reads").c_str(), readers[r].reads)
+              .number(label("hits").c_str(), readers[r].hits)
+              .number(label("device_reads").c_str(), readers[r].device_reads);
+        }
+        out.measured("", timed);
+        cache_fields(out, page_cache_snapshot{}, after);
+    }
+    co_return chosen.groups;
+}
+
+struct read_path : index_bench {};
+PERF_TEST_F(read_path, cold_seek) {
+    return run_store([](environment env) { return seek_case(env, true); });
+}
+PERF_TEST_F(read_path, warm_seek) {
+    return run_store([](environment env) { return seek_case(env, false); });
+}
+PERF_TEST_F(read_path, stride_sweep) {
+    return run_store([](environment env) { return read_stride_case(env); });
+}
+PERF_TEST_F(read_path, ahead_sweep) {
+    return run_store([](environment env) { return ahead_case(env); });
+}
+PERF_TEST_F(read_path, every_entry_held) {
+    return run_store([](environment env) { return held_case(env, true); });
+}
+PERF_TEST_F(read_path, every_entry_kept) {
+    return run_store([](environment env) { return held_case(env, false); });
+}
+PERF_TEST_F(read_path, tail_unfed) {
+    return run_store(
+      [](environment env) { return tail_case(env, feeding::unfed, false); });
+}
+PERF_TEST_F(read_path, tail_untold) {
+    return run_store(
+      [](environment env) { return tail_case(env, feeding::untold, false); });
+}
+PERF_TEST_F(read_path, tail_told) {
+    return run_store(
+      [](environment env) { return tail_case(env, feeding::told, false); });
+}
+PERF_TEST_F(read_path, tail_untold_scanned) {
+    return run_store(
+      [](environment env) { return tail_case(env, feeding::untold, true); });
+}
+PERF_TEST_F(read_path, tail_told_scanned) {
+    return run_store(
+      [](environment env) { return tail_case(env, feeding::told, true); });
+}
+} // namespace read_cases
 } // namespace kwaque::storage::testing::index_bench_support

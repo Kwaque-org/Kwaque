@@ -4,6 +4,7 @@
 #include "src/codec/digest.h"
 #include "src/storage/local_generation.h"
 #include "src/storage/local_paths.h"
+#include "src/storage/page_cache.h"
 #include "src/storage/recovery_pins.h"
 #include "src/storage/retry_snapshot.h"
 #include "src/storage/segment_format.h"
@@ -2358,6 +2359,752 @@ seastar::future<> paged_lookups(
             failed.observe(std::current_exception());
         }
         index.reset();
+    }
+    try {
+        failed.observe(co_await drive.lifecycle(writer.close()));
+    } catch (...) {
+        failed.observe(std::current_exception());
+    }
+    segment.writer.reset();
+    take(failed.outcome());
+}
+
+// A reader's lookups, through a cache. An index of several pages is published
+// as in paged_lookups, and its owner is given a cache. Every offset is
+// answered as the lookup read through the root answers it, with the root it
+// was read through. The routes are read once and each page once, however
+// many lookups there are, those that arrive together included. Once they are
+// kept a lookup opens no file and holds nothing: the root is given up, and
+// every offset is still answered with no handle, no admission and no read.
+// What is kept was verified when it was read and is not read again. A lookup
+// the cache has no room for reads through the root and keeps nothing. A page
+// that cannot be read makes the index owed. What the cache holds of an index
+// goes when its owner closes.
+template<
+  runtime::monotonic_clock Clock,
+  typename Backend,
+  typename Owner,
+  typename Driver>
+seastar::future<> cached_lookups(
+  Backend& files,
+  Owner& owner,
+  const local_device_spec& spec,
+  workload_budget& resources,
+  Driver drive) {
+    using index_type = sealed_sparse_index<Backend, Owner>;
+    constexpr std::uint32_t anchors = 2 * sparse_index_page_entries + 500;
+    seastar::abort_source abort;
+    codec::cooperative_work work{codec::limits::defaults(), abort};
+    co_await installation::bootstrap(
+      files, owner, spec, resources, work, drive);
+    const sparse_index_stride stride{byte_count{0}};
+    const auto sequence = [](std::uint64_t value) {
+        return local_object_sequence::make(value).value();
+    };
+    const auto offset = [](std::uint64_t value) {
+        return model::range_logical_offset::make(value).value();
+    };
+    // The segment only gives the bundle a place to be published in.
+    auto segment = co_await seal_segment<Clock>(
+      files, owner, spec, resources, work, drive, 2, stride, sequence(46));
+    auto& writer = *segment.writer;
+    sparse_index_residency residency{1};
+    sparse_index_rebuild_limit rebuilds;
+    // Room for every page; and a cache no page fits in.
+    auto cache = take(
+      page_cache::make(resources, {.capacity = byte_count{1_MiB}}));
+    auto tight = take(
+      page_cache::make(resources, {.capacity = byte_count{64_KiB}}));
+    std::unique_ptr<index_type> index, crowded, damaged;
+    runtime::first_failure failed;
+    try {
+        const auto described = segments::descriptor();
+        const auto unit = described.alignment.bytes().value();
+        anchor_choices choices{11};
+        std::map<std::uint64_t, std::uint64_t> placed;
+        std::uint64_t base = (std::uint64_t{1} << 32) - anchors / 2;
+        std::uint64_t position = unit;
+        while (placed.size() < anchors) {
+            placed.emplace(base, position);
+            base += choices.uniform(15) + 1;
+            position += unit * (choices.uniform(4) + 1);
+        }
+        const auto first = placed.begin()->first;
+        const runtime::file_position end{position};
+        const auto spans = [](
+                             std::uint64_t from,
+                             std::uint64_t until,
+                             std::uint64_t ordinal,
+                             std::uint64_t records,
+                             std::uint64_t begins,
+                             std::uint64_t ends) {
+            return coverage{
+              model::range_logical_span::from_count(
+                model::range_logical_end{from},
+                model::range_logical_count{until - from})
+                .value(),
+              model::segment_relative_span::from_count(
+                model::segment_relative_end{ordinal},
+                model::segment_record_count{records})
+                .value(),
+              model::file_byte_span::from_size(
+                runtime::file_position{begins}, byte_count{ends - begins})
+                .value()};
+        };
+        const auto context = take(
+          sparse_index_context::make(
+            described.segment,
+            spans(first, base, 0, anchors, unit, position),
+            codec::extent_digest{codec::content_digest{}},
+            described.alignment));
+        auto frozen = take(
+          active_sparse_index::make(stride, anchors, resources));
+        std::uint64_t ordinal = 0;
+        for (auto entry = placed.begin(); entry != placed.end(); ++entry) {
+            const auto next = std::next(entry);
+            frozen.written(spans(
+              entry->first,
+              next == placed.end() ? base : next->first,
+              ordinal++,
+              1,
+              entry->second,
+              next == placed.end() ? position : next->second));
+        }
+        frozen.durable(end);
+        frozen.freeze();
+        require(
+          frozen.size() == anchors && frozen.pages() == 3,
+          "the index to publish is not the one this case is about");
+        const auto root = take(
+          co_await drive.lifecycle(publish_sparse_index(
+            files,
+            owner,
+            spec,
+            0,
+            frozen,
+            context,
+            sequence(60),
+            resources,
+            store_contract::limits(),
+            work)));
+        const auto open_index = [&](page_cache* kept) {
+            return take(
+              index_type::make(
+                files,
+                owner,
+                spec,
+                0,
+                segment.history(),
+                context,
+                stride,
+                root,
+                std::nullopt,
+                residency,
+                rebuilds,
+                resources,
+                resources,
+                store_contract::limits(),
+                scan_limits(),
+                work.policy(),
+                kept));
+        };
+        index = open_index(cache.get());
+        const auto idle = resources.snapshot();
+        require(
+          cache->snapshot().bytes == 0 && cache->snapshot().loads == 0
+            && index->loads() == 0 && residency.resident() == 0,
+          "an index was read before anything looked into it");
+        seastar::abort_source asking;
+        {
+            // Three arrive together for the same page: the routes are read
+            // once and that page once, through one open of the root.
+            auto one = index->locate(offset(first), asking);
+            auto two = index->locate(offset(first + 1), asking);
+            auto three = index->locate(offset(first), asking);
+            const auto led = take(co_await drive.lifecycle(std::move(one)));
+            const auto joined = take(co_await drive.lifecycle(std::move(two)));
+            const auto shared = take(
+              co_await drive.lifecycle(std::move(three)));
+            require(
+              led == shared && led.position && joined.position
+                && led.through == std::optional{root}
+                && cache->snapshot().loads == 2 && index->loads() == 1,
+              "lookups that arrived together read the index more than once");
+        }
+        // Around every page's edge, around both ends, and anywhere else.
+        std::vector<std::uint64_t> targets{
+          first - 1, first, base - 1, base, base + 20};
+        for (const std::uint32_t edge :
+             {sparse_index_page_entries, 2 * sparse_index_page_entries}) {
+            const auto begins = frozen[edge].logical_anchor().value();
+            const auto before = frozen[edge - 1].logical_anchor().value();
+            targets.insert(
+              targets.end(),
+              {before - 1, before, before + 1, begins - 1, begins, begins + 1});
+        }
+        for (std::uint32_t i = 0; i < 256; ++i)
+            targets.push_back(first + choices.uniform(base - first));
+        std::vector<sparse_index_answer> answers;
+        answers.reserve(targets.size());
+        for (const auto target : targets) {
+            const auto located = take(
+              co_await drive.lifecycle(index->locate(offset(target), asking)));
+            const auto found = take(
+              co_await drive.lifecycle(index->find(offset(target), work)));
+            // The same anchor as the lookup read through the root. A
+            // reader is also told where its run ends: where the next
+            // anchor's block begins, also when that anchor opens the next
+            // page, as the index in memory tells it. The lookup read
+            // through the root sizes that one read by the extent's end.
+            const auto exact = frozen.find(offset(target), end);
+            // And where the run after its own begins: the anchor after the
+            // one found, as the index in memory says it, across a page's
+            // edge too.
+            const auto following = frozen.after(offset(target));
+            const auto next = exact && following
+                                ? std::optional{following->logical_anchor()}
+                                : std::nullopt;
+            require(
+              located.position == exact && located.next == next
+                && located.position.has_value() == found.has_value()
+                && (!found
+                    || (found->anchor == located.position->anchor
+                        && located.position->end <= found->end))
+                && located.through == std::optional{root}
+                && (target >= first) == located.position.has_value(),
+              "a reader was not answered as the lookup read through the root "
+              "answers, or was not told where its run ends");
+            answers.push_back(located);
+        }
+        const auto warm = cache->snapshot();
+        require(
+          warm.loads == 1 + frozen.pages() && warm.uncached == 0
+            && warm.refused == 0 && warm.bytes != 0 && index->loads() == 1,
+          "the routes or a page were read more than once, or not kept");
+        // The root is given up, which nothing that is kept prevents: the
+        // values hold no pin of it and nothing of their reader's budget.
+        while (co_await drive.lifecycle(residency.evict())) {
+        }
+        const auto closed = resources.snapshot();
+        require(
+          !index->resident() && residency.resident() == 0
+            && closed.handles == idle.handles && closed.tasks == idle.tasks
+            && closed.bytes == idle.bytes,
+          "what is kept of an index kept its root open, or kept its reader's "
+          "admission");
+        for (std::size_t i = 0; i < targets.size(); ++i) {
+            const auto located = take(
+              co_await drive.lifecycle(
+                index->locate(offset(targets[i]), asking)));
+            require(
+              located == answers[i],
+              "a lookup answered from what is kept answered otherwise");
+        }
+        const auto settled = resources.snapshot();
+        require(
+          index->loads() == 1 && !index->resident() && residency.resident() == 0
+            && settled.handles == closed.handles
+            && settled.tasks == closed.tasks && settled.bytes == closed.bytes
+            && cache->snapshot().loads == warm.loads
+            && cache->snapshot().bytes == warm.bytes,
+          "a lookup whose routes and page are kept opened a file, held "
+          "something or read again");
+        {
+            // No room for a page: the routes are kept, and the page is read
+            // all the same, under the budget of the index's readers, for as
+            // long as a reader stands in it. A lookup from where a reader
+            // stands reads nothing; one that stands nowhere reads the page
+            // again. Nothing of the page is the cache's.
+            crowded = open_index(tight.get());
+            const auto beyond
+              = frozen[sparse_index_page_entries].logical_anchor().value();
+            const auto place = static_cast<std::size_t>(
+              std::ranges::find(targets, beyond) - targets.begin());
+            require(place < targets.size(), "the page edge is not a target");
+            const auto before = tight->snapshot();
+            sparse_index_place standing;
+            const auto once = take(
+              co_await drive.lifecycle(
+                crowded->locate(offset(beyond), asking, &standing)));
+            const auto routed = tight->snapshot();
+            const auto again = take(
+              co_await drive.lifecycle(
+                crowded->locate(offset(beyond), asking, &standing)));
+            const auto stood = tight->snapshot();
+            // What a reader that looks ahead is told, from where it stands
+            // and from nowhere.
+            const auto ahead = crowded->peek(offset(beyond), &standing);
+            const auto blind = crowded->peek(offset(beyond));
+            const auto apart = take(
+              co_await drive.lifecycle(
+                crowded->locate(offset(beyond), asking)));
+            const auto after = tight->snapshot();
+            require(
+              once == answers[place] && again == answers[place]
+                && apart == answers[place] && crowded->loads() == 1
+                && standing.page && standing.ordinal == 1
+                && ahead == std::optional{answers[place]} && !blind
+                && routed.loads == before.loads + 2
+                && routed.uncached == before.uncached + 1
+                && routed.refused == before.refused + 2
+                && stood.loads == routed.loads
+                && stood.refused == routed.refused
+                && after.loads == stood.loads + 1
+                && after.uncached == stood.uncached + 1
+                && after.refused == stood.refused + 2
+                && after.bytes == routed.bytes && routed.bytes != 0,
+              "a lookup with no room for its page did not read it once for "
+              "the reader that stands in it, or kept what the cache had no "
+              "room for");
+            standing = {};
+            take(co_await drive.lifecycle(crowded->close()));
+            crowded.reset();
+            require(
+              tight->snapshot().bytes == 0,
+              "a closed index left what the cache held of it");
+        }
+        // The first page's first entry is changed on the device. What is
+        // kept was verified when it was read: it answers as before, and
+        // nothing is read.
+        while (co_await drive.lifecycle(residency.evict())) {
+        }
+        const auto path = take(
+          local_bundle_path(spec, 0, root, local_bundle_context{context}));
+        auto bytes = co_await store_contract::read_all_bytes(
+          files, path, drive);
+        bytes[root.bytes().value() + 32 + 172] ^= 1;
+        co_await store_contract::write_bytes(files, path, bytes, drive);
+        {
+            const auto located = take(
+              co_await drive.lifecycle(index->locate(offset(first), asking)));
+            require(
+              located == answers[1] && index->loads() == 1 && !index->resident()
+                && index->source() == sparse_index_source::published
+                && cache->snapshot().loads == warm.loads,
+              "a page that is kept was read again");
+        }
+        {
+            // An owner that keeps nothing of it yet reads the page, and
+            // finds it damaged: its index is owed at once, the lookup asks
+            // for the rebuild, and here no data stands behind the index for
+            // the rebuild to walk. Nothing damaged is kept.
+            damaged = open_index(cache.get());
+            const auto unread = co_await drive.lifecycle(
+              damaged->locate(offset(first), asking));
+            require(
+              !unread && damaged->source() == sparse_index_source::owed
+                && damaged->owed()
+                && detail::rebuildable_local_index_error(
+                  damaged->owed()->code())
+                && damaged->loads() == 1 && rebuilds.running() == 0
+                && cache->snapshot().bytes == warm.bytes,
+              "a damaged page answered, was kept, or did not make its index "
+              "owed");
+            take(co_await drive.lifecycle(damaged->close()));
+            damaged.reset();
+        }
+        take(co_await drive.lifecycle(index->close()));
+        index.reset();
+        require(
+          cache->snapshot().bytes == 0 && !writer.failure().failed(),
+          "a closed index left what the cache held of it");
+    } catch (...) {
+        failed.observe(std::current_exception());
+    }
+    for (auto* held : {&index, &crowded, &damaged}) {
+        if (!*held) continue;
+        try {
+            failed.observe(co_await drive.lifecycle((*held)->close()));
+        } catch (...) {
+            failed.observe(std::current_exception());
+        }
+        held->reset();
+    }
+    for (auto* held : {&cache, &tight}) {
+        try {
+            co_await drive.lifecycle((*held)->stop());
+        } catch (...) {
+            failed.observe(std::current_exception());
+        }
+        held->reset();
+    }
+    try {
+        failed.observe(co_await drive.lifecycle(writer.close()));
+    } catch (...) {
+        failed.observe(std::current_exception());
+    }
+    segment.writer.reset();
+    take(failed.outcome());
+    require(
+      residency.resident() == 0 && !residency.failure().failed(),
+      "a closed index left its root open");
+}
+
+// What a reader's lookup does when its index cannot answer. A reader that
+// follows an anchor to a block that does not bear it out reports the answer
+// it was given, and the index it was read through is owed; a report about an
+// answer read through another root changes nothing. Readers of an owed index
+// wait, together, for its one rebuild and are answered from memory: none of
+// them walks the data. One that leaves meanwhile leaves alone. An index that
+// is named again answers through its new root, and what the cache held of
+// the old one is gone. A page that cannot be read is owed and built again
+// within the lookup that met it.
+template<
+  runtime::monotonic_clock Clock,
+  typename Backend,
+  typename Owner,
+  typename Driver>
+seastar::future<> located_index(
+  Backend& files,
+  Owner& owner,
+  const local_device_spec& spec,
+  workload_budget& resources,
+  Driver drive) {
+    using index_type = sealed_sparse_index<Backend, Owner>;
+    seastar::abort_source abort;
+    codec::cooperative_work work{codec::limits::defaults(), abort};
+    co_await installation::bootstrap(
+      files, owner, spec, resources, work, drive);
+    const sparse_index_stride stride{byte_count{0}};
+    const auto sequence = [](std::uint64_t value) {
+        return local_object_sequence::make(value).value();
+    };
+    auto segment = co_await seal_segment<Clock>(
+      files, owner, spec, resources, work, drive, 2, stride, sequence(46));
+    auto& writer = *segment.writer;
+    const auto& blocks = segment.blocks;
+    sparse_index_residency residency{2};
+    sparse_index_rebuild_limit rebuilds;
+    auto cache = take(
+      page_cache::make(resources, {.capacity = byte_count{1_MiB}}));
+    std::unique_ptr<index_type> index;
+    runtime::first_failure failed;
+    try {
+        const auto context = segment.context();
+        const auto sealed_root = *segment.sealed.index;
+        const auto second = model::range_logical_offset::make(
+                              blocks[1].coverage().logical().begin().value())
+                              .value();
+        const auto data = co_await store_contract::read_all_bytes(
+          files, data_path(spec), drive);
+        index = take(
+          index_type::make(
+            files,
+            owner,
+            spec,
+            0,
+            segment.history(),
+            context,
+            stride,
+            sealed_root,
+            std::nullopt,
+            residency,
+            rebuilds,
+            resources,
+            resources,
+            store_contract::limits(),
+            scan_limits(),
+            work.policy(),
+            cache.get()));
+        const auto wrong = detail::path_error(errc::malformed_data);
+        const auto leads = [&](const sparse_index_answer& given) {
+            return given.position
+                   && validate_sparse_index_anchor(
+                        context, given.position->anchor, blocks[1])
+                        .has_value();
+        };
+        seastar::abort_source asking;
+        const auto answered = take(
+          co_await drive.lifecycle(index->locate(second, asking)));
+        require(
+          leads(answered) && answered.through == std::optional{sealed_root}
+            && index->loads() == 1 && cache->snapshot().loads == 2,
+          "a reader was not led to its block through the root that is named");
+        // A report about an answer that was read through another root is
+        // about an index that is gone.
+        const auto other = take(
+          local_root_reference::make(
+            local_root_kind::index,
+            sequence(99),
+            sealed_root.position(),
+            sealed_root.bytes(),
+            sealed_root.pages(),
+            sealed_root.digest()));
+        index->report(sparse_index_answer{answered.position, other}, wrong);
+        require(
+          index->source() == sparse_index_source::published
+            && cache->snapshot().bytes != 0,
+          "a report about another root changed the index that answers");
+        // The reader reports the answer it was given: that index is owed,
+        // and nothing of it is kept.
+        index->report(answered, wrong);
+        require(
+          index->source() == sparse_index_source::owed && index->owed()
+            && *index->owed() == wrong && cache->snapshot().bytes == 0,
+          "an answer its block did not bear out is not owed, or is still "
+          "kept");
+        {
+            // Three readers of the owed index: one rebuild. One of them
+            // leaves, alone; the others are answered from memory.
+            seastar::abort_source leaving;
+            auto one = index->locate(second, asking);
+            auto two = index->locate(second, leaving);
+            auto three = index->locate(second, asking);
+            require(
+              rebuilds.running() == 1,
+              "readers of an owed index did not share one rebuild");
+            leaving.request_abort();
+            const auto left = co_await drive.lifecycle(std::move(two));
+            const auto first = take(co_await drive.lifecycle(std::move(one)));
+            const auto third = take(co_await drive.lifecycle(std::move(three)));
+            require(
+              !left && left.error().code() == errc::aborted && leads(first)
+                && first == third && !first.through
+                && index->source() == sparse_index_source::memory
+                && rebuilds.running() == 0 && index->loads() == 1,
+              "readers of an owed index were not answered from the one index "
+              "built again");
+        }
+        // A report about an answer from memory is about the index that
+        // answers now.
+        const auto remembered = take(
+          co_await drive.lifecycle(index->locate(second, asking)));
+        index->report(remembered, wrong);
+        require(
+          index->source() == sparse_index_source::owed,
+          "an answer from memory that was reported wrong still answers");
+        const auto rebuilt = take(
+          co_await drive.lifecycle(index->locate(second, asking)));
+        require(
+          leads(rebuilt) && !rebuilt.through
+            && index->source() == sparse_index_source::memory,
+          "an index reported wrong was not built again for its reader");
+        // Named again: the next reader is answered through the new root,
+        // which is read once more and kept.
+        const auto named = take(
+          co_await drive.lifecycle(index->publish(writer, sequence(47), work)));
+        const auto kept = cache->snapshot();
+        const auto renamed = take(
+          co_await drive.lifecycle(index->locate(second, asking)));
+        require(
+          leads(renamed) && renamed.through == std::optional{named}
+            && named != sealed_root && index->loads() == 2
+            && cache->snapshot().loads == kept.loads + 2,
+          "a reader was not answered through the root that was named again");
+        // Named once more, and its page is damaged before anything reads
+        // it. The reader that meets it is answered all the same: the index
+        // is owed and built again from the data within its one lookup.
+        index->report(renamed, wrong);
+        take(co_await drive.lifecycle(index->rebuild(asking)));
+        const auto last = take(
+          co_await drive.lifecycle(index->publish(writer, sequence(48), work)));
+        while (co_await drive.lifecycle(residency.evict())) {
+        }
+        const auto path = take(
+          local_bundle_path(spec, 0, last, local_bundle_context{context}));
+        auto bytes = co_await store_contract::read_all_bytes(
+          files, path, drive);
+        bytes[last.bytes().value() + 32 + 172] ^= 1;
+        co_await store_contract::write_bytes(files, path, bytes, drive);
+        const auto before = cache->snapshot();
+        const auto survived = take(
+          co_await drive.lifecycle(index->locate(second, asking)));
+        require(
+          leads(survived) && !survived.through
+            && index->source() == sparse_index_source::memory && index->owed()
+            && detail::rebuildable_local_index_error(index->owed()->code())
+            && index->loads() == 3 && cache->snapshot().bytes == 0
+            && cache->snapshot().loads == before.loads + 2,
+          "a page that cannot be read was not owed and built again within "
+          "the lookup that met it");
+        // Whatever happened to the index, the data is as it was sealed.
+        require(
+          co_await store_contract::read_all_bytes(files, data_path(spec), drive)
+              == data
+            && !writer.failure().failed(),
+          "an index error changed the data or failed its segment");
+        take(co_await drive.lifecycle(index->close()));
+        index.reset();
+    } catch (...) {
+        failed.observe(std::current_exception());
+    }
+    if (index) {
+        try {
+            failed.observe(co_await drive.lifecycle(index->close()));
+        } catch (...) {
+            failed.observe(std::current_exception());
+        }
+        index.reset();
+    }
+    try {
+        co_await drive.lifecycle(cache->stop());
+    } catch (...) {
+        failed.observe(std::current_exception());
+    }
+    cache.reset();
+    try {
+        failed.observe(co_await drive.lifecycle(writer.close()));
+    } catch (...) {
+        failed.observe(std::current_exception());
+    }
+    segment.writer.reset();
+    take(failed.outcome());
+    require(
+      residency.resident() == 0 && !residency.failure().failed(),
+      "a closed index left its root open");
+}
+
+// A sealed generation's data, read through its pin and without its writer.
+// The generation was opened by its metadata: its descriptor, its publication
+// and the sealed root that publication pins. Its pin says where the sealed
+// extent ends, and reads any part of it below a bound the reader supplies:
+// the whole extent, each block where it lies. Nothing at or past the bound
+// is read, and no bound reaches past the sealed extent. A read that is
+// refused is that read's outcome: the next is served, nothing is taken from
+// the budget, and neither the generation nor the segment is failed. A read
+// keeps the generation open by itself.
+template<
+  runtime::monotonic_clock Clock,
+  typename Backend,
+  typename Owner,
+  typename Driver>
+seastar::future<> sealed_data(
+  Backend& files,
+  Owner& owner,
+  const local_device_spec& spec,
+  workload_budget& resources,
+  Driver drive) {
+    seastar::abort_source abort;
+    codec::cooperative_work work{codec::limits::defaults(), abort};
+    co_await installation::bootstrap(
+      files, owner, spec, resources, work, drive);
+    const auto sequence = [](std::uint64_t value) {
+        return local_object_sequence::make(value).value();
+    };
+    auto segment = co_await seal_segment<Clock>(
+      files,
+      owner,
+      spec,
+      resources,
+      work,
+      drive,
+      3,
+      sparse_index_stride{byte_count{0}},
+      sequence(46));
+    auto& writer = *segment.writer;
+    const auto& blocks = segment.blocks;
+    std::unique_ptr<local_generation_owner> generation;
+    runtime::first_failure failed;
+    try {
+        const auto described = segments::descriptor();
+        const auto context = segment.context();
+        const auto data = co_await store_contract::read_all_bytes(
+          files, data_path(spec), drive);
+        const std::array<local_bundle_context, 2> contexts{
+          context,
+          footer_expectation{
+            segment.history(), segment.sealed.boundary->position()}};
+        const local_generation_expectation expected{
+          *writer.publication_generation(),
+          {described.segment,
+           local_object_state::sealed,
+           *segment.sealed.boundary,
+           {*segment.sealed.index, *segment.sealed.retry}},
+          described,
+          contexts};
+        generation = take(
+          co_await drive.lifecycle(
+            local_generation_owner::open(
+              files,
+              owner,
+              spec,
+              0,
+              expected,
+              resources,
+              store_contract::limits(),
+              work)));
+        std::optional<local_generation_pin> pin{take(generation->pin())};
+        const auto begin = context.coverage().bytes().begin();
+        const auto end = context.coverage().bytes().end();
+        const byte_count extent{end.value() - begin.value()};
+        const auto unit = described.alignment.bytes();
+        require(
+          pin->data_end() == std::optional{end} && extent.value() != 0
+            && end.value() <= data.size(),
+          "a sealed generation does not say where its extent ends");
+        const auto held = resources.snapshot();
+        {
+            const auto whole = take(
+              co_await drive.lifecycle(pin->read_data(begin, extent, end)));
+            require(
+              flat(whole) == data.substr(begin.value(), extent.value()),
+              "the sealed extent read through its pin is not what was sealed");
+        }
+        for (const auto& block : blocks) {
+            const auto span = block.coverage().bytes();
+            const byte_count length{span.end().value() - span.begin().value()};
+            const auto read = take(
+              co_await drive.lifecycle(
+                pin->read_data(span.begin(), length, end)));
+            require(
+              flat(read) == data.substr(span.begin().value(), length.value()),
+              "a block read where it lies is not the block that was written");
+        }
+        // The bound is the reader's own. A range that does not lie wholly
+        // below it is refused before any work, and so is a bound past the
+        // sealed extent, and a read of nothing.
+        const auto first_end = blocks[0].coverage().bytes().end();
+        const auto across = co_await drive.lifecycle(
+          pin->read_data(begin, extent, first_end));
+        const auto past = co_await drive.lifecycle(pin->read_data(
+          begin, unit, runtime::file_position{end.value() + unit.value()}));
+        const auto nothing = co_await drive.lifecycle(
+          pin->read_data(begin, byte_count{}, end));
+        const auto at_bound = co_await drive.lifecycle(
+          pin->read_data(first_end, unit, first_end));
+        require(
+          !across && across.error().code() == errc::out_of_range && !past
+            && past.error().code() == errc::out_of_range && !nothing
+            && nothing.error().code() == errc::out_of_range && !at_bound
+            && at_bound.error().code() == errc::out_of_range,
+          "a read at or past its bound, or past the sealed extent, was "
+          "served");
+        {
+            // The refusals were those reads' outcomes and nobody else's.
+            const byte_count length{first_end.value() - begin.value()};
+            const auto served = take(
+              co_await drive.lifecycle(
+                pin->read_data(begin, length, first_end)));
+            const auto now = resources.snapshot();
+            require(
+              flat(served) == data.substr(begin.value(), length.value())
+                && now.tasks == held.tasks && now.bytes == held.bytes
+                && now.handles == held.handles && !writer.failure().failed(),
+              "a refused read failed the next one, took something from the "
+              "budget, or failed the segment");
+        }
+        {
+            // A read outlives the pin it was asked through.
+            auto reading = pin->read_data(begin, extent, end);
+            pin.reset();
+            const auto whole = take(
+              co_await drive.lifecycle(std::move(reading)));
+            require(
+              flat(whole) == data.substr(begin.value(), extent.value()),
+              "a read did not complete once its pin was let go");
+        }
+        take(co_await drive.lifecycle(generation->close()));
+        generation.reset();
+    } catch (...) {
+        failed.observe(std::current_exception());
+    }
+    if (generation) {
+        try {
+            failed.observe(co_await drive.lifecycle(generation->close()));
+        } catch (...) {
+            failed.observe(std::current_exception());
+        }
+        generation.reset();
     }
     try {
         failed.observe(co_await drive.lifecycle(writer.close()));

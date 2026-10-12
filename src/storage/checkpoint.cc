@@ -3,6 +3,7 @@
 #include "src/storage/page_internal.h"
 
 #include <compare>
+#include <new>
 
 namespace kwaque::storage {
 namespace {
@@ -230,9 +231,42 @@ checkpoint_pins::make(workload_budget& budget, checkpoint_pin_limits limits) {
     const auto charge = footers->checked_add(*discards);
     if (!charge)
         return runtime::failure(detail::path_error(errc::out_of_range));
-    auto held = budget.try_reserve(*charge);
+    // The segments covered between two cuts, in one allocation: nothing is
+    // allocated where a publication covers one or a cut is adopted.
+    const auto counted = std::min<std::size_t>(
+      limits.segments, maximum_covered_segments);
+    const auto covered = budget.allocation_charge(
+      byte_count{counted * sizeof(segment_context)});
+    if (!covered) return runtime::failure(covered.error());
+    const auto whole = charge->checked_add(*covered);
+    if (!whole) return runtime::failure(detail::path_error(errc::out_of_range));
+    auto held = budget.try_reserve(*whole);
     if (!held) return runtime::failure(held.error());
-    return checkpoint_pins{budget, limits, std::move(*held)};
+    std::vector<segment_context> kept;
+    try {
+        kept.reserve(counted);
+    } catch (const std::bad_alloc&) {
+        return runtime::failure(detail::path_error(errc::resource_exhausted));
+    }
+    return checkpoint_pins{budget, limits, std::move(*held), std::move(kept)};
+}
+
+bool checkpoint_pins::names(const segment_context& segment) const noexcept {
+    const auto first = std::lower_bound(
+      entries_.begin(), entries_.end(), segment, segment_less{});
+    return (first != entries_.end() && first->segment == segment) || uncounted_
+           || std::find(covered_.begin(), covered_.end(), segment)
+                != covered_.end();
+}
+
+void checkpoint_pins::linger(const segment_context& segment) noexcept {
+    if (std::find(covered_.begin(), covered_.end(), segment) != covered_.end())
+        return;
+    if (covered_.size() == covered_.capacity()) {
+        uncounted_ = true;
+        return;
+    }
+    covered_.push_back(segment);
 }
 
 runtime::result<void>
@@ -351,6 +385,7 @@ checkpoint_pins::cover(const local_object_publication& publication) {
         const auto newest = stale ? pending->footer.begin().value()
                                   : first->locator;
         if (publication.boundary->position().value() < newest) return {};
+        if (pinned || cut_open_) linger(segment);
         if (stale) erase_range(pending_, pending, pending + 1);
         if (pinned) erase_range(entries_, first, first + 1);
         --segments_;
@@ -373,6 +408,11 @@ checkpoint_pins::cover(const local_object_publication& publication) {
         drop_last(discards_, held);
         decisions_ -= carried + held;
         if (pinned || stale) --segments_;
+        // What the durable checkpoint carries of it stays there until a
+        // later cut is adopted, and so may what the cut being published
+        // took of it.
+        if (pinned || carried != 0 || (cut_open_ && (stale || held != 0)))
+            linger(segment);
         return {};
     }
     case local_object_state::active:
@@ -469,7 +509,17 @@ runtime::result<void> checkpoint_pins::adopt(checkpoint_capture&& cut) {
           discards_.begin(), discards_.end(), pin, held_less);
         return held == discards_.end() || !(held->pin == pin);
     };
-    const auto kept = std::remove_if(table.begin(), table.end(), covered);
+    // This cut is the durable checkpoint now: what was covered before it
+    // was taken is in no checkpoint, and what was covered since is in this
+    // one.
+    covered_.clear();
+    uncounted_ = false;
+    const auto kept = std::remove_if(
+      table.begin(), table.end(), [&](const local_checkpoint_entry& pin) {
+          if (!covered(pin)) return false;
+          linger(pin.segment);
+          return true;
+      });
     drop_last(table, static_cast<std::size_t>(table.end() - kept));
     // A footer the cut pinned waits no longer; one observed since still does.
     // One pass over the waiting footers, each looked up in the cut's.

@@ -9,6 +9,7 @@
 #include <seastar/core/coroutine.hh>
 
 #include <exception>
+#include <new>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -38,6 +39,12 @@ struct local_segment_name final {
 parse_local_wal_name(std::string_view, std::uint8_t bucket);
 [[nodiscard]] runtime::result<local_segment_name>
 parse_local_segment_name(std::string_view, std::uint8_t bucket);
+// The name a segment's directory takes when its removal begins: its own with
+// the separator changed, so nothing but a segment's directory is ever taken
+// for one. A directory under it is being removed whatever it holds, and is
+// told so by its name alone.
+[[nodiscard]] runtime::result<local_segment_name>
+parse_local_deleting_name(std::string_view, std::uint8_t bucket);
 [[nodiscard]] runtime::result<std::uint64_t>
 parse_local_sequence_name(std::string_view, bool metadata);
 [[nodiscard]] runtime::result<std::uint32_t>
@@ -75,6 +82,12 @@ public:
     wal(std::uint32_t shard, model::wal_incarnation_id) const;
     [[nodiscard]] runtime::result<runtime::file_path>
     segment(std::uint32_t shard, local_segment_name) const;
+    // The directory that holds a segment's directory under either name.
+    [[nodiscard]] runtime::result<runtime::file_path>
+    segment_bucket(std::uint32_t shard, model::segment_id) const;
+    // Where a segment's directory is while it is being removed.
+    [[nodiscard]] runtime::result<runtime::file_path>
+    deleting(std::uint32_t shard, local_segment_name) const;
     [[nodiscard]] runtime::result<runtime::file_path> segment_file(
       std::uint32_t shard, local_segment_name, local_segment_file) const;
     [[nodiscard]] runtime::result<runtime::file_path> object(
@@ -86,12 +99,29 @@ private:
     explicit local_paths(runtime::file_path root) noexcept
       : root_(std::move(root)) {}
     runtime::result<runtime::file_path> shard(std::uint32_t) const;
+    runtime::result<runtime::file_path>
+    segment_directory(std::uint32_t, local_segment_name, char separator) const;
     runtime::file_path root_;
 };
 
 namespace detail {
 inline runtime::operation_error path_error(errc code) noexcept {
     return runtime::operation_error{code, runtime::operation_kind::file};
+}
+// What a kept first failure answers with where an answer is owed and nothing
+// may be thrown: an exception is answered as a failure, and whoever joined
+// the attempt is told.
+inline runtime::result<void>
+settled(const runtime::first_failure& kept) noexcept {
+    if (const auto& error = kept.error()) return runtime::failure(*error);
+    if (!kept.exception()) return {};
+    try {
+        std::rethrow_exception(kept.exception());
+    } catch (const std::bad_alloc&) {
+        return runtime::failure(path_error(errc::resource_exhausted));
+    } catch (...) {
+        return runtime::failure(path_error(errc::io_failure));
+    }
 }
 inline seastar::future<runtime::result<void>>
 path_checkpoint(codec::cooperative_work& work) {
@@ -271,6 +301,15 @@ seastar::future<runtime::result<void>> walk_local_buckets(
                         }
                         child_end = entries->end();
                         for (const auto& entry : entries->entries()) {
+                            // A segment being removed is no segment to
+                            // visit: what its directory holds may be in any
+                            // state.
+                            if (
+                              kind == local_bucket_kind::segment
+                              && entry.kind == runtime::file_kind::directory
+                              && parse_local_deleting_name(
+                                entry.name.value(), *number))
+                                continue;
                             const bool valid
                               = kind == local_bucket_kind::wal
                                   ? entry.kind == runtime::file_kind::regular

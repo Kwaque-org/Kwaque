@@ -41,6 +41,10 @@ native_file_detail(const std::error_code& error) noexcept {
       || error == std::errc::operation_not_permitted)
         return file_failure_detail::permission;
     if (error == std::errc::io_error) return file_failure_detail::device_io;
+    if (
+      error == std::errc::no_such_device
+      || error == std::errc::no_such_device_or_address)
+        return file_failure_detail::device_gone;
     if (error == std::error_condition{EDQUOT, std::generic_category()})
         return file_failure_detail::quota;
     return file_failure_detail::unknown;

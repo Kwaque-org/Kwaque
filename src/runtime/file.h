@@ -6,6 +6,7 @@
 #include "src/bytes/fragmented_buffer.h"
 #include "src/runtime/error.h"
 #include "src/runtime/file_error.h"
+#include "src/runtime/file_flight.h"
 #include "src/runtime/file_position.h"
 #include "src/runtime/first_failure.h"
 #include "src/runtime/operation_statistics.h"
@@ -461,11 +462,14 @@ public:
         bool active_{false};
     };
 
+    // `flight`, when given, keeps this file's operations in start order
+    // among those of its device.
     explicit file(
       seastar::file&& native_file,
       file_io_limits limits = {},
       operation_statistics_owner statistics = {},
-      file_close_policy close_policy = file_close_policy::legacy);
+      file_close_policy close_policy = file_close_policy::legacy,
+      file_flight_ptr flight = {});
     file(file&& other) noexcept;
     file& operator=(file&&) = delete;
     file(const file&) = delete;
@@ -654,13 +658,19 @@ private:
       byte_count maximum_bytes,
       admission_reservation admission,
       seastar::gate::holder holder,
-      operation_statistics::reservation metric);
+      file_operation metric);
     [[nodiscard]] seastar::future<result<void>> close_once();
     [[nodiscard]] seastar::future<result<void>> close_checked_once();
+
+    // An admitted operation: counted, and in its device's order.
+    [[nodiscard]] file_operation admit() noexcept {
+        return file_operation{*statistics_, flight_.get()};
+    }
 
     owner_shard owner_;
     operation_statistics_owner statistics_owner_;
     operation_statistics* statistics_;
+    file_flight_ptr flight_;
     file_io_limits limits_;
     seastar::file native_file_;
     seastar::io_intent io_intent_;

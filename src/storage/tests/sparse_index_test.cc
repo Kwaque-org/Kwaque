@@ -1160,6 +1160,46 @@ SEASTAR_TEST_CASE(sparse_index_rebuild_is_ended_by_its_owner_alone) {
     BOOST_CHECK(!ran && is(closed, errc::closed));
 }
 
+SEASTAR_TEST_CASE(sparse_index_read_faults_owe_the_third_running) {
+    sparse_index_read_faults faults;
+    // One read that failed is that read's outcome, and so is the next.
+    BOOST_CHECK(faults.failed(errc::io_failure) == sparse_index_fault::unread);
+    BOOST_CHECK(
+      faults.failed(errc::fault_injected) == sparse_index_fault::unread);
+    BOOST_CHECK_EQUAL(faults.running(), 2U);
+    // A request that was refused or given up says nothing of the object.
+    for (const auto code :
+         {errc::aborted,
+          errc::closed,
+          errc::queue_full,
+          errc::resource_exhausted}) {
+        BOOST_CHECK(faults.failed(code) == sparse_index_fault::refused);
+        BOOST_CHECK_EQUAL(faults.running(), 2U);
+    }
+    // The third in a row: the index is owed, and the count begins again.
+    BOOST_CHECK(faults.failed(errc::io_failure) == sparse_index_fault::owed);
+    BOOST_CHECK_EQUAL(faults.running(), 0U);
+    // A read that succeeds between them clears what came before.
+    BOOST_CHECK(faults.failed(errc::io_failure) == sparse_index_fault::unread);
+    BOOST_CHECK(faults.failed(errc::timed_out) == sparse_index_fault::unread);
+    faults.succeeded();
+    BOOST_CHECK_EQUAL(faults.running(), 0U);
+    BOOST_CHECK(faults.failed(errc::io_failure) == sparse_index_fault::unread);
+    BOOST_CHECK(faults.failed(errc::io_failure) == sparse_index_fault::unread);
+    // Damage is owed at once, whatever was counted, and is not counted.
+    for (const auto code :
+         {errc::not_found,
+          errc::malformed_data,
+          errc::truncated_data,
+          errc::corrupt_data,
+          errc::wrong_context}) {
+        BOOST_CHECK(faults.failed(code) == sparse_index_fault::owed);
+        BOOST_CHECK_EQUAL(faults.running(), 0U);
+    }
+    static_assert(sparse_index_read_failures == 3);
+    co_return;
+}
+
 SEASTAR_TEST_CASE(sparse_index_budget_is_checked_before_any_segment) {
     co_await with_budget([](workload_budget& budget) {
         const auto limits = budget.limits();

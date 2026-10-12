@@ -104,6 +104,7 @@ kwaque_cc_library(
         ":error",
         ":file_error",
         ":file_error_internal",
+        ":file_flight",
         ":file_position",
         ":first_failure",
         ":fragmented_buffer_internal",
@@ -114,6 +115,25 @@ kwaque_cc_library(
         "//src/bytes:fragmented_buffer",
         "@seastar",
     ],
+)
+
+kwaque_cc_library(
+    name = "file_flight",
+    hdrs = ["file_flight.h"],
+    visibility = ["//visibility:public"],
+    deps = [
+        ":error",
+        ":operation_statistics",
+        ":time",
+        "@seastar",
+    ],
+)
+
+kwaque_cc_library(
+    name = "stall_watch",
+    hdrs = ["stall_watch.h"],
+    visibility = ["//visibility:public"],
+    deps = [":file_flight"],
 )
 
 kwaque_cc_library(

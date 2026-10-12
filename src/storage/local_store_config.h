@@ -10,7 +10,9 @@
 #include <span>
 
 namespace kwaque::storage {
-inline constexpr std::size_t maximum_local_devices = 16;
+// As many as the runtime has I/O queues: a device beyond them would share an
+// unlimited one, where no scheduling share holds.
+inline constexpr std::size_t maximum_local_devices = 8;
 // Configuration admission, not a change to the u32 wire representation.
 inline constexpr std::uint32_t maximum_local_shards = 65536;
 struct local_directory_identity final {
@@ -58,11 +60,28 @@ concept local_directory_owner = requires(
 // Creation is for a newly assigned device context or its known interrupted
 // bootstrap. It is never a way to recover erased metadata from an existing
 // device; that independently expected device uses must_exist.
-enum class local_store_intent : std::uint8_t { create_or_resume, must_exist };
+//
+// add_devices is for a store that exists and gains data devices: every
+// device that holds a store must be that store's, and a device named as
+// added that holds nothing, or only the interrupted bootstrap of itself, is
+// initialized. A device that is not named must hold the store already: no
+// record lists the devices a store had, so one it had and lost looks like a
+// new one, and is told apart only by not being named. It never makes a first
+// store, and it never initializes a control device: a store that was used is
+// extended only by this intent.
+enum class local_store_intent : std::uint8_t {
+    create_or_resume,
+    must_exist,
+    add_devices
+};
 struct local_store_open_options final {
     local_store_intent intent{local_store_intent::must_exist};
     // Explicitly false only for a store known not to have activated its WAL.
     bool require_wal_head{true};
+    // With add_devices: the data devices this start adds, by identity,
+    // borrowed for the call. Left set after they were added it changes
+    // nothing.
+    std::span<const device_store_id> added{};
 };
 struct local_store_io_limits final {
     bytes::allocation_charge_fn charge{nullptr};
@@ -89,6 +108,10 @@ struct local_store_report final {
     // Segment directories holding a creation prefix but no publication: no
     // append can have reached them. Retained; never a store-wide gap.
     std::uint32_t interrupted_creations{0};
+    // Segment directories under their deleting name: removals a crash or a
+    // stop left. What is inside one may be in any state and is not looked
+    // at; never a store-wide gap.
+    std::uint32_t deleting_segments{0};
     std::optional<runtime::operation_error> reason;
 };
 } // namespace kwaque::storage

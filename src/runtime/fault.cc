@@ -11,7 +11,7 @@ result<fault_decision> fault_decision::make_file_failure(
       action < fault_action::file_failure_before_effect
       || action > fault_action::file_failure_after_effect
       || static_cast<std::uint8_t>(cause)
-           > static_cast<std::uint8_t>(file_failure_detail::quota)
+           > static_cast<std::uint8_t>(file_failure_detail::device_gone)
       || cause == file_failure_detail::admission_not_dispatched
       || prefix.value() > (std::numeric_limits<std::uint64_t>::max() >> 8U)
       || ((action == fault_action::file_failure_after_prefix) != (prefix.value() != 0))) {

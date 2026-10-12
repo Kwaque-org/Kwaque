@@ -275,4 +275,35 @@ local_generation_pin::index_rebuild_reason() const {
     state_->assert_current();
     return state_->index_rebuild;
 }
+std::optional<runtime::file_position> local_generation_pin::data_end() const {
+    state_->assert_current();
+    if (!state_->boundary) return std::nullopt;
+    return std::visit(
+      [](const auto& pinned) -> runtime::file_position {
+          if constexpr (
+            std::same_as<std::remove_cvref_t<decltype(pinned)>, durable_footer>)
+              return pinned.boundary().coverage.bytes().end();
+          else
+              return pinned.coverage().bytes().end();
+      },
+      *state_->boundary);
+}
+seastar::future<runtime::result<bytes::fragmented_buffer>>
+local_generation_pin::read_data(
+  runtime::file_position position,
+  byte_count length,
+  runtime::file_position bound) const {
+    state_->assert_current();
+    // Kept until the read ends, whatever becomes of this pin meanwhile.
+    const auto state = state_;
+    const auto holder = holder_;
+    // Nothing lies past a sealed extent's end but its root.
+    const bool sealed = std::get<local_object_publication>(
+                          state->publication.value.payload())
+                          .state
+                        == local_object_state::sealed;
+    if (!state->data || (sealed && bound > data_end().value_or(bound)))
+        co_return runtime::failure(detail::path_error(errc::out_of_range));
+    co_return co_await read_segment_data(*state->data, position, length, bound);
+}
 } // namespace kwaque::storage

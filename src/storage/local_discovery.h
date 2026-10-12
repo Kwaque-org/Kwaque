@@ -388,4 +388,55 @@ seastar::future<runtime::result<local_located_segment>> resolve_local_segment(
     if (!found) co_return runtime::failure(detail::path_error(errc::not_found));
     co_return std::move(*found);
 }
+// Where a segment's directory is: the data device that holds it, and whether
+// under its deleting name. The name alone says so: nothing inside the
+// directory is read. None when no data device holds it under either name. A
+// device whose root is not there says nothing of what it holds, so it fails
+// the answer; a segment found under more than one name is wrong_context.
+struct segment_directory final {
+    device_store_id device;
+    bool marked{false};
+};
+template<runtime::file_system_backend Backend, local_directory_owner Owner>
+seastar::future<runtime::result<std::optional<segment_directory>>>
+find_segment_directory(
+  Backend& files,
+  Owner& ownership,
+  std::span<const local_device_spec> devices,
+  std::uint32_t shard,
+  const segment_context& segment,
+  codec::cooperative_work& work) {
+    using output = runtime::result<std::optional<segment_directory>>;
+    std::optional<segment_directory> found;
+    const local_segment_name name{segment.segment(), segment.generation()};
+    for (const auto& spec : devices) {
+        if (!spec.stores_data()) continue;
+        const auto paths = local_paths::make(spec.root);
+        if (!paths) co_return output{runtime::failure(paths.error())};
+        if (
+          const auto rooted = co_await inspect_local_path(
+            files, spec.root, spec.root, runtime::file_kind::directory, work);
+          !rooted)
+            co_return output{runtime::failure(rooted.error())};
+        for (const bool marked : {true, false}) {
+            const auto path = marked ? paths->deleting(shard, name)
+                                     : paths->segment(shard, name);
+            if (!path) co_return output{runtime::failure(path.error())};
+            const auto present = co_await inspect_local_path(
+              files, spec.root, *path, runtime::file_kind::directory, work);
+            if (!present) {
+                if (present.error().code() == errc::not_found) continue;
+                co_return output{runtime::failure(present.error())};
+            }
+            if (const auto owned = co_await ownership.validate(spec); !owned)
+                co_return output{runtime::failure(owned.error())};
+            if (found)
+                co_return output{
+                  runtime::failure(detail::path_error(errc::wrong_context))};
+            found = segment_directory{spec.owner.device(), marked};
+        }
+    }
+    co_return output{found};
+}
+
 } // namespace kwaque::storage

@@ -52,6 +52,27 @@ kwaque_cc_test(
 )
 
 kwaque_cc_test(
+    name = "file_flight_test",
+    srcs = ["file_flight_test.cc"],
+    deps = [
+        "//src/base:error",
+        "//src/runtime:file_flight",
+        "//src/runtime:operation_statistics",
+        "//src/runtime:stall_watch",
+        "//src/runtime:time",
+    ],
+)
+
+kwaque_cc_test(
+    name = "stall_judge_test",
+    srcs = ["stall_judge_test.cc"],
+    deps = [
+        "//src/runtime:stall_watch",
+        "//src/runtime/production:stall_judge",
+    ],
+)
+
+kwaque_cc_test(
     name = "time_random_contract_test",
     srcs = ["time_random_contract_test.cc"],
     deps = [

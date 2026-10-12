@@ -477,6 +477,15 @@ private:
               *bucket);
         }
         case node::segment_bucket: {
+            // A segment being removed is known by its directory's name and
+            // is not entered: its removal may have taken any of its files.
+            if (parse_local_deleting_name(name, frame.bucket)) {
+                if (entry.kind != runtime::file_kind::directory)
+                    co_return runtime::failure(path_error(errc::wrong_context));
+                report_.has_payload = true;
+                ++report_.deleting_segments;
+                co_return runtime::result<void>{};
+            }
             auto segment = parse_local_segment_name(name, frame.bucket);
             if (!segment) co_return unsupported();
             report_.has_payload = true;
@@ -626,7 +635,8 @@ seastar::future<runtime::result<local_store_report>> inspect_local_store(
         co_return runtime::failure(valid.error());
     if (
       options.intent != local_store_intent::create_or_resume
-      && options.intent != local_store_intent::must_exist)
+      && options.intent != local_store_intent::must_exist
+      && options.intent != local_store_intent::add_devices)
         co_return runtime::failure(detail::path_error(errc::invalid_argument));
     auto ownership = co_await owner.validate(spec);
     if (!ownership) co_return runtime::failure(ownership.error());

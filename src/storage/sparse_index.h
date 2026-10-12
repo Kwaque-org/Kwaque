@@ -198,8 +198,10 @@ public:
     active_sparse_index& operator=(const active_sparse_index&) = delete;
 
     // One complete block whose bytes are written. Blocks arrive in file
-    // order, each at or after the end of the one before it.
-    void written(const coverage& block) noexcept;
+    // order, each at or after the end of the one before it. True when the
+    // block was chosen: it is an anchor once it is durable, and the stretch
+    // of the file that the anchor before it leads to ends where it begins.
+    bool written(const coverage& block) noexcept;
     // Every block offered that begins below `end` is durable. `end` is where
     // a block ends: no block lies across it.
     void durable(runtime::file_position end) noexcept;
@@ -226,6 +228,11 @@ public:
     // is the scan's end when that anchor is the last.
     [[nodiscard]] std::optional<sparse_index_position> find(
       model::range_logical_offset, runtime::file_position end) const noexcept;
+    // The first anchor after an offset, when there is one: the stretch that
+    // find() answers with ends where its block begins, and the next stretch
+    // begins with it.
+    [[nodiscard]] std::optional<sparse_index_entry>
+      after(model::range_logical_offset) const noexcept;
 
     // Its segment is sealed: no block is offered and none becomes durable
     // after this, so its anchors are the segment's index from here on.
@@ -252,6 +259,9 @@ private:
     chosen(std::uint32_t entry) const noexcept {
         return chunks_[entry / chunk_entries][entry % chunk_entries];
     }
+    // How many anchors lie at or before an offset.
+    [[nodiscard]] std::uint32_t
+      upto(model::range_logical_offset) const noexcept;
     // 64 KiB of entries, so that a chunk stays within the contiguous
     // allocation ceiling however its allocator rounds it.
     static constexpr std::uint32_t chunk_entries = 4096;
@@ -725,6 +735,49 @@ seastar::future<> sparse_index_rebuilder::drive(Work work) {
     --shard_.running_;
     done.set_value(std::move(outcome));
 }
+
+// Reads of an index object that may fail one after another, for a reason
+// that is not damage, before its index is owed. One failed read says little
+// of an object: it is that read's outcome. An object that cannot be read
+// again and again answers nobody, and its index is then built again from the
+// data like one that is damaged.
+inline constexpr std::uint32_t sparse_index_read_failures = 3;
+
+// What a failed read of an index object means for its index.
+enum class sparse_index_fault : std::uint8_t {
+    // The request was refused or given up before the object was read:
+    // nothing is learned of the object.
+    refused,
+    // The object could not be read this time.
+    unread,
+    // The index is owed: the object is damaged, or it could not be read
+    // sparse_index_read_failures times with no read between that succeeded.
+    owed,
+};
+
+// One index's reads that failed one after another.
+class sparse_index_read_faults final {
+public:
+    [[nodiscard]] sparse_index_fault failed(errc code) noexcept {
+        if (detail::rebuildable_local_index_error(code)) {
+            running_ = 0;
+            return sparse_index_fault::owed;
+        }
+        if (
+          code == errc::aborted || code == errc::closed
+          || code == errc::queue_full || code == errc::resource_exhausted)
+            return sparse_index_fault::refused;
+        if (++running_ < sparse_index_read_failures)
+            return sparse_index_fault::unread;
+        running_ = 0;
+        return sparse_index_fault::owed;
+    }
+    void succeeded() noexcept { running_ = 0; }
+    [[nodiscard]] std::uint32_t running() const noexcept { return running_; }
+
+private:
+    std::uint32_t running_{0};
+};
 
 // What a seal is given to publish its segment's index beside its retry
 // summary: the index, and an object sequence reserved for the bundle. A live

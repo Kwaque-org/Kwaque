@@ -7,6 +7,7 @@
 #include "src/storage/extent_verifier.h"
 #include "src/storage/local_generation.h"
 #include "src/storage/local_publication.h"
+#include "src/storage/segment_data.h"
 #include "src/storage/segment_group.h"
 #include "src/storage/segment_seal.h"
 #include "src/storage/workload_budget.h"
@@ -18,8 +19,11 @@
 
 #include <algorithm>
 #include <array>
+#include <cstdint>
 #include <exception>
+#include <limits>
 #include <memory>
+#include <new>
 #include <optional>
 #include <span>
 #include <utility>
@@ -364,6 +368,81 @@ public:
         if (!first_acceptance_) return false;
         return age_expired(Clock::now());
     }
+    // What is left of it before its next group, for whoever decides when
+    // its successor is made. Nothing is left of a segment a restart found,
+    // which has no age either.
+    [[nodiscard]] runtime::result<segment_left> left() {
+        assert_current();
+        if (
+          closing_ || closed_ || lifetime_->failure.failed()
+          || append_ != model::append_state::active)
+            return runtime::failure(detail::path_error(errc::closed));
+        segment_left output;
+        if (recovered_ || !positions_) return output;
+        if (first_acceptance_) {
+            output.deadline = first_acceptance_->checked_add(
+              descriptor_.maximum_lifetime);
+            if (!output.deadline)
+                return runtime::failure(detail::path_error(errc::out_of_range));
+        }
+        auto fixed = capacity();
+        if (!fixed) return runtime::failure(fixed.error());
+        const auto& reserved = positions_->reserved;
+        const auto& limits = (*fixed)->limits;
+        const auto facts = std::min<std::uint64_t>(
+          limits.maximum_retry_entries,
+          config_.policy.config().max_object_entries.value());
+        // As its next group's plan counts them: that group's footer, and
+        // the root of a seal holding one fact more.
+        const auto root = (*fixed)->sealed_root(
+          std::uint64_t{reserved.retry_entries} + 1);
+        if (
+          !root || !(*fixed)->footer_bytes
+          || reserved.footers == std::numeric_limits<std::uint32_t>::max()
+          || reserved.blocks >= limits.maximum_blocks
+          || reserved.retry_entries >= facts)
+            return output;
+        auto taken = reserved.bytes.checked_add(*(*fixed)->footer_bytes);
+        if (taken) taken = taken->checked_add(*root);
+        if (!taken || taken->value() >= descriptor_.maximum_data_bytes.value())
+            return output;
+        output.bytes = byte_count{
+          descriptor_.maximum_data_bytes.value() - taken->value()};
+        output.blocks = static_cast<std::uint32_t>(std::min<std::uint64_t>(
+          limits.maximum_blocks - reserved.blocks,
+          facts - reserved.retry_entries));
+        return output;
+    }
+    // The most a segment made with this descriptor and configuration may
+    // come to hold on its device; see segment_disk_bound.
+    [[nodiscard]] static runtime::result<byte_count> disk_bound(
+      const local_segment_descriptor& descriptor,
+      const segment_writer_config& config) {
+        auto limits = config.admission;
+        limits.metadata_bytes = std::min(
+          limits.metadata_bytes, config.metadata.metadata_bytes);
+        return segment_disk_bound(
+          descriptor,
+          limits,
+          config.policy,
+          config.metadata.charge,
+          config.metadata.operation_bytes);
+    }
+    // What this segment may still come to write on its device: its bound
+    // less what its data file holds. Nothing once it is sealed, closed or
+    // failed, since it writes no more, and nothing for a segment a restart
+    // found.
+    [[nodiscard]] byte_count owed() const noexcept {
+        assert_current();
+        if (
+          closed_ || recovered_ || !positions_ || lifetime_->failure.failed()
+          || append_ == model::append_state::sealed)
+            return {};
+        const auto bound = disk_bound(descriptor_, config_);
+        if (!bound) return {};
+        const auto held = positions_->written.bytes.value();
+        return byte_count{bound->value() > held ? bound->value() - held : 0};
+    }
     [[nodiscard]] bool recovered() const noexcept {
         assert_current();
         return recovered_;
@@ -414,11 +493,31 @@ public:
         assert_current();
         if (closing_ || closed_)
             return runtime::failure(detail::path_error(errc::closed));
-        if (!observer.written || !observer.durable)
+        // Whoever takes the written bytes says when it wants them.
+        if (
+          !observer.written || !observer.durable
+          || (observer.wanted != nullptr) != static_cast<bool>(observer.fed))
             return runtime::failure(detail::path_error(errc::invalid_argument));
         if (observer_ || recovered_ || first_acceptance_)
             return runtime::failure(detail::path_error(errc::wrong_context));
         observer_.emplace(std::move(observer));
+        return {};
+    }
+    // Tells `observer` when this segment's lifetime begins to run, and each
+    // time a request is refused as roll-required, with why. It is bound
+    // once and before the first group freezes, so that the lifetime's
+    // beginning is not missed. Whatever the observer refers to outlives
+    // this owner's joined close.
+    [[nodiscard]] runtime::result<void>
+    observe_roll(segment_roll_observer observer) {
+        assert_current();
+        if (closing_ || closed_)
+            return runtime::failure(detail::path_error(errc::closed));
+        if (!observer.aging || !observer.refused)
+            return runtime::failure(detail::path_error(errc::invalid_argument));
+        if (roll_observer_ || first_acceptance_)
+            return runtime::failure(detail::path_error(errc::wrong_context));
+        roll_observer_.emplace(std::move(observer));
         return {};
     }
     [[nodiscard]] runtime::result<segment_captured_boundary> capture() const {
@@ -483,8 +582,7 @@ public:
         if (batches.empty() || batches.size() > maximum_segment_group_blocks)
             return runtime::failure(detail::path_error(errc::invalid_argument));
         if (recovered_)
-            return segment_group_preparation{
-              segment_capacity_decision::roll_required, {}};
+            return rolls(segment_roll_reasons{segment_roll_reason::recovered});
         if (work.policy() != config_.policy)
             return runtime::failure(detail::path_error(errc::invalid_argument));
         if (auto ready = work.poll(); !ready)
@@ -498,8 +596,10 @@ public:
         auto plan = detail::plan_segment_capacity(
           **fixed, positions_->reserved, batches);
         if (!plan) return runtime::failure(plan.error());
+        if (plan->decision == segment_capacity_decision::roll_required)
+            return rolls(plan->reasons);
         if (plan->decision != segment_capacity_decision::fits)
-            return segment_group_preparation{plan->decision, {}};
+            return segment_group_preparation{plan->decision, {}, {}};
         byte_count metadata{};
         // These are distinct bounded allocations, not one large vector.
         // Admit the donor's ordinary geometric spare capacity as well.
@@ -515,7 +615,7 @@ public:
             const auto cost = budget_.allocation_charge(byte_count{request});
             if (!cost)
                 return segment_group_preparation{
-                  segment_capacity_decision::impossible, {}};
+                  segment_capacity_decision::impossible, {}, {}};
             metadata = metadata.checked_add(*cost).value();
         }
         auto required = std::optional<byte_count>{metadata};
@@ -539,23 +639,23 @@ public:
         const auto control = node_charge(fragments);
         if (!control)
             return segment_group_preparation{
-              segment_capacity_decision::impossible, {}};
+              segment_capacity_decision::impossible, {}, {}};
         if (!group_fits_budget(*required, plan->retry_metadata, *control))
             return segment_group_preparation{
-              segment_capacity_decision::impossible, {}};
+              segment_capacity_decision::impossible, {}, {}};
         auto aged = age_expired(Clock::now());
         if (!aged) return runtime::failure(aged.error());
-        if (*aged)
-            return segment_group_preparation{
-              segment_capacity_decision::roll_required, {}};
+        if (*aged) return rolls(segment_roll_reasons{segment_roll_reason::age});
+        // The group fits the budget alone and not beside the facts this
+        // segment keeps for its seal.
         if (!group_fits_budget(*required, plan->retry_metadata, *control, true))
-            return segment_group_preparation{
-              segment_capacity_decision::roll_required, {}};
+            return rolls(
+              segment_roll_reasons{segment_roll_reason::retry_state});
         auto held = budget_.try_reserve(*required);
         if (!held) {
             if (held.error().code() == errc::out_of_range)
                 return segment_group_preparation{
-                  segment_capacity_decision::impossible, {}};
+                  segment_capacity_decision::impossible, {}, {}};
             return runtime::failure(held.error());
         }
         auto retries = budget_.try_reserve(plan->retry_metadata);
@@ -578,7 +678,8 @@ public:
             std::move(*retries),
             std::move(*node),
             retained,
-            work.policy()}};
+            work.policy()},
+          {}};
     }
 
     // Whether freeze_group of this current preparation would now pass its
@@ -848,7 +949,14 @@ private:
         } else {
             retry_memory_.emplace(std::move(prepared.retries_));
         }
-        if (!first_acceptance_) first_acceptance_ = now;
+        if (!first_acceptance_) {
+            first_acceptance_ = now;
+            // Checked above: its deadline is representable.
+            if (
+              const auto ends = now.checked_add(descriptor_.maximum_lifetime);
+              ends && roll_observer_)
+                roll_observer_->aging(*ends);
+        }
         node->linked = true;
         positions_->reserved = *plan->end;
         reserved_footer_ = footer;
@@ -1307,6 +1415,25 @@ public:
     }
     const segment_seal_progress& seal_progress() const&& = delete;
 
+    // The segment's durable publication as this owner last made or found it:
+    // its generation, the publication, the descriptor and each root's context
+    // in the publication's order. A generation of the segment is opened
+    // against it, and once the segment is sealed it is what covers the
+    // segment's checkpoint entries and its pinned PREPAREs. Nothing for a
+    // segment this owner created and has not sealed. The contexts are
+    // borrowed until the next publication through this owner. A native
+    // allocation failure throws.
+    [[nodiscard]] std::optional<local_generation_expectation>
+    published() const {
+        assert_current();
+        if (
+          !publication_ || !read_publication_
+          || read_roots_.size() != read_publication_->roots.size())
+            return std::nullopt;
+        return local_generation_expectation{
+          *publication_, *read_publication_, descriptor_, read_roots_};
+    }
+
     // Source is moved into the joined attempt and owns/pins an independently
     // completed immutable snapshot. read(first,count,work) returns exactly
     // that slice as result<vector<completed_retry>>, without fresh workload
@@ -1678,6 +1805,98 @@ public:
         co_return runtime::failure(failed.error());
     }
 
+    // A reader's right to read this segment's data while it is appended to,
+    // and how far it may read: everything below the durable position, as it
+    // stands now. Readers share one read-only handle, apart from the handle
+    // the writer writes through; it is opened when the first of them asks,
+    // and takes one handle credit while it is open. A pin outlives a seal:
+    // what lies below its reader's bound does not change. Close waits for
+    // every pin.
+    //
+    // Whatever keeps the handle from opening is this request's outcome: the
+    // segment is not failed by it, and the next request tries again. A
+    // request that arrives while the handle is being opened is asked to come
+    // back. A segment that was recovered, is sealed or is closing is read
+    // through its publication instead, and is refused here.
+    [[nodiscard]] seastar::future<runtime::result<segment_data_view>>
+    pin_data(codec::cooperative_work& work) {
+        using output = runtime::result<segment_data_view>;
+        assert_current();
+        const auto appended = [this] {
+            return !closing_ && !closed_ && !recovered_ && !seal_started_
+                   && positions_.has_value()
+                   && append_ == model::append_state::active
+                   && !lifetime_->failure.failed();
+        };
+        if (!appended())
+            co_return output{
+              runtime::failure(detail::path_error(errc::closed))};
+        if (data_pin_busy_)
+            co_return output{
+              runtime::failure(detail::path_error(errc::queue_full))};
+        if (auto ready = work.poll(); !ready)
+            co_return output{
+              runtime::failure(detail::path_error(ready.error().code()))};
+        if (!readable_) {
+            auto held = budget_.try_reserve(byte_count{512});
+            if (!held) co_return output{runtime::failure(held.error())};
+            if (auto credit = held->try_acquire_handles(1); !credit)
+                co_return output{runtime::failure(credit.error())};
+            auto holder = operations_.try_hold();
+            if (!holder)
+                co_return output{
+                  runtime::failure(detail::path_error(errc::closed))};
+            data_pin_busy_ = true;
+            const auto idle = seastar::defer(
+              [this] noexcept { data_pin_busy_ = false; });
+            runtime::result<void> opened{};
+            seastar::lw_shared_ptr<detail::segment_data_handle> made;
+            try {
+                // Made before the file is opened: once it is open nothing
+                // here can fail and leave it without an owner.
+                made = seastar::make_lw_shared<detail::segment_data_handle>(
+                  std::move(*held));
+                opened = co_await inspect_local_path(
+                  files_,
+                  spec_.root,
+                  path(local_segment_file::data),
+                  runtime::file_kind::regular,
+                  work);
+                if (opened) {
+                    auto file = co_await files_.open(
+                      path(local_segment_file::data),
+                      {.access = runtime::file_access::read_only,
+                       .close_policy = runtime::file_close_policy::checked});
+                    if (file)
+                        made->file.emplace(std::move(*file));
+                    else
+                        opened = runtime::failure(file.error());
+                }
+            } catch (const std::bad_alloc&) {
+                opened = runtime::failure(
+                  detail::path_error(errc::resource_exhausted));
+            } catch (...) {
+                opened = runtime::failure(detail::path_error(errc::io_failure));
+            }
+            if (!opened) co_return output{runtime::failure(opened.error())};
+            // Kept even when the segment moved on meanwhile: its close
+            // closes the handle.
+            readable_ = std::move(made);
+        }
+        if (!appended())
+            co_return output{
+              runtime::failure(detail::path_error(errc::closed))};
+        co_return output{segment_data_view{
+          readable_->pin(),
+          {descriptor_.segment,
+           descriptor_.alignment,
+           data_start_,
+           descriptor_.logical_origin,
+           descriptor_.physical_origin,
+           descriptor_.profile},
+          positions_->durable.bytes}};
+    }
+
     // Idle read eviction serializes with read/reopen. Active writable handles
     // and their startup completion reservation are never evicted.
     [[nodiscard]] seastar::future<runtime::result<void>> evict_read_handle() {
@@ -1761,6 +1980,17 @@ public:
         zero_memory_.reset();
         retry_memory_.reset();
         co_await close_publishers();
+        if (readable_) {
+            // Whoever still reads through it finishes first.
+            co_await readable_->readers.close();
+            try {
+                lifetime_->failure.observe(co_await readable_->file->close());
+            } catch (...) {
+                lifetime_->failure.observe(std::current_exception());
+            }
+            readable_->closed = true;
+            readable_ = nullptr;
+        }
         co_await close_handles();
         bundle_memory_.reset();
         seal_memory_.reset();
@@ -1772,6 +2002,12 @@ public:
     }
 
 private:
+    // A request this segment takes no more: its owner is told why.
+    [[nodiscard]] segment_group_preparation rolls(segment_roll_reasons why) {
+        if (roll_observer_) roll_observer_->refused(why);
+        return segment_group_preparation{
+          segment_capacity_decision::roll_required, {}, why};
+    }
     runtime::result<bool> age_expired(runtime::monotonic_time now) const {
         if (first_acceptance_ && now < *first_acceptance_)
             return runtime::failure(detail::path_error(errc::wrong_context));
@@ -3044,7 +3280,16 @@ private:
                     prefix_failed_ = true;
                 else if (!prefix_failed_) {
                     positions_->written = front->layout.boundary().end();
-                    if (observer_) observer_->written(front->layout.blocks());
+                    if (observer_) {
+                        observer_->written(front->layout.blocks());
+                        // The share the digest hashes holds the group's
+                        // exact bytes, unless the owner is closing.
+                        if (
+                          observer_->wanted != nullptr && *observer_->wanted
+                          && !front->digest.empty())
+                            observer_->fed(
+                              front->extent().begin(), front->digest);
+                    }
                 }
                 if (!digest) release_pending(*front);
                 inflight_.pop_front();
@@ -4049,8 +4294,13 @@ private:
     std::optional<segment_immutable_expectation> immutable_;
     std::optional<local_object_publication> read_publication_;
     std::vector<local_bundle_context> read_roots_;
+    // The read-only handle readers of an appended segment share, once one
+    // has asked, and whether it is being opened.
+    seastar::lw_shared_ptr<detail::segment_data_handle> readable_;
+    bool data_pin_busy_{false};
     bool freezing_{false}, prefix_failed_{false}, barrier_busy_{false};
     std::optional<segment_block_observer> observer_;
+    std::optional<segment_roll_observer> roll_observer_;
     std::optional<runtime::monotonic_time> first_acceptance_;
     runtime::file_position data_start_{};
     std::optional<detail::segment_capacity_constants> capacity_;

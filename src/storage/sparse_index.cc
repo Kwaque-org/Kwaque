@@ -305,13 +305,12 @@ active_sparse_index::operator[](std::uint32_t anchor) const noexcept {
     return chosen(anchor);
 }
 
-std::optional<sparse_index_position> active_sparse_index::find(
-  model::range_logical_offset target,
-  runtime::file_position end) const noexcept {
+std::uint32_t
+active_sparse_index::upto(model::range_logical_offset target) const noexcept {
     // The same search over a table kept in chunks: the first anchor after
-    // the offset, then the one before it.
+    // the offset.
     const auto anchors = std::views::iota(std::uint32_t{0}, anchors_);
-    const auto after = static_cast<std::uint32_t>(
+    return static_cast<std::uint32_t>(
       std::ranges::upper_bound(
         anchors,
         target,
@@ -320,10 +319,24 @@ std::optional<sparse_index_position> active_sparse_index::find(
             return chosen(anchor).logical_anchor();
         })
       - anchors.begin());
-    if (after == 0) return std::nullopt;
+}
+
+std::optional<sparse_index_position> active_sparse_index::find(
+  model::range_logical_offset target,
+  runtime::file_position end) const noexcept {
+    // The first anchor after the offset, then the one before it.
+    const auto before = upto(target);
+    if (before == 0) return std::nullopt;
     return sparse_index_position{
-      chosen(after - 1),
-      after == anchors_ ? end : chosen(after).block_position()};
+      chosen(before - 1),
+      before == anchors_ ? end : chosen(before).block_position()};
+}
+
+std::optional<sparse_index_entry>
+active_sparse_index::after(model::range_logical_offset target) const noexcept {
+    const auto before = upto(target);
+    if (before == anchors_) return std::nullopt;
+    return chosen(before);
 }
 
 std::span<const sparse_index_entry>
@@ -339,7 +352,7 @@ active_sparse_index::page(std::uint32_t ordinal) const noexcept {
       std::min(sparse_index_page_entries, anchors_ - first)};
 }
 
-void active_sparse_index::written(const coverage& block) noexcept {
+bool active_sparse_index::written(const coverage& block) noexcept {
     KWAQUE_INVARIANT(
       invariant_id{"KQ-INDEX-FROZEN"},
       !frozen_,
@@ -354,7 +367,7 @@ void active_sparse_index::written(const coverage& block) noexcept {
     // empty has none.
     const auto base = model::range_logical_offset::make(
       block.logical().begin().value());
-    if (block.logical().empty() || !base) return;
+    if (block.logical().empty() || !base) return false;
     const auto records = block.physical().begin();
     KWAQUE_INVARIANT(
       invariant_id{"KQ-INDEX-ORDER"},
@@ -365,14 +378,14 @@ void active_sparse_index::written(const coverage& block) noexcept {
       && begin.value() - chosen_bytes_.value() < stride_.bytes.value()
       && (stride_.records == 0
           || records.value() - chosen_records_.value() < stride_.records))
-        return;
+        return false;
     KWAQUE_INVARIANT(
       invariant_id{"KQ-INDEX-ORDER"},
       chosen_ == 0 || chosen(chosen_ - 1).logical_anchor() < *base,
       "index offered a block out of logical order");
     if (chosen_ == capacity_) {
         ++skipped_;
-        return;
+        return false;
     }
     if (chosen_ / chunk_entries == chunks_.size()) {
         try {
@@ -383,13 +396,14 @@ void active_sparse_index::written(const coverage& block) noexcept {
             // Tried again at the next block: the distances still run from
             // the last block that was chosen.
             ++skipped_;
-            return;
+            return false;
         }
     }
     chunks_.back().emplace_back(*base, begin);
     ++chosen_;
     chosen_bytes_ = begin;
     chosen_records_ = records;
+    return true;
 }
 
 void active_sparse_index::durable(runtime::file_position end) noexcept {

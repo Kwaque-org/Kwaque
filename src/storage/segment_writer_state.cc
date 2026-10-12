@@ -333,6 +333,44 @@ runtime::result<void> detail::validate_empty_segment_seal(
     return {};
 }
 
+runtime::result<byte_count> segment_disk_bound(
+  const local_segment_descriptor& descriptor,
+  segment_admission_limits limits,
+  const codec::limits& policy,
+  bytes::allocation_charge_fn charge,
+  byte_count finalization_bytes) {
+    if (auto valid = limits.validate(); !valid)
+        return runtime::failure(valid.error());
+    if (!charge)
+        return runtime::failure(detail::path_error(errc::invalid_argument));
+    const auto config = policy.config();
+    const auto unit = descriptor.alignment.bytes().value();
+    // Every block is at least one alignment unit: no more facts than units.
+    const auto facts = std::min<std::uint64_t>(
+      {limits.maximum_retry_entries,
+       limits.maximum_blocks,
+       config.max_object_entries.value(),
+       descriptor.maximum_data_bytes.value() / unit});
+    const auto projected = project_retries(
+      facts,
+      descriptor.alignment,
+      limits,
+      policy,
+      charge,
+      finalization_bytes,
+      wire_capacity_for(descriptor.alignment, policy));
+    // A count of facts no seal could publish is never reached, and then
+    // the most pages a bundle may have stand in for it.
+    const auto pages = std::min<std::uint64_t>(
+      limits.maximum_retry_pages, config.max_object_pages.value());
+    const auto page = (config.max_page_bytes.value() / unit + 1) * unit;
+    const auto bundle = projected ? projected->disk.value() : pages * page;
+    const auto bound = descriptor.maximum_data_bytes.checked_add(
+      byte_count{bundle});
+    if (!bound) return runtime::failure(detail::path_error(errc::out_of_range));
+    return *bound;
+}
+
 detail::segment_plan_input
 detail::plan_input(const encoded_assigned_batch& batch) noexcept {
     return {batch.info(), batch.bytes().size(), batch.bytes().fragment_count()};
@@ -449,6 +487,23 @@ detail::segment_capacity_constants::seal_page_entries(
       retry_wire_capacity);
     if (!projected) return std::nullopt;
     return projected->entries_per_page;
+}
+
+std::optional<byte_count>
+detail::segment_capacity_constants::sealed_root(std::uint64_t entries) {
+    if (root_asked != entries) {
+        const auto projected = project_retries(
+          entries,
+          descriptor.alignment,
+          limits,
+          policy,
+          charge,
+          finalization_bytes,
+          retry_wire_capacity);
+        root_kept = projected ? std::optional{projected->root} : std::nullopt;
+        root_asked = entries;
+    }
+    return root_kept;
 }
 
 runtime::result<segment_capacity_plan> plan_segment_capacity(
@@ -584,17 +639,24 @@ runtime::result<segment_capacity_plan> detail::plan_segment_capacity(
     const auto physical = current.physical.checked_add(
       model::segment_record_count{records});
     const auto data_end = current.bytes.checked_add(*incoming);
+    // Every reason that holds is given: a segment out of room in two ways
+    // says both.
+    if (!retry) output.reasons.add(segment_roll_reason::retry_state);
     if (
-      !retry || !physical || !data_end
+      !physical
       || batches.size() > limits.maximum_blocks
                             - std::min(current.blocks, limits.maximum_blocks)
       || current.footers == std::numeric_limits<std::uint32_t>::max())
-        return output;
-    auto sealed_end = data_end->checked_add(retry->root);
+        output.reasons.add(segment_roll_reason::count);
+    // With no root to add, the data alone says whether the extent is passed.
+    const auto sealed_end = data_end ? data_end->checked_add(
+                                         retry ? retry->root : byte_count{})
+                                     : std::nullopt;
     if (
       !sealed_end
       || sealed_end->value() > descriptor.maximum_data_bytes.value())
-        return output;
+        output.reasons.add(segment_roll_reason::size);
+    if (!output.reasons.empty()) return output;
     output.decision = segment_capacity_decision::fits;
     output.end = segment_writer_position{
       logical,

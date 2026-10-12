@@ -96,9 +96,11 @@ native_file_kind(seastar::directory_entry_type type) noexcept {
 struct directory_cursor::state final : shard_affine {
     state(
       seastar::lw_shared_ptr<detail::directory_cursor_memory> budget,
-      operation_statistics_owner metrics)
+      operation_statistics_owner metrics,
+      file_flight_ptr order)
       : memory(std::move(budget))
-      , statistics(std::move(metrics)) {}
+      , statistics(std::move(metrics))
+      , flight(std::move(order)) {}
 
     ~state() {
         assert_current();
@@ -113,7 +115,7 @@ struct directory_cursor::state final : shard_affine {
       seastar::semaphore_units<> reservation,
       seastar::gate::holder holder) {
         busy = true;
-        [[maybe_unused]] auto metric = statistics.get().accept();
+        [[maybe_unused]] file_operation metric{statistics.get(), flight.get()};
         auto idle = seastar::defer([this] noexcept { busy = false; });
         static_cast<void>(holder);
         try {
@@ -187,7 +189,7 @@ struct directory_cursor::state final : shard_affine {
         busy = true;
         auto idle = seastar::defer([this] noexcept { busy = false; });
         static_cast<void>(holder);
-        [[maybe_unused]] auto metric = statistics.get().accept();
+        [[maybe_unused]] file_operation metric{statistics.get(), flight.get()};
         try {
             co_await directory.flush();
         } catch (...) {
@@ -205,7 +207,7 @@ struct directory_cursor::state final : shard_affine {
 
     seastar::future<result<void>> drain() {
         closing = true;
-        [[maybe_unused]] auto metric = statistics.get().accept();
+        [[maybe_unused]] file_operation metric{statistics.get(), flight.get()};
         co_await operations.close();
         // No generator awaiter or relative stat can still borrow this frame/fd.
         lister.reset();
@@ -235,6 +237,8 @@ struct directory_cursor::state final : shard_affine {
 
     seastar::lw_shared_ptr<detail::directory_cursor_memory> memory;
     operation_statistics_owner statistics;
+    // The order its device's operations are kept in, when one is.
+    file_flight_ptr flight;
     seastar::file directory;
     std::optional<seastar::list_directory_generator_type> lister;
     std::optional<seastar::directory_entry> lookahead;
@@ -343,14 +347,14 @@ file_system::open_directory(file_path path, file_close_policy policy) {
       && policy != file_close_policy::checked)
         co_return failure(file_system_error(errc::invalid_argument));
     assert_current();
-    [[maybe_unused]] auto metric = statistics_->accept();
+    [[maybe_unused]] auto metric = admit(path);
     // Opening takes no listing slot: see directory_cursor_memory. An open
     // directory is a descriptor like any open file, bounded by the handle
     // credits of whoever holds it and by the process.
     auto memory = seastar::make_lw_shared<detail::directory_cursor_memory>(
       cursor_slots_);
     auto state = std::make_unique<directory_cursor::state>(
-      std::move(memory), statistics_owner_);
+      std::move(memory), statistics_owner_, flights_.under(path.value()));
     state->close_policy = policy;
     std::exception_ptr exception;
     try {
@@ -383,7 +387,7 @@ file_system::open(file_path path, file_open_options options) {
         statistics_->reject();
         co_return failure(valid.error());
     }
-    [[maybe_unused]] auto metric = statistics_->accept();
+    [[maybe_unused]] auto metric = admit(path);
     try {
         seastar::file_open_options native_options;
         native_options.create_permissions
@@ -395,7 +399,8 @@ file_system::open(file_path path, file_open_options options) {
           std::move(native),
           file_io_limits{},
           statistics_owner_,
-          options.close_policy};
+          options.close_policy,
+          flights_.under(path.value())};
     } catch (const std::bad_alloc&) {
         throw;
     } catch (...) {
@@ -406,7 +411,7 @@ file_system::open(file_path path, file_open_options options) {
 
 seastar::future<result<bool>> file_system::exists(file_path path) {
     assert_current();
-    [[maybe_unused]] auto metric = statistics_->accept();
+    [[maybe_unused]] auto metric = admit(path);
     try {
         co_return co_await seastar::file_exists(path.value());
     } catch (const std::bad_alloc&) {
@@ -419,7 +424,7 @@ seastar::future<result<bool>> file_system::exists(file_path path) {
 
 seastar::future<result<file_status>> file_system::stat(file_path path) {
     assert_current();
-    [[maybe_unused]] auto metric = statistics_->accept();
+    [[maybe_unused]] auto metric = admit(path);
     try {
         const auto native = co_await seastar::file_stat(
           path.value(), seastar::follow_symlink::no);
@@ -436,9 +441,15 @@ seastar::future<result<file_status>> file_system::stat(file_path path) {
     }
 }
 
+bool file_system::device_queue(std::uint64_t device) const noexcept {
+    assert_current();
+    return seastar::engine().try_get_io_queue(static_cast<dev_t>(device))
+           != nullptr;
+}
+
 seastar::future<result<file_system_space>> file_system::space(file_path path) {
     assert_current();
-    [[maybe_unused]] auto metric = statistics_->accept();
+    [[maybe_unused]] auto metric = admit(path);
     try {
         const auto native = co_await seastar::engine().statvfs(path.value());
         co_return file_system_space::from_blocks(
@@ -462,7 +473,7 @@ file_system::list(file_path path, directory_listing_limits limits) {
         statistics_->reject();
         co_return failure(valid.error());
     }
-    [[maybe_unused]] auto metric = statistics_->accept();
+    [[maybe_unused]] auto metric = admit(path);
 
     seastar::file directory;
     seastar::chunked_vector<directory_entry> entries;
@@ -556,7 +567,7 @@ file_system::list(file_path path, directory_listing_limits limits) {
 
 seastar::future<result<void>> file_system::create_directories(file_path path) {
     assert_current();
-    [[maybe_unused]] auto metric = statistics_->accept();
+    [[maybe_unused]] auto metric = admit(path);
     try {
         // Every prefix that ends at a component, shortest first. A relative
         // path starts at the working directory, which exists.
@@ -597,7 +608,7 @@ seastar::future<result<void>> file_system::create_directories(file_path path) {
 
 seastar::future<result<void>> file_system::remove_file(file_path path) {
     assert_current();
-    [[maybe_unused]] auto metric = statistics_->accept();
+    [[maybe_unused]] auto metric = admit(path);
     try {
         co_await seastar::unlink_file(path.value());
         co_return result<void>{};
@@ -651,7 +662,7 @@ void verified_directories::forget(std::string_view path) noexcept {
 seastar::future<result<void>> file_system::remove_directory(file_path path) {
     assert_current();
     verified_.forget(path.value());
-    [[maybe_unused]] auto metric = statistics_->accept();
+    [[maybe_unused]] auto metric = admit(path);
     try {
         co_await seastar::remove_directory(path.value());
         co_return result<void>{};
@@ -666,7 +677,7 @@ seastar::future<result<void>> file_system::rename(
     assert_current();
     verified_.forget(source.value());
     verified_.forget(destination.value());
-    [[maybe_unused]] auto metric = statistics_->accept();
+    [[maybe_unused]] auto metric = admit(source);
     try {
         if (
           policy != file_rename_policy::replace
@@ -696,7 +707,7 @@ file_system::sync_directory(file_path path, file_close_policy policy) {
       policy != file_close_policy::legacy
       && policy != file_close_policy::checked)
         co_return failure(file_system_error(errc::invalid_argument));
-    [[maybe_unused]] auto metric = statistics_->accept();
+    [[maybe_unused]] auto metric = admit(path);
     if (policy == file_close_policy::legacy) {
         try {
             co_await seastar::sync_directory(path.value());

@@ -621,7 +621,7 @@ TEST(
     EXPECT_FALSE(
       fault_decision::make_file_failure(
         fault_action::file_failure_before_effect,
-        static_cast<file_failure_detail>(8))
+        static_cast<file_failure_detail>(9))
         .has_value());
     static_assert(
       static_cast<std::uint8_t>(fault_action::partial_resize) == 13);
