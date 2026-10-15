@@ -1,0 +1,7 @@
+# The pairs index_timing_bench is compared by, one a line:
+#   <baseline>=<candidate> <kind>
+# Both sides do the same work with and without one owner: the owner of a
+# sealed segment's index, or the same root and pages with nothing between. A
+# device pair reads what its timed region needs from the device.
+
+baseline_index.warm_lookup=candidate_index.warm_lookup device

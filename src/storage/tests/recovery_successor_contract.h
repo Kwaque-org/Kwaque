@@ -1,6 +1,7 @@
 #pragma once
 
 #include "src/base/units.h"
+#include "src/bytes/test_allocation_profile.h"
 #include "src/storage/checkpoint.h"
 #include "src/storage/recovery_inventory.h"
 #include "src/storage/recovery_publication.h"
@@ -52,8 +53,14 @@ inline segment_writer_config segment_configuration(std::uint64_t retry) {
     config.admission.working_bytes = byte_count{1_MiB};
     return config;
 }
+// A scan keeps each window it reads as one allocation. The charge model of
+// a build without the native allocator rounds a window of 128 KiB up past
+// what one allocation may be, and a restart over more than one window of a
+// file is refused there: such a build reads windows of half that.
 inline recovery_merge_limits merge_limits() {
-    const scan_reader_limits reader{};
+    scan_reader_limits reader{};
+    if (!bytes::testing::native_charge_profile)
+        reader.window_bytes = byte_count{64_KiB};
     return {
       {store_contract::limits(), reader, byte_count{4_MiB}, byte_count{64_KiB}},
       {store_contract::limits(), reader, byte_count{4_MiB}, byte_count{64_KiB}},

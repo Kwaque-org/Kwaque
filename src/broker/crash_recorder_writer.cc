@@ -14,7 +14,7 @@
 namespace kwaque::broker::detail {
 namespace {
 
-constexpr std::string_view magic = "KQCRSH2";
+constexpr std::string_view magic = "KQCRSH1";
 static_assert(
   crash_header_size + 2U * crash_field_capacity + crash_version_capacity
     + crash_architecture_capacity + 4U
@@ -250,33 +250,25 @@ bool crash_report_timestamp(
   std::uint64_t file_size,
   std::int64_t& timestamp) noexcept {
     if (
-      record.size() < crash_v1_header_size + 4U
+      record.size() < crash_header_size + 4U
       || record.size() > crash_serialization_capacity
       || record.size() != file_size
-      || !std::equal(magic.begin(), magic.begin() + 6, record.begin())
-      || (record[6] != '1' && record[6] != '2') || record[7] != '\0') {
-        return false;
-    }
-    const auto header_size = record[6] == '1' ? crash_v1_header_size
-                                              : crash_header_size;
-    if (record.size() < header_size + 4U) {
+      || !std::equal(magic.begin(), magic.end(), record.begin())
+      || record[magic.size()] != '\0') {
         return false;
     }
     const auto message = load_number(record.data() + 28, 4);
     const auto stack = load_number(record.data() + 32, 4);
     const auto version = load_number(record.data() + 36, 4);
-    const auto architecture = record[6] == '1'
-                                ? 0U
-                                : load_number(record.data() + 40, 4);
+    const auto architecture = load_number(record.data() + 40, 4);
     const auto kind = load_number(record.data() + 24, 4);
     const auto time = load_number(record.data() + 8, 8);
     if (
       message > crash_field_capacity || stack > crash_field_capacity
       || version > crash_version_capacity || kind < 1 || kind > 4
-      || architecture > crash_architecture_capacity
-      || (record[6] == '2' && architecture == 0)
+      || architecture == 0 || architecture > crash_architecture_capacity
       || file_size
-           != header_size + message + stack + version + architecture + 4U
+           != crash_header_size + message + stack + version + architecture + 4U
       || time == 0 || time > INT64_MAX) {
         return false;
     }

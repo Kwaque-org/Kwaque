@@ -3,6 +3,7 @@
 #include "src/runtime/production/file.h"
 #include "src/storage/workload_budget.h"
 
+#include <seastar/core/reactor.hh>
 #include <seastar/core/seastar.hh>
 #include <seastar/core/shared_ptr.hh>
 #include <seastar/core/with_scheduling_group.hh>
@@ -23,6 +24,76 @@ inline std::uint64_t measurement_time() noexcept {
       std::chrono::duration_cast<std::chrono::nanoseconds>(
         std::chrono::steady_clock::now().time_since_epoch())
         .count());
+}
+// What the shard itself issued: flushes of a durable handle that is not opened
+// for synchronized writes, native write requests, and the bytes those requests
+// asked to write. The counts are the shard's, so they cover every file it
+// touched in the interval, and a flush the file layer skipped is not in them.
+// Native reads and the bytes they asked for are counted when submitted.
+struct reactor_io final {
+    std::uint64_t flushes{0}, writes{0}, write_bytes{0}, reads{0},
+      read_bytes{0};
+    [[nodiscard]] static reactor_io now() noexcept {
+        const auto& stats = seastar::engine().get_io_stats();
+        return {
+          stats.fsyncs,
+          stats.aio_writes,
+          stats.aio_write_bytes,
+          stats.aio_reads,
+          stats.aio_read_bytes};
+    }
+    [[nodiscard]] reactor_io since(const reactor_io& before) const noexcept {
+        return {
+          flushes - before.flushes,
+          writes - before.writes,
+          write_bytes - before.write_bytes,
+          reads - before.reads,
+          read_bytes - before.read_bytes};
+    }
+};
+// Which barrier a timed region took. A flush that reaches no device is not a
+// barrier. A flush covers blocks written before, a first write into
+// preallocated space, or a write that extended the file. A zero-written run
+// whose writes were all synchronized by their handle takes no flush at all.
+enum class barrier_kind {
+    none,
+    overwrite,
+    first_write,
+    extending,
+    synchronized
+};
+constexpr const char* barrier_name(barrier_kind kind) noexcept {
+    switch (kind) {
+    case barrier_kind::none:
+        return "none";
+    case barrier_kind::overwrite:
+        return "overwrite";
+    case barrier_kind::first_write:
+        return "first_write";
+    case barrier_kind::extending:
+        return "extending";
+    case barrier_kind::synchronized:
+        return "synchronized";
+    }
+    return "invalid";
+}
+// A row may claim a flush only where the shard issued one, and synchronized
+// writes only where the writer completed one.
+constexpr bool barrier_evident(
+  barrier_kind kind,
+  const reactor_io& io,
+  std::uint64_t synchronized_writes) noexcept {
+    switch (kind) {
+    case barrier_kind::none:
+        return true;
+    case barrier_kind::synchronized:
+        return synchronized_writes != 0;
+    case barrier_kind::overwrite:
+    case barrier_kind::first_write:
+    case barrier_kind::extending:
+        return io.flushes != 0;
+    }
+    return false;
 }
 struct flush_measurement final {
     std::uint64_t begin{0}, end{0};

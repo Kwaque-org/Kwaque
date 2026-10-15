@@ -1257,15 +1257,25 @@ private:
       , held_(std::move(held))
       , slots_(config.maximum_segments)
       , rows_(obligation_rows(config))
+      , accepted_(reserved<group_state*>(config.maximum_requests))
+      , forming_(
+          reserved<detail::local_append_item_ptr>(maximum_wal_group_members))
       , execution_(config.policy, abort_)
       , preparation_(config.policy, abort_)
       , sink_(std::move(sink))
       , pressure_sink_(std::move(pressure))
       , tasks_([this](std::exception_ptr failure) noexcept {
           first_.observe(std::move(failure));
-      }) {
-        forming_.reserve(maximum_wal_group_members);
-        accepted_.reserve(config.maximum_requests);
+      }) {}
+
+    // An empty table with room for `count`. Every table is made before the
+    // task scope is: a scope may not be destroyed before it is closed, so
+    // nothing that can fail to allocate follows it in the constructor.
+    template<typename T>
+    static std::vector<T> reserved(std::size_t count) {
+        std::vector<T> table;
+        table.reserve(count);
+        return table;
     }
 
     static runtime::operation_error error(errc code) noexcept {

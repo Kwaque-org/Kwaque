@@ -8,17 +8,23 @@
 #include "src/storage/tests/wal_bench_file.h"
 #include "src/storage/wal_group_commit.h"
 
+#include <seastar/core/condition-variable.hh>
 #include <seastar/core/posix.hh>
 #include <seastar/core/reactor.hh>
 #include <seastar/core/sleep.hh>
 #include <seastar/core/thread_cputime_clock.hh>
+#include <seastar/core/timer.hh>
 #include <seastar/util/later.hh>
 #include <seastar/util/tmp_file.hh>
 
+#include <charconv>
 #include <cinttypes>
 #include <cstdio>
+#include <cstring>
+#include <deque>
 #include <fstream>
 #include <span>
+#include <string>
 #include <string_view>
 
 namespace kwaque::storage::testing {
@@ -119,6 +125,50 @@ std::array<char, 33> hex_digest(codec::content_digest digest) {
     }
     return result;
 }
+
+// How the saturation search steps its offered rate. Each value is the default
+// unless the environment sets a whole number within its bound.
+struct saturation_plan final {
+    // Requests a second at the first step, and what a first pass adds.
+    std::uint64_t first_rate, increment;
+    // A step plans this many requests, and more where they would not fill
+    // its shortest period.
+    std::uint64_t step_requests, step_milliseconds;
+    std::uint64_t maximum_steps;
+
+    static std::uint64_t
+    setting(const char* name, std::uint64_t fallback, std::uint64_t maximum) {
+        const char* text = std::getenv(name);
+        if (!text) return fallback;
+        std::uint64_t value = 0;
+        const char* end = text + std::strlen(text);
+        const auto parsed = std::from_chars(text, end, value);
+        if (
+          parsed.ec != std::errc{} || parsed.ptr != end || value == 0
+          || value > maximum)
+            throw std::runtime_error(
+              std::string{name} + " must be a whole number from 1 to "
+              + std::to_string(maximum));
+        return value;
+    }
+    static saturation_plan from_environment() {
+        return {
+          .first_rate = setting(
+            "KWAQUE_WAL_SATURATION_FIRST_RATE", 500, 1'000'000),
+          .increment = setting(
+            "KWAQUE_WAL_SATURATION_INCREMENT", 500, 1'000'000),
+          .step_requests = setting(
+            "KWAQUE_WAL_SATURATION_STEP_REQUESTS", 128, 4096),
+          .step_milliseconds = setting(
+            "KWAQUE_WAL_SATURATION_STEP_MILLISECONDS", 100, 10'000),
+          .maximum_steps = setting("KWAQUE_WAL_SATURATION_STEPS", 12, 24)};
+    }
+    // The bounds above keep every rate the search can reach, times a period
+    // in milliseconds, inside 64 bits.
+    [[nodiscard]] std::uint64_t planned(std::uint64_t rate) const noexcept {
+        return std::max(step_requests, (rate * step_milliseconds + 999) / 1000);
+    }
+};
 
 struct wal_commit_bench {
     wal_commit_bench() { wal_bench_support::initialize(); }
@@ -335,6 +385,7 @@ struct wal_commit_bench {
                           std::uint64_t elapsed = 0, reactor_cpu = 0,
                                         allocations = 0, tasks = 0,
                                         metadata_operations = 0;
+                          wal_bench_support::reactor_io reactor;
                           codec::testing::allocation_observation memory;
                           bool observe_allocations = false;
 #if !defined(KWAQUE_WAL_TIMING_ONLY)
@@ -422,6 +473,8 @@ struct wal_commit_bench {
                               const auto before_tasks = seastar::engine()
                                                           .get_sched_stats()
                                                           .tasks_processed;
+                              const auto before_reactor
+                                = wal_bench_support::reactor_io::now();
                               const auto before_metadata
                                 = files.statistics().accepted;
                               peak_admission = budget.snapshot().bytes;
@@ -687,6 +740,8 @@ struct wal_commit_bench {
                                         .get_sched_stats()
                                         .tasks_processed
                                       - before_tasks;
+                              reactor = wal_bench_support::reactor_io::now()
+                                          .since(before_reactor);
                               metadata_operations = files.statistics().accepted
                                                     - before_metadata;
                           } catch (...) {
@@ -777,6 +832,25 @@ struct wal_commit_bench {
                                         != stats.write_calls
                                       || stats.flush_calls == 0)),
                             "zero-written flush rule broken");
+                          // A zero-written run flushes only for an ordinary
+                          // write, over blocks written before; with none, its
+                          // cohorts were durable when their synchronized
+                          // writes completed. A fallocated setup extent takes
+                          // first writes, and the default profile grows the
+                          // file.
+                          const auto barrier
+                            = zero_written
+                                ? stats.flush_calls != 0
+                                    ? wal_bench_support::barrier_kind::overwrite
+                                    : wal_bench_support::barrier_kind::
+                                        synchronized
+                              : preallocate
+                                ? wal_bench_support::barrier_kind::first_write
+                                : wal_bench_support::barrier_kind::extending;
+                          require(
+                            wal_bench_support::barrier_evident(
+                              barrier, reactor, stats.synchronized_writes),
+                            "claimed barrier reached no device");
                           require(
                             !files.sample.write_times_overflowed,
                             "write measurement exceeded its bound");
@@ -916,7 +990,7 @@ struct wal_commit_bench {
                               == hex_digest(std::move(actual_hash).final()),
                             "benchmark byte digest mismatch");
                           std::printf(
-                            "wal_cohort_v2 "
+                            "wal_cohort_v1 "
                             "{\"owner\":\"%s\",\"case\":\"%s\",\"observation\":"
                             "\"%s\",\"size\":%zu,"
                             "\"fragmented\":%s,\"delay_ns\":%" PRIu64
@@ -1056,7 +1130,18 @@ struct wal_commit_bench {
                               first_cpu = false;
                           }
                           std::printf(
-                            "],\"reactor_cpu_ns\":%" PRIu64, reactor_cpu);
+                            "],\"reactor_cpu_ns\":%" PRIu64
+                            ",\"reactor_flushes\":%" PRIu64
+                            ",\"reactor_writes\":%" PRIu64
+                            ",\"reactor_write_bytes\":%" PRIu64
+                            ",\"synchronized_writes\":%" PRIu64
+                            ",\"barrier\":\"%s\"",
+                            reactor_cpu,
+                            reactor.flushes,
+                            reactor.writes,
+                            reactor.write_bytes,
+                            stats.synchronized_writes,
+                            wal_bench_support::barrier_name(barrier));
                           if constexpr (timing_only) {
                               std::puts(
                                 ",\"write_busy_ns\":null,\"write_max_service_"
@@ -1082,6 +1167,431 @@ struct wal_commit_bench {
         co_await registry.stop();
         take(failed.outcome());
         co_return count;
+    }
+
+    // Steps the rate at which one-request groups are offered to the
+    // coordinator at its defaults until what it reports durable falls short
+    // of what was planned. A step holds one rate for a period: requests are
+    // offered at their planned instants and never wait for a result, and one
+    // behind its plan is offered at once. A step fails when more than a tenth
+    // of its planned requests are not reported durable by the end of its
+    // period and one further period, or when none is. A refused request is
+    // counted and is not achieved. A pass raises the rate by the increment,
+    // doubled for each pass before it, and the first failing step ends the
+    // search. The runner's time covers the whole search and is no result;
+    // every rate is from this case's own clock.
+    seastar::future<std::size_t> saturate() {
+        const auto plan = saturation_plan::from_environment();
+        // The search grows one WAL file through ordinary writes, joins every
+        // result and observes nothing at the file.
+        for (const char* profile :
+             {"KWAQUE_WAL_AGGREGATE_TIMING",
+              "KWAQUE_WAL_COHORT_FIXTURE",
+              "KWAQUE_WAL_OBSERVE_ALLOCATIONS",
+              "KWAQUE_WAL_PREALLOCATE",
+              "KWAQUE_WAL_ZERO_WRITTEN"})
+            require(
+              std::getenv(profile) == nullptr,
+              "saturation runs the default profile only");
+        const auto configuration = resource::resource_config::from_total_memory(
+                                     byte_count{
+                                       seastar::memory::stats().total_memory()})
+                                     .value();
+        resource::resource_registry registry;
+        co_await registry.start(configuration);
+        resource::resource_manager manager{registry.handles()};
+        runtime::production::timer timer;
+        runtime::first_failure failed;
+        std::uint64_t offered_total = 0;
+        try {
+            co_await manager.start();
+            co_await seastar::tmp_dir::do_with(
+              runtime::testing::test_directory_template(),
+              seastar::coroutine::lambda(
+                [&](seastar::tmp_dir& directory) -> seastar::future<> {
+                    // The reactor's own counts stand for the device's work.
+                    wal_bench_support::file_system files{false};
+                    const auto root = take(
+                      runtime::file_path::make(
+                        (directory.get_path() / "store").string()));
+                    take(co_await files.create_directories(root));
+                    const auto status = co_await seastar::file_stat(
+                      root.value(), seastar::follow_symlink::no);
+                    const auto spec = store_contract::specification(
+                      root, {status.device_id, status.inode_number});
+                    const std::array specs{spec};
+                    store_contract::ownership_input owner{specs};
+                    workload_budget budget{
+                      manager.acquire_workload(
+                        resource::workload_class::metadata),
+                      {.tasks = 512,
+                       .bytes = byte_count{96_MiB},
+                       .handles = 32},
+                      charge};
+                    auto writer_config = wal_writer_contract::configuration();
+                    writer_config.capacity_bytes = byte_count{128_MiB};
+                    writer_config.children.working_bytes = byte_count{16_MiB};
+                    co_await wal_append_contract::with_writer(
+                      files,
+                      owner,
+                      spec,
+                      budget,
+                      commit_driver{},
+                      writer_config,
+                      [&](auto& writer, auto& work) -> seastar::future<> {
+                          auto child = co_await wal_bench_support::child(
+                            0, work);
+                          auto backing = take(
+                            budget.try_reserve_buffer(child.bytes()));
+                          std::optional<admitted_wal_batch> seed{take(
+                            admitted_wal_batch::make(
+                              std::move(child), std::move(backing), charge))};
+                          const auto expected
+                            = wal_writer_contract::child_context(
+                              spec.owner.cluster());
+                          const auto head = *writer.prepared_head();
+                          const wal_prepare_expectation initial{
+                            wal_write_context::make(
+                              head.incarnation,
+                              alignment(8192),
+                              runtime::file_position{8192})
+                              .value(),
+                            expected.target,
+                            expected.target_data_start,
+                            expected.routing_epoch,
+                            expected.batch,
+                            expected.profile,
+                            expected.target_profile};
+                          const auto encoded_size
+                            = preflight_wal_prepare(
+                                seed->batch(),
+                                initial,
+                                work.policy(),
+                                {runtime::maximum_file_io_bytes,
+                                 runtime::maximum_file_io_bytes})
+                                .value()
+                                .encoded_bytes();
+                          // The groups the file holds past its header. A step
+                          // that could outgrow it is not started, so the
+                          // writer never refuses one for room.
+                          const std::uint64_t room
+                            = (writer_config.capacity_bytes.value() - 8192)
+                              / encoded_size.value();
+                          // Offers are made outside a step, this many ahead.
+                          // A refusal before the writer is entered leaves its
+                          // offer whole for the next arrival, so only an
+                          // acceptance uses one up; a step that accepts more
+                          // than were ready makes the next in line.
+                          constexpr std::size_t ahead = 128;
+                          std::array<std::optional<wal_group>, ahead> offers{};
+                          std::array<std::optional<workload_reservation>, ahead>
+                            preparation{};
+                          std::size_t ready = 0;
+                          auto prepare =
+                            [&](std::size_t slot) -> seastar::future<> {
+                              auto pair = take(
+                                co_await prepare_wal_children(
+                                  std::move(*seed),
+                                  expected,
+                                  budget,
+                                  writer_config.children,
+                                  work));
+                              seed.reset();
+                              seed.emplace(std::move(pair.segment));
+                              preparation[slot].emplace(
+                                std::move(pair.preparation));
+                              offers[slot].emplace(
+                                take(wal_group::make(budget, 1)));
+                              take(
+                                offers[slot]->append(
+                                  std::move(pair.wal), expected));
+                          };
+                          std::unique_ptr<wal_group_commit> groups;
+                          // The coordinator's own defaults, which the
+                          // default_paced case spells out.
+                          const wal_group_commit_config cfg;
+                          cohort_timer batching{timer, false};
+                          auto submit = [&](wal_group& offer) {
+                              return groups->template submit<clock>(
+                                writer, std::move(offer), work);
+                          };
+                          // One step's counts. A result counts as completed
+                          // only when it is in before the step's deadline.
+                          struct step_counts final {
+                              std::uint64_t accepted{0}, refused{0},
+                                completed{0}, settled{0}, deadline{0};
+                          };
+                          step_counts step;
+                          seastar::condition_variable settled;
+                          // Ends a wait for results at the step's deadline.
+                          seastar::timer<> expiry{
+                            [&settled] { settled.signal(); }};
+                          // Results not yet joined, oldest first. The
+                          // coordinator bounds how many are outstanding.
+                          std::deque<seastar::future<>> joining;
+                          runtime::first_failure execution;
+                          // A failure is kept for the case; nothing escapes.
+                          // What its request's preparation reserved stays
+                          // held until the result is in.
+                          auto observe =
+                            [&](
+                              std::uint64_t end,
+                              seastar::future<wal_commit_result> pending,
+                              workload_reservation) -> seastar::future<> {
+                              try {
+                                  auto result = co_await std::move(pending);
+                                  const auto now = measurement_time();
+                                  take(result.failure().outcome());
+                                  require(
+                                    result.receipt().has_value()
+                                      && result.receipt()
+                                             ->boundary()
+                                             .cursor()
+                                             .position()
+                                             .value()
+                                           >= end,
+                                    "saturation result lacks a receipt "
+                                    "covering its request");
+                                  if (now < step.deadline) ++step.completed;
+                              } catch (...) {
+                                  execution.observe(std::current_exception());
+                              }
+                              ++step.settled;
+                              settled.signal();
+                          };
+                          bool measuring = false;
+                          std::uint64_t accepted_total = 0, steps = 0;
+                          std::optional<std::uint64_t> passing, failing;
+                          try {
+                              groups = take(
+                                wal_group_commit::make(writer, budget, cfg));
+                              take(groups->template start<clock>(batching));
+                              co_await files.register_io_class(budget);
+                              measuring = true;
+                              perf_tests::start_measuring_time();
+                              std::uint64_t rate = plan.first_rate, streak = 0;
+                              while (steps != plan.maximum_steps) {
+                                  const auto planned = plan.planned(rate);
+                                  if (planned > room - accepted_total) break;
+                                  for (; ready != ahead; ++ready)
+                                      co_await prepare(ready);
+                                  step = {};
+                                  const auto period = planned * 1'000'000'000
+                                                      / rate;
+                                  const auto before
+                                    = wal_bench_support::reactor_io::now();
+                                  const auto start = measurement_time();
+                                  step.deadline = start + 2 * period;
+                                  for (std::uint64_t i = 0; i != planned; ++i) {
+                                      const auto arrival = start
+                                                           + i * 1'000'000'000
+                                                               / rate;
+                                      if (
+                                        const auto now = measurement_time();
+                                        arrival > now)
+                                          co_await seastar::sleep<
+                                            std::chrono::steady_clock>(
+                                            std::chrono::nanoseconds{
+                                              static_cast<std::int64_t>(
+                                                arrival - now)});
+                                      if (ready == 0) {
+                                          co_await prepare(0);
+                                          ready = 1;
+                                      }
+                                      auto& offer = *offers[ready - 1];
+                                      auto accepted = co_await submit(offer);
+                                      if (!accepted) {
+                                          require(
+                                            accepted.error().code()
+                                              == errc::queue_full,
+                                            "unexpected benchmark admission "
+                                            "failure");
+                                          ++step.refused;
+                                          if (offer.size() == 0) --ready;
+                                          continue;
+                                      }
+                                      --ready;
+                                      ++step.accepted;
+                                      require(
+                                        accepted->encoded_bytes()
+                                          == encoded_size,
+                                        "coordinator changed the prepared "
+                                        "group extent");
+                                      joining.push_back(observe(
+                                        accepted->boundary()
+                                          .cursor()
+                                          .position()
+                                          .value(),
+                                        take(accepted->observe()),
+                                        std::move(*preparation[ready])));
+                                      while (!joining.empty()
+                                             && joining.front().available()) {
+                                          joining.front().get();
+                                          joining.pop_front();
+                                      }
+                                  }
+                                  // The rate is held for the whole period.
+                                  // What was accepted then has one further
+                                  // period to be reported.
+                                  for (auto now = measurement_time();
+                                       now < start + period;
+                                       now = measurement_time())
+                                      co_await seastar::sleep<
+                                        std::chrono::steady_clock>(
+                                        std::chrono::nanoseconds{
+                                          static_cast<std::int64_t>(
+                                            start + period - now)});
+                                  while (step.settled != step.accepted) {
+                                      const auto now = measurement_time();
+                                      if (now >= step.deadline) break;
+                                      expiry.cancel();
+                                      expiry.arm(
+                                        std::chrono::nanoseconds{
+                                          static_cast<std::int64_t>(
+                                            step.deadline - now)});
+                                      co_await settled.wait();
+                                  }
+                                  expiry.cancel();
+                                  const auto elapsed = measurement_time()
+                                                       - start;
+                                  const auto io
+                                    = wal_bench_support::reactor_io::now()
+                                        .since(before);
+                                  const auto completed = step.completed;
+                                  // A result that comes later is joined and
+                                  // not counted.
+                                  if (step.settled != step.accepted)
+                                      groups->force();
+                                  while (!joining.empty()) {
+                                      auto pending = std::move(joining.front());
+                                      joining.pop_front();
+                                      co_await std::move(pending);
+                                  }
+                                  take(execution.outcome());
+                                  require(
+                                    step.accepted + step.refused == planned
+                                      && step.settled == step.accepted
+                                      && completed <= step.accepted,
+                                    "saturation step lost count of a request");
+                                  // What the step calls durable was flushed
+                                  // by this shard inside the step.
+                                  require(
+                                    completed == 0 || io.flushes != 0,
+                                    "saturation step completed with no flush "
+                                    "at the device");
+                                  const bool pass
+                                    = completed != 0
+                                      && 10 * (planned - completed) <= planned;
+                                  ++steps;
+                                  offered_total += planned;
+                                  accepted_total += step.accepted;
+                                  std::printf(
+                                    "wal_saturation_v1 {\"row\":\"step\","
+                                    "\"step\":%" PRIu64
+                                    ",\"offered_rate\":%" PRIu64
+                                    ",\"achieved_rate\":%.3f"
+                                    ",\"offered\":%" PRIu64
+                                    ",\"accepted\":%" PRIu64
+                                    ",\"refused\":%" PRIu64
+                                    ",\"completed\":%" PRIu64
+                                    ",\"elapsed_ns\":%" PRIu64 ",\"pass\":%s"
+                                    ",\"reactor_flushes\":%" PRIu64
+                                    ",\"reactor_writes\":%" PRIu64
+                                    ",\"reactor_write_bytes\":%" PRIu64 "}\n",
+                                    steps,
+                                    rate,
+                                    static_cast<double>(completed) * 1e9
+                                      / static_cast<double>(elapsed),
+                                    planned,
+                                    step.accepted,
+                                    step.refused,
+                                    completed,
+                                    elapsed,
+                                    pass ? "true" : "false",
+                                    io.flushes,
+                                    io.writes,
+                                    io.write_bytes);
+                                  if (!pass) {
+                                      failing = rate;
+                                      break;
+                                  }
+                                  passing = rate;
+                                  rate += plan.increment << streak;
+                                  ++streak;
+                              }
+                              perf_tests::stop_measuring_time();
+                              measuring = false;
+                          } catch (...) {
+                              execution.observe(std::current_exception());
+                          }
+                          if (measuring) perf_tests::stop_measuring_time();
+                          if (groups) {
+                              try {
+                                  execution.observe(co_await groups->close());
+                              } catch (...) {
+                                  execution.observe(std::current_exception());
+                              }
+                          }
+                          while (!joining.empty()) {
+                              auto pending = std::move(joining.front());
+                              joining.pop_front();
+                              try {
+                                  co_await std::move(pending);
+                              } catch (...) {
+                                  execution.observe(std::current_exception());
+                              }
+                          }
+                          groups.reset();
+                          take(execution.outcome());
+                          require(
+                            steps != 0,
+                            "saturation settings leave no room for a first "
+                            "step");
+                          require(
+                            writer.statistics().accepted_groups
+                              == accepted_total,
+                            "offered work accounting lost an accepted group");
+                          // No failing step inside the bound claims no limit;
+                          // the bound is the step count or the file's room.
+                          std::printf(
+                            "wal_saturation_v1 {\"row\":\"final\","
+                            "\"outcome\":\"%s\",\"steps\":%" PRIu64,
+                            failing ? "limit" : "not_reached",
+                            steps);
+                          if (failing && passing)
+                              std::printf(
+                                ",\"last_passing_rate\":%" PRIu64, *passing);
+                          if (failing)
+                              std::printf(
+                                ",\"first_failing_rate\":%" PRIu64, *failing);
+                          else
+                              std::printf(
+                                ",\"bound\":\"%s\"",
+                                steps == plan.maximum_steps ? "steps" : "room");
+                          std::printf(
+                            ",\"first_rate\":%" PRIu64 ",\"increment\":%" PRIu64
+                            ",\"step_requests\":%" PRIu64
+                            ",\"step_ns\":%" PRIu64
+                            ",\"maximum_steps\":%" PRIu64 "}\n",
+                            plan.first_rate,
+                            plan.increment,
+                            plan.step_requests,
+                            plan.step_milliseconds * 1'000'000,
+                            plan.maximum_steps);
+                      });
+                }));
+        } catch (...) {
+            failed.observe(std::current_exception());
+        }
+        try {
+            take(co_await timer.stop());
+        } catch (...) {
+            failed.observe(std::current_exception());
+        }
+        co_await manager.stop();
+        co_await registry.stop();
+        take(failed.outcome());
+        co_return offered_total;
     }
 };
 } // namespace
@@ -1142,6 +1652,7 @@ PERF_TEST_F(wal_commit_bench, default_paced) {
             4_MiB,
             2>());
 }
+PERF_TEST_F(wal_commit_bench, default_saturation) { return (saturate()); }
 PERF_TEST_F(wal_commit_bench, byte_target_zero) {
     return (
       measure<true, 128_KiB, false, 0, arrival_profile::burst, 32, 256_KiB>());

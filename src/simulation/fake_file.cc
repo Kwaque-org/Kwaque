@@ -36,6 +36,9 @@ constexpr invariant_id fake_storage_transaction_invariant{
   "KQ-FAKE-STORAGE-TRANSACTION"};
 constexpr invariant_id fake_storage_drained_invariant{
   "KQ-FAKE-STORAGE-DRAINED"};
+// Precedes a crash policy's chosen survivors where they are hashed. No field
+// hashed in its place takes this value.
+constexpr std::uint64_t namespace_survivors_tag{UINT64_C(0x6e616d6573757276)};
 
 [[nodiscard]] runtime::operation_error file_error(errc code) noexcept {
     return runtime::operation_error{code, runtime::operation_kind::file};
@@ -1203,7 +1206,8 @@ fake_file_system::validate_config(const fake_file_system_config& config) {
           || policy.maximum_namespace_groups == 0
           || policy.maximum_namespace_groups > 4096
           || policy.maximum_scratch_bytes.value() < 16_KiB
-          || policy.maximum_scratch_bytes > maximum_fake_pending_bytes)
+          || policy.maximum_scratch_bytes > maximum_fake_pending_bytes
+          || (policy.namespace_survivors && policy.namespace_percent != 0))
             return runtime::failure(file_error(errc::invalid_argument));
     }
     if (
@@ -1349,6 +1353,11 @@ runtime::result<std::unique_ptr<fake_file_system>> fake_file_system::make(
             field(policy.granule_bytes);
             field(policy.maximum_namespace_groups);
             field(policy.maximum_scratch_bytes.value());
+            // Only when it is set: a policy without it hashes as before.
+            if (policy.namespace_survivors) {
+                field(namespace_survivors_tag);
+                field(*policy.namespace_survivors);
+            }
         }
         field(config.space_override.has_value());
         if (config.space_override) {
@@ -3292,6 +3301,10 @@ fake_file_system::run_selective_crash(fake_operation_id active) {
         word(policy.eof_percent);
         word(policy.namespace_percent);
         word(policy.granule_bytes);
+        if (policy.namespace_survivors) {
+            word(namespace_survivors_tag);
+            word(*policy.namespace_survivors);
+        }
         auto required = [&](std::uint64_t object) {
             if (!state.required.contains(object)) {
                 state.charge(128, policy.maximum_scratch_bytes.value());
@@ -3302,16 +3315,23 @@ fake_file_system::run_selective_crash(fake_operation_id active) {
         // requires the preceding prefix on every participating directory/inode.
         // This keeps a rename's two endpoints and ancestor dependencies
         // together.
+        auto position = namespace_history_.size();
         for (auto& group : std::views::reverse(namespace_history_)) {
             check();
-            bool keep = storage_survives(
-              faults_->master_seed(),
-              {(config_.device_scope << 8U) | 0x82U,
-               group.first,
-               original_generation,
-               0,
-               state.epoch},
-              policy.namespace_percent);
+            --position;
+            bool keep = policy.namespace_survivors
+                          ? position < 64U
+                              && ((*policy.namespace_survivors >> position)
+                                  & 1U)
+                                   != 0
+                          : storage_survives(
+                              faults_->master_seed(),
+                              {(config_.device_scope << 8U) | 0x82U,
+                               group.first,
+                               original_generation,
+                               0,
+                               state.epoch},
+                              policy.namespace_percent);
             for (const auto& change : group.second.changes) {
                 if (!change) continue;
                 const auto& directory = std::get<directory_state>(
@@ -4285,7 +4305,7 @@ runtime::result<void> fake_file_system::validate_submission(
   byte_count retained_bytes,
   std::uint64_t retained_path_bytes,
   bool open_slot) const noexcept {
-    if (state_ == fake_file_system_state::crashing) {
+    if (state_ == fake_file_system_state::crashing || down_) {
         return runtime::failure(file_error(errc::unavailable));
     }
     if (state_ != fake_file_system_state::open) {
@@ -4348,6 +4368,37 @@ bool fake_file_system::is_read_operation(pending_kind kind) noexcept {
 
 bool fake_file_system::is_write_operation(pending_kind kind) noexcept {
     return kind == pending_kind::write;
+}
+
+bool fake_file_system::changes_device(pending_kind kind) noexcept {
+    switch (kind) {
+    case pending_kind::open:
+    case pending_kind::create_directories:
+    case pending_kind::remove_file:
+    case pending_kind::remove_directory:
+    case pending_kind::rename:
+    case pending_kind::sync_directory:
+    case pending_kind::write:
+    case pending_kind::flush:
+    case pending_kind::truncate:
+    case pending_kind::close:
+    case pending_kind::cursor_sync:
+        return true;
+    case pending_kind::exists:
+    case pending_kind::stat:
+    case pending_kind::list:
+    case pending_kind::read:
+    case pending_kind::bulk_read:
+    case pending_kind::size:
+    case pending_kind::crash_control:
+    case pending_kind::space:
+    case pending_kind::cursor_open:
+    case pending_kind::cursor_next:
+    case pending_kind::cursor_close:
+    case pending_kind::count:
+        break;
+    }
+    return false;
 }
 
 runtime::monotonic_duration fake_file_system::operation_latency(
@@ -4825,6 +4876,7 @@ void fake_file_system::complete(fake_operation_id id) noexcept {
         auto result = operation.fault.file_failure()
                         ? apply_file_failure(operation)
                         : apply(operation);
+        if (changes_device(operation.kind)) ++device_changes_;
         if (
           operation.phase == pending_phase::crash_apply_scheduled
           || operation.phase == pending_phase::partial_resize_apply_scheduled) {

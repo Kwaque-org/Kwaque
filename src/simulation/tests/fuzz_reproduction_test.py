@@ -201,14 +201,14 @@ class FuzzReproductionTest(unittest.TestCase):
         return "\n".join(lines) + "\n"
 
     @staticmethod
-    def obsolete_harness_with_valid_integrity(block: str) -> str:
+    def other_harness_with_valid_integrity(block: str) -> str:
         lines = block.splitlines()
         version = next(
             index
             for index, line in enumerate(lines)
             if line.startswith("HARNESS_VERSION ")
         )
-        lines[version] = "HARNESS_VERSION 00000001"
+        lines[version] = "HARNESS_VERSION 00000002"
         return FuzzReproductionTest.refresh_envelope_integrity(lines)
 
     def test_semantic_failure_is_complete_host_independent_and_replayable(self) -> None:
@@ -243,7 +243,7 @@ class FuzzReproductionTest(unittest.TestCase):
             emitted_digest, "EVENT_DIGEST " + hashlib.sha256(event_bytes).hexdigest()
         )
         self.assertIn("OUTCOME_CODE 00000010", block)
-        self.assertIn("HARNESS_VERSION 00000002", block)
+        self.assertIn("HARNESS_VERSION 00000001", block)
         rooted_home = os.sep.join(("", "home", ""))
         rooted_users = os.sep.join(("", "Users", ""))
         self.assertNotIn(rooted_home, block)
@@ -262,7 +262,7 @@ class FuzzReproductionTest(unittest.TestCase):
 
         bad_header = block.replace("KQREPRO 01", "KQREPRO 02", 1)
         self.assert_replay_exit(bad_header, 2)
-        self.assert_replay_exit(self.obsolete_harness_with_valid_integrity(block), 2)
+        self.assert_replay_exit(self.other_harness_with_valid_integrity(block), 2)
 
         for key in (
             "HARNESS",

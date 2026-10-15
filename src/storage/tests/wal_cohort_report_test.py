@@ -6,7 +6,9 @@ from pathlib import Path
 
 from src.storage.tests.wal_cohort_report import (
     PREFIX,
+    REACTOR_KEYS,
     compare,
+    durable_times,
     percentile,
     read_measurements,
     summarize,
@@ -82,6 +84,38 @@ def measurement():
             },
         ],
     }
+
+
+def counted(**changes):
+    """A row from a binary that prints what the reactor issued. The setup
+    extent was fallocated, so its one cohort flushed a first write."""
+    row = measurement()
+    row.update(
+        reactor_flushes=1,
+        reactor_writes=2,
+        reactor_write_bytes=16384,
+        synchronized_writes=0,
+        barrier="first_write",
+    )
+    row.update(changes)
+    return row
+
+
+def synchronized(**changes):
+    """A zero-written run whose one write was synchronized by its handle."""
+    row = counted(
+        zero_written=True,
+        zero_written_extent=2097152,
+        flushes=0,
+        flush_times=[],
+        flush_service_ns=0,
+        write_times=[[8192, 16384, 20, 50, True]],
+        reactor_flushes=0,
+        synchronized_writes=1,
+        barrier="synchronized",
+    )
+    row.update(changes)
+    return row
 
 
 def aggregate_measurement():
@@ -369,6 +403,130 @@ class ReportTest(unittest.TestCase):
             compare([measurement()], [other])["median_elapsed_ratio_right_over_left"],
             1.5,
         )
+
+    def test_reactor_counts_are_optional_and_complete_when_present(self):
+        # A row recorded before the counts were printed still loads.
+        validate(measurement())
+        validate(counted())
+        for key in REACTOR_KEYS:
+            row = counted()
+            row.pop(key)
+            with (
+                self.subTest(missing=key),
+                self.assertRaisesRegex(ValueError, "incomplete reactor counts"),
+            ):
+                validate(row)
+        for key in REACTOR_KEYS[:-1]:
+            for invalid in (-1, None, True, 1.5, "1"):
+                with (
+                    self.subTest(key=key, value=invalid),
+                    self.assertRaisesRegex(ValueError, "invalid reactor counts"),
+                ):
+                    validate(counted(**{key: invalid}))
+        for invalid in ("fsync", "", None, 1):
+            with (
+                self.subTest(barrier=invalid),
+                self.assertRaisesRegex(ValueError, "unknown barrier"),
+            ):
+                validate(counted(barrier=invalid))
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "run.log"
+            row = counted()
+            profile = "kwaque-benchmark-profile-v1 " + " ".join(
+                f"{k}={v}" for k, v in row.pop("build_profile").items()
+            )
+            path.write_text(profile + "\n" + PREFIX + json.dumps(row) + "\n")
+            self.assertEqual(read_measurements(path)[0]["barrier"], "first_write")
+
+    def test_barrier_agrees_with_the_rows_own_conditions(self):
+        validate(counted(preallocated=False, barrier="extending"))
+        validate(synchronized())
+        # An ordinary write in a zero-written file is covered by a flush over
+        # blocks written before.
+        validate(
+            synchronized(
+                flushes=1,
+                flush_times=[[55, 70]],
+                flush_service_ns=15,
+                write_times=[[8192, 16384, 20, 50, False]],
+                reactor_flushes=1,
+                synchronized_writes=0,
+                barrier="overwrite",
+            )
+        )
+        for row in (
+            counted(barrier="extending"),
+            counted(barrier="overwrite"),
+            counted(barrier="synchronized"),
+            # Every completed cohort took a barrier.
+            counted(barrier="none"),
+            counted(preallocated=False),
+            synchronized(barrier="overwrite"),
+            synchronized(barrier="first_write"),
+        ):
+            with (
+                self.subTest(barrier=row["barrier"]),
+                self.assertRaisesRegex(ValueError, "barrier disagrees"),
+            ):
+                validate(row)
+
+    def test_claimed_barrier_needs_a_flush_or_a_synchronized_write(self):
+        # The writer counted a flush that the reactor never issued.
+        with self.assertRaisesRegex(ValueError, "reached no device"):
+            validate(counted(reactor_flushes=0))
+        with self.assertRaisesRegex(ValueError, "reached no device"):
+            validate(
+                counted(preallocated=False, barrier="extending", reactor_flushes=0)
+            )
+        with self.assertRaisesRegex(ValueError, "reached no device"):
+            validate(synchronized(synchronized_writes=0))
+        # A flush elsewhere on the shard does not stand in for the writes.
+        with self.assertRaisesRegex(ValueError, "reached no device"):
+            validate(synchronized(synchronized_writes=0, reactor_flushes=3))
+        # Only a zero-written file has a synchronized handle, and no more
+        # writes are synchronized than were made.
+        with self.assertRaisesRegex(ValueError, "synchronized writes disagree"):
+            validate(counted(synchronized_writes=1))
+        with self.assertRaisesRegex(ValueError, "synchronized writes disagree"):
+            validate(synchronized(synchronized_writes=2))
+
+    def test_cohorts_are_durable_only_from_rows_that_show_a_barrier(self):
+        summary = summarize([counted(), counted(reactor_flushes=4)])
+        self.assertEqual(summary["durable_cohorts"], 2)
+        self.assertEqual(summary["barriers"], ["first_write"])
+        self.assertEqual([summary[key] for key in REACTOR_KEYS[:-1]], [5, 4, 32768, 0])
+        # The timing binary observes nothing at the file. Its row now carries
+        # the reactor's count, which is evidence it could not show before.
+        timing = counted(timing_only=True, flush_times=[])
+        validate(timing)
+        self.assertEqual(summarize([timing])["durable_cohorts"], 1)
+        validate(synchronized())
+        self.assertEqual(summarize([synchronized()])["durable_cohorts"], 1)
+        # An earlier row shows its writer's flush count and no more.
+        earlier = summarize([measurement()])
+        self.assertEqual(earlier["durable_cohorts"], 1)
+        self.assertNotIn("barriers", earlier)
+        self.assertNotIn("reactor_flushes", earlier)
+        # An earlier zero-written timing row shows neither a flush nor a
+        # write. It still loads, and none of its cohorts is called durable.
+        unshown = measurement()
+        unshown.update(timing_only=True, zero_written=True, flushes=0, flush_times=[])
+        validate(unshown)
+        self.assertEqual(summarize([unshown])["durable_cohorts"], 0)
+        with self.assertRaisesRegex(ValueError, "stands behind a cohort"):
+            durable_times(unshown, [(0, 24576)])
+
+    def test_reactor_counts_and_barrier_are_part_of_pair_identity(self):
+        self.assertEqual(
+            compare([counted()], [counted(reactor_writes=9)])[
+                "median_elapsed_ratio_right_over_left"
+            ],
+            1,
+        )
+        with self.assertRaisesRegex(ValueError, "comparison changed"):
+            compare([counted()], [measurement()])
+        with self.assertRaisesRegex(ValueError, "reactor count"):
+            summarize([counted(), measurement()])
 
     def test_timing_profile_does_not_invent_native_components(self):
         row = measurement()

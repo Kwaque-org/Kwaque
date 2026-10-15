@@ -411,7 +411,7 @@ def kwaque_cc_fuzz_test(
         srcs = srcs,
         args = ["$(rootpath {})".format(seed) for seed in corpus],
         copts = kwaque_copts(),
-        data = corpus + _SANITIZER_DATA,
+        data = corpus + data + _SANITIZER_DATA,
         deps = deps + ["//bazel:fuzz_corpus_replay"],
         env = _test_env(env),
         features = ["layering_check"],

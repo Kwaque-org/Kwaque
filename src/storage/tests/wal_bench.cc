@@ -306,6 +306,8 @@ struct wal_bench {
                                                    .tasks_processed;
                               const auto allocations
                                 = seastar::memory::stats().mallocs();
+                              const auto reactor_before
+                                = wal_bench_support::reactor_io::now();
                               const auto metadata_operations
                                 = files.statistics().accepted;
                               files.sample.noop = Noop;
@@ -455,6 +457,14 @@ struct wal_bench {
                                       allocation_threshold.reset();
                                   }
                               }
+                              // A flush the decorator discards reaches no
+                              // device: the region ends at it and no barrier
+                              // was taken.
+                              constexpr const char* boundary
+                                = Rotation   ? "rotation"
+                                  : !Barrier ? "written"
+                                  : Noop     ? "discarded_flush"
+                                             : "wal_barrier";
                               if (exact_observation) {
                                   if (!memory.observed || !memory.complete) {
                                       std::printf(
@@ -468,9 +478,7 @@ struct wal_bench {
                                         : Reference ? "codec_runtime"
                                                     : "writer",
                                         Noop ? "noop" : "disk",
-                                        Rotation  ? "rotation"
-                                        : Barrier ? "wal_barrier"
-                                                  : "written",
+                                        boundary,
                                         unsigned(memory.observed),
                                         unsigned(memory.complete),
                                         memory.allocations,
@@ -496,6 +504,27 @@ struct wal_bench {
                               const auto mallocs
                                 = seastar::memory::stats().mallocs()
                                   - allocations;
+                              const auto reactor
+                                = wal_bench_support::reactor_io::now().since(
+                                  reactor_before);
+                              // The writer's default profile grows its file
+                              // through writes; a fallocated setup extent takes
+                              // the first write into it instead.
+                              const auto barrier
+                                = !Barrier || Noop
+                                    ? wal_bench_support::barrier_kind::none
+                                  : preallocate ? wal_bench_support::
+                                                    barrier_kind::first_write
+                                                : wal_bench_support::
+                                                    barrier_kind::extending;
+                              std::uint64_t synchronized_writes = 0;
+                              if constexpr (!Reference)
+                                  synchronized_writes
+                                    = writer.statistics().synchronized_writes;
+                              require(
+                                wal_bench_support::barrier_evident(
+                                  barrier, reactor, synchronized_writes),
+                                "claimed barrier reached no device");
                               const auto sample = files.sample;
                               if constexpr (
                                 !Rotation && (!timing_only || Noop)) {
@@ -525,14 +554,11 @@ struct wal_bench {
                                         "wal_cost owner=%s storage=disk "
                                         "boundary=%s encoded_bytes=%" PRIu64
                                         " allocations=%" PRIu64
-                                        " tasks=%" PRIu64
-                                        " native_observed=0\n",
+                                        " tasks=%" PRIu64 " native_observed=0",
                                         Preencoded  ? "runtime_preencoded"
                                         : Reference ? "codec_runtime"
                                                     : "writer",
-                                        Rotation  ? "rotation"
-                                        : Barrier ? "wal_barrier"
-                                                  : "written",
+                                        boundary,
                                         encoded_bytes.value(),
                                         mallocs,
                                         elapsed_tasks);
@@ -553,15 +579,12 @@ struct wal_bench {
                                         " allocations=%" PRIu64
                                         " tasks=%" PRIu64
                                         " retained_admission=%" PRIu64
-                                        " staging_copy_upper_bound=%" PRIu64
-                                        "\n",
+                                        " staging_copy_upper_bound=%" PRIu64,
                                         Preencoded  ? "runtime_preencoded"
                                         : Reference ? "codec_runtime"
                                                     : "writer",
                                         Noop ? "noop" : "disk",
-                                        Rotation  ? "rotation"
-                                        : Barrier ? "wal_barrier"
-                                                  : "written",
+                                        boundary,
                                         child_size.value(),
                                         child_fragments,
                                         expected.fragment_count(),
@@ -576,6 +599,20 @@ struct wal_bench {
                                         elapsed_tasks,
                                         retained,
                                         sample.bytes);
+                                  std::printf(
+                                    " reactor_flushes=%" PRIu64
+                                    " reactor_writes=%" PRIu64
+                                    " reactor_write_bytes=%" PRIu64
+                                    " barrier=%s",
+                                    reactor.flushes,
+                                    reactor.writes,
+                                    reactor.write_bytes,
+                                    wal_bench_support::barrier_name(barrier));
+                                  if constexpr (!Reference)
+                                      std::printf(
+                                        " synchronized_writes=%" PRIu64,
+                                        synchronized_writes);
+                                  std::printf("\n");
                                   std::printf(
                                     "wal_cooperation foreground_turns=%" PRIu64
                                     " metadata_operations=%" PRIu64 "\n",

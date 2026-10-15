@@ -200,7 +200,7 @@ seastar::future<std::int64_t> report_timestamp(
                        status.time_changed.time_since_epoch())
                        .count();
     if (
-      status.size < detail::crash_v1_header_size
+      status.size < detail::crash_header_size
       || status.size > detail::crash_serialization_capacity) {
         co_return timestamp;
     }

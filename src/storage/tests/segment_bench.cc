@@ -549,7 +549,7 @@ void print_measurement(
     }
     const auto digest = hex_digest(input.front().proof->digest()->bytes());
     std::printf(
-      "segment_bench_v4 "
+      "segment_bench_v1 "
       "{\"scope\":\"%s\",\"case\":\"%s\",\"encoding\":\"%s\",\"digest\":\"%s\","
       "\"comparison_id\":\"%.*s\"",
       scope(op),

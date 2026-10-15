@@ -72,11 +72,14 @@ jobs:
           --build_tag_filters=-fuzz,-manual
           //...
 
-      - name: Verify optimized runtime, process policy and determinism goldens
+      - name: Verify optimized runtime, process policy, goldens and storage
         id: tests
         run: >-
           bazel test --config=ci-release
           --cache_test_results=no
+          //src/storage/suites:local_storage_tests
+          //src/storage/suites:storage_backend_tests
+          //src/storage/suites:storage_golden_tests
           //bazel/tests:seastar_gtest
           //src/runtime/tests:reactor_smoke_test
           //src/runtime/tests:runtime_metrics_test
@@ -200,7 +203,7 @@ jobs:
   goldens:
     # The other runner and build combinations execute the same suite inside
     # the test, build and arm-build jobs.
-    name: Determinism goldens (aarch64, debug)
+    name: Goldens and native storage (aarch64, debug)
     needs: workflow-lint
     if: needs.workflow-lint.outputs.run_checks != 'false'
     runs-on: ubuntu-24.04-arm
@@ -211,11 +214,16 @@ jobs:
         with:
           persist-credentials: false
       - uses: ./.github/actions/setup-build
-      - name: Execute the canonical golden suite
+      # The native storage tests open files through Linux AIO beside each other.
+      - name: Allow concurrent linux-aio reactors
+        run: sudo sysctl -w fs.aio-max-nr=1048576
+      - name: Execute the canonical golden suite and the native storage suite
         id: tests
         run: >-
           bazel test --config=ci-debug
           --cache_test_results=no
+          //src/storage/suites:storage_golden_tests
+          //src/storage/suites:storage_backend_tests
           //src/simulation/tests:determinism_goldens
           //src/storage/tests:format_tests
           //src/model/tests:checkpoint_tests
@@ -405,15 +413,19 @@ jobs:
       - name: Allow concurrent linux-aio reactors
         run: sudo sysctl -w fs.aio-max-nr=1048576
       - name: Build all ordinary targets
+        # The simulated storage tests run on x86-64; compiling the largest of
+        # them here has taken the runner down.
         run: >-
           bazel build --config=ci-release
-          --build_tag_filters=-fuzz,-manual
+          --build_tag_filters=-fuzz,-manual,-simulated_storage
           //...
-      - name: Test deterministic runtime and goldens on aarch64 release
+      - name: Test deterministic runtime, goldens and native storage on aarch64 release
         id: tests
         run: >-
           bazel test --config=ci-release
           --cache_test_results=no
+          //src/storage/suites:storage_golden_tests
+          //src/storage/suites:storage_backend_tests
           //src/simulation/tests:determinism_goldens
           //src/compression/tests:format_fixture_test
           //tools:verify_format_fixtures_test
@@ -465,7 +477,7 @@ jobs:
         run: >-
           bazel test --config=ci-release
           --//bazel:reactor_backend=linux-aio
-          --build_tag_filters=-fuzz,-manual
+          --build_tag_filters=-fuzz,-manual,-simulated_storage
           --test_tag_filters=package,smoke,fuzz_replay
           //...
 

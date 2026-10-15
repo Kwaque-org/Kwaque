@@ -98,7 +98,7 @@ trace_entry fault_entry(
 }
 
 constexpr std::string_view golden_trace
-  = "KQTR 0a 0000000000000000 00000001 00000001 00000001 00000004 "
+  = "KQTR 01 0000000000000000 00000001 00000001 00000001 00000004 "
     "0000000000000004 0000000000000008 0000000000000064 00000004 "
     "0000000000001000 00000400 0000000000000001 "
     "0000000000000000000000000000000000000000000000000000000000000000 "
@@ -111,7 +111,7 @@ constexpr std::string_view golden_trace
 static_assert(canonical_header_encoded_size == 294);
 static_assert(canonical_entry_encoded_size == 244);
 static_assert(golden_trace.size() == 538);
-static_assert(kwaque::simulation::event_trace_schema_version == 10);
+static_assert(kwaque::simulation::event_trace_schema_version == 1);
 static_assert(kwaque::runtime::builtin_fault_points.size() == 31);
 static_assert(
   kwaque::runtime::fault_action::partial_resize
@@ -220,9 +220,9 @@ TEST(EventTraceTest, EncodingAndParsingMatchTheCanonicalGoldenFixture) {
     ASSERT_TRUE(encoded_text.has_value());
     EXPECT_EQ(*encoded_text, golden_trace);
     constexpr kwaque::codec::sha256_digest expected_hash{
-      0xa2, 0xe8, 0x52, 0x27, 0x0e, 0x7d, 0xb9, 0x10, 0x93, 0x78, 0xe7,
-      0x32, 0xa7, 0x94, 0xce, 0xdf, 0x04, 0xd0, 0xc1, 0xee, 0xf8, 0x06,
-      0x47, 0xbb, 0x89, 0x3b, 0xf5, 0xb5, 0x0f, 0x52, 0xe4, 0xec};
+      0xfb, 0xcd, 0x27, 0xd9, 0x67, 0x43, 0x64, 0xcc, 0xdd, 0x4d, 0xa9,
+      0xb1, 0x65, 0x60, 0x4a, 0x32, 0xea, 0x56, 0x02, 0x19, 0x95, 0xc8,
+      0x29, 0x96, 0x8c, 0x2c, 0x8b, 0x57, 0xff, 0x08, 0xe7, 0x80};
     kwaque::codec::sha256_hasher hasher;
     for (const auto& chunk : encoded->chunks()) {
         hasher.update(chunk.data(), chunk.size());
@@ -232,10 +232,10 @@ TEST(EventTraceTest, EncodingAndParsingMatchTheCanonicalGoldenFixture) {
     EXPECT_EQ(encoded_text->find("/home/"), std::string::npos);
     EXPECT_EQ(encoded_text->find('\n'), canonical_header_encoded_size - 1U);
 
-    for (const char version : {'1', '2', '3', '4', '5', '6', '7', '8'}) {
-        auto old_version = *encoded_text;
-        old_version[6] = version;
-        EXPECT_FALSE(event_trace::decode(old_version, limits).has_value());
+    for (const char version : {'0', '2', '3', '4', '5', '6', '7', '8', '9'}) {
+        auto other_version = *encoded_text;
+        other_version[6] = version;
+        EXPECT_FALSE(event_trace::decode(other_version, limits).has_value());
     }
 
     const auto decoded = event_trace::decode(*encoded, limits);

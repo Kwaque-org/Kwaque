@@ -1,0 +1,19 @@
+#include "src/runtime/testing/seastar_fuzz.h"
+#include "src/storage/tests/local_metadata_fuzz_cases.h"
+
+#include <cstddef>
+#include <cstdint>
+#include <utility>
+#include <vector>
+
+extern "C" int
+LLVMFuzzerTestOneInput(const std::uint8_t* data, std::size_t size) {
+    if (size > kwaque::storage::testing::local_metadata_fuzz_max_input)
+        return 0;
+    std::vector<std::uint8_t> owned;
+    if (size != 0) owned.assign(data, data + size);
+    kwaque::runtime::testing::run_fuzz_input([owned = std::move(owned)] {
+        kwaque::storage::testing::exercise_local_metadata_case(owned);
+    });
+    return 0;
+}

@@ -3,6 +3,7 @@ load(
     "//bazel:test.bzl",
     "kwaque_cc_benchmark",
     "kwaque_cc_fuzz_test",
+    "kwaque_cc_seastar_gtest",
     "kwaque_cc_seastar_test",
     "kwaque_cc_test",
     "kwaque_fuzz_signal_canary_test",
@@ -15,6 +16,7 @@ kwaque_cc_seastar_test(
     name = "storage_completion_test",
     srcs = ["storage_completion_test.cc"],
     memory = "256MiB",
+    tags = ["simulated_storage"],
     deps = [
         "//src/base",
         "//src/base:error",
@@ -43,6 +45,45 @@ test_suite(
         "//src/observability:event_codec_goldens",
     ],
     visibility = ["//visibility:public"],
+)
+
+# Parts of the storage suites, manual as the suites are (src/storage/suites).
+# The storage contracts, histories and sweeps on the simulated file system.
+test_suite(
+    name = "storage_crash_tests",
+    tags = ["manual"],
+    tests = [
+        ":engine_history_test",
+        ":local_append_test",
+        ":local_publication_test",
+        ":local_store_test",
+        ":storage_completion_test",
+        ":storage_history_fuzz_cases_test",
+        ":storage_recovery_fuzz_cases_test",
+        ":wal_writer_test",
+    ],
+    visibility = ["//src/storage/suites:__pkg__"],
+)
+
+# The store a fixed history leaves, and the engine on the checked-in store image.
+test_suite(
+    name = "storage_golden_tests",
+    tags = ["manual"],
+    tests = [
+        ":engine_golden_test",
+    ],
+    visibility = ["//src/storage/suites:__pkg__"],
+)
+
+# The engine at the writable bound with churn, and failed allocations swept through it.
+test_suite(
+    name = "storage_scale_tests",
+    tags = ["manual"],
+    tests = [
+        ":engine_allocation_test",
+        ":engine_churn_test",
+    ],
+    visibility = ["//src/storage/suites:__pkg__"],
 )
 
 kwaque_cc_library(
@@ -759,6 +800,7 @@ kwaque_cc_seastar_test(
 kwaque_cc_seastar_test(
     name = "local_publication_test",
     srcs = ["local_publication_test.cc"],
+    tags = ["simulated_storage"],
     deps = [
         "//src/base",
         "//src/base:error",
@@ -781,6 +823,218 @@ kwaque_cc_seastar_test(
     ],
 )
 
+kwaque_cc_library(
+    name = "local_store_fixture",
+    testonly = True,
+    hdrs = ["local_store_fixture.h"],
+    deps = [
+        "//src/base",
+        "//src/bytes:allocation_test_profile",
+        "//src/resource:resource_manager",
+        "//src/resource:workload_class",
+        "//src/runtime:file",
+        "//src/runtime/testing:reactor_tasks",
+        "//src/simulation:environment",
+        "//src/simulation:fake_file",
+        "//src/simulation:fake_file_test_support",
+        "//src/simulation:scheduler",
+        "//src/simulation:scheduler_driver",
+        "//src/storage:workload_budget",
+        "//src/storage/tests:local_store_contract",
+        "@seastar",
+    ],
+)
+
+kwaque_cc_library(
+    name = "engine_history_fixture",
+    testonly = True,
+    hdrs = ["engine_history_fixture.h"],
+    deps = [
+        ":local_store_fixture",
+        "//src/simulation:fake_file",
+        "//src/simulation:fake_file_test_support",
+        "//src/simulation:virtual_time",
+        "//src/storage:local_store_config",
+        "//src/storage/tests:engine_history",
+        "//src/storage/tests:engine_history_contract",
+        "//src/storage/tests:local_store_contract",
+        "@seastar",
+    ],
+)
+
+kwaque_cc_library(
+    name = "storage_recovery_fuzz_cases",
+    testonly = True,
+    srcs = ["storage_recovery_fuzz_cases.cc"],
+    hdrs = ["storage_recovery_fuzz_cases.h"],
+    deps = [
+        ":engine_history_fixture",
+        ":local_store_fixture",
+        "//src/base:error",
+        "//src/runtime:file",
+        "//src/runtime/testing:fuzz_verdict",
+        "//src/simulation:fake_file",
+        "//src/simulation:fake_file_test_support",
+        "//src/simulation:scheduler_driver",
+        "//src/simulation:virtual_time",
+        "//src/storage/tests:engine_fixture_contract",
+        "//src/storage/tests:local_store_contract",
+        "@seastar",
+    ],
+)
+
+kwaque_cc_seastar_test(
+    name = "storage_recovery_fuzz_cases_test",
+    timeout = "moderate",
+    srcs = ["storage_recovery_fuzz_cases_test.cc"],
+    data = ["//src/storage/tests:local_metadata_fixture_data"] + glob(["testdata/storage_recovery_fuzz_corpus/*.bin"]),
+    memory = "256MiB",
+    tags = ["simulated_storage"],
+    deps = [
+        ":storage_recovery_fuzz_cases",
+        "//src/storage/tests:engine_fixture_contract",
+    ],
+)
+
+kwaque_cc_fuzz_test(
+    name = "storage_recovery_fuzz",
+    srcs = ["storage_recovery_fuzz.cc"],
+    args = [
+        "-max_len=4104",
+        "-rss_limit_mb=1024",
+    ],
+    corpus = glob(["testdata/storage_recovery_fuzz_corpus/*.bin"]),
+    data = ["//src/storage/tests:local_metadata_fixture_data"],
+    tags = [
+        "fuzz-campaign",
+        "resources:cpu:1",
+        "resources:memory:1024",
+    ],
+    deps = [
+        ":storage_recovery_fuzz_cases",
+        "//src/runtime/testing:seastar_fuzz",
+    ],
+)
+
+kwaque_cc_library(
+    name = "storage_history_fuzz_cases",
+    testonly = True,
+    srcs = ["storage_history_fuzz_cases.cc"],
+    hdrs = ["storage_history_fuzz_cases.h"],
+    deps = [
+        ":engine_history_fixture",
+        "//src/base:error",
+        "//src/runtime/testing:fuzz_verdict",
+        "//src/storage/tests:engine_history",
+        "//src/storage/tests:engine_ledger",
+        "@seastar",
+    ],
+)
+
+kwaque_cc_seastar_test(
+    name = "storage_history_fuzz_cases_test",
+    timeout = "moderate",
+    srcs = ["storage_history_fuzz_cases_test.cc"],
+    data = glob(["testdata/storage_history_fuzz_corpus/*.bin"]),
+    memory = "256MiB",
+    tags = ["simulated_storage"],
+    deps = [
+        ":storage_history_fuzz_cases",
+        "//src/storage/tests:engine_history",
+    ],
+)
+
+kwaque_cc_fuzz_test(
+    name = "storage_history_fuzz",
+    srcs = ["storage_history_fuzz.cc"],
+    args = [
+        "-max_len=264",
+        "-rss_limit_mb=1024",
+    ],
+    corpus = glob(["testdata/storage_history_fuzz_corpus/*.bin"]),
+    tags = [
+        "fuzz-campaign",
+        "resources:cpu:1",
+        "resources:memory:1024",
+    ],
+    deps = [
+        ":storage_history_fuzz_cases",
+        "//src/runtime/testing:seastar_fuzz",
+    ],
+)
+
+kwaque_cc_seastar_gtest(
+    name = "engine_churn_test",
+    timeout = "moderate",
+    srcs = ["engine_churn_test.cc"],
+    memory = "256MiB",
+    tags = ["simulated_storage"],
+    deps = [
+        ":engine_history_fixture",
+        "//src/base",
+        "//src/runtime/testing:allocation_failures",
+        "//src/storage/tests:engine_history",
+        "//src/storage/tests:engine_history_contract",
+        "//src/storage/tests:engine_ledger",
+    ],
+)
+
+kwaque_cc_seastar_gtest(
+    name = "engine_allocation_test",
+    # A round is one history over a store of its own.
+    timeout = "long",
+    srcs = ["engine_allocation_test.cc"],
+    memory = "256MiB",
+    tags = ["simulated_storage"],
+    deps = [
+        ":engine_history_fixture",
+        "//src/runtime/testing:allocation_failures",
+        "//src/storage/tests:engine_history",
+        "//src/storage/tests:engine_history_contract",
+        "//src/storage/tests:engine_ledger",
+    ],
+)
+
+kwaque_cc_seastar_test(
+    name = "engine_history_test",
+    # Every crash sweep runs one store per cut.
+    timeout = "long",
+    srcs = ["engine_history_test.cc"],
+    memory = "256MiB",
+    tags = ["simulated_storage"],
+    deps = [
+        ":engine_history_fixture",
+        ":local_store_fixture",
+        "//src/base",
+        "//src/simulation:environment",
+        "//src/simulation:fake_file",
+        "//src/simulation:fake_file_test_support",
+        "//src/simulation:virtual_time",
+        "//src/storage/tests:engine_history",
+        "//src/storage/tests:engine_history_contract",
+        "//src/storage/tests:engine_ledger",
+        "//src/storage/tests:local_append_contract",
+        "//src/storage/tests:local_store_contract",
+    ],
+)
+
+kwaque_cc_seastar_test(
+    name = "engine_golden_test",
+    srcs = ["engine_golden_test.cc"],
+    data = ["//src/storage/tests:local_metadata_fixture_data"],
+    memory = "256MiB",
+    deps = [
+        ":engine_history_fixture",
+        ":local_store_fixture",
+        "//src/simulation:fake_file",
+        "//src/storage/tests:engine_fixture_contract",
+        "//src/storage/tests:engine_history",
+        "//src/storage/tests:engine_history_contract",
+        "//src/storage/tests:engine_ledger",
+        "//src/storage/tests:local_store_contract",
+    ],
+)
+
 kwaque_cc_seastar_test(
     name = "local_append_test",
     # Three crash sweeps run one store per cut.
@@ -788,7 +1042,9 @@ kwaque_cc_seastar_test(
     srcs = ["local_append_test.cc"],
     data = ["//src/storage/tests:local_metadata_fixture_data"],
     memory = "256MiB",
+    tags = ["simulated_storage"],
     deps = [
+        ":local_store_fixture",
         "//src/base",
         "//src/base:error",
         "//src/bytes:allocation_test_profile",
@@ -815,6 +1071,7 @@ kwaque_cc_seastar_test(
     timeout = "moderate",
     srcs = ["local_store_test.cc"],
     data = ["//src/storage/tests:local_metadata_fixture_data"],
+    tags = ["simulated_storage"],
     deps = [
         "//src/base",
         "//src/base:error",
@@ -860,6 +1117,7 @@ kwaque_cc_seastar_test(
     srcs = ["wal_writer_test.cc"],
     data = ["//src/storage/tests:local_metadata_fixture_data"],
     memory = "256MiB",
+    tags = ["simulated_storage"],
     deps = [
         "//src/base",
         "//src/base:error",

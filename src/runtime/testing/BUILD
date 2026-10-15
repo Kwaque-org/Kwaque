@@ -74,10 +74,29 @@ kwaque_py_native_test(
 )
 
 kwaque_cc_library(
+    name = "fuzz_verdict",
+    testonly = True,
+    hdrs = ["fuzz_verdict.h"],
+    visibility = [
+        "//src/simulation/tests:__pkg__",
+        "//src/storage/tests:__pkg__",
+    ],
+)
+
+kwaque_cc_library(
+    name = "allocation_failures",
+    testonly = True,
+    hdrs = ["allocation_failures.h"],
+    visibility = ["//src/simulation/tests:__pkg__"],
+    deps = ["@seastar"],
+)
+
+kwaque_cc_library(
     name = "reactor_tasks",
     testonly = True,
     hdrs = ["reactor_tasks.h"],
     visibility = [
+        "//src/broker:__pkg__",
         "//src/runtime/tests:__pkg__",
         "//src/simulation:__pkg__",
         "//src/simulation/tests:__pkg__",

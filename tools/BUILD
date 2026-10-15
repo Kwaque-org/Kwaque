@@ -390,3 +390,21 @@ py_test(
     data = ["//src/storage/tests:local_metadata_fixture_data"],
     main = "verify_local_metadata_fixtures_test.py",
 )
+
+py_binary(
+    name = "storage_device_harness",
+    srcs = ["storage_device_harness.py"],
+    main = "storage_device_harness.py",
+    tags = ["manual"],
+    visibility = ["//visibility:public"],
+)
+
+py_test(
+    name = "storage_device_harness_test",
+    size = "small",
+    srcs = [
+        "storage_device_harness.py",
+        "storage_device_harness_test.py",
+    ],
+    main = "storage_device_harness_test.py",
+)

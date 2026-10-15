@@ -237,6 +237,7 @@ test_suite(
         ":format_size_test",
         ":index_manifest_qualification_test",
         ":local_metadata_fixture_test",
+        ":local_metadata_fuzz_cases_test",
         ":local_metadata_test",
         ":local_paths_test",
         ":local_store_config_test",
@@ -254,6 +255,53 @@ test_suite(
         ":storage_format_qualification_test",
         ":wal_format_test",
     ],
+)
+
+# Parts of the storage suites, manual as the suites are (src/storage/suites).
+# The storage unit tests outside the format suite: one owner or one rule at a time.
+test_suite(
+    name = "local_storage_tests",
+    tags = ["manual"],
+    tests = [
+        ":cache_policy_test",
+        ":checkpoint_test",
+        ":device_placement_test",
+        ":engine_history_test",
+        ":engine_ledger_test",
+        ":local_cleanup_test",
+        ":local_store_admission_test",
+        ":page_cache_test",
+        ":recovery_test",
+        ":retention_test",
+        ":retry_snapshot_test",
+        ":segment_writer_state_test",
+        ":space_sampler_test",
+        ":sparse_index_test",
+        ":wal_writer_state_test",
+        ":workload_budget_test",
+    ],
+    visibility = ["//src/storage/suites:__pkg__"],
+)
+
+# Contracts instantiated on the production file system in this package.
+test_suite(
+    name = "storage_backend_tests",
+    tags = ["manual"],
+    tests = [
+        ":completion_resources_test",
+        ":local_publication_test",
+    ],
+    visibility = ["//src/storage/suites:__pkg__"],
+)
+
+# The formats' independent goldens, as the golden storage suite holds them.
+test_suite(
+    name = "storage_golden_tests",
+    tags = ["manual"],
+    tests = [
+        ":format_tests",
+    ],
+    visibility = ["//src/storage/suites:__pkg__"],
 )
 
 kwaque_cc_seastar_gtest(
@@ -925,6 +973,7 @@ kwaque_cc_seastar_gtest(
     data = [":local_metadata_fixture_data"],
     deps = [
         ":local_metadata_fixture",
+        ":local_metadata_fixture_expectation",
         ":storage_test_support",
         "//src/base",
         "//src/base:error",
@@ -960,6 +1009,74 @@ kwaque_cc_library(
         "local_metadata_fixture_cases.h",
     ],
     deps = ["//src/base:error"],
+)
+
+kwaque_cc_library(
+    name = "local_metadata_fixture_expectation",
+    testonly = True,
+    hdrs = ["local_metadata_fixture_expectation.h"],
+    deps = [
+        ":local_metadata_fixture",
+        ":storage_test_support",
+        "//src/codec:digest",
+        "//src/storage:local_metadata",
+    ],
+)
+
+kwaque_cc_library(
+    name = "local_metadata_fuzz_cases",
+    testonly = True,
+    srcs = ["local_metadata_fuzz_cases.cc"],
+    hdrs = ["local_metadata_fuzz_cases.h"],
+    deps = [
+        ":local_metadata_fixture",
+        ":local_metadata_fixture_expectation",
+        ":storage_test_support",
+        "//src/base",
+        "//src/base:error",
+        "//src/bytes:fragmented_buffer_parser",
+        "//src/codec:cooperative",
+        "//src/codec:digest",
+        "//src/codec:limits",
+        "//src/runtime/testing:fuzz_verdict",
+        "//src/storage:local_metadata",
+        "//src/storage:page_ref",
+        "@seastar",
+    ],
+)
+
+kwaque_cc_seastar_gtest(
+    name = "local_metadata_fuzz_cases_test",
+    timeout = "moderate",
+    srcs = ["local_metadata_fuzz_cases_test.cc"],
+    data = [":local_metadata_fixture_data"] + glob(["testdata/local_metadata_fuzz_corpus/*.bin"]),
+    memory = "256MiB",
+    deps = [
+        ":local_metadata_fixture",
+        ":local_metadata_fuzz_cases",
+        ":storage_test_support",
+        "//src/base:error",
+    ],
+)
+
+kwaque_cc_fuzz_test(
+    name = "local_metadata_fuzz",
+    srcs = ["local_metadata_fuzz.cc"],
+    args = [
+        "-max_len=16384",
+        "-rss_limit_mb=1024",
+    ],
+    corpus = glob(["testdata/local_metadata_fuzz_corpus/*.bin"]),
+    data = [":local_metadata_fixture_data"],
+    tags = [
+        "fuzz-campaign",
+        "resources:cpu:1",
+        "resources:memory:1024",
+    ],
+    deps = [
+        ":local_metadata_fuzz_cases",
+        "//src/runtime/testing:seastar_fuzz",
+    ],
 )
 
 kwaque_cc_library(
@@ -1127,6 +1244,7 @@ kwaque_cc_library(
         ":checkpoint_coverage_oracle",
         ":local_append_contract",
         "//src/base",
+        "//src/bytes:allocation_test_profile",
         "//src/storage:checkpoint",
         "//src/storage:recovery",
         "//src/storage:retry_lookup",
@@ -1720,6 +1838,45 @@ py_test(
     main = "wal_cohort_report_test.py",
 )
 
+py_binary(
+    name = "wal_saturation_report",
+    srcs = [
+        "wal_cohort_report.py",
+        "wal_saturation_report.py",
+    ],
+    main = "wal_saturation_report.py",
+)
+
+py_test(
+    name = "wal_saturation_report_test",
+    srcs = [
+        "wal_cohort_report.py",
+        "wal_saturation_report.py",
+        "wal_saturation_report_test.py",
+    ],
+    main = "wal_saturation_report_test.py",
+)
+
+kwaque_py_native_test(
+    name = "wal_bench_pairs_test",
+    timeout = "moderate",
+    srcs = ["bench_pairs_test.py"],
+    args = [
+        "$(rootpath :wal_timing_bench)",
+        "$(rootpath wal_bench_pairs.txt)",
+    ],
+    data = [
+        "wal_bench_pairs.txt",
+        ":wal_timing_bench",
+    ],
+    main = "bench_pairs_test.py",
+    tags = [
+        "benchmark",
+        "resources:cpu:1",
+        "resources:memory:128",
+    ],
+)
+
 kwaque_cc_library(
     name = "segment_writer_contract",
     testonly = True,
@@ -1920,6 +2077,118 @@ kwaque_cc_library(
         "//src/storage:segment_writer_state",
         "//src/storage:sparse_index",
         "//src/storage:sparse_index_owner",
+        "//src/storage:workload_budget",
+        "@seastar",
+    ],
+)
+
+kwaque_cc_library(
+    name = "engine_ledger",
+    testonly = True,
+    hdrs = ["engine_ledger.h"],
+    visibility = [
+        "//src/broker:__pkg__",
+        "//src/simulation/tests:__pkg__",
+    ],
+)
+
+kwaque_cc_test(
+    name = "engine_ledger_test",
+    srcs = ["engine_ledger_test.cc"],
+    deps = [":engine_ledger"],
+)
+
+kwaque_cc_library(
+    name = "engine_history",
+    testonly = True,
+    hdrs = [
+        "choice_stack.h",
+        "engine_history.h",
+    ],
+    visibility = [
+        "//src/broker:__pkg__",
+        "//src/simulation/tests:__pkg__",
+    ],
+)
+
+kwaque_cc_test(
+    name = "engine_history_test",
+    srcs = ["engine_history_test.cc"],
+    deps = [":engine_history"],
+)
+
+kwaque_cc_library(
+    name = "engine_history_contract",
+    testonly = True,
+    hdrs = ["engine_history_contract.h"],
+    visibility = [
+        "//src/broker:__pkg__",
+        "//src/simulation/tests:__pkg__",
+    ],
+    deps = [
+        ":engine_history",
+        ":engine_ledger",
+        ":local_append_contract",
+        ":local_engine_contract",
+        ":local_installation_contract",
+        ":local_store_contract",
+        ":segment_lifecycle_contract",
+        ":storage_test_support",
+        "//src/base",
+        "//src/codec:cooperative",
+        "//src/codec:digest",
+        "//src/codec:limits",
+        "//src/model:position",
+        "//src/runtime:file",
+        "//src/runtime:time",
+        "//src/storage:device_placement",
+        "//src/storage:format_context",
+        "//src/storage:local_append",
+        "//src/storage:local_engine",
+        "//src/storage:local_paths",
+        "//src/storage:local_store_config",
+        "//src/storage:recovery",
+        "//src/storage:retention",
+        "//src/storage:segment_lifecycle",
+        "//src/storage:segment_reader",
+        "//src/storage:workload_budget",
+        "@seastar",
+    ],
+)
+
+kwaque_cc_library(
+    name = "engine_fixture_contract",
+    testonly = True,
+    hdrs = ["engine_fixture_contract.h"],
+    visibility = [
+        "//src/broker:__pkg__",
+        "//src/simulation/tests:__pkg__",
+    ],
+    deps = [
+        ":local_engine_contract",
+        ":local_installation_contract",
+        ":local_metadata_fixture",
+        ":local_reader_contract",
+        ":local_store_contract",
+        ":recovery_contract",
+        ":segment_lifecycle_contract",
+        ":segment_scan_contract",
+        ":storage_test_support",
+        ":wal_scan_contract",
+        "//src/base",
+        "//src/base:error",
+        "//src/codec:cooperative",
+        "//src/codec:digest",
+        "//src/codec:limits",
+        "//src/model:position",
+        "//src/runtime:file",
+        "//src/runtime:time",
+        "//src/storage:local_engine",
+        "//src/storage:local_paths",
+        "//src/storage:local_store_config",
+        "//src/storage:local_types",
+        "//src/storage:recovery",
+        "//src/storage:segment_lifecycle",
         "//src/storage:workload_budget",
         "@seastar",
     ],
@@ -2155,13 +2424,57 @@ kwaque_cc_library(
     ],
 )
 
+kwaque_cc_library(
+    name = "latency_histogram",
+    testonly = True,
+    hdrs = ["latency_histogram.h"],
+    deps = ["@seastar"],
+)
+
+kwaque_cc_library(
+    name = "engine_bench_fixture",
+    testonly = True,
+    hdrs = ["engine_bench_fixture.h"],
+    deps = [
+        ":local_append_contract",
+        ":local_engine_contract",
+        ":local_storage_bench_file",
+        ":local_store_contract",
+        ":segment_lifecycle_contract",
+        "//src/base",
+        "//src/bytes:allocation_test_profile",
+        "//src/codec:cooperative",
+        "//src/resource:resource_config",
+        "//src/resource:resource_manager",
+        "//src/resource:resource_registry",
+        "//src/resource:workload_class",
+        "//src/runtime:file",
+        "//src/runtime:first_failure",
+        "//src/runtime/production:clocks",
+        "//src/runtime/production:timer",
+        "//src/storage:device_placement",
+        "//src/storage:local_append",
+        "//src/storage:local_engine",
+        "//src/storage:local_store_bootstrap",
+        "//src/storage:local_store_config",
+        "//src/storage:recovery",
+        "//src/storage:segment_lifecycle",
+        "//src/storage:workload_budget",
+        "@seastar",
+    ],
+)
+
 _LOCAL_STORAGE_BENCH_DEPS = [
+    ":engine_bench_fixture",
+    ":latency_histogram",
+    ":local_append_contract",
     ":local_installation_contract",
     ":local_storage_bench_file",
     ":local_store_contract",
     ":segment_bench_fixture",
     ":segment_writer_contract",
     ":storage_test_support",
+    ":wal_bench_file",
     ":wal_writer_contract",
     "//src/base",
     "//src/base:error",
@@ -2171,6 +2484,7 @@ _LOCAL_STORAGE_BENCH_DEPS = [
     "//src/codec/tests:allocation_observer",
     "//src/codec/tests:codec_bench_reference",
     "//src/codec/tests:memory_qualification_support",
+    "//src/model:position",
     "//src/resource:resource_manager",
     "//src/resource:resource_registry",
     "//src/resource:workload_class",
@@ -2180,7 +2494,13 @@ _LOCAL_STORAGE_BENCH_DEPS = [
     "//src/runtime/production:timer",
     "//src/runtime/testing:test_directory",
     "//src/storage:local_append",
+    "//src/storage:local_engine",
+    "//src/storage:local_metadata",
     "//src/storage:local_paths",
+    "//src/storage:local_store_config",
+    "//src/storage:local_types",
+    "//src/storage:retention",
+    "//src/storage:segment_lifecycle",
     "//src/storage:segment_writer",
     "//src/storage:segment_writer_state",
     "//src/storage:wal_child",
@@ -2194,7 +2514,10 @@ _LOCAL_STORAGE_BENCH_DEPS = [
 
 kwaque_cc_benchmark(
     name = "local_storage_bench",
-    srcs = ["local_storage_bench.cc"],
+    srcs = [
+        "local_storage_bench.cc",
+        "local_storage_engine_bench.cc",
+    ],
     linkopts = ALLOCATION_OBSERVER_LINKOPTS,
     memory = "1GiB",
     deps = _LOCAL_STORAGE_BENCH_DEPS,
@@ -2202,7 +2525,10 @@ kwaque_cc_benchmark(
 
 kwaque_cc_benchmark(
     name = "local_storage_timing_bench",
-    srcs = ["local_storage_bench.cc"],
+    srcs = [
+        "local_storage_bench.cc",
+        "local_storage_engine_bench.cc",
+    ],
     local_defines = ["KWAQUE_LOCAL_STORAGE_TIMING_ONLY"],
     memory = "1GiB",
     deps = _LOCAL_STORAGE_BENCH_DEPS,
@@ -2225,6 +2551,45 @@ py_test(
         "wal_cohort_report.py",
     ],
     main = "local_storage_bench_report_test.py",
+)
+
+kwaque_py_native_test(
+    name = "local_storage_bench_pairs_test",
+    timeout = "moderate",
+    srcs = ["bench_pairs_test.py"],
+    args = [
+        "$(rootpath :local_storage_timing_bench)",
+        "$(rootpath local_storage_bench_pairs.txt)",
+    ],
+    data = [
+        "local_storage_bench_pairs.txt",
+        ":local_storage_timing_bench",
+    ],
+    main = "bench_pairs_test.py",
+    tags = [
+        "benchmark",
+        "resources:cpu:1",
+        "resources:memory:128",
+    ],
+)
+
+py_binary(
+    name = "engine_append_report",
+    srcs = [
+        "engine_append_report.py",
+        "wal_cohort_report.py",
+    ],
+    main = "engine_append_report.py",
+)
+
+py_test(
+    name = "engine_append_report_test",
+    srcs = [
+        "engine_append_report.py",
+        "engine_append_report_test.py",
+        "wal_cohort_report.py",
+    ],
+    main = "engine_append_report_test.py",
 )
 
 _STORAGE_RECOVERY_BENCH_DEPS = [
@@ -2262,7 +2627,10 @@ _STORAGE_RECOVERY_BENCH_DEPS = [
 
 kwaque_cc_benchmark(
     name = "storage_recovery_bench",
-    srcs = ["storage_recovery_bench.cc"],
+    srcs = [
+        "engine_start_bench.cc",
+        "storage_recovery_bench.cc",
+    ],
     linkopts = ALLOCATION_OBSERVER_LINKOPTS + [
         "-Wl,--wrap=LZ4F_decompress",
         "-Wl,--wrap=_ZN4absl12lts_2026052612crc_internal20ExtendCrc32cInternalENS0_8crc32c_tENSt3__117basic_string_viewIcNS3_11char_traitsIcEEEE",
@@ -2271,27 +2639,85 @@ kwaque_cc_benchmark(
         "//conditions:default": ["-Wl,--wrap=XXH3_128bits_update"],
     }),
     memory = "1GiB",
-    deps = _STORAGE_RECOVERY_BENCH_DEPS + [":segment_bench_observer"],
+    deps = _STORAGE_RECOVERY_BENCH_DEPS + [
+        ":engine_bench_fixture",
+        ":local_append_contract",
+        ":local_engine_contract",
+        ":segment_bench_observer",
+        ":wal_bench_file",
+        "//src/storage:local_engine",
+        "//src/storage:segment_lifecycle",
+    ],
 )
 
 kwaque_cc_benchmark(
     name = "storage_recovery_timing_bench",
-    srcs = ["storage_recovery_bench.cc"],
+    srcs = [
+        "engine_start_bench.cc",
+        "storage_recovery_bench.cc",
+    ],
     local_defines = ["KWAQUE_STORAGE_RECOVERY_TIMING_ONLY"],
     memory = "1GiB",
-    deps = _STORAGE_RECOVERY_BENCH_DEPS,
+    deps = _STORAGE_RECOVERY_BENCH_DEPS + [
+        ":engine_bench_fixture",
+        ":local_append_contract",
+        ":local_engine_contract",
+        ":wal_bench_file",
+        "//src/storage:local_engine",
+        "//src/storage:segment_lifecycle",
+    ],
 )
 
 kwaque_cc_benchmark(
     name = "checkpoint_bench",
-    srcs = ["checkpoint_bench.cc"],
+    srcs = [
+        "checkpoint_bench.cc",
+        "segment_lifecycle_bench.cc",
+    ],
+    # Counts the bytes hashed and checksummed in a timed region; outside one
+    # each wrapped call only checks that no region is open.
+    linkopts = [
+        "-Wl,--wrap=LZ4F_decompress",
+        "-Wl,--wrap=_ZN4absl12lts_2026052612crc_internal20ExtendCrc32cInternalENS0_8crc32c_tENSt3__117basic_string_viewIcNS3_11char_traitsIcEEEE",
+    ] + select({
+        "@platforms//cpu:x86_64": ["-Wl,--wrap=XXH3_128bits_update_dispatch"],
+        "//conditions:default": ["-Wl,--wrap=XXH3_128bits_update"],
+    }),
     # Its largest store keeps 32 segments open: the append benchmark's
     # sizing for that many needs more than the produce class has at 1 GiB.
     memory = "2GiB",
     deps = _STORAGE_RECOVERY_BENCH_DEPS + [
+        ":engine_bench_fixture",
+        ":local_append_contract",
+        ":segment_bench_observer",
+        ":segment_lifecycle_contract",
+        ":wal_bench_file",
         "//src/storage:checkpoint",
+        "//src/storage:local_engine",
+        "//src/storage:retention",
+        "//src/storage:segment_lifecycle",
+        "//src/storage:sparse_index",
         "//src/storage:wal_writer_state",
     ],
+)
+
+py_binary(
+    name = "segment_lifecycle_report",
+    srcs = [
+        "segment_lifecycle_report.py",
+        "wal_cohort_report.py",
+    ],
+    main = "segment_lifecycle_report.py",
+)
+
+py_test(
+    name = "segment_lifecycle_report_test",
+    srcs = [
+        "segment_lifecycle_report.py",
+        "segment_lifecycle_report_test.py",
+        "wal_cohort_report.py",
+    ],
+    main = "segment_lifecycle_report_test.py",
 )
 
 _INDEX_BENCH_DEPS = [
@@ -2301,6 +2727,7 @@ _INDEX_BENCH_DEPS = [
     ":segment_bench_fixture",
     ":segment_bench_observer_api",
     ":segment_writer_contract",
+    ":wal_bench_file",
     "//src/base",
     "//src/base:error",
     "//src/bytes:allocation_test_profile",
@@ -2376,6 +2803,26 @@ py_test(
     main = "index_bench_report_test.py",
 )
 
+kwaque_py_native_test(
+    name = "index_bench_pairs_test",
+    timeout = "moderate",
+    srcs = ["bench_pairs_test.py"],
+    args = [
+        "$(rootpath :index_timing_bench)",
+        "$(rootpath index_bench_pairs.txt)",
+    ],
+    data = [
+        "index_bench_pairs.txt",
+        ":index_timing_bench",
+    ],
+    main = "bench_pairs_test.py",
+    tags = [
+        "benchmark",
+        "resources:cpu:1",
+        "resources:memory:128",
+    ],
+)
+
 py_binary(
     name = "read_bench_report",
     srcs = ["read_bench_report.py"],
@@ -2408,4 +2855,23 @@ py_test(
         "wal_cohort_report.py",
     ],
     main = "storage_recovery_bench_report_test.py",
+)
+
+py_binary(
+    name = "engine_start_report",
+    srcs = [
+        "engine_start_report.py",
+        "wal_cohort_report.py",
+    ],
+    main = "engine_start_report.py",
+)
+
+py_test(
+    name = "engine_start_report_test",
+    srcs = [
+        "engine_start_report.py",
+        "engine_start_report_test.py",
+        "wal_cohort_report.py",
+    ],
+    main = "engine_start_report_test.py",
 )

@@ -5,6 +5,45 @@ load("//bazel:test.bzl", "kwaque_cc_seastar_gtest", "kwaque_cc_seastar_test", "k
 
 package(default_visibility = ["//visibility:private"])
 
+# Parts of the storage suites, manual as the suites are (src/storage/suites).
+# The storage contracts and the engine on the production file system.
+test_suite(
+    name = "storage_backend_tests",
+    tags = ["manual"],
+    tests = [
+        ":engine_durability_test",
+        ":local_append_test",
+        ":local_engine_test",
+        ":local_installation_test",
+        ":local_qualification_test",
+        ":local_reader_test",
+        ":local_store_test",
+        ":storage_shutdown_test",
+        ":wal_writer_test",
+    ],
+    visibility = ["//src/storage/suites:__pkg__"],
+)
+
+# The engine started natively on the checked-in store image.
+test_suite(
+    name = "storage_golden_tests",
+    tags = ["manual"],
+    tests = [
+        ":local_engine_test",
+    ],
+    visibility = ["//src/storage/suites:__pkg__"],
+)
+
+# The engine natively at the writable bound with churn beside a foreground task.
+test_suite(
+    name = "storage_scale_tests",
+    tags = ["manual"],
+    tests = [
+        ":local_engine_test",
+    ],
+    visibility = ["//src/storage/suites:__pkg__"],
+)
+
 kwaque_cc_library(
     name = "exit_code",
     hdrs = ["exit_code.h"],
@@ -611,6 +650,81 @@ kwaque_cc_seastar_test(
         "//src/storage/tests:recovery_successor_contract",
         "//src/storage/tests:segment_lifecycle_contract",
     ],
+)
+
+kwaque_cc_seastar_test(
+    name = "local_engine_test",
+    timeout = "moderate",
+    srcs = [
+        "local_engine_test.cc",
+        "native_store_test_support.h",
+    ],
+    data = ["//src/storage/tests:local_metadata_fixture_data"],
+    memory = "256MiB",
+    deps = [
+        ":storage_directories",
+        "//src/base",
+        "//src/resource:resource_config",
+        "//src/resource:resource_manager",
+        "//src/resource:resource_registry",
+        "//src/resource:workload_class",
+        "//src/runtime:file",
+        "//src/runtime/production:clocks",
+        "//src/runtime/production:file",
+        "//src/runtime/production:timer",
+        "//src/runtime/testing:reactor_tasks",
+        "//src/runtime/testing:test_directory",
+        "//src/storage:local_store_config",
+        "//src/storage:workload_budget",
+        "//src/storage/tests:engine_fixture_contract",
+        "//src/storage/tests:engine_history",
+        "//src/storage/tests:engine_history_contract",
+        "//src/storage/tests:engine_ledger",
+        "//src/storage/tests:local_append_contract",
+        "//src/storage/tests:local_engine_contract",
+        "//src/storage/tests:local_store_contract",
+        "//src/storage/tests:recovery_successor_contract",
+    ],
+)
+
+kwaque_cc_binary(
+    name = "engine_durability_probe",
+    testonly = True,
+    srcs = [
+        "engine_durability_probe.cc",
+        "native_store_test_support.h",
+    ],
+    visibility = ["//visibility:public"],
+    deps = [
+        ":storage_directories",
+        "//src/base",
+        "//src/resource:resource_config",
+        "//src/resource:resource_manager",
+        "//src/resource:resource_registry",
+        "//src/resource:workload_class",
+        "//src/runtime:file",
+        "//src/runtime/production:clocks",
+        "//src/runtime/production:file",
+        "//src/runtime/production:timer",
+        "//src/runtime/testing:reactor_tasks",
+        "//src/storage:local_store_config",
+        "//src/storage:workload_budget",
+        "//src/storage/tests:engine_history",
+        "//src/storage/tests:engine_history_contract",
+        "//src/storage/tests:engine_ledger",
+        "//src/storage/tests:local_engine_contract",
+        "//src/storage/tests:local_store_contract",
+        "@boost//:program_options",
+        "@seastar",
+    ],
+)
+
+kwaque_py_native_test(
+    name = "engine_durability_test",
+    timeout = "moderate",
+    srcs = ["engine_durability_test.py"],
+    data = [":engine_durability_probe"],
+    main = "engine_durability_test.py",
 )
 
 kwaque_cc_seastar_test(

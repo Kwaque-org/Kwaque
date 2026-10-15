@@ -17,7 +17,7 @@
 namespace kwaque::simulation::testing {
 
 inline constexpr std::uint32_t fuzz_reproduction_format_version{1};
-inline constexpr std::uint32_t fuzz_harness_version{2};
+inline constexpr std::uint32_t fuzz_harness_version{1};
 inline constexpr std::size_t fuzz_input_bytes_max{16U * 1'024U};
 inline constexpr std::uint32_t fuzz_commands_max{512};
 inline constexpr std::uint32_t fuzz_trace_entries_max{512};

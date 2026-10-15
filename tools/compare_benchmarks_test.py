@@ -16,10 +16,25 @@ except ModuleNotFoundError:
 
 
 PAIR = driver.Pair("group.native", "group.kwaque")
+OTHER = driver.Pair("other.native", "other.kwaque")
 PROFILE_LINE = (
     b"kwaque-benchmark-profile-v1 allocator=native injection=false optimized=true "
     b"asan=false ubsan=false oom_abort=true\n"
 )
+# The cases the mocked binary lists, as the native harness prints them.
+LISTED = (
+    PAIR.baseline,
+    PAIR.candidate,
+    OTHER.baseline,
+    OTHER.candidate,
+    "maximum_noise.cold_decompress",
+)
+
+
+def listing(names) -> bytes:
+    return b"startup diagnostics\navailable tests:\n" + b"".join(
+        f"\t{name}\n".encode() for name in names
+    )
 
 
 def native_document(case: str, median: float = 10.0) -> dict:
@@ -58,6 +73,7 @@ class BenchmarkComparisonTest(unittest.TestCase):
         self.addCleanup(affinity.stop)
         self.expected_cpu = 3
         self.reactor_backend = "epoll"
+        self.listed = LISTED
 
     def fake_native(
         self, arguments, *, cwd, stdin, stdout, stderr, timeout, check, shell, env
@@ -75,7 +91,6 @@ class BenchmarkComparisonTest(unittest.TestCase):
         self.assertFalse(shell)
         self.assertFalse(check)
         self.assertGreater(timeout, 0)
-        self.assertIn("--runs=7", arguments)
         self.assertIn(f"--reactor-backend={self.reactor_backend}", arguments)
         self.assertIn("--smp=1", arguments)
         self.assertEqual(
@@ -85,6 +100,18 @@ class BenchmarkComparisonTest(unittest.TestCase):
         self.assertIn("--thread-affinity=1", arguments)
         self.assertIn("--mbind=0", arguments)
         self.assertIn("--overprovisioned", arguments)
+        if "--list" in arguments:
+            # The listing starts a reactor and selects, runs and writes nothing.
+            self.assertFalse(
+                [
+                    arg
+                    for arg in arguments
+                    if arg.startswith(("--test=", "--runs=", "--json-output="))
+                ]
+            )
+            stdout.write(listing(self.listed))
+            return subprocess.CompletedProcess(arguments, 0)
+        self.assertIn("--runs=7", arguments)
         selector = next(
             value.removeprefix("--test=")
             for value in arguments
@@ -134,8 +161,13 @@ class BenchmarkComparisonTest(unittest.TestCase):
                 self.output,
                 baseline_binary=baseline,
             )
-        self.assertEqual(invoked.count(baseline), 3)
-        self.assertEqual(invoked.count(self.binary), 3)
+        # Each binary lists its cases once and then runs one side a round.
+        self.assertEqual(invoked.count(baseline), 4)
+        self.assertEqual(invoked.count(self.binary), 4)
+        self.assertEqual(invoked[:2], [baseline, self.binary])
+        self.assertEqual(
+            [item["role"] for item in result["listings"]], ["baseline", "candidate"]
+        )
         self.assertEqual(
             result["baseline_binary"]["sha256"], driver.binary_digest(baseline)
         )
@@ -155,13 +187,15 @@ class BenchmarkComparisonTest(unittest.TestCase):
         def mutate(arguments, **kwargs):
             with mock.patch.object(self, "binary", Path(arguments[0])):
                 result = self.fake_native(arguments, **kwargs)
-            if Path(arguments[0]) == baseline:
+            if Path(arguments[0]) == baseline and "--list" not in arguments:
                 baseline.write_bytes(b"changed during measurement")
             return result
 
         with (
             mock.patch.object(driver.subprocess, "run", side_effect=mutate),
-            self.assertRaisesRegex(driver.ComparisonError, "changed during"),
+            self.assertRaisesRegex(
+                driver.ComparisonError, "changed during a native invocation"
+            ),
         ):
             driver.run_comparison(
                 self.binary, [PAIR], self.output, baseline_binary=baseline
@@ -225,6 +259,8 @@ class BenchmarkComparisonTest(unittest.TestCase):
     def test_valid_measurements_with_wrong_runtime_profile_cannot_pass(self) -> None:
         def wrong_profile(arguments, **kwargs):
             completed = self.fake_native(arguments, **kwargs)
+            if "--list" in arguments:
+                return completed
             output = kwargs["stdout"]
             output.seek(0)
             output.truncate()
@@ -385,6 +421,310 @@ class BenchmarkComparisonTest(unittest.TestCase):
             ):
                 driver.parse_pair(pair)
 
+    def pairs_file(self, text: str) -> Path:
+        path = self.root / "pairs.txt"
+        path.write_text(text, encoding="ascii")
+        return path
+
+    def test_pairs_file_names_pairs_and_their_kinds(self) -> None:
+        path = self.pairs_file(
+            "# Owner-cost pairs.\n"
+            "\n"
+            f"{PAIR.baseline}={PAIR.candidate} device\n"
+            "   \n"
+            "  # An indented comment, then trailing space.\n"
+            f"{OTHER.baseline}={OTHER.candidate}\tprocessor  \n"
+        )
+        self.assertEqual(
+            driver.read_pairs_file(path), [(PAIR, "device"), (OTHER, "processor")]
+        )
+
+    def test_pairs_file_rejects_bad_lines_kinds_and_duplicates(self) -> None:
+        good = f"{PAIR.baseline}={PAIR.candidate} device\n"
+        for text, message in (
+            (good + "other.native=other.kwaque\n", "line 2 must be"),
+            (good + "other.native=other.kwaque device extra\n", "line 2 must be"),
+            (good + "other.native other.kwaque device\n", "line 2 must be"),
+            ("# only\n" + good + "other.native=other.kwaque disk\n", "line 3: kind"),
+            (good + "other.native=other.kwaque Device\n", "line 2: kind"),
+            (good + "other.*=other.kwaque device\n", "line 2: pair must contain"),
+            (good + "other.case=other.case device\n", "line 2: baseline and"),
+            (good + "\n" + good, "line 3 repeats a pair"),
+            (good + f"{PAIR.baseline}={PAIR.candidate} processor\n", "repeats a pair"),
+            ("# nothing but a comment\n\n", "names no pair"),
+            ("", "names no pair"),
+        ):
+            with (
+                self.subTest(text=text),
+                self.assertRaisesRegex(driver.ComparisonError, message),
+            ):
+                driver.read_pairs_file(self.pairs_file(text))
+        path = self.root / "pairs.txt"
+        path.write_bytes(good.encode() + b"caf\xc3\xa9.one=other.two device\n")
+        with self.assertRaisesRegex(driver.ComparisonError, "ASCII"):
+            driver.read_pairs_file(path)
+        path.write_text(good)
+        with (
+            mock.patch.object(driver, "MAXIMUM_PAIRS_FILE_BYTES", 16),
+            self.assertRaisesRegex(driver.ComparisonError, "size limit"),
+        ):
+            driver.read_pairs_file(path)
+        with self.assertRaisesRegex(driver.ComparisonError, "cannot read pairs file"):
+            driver.read_pairs_file(self.root / "absent.txt")
+
+    def cli(self, *selection: str) -> list[str]:
+        return [
+            "compare_benchmarks",
+            "--binary",
+            str(self.binary),
+            *selection,
+            "--output-dir",
+            str(self.output),
+        ]
+
+    def test_cli_pairs_file_follows_pairs_given_directly(self) -> None:
+        path = self.pairs_file(f"{OTHER.baseline}={OTHER.candidate} device\n")
+        pair = f"{PAIR.baseline}={PAIR.candidate}"
+        arguments = self.cli("--pair", pair, "--pairs-file", str(path))
+        with (
+            mock.patch.object(
+                driver.subprocess, "run", side_effect=self.fake_native
+            ) as child,
+            mock.patch.object(driver.sys, "argv", arguments),
+            mock.patch("builtins.print"),
+        ):
+            self.assertEqual(driver.main(), 0)
+        self.assertEqual(child.call_count, 13)
+        manifest = json.loads((self.output / "manifest.json").read_text())
+        self.assertEqual(manifest["pairs"], [driver.asdict(PAIR), driver.asdict(OTHER)])
+        # The kind is recorded; the gate's answer does not depend on it.
+        self.assertEqual(manifest["configuration"]["pair_kinds"], [None, "device"])
+        self.assertEqual(
+            [item["status"] for item in manifest["comparisons"]], ["win", "parity"]
+        )
+
+    def test_cli_pairs_file_alone_selects_its_pairs(self) -> None:
+        path = self.pairs_file(
+            f"{PAIR.baseline}={PAIR.candidate} processor\n"
+            f"{OTHER.baseline}={OTHER.candidate} device\n"
+        )
+        with (
+            mock.patch.object(
+                driver.subprocess, "run", side_effect=self.fake_native
+            ) as child,
+            mock.patch.object(driver.sys, "argv", self.cli("--pairs-file", str(path))),
+            mock.patch("builtins.print"),
+        ):
+            self.assertEqual(driver.main(), 0)
+        self.assertEqual(child.call_count, 13)
+        manifest = json.loads((self.output / "manifest.json").read_text())
+        self.assertEqual(
+            manifest["configuration"]["pair_kinds"], ["processor", "device"]
+        )
+
+    def test_cli_rejects_a_bad_or_conflicting_pairs_file_before_any_child(self) -> None:
+        pair = f"{PAIR.baseline}={PAIR.candidate}"
+        repeated = self.pairs_file(f"{pair} device\n")
+        for selection, status in (
+            # The same pair given both ways is a duplicate.
+            (("--pair", pair, "--pairs-file", str(repeated)), 1),
+            (("--pairs-file", str(self.root / "absent.txt")), 1),
+            (("--case", PAIR.baseline, "--pairs-file", str(repeated)), 2),
+            ((), 2),
+        ):
+            with (
+                self.subTest(selection=selection),
+                mock.patch.object(driver.subprocess, "run") as child,
+                mock.patch.object(driver.sys, "argv", self.cli(*selection)),
+                mock.patch("builtins.print"),
+                mock.patch.object(driver.sys, "stderr"),
+            ):
+                if status == 2:
+                    with self.assertRaises(SystemExit) as stopped:
+                        driver.main()
+                    self.assertEqual(stopped.exception.code, 2)
+                else:
+                    self.assertEqual(driver.main(), 1)
+                child.assert_not_called()
+                self.assertFalse(self.output.exists())
+
+    def test_pair_kinds_must_match_the_pairs(self) -> None:
+        for kinds in (["disk"], ["device", "device"], [], [True]):
+            with (
+                self.subTest(kinds=kinds),
+                mock.patch.object(driver.subprocess, "run") as child,
+            ):
+                with self.assertRaisesRegex(driver.ComparisonError, "kind"):
+                    driver.run_comparison(
+                        self.binary, [PAIR], self.output, pair_kinds=kinds
+                    )
+                child.assert_not_called()
+                self.assertFalse(self.output.exists())
+
+    def test_unlisted_names_are_refused_before_any_measurement(self) -> None:
+        self.listed = (PAIR.baseline, "other.unrelated")
+        with (
+            mock.patch.object(
+                driver.subprocess, "run", side_effect=self.fake_native
+            ) as child,
+            self.assertRaises(driver.ComparisonError) as refused,
+        ):
+            driver.run_comparison(self.binary, [OTHER, PAIR], self.output)
+        # Every missing name is given, not only the first.
+        self.assertEqual(
+            str(refused.exception),
+            "benchmark binary does not list "
+            f"{PAIR.candidate}, {OTHER.candidate}, {OTHER.baseline}",
+        )
+        self.assertEqual(child.call_count, 1)
+        self.assertIn("--list", child.call_args.args[0])
+        manifest = json.loads((self.output / "manifest.json").read_text())
+        self.assertEqual(manifest["status"], "failed")
+        self.assertEqual(manifest["error"], str(refused.exception))
+        self.assertEqual(manifest["invocations"], [])
+        self.assertEqual(manifest["comparisons"], [])
+        self.assertEqual(
+            sorted(path.name for path in self.output.iterdir()),
+            ["0000-list-candidate.log", "manifest.json"],
+        )
+
+    def test_each_saved_binary_is_asked_for_its_own_side(self) -> None:
+        baseline = self.root / "saved baseline"
+        baseline.write_bytes(b"saved-release-fixture")
+        baseline.chmod(0o755)
+        case = "maximum_noise.cold_decompress"
+
+        def run(arguments, **kwargs):
+            with (
+                mock.patch.object(self, "binary", Path(arguments[0])),
+                mock.patch.object(
+                    self, "listed", () if Path(arguments[0]) == baseline else LISTED
+                ),
+            ):
+                return self.fake_native(arguments, **kwargs)
+
+        with (
+            mock.patch.object(driver.subprocess, "run", side_effect=run) as child,
+            self.assertRaisesRegex(
+                driver.ComparisonError, f"^baseline binary does not list {case}$"
+            ),
+        ):
+            driver.run_comparison(
+                self.binary,
+                [driver.Pair(case, case)],
+                self.output,
+                baseline_binary=baseline,
+            )
+        # Both binaries are listed before the refusal, and neither is measured.
+        self.assertEqual(child.call_count, 2)
+
+    def test_a_listing_that_fails_or_lists_nothing_measures_nothing(self) -> None:
+        for failure, message in (
+            ("exit", "listing exited with status 2"),
+            ("timeout", "listing timed out"),
+            ("silent", "did not list its cases"),
+            ("changed", "changed during its case listing"),
+        ):
+
+            def failed(arguments, *, failure=failure, **kwargs):
+                self.assertIn("--list", arguments)
+                if failure == "exit":
+                    return subprocess.CompletedProcess(arguments, 2)
+                if failure == "timeout":
+                    raise subprocess.TimeoutExpired(arguments, kwargs["timeout"])
+                if failure == "silent":
+                    kwargs["stdout"].write(f"\t{PAIR.baseline}\n".encode())
+                    return subprocess.CompletedProcess(arguments, 0)
+                completed = self.fake_native(arguments, **kwargs)
+                self.binary.write_bytes(b"changed binary")
+                return completed
+
+            with self.subTest(failure=failure):
+                self.binary.write_bytes(b"prebuilt-test-fixture")
+                self.output = self.root / failure
+                with self.assertRaisesRegex(driver.ComparisonError, message):
+                    _, child = self.run_mocked(failed)
+                manifest = json.loads((self.output / "manifest.json").read_text())
+                self.assertEqual(manifest["status"], "failed")
+                self.assertEqual(manifest["invocations"], [])
+                self.assertEqual(manifest["comparisons"], [])
+
+    def test_listing_reads_only_exact_names_after_its_header(self) -> None:
+        path = self.root / "list.log"
+        path.write_bytes(
+            b"\tbefore.header\n"
+            b"available tests:\n"
+            b"\tgroup.native\n"
+            b"\tgroup.kwaque\r\n"
+            b"group.untabbed\n"
+            b"\t group.spaced\n"
+            b"\tnot a name\n"
+            b"\t\xff.bad\n"
+        )
+        self.assertEqual(driver.read_listing(path), {"group.native", "group.kwaque"})
+        with (
+            mock.patch.object(driver, "MAXIMUM_PROFILE_LOG_BYTES", 16),
+            self.assertRaisesRegex(driver.ComparisonError, "size limit"),
+        ):
+            driver.read_listing(path)
+        with self.assertRaisesRegex(driver.ComparisonError, "cannot read"):
+            driver.read_listing(self.root / "absent.log")
+
+    def test_without_a_pairs_file_only_one_listing_is_added(self) -> None:
+        result, child = self.run_mocked()
+        calls = [call.args[0] for call in child.call_args_list]
+        self.assertEqual(len(calls), 7)
+        self.assertEqual(
+            calls[0][1:],
+            [
+                *driver.NATIVE_ARGUMENTS,
+                "--reactor-backend=epoll",
+                "--cpuset=3",
+                "--thread-affinity=1",
+                "--mbind=0",
+                "--list",
+            ],
+        )
+        self.assertEqual(
+            result["listings"],
+            [
+                {
+                    "role": "candidate",
+                    "log": "0000-list-candidate.log",
+                    "arguments": calls[0][1:],
+                    "returncode": 0,
+                    "cases": len(LISTED),
+                }
+            ],
+        )
+        # The six measured invocations are what they were before the listing.
+        self.assertFalse(any("--list" in call for call in calls[1:]))
+        self.assertEqual(len(result["invocations"]), 6)
+        for call, invocation in zip(calls[1:], result["invocations"], strict=True):
+            self.assertEqual(call[1:], invocation["arguments"])
+            self.assertEqual(
+                call[1:],
+                [
+                    *driver.NATIVE_ARGUMENTS,
+                    "--reactor-backend=epoll",
+                    "--cpuset=3",
+                    "--thread-affinity=1",
+                    "--mbind=0",
+                    "--runs=7",
+                    "--duration=1",
+                    "--random-seed=41",
+                    f"--test=^{invocation['case'].replace('.', chr(92) + '.')}$",
+                    f"--json-output={invocation['json']}",
+                ],
+            )
+            self.assertRegex(
+                invocation["json"], r"^000[1-6]-round-[123]-pair-1-\w+\.json$"
+            )
+        self.assertNotIn("pair_kinds", result["configuration"])
+        self.assertEqual(result["pairs"], [driver.asdict(PAIR)])
+        self.assertEqual(result["status"], "passed")
+        self.assertEqual(result["comparisons"][0]["status"], "win")
+
     def test_selected_reactor_backend_reaches_every_invocation(self) -> None:
         self.reactor_backend = "linux-aio"
         with mock.patch.object(driver.subprocess, "run", side_effect=self.fake_native):
@@ -411,7 +751,7 @@ class BenchmarkComparisonTest(unittest.TestCase):
                 seed=41,
             )
         self.assertEqual(Path.cwd(), parent_cwd)
-        self.assertEqual(child.call_count, 6)
+        self.assertEqual(child.call_count, 7)
         self.assertEqual(result["status"], "passed")
         self.assertEqual(result["comparisons"][0]["status"], "win")
         self.assertEqual(result["binary"]["name"], self.binary.name)
@@ -457,7 +797,7 @@ class BenchmarkComparisonTest(unittest.TestCase):
             result = driver.run_comparison(self.binary, pairs, self.output, cpu=7)
         self.affinity.assert_called_once_with(0)
         set_affinity.assert_not_called()
-        self.assertEqual(child.call_count, 12)
+        self.assertEqual(child.call_count, 13)
         self.assertEqual(result["configuration"]["selected_cpu"], 7)
         self.assertEqual(result["configuration"]["allowed_cpus"], [3, 7])
         self.assertTrue(result["configuration"]["thread_affinity"])
@@ -493,11 +833,16 @@ class BenchmarkComparisonTest(unittest.TestCase):
             result = driver.run_comparison(
                 self.binary, pairs, self.output, task_quota_ms=0.125
             )
-        self.assertEqual(child.call_count, 12)
+        self.assertEqual(child.call_count, 13)
         self.assertEqual(result["configuration"]["task_quota_ms"], 0.125)
         recorded = json.loads((self.output / "manifest.json").read_text())
         self.assertEqual(recorded["configuration"]["task_quota_ms"], 0.125)
-        for call, invocation in zip(child.call_args_list, result["invocations"]):
+        # The listing starts its reactor under the same quota.
+        self.assertIn("--task-quota-ms=0.125", child.call_args_list[0].args[0])
+        self.assertIn("--task-quota-ms=0.125", result["listings"][0]["arguments"])
+        for call, invocation in zip(
+            child.call_args_list[1:], result["invocations"], strict=True
+        ):
             actual = [arg for arg in call.args[0] if arg.startswith("--task-quota-ms=")]
             self.assertEqual(actual, ["--task-quota-ms=0.125"])
             self.assertEqual(
@@ -542,7 +887,7 @@ class BenchmarkComparisonTest(unittest.TestCase):
             mock.patch("builtins.print"),
         ):
             self.assertEqual(driver.main(), 0)
-        self.assertEqual(child.call_count, 6)
+        self.assertEqual(child.call_count, 7)
         for call in child.call_args_list:
             self.assertEqual(
                 [arg for arg in call.args[0] if arg.startswith("--task-quota-ms=")],
@@ -612,7 +957,7 @@ class BenchmarkComparisonTest(unittest.TestCase):
             mock.patch("builtins.print"),
         ):
             self.assertEqual(driver.main(), 0)
-        self.assertEqual(child.call_count, 6)
+        self.assertEqual(child.call_count, 7)
 
     def test_child_failure_timeout_missing_and_malformed_json_are_not_parity(
         self,
@@ -620,6 +965,8 @@ class BenchmarkComparisonTest(unittest.TestCase):
         for failure in ("exit", "timeout", "missing", "malformed"):
 
             def failed(arguments, *, failure=failure, **kwargs):
+                if "--list" in arguments:
+                    return self.fake_native(arguments, **kwargs)
                 kwargs["stdout"].write(PROFILE_LINE)
                 if failure == "exit":
                     return subprocess.CompletedProcess(arguments, 2)
@@ -648,10 +995,13 @@ class BenchmarkComparisonTest(unittest.TestCase):
     ) -> None:
         def changed(arguments, **kwargs):
             completed = self.fake_native(arguments, **kwargs)
-            self.binary.write_bytes(b"changed binary")
+            if "--list" not in arguments:
+                self.binary.write_bytes(b"changed binary")
             return completed
 
-        with self.assertRaisesRegex(driver.ComparisonError, "changed"):
+        with self.assertRaisesRegex(
+            driver.ComparisonError, "changed during a native invocation"
+        ):
             self.run_mocked(changed)
         manifest = (self.output / "manifest.json").read_bytes()
         with self.assertRaisesRegex(driver.ComparisonError, "must be new"):
@@ -664,6 +1014,8 @@ class BenchmarkComparisonTest(unittest.TestCase):
 
             def regressed(arguments, *, reason=reason, **kwargs):
                 result = self.fake_native(arguments, **kwargs)
+                if "--list" in arguments:
+                    return result
                 filename = next(
                     a.removeprefix("--json-output=")
                     for a in arguments
@@ -699,7 +1051,7 @@ class BenchmarkComparisonTest(unittest.TestCase):
                     mock.patch("builtins.print"),
                 ):
                     self.assertEqual(driver.main(), 1)
-                self.assertEqual(child.call_count, 6)
+                self.assertEqual(child.call_count, 7)
                 manifest = json.loads((self.output / "manifest.json").read_text())
                 self.assertEqual(manifest["status"], "failed")
                 self.assertEqual(manifest["comparisons"][0]["status"], reason)

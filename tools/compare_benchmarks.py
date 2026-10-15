@@ -3,6 +3,8 @@
 The caller supplies release-build evidence and reviews equal work. The native
 pre-run hook reports its build capabilities and effective OOM policy. Each of three rounds
 runs each case in a fresh native process, with at least seven native samples.
+Before anything is measured each binary lists its cases once, and a pair that
+names a case it does not list is refused.
 Hardware instruction/cycle counters are disabled; native allocator and reactor
 task counters remain active. This keeps the required measurements independent
 of host perf-event permissions.
@@ -31,7 +33,11 @@ REACTOR_BACKENDS = ("epoll", "linux-aio", "io_uring")
 CASE_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)+")
 MAXIMUM_RESULT_BYTES = 2 * 1024 * 1024
 MAXIMUM_PROFILE_LOG_BYTES = 2 * 1024 * 1024
+MAXIMUM_PAIRS_FILE_BYTES = 64 * 1024
 PROFILE_PREFIX = b"kwaque-benchmark-profile-v1 "
+LISTING_HEADER = b"available tests:"
+# What bounds a pair's time: the device its barrier reaches, or the processor.
+PAIR_KINDS = ("device", "processor")
 PRODUCTION_PROFILE = {
     "allocator": "native",
     "injection": "false",
@@ -127,6 +133,67 @@ def parse_pair(value: str) -> Pair:
     if names[0] == names[1]:
         raise ComparisonError("baseline and candidate must be distinct cases")
     return Pair(*names)
+
+
+def read_pairs_file(path: Path) -> list[tuple[Pair, str]]:
+    """Pairs and their kinds, one `<baseline>=<candidate> <kind>` a line.
+
+    Blank lines and lines starting with `#` are ignored.
+    """
+    try:
+        with path.open("rb") as source:
+            data = source.read(MAXIMUM_PAIRS_FILE_BYTES + 1)
+    except OSError as error:
+        raise ComparisonError(f"cannot read pairs file ({error.strerror})") from error
+    if len(data) > MAXIMUM_PAIRS_FILE_BYTES:
+        raise ComparisonError("pairs file exceeds size limit")
+    try:
+        lines = data.decode("ascii").splitlines()
+    except UnicodeError as error:
+        raise ComparisonError("pairs file is not ASCII text") from error
+    entries: list[tuple[Pair, str]] = []
+    for number, line in enumerate(lines, 1):
+        fields = line.split()
+        if not fields or fields[0].startswith("#"):
+            continue
+        if len(fields) != 2:
+            raise ComparisonError(
+                f"pairs file line {number} must be '<baseline>=<candidate> <kind>'"
+            )
+        try:
+            pair = parse_pair(fields[0])
+        except ComparisonError as error:
+            raise ComparisonError(f"pairs file line {number}: {error}") from error
+        if fields[1] not in PAIR_KINDS:
+            raise ComparisonError(
+                f"pairs file line {number}: kind must be device or processor"
+            )
+        if any(pair == listed for listed, _ in entries):
+            raise ComparisonError(f"pairs file line {number} repeats a pair")
+        entries.append((pair, fields[1]))
+    if not entries:
+        raise ComparisonError("pairs file names no pair")
+    return entries
+
+
+def read_listing(path: Path) -> set[str]:
+    """The case names a benchmark binary printed for --list."""
+    try:
+        with path.open("rb") as source:
+            data = source.read(MAXIMUM_PROFILE_LOG_BYTES + 1)
+    except OSError as error:
+        raise ComparisonError("cannot read benchmark case listing") from error
+    if len(data) > MAXIMUM_PROFILE_LOG_BYTES:
+        raise ComparisonError("benchmark case listing exceeds size limit")
+    lines = data.splitlines()
+    if LISTING_HEADER not in lines:
+        raise ComparisonError("native benchmark did not list its cases")
+    names = set()
+    for line in lines[lines.index(LISTING_HEADER) + 1 :]:
+        name = line[1:].decode("ascii", "replace")
+        if line.startswith(b"\t") and CASE_NAME.fullmatch(name):
+            names.add(name)
+    return names
 
 
 def invocation_order(pairs: list[Pair], seed: int) -> list[Invocation]:
@@ -331,6 +398,7 @@ def run_comparison(
     task_quota_ms: float | None = None,
     baseline_binary: Path | None = None,
     reactor_backend: str = "epoll",
+    pair_kinds: list[str | None] | None = None,
 ) -> dict[str, Any]:
     if isinstance(runs, bool) or not isinstance(runs, int) or runs < MINIMUM_RUNS:
         raise ComparisonError("runs must be an integer of at least seven")
@@ -358,6 +426,13 @@ def run_comparison(
         raise ComparisonError("at least one valid comparison pair is required")
     if len(set(pairs)) != len(pairs):
         raise ComparisonError("duplicate comparison pairs are not permitted")
+    if pair_kinds is not None and (
+        len(pair_kinds) != len(pairs)
+        or any(kind is not None and kind not in PAIR_KINDS for kind in pair_kinds)
+    ):
+        raise ComparisonError(
+            "each pair's kind must be device, processor or undeclared"
+        )
     timeout = finite_number(
         timeout if timeout is not None else max(60.0, runs * duration * 3 + 30),
         "timeout",
@@ -425,17 +500,87 @@ def run_comparison(
         },
         "pairs": [asdict(pair) for pair in pairs],
         "order": [asdict(invocation) for invocation in order],
+        "listings": [],
         "invocations": [],
         "comparisons": [],
     }
     measurements: dict[tuple[int, int, str], Measurement] = {}
+    if pair_kinds is not None and any(pair_kinds):
+        # Declared for the report; the gate below does not read it.
+        manifest["configuration"]["pair_kinds"] = list(pair_kinds)
     if baseline_binary:
         manifest["baseline_binary"] = {
             "name": baseline_binary.name,
             "sha256": baseline_digest,
         }
     write_manifest(output_dir, manifest)
+    reactor_arguments = [
+        *NATIVE_ARGUMENTS,
+        f"--reactor-backend={reactor_backend}",
+        f"--cpuset={selected_cpu}",
+        "--thread-affinity=1",
+        "--mbind=0",
+    ]
+    quota_arguments = (
+        [] if task_quota_ms is None else [f"--task-quota-ms={task_quota_ms:.17g}"]
+    )
+    environment = {**os.environ, "KWAQUE_REQUIRE_BENCHMARK_PROFILE": "production"}
     try:
+        # A name the binary does not register would fail only at its own
+        # invocation, after others had been measured. Ask each binary for its
+        # cases once and refuse every unlisted name before measuring anything.
+        unlisted = []
+        for role, listed_binary, listed_digest in (
+            ("baseline", baseline_binary, baseline_digest),
+            ("candidate", binary, digest),
+        ):
+            if listed_binary is None:
+                continue
+            log_name = f"0000-list-{role}.log"
+            arguments = [*reactor_arguments, "--list", *quota_arguments]
+            record = {"role": role, "log": log_name, "arguments": arguments}
+            manifest["listings"].append(record)
+            try:
+                with (output_dir / log_name).open("xb") as log:
+                    result = subprocess.run(
+                        [str(listed_binary), *arguments],
+                        cwd=output_dir,
+                        stdin=subprocess.DEVNULL,
+                        stdout=log,
+                        stderr=subprocess.STDOUT,
+                        timeout=timeout,
+                        check=False,
+                        shell=False,
+                        env=environment,
+                    )
+            except subprocess.TimeoutExpired as error:
+                raise ComparisonError("native case listing timed out") from error
+            except OSError as error:
+                raise ComparisonError(
+                    f"native case listing could not execute ({error.strerror})"
+                ) from error
+            record["returncode"] = result.returncode
+            if result.returncode != 0:
+                raise ComparisonError(
+                    f"native case listing exited with status {result.returncode}"
+                )
+            if binary_digest(listed_binary) != listed_digest:
+                raise ComparisonError(
+                    "benchmark binary changed during its case listing"
+                )
+            listed = read_listing(output_dir / log_name)
+            record["cases"] = len(listed)
+            # Without a saved baseline one binary runs both sides.
+            sides = (role,) if baseline_binary else ("baseline", "candidate")
+            missing = sorted(
+                {getattr(pair, side) for pair in pairs for side in sides} - listed
+            )
+            if missing:
+                owner = "baseline" if role == "baseline" else "benchmark"
+                unlisted.append(f"{owner} binary does not list {', '.join(missing)}")
+        if unlisted:
+            raise ComparisonError("; ".join(unlisted))
+        write_manifest(output_dir, manifest)
         for sequence, invocation in enumerate(order, 1):
             selected_binary = (
                 baseline_binary
@@ -451,19 +596,14 @@ def run_comparison(
             json_name = stem + ".json"
             log_name = stem + ".log"
             arguments = [
-                *NATIVE_ARGUMENTS,
-                f"--reactor-backend={reactor_backend}",
-                f"--cpuset={selected_cpu}",
-                "--thread-affinity=1",
-                "--mbind=0",
+                *reactor_arguments,
                 f"--runs={runs}",
                 f"--duration={duration:.17g}",
                 f"--random-seed={seed}",
                 f"--test=^{re.escape(invocation.case)}$",
                 f"--json-output={json_name}",
+                *quota_arguments,
             ]
-            if task_quota_ms is not None:
-                arguments.append(f"--task-quota-ms={task_quota_ms:.17g}")
             record = {
                 **asdict(invocation),
                 "json": json_name,
@@ -488,10 +628,7 @@ def run_comparison(
                         timeout=timeout,
                         check=False,
                         shell=False,
-                        env={
-                            **os.environ,
-                            "KWAQUE_REQUIRE_BENCHMARK_PROFILE": "production",
-                        },
+                        env=environment,
                     )
             except subprocess.TimeoutExpired as error:
                 raise ComparisonError(
@@ -561,7 +698,7 @@ def main() -> int:
         type=Path,
         help="optional saved release binary for an equivalent before/after comparison",
     )
-    selection = parser.add_mutually_exclusive_group(required=True)
+    selection = parser.add_mutually_exclusive_group()
     selection.add_argument(
         "--pair",
         action="append",
@@ -572,6 +709,12 @@ def main() -> int:
         "--case",
         action="append",
         help="same exact group.case in both binaries; requires --baseline-binary",
+    )
+    parser.add_argument(
+        "--pairs-file",
+        type=Path,
+        help="file of '<baseline>=<candidate> <device|processor>' lines; "
+        "its pairs follow any given with --pair",
     )
     parser.add_argument(
         "--output-dir",
@@ -610,10 +753,22 @@ def main() -> int:
         help="native reactor backend for every invocation",
     )
     arguments = parser.parse_args()
+    if not (arguments.pair or arguments.case or arguments.pairs_file):
+        parser.error("one of the arguments --pair --pairs-file --case is required")
+    if arguments.case and arguments.pairs_file:
+        parser.error("argument --pairs-file: not allowed with argument --case")
     try:
         if arguments.case and not arguments.baseline_binary:
             raise ComparisonError("--case requires --baseline-binary")
-        pairs = arguments.pair or [Pair(name, name) for name in arguments.case]
+        pairs = [
+            *(arguments.pair or []),
+            *(Pair(name, name) for name in arguments.case or []),
+        ]
+        kinds: list[str | None] = [None] * len(pairs)
+        if arguments.pairs_file:
+            for pair, kind in read_pairs_file(arguments.pairs_file):
+                pairs.append(pair)
+                kinds.append(kind)
         manifest = run_comparison(
             arguments.binary,
             pairs,
@@ -627,6 +782,7 @@ def main() -> int:
             cpu=arguments.cpu,
             task_quota_ms=arguments.task_quota_ms,
             reactor_backend=arguments.reactor_backend,
+            pair_kinds=kinds,
         )
     except (ComparisonError, OSError) as error:
         message = error.strerror if isinstance(error, OSError) else str(error)

@@ -33,6 +33,25 @@ SHIPPED_FLAGS = (
     "--test_tag_filters=package,smoke,fuzz_replay",
     "//...",
 )
+# The simulated storage tests run on x86-64 only: the aarch64 release job
+# compiles every other unit, and the x86-64 release job compiles them too.
+ARM_RELEASE_EXCLUSION = "--build_tag_filters=-fuzz,-manual,-simulated_storage"
+# The storage suites each release or aarch64 job executes.
+STORAGE_SUITES = {
+    "build": (
+        "//src/storage/suites:local_storage_tests",
+        "//src/storage/suites:storage_backend_tests",
+        "//src/storage/suites:storage_golden_tests",
+    ),
+    "goldens": (
+        "//src/storage/suites:storage_golden_tests",
+        "//src/storage/suites:storage_backend_tests",
+    ),
+    "arm-build": (
+        "//src/storage/suites:storage_golden_tests",
+        "//src/storage/suites:storage_backend_tests",
+    ),
+}
 GATE_FAILURE = (
     "contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled')"
     " || needs.workflow-lint.result != 'success'"
@@ -123,15 +142,22 @@ def fuzz_coverage_errors(workflow: str, scheduled: str, config: str) -> list[str
             "--config=ci",
             "--config=fuzz",
             "--test_output=all",
-            "--test_timeout=720",
+            "--test_timeout=2520",
             "--test_arg=-max_total_time=600",
             "--test_arg=-timeout=15",
+            '--test_arg=-seed="${CAMPAIGN_SEED}"',
             '--test_env=KWAQUE_FUZZ_CORPUS_DIR="${CORPUS}"',
             '--sandbox_writable_path="${CORPUS}"',
             '"${FUZZ_TARGET}"',
         ):
             if flag not in commands[0].split():
                 errors.append(f"scheduled campaign requires {flag}")
+    if (
+        "seed=$((16#${GITHUB_SHA:0:8}))" not in campaign
+        or "          CAMPAIGN_SEED: ${{ steps.seed.outputs.value }}"
+        not in campaign.splitlines()
+    ):
+        errors.append("scheduled campaigns must take their seed from the commit")
     restored = campaign.find("uses: actions/cache/restore@")
     saved = campaign.find("uses: actions/cache/save@")
     run = campaign.find("bazel test ")
@@ -400,6 +426,34 @@ def coverage_errors(workflow: str) -> list[str]:
             for command in run_commands(job)
         ):
             errors.append(f"{name}: execute the complete golden suite uncached")
+    for name, suites in STORAGE_SUITES.items():
+        for suite in suites:
+            if not any(
+                suite in command.split()
+                for command in run_commands(jobs.get(name, ""))
+                if command.startswith("bazel test ")
+            ):
+                errors.append(f"{name}: execute the storage suite {suite}")
+    for name, excluded in (("build", False), ("arm-build", True)):
+        commands = [
+            command
+            for command in run_commands(jobs.get(name, ""))
+            if command.startswith(("bazel build ", "bazel test "))
+            and "//..." in command.split()
+        ]
+        if any(
+            (ARM_RELEASE_EXCLUSION in command.split()) != excluded
+            or ("simulated_storage" in command) != excluded
+            for command in commands
+        ):
+            errors.append(
+                f"{name}: "
+                + (
+                    "leave only the simulated storage tests out of aarch64 release"
+                    if excluded
+                    else "compile the simulated storage tests on x86-64 release"
+                )
+            )
     arm = jobs.get("arm-build", "")
     if "runs-on: ubuntu-24.04-arm" not in arm:
         errors.append("arm-build: use a native aarch64 runner")
@@ -432,9 +486,15 @@ def shipped_artifact_errors(workflow: str) -> list[str]:
         commands = run_commands(jobs.get(name, ""))
         if "sudo sysctl -w fs.aio-max-nr=1048576" not in commands:
             errors.append(f"{name}: allow linux-aio reactors")
+        flags = tuple(
+            ARM_RELEASE_EXCLUSION
+            if name == "arm-build" and flag.startswith("--build_tag_filters=")
+            else flag
+            for flag in SHIPPED_FLAGS
+        )
         if not any(
             command.startswith("bazel test ")
-            and all(flag in command.split() for flag in SHIPPED_FLAGS)
+            and all(flag in command.split() for flag in flags)
             for command in commands
         ):
             errors.append(
@@ -850,7 +910,7 @@ class CiCoverageTest(unittest.TestCase):
             "--test_arg=-max_total_time=600",
             "--test_arg=-timeout=15",
             "if: failure()",
-            "--test_timeout=720",
+            "--test_timeout=2520",
             "fail-fast: false",
             "max-parallel: 4",
             "FUZZ_TARGET: ${{ matrix.target }}",
@@ -862,6 +922,9 @@ class CiCoverageTest(unittest.TestCase):
             "uses: actions/cache/restore@",
             "uses: actions/cache/save@",
             '--test_env=KWAQUE_FUZZ_CORPUS_DIR="${CORPUS}"',
+            '--test_arg=-seed="${CAMPAIGN_SEED}"',
+            "seed=$((16#${GITHUB_SHA:0:8}))",
+            "CAMPAIGN_SEED: ${{ steps.seed.outputs.value }}",
         ):
             with self.subTest(value=value):
                 self.assertIn(value, scheduled)
@@ -922,6 +985,36 @@ class CiCoverageTest(unittest.TestCase):
         self.assertIn(
             "path: bazel-out/_coverage/_coverage_report.dat", jobs["coverage"]
         )
+
+    def test_nightly_takes_every_cut_and_every_allocation_point(self) -> None:
+        jobs = job_blocks(NIGHTLY_WORKFLOW.read_text())
+        for name, config, suite, extra in (
+            (
+                "sweeps",
+                "ci-sanitizer",
+                "//src/storage/suites:storage_crash_tests",
+                '--test_env=SEASTAR_SHUFFLE_TASK_QUEUE_SEED="${SHUFFLE_SEED}"',
+            ),
+            ("scale", "ci-debug", "//src/storage/suites:storage_scale_tests", None),
+        ):
+            with self.subTest(job=name):
+                commands = [
+                    command
+                    for command in run_commands(jobs[name])
+                    if command.startswith("bazel test ")
+                ]
+                self.assertEqual(len(commands), 1)
+                words = commands[0].split()
+                for flag in (
+                    f"--config={config}",
+                    "--cache_test_results=no",
+                    "--test_env=KWAQUE_FULL_SWEEPS=1",
+                    suite,
+                ):
+                    self.assertIn(flag, words)
+                if extra:
+                    self.assertIn(extra, words)
+                    self.assertIn("$((16#${GITHUB_SHA:0:8}))", jobs[name])
 
     def test_fuzz_cache_cannot_skip_a_campaign(self) -> None:
         config = BAZEL_CONFIG.read_text()
@@ -1070,6 +1163,52 @@ class CiCoverageTest(unittest.TestCase):
                         ),
                         target,
                     )
+
+    def test_each_storage_suite_and_the_aarch64_exclusion_are_required(self) -> None:
+        jobs = job_blocks(self.workflow)
+        for name, suites in STORAGE_SUITES.items():
+            job = jobs[name]
+            for suite in suites:
+                with self.subTest(job=name, suite=suite):
+                    self.assertTrue(
+                        coverage_errors(
+                            self.workflow.replace(job, job.replace(suite + "\n", "\n"))
+                        )
+                    )
+        arm = jobs["arm-build"]
+        build = jobs["build"]
+        for changed in (
+            # aarch64 release compiles the simulated tests again.
+            self.workflow.replace(
+                arm,
+                arm.replace(ARM_RELEASE_EXCLUSION, "--build_tag_filters=-fuzz,-manual"),
+            ),
+            # Only one of its two steps leaves them out.
+            self.workflow.replace(
+                arm,
+                arm.replace(
+                    ARM_RELEASE_EXCLUSION, "--build_tag_filters=-fuzz,-manual", 1
+                ),
+            ),
+            # x86-64 release stops compiling them.
+            self.workflow.replace(
+                build,
+                build.replace(
+                    "--build_tag_filters=-fuzz,-manual", ARM_RELEASE_EXCLUSION, 1
+                ),
+            ),
+            # aarch64 release leaves out more than the simulated tests.
+            self.workflow.replace(
+                arm,
+                arm.replace(
+                    ARM_RELEASE_EXCLUSION, ARM_RELEASE_EXCLUSION + ",-benchmark2", 1
+                ),
+            ),
+        ):
+            with self.subTest(changed=changed.count("simulated_storage")):
+                self.assertTrue(
+                    coverage_errors(changed) or shipped_artifact_errors(changed)
+                )
 
     def test_actual_test_execution_and_configuration_isolation_are_required(
         self,

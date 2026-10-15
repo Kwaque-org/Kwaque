@@ -198,6 +198,7 @@ struct measurement final {
     std::uint64_t foreground_turns{0}, peak_admission{0};
     std::uint64_t wal_groups{0}, wal_flushes{0}, wal_writes{0}, footers{0},
       blocks{0};
+    wal_bench_support::reactor_io io;
     codec::testing::allocation_observation memory;
 };
 
@@ -211,7 +212,8 @@ public:
       , observe_allocations_(allocations)
       , before_allocations_(seastar::memory::stats().mallocs())
       , before_tasks_(seastar::engine().get_sched_stats().tasks_processed)
-      , before_operations_(files.statistics().accepted) {
+      , before_operations_(files.statistics().accepted)
+      , before_io_(wal_bench_support::reactor_io::now()) {
         files_.sample.measuring = true;
 #if !defined(KWAQUE_LOCAL_STORAGE_TIMING_ONLY)
         if (observe_allocations_)
@@ -237,6 +239,7 @@ public:
                         - before_tasks_;
         output_.runtime_operations = files_.statistics().accepted
                                      - before_operations_;
+        output_.io = wal_bench_support::reactor_io::now().since(before_io_);
     }
     measure_scope(const measure_scope&) = delete;
     measure_scope& operator=(const measure_scope&) = delete;
@@ -246,6 +249,7 @@ private:
     measurement& output_;
     [[maybe_unused]] bool observe_allocations_;
     std::uint64_t before_allocations_, before_tasks_, before_operations_;
+    wal_bench_support::reactor_io before_io_;
     seastar::thread_cputime_clock::time_point cpu_;
 };
 
@@ -843,6 +847,19 @@ void print_measurement(
     number("wal_writes", value.wal_writes);
     number("footers", value.footers);
     number("blocks", value.blocks);
+    // Neither file is preallocated here: each barrier follows writes that
+    // grew its file.
+    std::printf(
+      ",\"wal_barrier\":\"%s\",\"data_barrier\":\"%s\"",
+      wal_bench_support::barrier_name(
+        wal_bench_support::barrier_kind::extending),
+      wal_bench_support::barrier_name(
+        wal_bench_support::barrier_kind::extending));
+    number("reactor_flushes", value.io.flushes);
+    number("reactor_writes", value.io.writes);
+    number("reactor_write_bytes", value.io.write_bytes);
+    number("reactor_reads", value.io.reads);
+    number("reactor_read_bytes", value.io.read_bytes);
     flag("fragmented", selected.fragmented);
     flag("zero_timestamps", settings.zero_timestamps);
     flag("timing_only", timing_only);
@@ -1129,8 +1146,14 @@ private:
             }
         };
         std::optional<seastar::semaphore_units<>> hold;
+        // Requests in flight together never share a work account: each has
+        // its own, made before any interval and kept until the owners close.
+        std::deque<codec::cooperative_work> accounts;
         try {
             co_await open_stack(s, selected, inputs, chosen);
+            if (chosen == scope::candidate)
+                for (std::uint32_t i = 0; i < selected.requests; ++i)
+                    accounts.emplace_back(work.policy(), abort);
             std::deque<codec::cooperative_work> branches;
             for (std::uint32_t f = 0; f < selected.segments; ++f)
                 branches.emplace_back(work.policy(), abort);
@@ -1150,7 +1173,7 @@ private:
                 measure_scope interval{files, result, settings.memory};
                 if (chosen == scope::candidate)
                     co_await run_candidate(
-                      s, selected, members, samples, hold, result);
+                      s, selected, members, accounts, samples, hold, result);
                 else if (selected.profile == arrival::held)
                     co_await compose_group(
                       s,
@@ -1176,6 +1199,13 @@ private:
                                 - wal_before.accepted_groups;
             result.wal_flushes = wal_after.flush_calls - wal_before.flush_calls;
             result.wal_writes = wal_after.write_calls - wal_before.write_calls;
+            // Each barrier claimed reached the device: the shard issued at
+            // least the WAL's own flushes.
+            require(
+              wal_bench_support::barrier_evident(
+                wal_bench_support::barrier_kind::extending, result.io, 0)
+                && result.io.flushes >= result.wal_flushes,
+              "claimed barrier reached no device");
             for (std::size_t f = 0; f < s.segments.size(); ++f) {
                 const auto& durable = s.segments[f]->progress()->durable;
                 result.footers += durable.footers - footers_before[f];
@@ -1246,6 +1276,7 @@ private:
       stack& s,
       const case_shape& selected,
       std::span<pending> members,
+      std::deque<codec::cooperative_work>& accounts,
       std::span<request_sample> samples,
       std::optional<seastar::semaphore_units<>>& hold,
       measurement& observed) {
@@ -1256,7 +1287,7 @@ private:
             auto request = std::move(*member.request);
             member.request.reset();
             auto stages = s.append->append(
-              s.targets[member.segment], std::move(request), s.work);
+              s.targets[member.segment], std::move(request), accounts[i]);
             observed.peak_admission = std::max(
               observed.peak_admission, s.budget.snapshot().bytes);
             return stages;

@@ -25,7 +25,9 @@
 #include "src/storage/tests/segment_bench_fixture.h"
 #include "src/storage/tests/segment_bench_observer.h"
 #include "src/storage/tests/segment_writer_contract.h"
+#include "src/storage/tests/wal_bench_file.h"
 
+#include <seastar/core/condition-variable.hh>
 #include <seastar/core/coroutine.hh>
 #include <seastar/core/reactor.hh>
 #include <seastar/core/seastar.hh>
@@ -37,9 +39,11 @@
 
 #include <algorithm>
 #include <array>
+#include <charconv>
 #include <cinttypes>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <deque>
 #include <filesystem>
 #include <fstream>
@@ -60,6 +64,7 @@ using local_storage_bench_support::io_sample;
 using local_storage_bench_support::measurement_time;
 using store_contract::require;
 using store_contract::take;
+using wal_bench_support::reactor_io;
 namespace fixture = segment_bench_support;
 namespace installation = installation_contract;
 namespace segments = segment_writer_contract;
@@ -82,9 +87,10 @@ constexpr std::array<std::uint64_t, 9> swept_strides{
   4_KiB, 8_KiB, 16_KiB, 32_KiB, 64_KiB, 128_KiB, 256_KiB, 512_KiB, 1_MiB};
 
 struct settings final {
-    // Blocks of the measured segment, 4 KiB each. A segment holds at most
-    // 65,536; the count written is reported with every row. The default
-    // keeps a run of every case short and still fills more than one page.
+    // Blocks of the measured segment, 4 KiB each, and of the extent with
+    // holes. A segment holds at most 65,536; the count written is reported
+    // with every row. The default keeps a run of every case short and still
+    // fills more than one page.
     std::uint32_t blocks{2048};
     // Sealed segments of the many-segment cases, and the blocks of each. An
     // index of 64 anchors and its root are one device block each; the cost
@@ -99,6 +105,8 @@ struct settings final {
     // made outside this binary.
     const char* export_directory{nullptr};
 };
+// A count from the environment: a whole number within its bound, written
+// as digits alone.
 std::uint32_t chosen_count(
   const char* name,
   std::uint32_t otherwise,
@@ -106,10 +114,13 @@ std::uint32_t chosen_count(
   std::uint32_t most) {
     const auto* text = std::getenv(name);
     if (!text) return otherwise;
-    const auto value = std::strtoull(text, nullptr, 10);
+    std::uint64_t value = 0;
+    const auto* end = text + std::strlen(text);
+    const auto parsed = std::from_chars(text, end, value);
     require(
-      value >= least && value <= most,
-      "an index benchmark count is outside its bound");
+      parsed.ec == std::errc{} && parsed.ptr == end && value >= least
+        && value <= most,
+      "an index benchmark count is not a whole number within its bound");
     return static_cast<std::uint32_t>(value);
 }
 settings read_settings() {
@@ -749,6 +760,9 @@ struct measurement final {
     // Index bundles, with every other metadata file, and segment data.
     io_count index, data;
     std::uint64_t stats{0}, directory_syncs{0};
+    // What the shard itself issued, in both builds: every file together, a
+    // read counted when it was submitted.
+    reactor_io io;
     fixture::work_sample work;
 };
 io_count counted(const io_sample& sample, file_kind kind) {
@@ -784,7 +798,8 @@ public:
       , stats_(files.sample.stats)
       , directory_syncs_(files.sample.directory_syncs)
       , allocations_(seastar::memory::stats().mallocs())
-      , tasks_(seastar::engine().get_sched_stats().tasks_processed) {
+      , tasks_(seastar::engine().get_sched_stats().tasks_processed)
+      , io_(reactor_io::now()) {
         files_.sample.measuring = true;
 #if !defined(KWAQUE_INDEX_BENCH_TIMING_ONLY)
         fixture::begin_work_observation(output_.work);
@@ -798,6 +813,12 @@ public:
         output_.elapsed += measurement_time() - epoch_;
         output_.cpu += static_cast<std::uint64_t>(
           (seastar::thread_cputime_clock::now() - cpu_).count());
+        const auto issued = reactor_io::now().since(io_);
+        output_.io.flushes += issued.flushes;
+        output_.io.writes += issued.writes;
+        output_.io.write_bytes += issued.write_bytes;
+        output_.io.reads += issued.reads;
+        output_.io.read_bytes += issued.read_bytes;
         files_.sample.measuring = false;
 #if !defined(KWAQUE_INDEX_BENCH_TIMING_ONLY)
         fixture::end_work_observation();
@@ -832,6 +853,7 @@ private:
     bool timed_;
     io_count index_, data_;
     std::uint64_t stats_, directory_syncs_, allocations_, tasks_;
+    reactor_io io_;
     std::uint64_t epoch_{0};
     seastar::thread_cputime_clock::time_point cpu_;
 };
@@ -908,6 +930,11 @@ public:
         field("directory_syncs", value.directory_syncs);
         field("hashed_bytes", value.work.digest_bytes);
         field("crc_bulk_bytes", value.work.crc_bulk_bytes);
+        field("reactor_flushes", value.io.flushes);
+        field("reactor_writes", value.io.writes);
+        field("reactor_write_bytes", value.io.write_bytes);
+        field("reactor_reads", value.io.reads);
+        field("reactor_read_bytes", value.io.read_bytes);
         return *this;
     }
     row& budget(const char* prefix, const workload_budget_snapshot& held) {
@@ -934,13 +961,15 @@ workload_budget_snapshot held_since(
       now.rejected - then.rejected};
 }
 
-// The owner of a sealed segment's index, as a shard would make it.
+// The owner of a sealed segment's index, as a shard would make it: with a
+// cache that keeps what a reader's lookups read, or with none.
 std::unique_ptr<index_type> own_index(
   const environment& env,
   const sealed& segment,
   sparse_index_residency& residency,
   sparse_index_rebuild_limit& rebuilds,
-  const codec::cooperative_work& work) {
+  const codec::cooperative_work& work,
+  page_cache* cache = nullptr) {
     return take(
       index_type::make(
         env.files,
@@ -958,7 +987,15 @@ std::unique_ptr<index_type> own_index(
         env.indexing,
         store_contract::limits(),
         scan_limits(),
-        work.policy()));
+        work.policy(),
+        cache));
+}
+// What the cache of a sealed segment's index or runs may hold: ten of the
+// widest runs of the read sweep, with room to spare, or half of what funds
+// it. Every page of the largest index a segment has fits many times over.
+byte_count sealed_cache(const environment& env) {
+    return byte_count{
+      std::min<std::uint64_t>(16_MiB, env.indexing.limits().bytes.value() / 2)};
 }
 seastar::future<> close_index(std::unique_ptr<index_type>& index) {
     if (!index) co_return;
@@ -1191,20 +1228,30 @@ const char* side_name(side value) noexcept {
     std::abort();
 }
 
-// One segment whose every block is an anchor, and `lookups` offsets looked
-// up in its index. Cold, nothing of the index is open when the interval
-// starts: it holds the opening and every lookup. Warm, the root is open
-// before it starts, or the resident index is loaded, and it holds the
-// lookups alone. A lookup in a published index reads the one page its root
-// routes to and verifies it, every time: nothing here keeps a page.
-seastar::future<std::size_t>
-lookup_case(environment env, side measured, bool cold) {
-    seastar::abort_source abort;
-    codec::cooperative_work work{codec::limits::defaults(), abort};
-    auto segment = co_await write_segment(
-      env, {.blocks = env.chosen.blocks, .stride = every_block}, work);
-    const auto blocks = co_await scan_blocks(env, segment, work);
-    const auto targets = make_targets(blocks, 0x1dea);
+// What one side's lookups of a unit came to, checked against the blocks.
+struct looked_up final {
+    measurement timed;
+    workload_budget_snapshot held;
+    lookup_summary checked;
+    // Each lookup's answer, on a paged side.
+    answers found;
+    // What a resident index holds, and the bytes of its file.
+    std::uint64_t resident_columns{0}, resident_file{0};
+};
+// `targets` looked up in the index of `segment` by one side. Cold, nothing
+// of the index is open when the interval starts: it holds the opening and
+// every lookup. Warm, the root is open before it starts, or the resident
+// index is loaded, and it holds the lookups alone. A lookup in a published
+// index reads the one page its root routes to and verifies it, every time:
+// nothing here keeps a page.
+seastar::future<looked_up> look_up(
+  environment env,
+  const sealed& segment,
+  const block_list& blocks,
+  std::span<const model::range_logical_offset> targets,
+  side measured,
+  bool cold,
+  codec::cooperative_work& work) {
     const auto path = resident_path(env, segment.ordinal);
     if (measured == side::resident) {
         const auto built = resident_of(segment, env.indexing);
@@ -1215,12 +1262,10 @@ lookup_case(environment env, side measured, bool cold) {
     std::unique_ptr<index_type> index;
     std::unique_ptr<local_root_owner> root;
     std::optional<resident_index> resident;
-    answers found;
+    looked_up out;
     resident_answers resident_found;
-    found.reserve(targets.size());
+    out.found.reserve(targets.size());
     resident_found.reserve(targets.size());
-    measurement timed;
-    workload_budget_snapshot held;
     runtime::first_failure failed;
     try {
         const auto before = env.indexing.snapshot();
@@ -1243,10 +1288,10 @@ lookup_case(environment env, side measured, bool cold) {
         const auto look = [&]() -> seastar::future<> {
             switch (measured) {
             case side::candidate:
-                co_await owned_lookups(*index, targets, found, work);
+                co_await owned_lookups(*index, targets, out.found, work);
                 break;
             case side::baseline:
-                co_await composed_lookups(*root, targets, found, work);
+                co_await composed_lookups(*root, targets, out.found, work);
                 break;
             case side::resident:
                 for (const auto target : targets)
@@ -1256,13 +1301,13 @@ lookup_case(environment env, side measured, bool cold) {
         };
         const auto unit = [&]() -> seastar::future<> {
             if (!cold) co_await open();
-            measure_scope scope{env.files, timed};
+            measure_scope scope{env.files, out.timed};
             if (cold) co_await open();
             co_await look();
         };
         co_await seastar::with_scheduling_group(
           env.indexing.scheduling_group(), [&unit] { return unit(); });
-        held = held_since(env.indexing, before);
+        out.held = held_since(env.indexing, before);
     } catch (...) {
         failed.observe(std::current_exception());
     }
@@ -1277,32 +1322,368 @@ lookup_case(environment env, side measured, bool cold) {
         failed.observe(std::current_exception());
     }
     take(failed.outcome());
-    const auto checked
-      = measured == side::resident
-          ? check_resident(blocks, segment.end(), targets, resident_found)
-          : check_answers(blocks, segment.end(), targets, found);
+    out.checked = measured == side::resident
+                    ? check_resident(
+                        blocks, segment.end(), targets, resident_found)
+                    : check_answers(blocks, segment.end(), targets, out.found);
+    if (resident) {
+        out.resident_columns = resident->column_bytes().value();
+        out.resident_file
+          = resident_index::encoded_bytes(resident->size()).value();
+    }
+    co_return out;
+}
+void resident_fields(row& out, side measured, const looked_up& done) {
+    if (measured != side::resident) return;
+    out.number("resident_column_bytes", done.resident_columns)
+      .number("resident_file_bytes", done.resident_file);
+}
+
+// One segment whose every block is an anchor, and `lookups` offsets looked
+// up in its index, warm or cold.
+seastar::future<std::size_t>
+lookup_case(environment env, side measured, bool cold) {
+    seastar::abort_source abort;
+    codec::cooperative_work work{codec::limits::defaults(), abort};
+    auto segment = co_await write_segment(
+      env, {.blocks = env.chosen.blocks, .stride = every_block}, work);
+    const auto blocks = co_await scan_blocks(env, segment, work);
+    const auto targets = make_targets(blocks, 0x1dea);
+    const auto done = co_await look_up(
+      env, segment, blocks, targets, measured, cold, work);
     {
         row out{cold ? "cold_open_lookup" : "warm_lookup", side_name(measured)};
         out.data(segment, blocks)
-          .lookups_checked(checked, lookups)
-          .measured("", timed)
-          .budget("held_", held);
-        if (resident)
-            out
-              .number("resident_column_bytes", resident->column_bytes().value())
-              .number(
-                "resident_file_bytes",
-                resident_index::encoded_bytes(resident->size()).value());
+          .lookups_checked(done.checked, lookups)
+          .measured("", done.timed)
+          .budget("held_", done.held);
+        resident_fields(out, measured, done);
     }
     if (measured == side::candidate && cold) {
         exported file{env.chosen, "lookup.txt"};
         file.segment(segment);
         for (std::size_t q = 0; q < targets.size(); ++q)
-            file.lookup(segment.ordinal, targets[q], found[q]);
+            file.lookup(segment.ordinal, targets[q], done.found[q]);
         file.finish();
     }
     // A cold unit is the opening and its lookups together.
     co_return cold ? 1 : lookups;
+}
+
+// An extent whose original slots have holes, as a rewrite of a segment
+// leaves them: slots removed between batches, and batches that kept fewer
+// records than their original span. File positions and record ordinals stay
+// dense. No writer makes one, since an appended segment has no hole, so its
+// index is fed from a list made here. An index bundle lives in the directory
+// of the segment it indexes, so this one is published in the directory of a
+// segment written for it, under a context of its own: the list's coverage,
+// bound to a digest of the list. Its lookups read the index's pages alone and
+// never the data, which nothing here writes.
+struct hole_extent final {
+    sealed extent;
+    // The list's blocks: what every answer is checked against.
+    block_list blocks;
+    // Blocks followed by removed slots, and blocks that kept fewer records
+    // than their span, in order.
+    std::deque<std::size_t> gapped, sparse;
+    // Slots removed between batches, slots of a sparse batch's span that it
+    // kept no record of, and the records kept.
+    std::uint64_t removed{0}, unkept{0}, records{0};
+};
+constexpr std::uint64_t hole_block_bytes = 4_KiB;
+// `count` blocks of one to fifteen original slots each, after the segment's
+// first offset, each fed to the index as it is made. Every odd block keeps
+// fewer records than its span when it spans more than one, and two blocks in
+// every four are followed by one to fifteen removed slots, the last block
+// excepted: every pairing of the two.
+seastar::future<hole_extent> make_holes(
+  const environment& env,
+  const sealed& carrier,
+  std::uint32_t count,
+  codec::cooperative_work& work) {
+    hole_extent out{
+      .extent = {.descriptor = carrier.descriptor, .stride = every_block}};
+    const auto history = *carrier.history;
+    auto& extent = out.extent;
+    extent.ordinal = carrier.ordinal;
+    extent.history = history;
+    extent.blocks = count;
+    extent.capacity = sparse_index_capacity(
+      every_block, byte_count{1_GiB}, count);
+    extent.memory = std::make_unique<active_sparse_index>(take(
+      active_sparse_index::make(every_block, extent.capacity, env.writing)));
+    choices drawn{0x401e};
+    auto base = history.logical_origin.value();
+    auto ordinal = history.physical_origin.value();
+    auto position = history.data_start.value();
+    for (std::uint32_t at = 0; at < count; ++at) {
+        const auto span = 1 + drawn.uniform(15);
+        const auto kept = at % 2 == 1 && span > 1 ? 1 + drawn.uniform(span - 1)
+                                                  : span;
+        if (kept < span) {
+            out.sparse.push_back(at);
+            out.unkept += span - kept;
+        }
+        require(
+          extent.memory->written(
+            coverage{
+              model::range_logical_span::from_count(
+                model::range_logical_end{base},
+                model::range_logical_count{span})
+                .value(),
+              model::segment_relative_span::from_count(
+                model::segment_relative_end{ordinal},
+                model::segment_record_count{kept})
+                .value(),
+              model::file_byte_span::from_size(
+                runtime::file_position{position}, byte_count{hole_block_bytes})
+                .value()}),
+          "a block of the extent with holes was not chosen");
+        out.blocks.push_back(
+          {base, base + span, position, position + hole_block_bytes});
+        out.records += kept;
+        base += span;
+        ordinal += kept;
+        position += hole_block_bytes;
+        if (at % 4 < 2 && at + 1 < count) {
+            const auto gap = 1 + drawn.uniform(15);
+            out.gapped.push_back(at);
+            out.removed += gap;
+            base += gap;
+        }
+    }
+    extent.memory->durable(runtime::file_position{position});
+    extent.memory->freeze();
+    require(
+      !out.gapped.empty() && !out.sparse.empty()
+        && extent.memory->size() == count && extent.memory->skipped() == 0,
+      "the extent with holes has none, or a block that is not an anchor");
+    const coverage covered{
+      model::range_logical_span::from_count(
+        history.logical_origin,
+        model::range_logical_count{
+          out.blocks.back().next - history.logical_origin.value()})
+        .value(),
+      model::segment_relative_span::from_count(
+        history.physical_origin, model::segment_record_count{out.records})
+        .value(),
+      model::file_byte_span::from_size(
+        history.data_start, byte_count{position - history.data_start.value()})
+        .value()};
+    // No data bears this digest out: nothing reads the extent's data.
+    codec::content_digest listed{};
+    const auto digest = dataset_digest(out.blocks);
+    for (std::size_t at = 0; at < listed.size(); ++at)
+        listed[at] = static_cast<unsigned char>(digest >> (8 * (at % 8)));
+    extent.context = take(
+      sparse_index_context::make(
+        carrier.descriptor.segment,
+        covered,
+        codec::extent_digest{listed},
+        carrier.descriptor.alignment));
+    extent.index = take(
+      co_await publish_sparse_index(
+        env.files,
+        env.owner,
+        env.spec,
+        0,
+        *extent.memory,
+        *extent.context,
+        carrier.spare_object(0),
+        env.indexing,
+        store_contract::limits(),
+        work));
+    co_return out;
+}
+// Offsets to look up in an extent with holes: below its first batch, at a
+// batch's base, inside a sparse batch's span past its base, inside slots
+// removed after a batch, at the first base after them, past the end, at the
+// far end of the offset space, and anywhere across the extent, holes and
+// batches alike.
+std::vector<model::range_logical_offset>
+make_hole_targets(const hole_extent& holes, std::uint64_t seed) {
+    choices drawn{seed};
+    const auto& blocks = holes.blocks;
+    const auto first = blocks.front().base, end = blocks.back().next;
+    std::vector<model::range_logical_offset> out;
+    out.reserve(lookups);
+    for (std::uint32_t q = 0; q < lookups; ++q) {
+        std::uint64_t target = 0;
+        switch (q % 8) {
+        case 0:
+            target = first == 0 ? 0 : drawn.uniform(first);
+            break;
+        case 1:
+            target = blocks[drawn.uniform(blocks.size())].base;
+            break;
+        case 2: {
+            const auto& block
+              = blocks[holes.sparse[drawn.uniform(holes.sparse.size())]];
+            target = block.base + 1
+                     + drawn.uniform(block.next - block.base - 1);
+            break;
+        }
+        case 3: {
+            const auto at = holes.gapped[drawn.uniform(holes.gapped.size())];
+            target = blocks[at].next
+                     + drawn.uniform(blocks[at + 1].base - blocks[at].next);
+            break;
+        }
+        case 4:
+            target
+              = blocks[holes.gapped[drawn.uniform(holes.gapped.size())] + 1]
+                  .base;
+            break;
+        case 5:
+            target = end + drawn.uniform(1_MiB);
+            break;
+        case 6:
+            target = UINT64_MAX - 1 - drawn.uniform(16);
+            break;
+        default:
+            target = first + drawn.uniform(end - first);
+            break;
+        }
+        out.push_back(model::range_logical_offset::make(target).value());
+    }
+    return out;
+}
+// How many offsets lie in slots removed between batches, and how many in a
+// sparse batch's span past its base, by the list alone.
+struct hole_hits final {
+    std::uint32_t in_gap{0}, in_sparse{0};
+};
+hole_hits classify(
+  const hole_extent& holes,
+  std::span<const model::range_logical_offset> targets) {
+    hole_hits out;
+    const auto& blocks = holes.blocks;
+    for (const auto target : targets) {
+        const auto after = std::ranges::upper_bound(
+          blocks, target.value(), {}, &block_span::base);
+        if (after == blocks.begin()) continue;
+        const auto holder = std::prev(after);
+        const auto at = static_cast<std::size_t>(holder - blocks.begin());
+        if (target.value() >= holder->next) {
+            if (after != blocks.end()) ++out.in_gap;
+        } else if (
+          target.value() > holder->base
+          && std::ranges::binary_search(holes.sparse, at)) {
+            ++out.in_sparse;
+        }
+    }
+    return out;
+}
+
+// The warm lookups of an extent with holes, by each side, each answer
+// checked against the list: the anchor at or before the offset by original
+// base, as for any other extent.
+seastar::future<std::size_t> hole_case(environment env, side measured) {
+    seastar::abort_source abort;
+    codec::cooperative_work work{codec::limits::defaults(), abort};
+    const auto carrier = co_await write_segment(
+      env,
+      {.blocks = 64,
+       .stride = every_block,
+       .maximum_blocks = 64,
+       .maximum_data_bytes = byte_count{64_MiB}},
+      work);
+    const auto holes = co_await make_holes(
+      env, carrier, env.chosen.blocks, work);
+    const auto targets = make_hole_targets(holes, 0x401e);
+    const auto hits = classify(holes, targets);
+    const auto done = co_await look_up(
+      env, holes.extent, holes.blocks, targets, measured, false, work);
+    {
+        row out{"hole_lookup", side_name(measured)};
+        out.data(holes.extent, holes.blocks)
+          .number("gaps", holes.gapped.size())
+          .number("removed_slots", holes.removed)
+          .number("sparse_batches", holes.sparse.size())
+          .number("unkept_slots", holes.unkept)
+          .number("records", holes.records)
+          .number("gap_lookups", hits.in_gap)
+          .number("sparse_lookups", hits.in_sparse)
+          .lookups_checked(done.checked, lookups)
+          .measured("", done.timed)
+          .budget("held_", done.held);
+        resident_fields(out, measured, done);
+    }
+    co_return lookups;
+}
+
+// The same lookups as a reader makes them: through locate(), with a cache
+// that keeps what they read of the index's root and pages. Each lookup is a
+// reader's first and stands in no page. Every one has been made once before
+// the interval starts, so each is answered from what the cache holds, and
+// reads nothing and waits for nothing.
+seastar::future<std::size_t> cached_case(environment env) {
+    seastar::abort_source abort, asking;
+    codec::cooperative_work work{codec::limits::defaults(), abort};
+    auto segment = co_await write_segment(
+      env, {.blocks = env.chosen.blocks, .stride = every_block}, work);
+    const auto blocks = co_await scan_blocks(env, segment, work);
+    const auto targets = make_targets(blocks, 0x1dea);
+    auto cache = take(
+      page_cache::make(env.indexing, {.capacity = sealed_cache(env)}));
+    sparse_index_residency residency;
+    sparse_index_rebuild_limit rebuilds;
+    std::unique_ptr<index_type> index;
+    answers found;
+    found.reserve(targets.size());
+    measurement timed;
+    workload_budget_snapshot held;
+    page_cache_snapshot then, now;
+    runtime::first_failure failed;
+    try {
+        const auto before = env.indexing.snapshot();
+        index = own_index(env, segment, residency, rebuilds, work, cache.get());
+        const auto pass = [&]() -> seastar::future<> {
+            found.clear();
+            for (const auto target : targets)
+                found.push_back(
+                  take(co_await index->locate(target, asking)).position);
+        };
+        const auto unit = [&]() -> seastar::future<> {
+            co_await pass();
+            then = cache->snapshot();
+            measure_scope scope{env.files, timed};
+            co_await pass();
+        };
+        co_await seastar::with_scheduling_group(
+          env.indexing.scheduling_group(), [&unit] { return unit(); });
+        now = cache->snapshot();
+        held = held_since(env.indexing, before);
+        require(
+          now.loads == then.loads && timed.index.reads == 0
+            && timed.index.opens == 0,
+          "a lookup whose root and page are kept read a file");
+    } catch (...) {
+        failed.observe(std::current_exception());
+    }
+    try {
+        co_await close_index(index);
+    } catch (...) {
+        failed.observe(std::current_exception());
+    }
+    try {
+        co_await cache->stop();
+    } catch (...) {
+        failed.observe(std::current_exception());
+    }
+    take(failed.outcome());
+    const auto checked = check_answers(blocks, segment.end(), targets, found);
+    {
+        row out{"cached_lookup", "candidate"};
+        out.data(segment, blocks)
+          .lookups_checked(checked, lookups)
+          .measured("", timed)
+          .budget("held_", held)
+          .number("cache_capacity", now.capacity)
+          .number("cache_bytes", now.bytes)
+          .number("cache_loads", now.loads - then.loads);
+    }
+    co_return lookups;
 }
 
 // Many sealed segments, each with a small index, found again at once: every
@@ -1835,6 +2216,17 @@ PERF_TEST_F(candidate_index, rebuild) {
     return run_store(
       [](environment env) { return rebuild_case(env, side::candidate); });
 }
+PERF_TEST_F(candidate_index, hole_lookup) {
+    return run_store(
+      [](environment env) { return hole_case(env, side::candidate); });
+}
+PERF_TEST_F(baseline_index, hole_lookup) {
+    return run_store(
+      [](environment env) { return hole_case(env, side::baseline); });
+}
+PERF_TEST_F(candidate_index, cached_lookup) {
+    return run_store([](environment env) { return cached_case(env); });
+}
 
 // The lookup over one page's anchors with no branch on a comparison: each
 // step keeps the half that can hold the answer by a conditional move, and
@@ -2018,6 +2410,10 @@ PERF_TEST_F(resident_index, rebuild) {
     return run_store(
       [](environment env) { return rebuild_case(env, side::resident); });
 }
+PERF_TEST_F(resident_index, hole_lookup) {
+    return run_store(
+      [](environment env) { return hole_case(env, side::resident); });
+}
 } // namespace resident_cases
 
 // The read path over what the cases above write: a cache, a segment's runs
@@ -2052,12 +2448,6 @@ read_settings chosen_reads() {
 }
 // Seeks of one unit of work.
 constexpr std::uint32_t seeks = 256;
-// What the cache of a sealed segment's cases may hold: ten of the widest
-// runs of the sweep, with room to spare, or half of what funds it.
-byte_count sealed_cache(const environment& env) {
-    return byte_count{
-      std::min<std::uint64_t>(16_MiB, env.indexing.limits().bytes.value() / 2)};
-}
 // The strides of the sweep as a read unit, in bytes.
 constexpr std::array<std::uint64_t, 6> read_strides{
   32_KiB, 64_KiB, 128_KiB, 256_KiB, 512_KiB, 1_MiB};
@@ -2330,7 +2720,8 @@ seastar::future<std::size_t> seek_case(environment env, bool cold) {
 // One segment at each stride of the sweep, read from its first offset to
 // its end by one session that reads ahead, and then sought into with
 // nothing in memory. The stride is the read unit: what a seek reads to
-// return one batch, and how many reads a scan makes.
+// return one batch, and how many reads a scan makes. Each row says how far
+// its session looked ahead, whether that grew, and what it asked for.
 seastar::future<std::size_t> read_stride_case(environment env) {
     const auto chosen = chosen_reads();
     seastar::abort_source abort;
@@ -2360,18 +2751,18 @@ seastar::future<std::size_t> read_stride_case(environment env) {
             measurement timed;
             reads_done done;
             page_cache_snapshot before, after;
+            std::uint64_t asked = 0;
+            // A scan reads ahead as a session does when nothing is said:
+            // the bytes it asks for ahead are its window's, at every
+            // stride, past the first run. Seeks go anywhere and ask for
+            // nothing. The row says which.
+            const auto config = scanned
+                                  ? segment_reader_config{}
+                                  : segment_reader_config{.read_ahead = 0};
             runtime::first_failure failed;
             try {
                 seastar::abort_source asking;
-                // A scan reads ahead as a session does when nothing is
-                // said: the bytes it asks for ahead are its window's, at
-                // every stride, past the first run. Seeks go anywhere and
-                // ask for nothing.
-                auto reader = session(
-                  *world,
-                  env,
-                  scanned ? segment_reader_config{}
-                          : segment_reader_config{.read_ahead = 0});
+                auto reader = session(*world, env, config);
                 const auto unit = [&]() -> seastar::future<> {
                     before = world->cache->snapshot();
                     measure_scope scope{env.files, timed};
@@ -2404,6 +2795,7 @@ seastar::future<std::size_t> read_stride_case(environment env) {
                 co_await seastar::with_scheduling_group(
                   env.indexing.scheduling_group(), [&unit] { return unit(); });
                 after = world->cache->snapshot();
+                asked = world->runs->prefetches();
                 require(
                   !scanned || done.batches == segment.blocks,
                   "a scan did not return every batch of its segment");
@@ -2418,9 +2810,12 @@ seastar::future<std::size_t> read_stride_case(environment env) {
             take(failed.outcome());
             row out{"read_stride", scanned ? "scan" : "seek", family};
             out.data(segment, blocks)
+              .number("depth", config.read_ahead)
+              .flag("grows", config.read_ahead_grows)
               .number("reads", done.reads)
               .number("batches", done.batches)
               .number("returned_bytes", done.bytes)
+              .number("asked_ahead", asked)
               .measured("", timed);
             cache_fields(out, before, after);
         }
@@ -2589,12 +2984,51 @@ const char* feeding_name(feeding how) noexcept {
 constexpr std::uint32_t group_blocks = 8;
 constexpr std::array<std::uint32_t, 3> lags{0, 2, 8};
 
+// What the scan beside a tail is owed and has done: the bytes of batches
+// appended since it last read, whether the appends are over, and the time
+// its reads took and the batches they returned.
+struct scan_pace final {
+    std::uint64_t owed{0};
+    bool done{false};
+    seastar::condition_variable more;
+    std::uint64_t ns{0}, batches{0};
+};
+// A scan of a sealed segment, as far as the appends beside it have gone: as
+// many bytes of batches as they appended, until they are over and nothing
+// is owed, or the segment ends.
+seastar::future<> scan_beside(
+  segment_reader& reader,
+  segment_read_position at,
+  scan_pace& pace,
+  seastar::abort_source& asking) {
+    for (;;) {
+        while (pace.owed == 0 && !pace.done)
+            co_await pace.more.wait();
+        if (pace.owed == 0) co_return;
+        const auto started = measurement_time();
+        const auto got = co_await reader.read(
+          {at, byte_count{pace.owed}, true}, asking);
+        pace.ns += measurement_time() - started;
+        require(
+          (got.stop == segment_read_stop::limit && !got.batches.empty())
+            || got.stop == segment_read_stop::end_of_segment,
+          "a scan beside a tail stopped for no reason of its own");
+        pace.batches += got.batches.size();
+        pace.owed -= std::min(pace.owed, got.bytes.value());
+        at = got.next;
+        if (got.stop == segment_read_stop::end_of_segment) co_return;
+    }
+}
+
 // A segment that is appended to, a group and a barrier at a time, with a
 // reader at each of three distances behind its tail that reads each group
-// once it is that far behind. With `scanned`, a session also reads a sealed
-// segment nothing has in memory, one run for each group appended, through
-// the same cache. A read that no file was read for is a hit. The append's
-// own time is reported apart from the reads'.
+// once it is that far behind. With `scanned`, a session that does not fill
+// the cache reads a sealed segment nothing has in memory through the same
+// cache, as a scan does, in a fiber of its own beside the appends and the
+// readers: as many bytes of batches as were appended. It reads through a
+// file system of its own, so that a reader's device reads are its own, and
+// the shard's counts hold both. A read that no file was read for is a hit.
+// The append's own time is reported apart from the reads'.
 seastar::future<std::size_t>
 tail_case(environment env, feeding how, bool scanned) {
     const auto chosen = chosen_reads();
@@ -2608,7 +3042,22 @@ tail_case(environment env, feeding how, bool scanned) {
     auto cache = take(
       page_cache::make(
         env.indexing, {.capacity = byte_count{chosen.tail_cache_bytes}}));
+    // The scan's own files, abort source and work account.
+    file_system scan_files{!timing_only, 0};
+    const environment scanner{
+      scan_files,
+      env.owner,
+      env.spec,
+      env.writing,
+      env.indexing,
+      env.scratch,
+      env.chosen};
+    seastar::abort_source scan_abort;
+    codec::cooperative_work scan_work{codec::limits::defaults(), scan_abort};
     std::unique_ptr<read_world> beside;
+    std::optional<segment_reader> scanning;
+    scan_pace pace;
+    std::optional<seastar::future<>> scanned_by;
     const auto descriptor = describe(0, byte_count{1_GiB});
     const sparse_index_stride stride{};
     auto config = segments::configuration();
@@ -2624,7 +3073,7 @@ tail_case(environment env, feeding how, bool scanned) {
     };
     std::array<lagging, lags.size()> readers{};
     measurement timed;
-    std::uint64_t append_ns = 0, read_ns = 0, scan_ns = 0, scanned_batches = 0;
+    std::uint64_t append_ns = 0, read_ns = 0;
     std::uint64_t dropped = 0;
     page_cache_snapshot after;
     foreground probe;
@@ -2633,7 +3082,7 @@ tail_case(environment env, feeding how, bool scanned) {
     try {
         if (scanned)
             beside = co_await open_world(
-              env, *cold, cache.get(), byte_count{}, work);
+              scanner, *cold, cache.get(), byte_count{}, scan_work);
         index = std::make_unique<active_sparse_index>(take(
           active_sparse_index::make(
             stride,
@@ -2664,12 +3113,14 @@ tail_case(environment env, feeding how, bool scanned) {
         if (how == feeding::told)
             runs->establish(static_cast<std::uint32_t>(lags.size()));
         seastar::abort_source asking;
-        std::optional<segment_reader> scanning;
-        segment_read_position scan_at{
-          scanned ? cold->descriptor.logical_origin
-                  : model::range_logical_end{},
-          std::nullopt};
-        if (scanned) scanning.emplace(session(*beside, env));
+        if (scanned) {
+            scanning.emplace(session(*beside, scanner, {.fill = false}));
+            scanned_by.emplace(scan_beside(
+              *scanning,
+              {cold->descriptor.logical_origin, std::nullopt},
+              pace,
+              scan_abort));
+        }
         // Where each group begins and ends, in offsets.
         std::vector<std::uint64_t> begins, ends;
         begins.reserve(chosen.groups);
@@ -2732,6 +3183,12 @@ tail_case(environment env, feeding how, bool scanned) {
                 begins.push_back(logical.value());
                 ends.push_back(next.value());
                 logical = next;
+                if (scanned) {
+                    // The scan beside may read as many bytes of batches as
+                    // were just appended.
+                    pace.owed += appended_bytes;
+                    pace.more.signal();
+                }
                 // What the writer handed over is copied off its path: the
                 // readers come once that is done.
                 co_await runs->settled();
@@ -2770,15 +3227,14 @@ tail_case(environment env, feeding how, bool scanned) {
                     if (read == 0) ++mine.hits;
                 }
                 read_ns += measurement_time() - reading;
-                if (scanned) {
-                    const auto scanning_from = measurement_time();
-                    // As many bytes of batches as were just appended.
-                    const auto got = co_await scanning->read(
-                      {scan_at, byte_count{appended_bytes}, true}, asking);
-                    scan_at = got.next;
-                    scanned_batches += got.batches.size();
-                    scan_ns += measurement_time() - scanning_from;
-                }
+            }
+            // The scan ends with what it is owed, inside the interval.
+            if (scanned_by) {
+                pace.done = true;
+                pace.more.signal();
+                auto joined = std::move(*scanned_by);
+                scanned_by.reset();
+                co_await std::move(joined);
             }
         }
         after = cache->snapshot();
@@ -2786,6 +3242,19 @@ tail_case(environment env, feeding how, bool scanned) {
     } catch (...) {
         failed.observe(std::current_exception());
     }
+    if (scanned_by) {
+        pace.done = true;
+        pace.more.broadcast();
+        scan_abort.request_abort();
+        try {
+            co_await std::move(*scanned_by);
+        } catch (...) {
+            failed.observe(std::current_exception());
+        }
+        scanned_by.reset();
+    }
+    // A session leaves before its segment's runs are closed.
+    scanning.reset();
     probe.stop = true;
     if (turning) {
         try {
@@ -2834,8 +3303,8 @@ tail_case(environment env, feeding how, bool scanned) {
           .number("stride_bytes", stride.bytes.value())
           .number("append_ns", append_ns)
           .number("read_ns", read_ns)
-          .number("scan_ns", scan_ns)
-          .number("scanned_batches", scanned_batches)
+          .number("scan_ns", pace.ns)
+          .number("scanned_batches", pace.batches)
           .number("feed_dropped", dropped)
           .number("foreground_turns", probe.turns)
           .number("longest_wait_ns", probe.longest);

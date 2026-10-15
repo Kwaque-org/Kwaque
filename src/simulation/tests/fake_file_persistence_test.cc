@@ -333,6 +333,92 @@ SEASTAR_TEST_CASE(
     }
 }
 
+// A device that is down takes nothing: what a crash left running is refused
+// and changes nothing, and the device holds what the crash left when it is
+// brought back.
+SEASTAR_TEST_CASE(a_device_that_is_down_refuses_every_submission) {
+    fixture test{config()};
+    stable_file(test, "a", 'a');
+    checked(co_await test.drive(test.files->crash()));
+    fake_file_test_access::set_down(*test.files, true);
+    const auto refused = co_await test.drive(
+      test.files->rename(test.public_path("a"), test.public_path("b")));
+    BOOST_REQUIRE(!refused.has_value());
+    BOOST_CHECK(refused.error().code() == errc::unavailable);
+    BOOST_CHECK(test.names() == std::set<std::string>{"a"});
+    BOOST_CHECK_EQUAL(test.files->pending_operations(), 0U);
+    fake_file_test_access::set_down(*test.files, false);
+    checked(
+      co_await test.drive(
+        test.files->rename(test.public_path("a"), test.public_path("b"))));
+    BOOST_CHECK(test.names() == std::set<std::string>{"b"});
+}
+
+// The device counts the operations it applied that may have changed it, and
+// no other: a sweep of crashes takes one cut after each.
+SEASTAR_TEST_CASE(device_changes_count_what_may_change_the_device) {
+    fixture test{config()};
+    const auto before = fake_file_test_access::device_changes(*test.files);
+    BOOST_CHECK(
+      !checked(co_await test.drive(test.files->exists(test.public_path("d")))));
+    BOOST_CHECK_EQUAL(
+      fake_file_test_access::device_changes(*test.files), before);
+    checked(
+      co_await test.drive(
+        test.files->create_directories(test.public_path("d"))));
+    BOOST_CHECK_EQUAL(
+      fake_file_test_access::device_changes(*test.files), before + 1);
+    checked(
+      co_await test.drive(
+        test.files->rename(test.public_path("d"), test.public_path("e"))));
+    BOOST_CHECK_EQUAL(
+      fake_file_test_access::device_changes(*test.files), before + 2);
+    // A device that is down applies nothing.
+    fake_file_test_access::set_down(*test.files, true);
+    BOOST_CHECK(!(co_await test.drive(test.files->rename(
+                    test.public_path("e"), test.public_path("f"))))
+                   .has_value());
+    BOOST_CHECK_EQUAL(
+      fake_file_test_access::device_changes(*test.files), before + 2);
+    fake_file_test_access::set_down(*test.files, false);
+}
+
+// Unsynced names chosen one by one: of the groups pending at the crash,
+// oldest first, those the policy names survive and no other does.
+SEASTAR_TEST_CASE(selective_namespace_survivors_are_the_ones_named) {
+    for (const std::uint64_t named :
+         {std::uint64_t{0},
+          std::uint64_t{0b010},
+          std::uint64_t{0b101},
+          std::uint64_t{0b111}}) {
+        fixture test{config(fake_crash_policy{.namespace_survivors = named})};
+        std::set<std::string> expected;
+        for (unsigned index = 0; index < 3; ++index) {
+            const auto name = "f" + std::to_string(index);
+            test.create(name);
+            if (((named >> index) & 1U) != 0) expected.insert(name);
+        }
+        BOOST_CHECK_EQUAL(
+          fake_file_test_access::pending_namespace_groups(*test.files), 3U);
+        checked(co_await test.drive(test.files->crash()));
+        BOOST_CHECK(test.names() == expected);
+        BOOST_CHECK_EQUAL(
+          fake_file_test_access::pending_namespace_groups(*test.files), 0U);
+        // A second crash decides nothing again.
+        checked(co_await test.drive(test.files->crash()));
+        BOOST_CHECK(test.names() == expected);
+    }
+    // A dependency still forces a group the policy did not name: a file's
+    // name keeps the directory it is in.
+    fixture nested{config(fake_crash_policy{.namespace_survivors = 0b10})};
+    checked(
+      co_await nested.drive(
+        nested.files->create_directories(nested.public_path("parent"))));
+    nested.create("parent/file");
+    checked(co_await nested.drive(nested.files->crash()));
+    BOOST_CHECK(nested.names() == std::set<std::string>{"parent"});
+}
+
 SEASTAR_TEST_CASE(
   selective_crash_cannot_undo_successful_file_or_directory_sync) {
     fixture test{config(fake_crash_policy{})};
@@ -913,11 +999,16 @@ SEASTAR_TEST_CASE(
     const auto valid = config(fake_crash_policy{});
     BOOST_CHECK(fake_file_system::validate_config(valid).has_value());
     BOOST_CHECK(!fake_file_system::make(valid).has_value());
-    for (unsigned field = 0; field < 6; ++field) {
+    for (unsigned field = 0; field < 7; ++field) {
         auto invalid = valid;
         switch (field) {
         case 0:
             invalid.crash_policy->data_percent = 101;
+            break;
+        case 5:
+            // Survivors are named or drawn, never both.
+            invalid.crash_policy->namespace_percent = 50;
+            invalid.crash_policy->namespace_survivors = 1;
             break;
         case 1:
             invalid.crash_policy->namespace_percent = 101;

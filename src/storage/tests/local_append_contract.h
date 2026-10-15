@@ -622,6 +622,9 @@ seastar::future<> occupancy_batching(
 
 // Members of one group across two segments keep acceptance order in the WAL
 // (A1, B1, A2); each segment freezes its own contiguous blocks and footer.
+// deterministic is false where I/O may overtake acceptance: the requests may
+// then form more than one group, and a segment's two members lie in order
+// with a footer between them.
 template<
   runtime::monotonic_clock Clock,
   typename Backend,
@@ -634,7 +637,8 @@ seastar::future<> multi_segment_group(
   const local_device_spec& spec,
   workload_budget& budget,
   Driver drive,
-  Timer& timer) {
+  Timer& timer,
+  bool deterministic) {
     co_await with_local_append<Clock>(
       files,
       owner,
@@ -677,17 +681,22 @@ seastar::future<> multi_segment_group(
           const auto& b1 = durable(results[1]);
           const auto& a2 = durable(results[2]);
           require(
-            a1.segment.boundary() == a2.segment.boundary()
+            a1.block.records.bytes().begin()
+                == first.segment.boundary().end().bytes
               && a2.block.records.bytes().begin()
-                   == a1.block.records.bytes().end()
-              && a1.block.records.bytes().begin()
-                   == first.segment.boundary().end().bytes
+                   >= a1.block.records.bytes().end()
               && b1.block.records.bytes().begin() == other.bytes
               && b1.segment.boundary().end().footers == 1
               && segments[1]->progress()->durable
                    == b1.segment.boundary().end(),
-            "a segment's members did not freeze contiguously under one "
-            "footer");
+            "a segment's members lost their order or their place");
+          if (deterministic)
+              require(
+                a1.segment.boundary() == a2.segment.boundary()
+                  && a2.block.records.bytes().begin()
+                       == a1.block.records.bytes().end(),
+                "a segment's members did not freeze contiguously under one "
+                "footer");
           // After the blocker's PREPARE: A1, B1, A2 in acceptance order.
           const auto incarnation = writer.prepared_head()->incarnation;
           const auto stored = co_await read_wal(
@@ -1716,7 +1725,10 @@ seastar::future<> completed_retry_facts(
 
 // Each WAL file's open obligations toward each segment, and the discharged
 // prefix: open while a group's segment barrier is pending, gone once every
-// group is segment-durable. Needs I/O that acceptance cannot overtake.
+// group is segment-durable. What is open while a group is in flight is
+// looked at only with `ordered`, where no I/O overtakes an acceptance and no
+// acceptance overtakes the group it formed; what is left once every group is
+// segment-durable is looked at everywhere.
 template<
   runtime::monotonic_clock Clock,
   typename Backend,
@@ -1729,7 +1741,8 @@ seastar::future<> obligations_track_segments(
   const local_device_spec& spec,
   workload_budget& budget,
   Driver drive,
-  Timer& timer) {
+  Timer& timer,
+  bool ordered) {
     co_await with_local_append<Clock>(
       files,
       owner,
@@ -1764,19 +1777,23 @@ seastar::future<> obligations_track_segments(
                 (co_await drive.lifecycle(std::move(stages->accepted)))
                   .accepted(),
                 "grouped request rejected");
-          // Only the blocker's group reached the WAL so far.
-          const auto [early, during] = collect();
+          if (ordered) {
+              // Only the blocker's group reached the WAL so far.
+              const auto [early, during] = collect();
+              require(
+                early.size() == 1 && early[0].wal == file
+                  && early[0].segment == context(1) && early[0].pending == 1
+                  && early[0].pinned == 0 && during.discharged == start,
+                "an in-flight group's obligation was not open");
+              // No barrier has covered a group yet: nothing to pin.
+              std::uint32_t reported = 0;
+              append.durable_boundaries(
+                [&reported](const local_durable_boundary&) { ++reported; });
+              require(
+                reported == 0, "a footer was reported before its barrier");
+          }
           require(
-            early.size() == 1 && early[0].wal == file
-              && early[0].segment == context(1) && early[0].pending == 1
-              && early[0].pinned == 0 && during.discharged == start
-              && !append.reclaimable(file),
-            "an in-flight group's obligation was not open");
-          // No barrier has covered a group yet: nothing to pin.
-          std::uint32_t reported = 0;
-          append.durable_boundaries(
-            [&reported](const local_durable_boundary&) { ++reported; });
-          require(reported == 0, "a footer was reported before its barrier");
+            !append.reclaimable(file), "the WAL's head file was called free");
           static_cast<void>(
             durable(co_await drive.lifecycle(std::move(blocker.result))));
           static_cast<void>(

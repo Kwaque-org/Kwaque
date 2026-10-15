@@ -1,0 +1,14 @@
+# The pairs local_storage_timing_bench is compared by, one a line:
+#   <baseline>=<candidate> <kind>
+# Both sides do the same work with and without one owner: the local append
+# owner, or the calls it makes composed in a straight line. A device pair ends
+# its timed region at a barrier that reaches the device.
+
+baseline_append.tiny_group=candidate_append.tiny_group device
+baseline_append.tiny_serial=candidate_append.tiny_serial device
+baseline_append.aligned_group=candidate_append.aligned_group device
+baseline_append.aligned_serial=candidate_append.aligned_serial device
+baseline_append.fragmented_group=candidate_append.fragmented_group device
+baseline_append.fragmented_serial=candidate_append.fragmented_serial device
+baseline_append.maximum_serial=candidate_append.maximum_serial device
+baseline_append.many_segments=candidate_append.many_segments device

@@ -77,6 +77,67 @@ jobs:
         with:
           name: nightly-${{ github.job }}-${{ github.run_attempt }}
 
+  sweeps:
+    name: Every cut of the storage crash sweeps (sanitizer)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 300
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/setup-build
+      # The commit seeds the shuffled task order: its first eight hexadecimal
+      # digits, which the log prints for replay with
+      # SEASTAR_SHUFFLE_TASK_QUEUE_SEED. A change takes a sample of each
+      # sweep's cuts; this takes every one.
+      - name: Seed the task order from the commit
+        id: seed
+        run: |
+          echo "value=$((16#${GITHUB_SHA:0:8}))" >> "${GITHUB_OUTPUT}"
+      - name: Take every cut of every storage crash sweep
+        id: tests
+        env:
+          SHUFFLE_SEED: ${{ steps.seed.outputs.value }}
+        run: >-
+          bazel test --config=ci-sanitizer
+          --cache_test_results=no
+          --test_timeout=14400
+          --test_env=KWAQUE_FULL_SWEEPS=1
+          --test_env=SEASTAR_SHUFFLE_TASK_QUEUE_SEED="${SHUFFLE_SEED}"
+          //src/storage/suites:storage_crash_tests
+      - name: Retain failed test diagnostics
+        if: failure() && steps.tests.outcome == 'failure'
+        uses: ./.github/actions/retain-logs
+        with:
+          name: nightly-${{ github.job }}-${{ github.run_attempt }}
+
+  scale:
+    name: Every allocation point and the storage maxima (debug)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 330
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/setup-build
+      # Only the debug build fails allocations on purpose. A change fails a
+      # dozen points of each window; this fails every one.
+      - name: Fail every allocation point of the engine's owners
+        id: tests
+        run: >-
+          bazel test --config=ci-debug
+          --cache_test_results=no
+          --test_timeout=14400
+          --test_env=KWAQUE_FULL_SWEEPS=1
+          //src/storage/suites:storage_scale_tests
+      - name: Retain failed test diagnostics
+        if: failure() && steps.tests.outcome == 'failure'
+        uses: ./.github/actions/retain-logs
+        with:
+          name: nightly-${{ github.job }}-${{ github.run_attempt }}
+
   # Two cold release builds that share nothing but the source revision: separate
   # runners, output bases and checkout paths. The compare job requires
   # byte-identical archives.

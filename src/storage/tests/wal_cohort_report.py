@@ -7,9 +7,21 @@ import json
 import math
 from pathlib import Path
 
-PREFIX = "wal_cohort_v2 "
+PREFIX = "wal_cohort_v1 "
 PROFILE_KEYS = ("allocator", "injection", "optimized", "asan", "ubsan", "oom_abort")
 WAL_ALIGNMENT = 8192
+# What the shard issued in the timed region, the writes its writer completed
+# through a synchronized handle, and the barrier the region took. A row
+# recorded before these were printed has none of them and is read as it was;
+# a row with any has all.
+REACTOR_COUNTS = (
+    "reactor_flushes",
+    "reactor_writes",
+    "reactor_write_bytes",
+    "synchronized_writes",
+)
+REACTOR_KEYS = (*REACTOR_COUNTS, "barrier")
+BARRIERS = ("none", "overwrite", "first_write", "extending", "synchronized")
 
 
 def arrival_lateness(request: dict) -> int:
@@ -58,12 +70,63 @@ def zero_written(row: dict) -> bool:
     return row.get("zero_written", False)
 
 
+def barrier_shown(row: dict) -> bool:
+    """Whether the row shows what stands behind a durable cohort: a flush that
+    was issued, or a synchronized write that completed. The reactor's own
+    flush count says so where a row carries it. An earlier row has only its
+    writer's flush count and, where measured, its synchronized writes."""
+    if "reactor_flushes" in row:
+        return row["reactor_flushes"] > 0 or row["synchronized_writes"] > 0
+    return row["flushes"] > 0 or any(w[4] for w in row.get("write_times", []))
+
+
+def expected_barrier(row: dict) -> str:
+    """The barrier a cohort row's own conditions say it took. A zero-written
+    run flushes only for an ordinary write, over blocks written before; a
+    fallocated setup extent takes first writes; otherwise the file grows."""
+    if zero_written(row):
+        return "overwrite" if row["flushes"] else "synchronized"
+    return "first_write" if row["preallocated"] else "extending"
+
+
+def validate_reactor_counts(row: dict) -> None:
+    present = [key in row for key in REACTOR_KEYS]
+    if not any(present):
+        return
+    if not all(present):
+        raise ValueError("incomplete reactor counts")
+    if any(type(row[key]) is not int or row[key] < 0 for key in REACTOR_COUNTS):
+        raise ValueError("invalid reactor counts")
+    barrier = row["barrier"]
+    if barrier not in BARRIERS:
+        raise ValueError("unknown barrier")
+    if row["synchronized_writes"] > row["logical_writes"] or (
+        row["synchronized_writes"] and not zero_written(row)
+    ):
+        raise ValueError("synchronized writes disagree with the writer's profile")
+    if not row["accepted"]:
+        return
+    if barrier != expected_barrier(row):
+        raise ValueError("barrier disagrees with the row's conditions")
+    # A claimed flush that the file layer skipped is not in the reactor's
+    # count, and a run made durable by synchronized writes completed one.
+    if not (
+        row["synchronized_writes"]
+        if barrier == "synchronized"
+        else row["reactor_flushes"]
+    ):
+        raise ValueError("claimed barrier reached no device")
+
+
 def durable_times(row: dict, keys: list[tuple[int, int]]) -> dict:
     """When each cohort became durable. Without a zero-written window every
     cohort has its own covering flush. With one, a synchronized write is durable
     when it completes and an ordinary write when the first flush that began
     after it completed ends; a cohort is durable once every write overlapping
-    its bytes is."""
+    its bytes is. No cohort is called durable from a row that shows neither a
+    flush nor a synchronized write."""
+    if keys and not barrier_shown(row):
+        raise ValueError("no flush or synchronized write stands behind a cohort")
     flushes = row["flush_times"]
     if not zero_written(row):
         return dict(zip(keys, (end for _, end in flushes), strict=True))
@@ -207,6 +270,7 @@ def validate(row: dict) -> None:
     # A zero-written cohort flushes only if one of its writes was ordinary.
     if row["flushes"] > len(keys) if zero_written(row) else len(keys) != row["flushes"]:
         raise ValueError("physical barrier count disagrees with completed cohorts")
+    validate_reactor_counts(row)
     if zero_written(row) and not row["timing_only"]:
         writes = row.get("write_times")
         if (
@@ -260,6 +324,7 @@ def summarize(rows: list[dict]) -> dict:
     for field, label in (
         ("reactor_cpu_ns", "CPU"),
         ("write_busy_ns", "write interval"),
+        ("reactor_flushes", "reactor count"),
     ):
         if len({field in row for row in rows}) != 1:
             raise ValueError(f"cannot combine different {label} observation profiles")
@@ -339,6 +404,11 @@ def summarize(rows: list[dict]) -> dict:
             else sum(r["flush_service_ns"] for r in rows)
         ),
         "physical_flushes": sum(r["flushes"] for r in rows),
+        # Completed cohorts of the rows that show a flush or a synchronized
+        # write. Nothing else in a row is evidence that a cohort was durable.
+        "durable_cohorts": sum(
+            len(cohort_keys(row)) for row in rows if barrier_shown(row)
+        ),
         "logical_writes": sum(r["logical_writes"] for r in rows),
         "native_calls": (
             None
@@ -367,6 +437,10 @@ def summarize(rows: list[dict]) -> dict:
             "median": percentile(cpu, 0.5),
             "max": max(cpu),
         }
+    if "reactor_flushes" in rows[0]:
+        result["barriers"] = sorted({row["barrier"] for row in rows})
+        for key in REACTOR_COUNTS:
+            result[key] = sum(row[key] for row in rows)
     if "write_busy_ns" in rows[0]:
         busy = [
             row["write_busy_ns"] for row in rows if row["write_busy_ns"] is not None
@@ -426,6 +500,8 @@ def pair_signature(row: dict) -> tuple:
         tuple(row.get("affinity_cpus", [])),
         "reactor_cpu_ns" in row,
         "write_busy_ns" in row,
+        # A pair whose sides took different barriers is not a pair.
+        row.get("barrier"),
     )
 
 
@@ -487,6 +563,7 @@ def main() -> None:
                 tuple(row.get("affinity_cpus", [])),
             )
             key += ("reactor_cpu_ns" in row, "write_busy_ns" in row)
+            key += (row.get("barrier"),)
             groups.setdefault(key, []).append(row)
         result = [
             {"configuration": key, "summary": summarize(group)}
