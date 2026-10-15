@@ -313,13 +313,6 @@ ALLOWANCES = (
         "External timeout failure, never simulated time or artifact data.",
     ),
     Allowance(
-        "src/runtime/testing/contracts/real_backend_conformance.h",
-        "host-clock",
-        "return seastar::with_timeout(seastar::lowres_clock::now() + real_backend_operation_timeout, std::move(operation));",
-        1,
-        "External real-adapter watchdog only.",
-    ),
-    Allowance(
         "src/runtime/testing/contracts/network_contract.h",
         "host-clock",
         "void arm(seastar::lowres_clock::time_point deadline) { timer_.rearm(deadline); }",

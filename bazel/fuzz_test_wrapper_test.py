@@ -40,10 +40,25 @@ if option("-dict"):
 if option("-minimize_crash") == "1":
     pathlib.Path(option("-exact_artifact_path")).write_bytes(b"KQS1")
     sys.exit(0)
-corpus = pathlib.Path(args[-1])
-assert corpus.is_dir()
-assert any(p.read_bytes() == b"KQS1-extra" for p in corpus.iterdir())
-(corpus / "new-input").write_bytes(b"new")
+directories = [pathlib.Path(x) for x in args if not x.startswith("-")]
+assert directories and all(d.is_dir() for d in directories)
+if option("-merge") == "1":
+    # The union of the inputs, less those named redundant; an input that
+    # fails is written as an artifact and left out, as libFuzzer's merge does.
+    if option("-hang_merge"):
+        import time
+        time.sleep(60)
+    for directory in directories[1:]:
+        for path in directory.iterdir():
+            if path.read_bytes() == b"fails":
+                pathlib.Path(option("-artifact_prefix") + "crash-merged").write_bytes(b"fails")
+            elif not path.name.startswith("redundant"):
+                (directories[0] / path.name).write_bytes(path.read_bytes())
+    sys.exit(0)
+assert any(p.read_bytes() == b"KQS1-extra" for d in directories for p in d.iterdir())
+pathlib.Path("loaded").write_text(
+    "\\n".join(sorted(p.name for d in directories[1:] for p in d.iterdir())))
+(directories[0] / "new-input").write_bytes(b"new")
 pathlib.Path("child-working-directory").touch()
 print("fake campaign executed", flush=True)
 if option("-fail"):
@@ -140,6 +155,48 @@ if option("-fail"):
         self.assertEqual(next(self.outputs.glob("*/minimized-*")).read_bytes(), b"KQS1")
         self.assertTrue(next(self.outputs.glob("*/minimize.log")).is_file())
 
+    def test_a_reduction_is_held_to_the_verdict_the_campaign_failed_with(
+        self,
+    ) -> None:
+        # The stub says why it failed, and its reducer writes down the
+        # verdict it was told to keep.
+        self.script.write_text(
+            self.script.read_text()
+            .replace(
+                'pathlib.Path(option("-exact_artifact_path")).write_bytes(b"KQS1")',
+                'pathlib.Path(option("-exact_artifact_path")).write_bytes('
+                'os.environ.get("KWAQUE_FUZZ_REQUIRED_VERDICT", "none").encode())',
+            )
+            .replace(
+                'if option("-fail"):',
+                'if option("-fail"):\n'
+                '    assert "KWAQUE_FUZZ_REQUIRED_VERDICT" not in os.environ\n'
+                '    print("kwaque-fuzz-verdict altered", flush=True)\n'
+                '    print("kwaque-fuzz-verdict lost", flush=True)',
+            )
+        )
+        with mock.patch.dict(os.environ, {"KWAQUE_FUZZ_MINIMIZE_SECONDS": "1"}):
+            self.assertEqual(self.run_wrapper("-fail=1"), 77)
+        self.assertEqual(next(self.outputs.glob("*/minimized-*")).read_bytes(), b"lost")
+
+    def test_a_failure_that_names_no_verdict_is_reduced_as_any_failure(self) -> None:
+        self.script.write_text(
+            self.script.read_text()
+            .replace(
+                'pathlib.Path(option("-exact_artifact_path")).write_bytes(b"KQS1")',
+                'pathlib.Path(option("-exact_artifact_path")).write_bytes('
+                'os.environ.get("KWAQUE_FUZZ_REQUIRED_VERDICT", "none").encode())',
+            )
+            .replace(
+                'if option("-fail"):',
+                'if option("-fail"):\n'
+                '    print("kwaque-fuzz-verdict Not A Verdict", flush=True)',
+            )
+        )
+        with mock.patch.dict(os.environ, {"KWAQUE_FUZZ_MINIMIZE_SECONDS": "1"}):
+            self.assertEqual(self.run_wrapper("-fail=1"), 77)
+        self.assertEqual(next(self.outputs.glob("*/minimized-*")).read_bytes(), b"none")
+
     def test_reducer_failure_keeps_the_original_input_and_failing_status(self) -> None:
         self.script.write_text(
             self.script.read_text().replace(
@@ -174,7 +231,104 @@ if option("-fail"):
             {path.name for path in kept.iterdir()},
             {"000-seed", "earlier-input", "new-input"},
         )
-        self.assertEqual(list(self.work.glob("*/corpus")), [])
+        latest = max(
+            self.work.glob("*/loaded"), key=lambda path: path.stat().st_mtime_ns
+        )
+        self.assertIn("earlier-input", latest.read_text().split())
+
+    def test_a_campaign_starts_from_a_bounded_sample_of_the_kept_corpus(
+        self,
+    ) -> None:
+        kept = self.root / "kept-corpus"
+        kept.mkdir()
+        for index in range(400):
+            (kept / f"kept-{index:03d}").write_bytes(b"%d" % index)
+        with mock.patch.dict(os.environ, {"KWAQUE_FUZZ_CORPUS_DIR": str(kept)}):
+            self.assertEqual(self.run_wrapper("-seed=7"), 0)
+        loaded = next(self.work.glob("*/loaded")).read_text().split()
+        self.assertIn("000-seed", loaded)
+        self.assertIn(
+            len([name for name in loaded if name.startswith("kept-")]),
+            wrapper.CORPUS_SUBSET_SIZES,
+        )
+        self.assertEqual(len(list(kept.glob("kept-*"))), 400)
+        # The campaign's seed names its sample of a given corpus.
+        samples = []
+        for seed in ("7", "7", "8"):
+            sample = Path(tempfile.mkdtemp(dir=self.root))
+            wrapper.copy_subset(kept, sample, wrapper.random.Random(seed))
+            samples.append(sorted(path.name for path in sample.iterdir()))
+        self.assertEqual(samples[0], samples[1])
+        self.assertNotEqual(samples[0], samples[2])
+
+    def test_the_kept_corpus_becomes_the_merge_of_it_and_what_the_campaign_found(
+        self,
+    ) -> None:
+        kept = self.root / "kept-corpus"
+        kept.mkdir()
+        (kept / "redundant-input").write_bytes(b"redundant")
+        (kept / "covering-input").write_bytes(b"covering")
+        with mock.patch.dict(os.environ, {"KWAQUE_FUZZ_CORPUS_DIR": str(kept)}):
+            self.assertEqual(self.run_wrapper(), 0)
+        self.assertEqual(
+            {path.name for path in kept.iterdir()},
+            {"000-seed", "covering-input", "new-input"},
+        )
+        self.assertTrue(next(self.outputs.glob("*/merge.log")).is_file())
+
+    def test_an_input_that_fails_in_the_merge_fails_the_campaign(self) -> None:
+        kept = self.root / "kept-corpus"
+        kept.mkdir()
+        (kept / "failing-input").write_bytes(b"fails")
+        with mock.patch.dict(os.environ, {"KWAQUE_FUZZ_CORPUS_DIR": str(kept)}):
+            self.assertNotEqual(self.run_wrapper(), 0)
+        self.assertEqual(
+            next(self.outputs.glob("*/crash-merged")).read_bytes(), b"fails"
+        )
+        self.assertEqual({path.name for path in kept.iterdir()}, {"failing-input"})
+
+    def test_a_merge_that_does_not_finish_keeps_the_corpus(self) -> None:
+        kept = self.root / "kept-corpus"
+        kept.mkdir()
+        (kept / "earlier-input").write_bytes(b"earlier")
+        with (
+            mock.patch.dict(os.environ, {"KWAQUE_FUZZ_CORPUS_DIR": str(kept)}),
+            mock.patch.object(wrapper, "MERGE_SECONDS", 1),
+        ):
+            self.assertEqual(self.run_wrapper("-hang_merge=1"), 0)
+        self.assertEqual({path.name for path in kept.iterdir()}, {"earlier-input"})
+        self.assertIn(
+            "external watchdog expired",
+            next(self.outputs.glob("*/merge.log")).read_text(),
+        )
+
+    def test_the_watchdog_waits_for_every_input_libfuzzer_runs_first(self) -> None:
+        (self.runfiles / "second").write_bytes(b"KQS1-second")
+        bounds = []
+        run_logged = wrapper.run_logged
+
+        def recorded(command, work, environment, log, timeout):
+            bounds.append(timeout)
+            return run_logged(command, work, environment, log, timeout)
+
+        with (
+            mock.patch.object(wrapper, "run_logged", recorded),
+            contextlib.redirect_stdout(io.StringIO()),
+        ):
+            status = wrapper.main(
+                [
+                    "--binary=fake_fuzzer",
+                    "--seed=seed",
+                    "--seed=second",
+                    "--",
+                    "-max_total_time=2",
+                    "-timeout=3",
+                ]
+            )
+        self.assertEqual(status, 0)
+        # The empty input, both seeds and a round of mutations, each within
+        # -timeout, after the campaign's own seconds.
+        self.assertEqual(bounds[0], 2 + 3 * (1 + 2 + wrapper.MUTATIONS_PER_ROUND) + 5)
 
     def test_a_relative_kept_corpus_is_rejected(self) -> None:
         with mock.patch.dict(os.environ, {"KWAQUE_FUZZ_CORPUS_DIR": "corpus"}):

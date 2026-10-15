@@ -943,13 +943,12 @@ SEASTAR_TEST_CASE(
             BOOST_CHECK(rejected.error().code() == kwaque::errc::out_of_range);
         }
 
-        BOOST_REQUIRE_GT(fuzz_harness_version, 1U);
         const auto captured = execute_fuzz_case(
           fuzz_harness::semantic_canary, std::vector<std::uint8_t>(8, 0));
         BOOST_REQUIRE(captured.has_value());
         const auto rejected = fuzz_reproduction::make(
           captured->harness(),
-          1,
+          fuzz_harness_version + 1U,
           captured->master_seed(),
           captured->event_epoch(),
           {captured->configuration().begin(), captured->configuration().end()},

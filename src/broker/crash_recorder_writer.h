@@ -16,15 +16,14 @@ namespace kwaque::broker::detail {
 
 inline constexpr std::size_t crash_field_capacity = 4_KiB;
 inline constexpr std::size_t crash_serialization_capacity = 9_KiB;
-inline constexpr std::size_t crash_v1_header_size = 40;
 inline constexpr std::size_t crash_header_size = 44;
 inline constexpr std::size_t crash_version_capacity = 128;
 inline constexpr std::size_t crash_architecture_capacity = 16;
 
-// Wire v2: 8-byte magic, then little-endian milliseconds(u64), signal(u32),
+// Wire: 8-byte magic, then little-endian milliseconds(u64), signal(u32),
 // shard(u32), kind(u32), message/stack/version/architecture lengths(u32 each).
 // The four byte strings follow, then a little-endian CRC32C of all preceding
-// bytes. Retention also accepts v1, which has no architecture field or length.
+// bytes.
 
 [[nodiscard]] constexpr std::string_view crash_architecture() noexcept {
 #if defined(__x86_64__)

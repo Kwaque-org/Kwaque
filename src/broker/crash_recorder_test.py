@@ -67,7 +67,7 @@ class CrashRecorderTest(unittest.TestCase):
     def check_report(self, encoded: bytes, kind: int, signo: int) -> None:
         self.assertGreaterEqual(len(encoded), 48)
         self.assertLessEqual(len(encoded), 9216)
-        self.assertEqual(encoded[:8], b"KQCRSH2\0")
+        self.assertEqual(encoded[:8], b"KQCRSH1\0")
         (
             timestamp,
             actual_signal,

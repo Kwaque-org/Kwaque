@@ -41,7 +41,7 @@ kwaque_cc_fuzz_test(
         "-dict=$(rootpath :bootstrap_config_fuzz.dict)",
         "-max_len=65537",
         "-malloc_limit_mb=8",
-        "-rss_limit_mb=512",
+        "-rss_limit_mb=1024",
     ],
     corpus = [
         "testdata/bootstrap_config_fuzz_corpus/aliases.yaml",
@@ -56,7 +56,7 @@ kwaque_cc_fuzz_test(
     tags = [
         "fuzz-campaign",
         "resources:cpu:1",
-        "resources:memory:512",
+        "resources:memory:1024",
     ],
     deps = [":bootstrap_config"],
 )

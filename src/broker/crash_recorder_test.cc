@@ -55,14 +55,11 @@ seastar::future<> scripted_directory_sync(const std::filesystem::path& path) {
     return seastar::sync_directory(path.native());
 }
 
-void write_report(
-  const std::filesystem::path& path, std::uint64_t timestamp, bool legacy) {
+void write_report(const std::filesystem::path& path, std::uint64_t timestamp) {
     constexpr auto architecture = kwaque::broker::detail::crash_architecture();
-    const auto header = legacy ? kwaque::broker::detail::crash_v1_header_size
-                               : kwaque::broker::detail::crash_header_size;
-    std::vector<char> bytes(
-      header + 1U + (legacy ? 0U : architecture.size()) + 4U);
-    const std::string_view magic = legacy ? "KQCRSH1" : "KQCRSH2";
+    constexpr auto header = kwaque::broker::detail::crash_header_size;
+    std::vector<char> bytes(header + 1U + architecture.size() + 4U);
+    const std::string_view magic = "KQCRSH1";
     std::copy(magic.begin(), magic.end(), bytes.begin());
     const auto store =
       [&](std::size_t offset, std::uint64_t value, std::size_t width) {
@@ -75,11 +72,9 @@ void write_report(
     store(24, 1, 4);
     store(36, 1, 4);
     bytes[header] = 't';
-    if (!legacy) {
-        store(40, architecture.size(), 4);
-        std::copy(
-          architecture.begin(), architecture.end(), bytes.data() + header + 1U);
-    }
+    store(40, architecture.size(), 4);
+    std::copy(
+      architecture.begin(), architecture.end(), bytes.data() + header + 1U);
     store(
       bytes.size() - 4U, crc32c::Crc32c(bytes.data(), bytes.size() - 4U), 4);
     std::ofstream output{path, std::ios::binary | std::ios::trunc};
@@ -247,13 +242,12 @@ SEASTAR_TEST_CASE(
     for (std::size_t index = 0; index < 49; ++index) {
         write_report(
           reports / ("new_" + std::to_string(index) + ".crash"),
-          timestamp + 1000,
-          index % 2 == 0);
+          timestamp + 1000);
     }
-    write_report(reports / "a_tie.crash", timestamp, true);
-    write_report(reports / "b_tie.crash", timestamp, false);
-    write_report(reports / "x_ancient_v1.crash", 1, true);
-    write_report(reports / "y_ancient_v2.crash", 2, false);
+    write_report(reports / "a_tie.crash", timestamp);
+    write_report(reports / "b_tie.crash", timestamp);
+    write_report(reports / "x_ancient.crash", 1);
+    write_report(reports / "y_ancient.crash", 2);
     seastar::abort_source abort;
     kwaque::broker::crash_recorder recorder;
     co_await recorder.start(directory.path(), abort, false);
@@ -265,10 +259,7 @@ SEASTAR_TEST_CASE(
             reports / ("new_" + std::to_string(index) + ".crash")));
     }
     for (const auto name :
-         {"a_tie.crash",
-          "b_tie.crash",
-          "x_ancient_v1.crash",
-          "y_ancient_v2.crash"}) {
+         {"a_tie.crash", "b_tie.crash", "x_ancient.crash", "y_ancient.crash"}) {
         BOOST_CHECK(!std::filesystem::exists(reports / name));
     }
     co_await recorder.stop();

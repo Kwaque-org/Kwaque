@@ -10,10 +10,20 @@ what its case is about is rejected rather than summarized: a warm seek that
 read a file, a scan that lost a batch, a tail that was fed and still read
 its newest group from the device.
 
-The timing build counts nothing at the device: its rows carry zeroes for
-the reads, the bytes read and the bytes checked, and its tail rows count
-every read a hit. Such a row is held to what the cache itself counted and
-summarized without what the device would have said.
+A stride row says how far its session looked ahead, whether that grew, and
+how many runs it asked for ahead; rows of another read-ahead are another
+measurement and never samples of one. A scanned tail's scan is a session
+that does not fill the cache, reading in a fiber of its own beside the
+appends and the readers, through files of its own: a reader's device reads
+are its own, and the scan's are in the shard's counts alone.
+
+The timing build's file layer counts nothing at the device: its rows carry
+zeroes for the reads, the bytes read and the bytes checked, and its tail
+rows count every read a hit. Such a row is held to what the cache itself
+counted and summarized without what the file layer would have said. Every
+measured row of both builds carries the shard's own counts of the flushes,
+writes and reads it issued, and their bytes, every file together: a warm
+seek reads nothing there either.
 
 A seek into a run an earlier seek loaded is not a cold seek, and a case of
 seeks at offsets drawn at random has some. What a cold seek costs is
@@ -48,6 +58,11 @@ MEASURED = (
     "directory_syncs",
     "hashed_bytes",
     "crc_bulk_bytes",
+    "reactor_flushes",
+    "reactor_writes",
+    "reactor_write_bytes",
+    "reactor_reads",
+    "reactor_read_bytes",
 )
 DATA = (
     "blocks",
@@ -92,14 +107,20 @@ TAIL = (
 )
 # case -> side -> (counters, flags)
 SEALED = (DATA + READS + MEASURED + CACHE, SEALED_FLAGS)
+# A stride row also says its read-ahead: how many runs, whether that grew,
+# and how many runs were asked for ahead.
+STRIDE = (
+    DATA + ("depth",) + READS + ("asked_ahead",) + MEASURED + CACHE,
+    SEALED_FLAGS + ("grows",),
+)
 CASES = {
     "read_seek": {
         side: (DATA + ("seeks", "returned_bytes") + MEASURED + CACHE, SEALED_FLAGS)
         for side in ("cold", "warm")
     },
     "read_stride": {
-        "scan": SEALED,
-        "seek": SEALED,
+        "scan": STRIDE,
+        "seek": STRIDE,
         "skipped": (("stride_bytes",), COMMON_FLAGS),
     },
     "read_ahead": {
@@ -153,6 +174,8 @@ def check(row: dict) -> None:
             raise ValueError(f"{where} read a file")
         if observed and side == "cold" and not row["data_reads"]:
             raise ValueError(f"{where} read no data")
+        if side == "warm" and row["reactor_reads"]:
+            raise ValueError(f"{where} read the device")
         if side == "warm" and row["cache_loads"]:
             raise ValueError(f"{where} loaded what was kept")
         if side == "cold" and not row["cache_loads"]:
@@ -162,6 +185,11 @@ def check(row: dict) -> None:
     if case == "read_stride" and side == "scan":
         if row["batches"] != row["blocks"]:
             raise ValueError(f"{where} did not return every batch")
+    if case == "read_stride" and side != "skipped":
+        if row["depth"] > 4 or (row["depth"] == 0 and row["asked_ahead"]):
+            raise ValueError(f"{where} asked ahead where none was to be")
+        if side == "seek" and row["depth"]:
+            raise ValueError(f"{where} looked ahead of a seek")
     if case == "read_ahead":
         if row["batches"] != row["blocks"]:
             raise ValueError(f"{where} did not return every batch")
@@ -191,6 +219,8 @@ def check(row: dict) -> None:
             raise ValueError(f"{where} hit a tail nothing fed")
         if case == "read_tail" and (row["scan_ns"] or row["scanned_batches"]):
             raise ValueError(f"{where} scanned where no scan was to be")
+        if case == "read_tail_scanned" and not row["scanned_batches"]:
+            raise ValueError(f"{where} scanned nothing beside the tail")
 
 
 def read_measurements(path: Path) -> list[dict]:
@@ -232,8 +262,10 @@ def group_of(row: dict) -> tuple:
         key += [row["stride_bytes"]]
     else:
         key += [row["dataset_digest"], row["stride_bytes"]]
-        if case == "read_ahead":
+        if case in ("read_ahead", "read_stride"):
             key += [row["depth"]]
+        if case == "read_stride":
+            key += [row["grows"]]
     return tuple(key)
 
 
@@ -256,6 +288,8 @@ def summarize_group(rows: list[dict]) -> dict:
     out["elapsed_least_ns"] = min(row["elapsed_ns"] for row in rows)
     out["elapsed_most_ns"] = max(row["elapsed_ns"] for row in rows)
     out["cpu_ns"] = median(rows, "cpu_ns")
+    out["reactor_reads"] = median(rows, "reactor_reads")
+    out["reactor_read_bytes"] = median(rows, "reactor_read_bytes")
     if observed:
         out["data_reads"] = median(rows, "data_reads")
         out["index_reads"] = median(rows, "index_reads")
@@ -288,6 +322,7 @@ def summarize_group(rows: list[dict]) -> dict:
     if seeking:
         seeks = first["seeks"] if case == "read_seek" else first["reads"]
         out["ns_per_seek"] = per(out["elapsed_ns"], seeks)
+        out["reactor_reads_per_seek"] = per(out["reactor_reads"], seeks)
         if observed:
             if case == "read_seek":
                 out["reads_per_seek"] = per(
@@ -303,10 +338,12 @@ def summarize_group(rows: list[dict]) -> dict:
             out["data_reads_per_run_loaded"] = per(out["data_reads"], runs)
     else:
         out["ns_per_batch"] = per(out["elapsed_ns"], first["batches"])
-    if case == "read_ahead":
+    if case in ("read_ahead", "read_stride"):
         out["depth"] = first["depth"]
         out["asked_ahead"] = median(rows, "asked_ahead")
         out["cache_waits"] = median(rows, "cache_waits")
+    if case == "read_stride":
+        out["grows"] = first["grows"]
     return out
 
 

@@ -54,6 +54,7 @@ def lookups(**changed) -> dict:
 
 def lookup_row(case: str, side: str, **changed) -> dict:
     cold = case == "cold_open_lookup"
+    reads = (3585 if cold else 3584) if side != "resident" else 0
     row = {
         "case": case,
         "side": side,
@@ -63,7 +64,9 @@ def lookup_row(case: str, side: str, **changed) -> dict:
         **lookups(),
         **measured(
             index_opens=1 if cold else 0,
-            index_reads=(3585 if cold else 3584) if side != "resident" else 0,
+            index_reads=reads,
+            reactor_reads=reads,
+            reactor_read_bytes=reads * 20480,
         ),
         **budget("held_", budget_bytes=360448, budget_handles=1),
     }
@@ -77,7 +80,59 @@ def lookup_row(case: str, side: str, **changed) -> dict:
         )
         row["result_digest"] = 6
         if cold:
-            row["index_reads"] = 1
+            row.update(index_reads=1, reactor_reads=1)
+    row.update(changed)
+    return row
+
+
+def hole_row(side: str, **changed) -> dict:
+    row = lookup_row(
+        "warm_lookup",
+        side,
+        dataset_digest=91,
+        result_digest=15,
+        gaps=1024,
+        removed_slots=8192,
+        sparse_batches=960,
+        unkept_slots=6720,
+        records=12000,
+        gap_lookups=700,
+        sparse_lookups=650,
+    )
+    row["case"] = "hole_lookup"
+    if side == "resident":
+        row["result_digest"] = 16
+    row.update(changed)
+    return row
+
+
+def cached_row(**changed) -> dict:
+    row = lookup_row(
+        "warm_lookup",
+        "candidate",
+        index_reads=0,
+        reactor_reads=0,
+        reactor_read_bytes=0,
+        cache_capacity=1 << 24,
+        cache_bytes=2 * 32768 + 4096,
+        cache_loads=0,
+    )
+    row["case"] = "cached_lookup"
+    row.update(changed)
+    return row
+
+
+def memory_row(**changed) -> dict:
+    row = {
+        "case": "memory_lookup",
+        "side": "candidate",
+        "timing_only": False,
+        "ndebug": True,
+        **data(),
+        "admitted_bytes": 65536,
+        **lookups(),
+        **measured(),
+    }
     row.update(changed)
     return row
 
@@ -138,7 +193,14 @@ def rebuild_row(**changed) -> dict:
         **data(stride_bytes=32768, anchors=520),
         **lookups(),
         **measured(data_reads=140, data_read_bytes=17100000, hashed_bytes=17039360),
-        **measured("persist_", index_flushes=2, index_write_bytes=36864),
+        **measured(
+            "persist_",
+            index_flushes=2,
+            index_write_bytes=36864,
+            reactor_flushes=2,
+            reactor_writes=9,
+            reactor_write_bytes=36864,
+        ),
         **budget("memory_", budget_bytes=16384, budget_tasks=1),
     }
     row.update(changed)
@@ -336,9 +398,122 @@ class IndexBenchReportTest(unittest.TestCase):
             {"index_reads": 1},
             {"data_reads": 0},
             {"persist_index_flushes": 0},
+            {"persist_reactor_flushes": 0},
         ):
             with self.assertRaises(ValueError):
                 self.summarize([rebuild_row(**changed)])
+        # The shard's own count binds a timing row as well.
+        with self.assertRaises(ValueError):
+            self.summarize([rebuild_row(timing_only=True, persist_reactor_flushes=0)])
+
+    def test_the_reactor_counts_bind_both_builds(self):
+        for timing_only in (False, True):
+            native = {"index_reads": 0, "index_opens": 0} if timing_only else {}
+            # A page for every anchor found, and the root where it is opened.
+            for case, side, reads in (
+                ("warm_lookup", "candidate", 3584),
+                ("warm_lookup", "baseline", 9000),
+                ("cold_open_lookup", "baseline", 3585),
+            ):
+                self.summarize(
+                    [
+                        lookup_row(
+                            case,
+                            side,
+                            timing_only=timing_only,
+                            reactor_reads=reads,
+                            **native,
+                        )
+                    ]
+                )
+            for row in (
+                lookup_row("warm_lookup", "candidate", reactor_reads=3583),
+                lookup_row("cold_open_lookup", "candidate", reactor_reads=3584),
+                lookup_row("warm_lookup", "resident", reactor_reads=1),
+                hole_row("baseline", reactor_reads=10),
+                hole_row("resident", reactor_reads=1),
+                memory_row(reactor_reads=1),
+                cached_row(reactor_reads=1),
+                cached_row(cache_loads=1),
+            ):
+                row.update(timing_only=timing_only)
+                if timing_only:
+                    row.update(index_reads=0, index_opens=0)
+                with self.assertRaises(ValueError, msg=row):
+                    self.summarize([row])
+        self.summarize([memory_row()])
+        self.summarize([memory_row(timing_only=True)])
+        summary = self.summarize([lookup_row("warm_lookup", "candidate")])[0]
+        self.assertEqual(summary["reactor_reads_per_found"], 1.0)
+        self.assertEqual(summary["reactor_read_bytes"], 3584 * 20480)
+        # A row without the counts is of another binary.
+        missing = lookup_row("warm_lookup", "candidate")
+        del missing["reactor_reads"]
+        with self.assertRaises(ValueError):
+            self.summarize([missing])
+        with self.assertRaises(ValueError):
+            self.summarize([lookup_row("warm_lookup", "baseline", reactor_writes=-1)])
+
+    def test_holes_are_looked_up_on_every_side(self):
+        rows = [hole_row(side) for side in report.SIDES]
+        summaries = {item["side"]: item for item in self.summarize(rows, False)}
+        self.assertEqual(summaries["candidate"]["gaps"], 1024)
+        self.assertEqual(summaries["baseline"]["gap_lookups"], 700)
+        self.assertEqual(summaries["resident"]["resident_column_bytes"], 65536)
+        self.assertEqual(summaries["candidate"]["index_reads_per_found"], 1.0)
+        # Their sides go together, apart from the dense segment's.
+        with self.assertRaises(ValueError):
+            self.summarize(rows[:2], False)
+        self.summarize(rows + [lookup_row("warm_lookup", "candidate")])
+        with self.assertRaises(ValueError):
+            self.summarize([rows[0], hole_row("baseline", result_digest=17)])
+        for changed in (
+            {"gaps": 0},
+            {"removed_slots": 1023},
+            {"sparse_batches": 0},
+            {"unkept_slots": 959},
+            {"gaps": 4096},
+            {"records": 4095},
+            {"gap_lookups": 0},
+            {"sparse_lookups": 0},
+            {"gap_lookups": 4000},
+            {"index_opens": 1},
+            {"data_reads": 1},
+            {"index_reads": 3583},
+        ):
+            with self.assertRaises(ValueError, msg=changed):
+                self.summarize([hole_row("candidate", **changed)])
+        with self.assertRaises(ValueError):
+            self.summarize([hole_row("resident", index_reads=1)])
+        missing = hole_row("candidate")
+        del missing["unkept_slots"]
+        with self.assertRaises(ValueError):
+            self.summarize([missing])
+
+    def test_a_cached_lookup_reads_and_loads_nothing(self):
+        # A case of one side is whole by itself.
+        self.summarize([cached_row()], False)
+        summary = self.summarize([cached_row(), lookup_row("warm_lookup", "candidate")])
+        cached = next(item for item in summary if item["case"] == "cached_lookup")
+        self.assertEqual(cached["cache_capacity"], 1 << 24)
+        self.assertEqual(cached["index_reads_per_found"], 0.0)
+        # It answers as the uncached lookups of the same data do.
+        with self.assertRaises(ValueError):
+            self.summarize(
+                [cached_row(result_digest=8), lookup_row("warm_lookup", "candidate")]
+            )
+        for changed in (
+            {"index_reads": 1},
+            {"index_opens": 1},
+            {"data_reads": 1},
+            {"side": "baseline"},
+        ):
+            with self.assertRaises(ValueError, msg=changed):
+                self.summarize([cached_row(**changed)])
+        missing = cached_row()
+        del missing["cache_loads"]
+        with self.assertRaises(ValueError):
+            self.summarize([missing])
 
     def test_malformed_rows_are_rejected(self):
         good = lookup_row("warm_lookup", "candidate")

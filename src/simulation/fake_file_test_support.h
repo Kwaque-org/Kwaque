@@ -595,6 +595,13 @@ public:
                 errc::not_found, runtime::operation_kind::file});
         return inode->occurrences[static_cast<std::size_t>(point)];
     }
+    // Namespace groups a crash would decide now, oldest first: the bits of
+    // fake_crash_policy::namespace_survivors. None without a crash policy.
+    [[nodiscard]] static std::size_t
+    pending_namespace_groups(const fake_file_system& filesystem) {
+        filesystem.assert_current();
+        return filesystem.namespace_history_.size();
+    }
     [[nodiscard]] static runtime::result<fake_native_file_probe>
     make_native_file_probe(
       fake_file_system& filesystem,
@@ -661,6 +668,24 @@ public:
     }
     static void crash(fake_file_system& filesystem) {
         filesystem.restore_durable_state();
+    }
+    // Operations applied so far that may have changed the device: a write,
+    // a flush, a truncation, a creation, a removal, a rename, a directory
+    // sync, an open and a close. Between two of them a crash leaves the same
+    // device, so a sweep of crashes takes one cut after each.
+    [[nodiscard]] static std::uint64_t
+    device_changes(const fake_file_system& filesystem) noexcept {
+        filesystem.assert_current();
+        return filesystem.device_changes_;
+    }
+    // Takes the device down, or brings it back. While it is down every
+    // submission is refused as unavailable. A test takes it down once a
+    // crash has returned and brings it back for the start that follows, so
+    // that the owners the crash left running, which a test must still stop,
+    // change nothing the start then reads.
+    static void set_down(fake_file_system& filesystem, bool down) noexcept {
+        filesystem.assert_current();
+        filesystem.down_ = down;
     }
 
     [[nodiscard]] static runtime::result<void>

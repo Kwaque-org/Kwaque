@@ -155,6 +155,11 @@ struct fake_directory_entry final {
 // Percentages sample candidate granules, EOF, and namespace groups. Namespace
 // dependencies can force a candidate to survive. A granule is a model choice,
 // not a hardware atomicity claim.
+//
+// namespace_survivors chooses the namespace groups by name in place of a
+// percentage, which must then be zero: of the groups pending at the crash,
+// oldest first, the one at each set bit survives and no other does, but for
+// those a dependency forces. Groups past the sixty-fourth do not survive.
 struct fake_crash_policy final {
     std::uint8_t data_percent{0};
     std::uint8_t namespace_percent{0};
@@ -162,6 +167,7 @@ struct fake_crash_policy final {
     std::uint32_t granule_bytes{512};
     std::uint32_t maximum_namespace_groups{4096};
     byte_count maximum_scratch_bytes{64_MiB};
+    std::optional<std::uint64_t> namespace_survivors{};
     bool operator==(const fake_crash_policy&) const = default;
 };
 
@@ -852,6 +858,10 @@ private:
       fake_operation_id operation, pending_kind kind) const noexcept;
     [[nodiscard]] static bool is_read_operation(pending_kind kind) noexcept;
     [[nodiscard]] static bool is_write_operation(pending_kind kind) noexcept;
+    // Whether an operation of `kind` may change what the device holds or
+    // what of it is durable: every kind but a read of data, of a name or of
+    // a size.
+    [[nodiscard]] static bool changes_device(pending_kind kind) noexcept;
 
     [[nodiscard]] inode* find_inode(fake_object_id id) noexcept;
     [[nodiscard]] const inode* find_inode(fake_object_id id) const noexcept;
@@ -937,6 +947,14 @@ private:
     std::optional<seastar::shared_promise<runtime::result<void>>> stop_done_;
     std::optional<runtime::operation_error> stop_failure_;
     fake_file_system_state state_{fake_file_system_state::open};
+    // Set by a test between a crash and the start that follows it: nothing
+    // is submitted, so what was running when the device crashed changes
+    // nothing afterwards.
+    bool down_{false};
+    // Operations that may have changed the device and have been applied,
+    // whatever they returned: between two of them a crash leaves the same
+    // device.
+    std::uint64_t device_changes_{0};
     pending_operation* effect_operation_{nullptr};
 };
 

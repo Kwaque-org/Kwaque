@@ -11,7 +11,7 @@ if __package__:
 else:
     from wal_cohort_report import PROFILE_KEYS, percentile
 
-PREFIX = "segment_bench_v4 "
+PREFIX = "segment_bench_v1 "
 SCOPES = {
     "layout",
     "encode_evidence",

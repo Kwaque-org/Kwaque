@@ -435,7 +435,12 @@ debug and sanitizer suites and in the x86-64 and AArch64 release jobs, which
 never fuzz.
 
 The scheduled workflow gives every test tagged `fuzz-campaign` ten minutes, one
-target per job. To run one campaign locally:
+target per job. It keeps each target's corpus between runs
+(`KWAQUE_FUZZ_CORPUS_DIR`): a campaign starts from the checked-in seeds and a
+sample of that corpus chosen by its seed, and afterwards the wrapper replaces
+the corpus with a libFuzzer merge of it and what the campaign found. An input
+that fails during the merge fails the campaign; a merge that does not finish in
+30 minutes leaves the corpus as it was. To run one campaign locally:
 
 ```bash
 bazel test --config=ci --config=fuzz --test_output=all \
@@ -475,7 +480,7 @@ artifacts were reproduced, 1 means replay differed, and 2 means the envelope was
 invalid. A sanitizer signal may terminate before an envelope is emitted; retain
 its native crash input and harness identity for replay through the same fuzzer.
 
-The current harness version is 2; earlier harness versions are rejected before
+The current harness version is 1; any other harness version is rejected before
 scenario execution. Input and configuration are bounded at 16 KiB each, and the
 structured-event log at 128 KiB. Scheduler traces are bounded at 128 KiB for
 scheduler/rule cases, 1 MiB for file histories, and 4 MiB for concurrent network

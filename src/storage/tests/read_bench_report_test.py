@@ -52,6 +52,8 @@ def seek_row(side: str, **changed) -> dict:
             data_read_bytes=60 * 32768 if cold else 0,
             index_reads=2 if cold else 0,
             crc_bulk_bytes=60 * 32768 if cold else 0,
+            reactor_reads=62 if cold else 0,
+            reactor_read_bytes=60 * 32768 + 2 * 20480 if cold else 0,
         ),
         **cache(cache_loads=62 if cold else 0),
     }
@@ -71,6 +73,9 @@ def sealed_row(case: str, side: str, **changed) -> dict:
     }
     if case == "read_ahead":
         row.update(depth=1, asked_ahead=62)
+    if case == "read_stride":
+        scan = side == "scan"
+        row.update(depth=4 if scan else 0, grows=True, asked_ahead=62 if scan else 0)
     row.update(changed)
     return row
 
@@ -177,13 +182,18 @@ class ReadBenchReportTest(unittest.TestCase):
         self.assertEqual(cold["build"], "timing")
         self.assertEqual(cold["ns_per_seek"], 1000 / 256)
         self.assertEqual(cold["cache_loads"], 62)
+        # The shard's own counts are kept: the file layer's are not.
         for entry in summaries.values():
             for name in entry:
                 self.assertFalse(
-                    name.endswith(("_reads", "_per_returned", "_hit_rate"))
-                    or name in ("reads_per_seek", "read_bytes_per_seek"),
+                    not name.startswith("reactor_")
+                    and (
+                        name.endswith(("_reads", "_per_returned", "_hit_rate"))
+                        or name in ("reads_per_seek", "read_bytes_per_seek")
+                    ),
                     msg=(entry["case"], name),
                 )
+        self.assertIn("reactor_reads_per_seek", cold)
         # What the cache counted still binds it.
         for row in (
             seek_row("cold", timing_only=True, cache_loads=0, **nothing),
@@ -259,6 +269,77 @@ class ReadBenchReportTest(unittest.TestCase):
         for row in contradictions:
             with self.assertRaises(ValueError, msg=row):
                 report.validate(row)
+
+    def test_stride_rows_say_their_read_ahead(self) -> None:
+        scans = [
+            sealed_row("read_stride", "scan", elapsed_ns=elapsed)
+            for elapsed in (900, 1100)
+        ]
+        # Another read-ahead over the same data is another measurement.
+        scans.append(
+            sealed_row("read_stride", "scan", depth=1, grows=False, asked_ahead=63)
+        )
+        scans.append(sealed_row("read_stride", "scan", grows=False))
+        summaries = report.summarize(scans)
+        self.assertEqual(
+            sorted(
+                (entry["depth"], entry["grows"], entry["samples"])
+                for entry in summaries
+            ),
+            [(1, False, 1), (4, False, 1), (4, True, 2)],
+        )
+        pooled = next(entry for entry in summaries if entry["samples"] == 2)
+        self.assertEqual(pooled["elapsed_ns"], 1000)
+        self.assertEqual(pooled["asked_ahead"], 62)
+        seek = report.summarize([sealed_row("read_stride", "seek", reads=256)])[0]
+        self.assertEqual((seek["depth"], seek["asked_ahead"]), (0, 0))
+        for row in (
+            sealed_row("read_stride", "scan", depth=5),
+            sealed_row("read_stride", "scan", depth=0, asked_ahead=1),
+            sealed_row("read_stride", "seek", depth=1),
+            sealed_row("read_stride", "seek", asked_ahead=1),
+            sealed_row("read_stride", "scan", grows=1),
+        ):
+            with self.assertRaises(ValueError, msg=row):
+                report.validate(row)
+        for name in ("depth", "grows", "asked_ahead"):
+            missing = sealed_row("read_stride", "scan")
+            del missing[name]
+            with self.assertRaises(ValueError, msg=name):
+                report.validate(missing)
+
+    def test_the_reactor_counts_bind_both_builds(self) -> None:
+        cold = report.summarize([seek_row("cold")])[0]
+        self.assertEqual(cold["reactor_reads"], 62)
+        self.assertEqual(cold["reactor_reads_per_seek"], 62 / 256)
+        timing = report.summarize(
+            [
+                seek_row(
+                    "cold",
+                    timing_only=True,
+                    data_reads=0,
+                    data_read_bytes=0,
+                    index_reads=0,
+                    crc_bulk_bytes=0,
+                )
+            ]
+        )[0]
+        # The shard's counts are the timing build's only device counts.
+        self.assertEqual(timing["reactor_read_bytes"], 60 * 32768 + 2 * 20480)
+        for timing_only in (False, True):
+            with self.assertRaises(ValueError):
+                report.validate(
+                    seek_row("warm", timing_only=timing_only, reactor_reads=1)
+                )
+        missing = seek_row("warm")
+        del missing["reactor_flushes"]
+        with self.assertRaises(ValueError):
+            report.validate(missing)
+        with self.assertRaises(ValueError):
+            report.validate(tail_row("read_tail", "told", reactor_writes=-1))
+        # A scan beside the tail that read nothing measured no scan.
+        with self.assertRaises(ValueError):
+            report.validate(tail_row("read_tail_scanned", "told", scanned_batches=0))
 
     def test_rejects_rows_that_are_not_of_a_case(self) -> None:
         missing = seek_row("cold")

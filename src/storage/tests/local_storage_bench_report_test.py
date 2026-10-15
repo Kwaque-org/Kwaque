@@ -148,6 +148,49 @@ class LocalStorageReportTest(unittest.TestCase):
         self.assertEqual(summary["arrival_to_result_ns"]["p50"], 400)
         self.assertEqual(summary["accepted_stage_ns"]["p99"], 4)
         self.assertFalse(summary["arrival_to_result_ns"]["p999_qualified"])
+        self.assertIsNone(summary["arrival_to_result_ns"]["p999"])
+
+    def test_a_tail_counts_the_barriers_its_requests_took(self):
+        # A thousand requests pooled over runs are not a qualified tail when
+        # they took fewer independent barriers than the rule asks for.
+        rows = [observed() for _ in range(500)]
+        summary = report.summarize(rows)
+        self.assertEqual(summary["arrival_to_result_ns"]["samples"], 1000)
+        self.assertEqual(
+            summary["arrival_to_result_ns"]["groups"],
+            sum(row["wal_flushes"] for row in rows),
+        )
+        self.assertFalse(summary["arrival_to_result_ns"]["p999_qualified"])
+        for row in rows:
+            row["wal_flushes"] = row["wal_groups"] = row["footers"] = 2
+        rows += [copy.deepcopy(rows[0]) for _ in range(1000)]
+        summary = report.summarize(rows)
+        self.assertEqual(summary["arrival_to_result_ns"]["groups"], 3000)
+        self.assertTrue(summary["arrival_to_result_ns"]["p999_qualified"])
+        self.assertEqual(summary["arrival_to_result_ns"]["p999"], 450)
+
+    def test_a_claimed_barrier_reaches_the_device(self):
+        row = measurement()
+        row.update(
+            wal_barrier="extending",
+            data_barrier="extending",
+            reactor_flushes=2,
+            reactor_writes=3,
+            reactor_write_bytes=12288,
+            reactor_reads=0,
+            reactor_read_bytes=0,
+        )
+        report.validate(row)
+        for mutate in (
+            lambda r: r.update(reactor_flushes=0),
+            lambda r: r.update(wal_barrier="flushed"),
+            lambda r: r.pop("reactor_reads"),
+            lambda r: r.update(reactor_writes=-1),
+        ):
+            changed = copy.deepcopy(row)
+            mutate(changed)
+            with self.assertRaises((ValueError, KeyError)):
+                report.validate(changed)
 
     def test_barrier_components_report_their_overlap(self):
         summary = report.summarize([measurement()])

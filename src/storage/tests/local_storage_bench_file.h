@@ -5,6 +5,7 @@
 #include "src/runtime/production/file.h"
 #include "src/storage/tests/wal_bench_file.h"
 
+#include <seastar/core/coroutine.hh>
 #include <seastar/core/seastar.hh>
 #include <seastar/core/semaphore.hh>
 #include <seastar/core/shared_ptr.hh>
@@ -52,6 +53,8 @@ struct kind_sample final {
     // Native reads as requested, and the files opened.
     std::uint64_t reads{0}, read_bytes{0}, read_minimum{UINT64_MAX},
       read_maximum{0}, opens{0};
+    // Files removed, how long the removals took together, and the longest.
+    std::uint64_t unlinks{0}, unlink_ns{0}, unlink_longest_ns{0};
     // Recorded only when sized before measurement; overflow is reported.
     std::vector<interval> flush_times;
     std::size_t flushes_recorded{0};
@@ -60,9 +63,10 @@ struct kind_sample final {
 struct io_sample final {
     bool measuring{false};
     std::array<kind_sample, file_kinds> kinds{};
-    // Namespace operations: directory opens, syncs and pages read, and path
-    // status lookups.
-    std::uint64_t directory_opens{0}, directory_syncs{0}, listings{0}, stats{0};
+    // Namespace operations: directory opens, syncs and pages read, path
+    // status lookups, renames and directories removed.
+    std::uint64_t directory_opens{0}, directory_syncs{0}, listings{0}, stats{0},
+      renames{0}, directory_removes{0};
     [[nodiscard]] kind_sample& operator[](file_kind kind) noexcept {
         return kinds[static_cast<std::size_t>(kind)];
     }
@@ -364,16 +368,28 @@ public:
     auto create_directories(runtime::file_path path) {
         return files_.create_directories(std::move(path));
     }
-    auto remove_file(runtime::file_path path) {
-        return files_.remove_file(std::move(path));
+    seastar::future<runtime::result<void>>
+    remove_file(runtime::file_path path) {
+        if (!observe_ || !sample.measuring)
+            co_return co_await files_.remove_file(std::move(path));
+        auto& kind = sample[classify(path)];
+        const auto started = measurement_time();
+        auto removed = co_await files_.remove_file(std::move(path));
+        const auto took = measurement_time() - started;
+        ++kind.unlinks;
+        kind.unlink_ns += took;
+        kind.unlink_longest_ns = std::max(kind.unlink_longest_ns, took);
+        co_return removed;
     }
     auto remove_directory(runtime::file_path path) {
+        if (observe_ && sample.measuring) ++sample.directory_removes;
         return files_.remove_directory(std::move(path));
     }
     auto rename(
       runtime::file_path from,
       runtime::file_path to,
       runtime::file_rename_policy policy) {
+        if (observe_ && sample.measuring) ++sample.renames;
         return files_.rename(std::move(from), std::move(to), policy);
     }
     auto

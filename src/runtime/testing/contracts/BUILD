@@ -144,18 +144,6 @@ kwaque_cc_library(
 )
 
 kwaque_cc_library(
-    name = "real_backend_conformance",
-    testonly = True,
-    hdrs = ["real_backend_conformance.h"],
-    visibility = ["//src/runtime/tests:__pkg__"],
-    deps = [
-        "//src/bytes:fragmented_buffer",
-        "//src/runtime:environment",
-        "@seastar",
-    ],
-)
-
-kwaque_cc_library(
     name = "dns_test_server",
     testonly = True,
     hdrs = ["dns_test_server.h"],

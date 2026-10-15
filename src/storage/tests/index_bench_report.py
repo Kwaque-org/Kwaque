@@ -2,15 +2,25 @@
 
 Each row is one unit of work over a sealed segment the segment writer wrote:
 lookups through the owner of its index, the same lookups composed without
-the owner, the same lookups in an index held whole in memory, many segments
-found again at once, one rebuild from the segment's data, and one stride of
-a sweep. A row carries the data it was measured over. Rows of one case that
-looked the same offsets up in the same data must have found the same
-anchors, on every side and in every run; rows that did not are rejected
-rather than averaged. The sides of a case are set beside each other only
-when every one of them is present and was measured over the same data; a
-log that holds some of them is summarized only when a partial report is
-asked for.
+the owner, the same lookups in an index held whole in memory, the owner's
+lookups as a reader makes them through a cache that keeps what they read,
+many segments found again at once, one rebuild from the segment's data, and
+one stride of a sweep. The hole lookups are the same three sides over an
+index fed from a list of batches with holes: slots removed between batches
+and batches that kept fewer records than their span, which no writer makes;
+each answer is checked against that list. A row carries the data it was
+measured over. Rows of one case that looked the same offsets up in the same
+data must have found the same anchors, on every side and in every run; rows
+that did not are rejected rather than averaged. The sides of a case are set
+beside each other only when every one of them is present and was measured
+over the same data; a log that holds some of them is summarized only when a
+partial report is asked for.
+
+Every measured interval carries the shard's own counts of what it issued:
+flushes, writes and reads, and their bytes, every file together, in both
+builds. They are the only device counts a timing row has. A warm lookup that
+reads its page reads at least once for each anchor it found, and one that
+answers from memory or from what a cache keeps reads nothing at all.
 """
 
 from __future__ import annotations
@@ -41,6 +51,11 @@ MEASURED = (
     "directory_syncs",
     "hashed_bytes",
     "crc_bulk_bytes",
+    "reactor_flushes",
+    "reactor_writes",
+    "reactor_write_bytes",
+    "reactor_reads",
+    "reactor_read_bytes",
 )
 BUDGET = ("budget_bytes", "budget_handles", "budget_tasks")
 DATA = (
@@ -81,10 +96,26 @@ LOOKUP_CASE = (
     DATA + LOOKUPS + MEASURED + prefixed("held_", BUDGET),
     COMMON_FLAGS + ("segment_filled",),
 )
+# What a row of the extent with holes says of its list, and of its offsets.
+HOLES = (
+    "gaps",
+    "removed_slots",
+    "sparse_batches",
+    "unkept_slots",
+    "records",
+    "gap_lookups",
+    "sparse_lookups",
+)
+CACHE = ("cache_capacity", "cache_bytes", "cache_loads")
 # case -> (counters, flags)
 CASES = {
     "warm_lookup": LOOKUP_CASE,
     "cold_open_lookup": LOOKUP_CASE,
+    "hole_lookup": (
+        DATA + HOLES + LOOKUPS + MEASURED + prefixed("held_", BUDGET),
+        LOOKUP_CASE[1],
+    ),
+    "cached_lookup": (LOOKUP_CASE[0] + CACHE, LOOKUP_CASE[1]),
     "memory_lookup": (
         DATA + ("admitted_bytes",) + LOOKUPS + MEASURED,
         COMMON_FLAGS + ("segment_filled",),
@@ -131,10 +162,15 @@ CASES = {
     ),
 }
 RESIDENT_EXTRA = ("resident_column_bytes", "resident_file_bytes")
+# The cases that look offsets up in a published index, with its root open
+# before the interval, or in the resident index loaded before it.
+WARM = ("warm_lookup", "hole_lookup")
 # Which sides measure a case.
 CASE_SIDES = {
     "warm_lookup": SIDES,
     "cold_open_lookup": SIDES,
+    "hole_lookup": SIDES,
+    "cached_lookup": ("candidate",),
     "memory_lookup": ("candidate",),
     "open_many_segments": ("candidate", "resident"),
     "rebuild": ("candidate", "resident"),
@@ -160,7 +196,7 @@ def validate(row: dict) -> dict:
         raise ValueError("unknown case or side")
     counters, flags = CASES[case]
     expected = {"case", "side", *counters, *flags}
-    if case in ("warm_lookup", "cold_open_lookup") and side == "resident":
+    if case in ("cold_open_lookup",) + WARM and side == "resident":
         expected.update(RESIDENT_EXTRA)
         counters = counters + RESIDENT_EXTRA
     if case == "stride" and row.get("memory_observed") is True:
@@ -182,25 +218,67 @@ def validate(row: dict) -> dict:
         raise ValueError("a segment without a block or an anchor")
     if "blocks" in row and row["anchors"] > row["blocks"]:
         raise ValueError("more anchors than blocks")
+    if case == "hole_lookup":
+        check_holes(row)
+    check_reactor(row)
     if not row["timing_only"]:
         check_native_work(row)
     return row
 
 
+def check_holes(row: dict) -> None:
+    """An extent with holes has both kinds, and offsets were looked up in
+    each: one without measured a dense index under another name."""
+    if not row["gaps"] or row["removed_slots"] < row["gaps"]:
+        raise ValueError("an extent with holes removed no slot between batches")
+    if not row["sparse_batches"] or row["unkept_slots"] < row["sparse_batches"]:
+        raise ValueError("an extent with holes has no sparse batch")
+    if row["gaps"] >= row["blocks"] or row["sparse_batches"] > row["blocks"]:
+        raise ValueError("more holes than batches")
+    if row["records"] < row["blocks"]:
+        raise ValueError("a batch of the extent kept no record")
+    if not row["gap_lookups"] or not row["sparse_lookups"]:
+        raise ValueError("no offset was looked up in a hole")
+    if row["gap_lookups"] + row["sparse_lookups"] > row["lookups"]:
+        raise ValueError("more offsets in holes than looked up")
+
+
+def check_reactor(row: dict) -> None:
+    """What the shard's own counts must show, in both builds."""
+    case, side = row["case"], row["side"]
+    reads = row["reactor_reads"]
+    if case in WARM + ("cold_open_lookup",) and side != "resident":
+        # A page for every lookup that has an anchor, and the root once
+        # where it is opened: at least one read each.
+        opened = 1 if case == "cold_open_lookup" else 0
+        if reads < row["found"] + opened:
+            raise ValueError("a paged lookup read less than a page for each anchor")
+    if case in WARM and side == "resident" and reads:
+        raise ValueError("a resident lookup read the device")
+    if case in ("memory_lookup", "cached_lookup") and reads:
+        raise ValueError("a lookup answered from memory read the device")
+    if case == "cached_lookup" and row["cache_loads"]:
+        raise ValueError("a lookup whose root and page are kept loaded them")
+    if case == "rebuild" and not row["persist_reactor_flushes"]:
+        raise ValueError("an index was made durable without a flush")
+
+
 def check_native_work(row: dict) -> None:
     """What an observed interval may and may not touch."""
     case, side = row["case"], row["side"]
-    if case in ("warm_lookup", "cold_open_lookup", "open_many_segments"):
+    if case in WARM + ("cold_open_lookup", "cached_lookup", "open_many_segments"):
         # An index is never checked against its segment's data to be used.
         if row["data_reads"] or row["data_opens"] or row["index_writes"]:
             raise ValueError("a lookup read segment data or wrote")
-    if case == "warm_lookup" and row["index_opens"]:
+    if case in WARM + ("cached_lookup",) and row["index_opens"]:
         raise ValueError("a warm lookup opened a file")
     if case == "cold_open_lookup" and row["index_opens"] != 1:
         raise ValueError("a cold lookup did not open exactly one file")
-    if case == "warm_lookup" and side == "resident" and row["index_reads"]:
+    if case in WARM and side == "resident" and row["index_reads"]:
         raise ValueError("a resident lookup read the device")
-    if case in ("warm_lookup", "cold_open_lookup") and side != "resident":
+    if case == "cached_lookup" and row["index_reads"]:
+        raise ValueError("a lookup whose root and page are kept read the device")
+    if case in WARM + ("cold_open_lookup",) and side != "resident":
         # One page for every lookup that has an anchor, and the root once
         # where it is opened: nothing keeps a page between lookups.
         opened = 1 if case == "cold_open_lookup" else 0
@@ -328,6 +406,8 @@ def summarize_group(rows: list[dict]) -> dict:
         "index_reads": median(rows, "index_reads"),
         "index_read_bytes": median(rows, "index_read_bytes"),
         "data_read_bytes": median(rows, "data_read_bytes"),
+        "reactor_reads": median(rows, "reactor_reads"),
+        "reactor_read_bytes": median(rows, "reactor_read_bytes"),
     }
     for name in ("blocks", "data_bytes", "anchors", "stride_bytes", "segments"):
         if name in first:
@@ -342,11 +422,18 @@ def summarize_group(rows: list[dict]) -> dict:
         # A lookup below the first anchor reads nothing.
         out["index_reads_per_found"] = per(out["index_reads"], found)
         out["index_read_bytes_per_found"] = per(out["index_read_bytes"], found)
+        out["reactor_reads_per_found"] = per(out["reactor_reads"], found)
         out["mean_scan_bytes"] = per(one(rows, "scan_bytes"), found)
         out["longest_scan_bytes"] = one(rows, "longest_scan_bytes")
         out["far_lookups"] = one(rows, "far_lookups")
         out["far_at_first_block"] = one(rows, "far_at_first_block")
-    if case in ("warm_lookup", "cold_open_lookup"):
+    if case == "hole_lookup":
+        for name in HOLES:
+            out[name] = one(rows, name)
+    if case == "cached_lookup":
+        out["cache_capacity"] = one(rows, "cache_capacity")
+        out["cache_bytes"] = median(rows, "cache_bytes")
+    if case in WARM + ("cold_open_lookup", "cached_lookup"):
         out["held_budget_bytes"] = median(rows, "held_budget_bytes")
         out["held_budget_handles"] = median(rows, "held_budget_handles")
         if first["side"] == "resident":
@@ -372,6 +459,7 @@ def summarize_group(rows: list[dict]) -> dict:
         out["persist_elapsed_ns"] = median(rows, "persist_elapsed_ns")
         out["persist_index_write_bytes"] = median(rows, "persist_index_write_bytes")
         out["persist_index_flushes"] = median(rows, "persist_index_flushes")
+        out["persist_reactor_flushes"] = median(rows, "persist_reactor_flushes")
         out["persist_directory_syncs"] = median(rows, "persist_directory_syncs")
         if one(rows, "foreground_probe"):
             out["foreground_turns"] = median(rows, "foreground_turns")

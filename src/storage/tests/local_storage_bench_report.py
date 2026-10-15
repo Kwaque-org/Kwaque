@@ -3,6 +3,10 @@
 Pair mode proves equal work before comparing scopes: the owner and its
 composed baseline must store the same PREPARE and segment bytes with the same
 group, footer and block counts.
+
+Requests that one WAL barrier made durable are not independent of each other:
+a tail quantile counts the barriers its requests took, and a p99.9 is given
+only over 3,000 of them.
 """
 
 from __future__ import annotations
@@ -23,8 +27,18 @@ ARRIVALS = ("held", "serial", "isolated", "burst", "paced")
 OBSERVED = ("isolated", "burst", "paced")
 KINDS = ("wal", "data", "other")
 MAXIMUM_SEGMENTS = 32
-# Fewer samples than this leave p99.9 unqualified.
-TAIL_SAMPLES = 1000
+# Fewer independent groups than this leave p99.9 unqualified.
+TAIL_GROUPS = 3000
+# What a row of a later binary also says of its timed region: the barrier each
+# side of the append took, and the shard's own native counts.
+BARRIERS = ("none", "overwrite", "first_write", "extending", "synchronized")
+REACTOR_KEYS = (
+    "reactor_flushes",
+    "reactor_writes",
+    "reactor_write_bytes",
+    "reactor_reads",
+    "reactor_read_bytes",
+)
 COUNTERS = (
     "payload_bytes",
     "requests",
@@ -201,6 +215,14 @@ def validate(row: dict) -> None:
             validate_kind(row, kind)
         if row["wal"]["flushes"] != flushes or row["data"]["flushes"] < segments:
             raise ValueError("native flushes disagree with the barriers")
+    if "reactor_flushes" in row:
+        for key in REACTOR_KEYS:
+            integer(row[key], key)
+        if row["wal_barrier"] not in BARRIERS or row["data_barrier"] not in BARRIERS:
+            raise ValueError("unknown barrier")
+        # Every barrier the WAL claims reached the device.
+        if row["reactor_flushes"] == 0 or row["reactor_flushes"] < flushes:
+            raise ValueError("claimed barrier reached no device")
     if row["memory_observed"]:
         for key in ("memory_peak", "largest_allocation"):
             integer(row[key], key)
@@ -241,13 +263,16 @@ def overlap(left: list[tuple[int, int]], right: list[tuple[int, int]]) -> int:
     return total
 
 
-def quantiles(values: list[int]) -> dict:
+def quantiles(values: list[int], groups: int) -> dict:
+    """`values` taken from `groups` independent groups."""
+    qualified = groups >= TAIL_GROUPS
     return {
         "samples": len(values),
+        "groups": groups,
         "p50": percentile(values, 0.5),
         "p99": percentile(values, 0.99),
-        "p999": percentile(values, 0.999),
-        "p999_qualified": len(values) >= TAIL_SAMPLES,
+        "p999": percentile(values, 0.999) if qualified else None,
+        "p999_qualified": qualified,
     }
 
 
@@ -315,7 +340,7 @@ def summarize(rows: list[dict]) -> dict:
                 "bytes": statistics.median(r[kind]["bytes"] for r in rows),
                 "flushes": statistics.median(r[kind]["flushes"] for r in rows),
                 "flush_depth": max(r[kind]["flush_depth"] for r in rows),
-                "flush_ns": quantiles(flushes),
+                "flush_ns": quantiles(flushes, len(flushes)),
                 "cap_waits": statistics.median(r[kind]["cap_waits"] for r in rows),
             }
         # The WAL and segment barriers as components: each one's busy time and
@@ -331,9 +356,14 @@ def summarize(rows: list[dict]) -> dict:
         result["native"] = native
     if first["arrival"] in OBSERVED:
         samples = [s for r in rows for s in r["samples"]]
-        result["arrival_to_result_ns"] = quantiles([s[3] - s[0] for s in samples])
-        result["accepted_stage_ns"] = quantiles([s[2] - s[1] for s in samples])
-        result["arrival_lateness_ns"] = quantiles([s[1] - s[0] for s in samples])
+        groups = sum(r["wal_flushes"] for r in rows)
+        result["arrival_to_result_ns"] = quantiles(
+            [s[3] - s[0] for s in samples], groups
+        )
+        result["accepted_stage_ns"] = quantiles([s[2] - s[1] for s in samples], groups)
+        result["arrival_lateness_ns"] = quantiles(
+            [s[1] - s[0] for s in samples], groups
+        )
     return result
 
 

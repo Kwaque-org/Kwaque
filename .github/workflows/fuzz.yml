@@ -62,8 +62,21 @@ jobs:
         run: |
           echo "key=fuzz-corpus-$(printf '%s' "${FUZZ_TARGET}" | tr -c 'A-Za-z0-9_-' '_')" >> "${GITHUB_OUTPUT}"
           echo "directory=${RUNNER_TEMP}/fuzz-corpus" >> "${GITHUB_OUTPUT}"
-      # Each campaign continues from the corpus the previous ones grew instead
-      # of starting again from the checked-in seeds.
+      # The commit seeds the campaign: libFuzzer takes a nonzero 32-bit seed,
+      # here the commit's first eight hexadecimal digits, and its log prints
+      # it beside the target and the corpus it continued from. A campaign on
+      # a grown corpus and a time bound is replayed from its retained input;
+      # the seed and the commit say which campaign that was.
+      - name: Seed the campaign from the commit
+        id: seed
+        run: |
+          seed=$((16#${GITHUB_SHA:0:8}))
+          if [ "${seed}" -eq 0 ]; then seed=1; fi
+          echo "value=${seed}" >> "${GITHUB_OUTPUT}"
+          echo "campaign seed ${seed} at ${GITHUB_SHA}"
+      # Each campaign starts from the checked-in seeds and a sample of the
+      # corpus the previous ones kept; the wrapper then merges what it found
+      # into that corpus, which keeps only the inputs that add coverage.
       - name: Restore the corpus from earlier campaigns
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
@@ -76,19 +89,23 @@ jobs:
         env:
           CORPUS: ${{ steps.corpus.outputs.directory }}
         run: mkdir -p "${CORPUS}"
+      # The campaign's 600 s, which its first inputs run inside, a round of
+      # mutations past it, the merge's 1800 s and a reduction's 50 s.
       - name: Run a bounded fuzz campaign
         id: tests
         env:
           FUZZ_TARGET: ${{ matrix.target }}
           CORPUS: ${{ steps.corpus.outputs.directory }}
+          CAMPAIGN_SEED: ${{ steps.seed.outputs.value }}
         run: >-
           bazel test --config=ci --config=fuzz
-          --test_output=all --test_timeout=720
+          --test_output=all --test_timeout=2520
           --test_env=KWAQUE_FUZZ_MINIMIZE_SECONDS=30
           --test_env=KWAQUE_FUZZ_CORPUS_DIR="${CORPUS}"
           --sandbox_writable_path="${CORPUS}"
           --test_arg=-max_total_time=600
           --test_arg=-timeout=15
+          --test_arg=-seed="${CAMPAIGN_SEED}"
           "${FUZZ_TARGET}"
       - name: Keep the grown corpus
         if: always() && (steps.tests.outcome == 'success' || steps.tests.outcome == 'failure')

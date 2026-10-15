@@ -478,23 +478,23 @@ std::vector<std::uint8_t> fuzz_configuration(fuzz_harness harness) {
     std::string_view text;
     switch (harness) {
     case fuzz_harness::scheduler:
-        text = "scheduler:v2;pending=256;batch=64;total=4096;trace=512;"
+        text = "scheduler:v1;pending=256;batch=64;total=4096;trace=512;"
                "pressure=cancel";
         break;
     case fuzz_harness::fault_schedule:
-        text = "fault:v2;rules=128;evaluations=512";
+        text = "fault:v1;rules=128;evaluations=512";
         break;
     case fuzz_harness::fake_file:
-        text = "file:v2;objects=16;handles=4;pending=64;bytes=65536;trace=4096;"
+        text = "file:v1;objects=16;handles=4;pending=64;bytes=65536;trace=4096;"
                "fault-history=1";
         break;
     case fuzz_harness::fake_network:
-        text = "network:v3;flows=1,8,32,96;commands=512;pending=4096;total="
+        text = "network:v1;flows=1,8,32,96;commands=512;pending=4096;total="
                "32768;deadline=1000000000000;trace=16384;trace-bytes=4194304;"
                "packets-per-flow=3";
         break;
     case fuzz_harness::semantic_canary:
-        text = "canary:v2";
+        text = "canary:v1";
         break;
     }
     return {text.begin(), text.end()};

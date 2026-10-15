@@ -1,0 +1,24 @@
+# The pairs wal_timing_bench is compared by, one a line:
+#   <baseline>=<candidate> <kind>
+# Both sides do the same work with and without one owner. A device pair ends
+# its timed region at a barrier that reaches the device; a processor pair
+# writes through the decorator that discards every write and reaches none.
+
+# The WAL writer beside the codec and the runtime file alone, one group.
+wal_bench.codec_runtime_tiny_disk_barrier=wal_bench.writer_tiny_disk_barrier device
+wal_bench.codec_runtime_k128_disk_barrier=wal_bench.writer_k128_disk_barrier device
+wal_bench.codec_runtime_m4_disk_barrier=wal_bench.writer_m4_disk_barrier device
+wal_bench.codec_runtime_maximum_disk_barrier=wal_bench.writer_maximum_disk_barrier device
+wal_bench.codec_runtime_fragmented_disk_barrier=wal_bench.writer_fragmented_disk_barrier device
+wal_bench.codec_runtime_tiny_noop_written=wal_bench.writer_tiny_noop_written processor
+wal_bench.codec_runtime_k128_noop_written=wal_bench.writer_k128_noop_written processor
+wal_bench.codec_runtime_m4_noop_written=wal_bench.writer_m4_noop_written processor
+wal_bench.codec_runtime_maximum_noop_written=wal_bench.writer_maximum_noop_written processor
+wal_bench.codec_runtime_fragmented_noop_written=wal_bench.writer_fragmented_noop_written processor
+
+# The group commit coordinator beside the WAL writer alone, fixed cohorts.
+wal_commit_bench.writer_tiny=wal_commit_bench.coordinator_tiny device
+wal_commit_bench.writer_aligned=wal_commit_bench.coordinator_aligned device
+wal_commit_bench.writer_fragmented=wal_commit_bench.coordinator_fragmented device
+wal_commit_bench.writer_m4=wal_commit_bench.coordinator_m4 device
+wal_commit_bench.writer_maximum=wal_commit_bench.coordinator_maximum device

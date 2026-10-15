@@ -102,7 +102,7 @@ TEST_F(
     EXPECT_GT(script.writes, 2U);
     EXPECT_EQ(script.syncs, 2U);
     const std::string_view encoded{script.output.data(), script.size};
-    EXPECT_EQ(encoded.substr(0, 8), std::string_view("KQCRSH2\0", 8));
+    EXPECT_EQ(encoded.substr(0, 8), std::string_view("KQCRSH1\0", 8));
     constexpr auto header_size = kwaque::broker::detail::crash_header_size;
     constexpr auto architecture = kwaque::broker::detail::crash_architecture();
     EXPECT_EQ(
@@ -296,7 +296,7 @@ TEST_F(CrashWriterTest, ChecksummedStructuralErrorsAreRejectedIndependently) {
         bytes, bytes.size(), timestamp));
 }
 
-TEST_F(CrashWriterTest, VersionTwoRequiresBoundedArchitectureMetadata) {
+TEST_F(CrashWriterTest, ARecordRequiresBoundedArchitectureMetadata) {
     ASSERT_TRUE(writer.record(crash_kind::startup_failure, 0, 0, false));
     std::vector<char> bytes(
       script.output.data(), script.output.data() + script.size);
@@ -322,10 +322,10 @@ TEST(CrashReportFormatTest, KnownRecordAndEverySingleByteCorruption) {
     constexpr std::string_view bytes{
       "\x4b\x51\x43\x52\x53\x48\x31\x00\x00\x84\xd9\x7b\x89\x01\x00\x00"
       "\x00\x00\x00\x00\x03\x00\x00\x00\x01\x00\x00\x00\x16\x00\x00\x00"
-      "\x00\x00\x00\x00\x02\x00\x00\x00\x46\x61\x69\x6c\x75\x72\x65\x20"
-      "\x64\x75\x72\x69\x6e\x67\x20\x73\x74\x61\x72\x74\x75\x70\x76\x31"
-      "\xf2\x65\xdc\x5b",
-      68};
+      "\x00\x00\x00\x00\x02\x00\x00\x00\x06\x00\x00\x00\x46\x61\x69\x6c"
+      "\x75\x72\x65\x20\x64\x75\x72\x69\x6e\x67\x20\x73\x74\x61\x72\x74"
+      "\x75\x70\x76\x31\x78\x38\x36\x5f\x36\x34\xfb\xd1\x9f\xd8",
+      78};
     std::int64_t timestamp = 0;
     ASSERT_TRUE(
       kwaque::broker::detail::crash_report_timestamp(
@@ -346,10 +346,10 @@ TEST(CrashReportFormatTest, KnownRecordAndEverySingleByteCorruption) {
     std::fill(
       corrupt.begin() + 8, corrupt.begin() + 15, static_cast<char>(0xff));
     corrupt[15] = 0x7f;
-    corrupt[64] = static_cast<char>(0xa9);
-    corrupt[65] = 0x02;
-    corrupt[66] = static_cast<char>(0xe9);
-    corrupt[67] = 0x02;
+    corrupt[74] = 0x6c;
+    corrupt[75] = static_cast<char>(0xcc);
+    corrupt[76] = static_cast<char>(0xc9);
+    corrupt[77] = static_cast<char>(0xab);
     EXPECT_TRUE(
       kwaque::broker::detail::crash_report_timestamp(
         corrupt, corrupt.size(), timestamp));
