@@ -892,6 +892,7 @@ kwaque_cc_seastar_test(
     tags = ["simulated_storage"],
     deps = [
         ":storage_recovery_fuzz_cases",
+        "//src/base:error",
         "//src/storage/tests:engine_fixture_contract",
     ],
 )

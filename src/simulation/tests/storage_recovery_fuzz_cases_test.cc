@@ -1,3 +1,4 @@
+#include "src/base/error.h"
 #include "src/simulation/tests/storage_recovery_fuzz_cases.h"
 #include "src/storage/tests/engine_fixture_contract.h"
 
@@ -208,25 +209,24 @@ SEASTAR_THREAD_TEST_CASE(storage_recovery_fuzz_every_seed_breaks_no_rule) {
             << ": " << result.word << " about " << result.about);
         ++seeds;
     }
-    BOOST_CHECK_EQUAL(seeds, 32U);
+    BOOST_CHECK_EQUAL(seeds, 33U);
 }
 
 // An earlier control record in the newer one's place says the store was
-// never used. The run ends; what the start made of it is said here, and is
-// held to no more than that it either breaks no rule or is refused after
-// something was written, which is the one rule a store that looks unused
-// can break.
-SEASTAR_THREAD_TEST_CASE(storage_recovery_fuzz_a_stale_control_record_ends) {
+// never used, beside a WAL it never handed out and segments its owner lists.
+// The start refuses it before it writes anything.
+SEASTAR_THREAD_TEST_CASE(
+  storage_recovery_fuzz_a_stale_control_record_is_refused) {
     const auto result = exercise_recovery_case(
       control(1, image_damage::stale), {});
     say("a stale control record", result);
-    BOOST_TEST_MESSAGE(
-      "a stale control record: "
-      << (result.word.empty() ? std::string{"no rule broke"} : result.word));
     BOOST_CHECK(result.seen.changed);
     BOOST_CHECK_MESSAGE(
-      result.word.empty() || result.word == "wrote",
-      result.word << " about " << result.about);
+      result.word.empty(), result.word << " about " << result.about);
+    BOOST_CHECK(!result.seen.ready && result.seen.untouched);
+    BOOST_CHECK(
+      result.seen.failure
+      == make_error_code(kwaque::errc::wrong_context).message());
 }
 
 // A start that hangs, throws or runs something out is its own word and

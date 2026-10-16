@@ -339,6 +339,7 @@ kwaque_cc_library(
         "//src/runtime:time",
         "@abseil-cpp//absl/container:btree",
         "@seastar",
+        "@unordered_dense",
     ],
 )
 

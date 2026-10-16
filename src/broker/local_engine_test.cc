@@ -122,6 +122,13 @@ SEASTAR_TEST_CASE(local_engine_native_started_and_restarted) {
     });
 }
 
+SEASTAR_TEST_CASE(local_engine_native_stale_control_record_refused) {
+    co_await with_reserved_store([](auto&&... shared) {
+        return storage::testing::local_engine_contract::
+          stale_control_record_refused<clock_type>(shared...);
+    });
+}
+
 SEASTAR_TEST_CASE(local_checkpoint_native_detached_boundary_pinned) {
     co_await with_local_store([](auto&&... shared) {
         return successor::detached_boundary_pinned<clock_type>(shared...);

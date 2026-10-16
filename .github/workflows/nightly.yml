@@ -123,7 +123,7 @@ jobs:
           persist-credentials: false
       - uses: ./.github/actions/setup-build
       # Only the debug build fails allocations on purpose. A change fails a
-      # dozen points of each window; this fails every one.
+      # dozen points of each window; this fails every one, one a round.
       - name: Fail every allocation point of the engine's owners
         id: tests
         run: >-

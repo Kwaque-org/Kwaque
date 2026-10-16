@@ -132,15 +132,22 @@ seastar::future<runtime::result<local_recovery_generation>> open_recovery_pins(
     if (!opened) co_return runtime::failure(opened.error());
     auto owner = std::move(*opened);
     std::optional<runtime::operation_error> rebuild;
-    std::optional<runtime::operation_error> failed;
-    if (auto pin = owner->pin(); !pin)
-        failed = pin.error();
-    else
-        rebuild = pin->index_rebuild_reason();
-    if (failed) {
+    // A pin that throws leaves the owner open as one that fails does: it is
+    // closed before the failure leaves.
+    runtime::first_failure failed;
+    try {
+        if (auto pin = owner->pin(); !pin)
+            failed.observe(pin);
+        else
+            rebuild = pin->index_rebuild_reason();
+    } catch (...) {
+        failed.observe(std::current_exception());
+    }
+    if (failed.failed()) {
         owner->retire();
         static_cast<void>(co_await owner->close());
-        co_return runtime::failure(*failed);
+        auto error = failed.outcome();
+        co_return runtime::failure(error.error());
     }
     output.index_rebuild = rebuild;
     if (publication.state != local_object_state::sealed && publication.boundary)

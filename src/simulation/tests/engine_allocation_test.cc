@@ -54,8 +54,13 @@ using storage::testing::history_survival;
 using verdict = storage::testing::engine_ledger::verdict;
 
 // On every change a dozen points of each window are failed, spread over it;
-// with the switch every point is.
-std::uint64_t sampled_points() {
+// with the switch every point is, one failure a round. Where every
+// allocation after the first fails, the exceptions the failure raises and
+// rethrows come from the C++ runtime's emergency heap, a few hundred bytes
+// whose free path can lose its list, and it is process-wide: that way stays
+// at the dozen.
+std::uint64_t sampled_points(allocation_failures mode) {
+    if (mode == allocation_failures::from_the_first) return 12;
     return std::getenv("KWAQUE_FULL_SWEEPS") != nullptr ? 0 : 12;
 }
 
@@ -111,7 +116,7 @@ void sweep(
           once ? "one allocation fails"
                : "every allocation after the first fails");
         const auto swept = runtime::testing::sweep_allocation_failures(
-          mode, sampled_points(), [&](allocation_window& window) {
+          mode, sampled_points(mode), [&](allocation_window& window) {
               round(history, step, window);
               if (once) EXPECT_LE(window.failures(), 1U);
           });

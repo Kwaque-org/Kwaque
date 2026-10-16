@@ -2647,7 +2647,7 @@ private:
         auto& slot = slots_[index];
         for (;;) {
             try {
-                co_await slot.wake.wait([&slot] {
+                co_await slot.wake.when([&slot] {
                     return (slot.head && slot.head->ready)
                            || (slot.stop && !slot.head);
                 });

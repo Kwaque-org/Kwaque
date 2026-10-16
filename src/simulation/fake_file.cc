@@ -2163,8 +2163,12 @@ fake_file_system::prepared_directory_change::prepared_directory_change(
 
     try {
         if (!had_unsynced_) {
+            // The key is copied before the map changes. A B-tree map moves
+            // its later values aside and then makes the new one in place; a
+            // copy that fails there loses a value and leaves a hole.
+            auto key = name_;
             const auto [position, inserted] = directory_->unsynced.try_emplace(
-              name_, replacement_);
+              std::move(key), replacement_);
             static_cast<void>(position);
             KWAQUE_INVARIANT(
               fake_directory_transaction_invariant,
@@ -2537,8 +2541,10 @@ fake_file_system::sync_directory(fake_object_id selected_id) {
         for (; prepared < changes.size(); ++prepared) {
             auto& change = changes[prepared];
             if (change.replacement && !change.previous) {
+                // Copied first, as in prepared_directory_change.
+                auto key = change.name;
                 const auto [position, inserted] = state.durable.try_emplace(
-                  change.name, *change.replacement);
+                  std::move(key), *change.replacement);
                 static_cast<void>(position);
                 KWAQUE_INVARIANT(
                   fake_directory_transaction_invariant,
@@ -3419,7 +3425,9 @@ fake_file_system::run_selective_crash(fake_operation_id active) {
                       {object.id, name, before, visible, chosen});
                     auto& staged = state.names.back();
                     if (chosen && !before) {
-                        directory.durable.try_emplace(name, *chosen);
+                        // Copied first, as in prepared_directory_change.
+                        std::string key{name};
+                        directory.durable.try_emplace(std::move(key), *chosen);
                         staged.inserted = true;
                     }
                     word(object.id.value());

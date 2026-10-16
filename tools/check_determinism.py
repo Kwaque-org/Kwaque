@@ -294,7 +294,7 @@ ALLOWANCES = (
     Allowance(
         "src/simulation/fake_file.h",
         "unordered-state",
-        "seastar::chunked_hash_set<std::uint64_t> open_objects_;",
+        "ankerl::unordered_dense::set<std::uint64_t> open_objects_;",
         1,
         "Membership and commutative invalidation; diagnostic IDs are sorted.",
     ),
