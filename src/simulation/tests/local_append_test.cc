@@ -407,6 +407,13 @@ SEASTAR_TEST_CASE(local_engine_fake_started_and_restarted) {
     });
 }
 
+SEASTAR_TEST_CASE(local_engine_fake_stale_control_record_refused) {
+    co_await with_reserved_store([](auto&&... shared) {
+        return storage::testing::local_engine_contract::
+          stale_control_record_refused<simulation::monotonic_clock>(shared...);
+    });
+}
+
 SEASTAR_TEST_CASE(segment_lifecycle_fake_removal_against_transitions) {
     co_await with_local_store([](auto&&... shared) {
         return storage::testing::segment_lifecycle_contract::

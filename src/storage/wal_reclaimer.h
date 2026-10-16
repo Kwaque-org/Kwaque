@@ -248,4 +248,145 @@ seastar::future<runtime::result<wal_reopen_outcome>> remove_wal_below(
     co_return output;
 }
 
+// Whether the shard holds a WAL file its control record never handed out:
+// one whose incarnation is above `high`. The record makes an incarnation
+// durable before a file of it is made, so a first start cut short leaves
+// files at or below it, and one above it is of a WAL the record is older
+// than. Names that are no WAL file, such as an unfinished publication's
+// temporary, are passed over. A shard with no WAL directory holds none.
+template<runtime::file_system_backend Backend, local_directory_owner Owner>
+seastar::future<runtime::result<bool>> holds_unallocated_wal(
+  Backend& files,
+  Owner& ownership,
+  const local_device_spec& spec,
+  std::uint32_t shard,
+  local_wal_high high,
+  codec::cooperative_work& work) {
+    if (auto valid = validate_local_device_spec(spec); !valid)
+        co_return runtime::failure(valid.error());
+    if (!spec.shard_owner(shard) || !spec.controls())
+        co_return runtime::failure(detail::path_error(errc::wrong_context));
+    if (auto valid = co_await ownership.validate(spec); !valid)
+        co_return runtime::failure(valid.error());
+    const auto paths = local_paths::make(spec.root);
+    if (!paths) co_return runtime::failure(paths.error());
+    const auto root = paths->buckets(shard, local_bucket_kind::wal);
+    if (!root) co_return runtime::failure(root.error());
+    using cursor = typename Backend::directory_cursor_type;
+    std::optional<cursor> buckets, names;
+    bool found = false;
+    runtime::first_failure failed;
+    try {
+        do {
+            auto inspected = co_await inspect_local_path(
+              files,
+              spec.root,
+              *root,
+              runtime::file_kind::directory,
+              work,
+              true);
+            if (!inspected) {
+                failed.observe(inspected);
+                break;
+            }
+            auto opened = co_await files.open_directory(
+              *root, runtime::file_close_policy::checked);
+            if (!opened) {
+                if (opened.error().code() != errc::not_found)
+                    failed.observe(opened);
+                break;
+            }
+            buckets.emplace(std::move(*opened));
+            bool end = false;
+            while (!end && !found && !failed.failed()) {
+                if (
+                  auto ready = co_await detail::path_checkpoint(work); !ready) {
+                    failed.observe(ready);
+                    break;
+                }
+                auto page = co_await buckets->next(
+                  {.maximum_entries = item_count{1},
+                   .maximum_name_bytes = byte_count{255}});
+                if (!page) {
+                    failed.observe(page);
+                    break;
+                }
+                end = page->end();
+                for (const auto& bucket : page->entries()) {
+                    const auto number = parse_local_bucket(bucket.name.value());
+                    if (!number || bucket.kind != runtime::file_kind::directory)
+                        continue;
+                    auto parent = local_child_path(*root, bucket.name);
+                    if (!parent) {
+                        failed.observe(parent);
+                        break;
+                    }
+                    opened = co_await files.open_directory(
+                      *parent, runtime::file_close_policy::checked);
+                    if (!opened) {
+                        failed.observe(opened);
+                        break;
+                    }
+                    names.emplace(std::move(*opened));
+                    bool last = false;
+                    while (!last && !found && !failed.failed()) {
+                        if (
+                          auto ready = co_await detail::path_checkpoint(work);
+                          !ready) {
+                            failed.observe(ready);
+                            break;
+                        }
+                        auto entries = co_await names->next(
+                          {.maximum_entries = item_count{16},
+                           .maximum_name_bytes = byte_count{4_KiB}});
+                        if (!entries) {
+                            failed.observe(entries);
+                            break;
+                        }
+                        last = entries->end();
+                        for (const auto& entry : entries->entries()) {
+                            const auto file = parse_local_wal_name(
+                              entry.name.value(), *number);
+                            if (
+                              !file
+                              || entry.kind != runtime::file_kind::regular)
+                                continue;
+                            const auto handed
+                              = local_wal_high::from_incarnation(*file);
+                            if (!handed || *handed > high) {
+                                found = true;
+                                break;
+                            }
+                        }
+                    }
+                    failed.observe(co_await names->close());
+                    names.reset();
+                    if (failed.failed() || found) break;
+                }
+            }
+        } while (false);
+    } catch (...) {
+        failed.observe(std::current_exception());
+    }
+    if (names) {
+        try {
+            failed.observe(co_await names->close());
+        } catch (...) {
+            failed.observe(std::current_exception());
+        }
+    }
+    if (buckets) {
+        try {
+            failed.observe(co_await buckets->close());
+        } catch (...) {
+            failed.observe(std::current_exception());
+        }
+    }
+    if (failed.failed()) {
+        auto error = failed.outcome();
+        co_return runtime::failure(error.error());
+    }
+    co_return found;
+}
+
 } // namespace kwaque::storage

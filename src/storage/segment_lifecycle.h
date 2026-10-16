@@ -1345,12 +1345,14 @@ private:
         owner& owner_;
     };
 
+    // Not noexcept: the task scope, made last, allocates. If it cannot,
+    // nothing made before it needs closing and make() answers the failure.
     segment_table(
       providers given,
       segment_table_config config,
       workload_reservation held,
       std::vector<std::unique_ptr<owner>> owners,
-      std::vector<quiet_mark> quiet) noexcept
+      std::vector<quiet_mark> quiet)
       : held_(std::move(held))
       , files_(given.files)
       , ownership_(given.ownership)
@@ -2921,7 +2923,7 @@ private:
             if (closed.removing)
                 static_cast<void>(
                   co_await closed.removing->get_shared_future());
-            co_await closed.left.wait([&closed] { return closed.inside == 0; });
+            co_await closed.left.when([&closed] { return closed.inside == 0; });
         } catch (...) {
             kept.observe(std::current_exception());
         }

@@ -141,6 +141,11 @@ struct engine_start final {
 // was never used or restarts one that was, and stops them in the order each
 // owner's contract asks for.
 //
+// A control record with no WAL head says the store was never used. It is
+// believed only when the owner lists no segment and no WAL file is there
+// that the record never handed out; otherwise the record is older than the
+// store, and the start is refused before it writes anything.
+//
 // A restart reads everything before it changes anything: every durable
 // decision, the segments its owner's catalog lists, the durable checkpoint
 // and the WAL from the checkpoint's cutoff. Only a plan with no stopped
@@ -454,7 +459,25 @@ private:
 
         std::optional<restarted> recovered;
         if (!opened->fields.wal_head) {
-            // Never used: the first WAL head is made here.
+            // Never used, unless the store says otherwise: a segment its
+            // owner lists, or a WAL file the record never handed out, is a
+            // store the record is older than. It is refused with nothing
+            // written over it.
+            if (!catalog.empty())
+                co_return runtime::failure(
+                  detail::path_error(errc::wrong_context));
+            auto unallocated = co_await holds_unallocated_wal(
+              files_,
+              ownership_,
+              control_spec_,
+              shard_,
+              opened->fields.wal_high,
+              work);
+            if (!unallocated) co_return runtime::failure(unallocated.error());
+            if (*unallocated)
+                co_return runtime::failure(
+                  detail::path_error(errc::wrong_context));
+            // The first WAL head is made here.
             auto writer = wal_type::make(
               *control_,
               *ids_,

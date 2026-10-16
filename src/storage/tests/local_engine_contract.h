@@ -251,6 +251,89 @@ seastar::future<> started_and_restarted(
     }
 }
 
+// A control record older than its store is refused before anything is
+// written. The record a store was made with, put back after a start made
+// the first WAL file, says the store was never used, beside a WAL file it
+// never handed out and with no segment listed. The start is refused and the
+// record is as it was put back; the newer record put back again restarts
+// the store as it was.
+template<
+  runtime::monotonic_clock Clock,
+  typename Backend,
+  typename Owner,
+  typename Driver,
+  typename Timer>
+seastar::future<> stale_control_record_refused(
+  Backend& files,
+  Owner& owner,
+  const local_device_spec& spec,
+  workload_budget& budget,
+  workload_budget& reserve,
+  Driver drive,
+  Timer& timer) {
+    using engine_type = local_engine<Backend, Owner, Clock>;
+    seastar::abort_source abort;
+    codec::cooperative_work work{codec::limits::defaults(), abort};
+    co_await installation_contract::bootstrap(
+      files, owner, spec, budget, work, drive);
+    const std::array devices{spec};
+    const auto make = [&] {
+        return take(
+          engine_type::make(
+            {files, owner, devices, spec, 0, budget, budget, reserve, budget},
+            configuration()));
+    };
+    const auto control = take(take(local_paths::make(spec.root)).control(0));
+    const auto made = co_await store_contract::read_all_bytes(
+      files, control, drive);
+    // Started on what the record says, and refused on it.
+    const auto life = [&]() -> seastar::future<engine_start> {
+        lifecycle::told heard;
+        auto engine = make();
+        runtime::first_failure failed;
+        engine_start began;
+        try {
+            began = co_await drive.lifecycle(
+              engine->start(timer, {}, {heard.sink(), {}, {}}));
+        } catch (...) {
+            failed.observe(std::current_exception());
+        }
+        failed.observe(co_await drive.lifecycle(engine->stop()));
+        take(failed.outcome());
+        co_return began;
+    };
+
+    const auto first = co_await life();
+    take(first.failure.outcome());
+    require(
+      first.state == engine_state::ready && !first.restarted,
+      "a store that was never used did not start");
+    const auto used = co_await store_contract::read_all_bytes(
+      files, control, drive);
+    require(used != made, "a start left the record it was made with");
+
+    co_await store_contract::write_bytes(files, control, made, drive);
+    const auto refused = co_await life();
+    require(
+      refused.failure.failed() && refused.state == engine_state::stopped
+        && !refused.restarted,
+      "a store with a WAL its record never handed out was taken as unused");
+    const auto kept = refused.failure.outcome();
+    require(
+      !kept && kept.error().code() == errc::wrong_context,
+      "a record older than its store was refused for another reason");
+    require(
+      co_await store_contract::read_all_bytes(files, control, drive) == made,
+      "a refused start wrote over the record");
+
+    co_await store_contract::write_bytes(files, control, used, drive);
+    const auto again = co_await life();
+    take(again.failure.outcome());
+    require(
+      again.state == engine_state::ready && again.restarted,
+      "the store a refused start was given did not restart");
+}
+
 // One crash history of a removal. A store takes a segment, seals it and lets
 // its owner go; the segment's removal is then cut after `cut` scheduler
 // events and the device crashes with the removal wherever it stood: before,

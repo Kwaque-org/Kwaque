@@ -21,6 +21,7 @@
 #include <seastar/core/temporary_buffer.hh>
 
 #include <absl/container/btree_map.h>
+#include <ankerl/unordered_dense.h>
 
 #include <algorithm>
 #include <array>
@@ -941,7 +942,10 @@ private:
     std::unique_ptr<crash_state> crash_;
     std::optional<seastar::future<>> crash_task_;
     object_worklist collection_worklist_;
-    seastar::chunked_hash_set<std::uint64_t> open_objects_;
+    // Objects with an open reference, with room for every handle reserved
+    // when the device is made. Its storage outlives erasure (a chunked set
+    // frees a fragment it empties), so retaining a reference never allocates.
+    ankerl::unordered_dense::set<std::uint64_t> open_objects_;
     std::uint64_t dirty_head_{0};
     std::vector<std::uint64_t> pending_ids_;
     std::optional<seastar::shared_promise<runtime::result<void>>> stop_done_;

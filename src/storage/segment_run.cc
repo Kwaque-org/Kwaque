@@ -984,7 +984,7 @@ seastar::future<> segment_runs::copy() {
             publish();
             stirring_ = false;
             idle_.broadcast();
-            co_await wake_.wait();
+            co_await wake_.when();
             continue;
         }
         auto group = std::move(waiting_.front());
