@@ -7,6 +7,7 @@
 #include "src/storage/local_append.h"
 #include "src/storage/local_bundle.h"
 #include "src/storage/local_id_allocator.h"
+#include "src/storage/local_paths.h"
 #include "src/storage/retry_lookup.h"
 
 #include <seastar/core/abort_source.hh>
@@ -750,7 +751,7 @@ public:
         try {
             turn.emplace(co_await seastar::get_units(turn_, 1));
         } catch (...) {
-            co_return runtime::failure(error(errc::closed));
+            co_return runtime::failure(detail::recognized_or_rethrown());
         }
         if (closing_ || closed_ || failed_.failed())
             co_return runtime::failure(error(errc::closed));
@@ -1209,8 +1210,7 @@ seastar::future<runtime::result<std::uint32_t>> remove_unreferenced_objects(
         files, spec.root, *directory, runtime::file_kind::directory, work);
       !inspected)
         co_return runtime::failure(inspected.error());
-    auto opened = co_await files.open_directory(
-      *directory, runtime::file_close_policy::checked);
+    auto opened = co_await files.open_directory(*directory);
     if (!opened) co_return runtime::failure(opened.error());
     auto cursor = std::move(*opened);
     std::uint32_t removed = 0;

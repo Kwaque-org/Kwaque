@@ -97,8 +97,7 @@ public:
             path_,
             {.access = runtime::file_access::read_write,
              .create = true,
-             .exclusive = true,
-             .close_policy = runtime::file_close_policy::checked}))));
+             .exclusive = true}))));
         if (backend.abort_requested())
             throw seastar::abort_requested_exception{};
         checkpoint(1);
@@ -202,9 +201,7 @@ public:
         // event. Use the lifecycle driver to join the complete verification.
         auto file = take(
           co_await drive.lifecycle(view_.file_system().open(
-            path_,
-            {.access = runtime::file_access::read_only,
-             .close_policy = runtime::file_close_policy::checked})));
+            path_, {.access = runtime::file_access::read_only})));
         runtime::first_failure first;
         try {
             const auto read = take(

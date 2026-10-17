@@ -484,8 +484,17 @@ public:
         rotating_ = true;
         auto done = seastar::defer([this] noexcept {
             rotating_ = false;
-            if (service_enabled_ && !stopped_ && !closing_)
-                service_worker_.emplace(service_loop());
+            if (service_enabled_ && !stopped_ && !closing_) {
+                // A loop that cannot be made stops the WAL as one that
+                // fails does: nothing else would form or flush its groups.
+                try {
+                    service_worker_.emplace(service_loop());
+                } catch (...) {
+                    coordinator_failure_.observe(std::current_exception());
+                    first_.observe(std::current_exception());
+                    request_stop();
+                }
+            }
             wake();
         });
         force();

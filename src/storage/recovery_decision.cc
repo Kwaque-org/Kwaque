@@ -32,7 +32,7 @@ codec::immutable_object_digest recovery_suffix_identity::finish() && noexcept {
 
 runtime::result<void> recovery_decision_limits::validate() const noexcept {
     if (auto valid = metadata.validate(); !valid) return valid;
-    if (decisions == 0)
+    if (decisions == 0 || decisions > maximum_recovery_decisions)
         return runtime::failure(detail::path_error(errc::invalid_argument));
     return {};
 }

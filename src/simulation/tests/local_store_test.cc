@@ -4581,10 +4581,9 @@ public:
         return invoke<runtime::file>(
           [&] { return files_.open(std::move(path), options); });
     }
-    auto
-    open_directory(runtime::file_path path, runtime::file_close_policy policy) {
+    auto open_directory(runtime::file_path path) {
         return invoke<directory_cursor_type>(
-          [&] { return files_.open_directory(std::move(path), policy); });
+          [&] { return files_.open_directory(std::move(path)); });
     }
     auto exists(runtime::file_path path) {
         return invoke<bool>([&] { return files_.exists(std::move(path)); });
@@ -4623,10 +4622,9 @@ public:
               std::move(source), std::move(destination), policy);
         });
     }
-    auto
-    sync_directory(runtime::file_path path, runtime::file_close_policy policy) {
+    auto sync_directory(runtime::file_path path) {
         return invoke<void>(
-          [&] { return files_.sync_directory(std::move(path), policy); });
+          [&] { return files_.sync_directory(std::move(path)); });
     }
 
 private:
@@ -5390,10 +5388,8 @@ SEASTAR_TEST_CASE(
           runtime::first_failure failed;
           try {
               for (unsigned i = 0; i < 15; ++i)
-                  pressure.push_back(take(
-                    co_await drive.lifecycle(files.open(
-                      control,
-                      {.close_policy = runtime::file_close_policy::checked}))));
+                  pressure.push_back(
+                    take(co_await drive.lifecycle(files.open(control, {}))));
               require(
                 fake_file_test_access::open_handles(files) == 15,
                 "native descriptor pressure was not exercised");
@@ -5740,10 +5736,7 @@ seastar::future<> write_unsynced(
   simulation::testing::scheduler_driver drive) {
     auto file = take(
       co_await drive.lifecycle(files.open(
-        path,
-        {.access = runtime::file_access::read_write,
-         .create = true,
-         .close_policy = runtime::file_close_policy::checked})));
+        path, {.access = runtime::file_access::read_write, .create = true})));
     runtime::first_failure failed;
     try {
         auto written = co_await drive.lifecycle(file.write(

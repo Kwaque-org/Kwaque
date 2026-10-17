@@ -97,8 +97,7 @@ seastar::future<runtime::result<local_recovery_generation>> open_recovery_pins(
             files, spec.root, *data_path, runtime::file_kind::regular, work);
           !inspected)
             co_return runtime::failure(inspected.error());
-        auto opened = co_await files.open(
-          *data_path, {.close_policy = runtime::file_close_policy::checked});
+        auto opened = co_await files.open(*data_path, {});
         if (!opened) co_return runtime::failure(opened.error());
         auto data = std::move(*opened);
         runtime::first_failure failed;

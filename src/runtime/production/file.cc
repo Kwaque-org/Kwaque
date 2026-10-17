@@ -213,10 +213,7 @@ struct directory_cursor::state final : shard_affine {
         lister.reset();
         lookahead.reset();
         try {
-            if (close_policy == file_close_policy::checked)
-                co_await directory.close_checked();
-            else
-                co_await directory.close();
+            co_await directory.close_checked();
         } catch (...) {
             if (!exception && !failed) {
                 try {
@@ -245,7 +242,6 @@ struct directory_cursor::state final : shard_affine {
     seastar::gate operations;
     std::optional<operation_error> failed;
     std::exception_ptr exception;
-    file_close_policy close_policy{file_close_policy::legacy};
     bool busy{false}, closing{false}, end{false};
 };
 
@@ -341,11 +337,7 @@ seastar::future<result<void>> directory_cursor::close() {
 }
 
 seastar::future<result<directory_cursor>>
-file_system::open_directory(file_path path, file_close_policy policy) {
-    if (
-      policy != file_close_policy::legacy
-      && policy != file_close_policy::checked)
-        co_return failure(file_system_error(errc::invalid_argument));
+file_system::open_directory(file_path path) {
     assert_current();
     [[maybe_unused]] auto metric = admit(path);
     // Opening takes no listing slot: see directory_cursor_memory. An open
@@ -355,7 +347,6 @@ file_system::open_directory(file_path path, file_close_policy policy) {
       cursor_slots_);
     auto state = std::make_unique<directory_cursor::state>(
       std::move(memory), statistics_owner_, flights_.under(path.value()));
-    state->close_policy = policy;
     std::exception_ptr exception;
     try {
         state->directory = co_await seastar::open_directory(path.value());
@@ -366,10 +357,7 @@ file_system::open_directory(file_path path, file_close_policy policy) {
     if (exception) {
         if (state->directory) {
             try {
-                if (policy == file_close_policy::checked)
-                    co_await state->directory.close_checked();
-                else
-                    co_await state->directory.close();
+                co_await state->directory.close_checked();
             } catch (...) {
                 // Construction failed first; cleanup must not replace it.
             }
@@ -399,7 +387,6 @@ file_system::open(file_path path, file_open_options options) {
           std::move(native),
           file_io_limits{},
           statistics_owner_,
-          options.close_policy,
           flights_.under(path.value())};
     } catch (const std::bad_alloc&) {
         throw;
@@ -548,9 +535,10 @@ file_system::list(file_path path, directory_listing_limits limits) {
 
     if (directory) {
         try {
-            co_await directory.close();
+            co_await directory.close_checked();
         } catch (...) {
-            record_failure(std::current_exception());
+            // A refused listing failed first.
+            if (!rejected) record_failure(std::current_exception());
         }
     }
     if (exception) {
@@ -700,23 +688,9 @@ seastar::future<result<void>> file_system::rename(
     }
 }
 
-seastar::future<result<void>>
-file_system::sync_directory(file_path path, file_close_policy policy) {
+seastar::future<result<void>> file_system::sync_directory(file_path path) {
     assert_current();
-    if (
-      policy != file_close_policy::legacy
-      && policy != file_close_policy::checked)
-        co_return failure(file_system_error(errc::invalid_argument));
     [[maybe_unused]] auto metric = admit(path);
-    if (policy == file_close_policy::legacy) {
-        try {
-            co_await seastar::sync_directory(path.value());
-            co_return result<void>{};
-        } catch (...) {
-            co_return failure(
-              file_system_error_from_exception(std::current_exception()));
-        }
-    }
     first_failure failed;
     seastar::file directory;
     const auto remember = [&failed](std::exception_ptr exception) {
@@ -733,6 +707,7 @@ file_system::sync_directory(file_path path, file_close_policy policy) {
     } catch (...) {
         remember(std::current_exception());
     }
+    // Closed after a failed flush too.
     if (directory) {
         try {
             co_await directory.close_checked();

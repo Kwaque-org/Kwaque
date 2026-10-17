@@ -319,8 +319,7 @@ public:
             co_return runtime::file{
               std::move(measured),
               runtime::file_io_limits{},
-              runtime::operation_statistics_owner{},
-              options.close_policy};
+              runtime::operation_statistics_owner{}};
         } catch (...) {
             failure = std::current_exception();
         }
@@ -330,8 +329,8 @@ public:
         }
         std::rethrow_exception(failure);
     }
-    auto open_directory(runtime::file_path p, runtime::file_close_policy c) {
-        return files_.open_directory(std::move(p), c);
+    auto open_directory(runtime::file_path p) {
+        return files_.open_directory(std::move(p));
     }
     auto statistics() const noexcept { return files_.statistics(); }
     auto exists(runtime::file_path p) { return files_.exists(std::move(p)); }
@@ -355,8 +354,8 @@ public:
       runtime::file_rename_policy c) {
         return files_.rename(std::move(a), std::move(b), c);
     }
-    auto sync_directory(runtime::file_path p, runtime::file_close_policy c) {
-        return files_.sync_directory(std::move(p), c);
+    auto sync_directory(runtime::file_path p) {
+        return files_.sync_directory(std::move(p));
     }
 
 private:

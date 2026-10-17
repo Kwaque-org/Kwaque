@@ -1,6 +1,7 @@
 #pragma once
 
 #include "src/base/allocation.h"
+#include "src/base/invariant.h"
 #include "src/base/units.h"
 #include "src/storage/local_discovery.h"
 #include "src/storage/local_metadata_file.h"
@@ -168,8 +169,7 @@ discover_recovery_decisions(
         files, control.root, *directory, runtime::file_kind::directory, work);
       !inspected)
         co_return runtime::failure(inspected.error());
-    auto opened = co_await files.open_directory(
-      *directory, runtime::file_close_policy::checked);
+    auto opened = co_await files.open_directory(*directory);
     if (!opened) co_return runtime::failure(opened.error());
     auto cursor = std::move(*opened);
     recovery_decision_discovery output;
@@ -546,12 +546,15 @@ seastar::future<runtime::result<recovery_found>> find_recovery_segment(
             std::nullopt,
             std::nullopt})
            == authorization_verdict::authorized) {
+        // The directory was found on one of these devices.
         const auto on = std::find_if(
           devices.begin(), devices.end(), [&place](const auto& value) {
               return value.owner.device() == (*place)->device;
           });
-        if (on == devices.end())
-            co_return runtime::failure(path_error(errc::invariant_violation));
+        KWAQUE_INVARIANT(
+          invariant_id{"KQ-RECOVERY-DEVICE-KNOWN"},
+          on != devices.end(),
+          "a segment directory was found on no device of the set");
         const auto published = co_await select_recovery_publication(
           files, *on, shard, item.descriptor, budget, limits, work);
         if (!published && published.error().code() != errc::not_found)
@@ -584,12 +587,15 @@ seastar::future<runtime::result<recovery_found>> find_recovery_segment(
       item.descriptor.logical_origin,
       item.descriptor.physical_origin,
       item.descriptor.profile};
+    // The segment was located on one of these devices.
     const auto spec = std::find_if(
       devices.begin(), devices.end(), [device](const auto& value) {
           return value.owner.device() == device;
       });
-    if (spec == devices.end())
-        co_return runtime::failure(path_error(errc::invariant_violation));
+    KWAQUE_INVARIANT(
+      invariant_id{"KQ-RECOVERY-DEVICE-KNOWN"},
+      spec != devices.end(),
+      "a segment was located on no device of the set");
     // The publication alone first: a pending seal supersedes its pins.
     auto selected = co_await select_recovery_publication(
       files, *spec, shard, item.descriptor, budget, limits, work);

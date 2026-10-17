@@ -8,15 +8,6 @@ namespace detail {
 runtime::operation_error cache_error(errc code) noexcept {
     return runtime::operation_error{code, runtime::operation_kind::resource};
 }
-runtime::operation_error cache_thrown(std::exception_ptr thrown) noexcept {
-    try {
-        std::rethrow_exception(std::move(thrown));
-    } catch (const std::bad_alloc&) {
-        return cache_error(errc::resource_exhausted);
-    } catch (...) {
-        return cache_error(errc::io_failure);
-    }
-}
 
 cache_account::cache_account(
   workload_reservation held, std::uint64_t capacity) noexcept
@@ -134,14 +125,15 @@ void cache_entry::enlist(cache_waiter& waiting) noexcept {
     waiters_.push_back(waiting);
 }
 void cache_entry::settle(
-  std::optional<runtime::operation_error> failed) noexcept {
+  std::optional<runtime::operation_error> failed,
+  std::exception_ptr thrown) noexcept {
     assert_current();
     KWAQUE_INVARIANT(
       invariant_id{"KQ-CACHE-LOAD-ONCE"},
       loading_ && holders_ != 0,
       "a cache load ended that was not in flight");
     loading_ = false;
-    if (failed || funding_ || account_->stopped)
+    if (failed || thrown || funding_ || account_->stopped)
         retire();
     else if (resident_)
         account_->queues.insert(*this);
@@ -149,7 +141,10 @@ void cache_entry::settle(
     while (!waiters_.empty()) {
         auto& waiting = waiters_.front();
         waiters_.pop_front();
-        waiting.told.set_value(failed);
+        if (thrown)
+            waiting.told.set_exception(thrown);
+        else
+            waiting.told.set_value(failed);
     }
 }
 bool cache_entry::evicted_from(cache_queue from) noexcept {

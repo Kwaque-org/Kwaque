@@ -637,9 +637,7 @@ seastar::future<std::array<char, 33>> verify_data(
                                {input.descriptor.segment.segment(),
                                 input.descriptor.segment.generation()},
                                local_segment_file::data));
-    auto file = take(
-      co_await s.files.open(
-        path, {.close_policy = runtime::file_close_policy::checked}));
+    auto file = take(co_await s.files.open(path, {}));
     runtime::first_failure checked;
     codec::xxh3_128_hasher actual;
     try {
@@ -679,9 +677,7 @@ seastar::future<std::array<char, 33>> verify_wal(
   codec::cooperative_work& work) {
     const auto path = take(
       take(local_paths::make(s.wal_spec.root)).wal(0, start.incarnation()));
-    auto file = take(
-      co_await s.files.open(
-        path, {.close_policy = runtime::file_close_policy::checked}));
+    auto file = take(co_await s.files.open(path, {}));
     runtime::first_failure checked;
     codec::xxh3_128_hasher expected_hash;
     try {

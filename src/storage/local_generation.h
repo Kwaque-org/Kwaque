@@ -242,8 +242,7 @@ local_generation_owner::open(
                     failed.observe(valid);
                     break;
                 }
-                auto file = co_await files.open(
-                  *path, {.close_policy = runtime::file_close_policy::checked});
+                auto file = co_await files.open(*path, {});
                 if (!file) {
                     failed.observe(file);
                     break;

@@ -344,8 +344,12 @@ seastar::future<partial_resize_result> run_partial_resize(
     BOOST_CHECK(effect->coordinate_a > 10U);
     BOOST_CHECK(effect->coordinate_a < 4'096U);
 
+    // The failed truncate is the file's first failure; close answers it.
     auto closing = file.close();
-    co_await require_success(environment.events, closing);
+    co_await pump_until(environment.events, closing);
+    const auto closed = co_await std::move(closing);
+    BOOST_REQUIRE(!closed.has_value());
+    BOOST_CHECK(closed.error() == truncated.error());
     auto stopping = environment.files->stop();
     if (!stopping.available()) {
         co_await pump_until(environment.events, stopping);
@@ -524,10 +528,11 @@ seastar::future<compound_result> run_compound(
     co_await require_aborted(environment.events, stale_a);
     auto stale_b = file_b.size();
     co_await require_aborted(environment.events, stale_b);
+    // Each handle's first failure is a mutation the crash aborted.
     auto close_a = file_a.close();
-    co_await require_success(environment.events, close_a);
+    co_await require_aborted(environment.events, close_a);
     auto close_b = file_b.close();
-    co_await require_success(environment.events, close_b);
+    co_await require_aborted(environment.events, close_b);
 
     auto reopen_b = environment.files->open(
       path("/kwaque/b/file"),
@@ -672,11 +677,13 @@ seastar::future<crash_boundary_result> run_crash_boundary(
         co_await drain_reactor_tasks();
     }
 
+    std::optional<kwaque::runtime::operation_error> delayed_failure;
     if (!diverged) {
         co_await require_ready_success(crashing);
         const auto delayed_result = co_await std::move(delayed);
         BOOST_REQUIRE(!delayed_result.has_value());
         BOOST_CHECK(delayed_result.error().code() == kwaque::errc::aborted);
+        delayed_failure = delayed_result.error();
     } else {
         const auto crash_result = co_await std::move(crashing);
         BOOST_REQUIRE(!crash_result.has_value());
@@ -687,6 +694,7 @@ seastar::future<crash_boundary_result> run_crash_boundary(
         // The private file_impl transports the poison through a native
         // std::error_code; runtime::file therefore exposes it as I/O failure.
         BOOST_CHECK(delayed_result.error().code() == kwaque::errc::io_failure);
+        delayed_failure = delayed_result.error();
     }
 
     auto stopping = environment.files->stop();
@@ -700,8 +708,10 @@ seastar::future<crash_boundary_result> run_crash_boundary(
     auto captured = fake_file_test_access::snapshot(*environment.files);
     BOOST_REQUIRE(captured.has_value());
     auto state = std::move(*captured);
-    auto closing = file.close();
-    co_await require_ready_success(closing);
+    // The failed write is the file's first failure; close answers it.
+    const auto closed = co_await file.close();
+    BOOST_REQUIRE(!closed.has_value());
+    BOOST_CHECK(closed.error() == *delayed_failure);
     co_return crash_boundary_result{
       .state = std::move(state),
       .diverged = diverged,
@@ -853,7 +863,10 @@ SEASTAR_TEST_CASE(fake_file_partial_resize_replay_diverges_before_size_change) {
     const auto stopped = co_await std::move(stopping);
     BOOST_REQUIRE(!stopped.has_value());
     BOOST_CHECK(stopped.error().code() == kwaque::errc::replay_divergence);
-    BOOST_REQUIRE((co_await file.close()).has_value());
+    // The diverged truncate is the file's first failure; close answers it.
+    const auto closed = co_await file.close();
+    BOOST_REQUIRE(!closed.has_value());
+    BOOST_CHECK(closed.error() == truncated.error());
     co_return;
 }
 
@@ -1247,8 +1260,7 @@ seastar::future<kwaque::errc> rename_policy_scenario(
       path("/kwaque/rename-policy/a"),
       {.access = kwaque::runtime::file_access::read_write,
        .create = true,
-       .exclusive = true,
-       .close_policy = kwaque::runtime::file_close_policy::checked});
+       .exclusive = true});
     co_await pump_until(target.events, opening);
     auto file_result = co_await std::move(opening);
     BOOST_REQUIRE(file_result.has_value());

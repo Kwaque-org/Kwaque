@@ -156,6 +156,9 @@ public:
         ++state_.closes;
         return seastar::make_ready_future<>();
     }
+    // It owns no descriptor, so its checked close is its ordinary one.
+    bool supports_checked_close() const noexcept final { return true; }
+    seastar::future<> close_checked() final { return close(); }
 
     seastar::subscription<seastar::directory_entry> list_directory(
       std::function<seastar::future<>(seastar::directory_entry)>) final {
@@ -456,6 +459,7 @@ public:
     }
 
     ~native_aligned_file_fixture() {
+        operations_.close().get();
         auto serialization = seastar::get_units(write_serialization_, 1).get();
         static_cast<void>(serialization);
         native_.close().get();
@@ -522,6 +526,7 @@ public:
         if (!serialization) {
             std::terminate();
         }
+        auto holder = operations_.hold();
         auto consumer = detail::fragmented_buffer_io_access::consume(data);
         auto fragment = consumer.take_front();
         const auto expected = fragment.size();
@@ -529,6 +534,7 @@ public:
           .dma_write(position.value(), fragment.get(), expected, &io_intent_)
           .then_wrapped(
             [this,
+             holder = std::move(holder),
              position = position.value(),
              fragment = std::move(fragment),
              data = std::move(data),
@@ -539,6 +545,7 @@ public:
               seastar::future<std::size_t> completed) mutable
               -> seastar::future<result<byte_count>> {
                 static_cast<void>(this);
+                static_cast<void>(holder);
                 static_cast<void>(position);
                 static_cast<void>(fragment);
                 static_cast<void>(data);
@@ -599,6 +606,7 @@ private:
     benchmark_file_state state_;
     seastar::file native_;
     seastar::io_intent io_intent_;
+    seastar::gate operations_;
     seastar::temporary_buffer<char> source_;
     seastar::semaphore write_serialization_{1};
     owner_shard owner_;

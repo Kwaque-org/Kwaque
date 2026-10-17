@@ -1034,6 +1034,13 @@ struct file_command_observation final {
         return {storage_outcome_for(opened.error())};
     }
     auto file = std::move(*opened);
+    // A failed write, truncate or flush is the file's first failure, and its
+    // close repeats it; any other close failure is the harness's.
+    std::optional<runtime::operation_error> mutation_failure;
+    const auto mutated = [&mutation_failure](const auto& result) {
+        if (!result) mutation_failure = result.error();
+        return storage_outcome_for(result);
+    };
     return with_cleanup(
       [&] {
           storage_outcome outcome = storage_outcome::success;
@@ -1044,13 +1051,13 @@ struct file_command_observation final {
                 file.write(
                   runtime::file_position{command.position},
                   fuzz_file_payload(command.length, command.value)));
-              outcome = storage_outcome_for(written);
+              outcome = mutated(written);
               value_matches = !written || written->value() == command.length;
           } else if (command.kind == storage_command_kind::truncate) {
-              outcome = storage_outcome_for(
+              outcome = mutated(
                 wait_for(events, file.truncate(command.length)));
           } else if (command.kind == storage_command_kind::flush) {
-              outcome = storage_outcome_for(wait_for(events, file.flush()));
+              outcome = mutated(wait_for(events, file.flush()));
           } else {
               auto read = wait_for(
                 events,
@@ -1087,7 +1094,9 @@ struct file_command_observation final {
       },
       [&] {
           const auto closed = wait_for(events, file.close());
-          if (!closed) {
+          if (
+            !closed && !events.trace_failed()
+            && closed.error() != mutation_failure) {
               throw std::system_error(make_error_code(closed.error().code()));
           }
       });
@@ -1271,8 +1280,10 @@ struct file_command_observation final {
           return matches;
       },
       [&] {
+          // Reads leave the file as it was. Once a replay diverged, its
+          // divergence is the case's answer, not the close's failure.
           const auto closed = wait_for(context.event_scheduler(), file.close());
-          if (!closed) {
+          if (!closed && !context.event_scheduler().trace_failed()) {
               throw std::system_error(make_error_code(closed.error().code()));
           }
       });
@@ -1452,6 +1463,11 @@ file_history_model_rules(std::uint8_t profile) {
       writes;
     std::array<std::optional<seastar::future<runtime::result<void>>>, 2>
       resizes;
+    // Each handle's first failed write or truncate, which its close repeats.
+    std::array<std::optional<runtime::operation_error>, 2> fenced;
+    const auto fence = [&fenced](std::uint8_t slot, const auto& result) {
+        if (!result && !fenced[slot]) fenced[slot] = result.error();
+    };
     const auto result = with_cleanup(
       [&] {
           for (std::uint8_t slot = 0; slot < 2; ++slot) {
@@ -1574,14 +1590,16 @@ file_history_model_rules(std::uint8_t profile) {
               if (resizes[slot]) {
                   auto pending = std::move(*resizes[slot]);
                   resizes[slot].reset();
-                  observed = storage_outcome_for(
-                    wait_for(events, std::move(pending)));
+                  const auto resized = wait_for(events, std::move(pending));
+                  fence(slot, resized);
+                  observed = storage_outcome_for(resized);
               } else {
                   auto pending = std::move(*writes[slot]);
                   writes[slot].reset();
                   const auto written = profile == 12 && order == 0
                                          ? std::move(pending).get()
                                          : wait_for(events, std::move(pending));
+                  fence(slot, written);
                   if (profile == 6) {
                       if (written || written.error().code() != errc::aborted) {
                           return mismatch(runtime::operation_kind::file);
@@ -1679,15 +1697,14 @@ file_history_model_rules(std::uint8_t profile) {
               }
           }
           for (std::size_t slot = 0; slot < handles.size(); ++slot) {
+              const auto index = static_cast<std::uint8_t>(slot);
               try {
                   if (writes[slot]) {
-                      static_cast<void>(
-                        wait_for(events, std::move(*writes[slot])));
+                      fence(index, wait_for(events, std::move(*writes[slot])));
                       writes[slot].reset();
                   }
                   if (resizes[slot]) {
-                      static_cast<void>(
-                        wait_for(events, std::move(*resizes[slot])));
+                      fence(index, wait_for(events, std::move(*resizes[slot])));
                       resizes[slot].reset();
                   }
               } catch (...) {
@@ -1695,8 +1712,12 @@ file_history_model_rules(std::uint8_t profile) {
               }
               if (handles[slot]) {
                   try {
+                      // A close may repeat the handle's first failure. Once
+                      // a replay diverged, the divergence is the answer.
                       auto closed = wait_for(events, handles[slot]->close());
-                      if (!closed) {
+                      if (
+                        !closed && !events.trace_failed()
+                        && closed.error() != fenced[slot]) {
                           throw std::system_error(
                             make_error_code(closed.error().code()));
                       }

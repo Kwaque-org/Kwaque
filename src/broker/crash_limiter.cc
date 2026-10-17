@@ -2,6 +2,7 @@
 
 #include "src/base/logging.h"
 #include "src/base/units.h"
+#include "src/broker/directory_sync.h"
 
 #include <seastar/core/coroutine.hh>
 #include <seastar/core/file.hh>
@@ -16,6 +17,7 @@
 #include <charconv>
 #include <chrono>
 #include <cstddef>
+#include <exception>
 #include <fcntl.h>
 #include <limits>
 #include <string_view>
@@ -296,38 +298,44 @@ seastar::future<> crash_limiter::start(
           "crash limiter requires a configuration checksum");
     }
     bool created = false;
-    co_await seastar::with_file(
-      open_tracker(path_, created),
-      [this, &configuration, &abort, &created, limit](
-        this auto, seastar::file& file) -> seastar::future<> {
-          const auto previous = co_await read_metadata(file, abort, created);
-          const auto now = clock_();
-          if (now < 0) {
-              throw std::runtime_error(
-                "crash limiter clock precedes the epoch");
-          }
-          const auto count = detail::next_crash_count(
-            previous, configuration, now, limit);
-          if (!count) {
-              throw crash_loop_limit_reached{};
-          }
-          abort.check();
-          co_await write_metadata(
-            file,
-            {
-              .crash_count = *count,
-              .configuration_checksum = configuration.checksum,
-              .last_start_milliseconds = now,
-            });
-      });
-    co_await seastar::sync_directory(directory_.native());
+    auto file = co_await open_tracker(path_, created);
+    std::exception_ptr failure;
+    try {
+        const auto previous = co_await read_metadata(file, abort, created);
+        const auto now = clock_();
+        if (now < 0) {
+            throw std::runtime_error("crash limiter clock precedes the epoch");
+        }
+        const auto count = detail::next_crash_count(
+          previous, configuration, now, limit);
+        if (!count) {
+            throw crash_loop_limit_reached{};
+        }
+        abort.check();
+        co_await write_metadata(
+          file,
+          {
+            .crash_count = *count,
+            .configuration_checksum = configuration.checksum,
+            .last_start_milliseconds = now,
+          });
+    } catch (...) {
+        failure = std::current_exception();
+    }
+    try {
+        co_await file.close_checked();
+    } catch (...) {
+        if (!failure) failure = std::current_exception();
+    }
+    if (failure) std::rethrow_exception(failure);
+    co_await sync_directory_checked(directory_.native());
     recorded_ = true;
     abort.check();
 }
 
 seastar::future<>
 crash_limiter::sync_directory(const std::filesystem::path& directory) {
-    return seastar::sync_directory(directory.native());
+    return sync_directory_checked(directory.native());
 }
 
 seastar::future<> crash_limiter::record_clean_shutdown() {

@@ -96,18 +96,12 @@ operation_error file_error_from_exception(std::exception_ptr exception) {
     }
 }
 
-seastar::file
-require_open_file(seastar::file&& native_file, file_close_policy policy) {
+seastar::file require_open_file(seastar::file&& native_file) {
     if (!native_file) {
         throw std::invalid_argument("file requires an open native handle");
     }
-    if (
-      policy != file_close_policy::legacy
-      && policy != file_close_policy::checked)
-        throw std::invalid_argument("invalid file close policy");
-    if (
-      policy == file_close_policy::checked
-      && !native_file.supports_checked_close())
+    // Refused before the handle is consumed; the caller still owns it.
+    if (!native_file.supports_checked_close())
         throw detail::file_operation_exception{file_error(errc::unavailable)};
     return std::move(native_file);
 }
@@ -853,9 +847,7 @@ result<void> file_open_options::validate() const noexcept {
       || (exclusive && !create)
       || (truncate && access == file_access::read_only)
       || (synchronous && access == file_access::read_only)
-      || permissions > 0777U
-      || static_cast<std::uint8_t>(close_policy)
-           > static_cast<std::uint8_t>(file_close_policy::checked)) {
+      || permissions > 0777U) {
         return failure(file_error(errc::invalid_argument));
     }
     return {};
@@ -903,13 +895,12 @@ file::file(
   seastar::file&& native_file,
   file_io_limits limits,
   operation_statistics_owner statistics,
-  file_close_policy close_policy,
   file_flight_ptr flight)
   : statistics_owner_(std::move(statistics))
   , statistics_(&statistics_owner_.get())
   , flight_(std::move(flight))
   , limits_(validated_file_io_limits(limits))
-  , native_file_(require_open_file(std::move(native_file), close_policy))
+  , native_file_(require_open_file(std::move(native_file)))
   , read_operation_units_(limits_.pending_reads)
   , read_byte_units_(limits_.pending_read_bytes.value())
   , metadata_operation_units_(limits_.pending_metadata_operations)
@@ -926,8 +917,7 @@ file::file(
         native_file_.disk_write_max_length(),
         maximum_contiguous_allocation_bytes))
   , append_chunk_limit_(
-      round_down(native_write_max_length_, disk_write_dma_alignment_))
-  , close_policy_(close_policy) {
+      round_down(native_write_max_length_, disk_write_dma_alignment_)) {
     KWAQUE_INVARIANT(
       file_alignment_invariant,
       std::has_single_bit(native_file_.memory_dma_alignment())
@@ -996,9 +986,7 @@ file::file(file&& other) noexcept
   , disk_overwrite_dma_alignment_(other.disk_overwrite_dma_alignment_)
   , native_write_max_length_(other.native_write_max_length_)
   , append_chunk_limit_(other.append_chunk_limit_)
-  , close_done_(std::move(other.close_done_))
   , first_failure_(other.first_failure_)
-  , close_policy_(other.close_policy_)
   , state_(other.state_)
   , abort_requested_(other.abort_requested_) {
     other.state_ = file_state::closed;
@@ -1159,25 +1147,13 @@ seastar::future<result<void>> file::flush(metadata_reservation& reservation) {
 }
 
 operation_error file::remember_error(operation_error error) {
-    const auto detail = file_detail(error);
-    bool qualified = false;
-    for (std::size_t index = 0; index < error.context_size(); ++index)
-        qualified |= error.context_at(index)->key
-                     == operation_context_key::detail;
-    if (
-      qualified && detail
-      && *detail != file_failure_detail::admission_not_dispatched
-      && error.code() != errc::aborted && !first_failure_.failed())
-        first_failure_.observe(error);
-    if (
-      close_policy_ == file_close_policy::checked
-      && (!detail || *detail != file_failure_detail::admission_not_dispatched)) {
-        first_failure_.observe(error);
-        if (first_failure_.exception())
-            std::rethrow_exception(first_failure_.exception());
-        return *first_failure_.error();
-    }
-    return first_failure_.error().value_or(error);
+    // A refusal that dispatched nothing leaves the file as it was.
+    if (file_detail(error) == file_failure_detail::admission_not_dispatched)
+        return first_failure_.error().value_or(error);
+    first_failure_.observe(error);
+    if (first_failure_.exception())
+        std::rethrow_exception(first_failure_.exception());
+    return *first_failure_.error();
 }
 
 operation_error file::remember_io_failure(
@@ -1204,8 +1180,7 @@ operation_error file::remember_io_failure(
         }
         return remember_error(std::move(error));
     } catch (...) {
-        if (close_policy_ == file_close_policy::checked)
-            first_failure_.observe(exception);
+        first_failure_.observe(exception);
         throw;
     }
 }
@@ -1367,10 +1342,8 @@ file::write_validated(file_position position, bytes::fragmented_buffer&& data) {
         auto serialization = seastar::try_get_units(
           write_serialization_, units);
         if (serialization && single_request) {
-            seastar::gate::holder holder;
-            if (close_policy_ == file_close_policy::checked) {
-                holder = seastar::gate::holder{operations_};
-            }
+            // Held through short-write recovery, so close drains it.
+            seastar::gate::holder holder{operations_};
             auto metric = admit();
             seastar::temporary_buffer<char> fragment;
             if (has_one_fragment && aligned_front) {
@@ -1635,62 +1608,27 @@ seastar::future<result<void>> file::close() {
     if (moved_from_) {
         return seastar::make_ready_future<result<void>>(result<void>{});
     }
-    if (close_policy_ == file_close_policy::checked) {
-        if (state_ == file_state::closing)
-            return seastar::make_ready_future<result<void>>(
-              failure(make_file_error(
-                errc::queue_full,
-                file_failure_detail::admission_not_dispatched)));
-        if (state_ == file_state::closed) {
-            if (first_failure_.exception())
-                return seastar::make_exception_future<result<void>>(
-                  first_failure_.exception());
-            return seastar::make_ready_future<result<void>>(
-              first_failure_.outcome());
-        }
-        return close_checked_once();
-    }
-    if (state_ == file_state::closing) {
-        return close_done_->get_shared_future();
-    }
+    if (state_ == file_state::closing)
+        return seastar::make_ready_future<result<void>>(failure(make_file_error(
+          errc::queue_full, file_failure_detail::admission_not_dispatched)));
     if (state_ == file_state::closed) {
-        return close_done_ && close_done_->available()
-                 ? close_done_->get_shared_future()
-                 : seastar::make_ready_future<result<void>>(result<void>{});
+        if (first_failure_.exception())
+            return seastar::make_exception_future<result<void>>(
+              first_failure_.exception());
+        return seastar::make_ready_future<result<void>>(
+          first_failure_.outcome());
     }
-
-    try {
-        close_done_.emplace();
-    } catch (...) {
-        return seastar::current_exception_as_future<result<void>>();
-    }
-    state_ = file_state::closing;
-    abort_requested_ = true;
-    io_intent_.cancel();
-    auto metric = admit();
-    auto completion = close_once().then_wrapped(
-      [this, metric = std::move(metric)](
-        seastar::future<result<void>> closed) mutable {
-          static_cast<void>(metric);
-          state_ = file_state::closed;
-          try {
-              close_done_->set_value(closed.get());
-          } catch (...) {
-              close_done_->set_exception(std::current_exception());
-          }
-      });
-    static_cast<void>(completion);
-    return close_done_->get_shared_future();
+    return close_once();
 }
 
-seastar::future<result<void>> file::close_checked_once() {
+seastar::future<result<void>> file::close_once() {
     // The coroutine frame is obtained before admission changes. No shared
     // promise or unbounded close-waiter list is created during shutdown.
     state_ = file_state::closing;
     [[maybe_unused]] auto metric = admit();
     co_await operations_.close();
-    // Checked direct writes retain the gate through short-write recovery too.
-    // Draining it leaves the serializer free without allocating a close waiter.
+    // Direct writes retain the gate through short-write recovery too. Draining
+    // it leaves the serializer free without allocating a close waiter.
     auto serialization = seastar::try_get_units(
       write_serialization_, write_slots_);
     KWAQUE_INVARIANT(
@@ -1711,22 +1649,6 @@ seastar::future<result<void>> file::close_checked_once() {
     }
     state_ = file_state::closed;
     co_return first_failure_.outcome();
-}
-
-seastar::future<result<void>> file::close_once() {
-    co_await operations_.close();
-    try {
-        auto serialization
-          = co_await seastar::coroutine::without_preemption_check(
-            seastar::get_units(write_serialization_, write_slots_));
-        static_cast<void>(serialization);
-        co_await native_file_.close();
-        co_return result<void>{};
-    } catch (const std::bad_alloc&) {
-        throw;
-    } catch (...) {
-        co_return failure(file_error_from_exception(std::current_exception()));
-    }
 }
 
 file_state file::state() const {

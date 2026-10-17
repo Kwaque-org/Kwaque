@@ -80,12 +80,20 @@ kwaque_cc_library(
     srcs = ["crash_limiter.cc"],
     hdrs = ["crash_limiter.h"],
     deps = [
+        ":directory_sync",
         ":startup_policy",
         "//src/base",
         "//src/base:logging",
         "@crc32c",
         "@seastar",
     ],
+)
+
+kwaque_cc_library(
+    name = "directory_sync",
+    srcs = ["directory_sync.cc"],
+    hdrs = ["directory_sync.h"],
+    deps = ["@seastar"],
 )
 
 kwaque_cc_library(
@@ -105,6 +113,7 @@ kwaque_cc_library(
     hdrs = ["crash_recorder.h"],
     deps = [
         ":crash_recorder_writer",
+        ":directory_sync",
         "//src/base",
         "//src/base:build_info",
         "@seastar",
@@ -133,7 +142,10 @@ kwaque_cc_library(
     name = "data_directory",
     srcs = ["data_directory.cc"],
     hdrs = ["data_directory.h"],
-    deps = ["@seastar"],
+    deps = [
+        ":directory_sync",
+        "@seastar",
+    ],
 )
 
 kwaque_cc_library(
@@ -485,6 +497,7 @@ kwaque_cc_seastar_test(
     tags = ["stress"],
     deps = [
         ":crash_limiter",
+        ":directory_sync",
         ":startup_policy",
         "//src/base",
         "@crc32c",
@@ -507,6 +520,7 @@ kwaque_cc_seastar_test(
     deps = [
         ":crash_recorder",
         ":crash_recorder_writer",
+        ":directory_sync",
         "//src/base",
         "@crc32c",
     ],

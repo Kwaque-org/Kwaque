@@ -53,8 +53,7 @@ seastar::future<local_publication_outcome> confirm_local_metadata(
                 output.failure.observe(directory);
                 break;
             }
-            auto opened = co_await files.open_directory(
-              *directory, runtime::file_close_policy::checked);
+            auto opened = co_await files.open_directory(*directory);
             if (!opened) {
                 output.failure.observe(opened);
                 break;
@@ -62,9 +61,7 @@ seastar::future<local_publication_outcome> confirm_local_metadata(
             parent.emplace(std::move(*opened));
             output.stage = local_publication_stage::parent_open;
             auto opened_file = co_await files.open(
-              path,
-              {.access = runtime::file_access::read_write,
-               .close_policy = runtime::file_close_policy::checked});
+              path, {.access = runtime::file_access::read_write});
             if (!opened_file) {
                 output.failure.observe(opened_file);
                 break;
@@ -140,8 +137,7 @@ seastar::future<runtime::result<void>> ensure_local_directory(
     if (!checked) co_return checked;
     auto path = local_child_path(parent, name);
     if (!path) co_return runtime::failure(path.error());
-    auto opened = co_await files.open_directory(
-      parent, runtime::file_close_policy::checked);
+    auto opened = co_await files.open_directory(parent);
     if (!opened) co_return runtime::failure(opened.error());
     auto directory = std::move(*opened);
     runtime::first_failure failed;

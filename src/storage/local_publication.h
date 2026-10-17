@@ -186,8 +186,7 @@ public:
           runtime::file_kind::directory,
           admission);
         if (!inspected) co_return inspected;
-        auto parent = co_await files_.open_directory(
-          target_.parent, runtime::file_close_policy::checked);
+        auto parent = co_await files_.open_directory(target_.parent);
         if (!parent) co_return runtime::failure(parent.error());
         prepared_parent_.emplace(std::move(*parent));
         prepared_.emplace(std::move(*held));
@@ -512,7 +511,7 @@ private:
                 }
                 if (!prepared_parent_) {
                     auto directory = co_await files_.open_directory(
-                      target_.parent, runtime::file_close_policy::checked);
+                      target_.parent);
                     if (!directory) {
                         output.failure.observe(directory);
                         break;
@@ -555,8 +554,7 @@ private:
                       *temp_path,
                       {.access = runtime::file_access::read_write,
                        .create = true,
-                       .exclusive = true,
-                       .close_policy = runtime::file_close_policy::checked});
+                       .exclusive = true});
                     if (!opened) {
                         if (opened.error().code() == errc::already_exists) {
                             output.temporary_may_exist = false;

@@ -65,7 +65,7 @@ seastar::future<wal_reclaim_outcome> reclaim_wal_prefix(
                 break;
             }
         } catch (...) {
-            output.failed = detail::path_error(errc::io_failure);
+            output.failed = detail::recognized_or_rethrown();
             break;
         }
         holder.wal_released();
@@ -133,8 +133,7 @@ seastar::future<runtime::result<wal_reopen_outcome>> remove_wal_below(
                 failed.observe(inspected);
                 break;
             }
-            auto opened = co_await files.open_directory(
-              *root, runtime::file_close_policy::checked);
+            auto opened = co_await files.open_directory(*root);
             if (!opened) {
                 failed.observe(opened);
                 break;
@@ -167,8 +166,7 @@ seastar::future<runtime::result<wal_reopen_outcome>> remove_wal_below(
                         failed.observe(parent);
                         break;
                     }
-                    opened = co_await files.open_directory(
-                      *parent, runtime::file_close_policy::checked);
+                    opened = co_await files.open_directory(*parent);
                     if (!opened) {
                         failed.observe(opened);
                         break;
@@ -289,8 +287,7 @@ seastar::future<runtime::result<bool>> holds_unallocated_wal(
                 failed.observe(inspected);
                 break;
             }
-            auto opened = co_await files.open_directory(
-              *root, runtime::file_close_policy::checked);
+            auto opened = co_await files.open_directory(*root);
             if (!opened) {
                 if (opened.error().code() != errc::not_found)
                     failed.observe(opened);
@@ -321,8 +318,7 @@ seastar::future<runtime::result<bool>> holds_unallocated_wal(
                         failed.observe(parent);
                         break;
                     }
-                    opened = co_await files.open_directory(
-                      *parent, runtime::file_close_policy::checked);
+                    opened = co_await files.open_directory(*parent);
                     if (!opened) {
                         failed.observe(opened);
                         break;

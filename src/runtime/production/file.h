@@ -20,9 +20,9 @@ namespace kwaque::runtime::production {
 
 // close() must be awaited before destruction. A move transfers stable state,
 // including a pending next; it does not move the generator's borrowed frame.
-// Close policy is fixed at open; checked close retains native failures.
-// Concurrent close returns queue_full; the first caller owns the drain. After
-// it settles, repeated close returns the cached outcome without another I/O.
+// Close answers the first failure, the native close's included. Concurrent
+// close returns queue_full; the first caller owns the drain. After it
+// settles, repeated close returns the cached outcome without another I/O.
 class directory_cursor final {
 public:
     directory_cursor(directory_cursor&&) noexcept;
@@ -86,8 +86,8 @@ public:
 
     [[nodiscard]] seastar::future<result<file>>
     open(file_path path, file_open_options options);
-    [[nodiscard]] seastar::future<result<directory_cursor>> open_directory(
-      file_path path, file_close_policy policy = file_close_policy::legacy);
+    [[nodiscard]] seastar::future<result<directory_cursor>>
+    open_directory(file_path path);
     [[nodiscard]] seastar::future<result<bool>> exists(file_path path);
     [[nodiscard]] seastar::future<result<file_status>> stat(file_path path);
     [[nodiscard]] seastar::future<result<file_system_space>>
@@ -103,8 +103,9 @@ public:
       file_path source,
       file_path destination,
       file_rename_policy policy = file_rename_policy::replace);
-    [[nodiscard]] seastar::future<result<void>> sync_directory(
-      file_path path, file_close_policy policy = file_close_policy::legacy);
+    // Opens the directory, flushes it and closes it, after a failed flush
+    // too: the first failure of the three.
+    [[nodiscard]] seastar::future<result<void>> sync_directory(file_path path);
     // See verified_directory_memo. Removing or renaming a path forgets it and
     // everything below it first.
     [[nodiscard]] bool

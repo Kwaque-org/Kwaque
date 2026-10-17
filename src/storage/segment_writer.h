@@ -6,6 +6,7 @@
 #include "src/storage/completion_resources.h"
 #include "src/storage/extent_verifier.h"
 #include "src/storage/local_generation.h"
+#include "src/storage/local_paths.h"
 #include "src/storage/local_publication.h"
 #include "src/storage/segment_data.h"
 #include "src/storage/segment_group.h"
@@ -1865,18 +1866,14 @@ public:
                 if (opened) {
                     auto file = co_await files_.open(
                       path(local_segment_file::data),
-                      {.access = runtime::file_access::read_only,
-                       .close_policy = runtime::file_close_policy::checked});
+                      {.access = runtime::file_access::read_only});
                     if (file)
                         made->file.emplace(std::move(*file));
                     else
                         opened = runtime::failure(file.error());
                 }
-            } catch (const std::bad_alloc&) {
-                opened = runtime::failure(
-                  detail::path_error(errc::resource_exhausted));
             } catch (...) {
-                opened = runtime::failure(detail::path_error(errc::io_failure));
+                opened = runtime::failure(detail::recognized_or_rethrown());
             }
             if (!opened) co_return output{runtime::failure(opened.error())};
             // Kept even when the segment moved on meanwhile: its close
@@ -3286,9 +3283,11 @@ private:
                         // exact bytes, unless the owner is closing.
                         if (
                           observer_->wanted != nullptr && *observer_->wanted
-                          && !front->digest.empty())
+                          && !front->digest.empty() && front->working)
                             observer_->fed(
-                              front->extent().begin(), front->digest);
+                              front->extent().begin(),
+                              front->digest,
+                              *front->working);
                     }
                 }
                 if (!digest) release_pending(*front);
@@ -3780,7 +3779,7 @@ private:
             co_return co_await pointer_publisher_->prepare(
               config_.metadata.operation_bytes, work);
         } catch (...) {
-            co_return runtime::failure(detail::path_error(errc::io_failure));
+            co_return runtime::failure(detail::recognized_or_rethrown());
         }
     }
     seastar::future<local_publication_outcome> publish_new(
@@ -3834,8 +3833,7 @@ private:
         auto opened = co_await files_.open(
           path(local_segment_file::data),
           {.access = writable ? runtime::file_access::read_write
-                              : runtime::file_access::read_only,
-           .close_policy = runtime::file_close_policy::checked});
+                              : runtime::file_access::read_only});
         if (!opened) co_return runtime::failure(opened.error());
         data_.emplace(std::move(*opened));
         handle_ = segment_handle_state::open;
@@ -4134,9 +4132,7 @@ private:
         if (!synced) co_return synced;
         auto opened = co_await files_.open(
           path(local_segment_file::data),
-          {.access = runtime::file_access::read_write,
-           .close_policy = runtime::file_close_policy::checked,
-           .synchronous = true});
+          {.access = runtime::file_access::read_write, .synchronous = true});
         if (!opened) co_return runtime::failure(opened.error());
         sync_.emplace(std::move(*opened));
         if (auto limited = sync_->limit_write_allocation(cap); !limited)

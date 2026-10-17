@@ -33,10 +33,9 @@ cover the generators used by proto3 and edition 2023 schemas;
 edition 2024 `VIEW` strings, whose generator paths are not patched. A Protobuf
 update must rebase both patches and keep their parser and accessor tests.
 
-The xxHash module carries two build patches. The first caps its x86-64
-run-time kernel selection at AVX2: 512-bit kernels can lower the clock of the
-whole core, which a shard-per-core runtime shares. The second exports the
-license file for the distribution. Neither changes any digest; the published
+The xxHash module carries one build patch. It caps the x86-64 run-time kernel
+selection at AVX2: 512-bit kernels can lower the clock of the whole core,
+which a shard-per-core runtime shares. It changes no digest; the published
 vectors in `//src/codec/tests:xxh3_test` fix the output.
 
 The Seastar archive at this baseline has SHA-256
@@ -90,6 +89,25 @@ Cleanup also excludes concurrent scheduling-specific key registration using the
 native key mutex; local construction rollback already holds that mutex.
 Dependency updates must retain the throwing-constructor rollback tests and prove
 equivalent cleanup before removing this patch.
+
+A file-close patch adds a checked close to the native file interface. The
+ordinary close still logs its errors and completes; the checked close returns
+the first error of the drain, truncate, submission or `close` call. Either way
+the descriptor is closed exactly once, also when the close cannot be
+submitted, and the file factory closes a descriptor it was given when
+construction fails. Kwaque closes every file it opens with the checked close:
+its file layer refuses a native file without one, and the broker's own files
+close checked too. Dependency updates must keep
+`//src/runtime/tests:native_checked_close_test` passing before removing this
+patch.
+
+A file-removal patch adds `unlink_file` and `remove_directory`, which call
+`unlink` and `rmdir`, so removing a path of the other kind fails instead of
+removing whatever is there.
+
+The Boost rules carry a patch that adds a header-only `@boost//:uuid_value`
+target: the UUID value type without the generator and serialization link
+dependencies of `@boost//:uuid`.
 
 A separate Seastar patch makes its custom `chunked_vector` compatible with
 those failure guarantees: a new fragment is fully allocated before it is

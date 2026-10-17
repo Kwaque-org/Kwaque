@@ -52,8 +52,7 @@ run_file_system_contract(Backend& files, file_path root, Driver drive) {
                 path,
                 {.access = file_access::read_write,
                  .create = true,
-                 .exclusive = true,
-                 .close_policy = file_close_policy::checked})));
+                 .exclusive = true})));
             opened.emplace(std::move(acquired));
             auto geometry = take(opened->geometry());
             require(
@@ -93,9 +92,7 @@ run_file_system_contract(Backend& files, file_path root, Driver drive) {
         require(
           !take(co_await drive(files.exists(renamed_path))),
           "rename retained its source");
-        take(
-          co_await drive(
-            files.sync_directory(root, file_close_policy::checked)));
+        take(co_await drive(files.sync_directory(root)));
         auto sample = take(co_await drive(files.space(root)));
         require(
           sample.available() <= sample.free()
@@ -111,9 +108,7 @@ run_file_system_contract(Backend& files, file_path root, Driver drive) {
         require(
           !regular && regular.error().code() == errc::not_a_directory,
           "regular file accepted as directory");
-        cursor.emplace(take(
-          co_await drive(
-            files.open_directory(root, file_close_policy::checked))));
+        cursor.emplace(take(co_await drive(files.open_directory(root))));
         // Move transfers ownership; a moved-from cursor cannot admit work.
         auto moved = std::move(*cursor);
         auto rejected_operation = cursor->next({});

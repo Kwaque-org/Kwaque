@@ -402,11 +402,22 @@ public:
             auto attempt = co_await seastar::coroutine::as_future(
               seastar::futurize_invoke(
                 [this, &held, reference] { return open(held, reference); }));
-            if (attempt.failed())
-                opened = runtime::failure(
-                  detail::thrown_index_error(attempt.get_exception()));
-            else
+            if (attempt.failed()) {
+                auto thrown = attempt.get_exception();
+                const auto code = detail::recognized(thrown);
+                if (!code) {
+                    // An exception of no expected family is no fault of the
+                    // root: everyone waiting for this open is given it as
+                    // it is, and nothing is counted against the root.
+                    auto waiting = std::move(*opening_);
+                    opening_.reset();
+                    waiting.set_exception(thrown);
+                    std::rethrow_exception(std::move(thrown));
+                }
+                opened = runtime::failure(*code);
+            } else {
                 opened = std::move(attempt).get();
+            }
             // Nothing suspends from here until this caller holds its pin: a
             // root just opened is read through before it can be taken.
             runtime::result<void> outcome{};

@@ -20,6 +20,7 @@
 #include <seastar/core/abort_source.hh>
 #include <seastar/core/future.hh>
 #include <seastar/util/later.hh>
+#include <seastar/util/noncopyable_function.hh>
 
 #include <array>
 #include <cstdint>
@@ -499,11 +500,16 @@ struct sealed_world final {
     [[nodiscard]] runtime::file_position bound() const {
         return pin->data_end().value();
     }
-    [[nodiscard]] std::unique_ptr<segment_runs>
-    runs(workload_budget& resources) const {
+    [[nodiscard]] std::unique_ptr<segment_runs> runs(
+      workload_budget& resources,
+      seastar::noncopyable_function<
+        void(const runtime::operation_error&) noexcept> failed = {}) const {
         return take(
           segment_runs::make(
-            *cache, resources, segment.history(), {.limits = run_limits()}));
+            *cache,
+            resources,
+            segment.history(),
+            {.limits = run_limits(), .failed = std::move(failed)}));
     }
     // A session that may see up to `visible`.
     [[nodiscard]] segment_reader session(
@@ -3039,7 +3045,12 @@ seastar::future<> damaged_runs(
                 break;
             }
             co_await store_contract::write_bytes(files, path, damaged, drive);
-            runs = w.runs(resources);
+            std::vector<errc> told;
+            told.reserve(2);
+            runs = w.runs(
+              resources, [&told](const runtime::operation_error& why) noexcept {
+                  told.push_back(why.code());
+              });
             {
                 auto reader = w.session(
                   *runs, resources, last, {.read_ahead = 0});
@@ -3072,6 +3083,14 @@ seastar::future<> damaged_runs(
                     && !runs->holds(offset(w.base(3))) && !w.index->owed(),
                   "a damaged run was handed out or kept, or the read that "
                   "met it did not say where and why it stopped");
+                // Damage is told once, however often it is met; a file cut
+                // short is not damage of what it holds.
+                require(
+                  what == damage::cut_short
+                    ? told.empty()
+                    : told.size() == 1 && told[0] == code,
+                  "damage of committed data was not told once, or a short "
+                  "file was told as damage");
             }
             take(co_await drive.lifecycle(runs->close()));
             runs.reset();

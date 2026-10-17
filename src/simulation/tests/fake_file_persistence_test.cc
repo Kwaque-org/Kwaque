@@ -458,8 +458,10 @@ SEASTAR_TEST_CASE(typed_write_failures_report_no_partial_and_complete_effects) {
         const auto failed = co_await test.drive(
           owner.write(runtime::file_position{}, payload('b')));
         const auto reflush = co_await test.drive(owner.flush());
-        checked(co_await test.drive(owner.close()));
+        const auto closed = co_await test.drive(owner.close());
         BOOST_REQUIRE(!failed.has_value());
+        BOOST_REQUIRE(!closed.has_value());
+        BOOST_CHECK(closed.error() == failed.error());
         BOOST_CHECK(failed.error().code() == errc::resource_exhausted);
         BOOST_CHECK(
           checked(runtime::file_detail(failed.error()))
@@ -502,10 +504,12 @@ SEASTAR_TEST_CASE(
         const auto attempts = fake_file_test_access::submitted(
           *test.files, fake_submission_kind::flush);
         const auto repeated = co_await test.drive(owner.flush());
-        checked(co_await test.drive(owner.close()));
+        const auto closed = co_await test.drive(owner.close());
         BOOST_REQUIRE(!failed.has_value());
         BOOST_REQUIRE(!repeated.has_value());
         BOOST_CHECK(repeated.error() == failed.error());
+        BOOST_REQUIRE(!closed.has_value());
+        BOOST_CHECK(closed.error() == failed.error());
         BOOST_CHECK_EQUAL(
           fake_file_test_access::submitted(
             *test.files, fake_submission_kind::flush),
@@ -520,7 +524,7 @@ SEASTAR_TEST_CASE(
 }
 
 SEASTAR_TEST_CASE(
-  typed_native_transport_preserves_every_cause_and_legacy_unknown) {
+  typed_native_transport_preserves_every_cause_and_a_broad_failure) {
     for (const auto cause :
          {file_failure_detail::unknown,
           file_failure_detail::no_space,
@@ -540,8 +544,10 @@ SEASTAR_TEST_CASE(
         auto owner = checked(
           co_await test.drive(test.files->open(test.public_path("file"), {})));
         const auto failed = co_await test.drive(owner.flush());
-        checked(co_await test.drive(owner.close()));
+        const auto closed = co_await test.drive(owner.close());
         BOOST_REQUIRE(!failed.has_value());
+        BOOST_REQUIRE(!closed.has_value());
+        BOOST_CHECK(closed.error() == failed.error());
         BOOST_CHECK(checked(runtime::file_detail(failed.error())) == cause);
         BOOST_CHECK(failed.error().code() == runtime::file_failure_code(cause));
         BOOST_REQUIRE_EQUAL(failed.error().context_size(), 4U);
@@ -555,23 +561,33 @@ SEASTAR_TEST_CASE(
         BOOST_CHECK_EQUAL(failed.error().context_at(2)->value, 2U);
         BOOST_CHECK_EQUAL(failed.error().context_at(3)->value, 2U);
     }
+    // A failure without a cause is still a failed flush: it fences the file
+    // as a typed one does, so a retry cannot report the data durable.
     seastar::chunked_vector<fault_rule> rules;
     rules.push_back(
       rule(builtin_fault_point::file_flush, fault_decision::make_error()));
-    fixture legacy{config(), std::move(rules)};
-    stable_file(legacy, "file", 'a');
+    fixture broad{config(), std::move(rules)};
+    stable_file(broad, "file", 'a');
     auto owner = checked(
-      co_await legacy.drive(
-        legacy.files->open(legacy.public_path("file"), {})));
-    auto failed = co_await legacy.drive(owner.flush());
-    auto retried = co_await legacy.drive(owner.flush());
-    checked(co_await legacy.drive(owner.close()));
+      co_await broad.drive(broad.files->open(broad.public_path("file"), {})));
+    const auto flushes = fake_file_test_access::submitted(
+      *broad.files, fake_submission_kind::flush);
+    auto failed = co_await broad.drive(owner.flush());
+    auto retried = co_await broad.drive(owner.flush());
+    const auto closed = co_await broad.drive(owner.close());
     BOOST_REQUIRE(!failed.has_value());
     BOOST_CHECK(failed.error().code() == errc::io_failure);
     BOOST_CHECK(
       checked(runtime::file_detail(failed.error()))
       == file_failure_detail::unknown);
-    BOOST_REQUIRE(retried.has_value());
+    BOOST_REQUIRE(!retried.has_value());
+    BOOST_CHECK(retried.error() == failed.error());
+    BOOST_CHECK_EQUAL(
+      fake_file_test_access::submitted(
+        *broad.files, fake_submission_kind::flush),
+      flushes + 1U);
+    BOOST_REQUIRE(!closed.has_value());
+    BOOST_CHECK(closed.error() == failed.error());
 }
 
 SEASTAR_TEST_CASE(
@@ -773,8 +789,10 @@ SEASTAR_TEST_CASE(
         {.access = runtime::file_access::read_write})));
     auto failed = co_await test.drive(owner.truncate(1024));
     const auto size = co_await test.drive(owner.size());
-    checked(co_await test.drive(owner.close()));
+    const auto closed = co_await test.drive(owner.close());
     BOOST_REQUIRE(!failed.has_value());
+    BOOST_REQUIRE(!closed.has_value());
+    BOOST_CHECK(closed.error() == failed.error());
     BOOST_CHECK(
       checked(runtime::file_detail(failed.error()))
       == file_failure_detail::device_io);
@@ -810,7 +828,7 @@ SEASTAR_TEST_CASE(
         {.access = runtime::file_access::read_write})));
     auto rejected = co_await test.drive(
       first.write(runtime::file_position{}, payload('b')));
-    checked(co_await test.drive(first.close()));
+    const auto first_closed = co_await test.drive(first.close());
     auto second = checked(
       co_await test.drive(test.files->open(
         test.public_path("file"),
@@ -819,6 +837,8 @@ SEASTAR_TEST_CASE(
       second.write(runtime::file_position{4096}, payload('c')));
     checked(co_await test.drive(second.close()));
     BOOST_REQUIRE(!rejected.has_value());
+    BOOST_REQUIRE(!first_closed.has_value());
+    BOOST_CHECK(first_closed.error() == rejected.error());
     BOOST_REQUIRE(written.has_value());
     BOOST_CHECK_EQUAL(test.read("file"), std::string(4096, 'a'));
     BOOST_CHECK_EQUAL(test.read("file", 4096), std::string(4096, 'c'));
@@ -1091,56 +1111,41 @@ SEASTAR_TEST_CASE(
     BOOST_CHECK(test.names() == std::set<std::string>{"a"});
 }
 
-SEASTAR_TEST_CASE(
-  checked_fake_close_retains_cause_and_releases_failed_handles) {
-    for (const auto policy :
-         {runtime::file_close_policy::legacy,
-          runtime::file_close_policy::checked}) {
-        seastar::chunked_vector<fault_rule> rules;
-        rules.push_back(rule(
-          builtin_fault_point::file_close,
-          checked(
-            fault_decision::make_file_failure(
-              fault_action::file_failure_before_effect,
-              file_failure_detail::no_space))));
-        fixture test{config(), std::move(rules)};
-        stable_file(test, "file", 'a');
-        auto owner = checked(
-          co_await test.drive(test.files->open(
-            test.public_path("file"),
-            {.access = runtime::file_access::read_write,
-             .close_policy = policy})));
-        const auto first = co_await test.drive(owner.close());
-        const auto second = co_await owner.close();
-        const bool expects_error = policy
-                                   == runtime::file_close_policy::checked;
-        BOOST_CHECK_EQUAL(first.has_value(), !expects_error);
-        BOOST_CHECK_EQUAL(second.has_value(), !expects_error);
-        if (expects_error) {
-            BOOST_REQUIRE(!first.has_value());
-            BOOST_REQUIRE(!second.has_value());
-            BOOST_CHECK(first.error() == second.error());
-            BOOST_CHECK(
-              checked(runtime::file_detail(first.error()))
-              == file_failure_detail::no_space);
-        }
-        const auto state = checked(
-          fake_file_test_access::snapshot(*test.files));
-        BOOST_CHECK_EQUAL(state.open_handles, 0U);
-        BOOST_CHECK_EQUAL(test.files->pending_operations(), 0U);
-    }
+SEASTAR_TEST_CASE(fake_close_retains_cause_and_releases_failed_handles) {
+    seastar::chunked_vector<fault_rule> rules;
+    rules.push_back(rule(
+      builtin_fault_point::file_close,
+      checked(
+        fault_decision::make_file_failure(
+          fault_action::file_failure_before_effect,
+          file_failure_detail::no_space))));
+    fixture test{config(), std::move(rules)};
+    stable_file(test, "file", 'a');
+    auto owner = checked(
+      co_await test.drive(test.files->open(
+        test.public_path("file"),
+        {.access = runtime::file_access::read_write})));
+    const auto first = co_await test.drive(owner.close());
+    const auto second = co_await owner.close();
+    BOOST_REQUIRE(!first.has_value());
+    BOOST_REQUIRE(!second.has_value());
+    BOOST_CHECK(first.error() == second.error());
+    BOOST_CHECK(
+      checked(runtime::file_detail(first.error()))
+      == file_failure_detail::no_space);
+    const auto state = checked(fake_file_test_access::snapshot(*test.files));
+    BOOST_CHECK_EQUAL(state.open_handles, 0U);
+    BOOST_CHECK_EQUAL(test.files->pending_operations(), 0U);
 }
 
-SEASTAR_TEST_CASE(checked_fake_close_lost_notification_joins_backend_stop) {
+SEASTAR_TEST_CASE(fake_close_lost_notification_joins_backend_stop) {
     seastar::chunked_vector<fault_rule> rules;
     rules.push_back(rule(
       builtin_fault_point::file_close, fault_decision::make_drop_completion()));
     fixture test{config(), std::move(rules)};
     stable_file(test, "file", 'a');
     auto owner = checked(
-      co_await test.drive(test.files->open(
-        test.public_path("file"),
-        {.close_policy = runtime::file_close_policy::checked})));
+      co_await test.drive(test.files->open(test.public_path("file"), {})));
     auto closing = owner.close();
     auto parked = fake_file_test_access::wait_parked(
       *test.files, fake_submission_kind::close, 1);
@@ -1158,7 +1163,7 @@ SEASTAR_TEST_CASE(checked_fake_close_lost_notification_joins_backend_stop) {
     BOOST_CHECK_EQUAL(test.files->pending_operations(), 0U);
 }
 
-SEASTAR_TEST_CASE(checked_fake_directory_cleanup_preserves_its_close_failure) {
+SEASTAR_TEST_CASE(fake_directory_close_failure_is_its_cached_outcome) {
     seastar::chunked_vector<fault_rule> rules;
     rules.push_back(rule(
       builtin_fault_point::directory_cursor_close,
@@ -1167,13 +1172,72 @@ SEASTAR_TEST_CASE(checked_fake_directory_cleanup_preserves_its_close_failure) {
           fault_action::file_failure_before_effect,
           file_failure_detail::device_io))));
     fixture test{config(), std::move(rules)};
-    const auto result = co_await test.drive(test.files->sync_directory(
-      test.public_path(""), runtime::file_close_policy::checked));
-    BOOST_REQUIRE(!result.has_value());
+    auto cursor = checked(
+      co_await test.drive(test.files->open_directory(test.public_path(""))));
+    const auto synced = co_await test.drive(cursor.sync());
+    const auto closed = co_await test.drive(cursor.close());
+    const auto repeated = co_await cursor.close();
+    BOOST_CHECK(synced.has_value());
+    BOOST_REQUIRE(!closed.has_value());
+    BOOST_REQUIRE(!repeated.has_value());
+    BOOST_CHECK(closed.error() == repeated.error());
     BOOST_CHECK(
-      checked(runtime::file_detail(result.error()))
+      checked(runtime::file_detail(closed.error()))
       == file_failure_detail::device_io);
     BOOST_CHECK_EQUAL(
       checked(fake_file_test_access::snapshot(*test.files)).open_handles, 0U);
     BOOST_CHECK_EQUAL(test.files->pending_operations(), 0U);
+}
+
+// A pathname sync is one operation: a failure after its effect stands for a
+// directory whose close failed after its flush, and the flush still holds.
+SEASTAR_TEST_CASE(fake_pathname_sync_failure_after_its_effect_keeps_the_flush) {
+    seastar::chunked_vector<fault_rule> rules;
+    rules.push_back(rule(
+      builtin_fault_point::directory_sync,
+      checked(
+        fault_decision::make_file_failure(
+          fault_action::file_failure_after_effect,
+          file_failure_detail::device_io))));
+    fixture test{config(), std::move(rules)};
+    test.create("file");
+    const auto result = co_await test.drive(
+      test.files->sync_directory(test.public_path("")));
+    checked(co_await test.drive(test.files->crash()));
+    BOOST_REQUIRE(!result.has_value());
+    BOOST_CHECK(
+      checked(runtime::file_detail(result.error()))
+      == file_failure_detail::device_io);
+    BOOST_CHECK(test.names() == std::set<std::string>{"file"});
+    BOOST_CHECK_EQUAL(
+      checked(fake_file_test_access::snapshot(*test.files)).open_handles, 0U);
+    BOOST_CHECK_EQUAL(test.files->pending_operations(), 0U);
+}
+
+// A cursor flushes the directory it opened: renaming that directory away and
+// putting a new one in its place before the flush does not move the barrier.
+SEASTAR_TEST_CASE(fake_cursor_sync_flushes_the_directory_it_opened) {
+    fixture test{config()};
+    static_cast<void>(checked(
+      fake_file_test_access::create_directory(*test.files, test.path("d"))));
+    test.sync_root();
+    auto cursor = checked(
+      co_await test.drive(test.files->open_directory(test.public_path("d"))));
+    test.create("d/file");
+    checked(
+      fake_file_test_access::rename(
+        *test.files, test.path("d"), test.path("e")));
+    static_cast<void>(checked(
+      fake_file_test_access::create_directory(*test.files, test.path("d"))));
+    const auto synced = co_await test.drive(cursor.sync());
+    const auto closed = co_await test.drive(cursor.close());
+    checked(co_await test.drive(test.files->crash()));
+    BOOST_CHECK(synced.has_value());
+    BOOST_CHECK(closed.has_value());
+    // The root was not flushed again, so its durable "d" is the directory the
+    // cursor opened, and that flush kept "file" in it.
+    const auto entries = checked(
+      fake_file_test_access::list(*test.files, test.path("d")));
+    BOOST_REQUIRE_EQUAL(entries.size(), 1U);
+    BOOST_CHECK_EQUAL(entries[0].name, "file");
 }

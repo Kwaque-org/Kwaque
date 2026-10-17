@@ -345,7 +345,7 @@ seastar::future<segment_read> segment_reader::state::read(
         drained = false;
     };
     const auto fail =
-      [&out, &caller, &drained](const runtime::operation_error& why) {
+      [this, &out, &caller, &drained](const runtime::operation_error& why) {
           drained = false;
           // A caller that left is not a read that failed; a wait that was
           // ended for the cache's or the index's own reasons is not a caller
@@ -356,6 +356,9 @@ seastar::future<segment_read> segment_reader::state::read(
               out.stop = segment_read_stop::failed;
               out.error = why.code() == errc::aborted ? read_error(errc::closed)
                                                       : why;
+              // A place handed back that misled the read was forgotten
+              // before it came here: what fails here is the segment's.
+              runs.read_failed(why);
           }
       };
     // One read at a time is its caller's to keep: a second is not a read

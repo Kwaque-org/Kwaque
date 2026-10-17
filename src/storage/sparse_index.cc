@@ -3,6 +3,7 @@
 #include "src/base/allocation.h"
 #include "src/base/invariant.h"
 #include "src/codec/envelope.h"
+#include "src/storage/local_paths.h"
 #include "src/storage/page_ref.h"
 
 #include <algorithm>
@@ -20,19 +21,6 @@ runtime::operation_error index_error(errc code) noexcept {
     return runtime::operation_error{code, runtime::operation_kind::resource};
 }
 } // namespace
-
-namespace detail {
-runtime::operation_error
-thrown_index_error(std::exception_ptr thrown) noexcept {
-    try {
-        std::rethrow_exception(std::move(thrown));
-    } catch (const std::bad_alloc&) {
-        return path_error(errc::resource_exhausted);
-    } catch (...) {
-        return path_error(errc::io_failure);
-    }
-}
-} // namespace detail
 
 runtime::result<void> validate_sparse_index_pages(
   const local_store_io_limits& limits,

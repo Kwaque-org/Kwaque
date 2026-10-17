@@ -272,6 +272,14 @@ struct segment_runs_config final {
     // The time, for that. Without it a segment is fed only while an owner
     // says a reader is established on it.
     seastar::noncopyable_function<runtime::monotonic_time() noexcept> now{};
+    // Told of a read of the segment that failed for the segment's own
+    // reasons, each kind once: the first time a read finds its committed
+    // data not what a barrier made durable there, and the first time its
+    // device fails a read (an I/O error, a read-only filesystem, a device
+    // that is gone).
+    seastar::noncopyable_function<void(
+      const runtime::operation_error&) noexcept>
+      failed{};
 };
 
 // The cached runs of one segment, and the tail its writer feeds.
@@ -322,6 +330,10 @@ public:
     // Something read the segment now: it is fed from here on, for as long
     // as the configured time after its last read.
     void touch() noexcept;
+    // A read of the segment failed for `why`. Whoever the configuration
+    // names is told when the failure is the data's or its device's:
+    // everything a reader reads lies below its durable bound.
+    void read_failed(const runtime::operation_error& why) noexcept;
     // Its owner says `readers` readers are established on the segment: it
     // is fed while that is not zero, and a fed run is kept for that many
     // reads. Zero hands the question back to touch().
@@ -450,6 +462,9 @@ private:
     };
     struct fed_group final {
         runtime::file_position begin;
+        // A share of what the writer's group is charged to: released after
+        // the bytes it pays for, once the group is copied or dropped.
+        workload_reservation paid;
         bytes::fragmented_buffer bytes;
         std::vector<noted_block> blocks;
         // A group before this one was not kept.
@@ -492,7 +507,9 @@ private:
       std::span<const segment_block_layout> blocks,
       active_sparse_index& index) noexcept;
     void feed(
-      runtime::file_position begin, bytes::fragmented_buffer& bytes) noexcept;
+      runtime::file_position begin,
+      bytes::fragmented_buffer& bytes,
+      const workload_reservation& paid) noexcept;
     void drop() noexcept;
     // Wakes the feed's own work.
     void stir() noexcept;
@@ -531,6 +548,8 @@ private:
     bool finished_{false};
     std::uint64_t prefetched_{0};
     runtime::first_failure debt_;
+    // Damage of its committed data, and a read its device failed, were told.
+    bool damage_told_{false}, device_told_{false};
     // The run that is filling is missing bytes, or there is none: nothing
     // is copied until the next anchor.
     bool skipping_{true};

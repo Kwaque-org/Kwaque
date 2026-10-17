@@ -1080,8 +1080,7 @@ seastar::future<> write_resident(
         path,
         {.access = runtime::file_access::read_write,
          .create = true,
-         .truncate = true,
-         .close_policy = runtime::file_close_policy::checked}));
+         .truncate = true}));
     runtime::first_failure failed;
     try {
         auto image = take(index.encode());
@@ -1101,16 +1100,13 @@ seastar::future<> write_resident(
     take(failed.outcome());
     take(
       co_await env.files.sync_directory(
-        take(runtime::file_path::make(env.scratch.string())),
-        runtime::file_close_policy::checked));
+        take(runtime::file_path::make(env.scratch.string()))));
 }
 // Opens a resident index: its whole file and no more, in the largest reads
 // the profile admits, checked and held in memory from then on.
 seastar::future<resident_index>
 open_resident(const environment& env, const runtime::file_path& path) {
-    auto file = take(
-      co_await env.files.open(
-        path, {.close_policy = runtime::file_close_policy::checked}));
+    auto file = take(co_await env.files.open(path, {}));
     runtime::first_failure failed;
     std::optional<resident_index> out;
     try {

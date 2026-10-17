@@ -54,9 +54,7 @@ struct ownership_input final {
 template<runtime::file_system_backend Backend, typename Driver>
 seastar::future<std::string>
 read_bytes(Backend& files, const runtime::file_path& path, Driver drive) {
-    auto file = take(
-      co_await drive.lifecycle(files.open(
-        path, {.close_policy = runtime::file_close_policy::checked})));
+    auto file = take(co_await drive.lifecycle(files.open(path, {})));
     runtime::first_failure failed;
     std::string result;
     try {
@@ -80,9 +78,7 @@ read_bytes(Backend& files, const runtime::file_path& path, Driver drive) {
 template<runtime::file_system_backend Backend, typename Driver>
 seastar::future<std::string>
 read_all_bytes(Backend& files, const runtime::file_path& path, Driver drive) {
-    auto file = take(
-      co_await drive.lifecycle(files.open(
-        path, {.close_policy = runtime::file_close_policy::checked})));
+    auto file = take(co_await drive.lifecycle(files.open(path, {})));
     runtime::first_failure failed;
     std::string result;
     try {
@@ -116,8 +112,7 @@ seastar::future<> write_bytes(
         path,
         {.access = runtime::file_access::read_write,
          .create = true,
-         .truncate = true,
-         .close_policy = runtime::file_close_policy::checked})));
+         .truncate = true})));
     runtime::first_failure failed;
     try {
         if (!bytes.empty()) {
@@ -144,11 +139,9 @@ seastar::future<> write_bytes(
     take(failed.outcome());
     const auto split = path.value().rfind('/');
     take(
-      co_await drive.lifecycle(files.sync_directory(
-        take(
-          runtime::file_path::make(
-            split == 0 ? "/" : path.value().substr(0, split))),
-        runtime::file_close_policy::checked)));
+      co_await drive.lifecycle(files.sync_directory(take(
+        runtime::file_path::make(
+          split == 0 ? "/" : path.value().substr(0, split))))));
 }
 
 template<

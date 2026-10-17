@@ -2,6 +2,7 @@
 
 #include "src/base/build_info.h"
 #include "src/base/units.h"
+#include "src/broker/directory_sync.h"
 
 #include <seastar/core/coroutine.hh>
 #include <seastar/core/file.hh>
@@ -242,7 +243,7 @@ seastar::future<std::int64_t> report_timestamp(
     }
     if (file) {
         try {
-            co_await file.close();
+            co_await file.close_checked();
         } catch (...) {
             if (!failure) {
                 failure = std::current_exception();
@@ -325,7 +326,7 @@ seastar::future<> crash_recorder::prune(seastar::abort_source& abort) {
     }
     if (directory) {
         try {
-            co_await directory.close();
+            co_await directory.close_checked();
         } catch (...) {
             if (!failure) {
                 failure = std::current_exception();
@@ -349,7 +350,7 @@ seastar::future<> crash_recorder::start(
     co_await seastar::recursive_touch_directory(
       directory_.native(), seastar::file_permissions::user_permissions);
     abort.check();
-    co_await seastar::sync_directory(data_directory.native());
+    co_await sync_directory_checked(data_directory.native());
     abort.check();
     co_await prune(abort);
     abort.check();
@@ -385,7 +386,11 @@ seastar::future<> crash_recorder::start(
             } catch (...) {
                 failure = std::current_exception();
             }
-            co_await file.close();
+            try {
+                co_await file.close_checked();
+            } catch (...) {
+                if (!failure) failure = std::current_exception();
+            }
             if (failure) {
                 std::rethrow_exception(failure);
             }
@@ -398,7 +403,7 @@ seastar::future<> crash_recorder::start(
         throw std::runtime_error("unable to prepare a unique crash report");
     }
     abort.check();
-    co_await seastar::sync_directory(directory_.native());
+    co_await sync_directory_checked(directory_.native());
     abort.check();
     // Fatal handlers need a plain descriptor, without DMA alignment
     // constraints.
@@ -462,7 +467,7 @@ void crash_recorder::record_startup_failure() noexcept {
 
 seastar::future<>
 crash_recorder::sync_directory(const std::filesystem::path& directory) {
-    return seastar::sync_directory(directory.native());
+    return sync_directory_checked(directory.native());
 }
 
 seastar::future<> crash_recorder::stop() {

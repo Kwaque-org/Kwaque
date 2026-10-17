@@ -1,5 +1,7 @@
 #include "src/broker/data_directory.h"
 
+#include "src/broker/directory_sync.h"
+
 #include <seastar/core/coroutine.hh>
 #include <seastar/core/file.hh>
 #include <seastar/core/seastar.hh>
@@ -75,11 +77,11 @@ seastar::future<> prepare_data_directory(
         // Preserve probe ownership across suspension points for failure
         // cleanup.
         created = true; // NOLINT(clang-analyzer-deadcode.DeadStores)
-        co_await file.close();
+        co_await file.close_checked();
         check_abort();
         co_await seastar::remove_file(probe);
         created = false;
-        co_await seastar::sync_directory(directory);
+        co_await sync_directory_checked(directory);
         check_abort();
     } catch (...) {
         failure = std::current_exception();

@@ -11,6 +11,7 @@
 #include <seastar/core/coroutine.hh>
 #include <seastar/core/future.hh>
 #include <seastar/core/memory.hh>
+#include <seastar/coroutine/as_future.hh>
 #include <seastar/testing/test_case.hh>
 #include <seastar/util/alloc_failure_injector.hh>
 
@@ -18,12 +19,14 @@
 
 #include <array>
 #include <cstdint>
+#include <exception>
 #include <iterator>
 #include <limits>
 #include <map>
 #include <new>
 #include <optional>
 #include <stdexcept>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -115,6 +118,18 @@ seastar::future<outcome> never_runs(seastar::abort_source&) {
 }
 bool is(const outcome& value, errc code) {
     return !value && value.error().code() == code;
+}
+// Whether a future failed with what its work threw, as it was thrown.
+template<typename T>
+bool boom(seastar::future<T>& settled) {
+    if (!settled.failed()) return false;
+    try {
+        std::rethrow_exception(settled.get_exception());
+    } catch (const std::runtime_error& thrown) {
+        return std::string_view{thrown.what()} == "boom";
+    } catch (...) {
+        return false;
+    }
 }
 
 // Writes dense blocks one after another, as a segment does, and keeps where
@@ -1021,13 +1036,16 @@ SEASTAR_TEST_CASE(sparse_index_rebuild_that_throws_fails_like_any_other) {
           first_caller);
         auto second = rebuilder.run(never_runs, second_caller);
         gate.set_value();
+        // Every waiter is given what the work threw, as it is.
         {
-            const auto settled = co_await std::move(first);
-            BOOST_CHECK(is(settled, errc::io_failure));
+            auto settled = co_await seastar::coroutine::as_future(
+              std::move(first));
+            BOOST_CHECK(boom(settled));
         }
         {
-            const auto settled = co_await std::move(second);
-            BOOST_CHECK(is(settled, errc::io_failure));
+            auto settled = co_await seastar::coroutine::as_future(
+              std::move(second));
+            BOOST_CHECK(boom(settled));
         }
         BOOST_CHECK(!rebuilder.running());
         BOOST_CHECK_EQUAL(shard.running(), 0U);
@@ -1035,12 +1053,13 @@ SEASTAR_TEST_CASE(sparse_index_rebuild_that_throws_fails_like_any_other) {
     {
         // Thrown before any future exists.
         seastar::abort_source caller;
-        const auto thrown = co_await rebuilder.run(
+        auto thrown = co_await seastar::coroutine::as_future(rebuilder.run(
           [](seastar::abort_source&) -> seastar::future<outcome> {
               throw std::runtime_error("boom");
           },
-          caller);
-        BOOST_CHECK(is(thrown, errc::io_failure));
+          caller));
+        BOOST_CHECK(boom(thrown));
+        BOOST_CHECK(!rebuilder.running());
         BOOST_CHECK_EQUAL(shard.running(), 0U);
     }
     {

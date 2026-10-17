@@ -194,8 +194,7 @@ local_root_owner::open(
                 failed.observe(valid);
                 break;
             }
-            auto opened = co_await files.open(
-              *path, {.close_policy = runtime::file_close_policy::checked});
+            auto opened = co_await files.open(*path, {});
             if (!opened) {
                 failed.observe(opened);
                 break;
@@ -223,9 +222,7 @@ local_root_owner::open(
                     failed.observe(valid);
                     break;
                 }
-                auto data_opened = co_await files.open(
-                  *data_path,
-                  {.close_policy = runtime::file_close_policy::checked});
+                auto data_opened = co_await files.open(*data_path, {});
                 if (!data_opened) {
                     failed.observe(data_opened);
                     break;

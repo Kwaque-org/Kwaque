@@ -205,9 +205,7 @@ struct wal_bench {
                                   take(runtime::file_path::make(name)),
                                   {.access = runtime::file_access::read_write,
                                    .create = true,
-                                   .truncate = true,
-                                   .close_policy
-                                   = runtime::file_close_policy::checked}));
+                                   .truncate = true}));
                               runtime::first_failure exported;
                               try {
                                   take(
@@ -279,9 +277,7 @@ struct wal_bench {
                                     co_await files.open(
                                       path,
                                       {.access
-                                       = runtime::file_access::read_write,
-                                       .close_policy = runtime::
-                                         file_close_policy::checked})));
+                                       = runtime::file_access::read_write})));
                                   metadata.emplace(
                                     take(direct->try_reserve_metadata()));
                               }
@@ -669,11 +665,7 @@ struct wal_bench {
                           }
                           take(execution_failure.outcome());
                           if constexpr (!Noop) {
-                              auto file = take(
-                                co_await files.open(
-                                  path,
-                                  {.close_policy
-                                   = runtime::file_close_policy::checked}));
+                              auto file = take(co_await files.open(path, {}));
                               runtime::first_failure check;
                               try {
                                   for (std::uint64_t offset = 0;

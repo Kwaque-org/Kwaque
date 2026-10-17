@@ -2,10 +2,13 @@
 #include "src/broker/application_internal.h"
 
 #include <seastar/core/coroutine.hh>
+#include <seastar/core/file.hh>
+#include <seastar/core/fstream.hh>
 #include <seastar/core/iostream.hh>
-#include <seastar/util/file.hh>
+#include <seastar/core/seastar.hh>
 
 #include <array>
+#include <exception>
 #include <filesystem>
 #include <stdexcept>
 #include <string>
@@ -46,14 +49,38 @@ decode_configuration_snapshot(std::string_view contents) {
 
 namespace {
 
+// The first failure of the read and the file's close.
+seastar::future<seastar::temporary_buffer<char>> read_configuration_file(
+  const std::filesystem::path& path, seastar::abort_source& abort_source) {
+    auto file = co_await seastar::open_file_dma(
+      path.native(), seastar::open_flags::ro);
+    seastar::temporary_buffer<char> contents;
+    std::exception_ptr failure;
+    try {
+        auto input = seastar::make_file_input_stream(file);
+        try {
+            contents = co_await read_configuration_bytes(input, abort_source);
+        } catch (...) {
+            failure = std::current_exception();
+        }
+        co_await input.close();
+    } catch (...) {
+        if (!failure) failure = std::current_exception();
+    }
+    try {
+        co_await file.close_checked();
+    } catch (...) {
+        if (!failure) failure = std::current_exception();
+    }
+    if (failure) std::rethrow_exception(failure);
+    co_return contents;
+}
+
 seastar::future<loaded_configuration_result> load_configuration_file(
   const std::filesystem::path& path, seastar::abort_source& abort_source) {
     seastar::temporary_buffer<char> contents;
     try {
-        contents = co_await seastar::util::with_file_input_stream(
-          path, [&abort_source](seastar::input_stream<char>& input) {
-              return read_configuration_bytes(input, abort_source);
-          });
+        contents = co_await read_configuration_file(path, abort_source);
     } catch (const std::system_error& error) {
         // Keep the operating-system reason: a missing file, a permission
         // problem and a directory need different fixes.

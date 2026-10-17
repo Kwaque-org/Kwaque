@@ -666,9 +666,7 @@ seastar::future<> paged_seal_and_retained_results(
               0,
               {description.segment.segment(), description.segment.generation()},
               local_segment_file::data));
-          auto file = take(
-            co_await drive.lifecycle(files.open(
-              path, {.close_policy = runtime::file_close_policy::checked})));
+          auto file = take(co_await drive.lifecycle(files.open(path, {})));
           runtime::first_failure failed;
           try {
               const auto read = take(

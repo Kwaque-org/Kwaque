@@ -6,6 +6,7 @@
 #include "src/runtime/error.h"
 #include "src/runtime/shard_affinity.h"
 #include "src/storage/cache_policy.h"
+#include "src/storage/local_paths.h"
 #include "src/storage/workload_budget.h"
 
 #include <seastar/core/abort_source.hh>
@@ -77,10 +78,6 @@ class page_cache;
 namespace detail {
 
 [[nodiscard]] runtime::operation_error cache_error(errc) noexcept;
-// The failure an exception out of a load stands for: memory that could not
-// be had is not a device's error.
-[[nodiscard]] runtime::operation_error
-  cache_thrown(std::exception_ptr) noexcept;
 
 // What loads a value for the cache: called once, on the cache's own behalf,
 // with the source the cache requests when it stops. It owns everything it
@@ -186,7 +183,11 @@ public:
     // from here on. A failure is kept by nothing, and neither is a value its
     // reader funds or one that outlived its object or its cache: the entry
     // leaves its index.
-    void settle(std::optional<runtime::operation_error> failed) noexcept;
+    // The load ended: with its value, its failure, or an exception of no
+    // expected family, which every waiter is given as it is.
+    void settle(
+      std::optional<runtime::operation_error> failed,
+      std::exception_ptr thrown = {}) noexcept;
     // The policy's question and its verdict: see cache_evictor.
     [[nodiscard]] bool evicted_from(cache_queue from) noexcept;
 
@@ -481,6 +482,9 @@ public:
         return held;
     }
     void fail(runtime::operation_error why) && noexcept { end(why); }
+    void fail(std::exception_ptr thrown) && noexcept {
+        end(std::nullopt, std::move(thrown));
+    }
 
     // The value will hold `backing` and not what the load was admitted for:
     // a read whose buffers are priced once they are there, or a value that
@@ -508,13 +512,15 @@ private:
       : entry_(&loading) {
         loading.hold();
     }
-    void end(std::optional<runtime::operation_error> failed) noexcept {
+    void end(
+      std::optional<runtime::operation_error> failed,
+      std::exception_ptr thrown = {}) noexcept {
         KWAQUE_INVARIANT(
           invariant_id{"KQ-CACHE-LOAD-LIVE"},
           entry_ != nullptr,
           "a cache load ended twice");
         auto* loaded = std::exchange(entry_, nullptr);
-        loaded->settle(failed);
+        loaded->settle(failed, std::move(thrown));
         loaded->release();
     }
     detail::cached<Value>* entry_;
@@ -706,8 +712,14 @@ private:
         auto loaded = co_await seastar::coroutine::as_future(
           seastar::with_scheduling_group(
             group_, [this, &loader] { return loader(stop_); }));
+        // A loader that throws has failed like any other: an exception of
+        // an expected family as its code, and any other as itself.
         if (loaded.failed()) {
-            std::move(load).fail(detail::cache_thrown(loaded.get_exception()));
+            auto thrown = loaded.get_exception();
+            if (const auto code = detail::recognized(thrown))
+                std::move(load).fail(detail::cache_error(code->code()));
+            else
+                std::move(load).fail(std::move(thrown));
             co_return;
         }
         auto value = loaded.get();

@@ -600,9 +600,7 @@ seastar::future<> reserved_publication(
             pointer->prepare(byte_count{256_KiB}, work)));
         data.emplace(take(
           co_await drive.lifecycle(files.open(
-            data_path,
-            {.access = runtime::file_access::read_write,
-             .close_policy = runtime::file_close_policy::checked}))));
+            data_path, {.access = runtime::file_access::read_write}))));
         completion.emplace(take(completion_resources::make(resources, *data)));
         auto grant = take(resources.try_reserve(byte_count{1_MiB}));
         auto insufficient = take(resources.try_reserve(byte_count{1}));
@@ -618,8 +616,8 @@ seastar::future<> reserved_publication(
         // cursor's first page.
         bool saturated = false;
         for (auto& retained : cursor_pressure) {
-            auto opened = co_await drive.lifecycle(files.open_directory(
-              spec.root, runtime::file_close_policy::checked));
+            auto opened = co_await drive.lifecycle(
+              files.open_directory(spec.root));
             if (!opened) {
                 require(
                   opened.error().code() == errc::queue_full,

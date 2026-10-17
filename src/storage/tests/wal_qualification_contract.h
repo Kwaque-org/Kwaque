@@ -67,8 +67,7 @@ seastar::future<> pinned_headers(
                     co_await drive.lifecycle(files.open(
                       path,
                       {.access = runtime::file_access::read_write,
-                       .truncate = true,
-                       .close_policy = runtime::file_close_policy::checked})));
+                       .truncate = true})));
                   runtime::first_failure failed;
                   try {
                       failed.observe(co_await drive.lifecycle(file.flush()));

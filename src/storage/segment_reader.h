@@ -1,5 +1,6 @@
 #pragma once
 
+#include "src/base/allocation.h"
 #include "src/base/units.h"
 #include "src/bytes/fragmented_buffer.h"
 #include "src/model/position.h"
@@ -146,8 +147,12 @@ struct segment_read_batch final {
     std::optional<workload_reservation> charged{};
 };
 
-// The most batches one read returns.
+// The most batches one read returns. Their table is one allocation, less
+// what a charge profile adds to it.
 inline constexpr std::uint32_t maximum_read_batches = 1024;
+static_assert(
+  std::size_t{maximum_read_batches} * sizeof(segment_read_batch)
+  <= maximum_contiguous_allocation_bytes - 64);
 
 // Where a read begins, and where the one after it goes on: an offset, and,
 // when the read that handed it back knew, where in the file the block that
@@ -292,7 +297,9 @@ private:
 //
 // A batch is returned whole or not at all. An offset inside a batch returns
 // that batch; one that no batch of its run holds returns the next batch of
-// that run. Every read says why it stopped, and where the next one goes on.
+// that run. Every read says why it stopped, and where the next one goes on,
+// unless what it waited for threw an exception of no expected family: that
+// leaves the read as it was thrown, and the session reads again as before.
 //
 // What a read returns is charged to the session's budget: its table, and
 // the runs its batches keep in the cache. A budget that has no more ends
