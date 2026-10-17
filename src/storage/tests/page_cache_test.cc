@@ -12,6 +12,7 @@
 #include <seastar/core/memory.hh>
 #include <seastar/core/shared_ptr.hh>
 #include <seastar/core/thread.hh>
+#include <seastar/coroutine/as_future.hh>
 #include <seastar/testing/test_case.hh>
 #include <seastar/util/alloc_failure_injector.hh>
 #include <seastar/util/later.hh>
@@ -29,6 +30,7 @@
 #include <new>
 #include <optional>
 #include <stdexcept>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -108,6 +110,18 @@ bool is(const runtime::result<T>& outcome, errc code) {
 }
 runtime::operation_error failed(errc code) {
     return runtime::operation_error{code, runtime::operation_kind::file};
+}
+// Whether a future failed with what a loader threw, as it was thrown.
+template<typename T>
+bool boom(seastar::future<T>& settled) {
+    if (!settled.failed()) return false;
+    try {
+        std::rethrow_exception(settled.get_exception());
+    } catch (const std::runtime_error& thrown) {
+        return std::string_view{thrown.what()} == "boom";
+    } catch (...) {
+        return false;
+    }
 }
 // Loads a value at once.
 void fill(
@@ -1108,15 +1122,17 @@ SEASTAR_TEST_CASE(page_cache_fetch_tells_everyone_why_a_load_failed) {
               BOOST_CHECK(place.empty());
           }
           {
-              // A loader that throws has failed like any other.
-              const auto settled = co_await place.fetch(
+              // A loader that throws has failed like any other: its caller
+              // is given what it threw, as it is, and nothing is kept.
+              auto settled = co_await seastar::coroutine::as_future(place.fetch(
                 cache,
                 byte_count{4_KiB},
                 [](seastar::abort_source&) -> seastar::future<loaded> {
                     throw std::runtime_error("boom");
                 },
-                caller);
-              BOOST_CHECK(is(settled, errc::io_failure));
+                caller));
+              BOOST_CHECK(boom(settled));
+              BOOST_CHECK(place.empty());
           }
           {
               // One that throws after it began, with a caller waiting
@@ -1134,12 +1150,14 @@ SEASTAR_TEST_CASE(page_cache_fetch_tells_everyone_why_a_load_failed) {
                 cache, byte_count{4_KiB}, never_loads, caller);
               begun.set_value();
               {
-                  const auto settled = co_await std::move(first);
-                  BOOST_CHECK(is(settled, errc::io_failure));
+                  auto settled = co_await seastar::coroutine::as_future(
+                    std::move(first));
+                  BOOST_CHECK(boom(settled));
               }
               {
-                  const auto settled = co_await std::move(second);
-                  BOOST_CHECK(is(settled, errc::io_failure));
+                  auto settled = co_await seastar::coroutine::as_future(
+                    std::move(second));
+                  BOOST_CHECK(boom(settled));
               }
               BOOST_CHECK(place.empty());
           }

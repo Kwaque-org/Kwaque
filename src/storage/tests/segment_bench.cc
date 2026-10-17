@@ -411,9 +411,7 @@ seastar::future<> verify_file(
   extent_input& input,
   bool sealed,
   codec::cooperative_work& work) {
-    auto file = take(
-      co_await files.open(
-        path, {.close_policy = runtime::file_close_policy::checked}));
+    auto file = take(co_await files.open(path, {}));
     runtime::first_failure failed;
     try {
         const auto header = take(
@@ -855,9 +853,7 @@ struct segment_bench {
                                 *raw_path,
                                 {.access = runtime::file_access::read_write,
                                  .create = true,
-                                 .exclusive = true,
-                                 .close_policy
-                                 = runtime::file_close_policy::checked}));
+                                 .exclusive = true}));
                             runtime::first_failure setup;
                             try {
                                 auto header = take(
@@ -880,9 +876,7 @@ struct segment_bench {
                             raw_file.emplace(take(
                               co_await files.open(
                                 *raw_path,
-                                {.access = runtime::file_access::read_write,
-                                 .close_policy
-                                 = runtime::file_close_policy::checked})));
+                                {.access = runtime::file_access::read_write})));
                         }
                         if (preallocate) {
                             result.setup_extent = setup_extent;

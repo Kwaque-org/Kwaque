@@ -6,13 +6,11 @@
 
 #include <gtest/gtest.h>
 
-#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <exception>
-#include <span>
 #include <string_view>
 #include <utility>
 
@@ -24,19 +22,20 @@
 // stop.
 //
 // A round runs the history over a store of its own on the simulated file
-// system, with the allocations of that one step failing: one of them, or
-// that one and every one after it until the step has ended. A step may
-// answer the failure itself, and then the history goes on. A life in which
-// an allocation failed may also end there, as a process that cannot allocate
-// ends: the device crashes where it stands, and the next life starts on what
-// it holds, reads back everything the ledger was told is durable and stops.
-// Either way the ledger holds, the store leaves no budget charged and no
-// file open, and the round leaves no more objects live than it found.
+// system, with one allocation of that one step failing, as the allocator's
+// injector fails one and disarms. A step may answer the failure itself, and
+// then the history goes on. A life in which an allocation failed may also
+// end there, as a process that cannot allocate ends: the device crashes
+// where it stands, and the next life starts on what it holds, reads back
+// everything the ledger was told is durable and stops. Either way the
+// ledger holds, the store leaves no budget charged and no file open, and
+// the round leaves no more objects live than it found.
 //
-// The stop is swept one failure at a time and no further. What follows a
-// step that failed is a stop that can allocate; a stop that itself can
-// allocate nothing from its first failure on has nothing that follows it,
-// and an engine whose owners could not be closed cannot be destroyed.
+// One failure a round, not every allocation after the first: a process that
+// cannot allocate ends at its first failure, and past it the exceptions that
+// Seastar and the C++ runtime raise (a broken condition variable's, an abort
+// source's) would have to come from the runtime's few hundred bytes of
+// emergency memory, which a sweep cannot keep enough of.
 //
 // Not swept here: a roll, which no history asks for; and whatever the
 // device, the scheduler and the driver themselves allocate inside a step is
@@ -46,7 +45,6 @@ using namespace kwaque;
 namespace fixture = simulation::testing::engine_history_fixture;
 namespace histories = storage::testing::engine_history_contract;
 using histories::history_step;
-using runtime::testing::allocation_failures;
 using runtime::testing::allocation_window;
 using storage::testing::engine_history;
 using storage::testing::history_op;
@@ -54,13 +52,8 @@ using storage::testing::history_survival;
 using verdict = storage::testing::engine_ledger::verdict;
 
 // On every change a dozen points of each window are failed, spread over it;
-// with the switch every point is, one failure a round. Where every
-// allocation after the first fails, the exceptions the failure raises and
-// rethrows come from the C++ runtime's emergency heap, a few hundred bytes
-// whose free path can lose its list, and it is process-wide: that way stays
-// at the dozen.
-std::uint64_t sampled_points(allocation_failures mode) {
-    if (mode == allocation_failures::from_the_first) return 12;
+// with the switch every point is.
+std::uint64_t sampled_points() {
     return std::getenv("KWAQUE_FULL_SWEEPS") != nullptr ? 0 : 12;
 }
 
@@ -98,45 +91,27 @@ void round(
     }
 }
 
-// The two ways a window fails, and the first of them alone.
-constexpr std::array both_ways{
-  allocation_failures::once, allocation_failures::from_the_first};
-constexpr std::array one_failure{allocation_failures::once};
-
 void sweep(
-  std::string_view name,
-  const engine_history& history,
-  history_step step,
-  std::span<const allocation_failures> ways = both_ways) {
+  std::string_view name, const engine_history& history, history_step step) {
     if (!runtime::testing::allocation_failures_available)
         GTEST_SKIP() << "this build cannot fail an allocation";
-    for (const auto mode : ways) {
-        const bool once = mode == allocation_failures::once;
-        SCOPED_TRACE(
-          once ? "one allocation fails"
-               : "every allocation after the first fails");
-        const auto swept = runtime::testing::sweep_allocation_failures(
-          mode, sampled_points(mode), [&](allocation_window& window) {
-              round(history, step, window);
-              if (once) EXPECT_LE(window.failures(), 1U);
-          });
-        std::printf(
-          "%.*s, %s: %llu allocation points, %llu rounds, %llu with a "
-          "failure, %llu allocations failed\n",
-          static_cast<int>(name.size()),
-          name.data(),
-          once ? "one failure" : "failing on",
-          static_cast<unsigned long long>(swept.points),
-          static_cast<unsigned long long>(swept.rounds),
-          static_cast<unsigned long long>(swept.failed),
-          static_cast<unsigned long long>(swept.failures));
-        // Told before the next sweep, which may end the process.
-        std::fflush(stdout);
-        // The step allocates, and some round met a failure.
-        EXPECT_GT(swept.points, 0U);
-        EXPECT_GT(swept.failed, 0U);
-        EXPECT_EQ(swept.leaks, 0U);
-    }
+    const auto swept = runtime::testing::sweep_allocation_failures(
+      sampled_points(), [&](allocation_window& window) {
+          round(history, step, window);
+          EXPECT_LE(window.failures(), 1U);
+      });
+    std::printf(
+      "%.*s: %llu allocation points, %llu rounds, %llu with a failure\n",
+      static_cast<int>(name.size()),
+      name.data(),
+      static_cast<unsigned long long>(swept.points),
+      static_cast<unsigned long long>(swept.rounds),
+      static_cast<unsigned long long>(swept.failed));
+    std::fflush(stdout);
+    // The step allocates, and some round met a failure.
+    EXPECT_GT(swept.points, 0U);
+    EXPECT_GT(swept.failed, 0U);
+    EXPECT_EQ(swept.leaks, 0U);
 }
 
 // The fixed history with everything a history can ask of a store and a
@@ -240,10 +215,7 @@ TEST(EngineAllocationTest, ACheckpoint) {
 TEST(EngineAllocationTest, AStop) {
     const whole_life life;
     sweep(
-      "a stop",
-      life.history,
-      {history_step::kind::stop, 0, life.restart + 1},
-      one_failure);
+      "a stop", life.history, {history_step::kind::stop, 0, life.restart + 1});
 }
 
 TEST(EngineAllocationTest, AStartAfterAStop) {

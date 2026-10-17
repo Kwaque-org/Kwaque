@@ -87,8 +87,7 @@ public:
 class contract_file_system final {
 public:
     using directory_cursor_type = contract_directory_cursor;
-    seastar::future<result<directory_cursor_type>>
-    open_directory(file_path, file_close_policy = file_close_policy::legacy) {
+    seastar::future<result<directory_cursor_type>> open_directory(file_path) {
         return detail::unavailable<directory_cursor_type>(operation_kind::file);
     }
     seastar::future<result<file>> open(file_path, file_open_options) {
@@ -124,8 +123,7 @@ public:
       file_path, file_path, file_rename_policy = file_rename_policy::replace) {
         return detail::success();
     }
-    seastar::future<result<void>>
-    sync_directory(file_path, file_close_policy = file_close_policy::legacy) {
+    seastar::future<result<void>> sync_directory(file_path) {
         return detail::success();
     }
 };

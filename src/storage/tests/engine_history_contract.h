@@ -654,6 +654,12 @@ private:
                    std::move(wire),
                    std::move(accepted),
                    std::move(stages.result)});
+                // Its acceptance, and the group formation that starts, run
+                // to where they wait on the device before anything else is
+                // asked, as the driver lets every operation do. Otherwise a
+                // timed preemption decides whether the next request joins
+                // its group, and the same history writes other bytes.
+                co_await drive_.lifecycle(seastar::make_ready_future<>());
             }
             co_return true;
         }

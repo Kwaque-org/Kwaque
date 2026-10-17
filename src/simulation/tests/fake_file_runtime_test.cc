@@ -25,6 +25,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <system_error>
@@ -322,9 +323,12 @@ seastar::future<partial_resize_observation> run_partial_resize_case(
         }
     }
 
+    // The failed truncate is the file's first failure, so close answers it.
     auto closing = file.close();
     co_await pump_until(environment.events, closing);
-    co_await require_ready_success(closing);
+    const auto closed = co_await std::move(closing);
+    BOOST_REQUIRE(!closed.has_value());
+    BOOST_CHECK(closed.error() == truncated.error());
     auto stopping = environment.files->stop();
     if (!stopping.available()) {
         co_await pump_until(environment.events, stopping);
@@ -393,6 +397,13 @@ execute_model_command(fixture& environment, const storage_command& command) {
     }
     auto file = std::move(*opened);
     storage_outcome outcome{storage_outcome::success};
+    // A failed write, truncate or flush is the file's first failure, and its
+    // close answers it; a failed read leaves the file as it was.
+    std::optional<kwaque::runtime::operation_error> mutation_failure;
+    const auto mutated = [&mutation_failure](const auto& result) {
+        if (!result) mutation_failure = result.error();
+        return outcome_for(result);
+    };
     if (command.kind == storage_command_kind::write) {
         const std::string bytes(
           command.length,
@@ -400,15 +411,15 @@ execute_model_command(fixture& environment, const storage_command& command) {
         auto pending = file.write(
           kwaque::runtime::file_position{command.position}, payload(bytes));
         co_await pump_until(environment.events, pending);
-        outcome = outcome_for(co_await std::move(pending));
+        outcome = mutated(co_await std::move(pending));
     } else if (command.kind == storage_command_kind::truncate) {
         auto pending = file.truncate(command.length);
         co_await pump_until(environment.events, pending);
-        outcome = outcome_for(co_await std::move(pending));
+        outcome = mutated(co_await std::move(pending));
     } else if (command.kind == storage_command_kind::flush) {
         auto pending = file.flush();
         co_await pump_until(environment.events, pending);
-        outcome = outcome_for(co_await std::move(pending));
+        outcome = mutated(co_await std::move(pending));
     } else {
         auto pending = file.read(
           kwaque::runtime::file_position{command.position},
@@ -419,7 +430,12 @@ execute_model_command(fixture& environment, const storage_command& command) {
     auto closing = file.close();
     co_await pump_until(environment.events, closing);
     const auto closed = co_await std::move(closing);
-    BOOST_REQUIRE(closed.has_value());
+    if (mutation_failure) {
+        BOOST_REQUIRE(!closed.has_value());
+        BOOST_CHECK(closed.error() == *mutation_failure);
+    } else {
+        BOOST_REQUIRE(closed.has_value());
+    }
     co_return outcome;
 }
 
@@ -616,9 +632,12 @@ SEASTAR_TEST_CASE(
     const auto write_result = co_await std::move(rejected_write);
     BOOST_REQUIRE(!write_result.has_value());
     BOOST_CHECK(write_result.error().code() == kwaque::errc::permission_denied);
+    // The refused write is the handle's first failure; close answers it.
     auto close_read_only = read_only->close();
     co_await pump_until(environment.events, close_read_only);
-    co_await require_ready_success(close_read_only);
+    const auto read_only_closed = co_await std::move(close_read_only);
+    BOOST_REQUIRE(!read_only_closed.has_value());
+    BOOST_CHECK(read_only_closed.error() == write_result.error());
 
     auto opening_write_only = environment.files->open(
       path("/kwaque/data/file"),
@@ -798,7 +817,14 @@ SEASTAR_TEST_CASE(fake_rejected_close_releases_its_handle_capacity) {
         co_await seastar::yield();
     }
     BOOST_REQUIRE(closing.available());
-    co_await require_ready_success(closing);
+    // A close that could not be scheduled still releases the handle, and says
+    // it failed, as the native close does when its submission fails.
+    const auto refused = co_await std::move(closing);
+    BOOST_REQUIRE(!refused.has_value());
+    BOOST_CHECK(refused.error().code() == kwaque::errc::resource_exhausted);
+    const auto repeated = co_await file.close();
+    BOOST_REQUIRE(!repeated.has_value());
+    BOOST_CHECK(repeated.error() == refused.error());
     BOOST_CHECK(fake_file_test_access::open_handles(*environment.files) == 0U);
 
     co_await pump_until(environment.events, occupying);
@@ -1222,9 +1248,7 @@ SEASTAR_TEST_CASE(fake_zero_write_fails_without_changing_bytes_or_eof) {
     BOOST_REQUIRE(created.has_value());
     auto opened = co_await drive(environment.files->open(
       path("/kwaque/data/file"),
-      {.access = kwaque::runtime::file_access::read_write,
-       .create = true,
-       .close_policy = kwaque::runtime::file_close_policy::checked}));
+      {.access = kwaque::runtime::file_access::read_write, .create = true}));
     BOOST_REQUIRE(opened.has_value());
     auto file = std::move(*opened);
     const std::string prefix(4096, 'p');
@@ -1457,7 +1481,9 @@ SEASTAR_TEST_CASE(fake_partial_resize_applies_to_unaligned_write_finalization) {
 
     auto closing = file.close();
     co_await pump_until(environment.events, closing);
-    co_await require_ready_success(closing);
+    const auto closed = co_await std::move(closing);
+    BOOST_REQUIRE(!closed.has_value());
+    BOOST_CHECK(closed.error() == written.error());
     auto stopping = environment.files->stop();
     if (!stopping.available()) {
         co_await pump_until(environment.events, stopping);
@@ -1576,7 +1602,9 @@ SEASTAR_TEST_CASE(fake_partial_resize_obeys_the_flush_crash_boundary) {
 
     auto stale_close = file.close();
     co_await pump_until(environment.events, stale_close);
-    co_await require_ready_success(stale_close);
+    const auto stale_closed = co_await std::move(stale_close);
+    BOOST_REQUIRE(!stale_closed.has_value());
+    BOOST_CHECK(stale_closed.error() == partial_result.error());
 
     auto reopening = environment.files->open(
       path("/kwaque/data/file"),
@@ -1595,9 +1623,26 @@ SEASTAR_TEST_CASE(fake_partial_resize_obeys_the_flush_crash_boundary) {
     BOOST_REQUIRE(persisted_size.has_value());
     BOOST_CHECK(*persisted_size > 10U);
     BOOST_CHECK(*persisted_size < 100U);
-    auto persisted_flush = second_file.flush();
+    // The failed truncate fences its handle. A flush covers the file
+    // whichever handle issues it, so another one makes the size durable.
+    auto refused_flush = second_file.flush();
+    co_await pump_until(environment.events, refused_flush);
+    const auto refused = co_await std::move(refused_flush);
+    BOOST_REQUIRE(!refused.has_value());
+    BOOST_CHECK(refused.error() == persisted_result.error());
+    auto opening_flusher = environment.files->open(
+      path("/kwaque/data/file"),
+      {.access = kwaque::runtime::file_access::read_write});
+    co_await pump_until(environment.events, opening_flusher);
+    auto opened_flusher = co_await std::move(opening_flusher);
+    BOOST_REQUIRE(opened_flusher.has_value());
+    auto flusher = std::move(*opened_flusher);
+    auto persisted_flush = flusher.flush();
     co_await pump_until(environment.events, persisted_flush);
     co_await require_ready_success(persisted_flush);
+    auto flusher_close = flusher.close();
+    co_await pump_until(environment.events, flusher_close);
+    co_await require_ready_success(flusher_close);
     auto second_crash = environment.files->crash();
     co_await pump_until(environment.events, second_crash);
     co_await require_ready_success(second_crash);
@@ -1609,7 +1654,9 @@ SEASTAR_TEST_CASE(fake_partial_resize_obeys_the_flush_crash_boundary) {
       == *persisted_size);
     auto second_close = second_file.close();
     co_await pump_until(environment.events, second_close);
-    co_await require_ready_success(second_close);
+    const auto second_closed = co_await std::move(second_close);
+    BOOST_REQUIRE(!second_closed.has_value());
+    BOOST_CHECK(second_closed.error() == persisted_result.error());
 
     auto stopping = environment.files->stop();
     if (!stopping.available()) {
@@ -1787,8 +1834,10 @@ SEASTAR_TEST_CASE(fake_crash_restores_only_completed_durable_boundaries) {
     const auto aborted = co_await std::move(crash_write);
     BOOST_REQUIRE(!aborted.has_value());
     BOOST_CHECK(aborted.error().code() == kwaque::errc::aborted);
-    auto crash_close = current.close();
-    co_await require_ready_success(crash_close);
+    // The crash released the handle; the aborted write is its first failure.
+    const auto crash_closed = co_await current.close();
+    BOOST_REQUIRE(!crash_closed.has_value());
+    BOOST_CHECK(crash_closed.error() == aborted.error());
 
     auto final_open = environment.files->open(
       path("/kwaque/data/file"),
@@ -2447,9 +2496,12 @@ SEASTAR_TEST_CASE(
       storage_outcome::success));
     compare_model_state(*environment.files, model);
 
+    // The write the crash aborted is the first handle's first failure.
     auto close_first = first_handle.close();
     auto close_second = second_handle.close();
-    co_await require_ready_success(close_first);
+    const auto first_closed = co_await std::move(close_first);
+    BOOST_REQUIRE(!first_closed.has_value());
+    BOOST_CHECK(first_closed.error() == dropped_result.error());
     co_await require_ready_success(close_second);
     co_return;
 }
@@ -2836,7 +2888,9 @@ SEASTAR_TEST_CASE(fake_partial_resize_apply_uses_only_prepared_storage) {
     BOOST_CHECK(contents->data().content_equals(std::string(*size, 'p')));
     auto closing = file.close();
     co_await pump_until(environment.events, closing);
-    co_await require_ready_success(closing);
+    const auto closed = co_await std::move(closing);
+    BOOST_REQUIRE(!closed.has_value());
+    BOOST_CHECK(closed.error() == result.error());
     auto stopping = environment.files->stop();
     co_await pump_until(environment.events, stopping);
     co_await require_ready_success(stopping);
@@ -3332,9 +3386,7 @@ SEASTAR_TEST_CASE(
           co_await drive(environment.files->sync_directory(path("/kwaque"))));
         auto opened = co_await drive(environment.files->open(
           path("/kwaque/data/file"),
-          {.access = runtime::file_access::read_write,
-           .create = true,
-           .close_policy = runtime::file_close_policy::checked}));
+          {.access = runtime::file_access::read_write, .create = true}));
         BOOST_REQUIRE(opened);
         auto file = std::move(*opened);
         BOOST_REQUIRE(
@@ -3388,9 +3440,8 @@ SEASTAR_TEST_CASE(
             BOOST_CHECK(!failed);
         }
         static_cast<void>(co_await drive(file.close()));
-        auto reopening = co_await drive(environment.files->open(
-          path("/kwaque/data/file"),
-          {.close_policy = runtime::file_close_policy::checked}));
+        auto reopening = co_await drive(
+          environment.files->open(path("/kwaque/data/file"), {}));
         BOOST_REQUIRE(reopening);
         auto reader = std::move(*reopening);
         const auto bytes = co_await drive(
@@ -3422,9 +3473,7 @@ SEASTAR_TEST_CASE(
         environment.files->create_directories(path("/kwaque/data"))));
     auto opened = co_await drive(environment.files->open(
       path("/kwaque/data/pressure"),
-      {.access = runtime::file_access::read_write,
-       .create = true,
-       .close_policy = runtime::file_close_policy::checked}));
+      {.access = runtime::file_access::read_write, .create = true}));
     BOOST_REQUIRE(opened);
     auto file = std::move(*opened);
     const auto written = co_await drive(

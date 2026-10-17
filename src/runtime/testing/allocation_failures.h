@@ -35,20 +35,17 @@ inline constexpr bool live_objects_counted =
     return seastar::memory::stats().live_objects();
 }
 
-// How a window fails: its chosen allocation alone, or that one and every
-// one after it while the window is open. What throws a failure takes one
-// allocation of its own, which passes.
-enum class allocation_failures : std::uint8_t { once, from_the_first };
-
-// One round's window. Nothing fails before open() or after close().
+// One round's window: its chosen allocation fails, and nothing else, as the
+// allocator's injector fails one and disarms. Whatever handles that failure
+// allocates as usual, which is what a process does that goes on after one.
+// Nothing fails before open() or after close().
 class allocation_window final {
 public:
     // A window that fails nothing counts its allocation points.
     static constexpr std::uint64_t never = UINT64_MAX;
 
-    allocation_window(allocation_failures mode, std::uint64_t at) noexcept
-      : mode_(mode)
-      , at_(at) {}
+    explicit allocation_window(std::uint64_t at) noexcept
+      : at_(at) {}
     allocation_window(const allocation_window&) = delete;
     allocation_window& operator=(const allocation_window&) = delete;
     ~allocation_window() { close(); }
@@ -76,14 +73,10 @@ public:
     // The injector's action while a round runs.
     void fail() {
         ++failures_;
-        // The exception below is the next allocation point.
-        if (open_ && mode_ == allocation_failures::from_the_first)
-            seastar::memory::local_failure_injector().fail_after(1);
         throw std::bad_alloc();
     }
 
 private:
-    allocation_failures mode_;
     std::uint64_t at_;
     std::uint64_t begin_{0}, points_{0}, failures_{0};
     bool open_{false};
@@ -93,8 +86,8 @@ struct allocation_sweep final {
     // Allocation points of the window in the round that failed none.
     std::uint64_t points{0};
     std::uint64_t rounds{0};
-    // Rounds in which an allocation failed, and the allocations failed.
-    std::uint64_t failed{0}, failures{0};
+    // Rounds in which an allocation failed.
+    std::uint64_t failed{0};
     // Rounds that left more objects live than they found, twice running.
     std::uint64_t leaks{0};
 };
@@ -110,20 +103,18 @@ struct allocation_sweep final {
 // process makes once is there the second time, and a leak grows again.
 // Called on a Seastar thread; a round may block.
 template<typename Round>
-allocation_sweep sweep_allocation_failures(
-  allocation_failures mode, std::uint64_t sample, Round round) {
+allocation_sweep sweep_allocation_failures(std::uint64_t sample, Round round) {
     auto& injector = seastar::memory::local_failure_injector();
     allocation_sweep swept;
     // What a round left live beyond what it found.
     const auto run = [&](std::uint64_t at) {
         const auto before = live_objects();
-        allocation_window window{mode, at};
+        allocation_window window{at};
         injector.run_with_callback(
           [&window] { window.fail(); }, [&] { round(window); });
         window.close();
         ++swept.rounds;
         swept.failed += window.failures() != 0 ? 1 : 0;
-        swept.failures += window.failures();
         if (at == allocation_window::never) swept.points = window.points();
         const auto after = live_objects();
         return after > before ? after - before : 0;

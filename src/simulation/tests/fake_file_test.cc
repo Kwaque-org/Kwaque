@@ -837,7 +837,11 @@ SEASTAR_TEST_CASE(fake_open_allocates_handles_before_create_or_truncate) {
     BOOST_REQUIRE(created_handle.has_value());
     BOOST_CHECK(fake_file_test_access::lookup(*filesystem, file).has_value());
     BOOST_CHECK(fake_file_test_access::open_handles(*filesystem) == 1U);
-    BOOST_REQUIRE((co_await created_handle->close()).has_value());
+    // This fake runs no scheduler, so the close cannot be scheduled: the
+    // handle is released all the same, and the close says it failed.
+    const auto created_closed = co_await created_handle->close();
+    BOOST_REQUIRE(!created_closed.has_value());
+    BOOST_CHECK(created_closed.error().code() == kwaque::errc::io_failure);
     created_handle.reset();
     BOOST_CHECK(fake_file_test_access::open_handles(*filesystem) == 0U);
 
@@ -880,7 +884,11 @@ SEASTAR_TEST_CASE(fake_open_allocates_handles_before_create_or_truncate) {
     BOOST_CHECK(
       *fake_file_test_access::durable_size(*filesystem, file)
       == payload.size());
-    BOOST_REQUIRE((co_await truncated_handle->close()).has_value());
+    // This fake runs no scheduler, so the close cannot be scheduled: the
+    // handle is released all the same, and the close says it failed.
+    const auto truncated_closed = co_await truncated_handle->close();
+    BOOST_REQUIRE(!truncated_closed.has_value());
+    BOOST_CHECK(truncated_closed.error().code() == kwaque::errc::io_failure);
     truncated_handle.reset();
     BOOST_CHECK(fake_file_test_access::open_handles(*filesystem) == 0U);
     co_return;

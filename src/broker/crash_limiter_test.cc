@@ -1,5 +1,6 @@
 #include "src/base/units.h"
 #include "src/broker/crash_limiter.h"
+#include "src/broker/directory_sync.h"
 
 #include <seastar/core/abort_source.hh>
 #include <seastar/core/coroutine.hh>
@@ -60,7 +61,7 @@ seastar::future<> scripted_directory_sync(const std::filesystem::path& path) {
         directory_sync_result.reset();
         return result;
     }
-    return seastar::sync_directory(path.native());
+    return kwaque::broker::sync_directory_checked(path.native());
 }
 
 std::int64_t fixed_time() noexcept { return test_time; }

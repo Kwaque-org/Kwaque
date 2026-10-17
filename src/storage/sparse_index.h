@@ -7,6 +7,7 @@
 #include "src/storage/format_context.h"
 #include "src/storage/local_bundle.h"
 #include "src/storage/local_generation.h"
+#include "src/storage/local_paths.h"
 #include "src/storage/local_root.h"
 #include "src/storage/local_store_config.h"
 #include "src/storage/local_types.h"
@@ -588,13 +589,6 @@ seastar::future<runtime::result<active_sparse_index>> rebuild_sparse_index(
     co_return std::move(index);
 }
 
-namespace detail {
-// The failure an exception out of index work stands for: memory that could
-// not be had is not a device error.
-[[nodiscard]] runtime::operation_error
-  thrown_index_error(std::exception_ptr) noexcept;
-} // namespace detail
-
 // How many index rebuilds one shard runs at once, at most
 // maximum_sparse_index_rebuilds whatever is asked. Every segment's rebuilder
 // on the shard shares one, which outlives them. With none allowed, every
@@ -699,8 +693,7 @@ sparse_index_rebuilder::run(Work work, seastar::abort_source& caller) {
             flight_.emplace();
         } catch (...) {
             --shard_.running_;
-            co_return runtime::failure(
-              detail::thrown_index_error(std::current_exception()));
+            co_return runtime::failure(detail::recognized_or_rethrown());
         }
     } else if (flight_->waiters == maximum_waiters)
         co_return runtime::failure(detail::path_error(errc::queue_full));
@@ -711,9 +704,13 @@ sparse_index_rebuilder::run(Work work, seastar::abort_source& caller) {
     if (starts) running_ = drive(std::move(work));
     auto waited = co_await seastar::coroutine::as_future(std::move(joined));
     if (waited.failed()) {
-        // Only this caller's release ends the wait any other way.
-        waited.ignore_ready_future();
-        co_return runtime::failure(detail::path_error(errc::aborted));
+        // This caller's release, or work that threw an exception of no
+        // expected family, which every waiter is given as it is.
+        if (caller.abort_requested()) {
+            waited.ignore_ready_future();
+            co_return runtime::failure(detail::path_error(errc::aborted));
+        }
+        std::rethrow_exception(waited.get_exception());
     }
     co_return waited.get();
 }
@@ -721,19 +718,28 @@ sparse_index_rebuilder::run(Work work, seastar::abort_source& caller) {
 template<typename Work>
 seastar::future<> sparse_index_rebuilder::drive(Work work) {
     // Work reports failure in its outcome. Work that throws is a failed
-    // rebuild like any other, and its waiters are still told.
+    // rebuild like any other, and its waiters are still told: an exception
+    // of an expected family as its code, and any other as itself.
     runtime::result<void> outcome{};
+    std::exception_ptr thrown;
     auto worked = co_await seastar::coroutine::as_future(
       seastar::futurize_invoke(work, stop_));
-    if (worked.failed())
-        outcome = runtime::failure(
-          detail::thrown_index_error(worked.get_exception()));
-    else
+    if (worked.failed()) {
+        thrown = worked.get_exception();
+        if (const auto code = detail::recognized(thrown)) {
+            outcome = runtime::failure(*code);
+            thrown = nullptr;
+        }
+    } else {
         outcome = worked.get();
+    }
     auto done = std::move(flight_->done);
     flight_.reset();
     --shard_.running_;
-    done.set_value(std::move(outcome));
+    if (thrown)
+        done.set_exception(std::move(thrown));
+    else
+        done.set_value(std::move(outcome));
 }
 
 // Reads of an index object that may fail one after another, for a reason

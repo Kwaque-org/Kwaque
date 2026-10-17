@@ -38,10 +38,7 @@ struct contract_directory_cursor {
 struct contract_file_system {
     using directory_cursor_type = contract_directory_cursor;
     seastar::future<kwaque::runtime::result<directory_cursor_type>>
-      open_directory(
-        kwaque::runtime::file_path,
-        kwaque::runtime::file_close_policy
-        = kwaque::runtime::file_close_policy::legacy);
+      open_directory(kwaque::runtime::file_path);
     seastar::future<kwaque::runtime::result<kwaque::runtime::file>>
       open(kwaque::runtime::file_path, kwaque::runtime::file_open_options);
     seastar::future<kwaque::runtime::result<bool>>
@@ -64,10 +61,8 @@ struct contract_file_system {
       kwaque::runtime::file_path,
       kwaque::runtime::file_rename_policy
       = kwaque::runtime::file_rename_policy::replace);
-    seastar::future<kwaque::runtime::result<void>> sync_directory(
-      kwaque::runtime::file_path,
-      kwaque::runtime::file_close_policy
-      = kwaque::runtime::file_close_policy::legacy);
+    seastar::future<kwaque::runtime::result<void>>
+      sync_directory(kwaque::runtime::file_path);
 };
 
 struct invalid_file_system final {
@@ -80,21 +75,14 @@ struct missing_retained_sync : contract_directory_cursor {
 struct missing_sync_backend : contract_file_system {
     using directory_cursor_type = missing_retained_sync;
     seastar::future<kwaque::runtime::result<directory_cursor_type>>
-      open_directory(
-        kwaque::runtime::file_path, kwaque::runtime::file_close_policy);
+      open_directory(kwaque::runtime::file_path);
 };
 struct missing_rename_policy : contract_file_system {
     seastar::future<kwaque::runtime::result<void>>
       rename(kwaque::runtime::file_path, kwaque::runtime::file_path);
 };
-struct missing_directory_close_policy : contract_file_system {
-    seastar::future<kwaque::runtime::result<directory_cursor_type>>
-      open_directory(kwaque::runtime::file_path);
-};
 static_assert(!kwaque::runtime::file_system_backend<missing_sync_backend>);
 static_assert(!kwaque::runtime::file_system_backend<missing_rename_policy>);
-static_assert(
-  !kwaque::runtime::file_system_backend<missing_directory_close_policy>);
 
 static_assert(kwaque::runtime::file_system_backend<contract_file_system>);
 static_assert(!kwaque::runtime::file_system_backend<invalid_file_system>);

@@ -935,11 +935,7 @@ struct wal_commit_bench {
                               const auto path = take(
                                 take(local_paths::make(root))
                                   .wal(0, heads[i]->incarnation));
-                              auto file = take(
-                                co_await files.open(
-                                  path,
-                                  {.close_policy
-                                   = runtime::file_close_policy::checked}));
+                              auto file = take(co_await files.open(path, {}));
                               runtime::first_failure checked;
                               try {
                                   std::uint64_t offset = 0;

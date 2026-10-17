@@ -43,6 +43,11 @@ result<void> stall_judge::start() {
     } catch (const std::system_error&) {
         started = failure(
           operation_error{errc::resource_exhausted, operation_kind::file});
+    } catch (...) {
+        // The calling thread is a reactor's: its signals are its own again
+        // whatever the start failed with.
+        pthread_sigmask(SIG_SETMASK, &before, nullptr);
+        throw;
     }
     pthread_sigmask(SIG_SETMASK, &before, nullptr);
     return started;

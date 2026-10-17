@@ -7,6 +7,7 @@
 #include "src/storage/local_append.h"
 #include "src/storage/local_bundle.h"
 #include "src/storage/local_generation.h"
+#include "src/storage/local_paths.h"
 #include "src/storage/recovery_decision.h"
 #include "src/storage/recovery_inventory.h"
 #include "src/storage/recovery_publication.h"
@@ -411,8 +412,7 @@ seastar::future<runtime::result<local_footer_reference>> read_durable_boundary(
         files, spec.root, *path, runtime::file_kind::regular, work);
       !inspected)
         co_return runtime::failure(inspected.error());
-    auto opened = co_await files.open(
-      *path, {.close_policy = runtime::file_close_policy::checked});
+    auto opened = co_await files.open(*path, {});
     if (!opened) co_return runtime::failure(opened.error());
     auto data = std::move(*opened);
     runtime::first_failure failed;
@@ -540,8 +540,7 @@ load_checkpoint(
     if (!handle) co_return runtime::failure(handle.error());
     if (auto held = handle->try_acquire_handles(1); !held)
         co_return runtime::failure(held.error());
-    auto opened = co_await files.open(
-      *path, {.close_policy = runtime::file_close_policy::checked});
+    auto opened = co_await files.open(*path, {});
     if (!opened) co_return runtime::failure(opened.error());
     auto bundle = std::move(*opened);
     runtime::first_failure failed;
@@ -636,8 +635,7 @@ seastar::future<runtime::result<std::uint32_t>> remove_stale_checkpoints(
         files, spec.root, *directory, runtime::file_kind::directory, work);
       !inspected)
         co_return runtime::failure(inspected.error());
-    auto opened = co_await files.open_directory(
-      *directory, runtime::file_close_policy::checked);
+    auto opened = co_await files.open_directory(*directory);
     if (!opened) co_return runtime::failure(opened.error());
     auto cursor = std::move(*opened);
     std::uint32_t removed = 0;
@@ -944,6 +942,15 @@ public:
         return first_;
     }
     const runtime::first_failure& failure() const&& = delete;
+    // Tells `sink`, whether or not anyone waits for the run that found it:
+    // once, the failure that ends this owner, as the control record's; and
+    // once, a footer a cut needs that no longer reads back as its barrier
+    // made it durable, as damage of its segment. Bound before the first
+    // run; it outlives joined close().
+    void report_failures(local_failure_sink sink) noexcept {
+        assert_current();
+        failures_ = std::move(sink);
+    }
 
     // The pin table's inputs; see checkpoint_pins.
     [[nodiscard]] runtime::result<void>
@@ -1083,6 +1090,7 @@ public:
             co_await tasks_.close();
         } catch (...) {
             first_.observe(std::current_exception());
+            ended();
         }
         closed_ = true;
         co_return runtime::result<void>{};
@@ -1124,10 +1132,27 @@ private:
       , execution_(policy, abort_)
       , tasks_([this](std::exception_ptr failure) noexcept {
           first_.observe(std::move(failure));
+          ended();
       }) {}
 
     static runtime::operation_error error(errc code) noexcept {
         return detail::path_error(code);
+    }
+    // The failure that ends this owner is told once, after it is kept.
+    void ended() noexcept {
+        if (ended_told_ || !first_.failed() || !failures_) return;
+        ended_told_ = true;
+        auto detail = runtime::file_failure_detail::unknown;
+        if (first_.error())
+            if (const auto found = runtime::file_detail(*first_.error()))
+                detail = *found;
+        failures_(
+          local_storage_failure{
+            local_storage_path::control,
+            std::nullopt,
+            first_,
+            detail,
+            std::nullopt});
     }
     // A detaching segment's final footer, from the append owner.
     runtime::result<void>
@@ -1135,7 +1160,9 @@ private:
         try {
             return pins_.observe(boundary);
         } catch (...) {
-            return runtime::failure(error(errc::resource_exhausted));
+            const auto answer = detail::answer_thrown(first_);
+            ended();
+            return runtime::failure(answer);
         }
     }
 
@@ -1226,6 +1253,12 @@ private:
                 outcome = co_await run();
             } catch (...) {
                 thrown = std::current_exception();
+                // One of no expected family ends this owner, whether or not
+                // anyone waits for this run.
+                if (!detail::recognized(thrown)) {
+                    first_.observe(thrown);
+                    ended();
+                }
             }
             publishing_ = false;
             auto served = std::move(*serving_);
@@ -1303,6 +1336,21 @@ private:
             if (cut->installed() < cut->refresh().size())
                 unpinned_.emplace(
                   cut->refresh()[cut->installed()].history.segment);
+            const auto code = pinned.error().code();
+            if (
+              (code == errc::corrupt_data || code == errc::malformed_data)
+              && failures_ && !damage_told_) {
+                damage_told_ = true;
+                runtime::first_failure damage;
+                damage.observe(pinned.error());
+                failures_(
+                  local_storage_failure{
+                    local_storage_path::damage,
+                    unpinned_,
+                    damage,
+                    runtime::file_failure_detail::unknown,
+                    std::nullopt});
+            }
             co_return runtime::failure(pinned.error());
         }
         unpinned_.reset();
@@ -1377,7 +1425,10 @@ private:
         if (
           updated.failure.failed()
           || updated.disposition != local_publication_disposition::durable) {
-            if (head_.fenced()) first_.observe(error(errc::closed));
+            if (head_.fenced()) {
+                first_.observe(error(errc::closed));
+                ended();
+            }
             // An update that touched nothing leaves the bundle referenced by
             // nothing, so it goes; after anything else it may be the head.
             if (
@@ -1392,9 +1443,10 @@ private:
         // Durable: the cut is the table, and what only the previous
         // checkpoint kept may go.
         const auto entries = static_cast<std::uint32_t>(cut->entries().size());
-        if (auto adopted = pins_.adopt(std::move(*cut)); !adopted)
+        if (auto adopted = pins_.adopt(std::move(*cut)); !adopted) {
             first_.observe(adopted.error());
-        else
+            ended();
+        } else
             pins_.continue_from(reference);
         if (replaced) owe(replaced->sequence());
         co_await settle_debts();
@@ -1480,6 +1532,8 @@ private:
     std::array<std::uint64_t, 8> debt_{};
     std::uint32_t debts_{0}, holds_{0};
     runtime::first_failure first_;
+    local_failure_sink failures_;
+    bool ended_told_{false}, damage_told_{false};
     std::optional<segment_context> unpinned_;
     bool running_{false}, publishing_{false}, closing_{false}, closed_{false};
     // A run was asked for that publishes for covered entries alone.

@@ -236,8 +236,7 @@ private:
         auto checked = co_await inspect_local_path(
           files_, spec_.root, path, runtime::file_kind::directory, work_);
         if (!checked) co_return checked;
-        auto opened = co_await files_.open_directory(
-          path, runtime::file_close_policy::checked);
+        auto opened = co_await files_.open_directory(path);
         if (!opened) co_return runtime::failure(opened.error());
         auto& next = frames_[depth_++];
         next.path = std::move(path);

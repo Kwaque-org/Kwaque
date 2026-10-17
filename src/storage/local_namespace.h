@@ -140,8 +140,7 @@ seastar::future<runtime::result<local_inventory_progress>> walk_local_namespace(
         auto checked = co_await inspect_local_path(
           files, spec.root, path, runtime::file_kind::directory, work);
         if (!checked) co_return checked;
-        auto cursor = co_await files.open_directory(
-          path, runtime::file_close_policy::checked);
+        auto cursor = co_await files.open_directory(path);
         if (!cursor) co_return runtime::failure(cursor.error());
         auto& current = frames[depth++];
         current.path.emplace(std::move(path));

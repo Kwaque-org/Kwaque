@@ -43,6 +43,7 @@
 
 #include <cstdint>
 #include <exception>
+#include <initializer_list>
 #include <memory>
 #include <new>
 #include <optional>
@@ -290,7 +291,8 @@ public:
         return state_ == engine_state::ready ? placement_.get() : nullptr;
     }
     // Why the shard stopped serving, when a failure did it: the first
-    // failure of the WAL, which is on the control device.
+    // failure of the WAL or of the control record, both on the control
+    // device, or of the append owner's own work.
     [[nodiscard]] const runtime::first_failure& failure() const& noexcept {
         assert_current();
         return failed_;
@@ -387,10 +389,16 @@ public:
         } catch (...) {
             kept.observe(std::current_exception());
         }
-        const auto outcome = detail::settled(kept);
         state_ = engine_state::stopped;
         auto ended = std::move(*stopping_);
         stopping_.reset();
+        // An exception of no operational family leaves as itself, to this
+        // caller and to every stop that joined it.
+        if (kept.exception() && !detail::recognized(kept.exception())) {
+            ended.set_exception(kept.exception());
+            std::rethrow_exception(kept.exception());
+        }
+        const auto outcome = detail::settled(kept);
         ended.set_value(outcome);
         co_return outcome;
     }
@@ -424,8 +432,27 @@ private:
             return seastar::make_ready_future<runtime::result<bool>>(true);
         }
     };
+    // Arrays a restart keeps, each one allocation of the given bytes, charged
+    // to maintenance under one reservation.
+    runtime::result<workload_reservation>
+    reserve_restart(std::initializer_list<std::size_t> arrays) {
+        byte_count total;
+        for (const auto bytes : arrays) {
+            if (bytes == 0) continue;
+            auto charged = maintenance_.allocation_charge(byte_count{bytes});
+            if (!charged) return runtime::failure(charged.error());
+            auto next = total.checked_add(*charged);
+            if (!next)
+                return runtime::failure(detail::path_error(errc::out_of_range));
+            total = *next;
+        }
+        return maintenance_.try_reserve(total);
+    }
+
     // What a restart read and established before the append owner exists.
     struct restarted final {
+        // Declared first: released after the rows it pays for.
+        workload_reservation held;
         recovery_inventory inventory;
         std::vector<recovery_obligation> rows;
         std::optional<loaded_checkpoint> durable;
@@ -549,10 +576,12 @@ private:
         const auto oldest = append_->retained_wal().oldest();
         if (!oldest)
             co_return runtime::failure(detail::path_error(errc::closed));
+        // A file the WAL holds, at a position its own cursor was made with.
         const auto origin = local_wal_cursor::make(*oldest, data_start);
-        if (!origin)
-            co_return runtime::failure(
-              detail::path_error(errc::invariant_violation));
+        KWAQUE_INVARIANT(
+          invariant_id{"KQ-ENGINE-WAL-ORIGIN"},
+          origin.has_value(),
+          "the WAL's oldest file and its data start made no cursor");
         auto checkpoint = checkpoint_type::make(
           files_,
           ownership_,
@@ -568,6 +597,10 @@ private:
           *origin);
         if (!checkpoint) co_return runtime::failure(checkpoint.error());
         checkpoint_ = std::move(*checkpoint);
+        checkpoint_->report_failures(
+          [this](const local_storage_failure& failure) noexcept {
+              failed_storage(failure);
+          });
         if (recovered) {
             if (recovered->durable)
                 if (
@@ -623,6 +656,10 @@ private:
           config_.table);
         if (!table) co_return runtime::failure(table.error());
         table_ = std::move(*table);
+        table_->report_failures(
+          [this](const local_storage_failure& failure) noexcept {
+              failed_storage(failure);
+          });
         if (rolls)
             if (
               auto telling = table_->report_rolls(timer, std::move(rolls));
@@ -654,11 +691,36 @@ private:
       codec::cooperative_work& work,
       engine_start& report) {
         using output = runtime::result<std::optional<restarted>>;
+        // What a restart collects is reserved before anything is read, each
+        // in one allocation charged to maintenance, so that none grows: the
+        // catalog's descriptors, every decision discovery may find and every
+        // obligation row the merge may deliver. A catalog longer than one
+        // restart reads is refused here.
+        if (catalog.size() > maximum_recovery_catalog)
+            co_return output{
+              runtime::failure(detail::path_error(errc::out_of_range))};
+        auto collected = reserve_restart(
+          {catalog.size() * sizeof(local_segment_descriptor),
+           std::size_t{config_.decisions.decisions}
+             * sizeof(recovery_decision_record)});
+        if (!collected) co_return output{runtime::failure(collected.error())};
+        auto delivered = reserve_restart(
+          {std::size_t{config_.merge.obligations}
+           * sizeof(recovery_obligation)});
+        if (!delivered) co_return output{runtime::failure(delivered.error())};
         std::vector<local_segment_descriptor> descriptors;
-        descriptors.reserve(catalog.size());
+        std::vector<recovery_decision_record> decided;
+        std::vector<recovery_obligation> rows;
+        try {
+            descriptors.reserve(catalog.size());
+            decided.reserve(config_.decisions.decisions);
+            rows.reserve(config_.merge.obligations);
+        } catch (const std::bad_alloc&) {
+            co_return output{
+              runtime::failure(detail::path_error(errc::resource_exhausted))};
+        }
         for (const auto& listed : catalog)
             descriptors.push_back(listed.descriptor);
-        std::vector<recovery_decision_record> decided;
         const auto discovered = co_await discover_recovery_decisions(
           files_,
           ownership_,
@@ -670,13 +732,9 @@ private:
           config_.decisions,
           work,
           [&decided](const recovery_decision_record& value) {
-              try {
-                  decided.push_back(value);
-              } catch (const std::bad_alloc&) {
-                  return seastar::make_ready_future<runtime::result<bool>>(
-                    runtime::failure(
-                      detail::path_error(errc::resource_exhausted)));
-              }
+              // Discovery delivers no more than the limit it was given,
+              // which the array was reserved for.
+              decided.push_back(value);
               return seastar::make_ready_future<runtime::result<bool>>(true);
           });
         if (!discovered) co_return output{runtime::failure(discovered.error())};
@@ -691,8 +749,8 @@ private:
           config_.metadata,
           work);
         if (!found) co_return output{runtime::failure(found.error())};
-        restarted read{std::move(*found), {}, {}, {}};
-        read.rows.reserve(read.inventory.targets.size());
+        restarted read{
+          std::move(*delivered), std::move(*found), std::move(rows), {}, {}};
         for (const auto& entry : read.inventory.entries) {
             if (entry.state == recovery_entry_state::sealing) ++report.sealing;
             if (entry.refused) ++report.refused;
@@ -831,17 +889,31 @@ private:
         }
     }
 
-    // The WAL's first failure ends what the shard can make durable: it is
-    // kept, and whoever composes the process is told.
+    // The first failure of the WAL, of the control record or of the append
+    // owner's own work ends what the shard can make durable: it is kept. A
+    // segment writer's failure fails its segment and, by its cause, its
+    // device. Damage found in committed data changes nothing here. Each is
+    // then told to whoever composes the process, which decides what the
+    // process does.
     void failed_storage(const local_storage_failure& failure) noexcept {
-        if (failure.path == local_storage_path::wal && !failed_.failed())
-            failed_ = failure.failure;
-        // The segment's own failure first: its device's then fails the
-        // segments beside it, and finds this one failed with what it said.
-        if (table_ && failure.segment)
-            table_->fail(*failure.segment, failure.failure);
-        if (placement_ && failure.device)
-            placement_->failed(*failure.device, failure.detail);
+        switch (failure.path) {
+        case local_storage_path::wal:
+        case local_storage_path::control:
+        case local_storage_path::internal:
+            if (!failed_.failed()) failed_ = failure.failure;
+            break;
+        case local_storage_path::segment:
+            // The segment's own failure first: its device's then fails the
+            // segments beside it, and finds this one failed with what it
+            // said.
+            if (table_ && failure.segment)
+                table_->fail(*failure.segment, failure.failure);
+            if (placement_ && failure.device)
+                placement_->failed(*failure.device, failure.detail);
+            break;
+        case local_storage_path::damage:
+            break;
+        }
         if (failures_) failures_(failure);
     }
 

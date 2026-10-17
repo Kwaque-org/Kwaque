@@ -55,8 +55,7 @@ seastar::future<> with_file(Func body) {
                         (directory.get_path() / "completion").string())),
                     {.access = runtime::file_access::read_write,
                      .create = true,
-                     .exclusive = true,
-                     .close_policy = runtime::file_close_policy::checked}));
+                     .exclusive = true}));
                 std::exception_ptr failure;
                 try {
                     co_await body(manager, file);

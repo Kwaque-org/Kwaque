@@ -231,8 +231,7 @@ seastar::future<runtime::result<runtime::file>> open_local_segment_data(
         files, spec.root, *path, runtime::file_kind::regular, work);
       !inspected)
         co_return runtime::failure(inspected.error());
-    co_return co_await files.open(
-      *path, {.close_policy = runtime::file_close_policy::checked});
+    co_return co_await files.open(*path, {});
 }
 
 // The walk behind scan_local_segment and verify_local_segment_extent: opens

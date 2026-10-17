@@ -1155,8 +1155,7 @@ seastar::future<> device_watched(
         path,
         {.access = runtime::file_access::read_write,
          .create = true,
-         .truncate = true,
-         .close_policy = runtime::file_close_policy::checked})));
+         .truncate = true})));
     runtime::first_failure failed;
     try {
         require(

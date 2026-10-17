@@ -1,5 +1,6 @@
 #pragma once
 
+#include "src/base/allocation.h"
 #include "src/base/invariant.h"
 #include "src/base/units.h"
 #include "src/storage/local_id_allocator.h"
@@ -301,10 +302,17 @@ load_recovery_decision(
 }
 } // namespace detail
 
+// The most decisions held at once. Whoever holds them, the log or a restart,
+// holds them in one array, which is one allocation, less what a charge
+// profile adds to it.
+inline constexpr std::uint32_t maximum_recovery_decisions
+  = (maximum_contiguous_allocation_bytes - 64)
+    / sizeof(recovery_decision_record);
+
 struct recovery_decision_limits final {
     local_store_io_limits metadata{};
     // Decisions held for replay and conflict checks.
-    std::uint32_t decisions{1024};
+    std::uint32_t decisions{maximum_recovery_decisions};
     [[nodiscard]] runtime::result<void> validate() const noexcept;
 };
 

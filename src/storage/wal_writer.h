@@ -1698,9 +1698,7 @@ private:
             co_return runtime::failure(detail::path_error(errc::closed));
         if (!slot.file) {
             auto opened = co_await files.open(
-              *slot.path,
-              {.access = runtime::file_access::read_write,
-               .close_policy = runtime::file_close_policy::checked});
+              *slot.path, {.access = runtime::file_access::read_write});
             if (!opened) {
                 slot.retryable = admission_pressure(opened.error());
                 co_return runtime::failure(opened.error());
@@ -2048,9 +2046,7 @@ private:
           !inspected)
             co_return inspected;
         auto opened = co_await files.open(
-          *path,
-          {.access = runtime::file_access::read_only,
-           .close_policy = runtime::file_close_policy::checked});
+          *path, {.access = runtime::file_access::read_only});
         if (!opened) co_return runtime::failure(opened.error());
         auto file = std::move(*opened);
         runtime::first_failure failed;
@@ -2308,9 +2304,7 @@ private:
         }
         auto opened = co_await control_.files_.open(
           *slot.path,
-          {.access = runtime::file_access::read_write,
-           .close_policy = runtime::file_close_policy::checked,
-           .synchronous = true});
+          {.access = runtime::file_access::read_write, .synchronous = true});
         if (!opened) co_return runtime::failure(opened.error());
         slot.sync.emplace(std::move(*opened));
         if (

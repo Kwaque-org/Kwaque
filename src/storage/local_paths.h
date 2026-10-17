@@ -6,7 +6,13 @@
 #include "src/runtime/first_failure.h"
 #include "src/storage/local_types.h"
 
+#include <seastar/core/abort_source.hh>
+#include <seastar/core/condition-variable.hh>
 #include <seastar/core/coroutine.hh>
+#include <seastar/core/file.hh>
+#include <seastar/core/gate.hh>
+#include <seastar/core/semaphore.hh>
+#include <seastar/core/timed_out_error.hh>
 
 #include <exception>
 #include <new>
@@ -108,20 +114,61 @@ namespace detail {
 inline runtime::operation_error path_error(errc code) noexcept {
     return runtime::operation_error{code, runtime::operation_kind::file};
 }
+// The code of an exception from a family an operation expects: an
+// allocation that failed, a wait that was aborted or cancelled, work turned
+// away because its owner closed, a deadline. Nothing for any other, which
+// is no operational failure and leaves as itself wherever it can.
+inline std::optional<runtime::operation_error>
+recognized(const std::exception_ptr& kept) noexcept {
+    try {
+        std::rethrow_exception(kept);
+    } catch (const std::bad_alloc&) {
+        return path_error(errc::resource_exhausted);
+    } catch (const seastar::abort_requested_exception&) {
+        return path_error(errc::aborted);
+    } catch (const seastar::cancelled_error&) {
+        return path_error(errc::aborted);
+    } catch (const seastar::gate_closed_exception&) {
+        return path_error(errc::closed);
+    } catch (const seastar::broken_condition_variable&) {
+        return path_error(errc::closed);
+    } catch (const seastar::broken_semaphore&) {
+        return path_error(errc::closed);
+    } catch (const seastar::timed_out_error&) {
+        return path_error(errc::timed_out);
+    } catch (const seastar::condition_variable_timed_out&) {
+        return path_error(errc::timed_out);
+    } catch (...) {
+        return std::nullopt;
+    }
+}
+// Inside a handler: the code of the exception it handles when its family is
+// recognized. Any other leaves as itself.
+[[nodiscard]] inline runtime::operation_error recognized_or_rethrown() {
+    if (auto code = recognized(std::current_exception())) return *code;
+    throw;
+}
+// Inside a handler, where an answer is owed and nothing may be thrown: the
+// code of a recognized exception. Any other is kept in `keep` as itself,
+// for whoever closes its owner, and answered as an internal failure.
+[[nodiscard]] inline runtime::operation_error
+answer_thrown(runtime::first_failure& keep) noexcept {
+    const auto thrown = std::current_exception();
+    if (auto code = recognized(thrown)) return *code;
+    keep.observe(thrown);
+    return path_error(errc::invariant_violation);
+}
 // What a kept first failure answers with where an answer is owed and nothing
-// may be thrown: an exception is answered as a failure, and whoever joined
-// the attempt is told.
+// may be thrown, and whoever joined the attempt is told: a recognized
+// exception as its code, and any other as an internal failure, never as an
+// I/O failure its device did not have. The exception itself stays with
+// whoever kept it.
 inline runtime::result<void>
 settled(const runtime::first_failure& kept) noexcept {
     if (const auto& error = kept.error()) return runtime::failure(*error);
     if (!kept.exception()) return {};
-    try {
-        std::rethrow_exception(kept.exception());
-    } catch (const std::bad_alloc&) {
-        return runtime::failure(path_error(errc::resource_exhausted));
-    } catch (...) {
-        return runtime::failure(path_error(errc::io_failure));
-    }
+    return runtime::failure(recognized(kept.exception())
+                              .value_or(path_error(errc::invariant_violation)));
 }
 inline seastar::future<runtime::result<void>>
 path_checkpoint(codec::cooperative_work& work) {
@@ -233,8 +280,7 @@ seastar::future<runtime::result<void>> walk_local_buckets(
                 failed.observe(inspected);
                 break;
             }
-            auto opened = co_await files.open_directory(
-              root, runtime::file_close_policy::checked);
+            auto opened = co_await files.open_directory(root);
             if (!opened) {
                 failed.observe(opened);
                 break;
@@ -278,8 +324,7 @@ seastar::future<runtime::result<void>> walk_local_buckets(
                         failed.observe(inspected);
                         break;
                     }
-                    opened = co_await files.open_directory(
-                      *parent, runtime::file_close_policy::checked);
+                    opened = co_await files.open_directory(*parent);
                     if (!opened) {
                         failed.observe(opened);
                         break;

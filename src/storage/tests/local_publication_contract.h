@@ -43,9 +43,7 @@ inline bytes::fragmented_buffer payload(char c) {
 template<runtime::file_system_backend Files, typename Driver>
 seastar::future<> check_contents(
   Files& files, runtime::file_path path, Driver drive, char expected) {
-    auto file = take(
-      co_await drive.lifecycle(files.open(
-        path, {.close_policy = runtime::file_close_policy::checked})));
+    auto file = take(co_await drive.lifecycle(files.open(path, {})));
     runtime::first_failure first;
     try {
         auto data = take(
@@ -71,8 +69,7 @@ seastar::future<> run(
     auto parent = root.value().substr(0, root.value().rfind('/'));
     take(
       co_await drive.lifecycle(files.sync_directory(
-        take(runtime::file_path::make(parent.empty() ? "/" : parent)),
-        runtime::file_close_policy::checked)));
+        take(runtime::file_path::make(parent.empty() ? "/" : parent)))));
     auto name = take(runtime::file_name::make("control"));
     const auto path = take(local_child_path(root, name));
     seastar::abort_source abort;
@@ -110,8 +107,7 @@ seastar::future<> run(
         collision_path,
         {.access = runtime::file_access::read_write,
          .create = true,
-         .exclusive = true,
-         .close_policy = runtime::file_close_policy::checked})));
+         .exclusive = true})));
     take(co_await drive.lifecycle(collision.close()));
     local_file_publisher<Files> replace{
       files,
@@ -231,8 +227,7 @@ seastar::future<> walk(Files& files, runtime::file_path root, Driver drive) {
             path,
             {.access = runtime::file_access::read_write,
              .create = true,
-             .exclusive = true,
-             .close_policy = runtime::file_close_policy::checked})));
+             .exclusive = true})));
         take(co_await drive.lifecycle(file.close()));
         expected.insert(path.value());
     }

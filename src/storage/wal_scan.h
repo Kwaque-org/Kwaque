@@ -1,5 +1,6 @@
 #pragma once
 
+#include "src/base/invariant.h"
 #include "src/base/units.h"
 #include "src/codec/transaction.h"
 #include "src/storage/local_discovery.h"
@@ -309,9 +310,12 @@ seastar::future<runtime::result<wal_scan_result>> scan_local_wal(
       bounds);
     if (!walked) co_return runtime::failure(walked.error());
     wal_scan_result output;
-    if (!walked->complete)
-        co_return runtime::failure(
-          detail::path_error(errc::invariant_violation));
+    // Only a visitor that stops leaves a walk incomplete, and this one
+    // never stops.
+    KWAQUE_INVARIANT(
+      invariant_id{"KQ-WAL-SCAN-COMPLETE"},
+      walked->complete,
+      "the WAL chain walk stopped short");
     if (chain.empty()) {
         output.complete = true;
         co_return output;
@@ -357,8 +361,7 @@ seastar::future<runtime::result<wal_scan_result>> scan_local_wal(
             files, spec.root, *path, runtime::file_kind::regular, work);
           !inspected)
             co_return runtime::failure(inspected.error());
-        auto opened = co_await files.open(
-          *path, {.close_policy = runtime::file_close_policy::checked});
+        auto opened = co_await files.open(*path, {});
         if (!opened) co_return runtime::failure(opened.error());
         auto file = std::move(*opened);
         runtime::first_failure failed;

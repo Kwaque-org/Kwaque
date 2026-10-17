@@ -294,7 +294,7 @@ private:
             try {
                 if (next) slept = co_await sleep_(timer_, *next, abort_);
             } catch (...) {
-                slept = runtime::failure(detail::path_error(errc::io_failure));
+                slept = runtime::failure(detail::answer_thrown(ended_));
             }
             // Its timer stopped: no sample follows, the shards' shares go
             // stale, and why is kept.

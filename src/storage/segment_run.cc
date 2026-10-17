@@ -8,6 +8,7 @@
 #include "src/codec/error.h"
 #include "src/codec/format_registry.h"
 #include "src/codec/transaction.h"
+#include "src/runtime/file_error.h"
 #include "src/storage/format_context.h"
 #include "src/storage/segment_format.h"
 
@@ -60,6 +61,26 @@ runtime::operation_error object_error(errc code, bool first) noexcept {
     default:
         return run_error(errc::malformed_data);
     }
+}
+// Whether a read failed because its device did: an I/O error, a read-only
+// filesystem, a device that is gone.
+bool device_failed(const runtime::operation_error& why) noexcept {
+    const auto detail = runtime::file_detail(why);
+    if (!detail) return false;
+    switch (*detail) {
+    case runtime::file_failure_detail::device_io:
+    case runtime::file_failure_detail::read_only:
+    case runtime::file_failure_detail::device_gone:
+        return true;
+    case runtime::file_failure_detail::unknown:
+    case runtime::file_failure_detail::no_space:
+    case runtime::file_failure_detail::descriptor_limit:
+    case runtime::file_failure_detail::permission:
+    case runtime::file_failure_detail::admission_not_dispatched:
+    case runtime::file_failure_detail::quota:
+        return false;
+    }
+    return false;
 }
 // Whether the cache answered that it does not keep a run: there was no room
 // for it, or it is more than the cache keeps in one value.
@@ -473,6 +494,21 @@ void segment_runs::touch() noexcept {
     wanted_ = true;
 }
 
+void segment_runs::read_failed(const runtime::operation_error& why) noexcept {
+    assert_current();
+    if (!config_.failed) return;
+    // A checksum that fails, or bytes that are not what they say, where a
+    // barrier made them durable.
+    const bool damage = why.code() == errc::corrupt_data
+                        || why.code() == errc::malformed_data;
+    const bool device = !damage && device_failed(why);
+    if (!damage && !device) return;
+    auto& told = damage ? damage_told_ : device_told_;
+    if (told) return;
+    told = true;
+    config_.failed(why);
+}
+
 void segment_runs::establish(std::uint32_t readers) noexcept {
     assert_current();
     established_ = readers;
@@ -497,7 +533,7 @@ void segment_runs::stir() noexcept {
 seastar::future<> segment_runs::settled() {
     assert_current();
     while (!closing_ && (stirring_ || !waiting_.empty()))
-        co_await idle_.wait();
+        co_await idle_.when();
 }
 
 std::optional<segment_tail>
@@ -766,7 +802,10 @@ segment_runs::observer(active_sparse_index& index) noexcept {
       },
       [this](
         runtime::file_position begin,
-        bytes::fragmented_buffer& bytes) noexcept { feed(begin, bytes); },
+        bytes::fragmented_buffer& bytes,
+        const workload_reservation& paid) noexcept {
+          feed(begin, bytes, paid);
+      },
       &wanted_};
 }
 
@@ -795,7 +834,9 @@ void segment_runs::drop() noexcept {
 }
 
 void segment_runs::feed(
-  runtime::file_position begin, bytes::fragmented_buffer& bytes) noexcept {
+  runtime::file_position begin,
+  bytes::fragmented_buffer& bytes,
+  const workload_reservation& paid) noexcept {
     assert_current();
     // The time is looked at here, once a group: a segment nobody reads any
     // more stops being fed with the next thing written to it.
@@ -821,7 +862,8 @@ void segment_runs::feed(
     }
     try {
         waiting_.push_back(
-          fed_group{begin, bytes.share(), std::move(noted_), gap_});
+          fed_group{
+            begin, paid.share(), bytes.share(), std::move(noted_), gap_});
     } catch (...) {
         drop();
         return;

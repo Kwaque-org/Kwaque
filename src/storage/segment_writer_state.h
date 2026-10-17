@@ -175,9 +175,13 @@ struct segment_block_observer final {
     // whoever keeps what was just written for those reading behind the
     // writer. Called only while `*wanted` is true, which costs a segment
     // nobody reads one branch. The bytes are borrowed for the call and may
-    // be shared: nothing here waits, copies or fails.
+    // be shared: nothing here waits, copies or fails. The reservation is
+    // what the bytes are charged to: whoever keeps a share of them keeps a
+    // share of it, so that they stay charged for as long as they live.
     seastar::noncopyable_function<void(
-      runtime::file_position, bytes::fragmented_buffer&) noexcept>
+      runtime::file_position,
+      bytes::fragmented_buffer&,
+      const workload_reservation&) noexcept>
       fed{};
     const bool* wanted{nullptr};
 };

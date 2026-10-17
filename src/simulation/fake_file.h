@@ -221,9 +221,7 @@ class fake_file_system final : public runtime::shard_affine {
 public:
     using directory_cursor_type = fake_directory_cursor;
     [[nodiscard]] seastar::future<runtime::result<fake_directory_cursor>>
-    open_directory(
-      runtime::file_path path,
-      runtime::file_close_policy policy = runtime::file_close_policy::legacy);
+    open_directory(runtime::file_path path);
     [[nodiscard]] static runtime::result<canonical_fake_path>
     validate_config(const fake_file_system_config& config);
 
@@ -274,9 +272,11 @@ public:
       runtime::file_path destination,
       runtime::file_rename_policy policy
       = runtime::file_rename_policy::replace);
-    [[nodiscard]] seastar::future<runtime::result<void>> sync_directory(
-      runtime::file_path path,
-      runtime::file_close_policy policy = runtime::file_close_policy::legacy);
+    // One operation: the open, flush and close of the directory at one
+    // instant, so no rename can come between them. Its failure stands for
+    // any of the three, its effect for a flush that took effect.
+    [[nodiscard]] seastar::future<runtime::result<void>>
+    sync_directory(runtime::file_path path);
     [[nodiscard]] seastar::future<runtime::result<void>> crash();
     [[nodiscard]] seastar::future<runtime::result<void>> stop();
     [[nodiscard]] fake_file_system_state state() const {
@@ -500,14 +500,9 @@ private:
         std::uint64_t generation{0};
     };
 
-    seastar::future<runtime::result<void>>
-    sync_directory_checked(runtime::file_path path);
-
     struct pending_open final {
         seastar::file native;
         runtime::operation_statistics_owner statistics;
-        runtime::file_close_policy close_policy{
-          runtime::file_close_policy::legacy};
         runtime::file_flight_ptr flight{};
 
         [[nodiscard]] runtime::file publish() && {
@@ -515,7 +510,6 @@ private:
               std::move(native),
               runtime::file_io_limits{},
               std::move(statistics),
-              close_policy,
               std::move(flight)};
         }
     };

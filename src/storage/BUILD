@@ -417,6 +417,7 @@ kwaque_cc_library(
     visibility = ["//src/storage/tests:__pkg__"],
     deps = [
         ":cache_policy",
+        ":local_paths",
         ":workload_budget",
         "//src/base",
         "//src/base:error",
@@ -1414,6 +1415,7 @@ kwaque_cc_library(
         "//src/codec:limits",
         "//src/model:position",
         "//src/runtime:error",
+        "//src/runtime:file_error",
         "//src/runtime:file_position",
         "//src/runtime:first_failure",
         "//src/runtime:shard_affinity",

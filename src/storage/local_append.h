@@ -274,22 +274,34 @@ struct local_detached final {
     std::optional<local_durable_boundary> boundary;
 };
 
-// The first storage failure of the WAL or of one segment owner.
-enum class local_storage_path : std::uint8_t { wal, segment };
+// Where a storage failure arose: the WAL; one segment owner's writer; the
+// control record, which the checkpoint owner publishes through; a segment's
+// committed data, found not to be what a barrier made durable there: its
+// checksums fail, or its bytes are not what they say; or the append owner's
+// own work, which ended in a way no operation expects.
+enum class local_storage_path : std::uint8_t {
+    wal,
+    segment,
+    control,
+    damage,
+    internal,
+};
 struct local_storage_failure final {
     local_storage_path path;
-    // The failed segment, for a segment failure.
+    // The segment, for a segment failure, and for damage when its finder
+    // knows which.
     std::optional<segment_context> segment;
     runtime::first_failure failure;
     // From the file failure; unknown when the failure carries none.
     runtime::file_failure_detail detail{runtime::file_failure_detail::unknown};
-    // The data device the failed segment is on. None for the WAL, which is
-    // on the control device.
+    // The data device the segment is on. None for the WAL and the control
+    // record, which are on the control device.
     std::optional<device_store_id> device{};
 };
-// Receives the first storage failure once, on the owner's shard, after the
-// owner's state is consistent, so it may call back into the owner. It must not
-// throw. Stopping admission, isolating or stopping is the caller's policy.
+// Receives the WAL's first storage failure, and each segment's, once each, on
+// the owner's shard, after the owner's state is consistent, so it may call
+// back into the owner. It must not throw. Stopping admission, isolating or
+// stopping is the caller's policy; so is what damage means.
 using local_failure_sink
   = seastar::noncopyable_function<void(const local_storage_failure&) noexcept>;
 
@@ -509,6 +521,7 @@ public:
         slot.device = segment.device();
         slot.stop = false;
         slot.quiet = false;
+        slot.reported = false;
         slot.looping = true;
         // A native allocation failure throws, with the slot left free.
         std::optional<seastar::future<>> loop;
@@ -897,8 +910,8 @@ public:
             if (slot.writer && slot.durable) visit(*slot.durable);
     }
 
-    // The first storage failure of the WAL or of an attached segment, also
-    // reported once through the sink. Requests keep their own outcomes.
+    // The first storage failure reported through the sink, of the WAL or of
+    // an attached segment. Requests keep their own outcomes.
     [[nodiscard]] const std::optional<local_storage_failure>&
     storage_failure() const& noexcept {
         assert_current();
@@ -1081,7 +1094,7 @@ public:
             // Acceptances in progress finish: rejected, or forming.
             co_await operations_.close();
             maybe_form();
-            co_await drained_.wait(
+            co_await drained_.when(
               [this] { return formations_ == 0 && groups_ == 0; });
             // Pressure with nothing in flight left these unformed.
             if (!forming_.empty()) fail_forming(reason(error(errc::closed)));
@@ -1092,7 +1105,7 @@ public:
         unquiet_ = true;
         try {
             quiet_.broadcast();
-            co_await drained_.wait([this] { return quiescing_ == 0; });
+            co_await drained_.when([this] { return quiescing_ == 0; });
         } catch (...) {
             close_outcome_.observe(std::current_exception());
         }
@@ -1193,6 +1206,8 @@ private:
         bool looping{false}, stop{false};
         // quiesce() closed this attachment's admission.
         bool quiet{false};
+        // Its writer's failure was reported.
+        bool reported{false};
     };
     struct group_state final {
         group_state(
@@ -1265,7 +1280,17 @@ private:
       , sink_(std::move(sink))
       , pressure_sink_(std::move(pressure))
       , tasks_([this](std::exception_ptr failure) noexcept {
-          first_.observe(std::move(failure));
+          first_.observe(failure);
+          // A worker of every append ended: whoever composes the shard is
+          // told now, not at close.
+          if (sink_ && !internal_reported_) {
+              internal_reported_ = true;
+              runtime::first_failure ended;
+              ended.observe(std::move(failure));
+              sink_(
+                local_storage_failure{
+                  local_storage_path::internal, std::nullopt, ended});
+          }
       }) {}
 
     // An empty table with room for `count`. Every table is made before the
@@ -1316,33 +1341,40 @@ private:
         maybe_form();
     }
 
-    // Latches the first storage failure and reports it once, after the
-    // caller's state changes are complete.
+    // Reports the WAL's first storage failure, and each attachment's, once
+    // each, after the caller's state changes are complete: a segment's
+    // failure sets its device aside and the WAL's ends what the shard can
+    // make durable, so neither may hide the other. The first of them all is
+    // kept.
     void observe_storage(
+      bool& reported,
       local_storage_path path,
       const std::optional<segment_context>& segment,
       const runtime::first_failure& failure,
       std::optional<device_store_id> device = std::nullopt) noexcept {
-        if (!failure.failed() || storage_failure_) return;
+        if (!failure.failed() || reported) return;
+        reported = true;
         auto detail = runtime::file_failure_detail::unknown;
         if (failure.error()) {
             if (auto found = runtime::file_detail(*failure.error()))
                 detail = *found;
         }
-        storage_failure_.emplace(
-          local_storage_failure{path, segment, failure, detail, device});
-        if (sink_) sink_(*storage_failure_);
+        const local_storage_failure observed{
+          path, segment, failure, detail, device};
+        if (!storage_failure_) storage_failure_.emplace(observed);
+        if (sink_) sink_(observed);
     }
-    // The WAL owners latch their own storage failures; this owner reports the
-    // first. Every later group needs the same WAL, so this owner latches it
-    // too and refuses later requests on entry.
+    // The WAL owners latch their own storage failures; this owner reports
+    // the WAL's. Every later group needs the same WAL, so this owner latches
+    // it too and refuses later requests on entry.
     void observe_wal() noexcept {
         const auto& failed = commit_.storage_failure().failed()
                                ? commit_.storage_failure()
                                : writer_.failure();
         if (!failed.failed()) return;
         detail::merge_failure(first_, failed);
-        observe_storage(local_storage_path::wal, std::nullopt, failed);
+        observe_storage(
+          wal_reported_, local_storage_path::wal, std::nullopt, failed);
     }
     bool
     rotation_pressure(const runtime::operation_error& refused) const noexcept {
@@ -1350,9 +1382,10 @@ private:
                 || refused.code() == errc::resource_exhausted)
                && !commit_.failure().failed() && !writer_.failure().failed();
     }
-    void observe_segment(const segment_slot& slot) noexcept {
+    void observe_segment(segment_slot& slot) noexcept {
         if (slot.writer && slot.writer->failure().failed())
             observe_storage(
+              slot.reported,
               local_storage_path::segment,
               slot.segment,
               slot.writer->failure(),
@@ -1951,8 +1984,12 @@ private:
         try {
             const auto relieved = co_await checkpointer_->relieve();
             if (!relieved) co_return output{relieved.error()};
+        } catch (const std::bad_alloc&) {
+            co_return output{error(errc::resource_exhausted)};
         } catch (...) {
-            co_return output{error(errc::io_failure)};
+            // Anything else a run threw ended the checkpoint owner, which
+            // told it: no device failed here.
+            co_return output{error(errc::invariant_violation)};
         }
         co_return output{};
     }
@@ -2816,6 +2853,7 @@ private:
     codec::cooperative_work execution_, preparation_;
     local_failure_sink sink_;
     std::optional<local_storage_failure> storage_failure_;
+    bool wal_reported_{false}, internal_reported_{false};
     local_retention_sink pressure_sink_;
     // The newest rotation the retained limit refused, while the limit holds.
     std::optional<local_retention_pressure> pressure_;

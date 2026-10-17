@@ -1,6 +1,7 @@
 #include "src/base/units.h"
 #include "src/broker/crash_recorder.h"
 #include "src/broker/crash_recorder_writer.h"
+#include "src/broker/directory_sync.h"
 
 #include <seastar/core/coroutine.hh>
 #include <seastar/core/file.hh>
@@ -52,7 +53,7 @@ seastar::future<> scripted_directory_sync(const std::filesystem::path& path) {
         directory_sync_result.reset();
         return result;
     }
-    return seastar::sync_directory(path.native());
+    return kwaque::broker::sync_directory_checked(path.native());
 }
 
 void write_report(const std::filesystem::path& path, std::uint64_t timestamp) {

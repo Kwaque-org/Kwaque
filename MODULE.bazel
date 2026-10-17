@@ -97,7 +97,6 @@ single_version_override(
     patch_strip = 1,
     patches = [
         "//bazel/thirdparty:xxhash-dispatch.patch",
-        "//bazel/thirdparty:xxhash-license.patch",
     ],
 )
 

@@ -552,6 +552,18 @@ public:
         }
         return spawned;
     }
+    // Tells `sink` of the failures that are a segment's own, from what the
+    // table does with it after its writer left the append owner, or never
+    // joined it: a read, the open of its sealed generation, its seal and
+    // its creation. Each is told as damage when the segment's committed
+    // data is not what a barrier made durable, and as the segment's
+    // failure when its cause fails or fills its device. A read tells each
+    // kind once for each time the segment's runs are made. Bound before the
+    // first segment is created or opened; it outlives joined close().
+    void report_failures(local_failure_sink sink) noexcept {
+        assert_current();
+        failures_ = std::move(sink);
+    }
     // A device that is short of space, stalled or failed, as whoever
     // watches the devices reports it: each writable segment on it is told
     // so, once.
@@ -808,9 +820,8 @@ public:
         runtime::result<void> created = failed(errc::resource_exhausted);
         try {
             created = co_await create_owned(*made, std::move(request), work);
-        } catch (const std::bad_alloc&) {
         } catch (...) {
-            created = failed(errc::io_failure);
+            created = runtime::failure(detail::answer_thrown(made->failure));
         }
         // Its device may have failed while it was made: it fails with it,
         // as the segments that were written there did.
@@ -825,6 +836,7 @@ public:
         }
         made->failure.observe(created.error());
         made->life = segment_life::failed;
+        told(*made, made->failure);
         if (made->writer && created.error().code() != errc::already_exists) {
             // It may have left files, and they are not removed here. What
             // it was attached with takes nothing.
@@ -1578,7 +1590,7 @@ private:
         try {
             slept = co_await sleep_(timer_, deadline, rearm);
         } catch (...) {
-            slept = failed(errc::io_failure);
+            slept = runtime::failure(detail::answer_thrown(unslept_));
         }
         // A sleep that ended for no reason of the table's own: its timer
         // stopped or cannot sleep that long. No lifetime is told from here
@@ -1587,12 +1599,45 @@ private:
         napped_ = true;
         stir();
     }
-    [[nodiscard]] segment_runs_config runs_config() const {
+    [[nodiscard]] segment_runs_config runs_config(const owner& read) {
         return segment_runs_config{
           config_.runs,
           config_.feed_bytes,
           config_.feed_linger_nanoseconds,
-          []() noexcept { return Clock::now(); }};
+          []() noexcept { return Clock::now(); },
+          [this, context = read.context, device = read.device->owner.device()](
+            const runtime::operation_error& why) noexcept {
+              told(context, device, why);
+          }};
+    }
+    // A segment's own failure, told: see report_failures(). Anything else
+    // is its caller's alone.
+    void told(
+      const segment_context& context,
+      device_store_id device,
+      const runtime::operation_error& why) noexcept {
+        if (!failures_) return;
+        auto path = local_storage_path::damage;
+        auto detail = runtime::file_failure_detail::unknown;
+        if (
+          why.code() != errc::corrupt_data
+          && why.code() != errc::malformed_data) {
+            const auto found = runtime::file_detail(why);
+            if (
+              !found
+              || device_verdict_of(*found).state == device_state::healthy)
+                return;
+            path = local_storage_path::segment;
+            detail = *found;
+        }
+        runtime::first_failure failure;
+        failure.observe(why);
+        failures_(
+          local_storage_failure{path, context, failure, detail, device});
+    }
+    void told(const owner& of, const runtime::first_failure& why) noexcept {
+        if (const auto& error = why.error())
+            told(of.context, of.device->owner.device(), *error);
     }
 
     // Starts the close of an owner whose `closing` its caller has made: an
@@ -1668,7 +1713,7 @@ private:
         const auto boundary = made.writer->capture();
         if (!boundary) co_return runtime::failure(boundary.error());
         auto runs = segment_runs::make(
-          cache_, reading_, boundary->history(), runs_config());
+          cache_, reading_, boundary->history(), runs_config(made));
         if (!runs) co_return runtime::failure(runs.error());
         made.runs = std::move(*runs);
         // Before the first group, so that no block is missed.
@@ -1822,6 +1867,7 @@ private:
                 outcome.failure.observe(detail::path_error(errc::io_failure));
             sealed.failure = outcome.failure;
             sealed.life = segment_life::failed;
+            told(sealed, outcome.failure);
             co_return outcome;
         }
         // The publication takes over from the checkpoint's entries and the
@@ -1977,11 +2023,18 @@ private:
               config_.metadata,
               work,
               config_.readers);
-        } catch (const std::bad_alloc&) {
-            generation = failed(errc::resource_exhausted);
         } catch (...) {
+            // A seal opens it one step from the sealed state: nothing here
+            // may throw.
+            generation = runtime::failure(detail::answer_thrown(sealed.debt));
         }
-        if (!generation) co_return runtime::failure(generation.error());
+        if (!generation) {
+            told(
+              sealed.context,
+              sealed.device->owner.device(),
+              generation.error());
+            co_return runtime::failure(generation.error());
+        }
         runtime::result<void> made{};
         std::optional<local_generation_pin> pin;
         std::unique_ptr<index_type> index;
@@ -2029,7 +2082,7 @@ private:
             }
             if (made && !sealed.runs) {
                 auto cached = segment_runs::make(
-                  cache_, reading_, expected.history, runs_config());
+                  cache_, reading_, expected.history, runs_config(sealed));
                 if (cached)
                     runs = std::move(*cached);
                 else
@@ -2352,9 +2405,8 @@ private:
               config_.metadata,
               work,
               config_.readers);
-        } catch (const std::bad_alloc&) {
-            generation = failed(errc::resource_exhausted);
         } catch (...) {
+            generation = runtime::failure(detail::recognized_or_rethrown());
         }
         if (!generation) co_return runtime::failure(generation.error());
         runtime::result<void> proved{};
@@ -2386,9 +2438,8 @@ private:
         try {
             place = co_await find_segment_directory(
               files_, ownership_, devices_, shard_, segment, work);
-        } catch (const std::bad_alloc&) {
-            place = failed(errc::resource_exhausted);
         } catch (...) {
+            place = runtime::failure(detail::answer_thrown(refused.failure));
         }
         if (!place) {
             refused.failure.observe(place.error());
@@ -2502,8 +2553,7 @@ private:
             true);
           !inspected)
             co_return output{runtime::failure(inspected.error())};
-        auto opened = co_await files_.open_directory(
-          at.above, runtime::file_close_policy::checked);
+        auto opened = co_await files_.open_directory(at.above);
         if (!opened) {
             if (opened.error().code() == errc::not_found)
                 co_return output{false};
@@ -2574,8 +2624,7 @@ private:
             true);
           !inspected)
             co_return inspected;
-        auto opened = co_await files_.open_directory(
-          directory, runtime::file_close_policy::checked);
+        auto opened = co_await files_.open_directory(directory);
         if (!opened) {
             if (opened.error().code() == errc::not_found)
                 co_return runtime::result<void>{};
@@ -2696,8 +2745,7 @@ private:
             true);
           !inspected)
             co_return inspected;
-        auto opened = co_await files_.open_directory(
-          at.above, runtime::file_close_policy::checked);
+        auto opened = co_await files_.open_directory(at.above);
         if (!opened) {
             if (opened.error().code() == errc::not_found)
                 co_return runtime::result<void>{};
@@ -2895,7 +2943,7 @@ private:
             // Everyone inside leaves first: a seal's tail closes its
             // writer, and whoever came for a session finds the segment
             // deleting.
-            co_await removed.left.wait(
+            co_await removed.left.when(
               [&removed] { return removed.inside == 0; });
             outcome = co_await remove_owned(removed);
         } catch (...) {
@@ -2996,6 +3044,7 @@ private:
     std::array<std::optional<runtime::operation_error>, maximum_local_devices>
       unsynced_{};
     std::uint64_t uses_{0};
+    local_failure_sink failures_;
     // Owners about to be among the sealed: each has its place already.
     std::uint32_t arriving_{0};
     bool closing_{false}, closed_{false};

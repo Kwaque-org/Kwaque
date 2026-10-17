@@ -327,10 +327,7 @@ public:
                               native, observe_ ? &sample : nullptr, kind, cap)}
                           : native;
             co_return runtime::file{
-              std::move(file),
-              runtime::file_io_limits{},
-              statistics_,
-              options.close_policy};
+              std::move(file), runtime::file_io_limits{}, statistics_};
         } catch (...) {
             failure = std::current_exception();
         }
@@ -341,9 +338,9 @@ public:
         std::rethrow_exception(failure);
     }
     seastar::future<runtime::result<measured_cursor>>
-    open_directory(runtime::file_path path, runtime::file_close_policy c) {
+    open_directory(runtime::file_path path) {
         if (observe_ && sample.measuring) ++sample.directory_opens;
-        auto opened = co_await files_.open_directory(std::move(path), c);
+        auto opened = co_await files_.open_directory(std::move(path));
         if (!opened) co_return runtime::failure(opened.error());
         co_return measured_cursor{
           std::move(*opened), observe_ ? &sample : nullptr};
@@ -392,10 +389,9 @@ public:
         if (observe_ && sample.measuring) ++sample.renames;
         return files_.rename(std::move(from), std::move(to), policy);
     }
-    auto
-    sync_directory(runtime::file_path path, runtime::file_close_policy policy) {
+    auto sync_directory(runtime::file_path path) {
         if (observe_ && sample.measuring) ++sample.directory_syncs;
-        return files_.sync_directory(std::move(path), policy);
+        return files_.sync_directory(std::move(path));
     }
     bool verified_directory(std::string_view path) const noexcept {
         return files_.verified_directory(path);

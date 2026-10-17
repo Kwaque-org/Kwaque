@@ -200,8 +200,12 @@ scan_reader::classify(codec::cooperative_work& work) {
         auto bytes = share(at, byte_count{codec::envelope_prefix_bytes});
         if (!bytes) co_return runtime::failure(bytes.error());
         bytes::fragmented_buffer_parser input{std::move(*bytes)};
-        if (!input.peek_to(raw))
-            co_return runtime::failure(path_error(errc::invariant_violation));
+        // Exactly the prefix's bytes were shared.
+        const auto whole = input.peek_to(raw);
+        KWAQUE_INVARIANT(
+          invariant_id{"KQ-SCAN-PREFIX"},
+          whole.has_value(),
+          "a scan prefix share held fewer bytes than the prefix");
         if (all_zero(raw)) co_return slot(scan_slot_kind::zero);
         const codec::field_context context{.origin = at.value()};
         prefix.emplace(

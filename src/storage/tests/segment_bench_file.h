@@ -98,10 +98,7 @@ public:
                                      native, sample, 0, options.synchronous)}
                                  : native;
             co_return runtime::file{
-              std::move(file),
-              runtime::file_io_limits{},
-              statistics_,
-              options.close_policy};
+              std::move(file), runtime::file_io_limits{}, statistics_};
         } catch (...) {
             failure = std::current_exception();
         }
@@ -112,8 +109,8 @@ public:
         std::rethrow_exception(failure);
     }
     seastar::future<runtime::result<directory_cursor>>
-    open_directory(runtime::file_path path, runtime::file_close_policy policy) {
-        auto opened = co_await files_.open_directory(std::move(path), policy);
+    open_directory(runtime::file_path path) {
+        auto opened = co_await files_.open_directory(std::move(path));
         if (!opened) co_return runtime::failure(opened.error());
         co_return directory_cursor{std::move(*opened), *this};
     }
@@ -145,8 +142,8 @@ public:
         return files_.rename(std::move(from), std::move(to), policy);
     }
     seastar::future<runtime::result<void>>
-    sync_directory(runtime::file_path path, runtime::file_close_policy policy) {
-        auto opened = co_await open_directory(std::move(path), policy);
+    sync_directory(runtime::file_path path) {
+        auto opened = co_await open_directory(std::move(path));
         if (!opened) co_return runtime::failure(opened.error());
         runtime::first_failure failed;
         try {

@@ -242,38 +242,33 @@ seastar::future<> with_local_append(
     } catch (...) {
         failed.observe(std::current_exception());
     }
-    const auto close = [&](auto operation) -> seastar::future<> {
+    // A tolerated close may report the failure the test injected.
+    const auto close = [&](
+                         auto operation, bool tolerated) -> seastar::future<> {
         try {
             auto closed = co_await drive.lifecycle(std::move(operation));
-            if (!chosen.tolerate_close) failed.observe(closed);
+            if (!tolerated) failed.observe(closed);
         } catch (...) {
             failed.observe(std::current_exception());
         }
     };
-    if (append) co_await close(append->close());
+    const auto tolerated = chosen.tolerate_close;
+    if (append) co_await close(append->close(), tolerated);
     append.reset();
     for (std::uint32_t i = 0; i != segments.size(); ++i) {
         auto& owned = segments[i];
         if (!owned) continue;
-        if ((chosen.fenced & (1U << i)) != 0) {
-            // Its latched failure is the fence the test injected.
-            try {
-                static_cast<void>(co_await drive.lifecycle(owned->close()));
-            } catch (...) {
-                failed.observe(std::current_exception());
-            }
-        } else {
-            co_await close(owned->close());
-        }
+        co_await close(
+          owned->close(), tolerated || (chosen.fenced & (1U << i)) != 0);
         owned.reset();
     }
-    if (commit) co_await close(commit->close());
+    if (commit) co_await close(commit->close(), tolerated);
     commit.reset();
-    if (writer) co_await close(writer->close());
+    if (writer) co_await close(writer->close(), tolerated);
     writer.reset();
-    if (ids) co_await close(ids->close());
+    if (ids) co_await close(ids->close(), tolerated);
     ids.reset();
-    if (control) co_await close(control->close());
+    if (control) co_await close(control->close(), tolerated);
     control.reset();
     take(failed.outcome());
 }
@@ -372,6 +367,97 @@ durable(const local_append_outcome& outcome) {
     return *outcome.receipt;
 }
 
+// A case's caller of one append owner: it builds each independent child,
+// charges it to the budget and submits it, and checks the stages it gets
+// back. Nothing here awaits what the case would not await itself.
+template<typename Append, typename Driver>
+struct caller final {
+    Append& append;
+    workload_budget& budget;
+    codec::cooperative_work& work;
+    Driver drive;
+
+    seastar::future<local_append_request> request(std::string wire) {
+        return local_append_contract::request(std::move(wire), budget, work);
+    }
+    seastar::future<local_append_stages>
+    submit(local_append_target target, std::string wire) {
+        co_return append.append(
+          target, co_await request(std::move(wire)), work);
+    }
+    // Either kind of stages: with or without a caller's interest.
+    template<typename Stages>
+    seastar::future<> accepted(Stages& stages, const char* rejected) {
+        require(
+          (co_await drive.lifecycle(std::move(stages.accepted))).accepted(),
+          rejected);
+    }
+    seastar::future<local_append_stages>
+    accept(local_append_target target, std::string wire, const char* rejected) {
+        auto stages = co_await submit(target, std::move(wire));
+        co_await accepted(stages, rejected);
+        co_return stages;
+    }
+    // Submitted, accepted and settled.
+    seastar::future<local_append_outcome>
+    settle(local_append_target target, std::string wire) {
+        co_return co_await local_append_contract::settle(
+          co_await submit(target, std::move(wire)), drive);
+    }
+    // An accepted request's receipt; it must be durable.
+    seastar::future<local_append_receipt> durable(local_append_stages& stages) {
+        co_return local_append_contract::durable(
+          co_await drive.lifecycle(std::move(stages.result)));
+    }
+    // Refused before acceptance with code, and nothing written.
+    seastar::future<> refused(local_append_stages stages, errc code) {
+        auto decision = co_await drive.lifecycle(std::move(stages.accepted));
+        auto outcome = co_await drive.lifecycle(std::move(stages.result));
+        require(
+          !decision.accepted() && decision.failure.error()
+            && decision.failure.error()->code() == code
+            && outcome.status == local_append_status::not_written
+            && !outcome.receipt,
+          "a request that should have been refused was accepted or written");
+    }
+};
+
+// The open WAL obligations, and the snapshot that counted them.
+template<typename Append>
+auto obligations(Append& append) {
+    std::vector<local_obligation> open;
+    auto snapshot = take(append.obligations(
+      [&open](const local_obligation& one) { open.push_back(one); }));
+    return std::pair{std::move(open), snapshot};
+}
+// Each attachment's newest durable footer.
+template<typename Append>
+std::vector<local_durable_boundary> newest_footers(Append& append) {
+    std::vector<local_durable_boundary> newest;
+    append.durable_boundaries(
+      [&newest](const local_durable_boundary& one) { newest.push_back(one); });
+    return newest;
+}
+// Nothing charged since charged was taken.
+inline bool uncharged(
+  const workload_budget& budget, const workload_budget_snapshot& charged) {
+    const auto now = budget.snapshot();
+    return now.bytes == charged.bytes && now.tasks == charged.tasks;
+}
+
+// Where a member's final block lies in the segment with this generation.
+inline segment_write_context written_at(
+  std::uint64_t generation,
+  const segment_block_layout& block,
+  std::uint64_t segment_alignment) {
+    return segment_write_context::make(
+             context(generation),
+             alignment(segment_alignment),
+             block.records.physical().begin(),
+             block.records.bytes().begin())
+      .value();
+}
+
 // The expected PREPARE, built independently at a WAL position and naming the
 // member's final block. The WAL is 8-KiB aligned; a segment's header fills its
 // first alignment unit.
@@ -387,12 +473,7 @@ inline std::string prepare_at(
       {wal_write_context::make(
          incarnation, alignment(8192), runtime::file_position{wal_position})
          .value(),
-       segment_write_context::make(
-         context(generation),
-         alignment(segment_alignment),
-         block.records.physical().begin(),
-         block.records.bytes().begin())
-         .value(),
+       written_at(generation, block, segment_alignment),
        runtime::file_position{segment_alignment},
        routing(),
        batch_expected()});
@@ -404,12 +485,7 @@ inline std::string block_at(
   std::uint64_t segment_alignment = 8192) {
     return block_wire(
       child,
-      {segment_write_context::make(
-         context(generation),
-         alignment(segment_alignment),
-         block.records.physical().begin(),
-         block.records.bytes().begin())
-         .value(),
+      {written_at(generation, block, segment_alignment),
        runtime::file_position{segment_alignment},
        batch_expected()});
 }
@@ -501,13 +577,11 @@ seastar::future<> durable_append(
       {.segment_alignment = segment_alignment},
       [&](auto& append, auto& writer, auto& segments, auto& targets, auto& work)
         -> seastar::future<> {
+          caller client{append, budget, work, drive};
           const auto empty = segments[0]->progress()->reserved;
           const auto wal_start = writer.progress()->reserved;
           const auto wire = child_wire(100);
-          auto outcome = co_await settle(
-            append.append(
-              *targets[0], co_await request(wire, budget, work), work),
-            drive);
+          auto outcome = co_await client.settle(*targets[0], wire);
           const auto& receipt = durable(outcome);
           const auto& block = receipt.block.records;
           const auto cut = receipt.segment.boundary();
@@ -578,24 +652,16 @@ seastar::future<> occupancy_batching(
       {.outstanding = 1},
       [&](auto& append, auto&, auto& segments, auto& targets, auto& work)
         -> seastar::future<> {
-          auto first = append.append(
-            *targets[0], co_await request(child_wire(100), budget, work), work);
-          require(
-            (co_await drive.lifecycle(std::move(first.accepted))).accepted(),
-            "first request rejected");
+          caller client{append, budget, work, drive};
+          auto first = co_await client.accept(
+            *targets[0], child_wire(100), "first request rejected");
           std::vector<local_append_stages> later;
           for (std::uint64_t logical : {101U, 102U})
-              later.push_back(append.append(
-                *targets[0],
-                co_await request(child_wire(logical), budget, work),
-                work));
+              later.push_back(
+                co_await client.submit(*targets[0], child_wire(logical)));
           for (auto& stages : later)
-              require(
-                (co_await drive.lifecycle(std::move(stages.accepted)))
-                  .accepted(),
-                "later request rejected");
-          const auto head = durable(
-            co_await drive.lifecycle(std::move(first.result)));
+              co_await client.accepted(stages, "later request rejected");
+          const auto head = co_await client.durable(first);
           std::vector<local_append_outcome> tail;
           for (auto& stages : later)
               tail.push_back(
@@ -649,12 +715,10 @@ seastar::future<> multi_segment_group(
       {.outstanding = 1, .segments = 2},
       [&](auto& append, auto& writer, auto& segments, auto& targets, auto& work)
         -> seastar::future<> {
+          caller client{append, budget, work, drive};
           const auto other = segments[1]->progress()->reserved;
-          auto blocker = append.append(
-            *targets[0], co_await request(child_wire(100), budget, work), work);
-          require(
-            (co_await drive.lifecycle(std::move(blocker.accepted))).accepted(),
-            "blocking request rejected");
+          auto blocker = co_await client.accept(
+            *targets[0], child_wire(100), "blocking request rejected");
           const std::array wires{
             child_wire(101), child_wire(100, 2), child_wire(102)};
           const std::array<std::uint32_t, 3> owners{0, 1, 0};
@@ -662,17 +726,11 @@ seastar::future<> multi_segment_group(
           // costs; the WAL order below checks it.
           std::vector<local_append_stages> grouped;
           for (std::size_t i = 0; i != wires.size(); ++i)
-              grouped.push_back(append.append(
-                *targets[owners[i]],
-                co_await request(wires[i], budget, work),
-                work));
+              grouped.push_back(
+                co_await client.submit(*targets[owners[i]], wires[i]));
           for (auto& stages : grouped)
-              require(
-                (co_await drive.lifecycle(std::move(stages.accepted)))
-                  .accepted(),
-                "grouped request rejected");
-          const auto first = durable(
-            co_await drive.lifecycle(std::move(blocker.result)));
+              co_await client.accepted(stages, "grouped request rejected");
+          const auto first = co_await client.durable(blocker);
           std::vector<local_append_outcome> results;
           for (auto& stages : grouped)
               results.push_back(
@@ -746,41 +804,27 @@ seastar::future<> rejections_have_no_effect(
       {},
       [&](auto& append, auto& writer, auto& segments, auto& targets, auto& work)
         -> seastar::future<> {
+          caller client{append, budget, work, drive};
           const auto segment_before = segments[0]->progress()->reserved;
           const auto wal_before = writer.progress()->reserved;
           const auto charged = budget.snapshot();
-          const auto rejected =
-            [&](local_append_stages stages, errc code) -> seastar::future<> {
-              auto accepted = co_await drive.lifecycle(
-                std::move(stages.accepted));
-              auto outcome = co_await drive.lifecycle(std::move(stages.result));
-              require(
-                !accepted.accepted() && accepted.failure.error()
-                  && accepted.failure.error()->code() == code
-                  && outcome.status == local_append_status::not_written
-                  && !outcome.receipt,
-                "invalid request was accepted or changed its outcome");
-          };
           {
-              auto wrong = co_await request(child_wire(100), budget, work);
+              auto wrong = co_await client.request(child_wire(100));
               wrong.physical_begin = model::segment_relative_end{7};
-              co_await rejected(
+              co_await client.refused(
                 append.append(*targets[0], std::move(wrong), work),
                 errc::wrong_context);
           }
-          co_await rejected(
-            append.append(
-              *targets[0],
-              co_await request(child_wire(105), budget, work),
-              work),
+          co_await client.refused(
+            co_await client.submit(*targets[0], child_wire(105)),
             errc::wrong_context);
           {
               seastar::abort_source stop;
               stop.request_abort();
               codec::cooperative_work cancelled{
                 codec::limits::defaults(), stop};
-              auto input = co_await request(child_wire(100), budget, work);
-              co_await rejected(
+              auto input = co_await client.request(child_wire(100));
+              co_await client.refused(
                 append.append(*targets[0], std::move(input), cancelled),
                 errc::aborted);
           }
@@ -790,24 +834,18 @@ seastar::future<> rejections_have_no_effect(
               seastar::abort_source stop;
               codec::cooperative_work narrow{
                 codec::limits::make(config).value(), stop};
-              auto input = co_await request(child_wire(100), budget, work);
-              co_await rejected(
+              auto input = co_await client.request(child_wire(100));
+              co_await client.refused(
                 append.append(*targets[0], std::move(input), narrow),
                 errc::invalid_argument);
           }
           require(
             segments[0]->progress()->reserved == segment_before
               && writer.progress()->reserved == wal_before
-              && budget.snapshot().bytes == charged.bytes
-              && budget.snapshot().tasks == charged.tasks
-              && !segments[0]->failure().failed() && append.forming() == 0,
+              && uncharged(budget, charged) && !segments[0]->failure().failed()
+              && append.forming() == 0,
             "a rejected request left positions, bytes or charges behind");
-          auto outcome = co_await settle(
-            append.append(
-              *targets[0],
-              co_await request(child_wire(100), budget, work),
-              work),
-            drive);
+          auto outcome = co_await client.settle(*targets[0], child_wire(100));
           require(
             durable(outcome).block.records.bytes().begin()
               == segment_before.bytes,
@@ -817,9 +855,8 @@ seastar::future<> rejections_have_no_effect(
           take(append.detach(stale));
           targets[0] = take(append.attach(*segments[0]));
           require(!(*targets[0] == stale), "reattachment reused a handle");
-          co_await rejected(
-            append.append(
-              stale, co_await request(child_wire(101), budget, work), work),
+          co_await client.refused(
+            co_await client.submit(stale, child_wire(101)),
             errc::wrong_context);
       });
 }
@@ -851,16 +888,11 @@ seastar::future<> pressure_before_freeze(
       {.outstanding = 1},
       [&](auto& append, auto& writer, auto& segments, auto& targets, auto& work)
         -> seastar::future<> {
-          auto first = append.append(
-            *targets[0], co_await request(child_wire(100), budget, work), work);
-          require(
-            (co_await drive.lifecycle(std::move(first.accepted))).accepted(),
-            "first request rejected");
-          auto waiting = append.append(
-            *targets[0], co_await request(child_wire(101), budget, work), work);
-          require(
-            (co_await drive.lifecycle(std::move(waiting.accepted))).accepted(),
-            "forming request rejected");
+          caller client{append, budget, work, drive};
+          auto first = co_await client.accept(
+            *targets[0], child_wire(100), "first request rejected");
+          auto waiting = co_await client.accept(
+            *targets[0], child_wire(101), "forming request rejected");
           // Fill the budget in a few reservations. What the in-flight group
           // returns stays below the WAL writer's validation working set.
           std::vector<workload_reservation> squeeze;
@@ -876,8 +908,7 @@ seastar::future<> pressure_before_freeze(
             !budget.try_reserve(
               byte_count{writer.child_limits().working_bytes.value() / 2}),
             "fixture could not create WAL-side pressure");
-          const auto head = durable(
-            co_await drive.lifecycle(std::move(first.result)));
+          const auto head = co_await client.durable(first);
           auto pressured = co_await drive.lifecycle(std::move(waiting.result));
           require(
             pressured.status == local_append_status::not_written
@@ -888,12 +919,7 @@ seastar::future<> pressure_before_freeze(
                    == head.segment.boundary().end(),
             "WAL pressure after acceptance froze or fenced the segment");
           squeeze.clear();
-          auto next = co_await settle(
-            append.append(
-              *targets[0],
-              co_await request(child_wire(101), budget, work),
-              work),
-            drive);
+          auto next = co_await client.settle(*targets[0], child_wire(101));
           require(
             durable(next).block.records.bytes().begin()
               == head.segment.boundary().end().bytes,
@@ -931,15 +957,12 @@ seastar::future<> rotation_before_freeze(
         auto& targets,
         auto& work,
         auto& control) -> seastar::future<> {
+          caller client{append, budget, work, drive};
           const auto initial = writer.progress()->reserved.incarnation();
           std::optional<local_append_receipt> last;
           for (std::uint64_t logical = 100; logical != 104; ++logical) {
-              auto outcome = co_await settle(
-                append.append(
-                  *targets[0],
-                  co_await request(child_wire(logical), budget, work),
-                  work),
-                drive);
+              auto outcome = co_await client.settle(
+                *targets[0], child_wire(logical));
               const auto& receipt = durable(outcome);
               if (last)
                   require(
@@ -963,8 +986,7 @@ seastar::future<> rotation_before_freeze(
           // With every group durable, the discharged prefix and the durable
           // end are positions in the current file: nothing still names the
           // rotated file's end.
-          const auto snapshot = take(
-            append.obligations([](const local_obligation&) {}));
+          const auto snapshot = obligations(append).second;
           require(
             snapshot.obligations == 0
               && snapshot.discharged == writer.progress()->reserved
@@ -972,11 +994,7 @@ seastar::future<> rotation_before_freeze(
               && snapshot.wal_durable.incarnation() == current,
             "the discharged prefix stayed in a rotated WAL file");
           // The segment's newest durable footer is the last group's.
-          std::vector<local_durable_boundary> newest;
-          append.durable_boundaries(
-            [&newest](const local_durable_boundary& one) {
-                newest.push_back(one);
-            });
+          const auto newest = newest_footers(append);
           const auto& cut = last->segment.boundary();
           require(
             newest.size() == 1 && newest[0].device == spec.owner.device()
@@ -1017,12 +1035,8 @@ seastar::future<> rotation_before_freeze(
                 "control edits did not wait their turn");
               std::optional<local_append_outcome> refused;
               for (; logical != 112 && !refused; ++logical) {
-                  auto outcome = co_await settle(
-                    append.append(
-                      *targets[0],
-                      co_await request(child_wire(logical), budget, work),
-                      work),
-                    drive);
+                  auto outcome = co_await client.settle(
+                    *targets[0], child_wire(logical));
                   if (outcome.status == local_append_status::durable)
                       last = *outcome.receipt;
                   else
@@ -1053,12 +1067,8 @@ seastar::future<> rotation_before_freeze(
           // refused batch is appended after the last durable one, in a new
           // WAL file.
           const auto rotations = writer.statistics().rotations;
-          auto resumed = co_await settle(
-            append.append(
-              *targets[0],
-              co_await request(child_wire(logical - 1), budget, work),
-              work),
-            drive);
+          auto resumed = co_await client.settle(
+            *targets[0], child_wire(logical - 1));
           const auto& receipt = durable(resumed);
           require(
             receipt.block.records.bytes().begin()
@@ -1093,26 +1103,20 @@ seastar::future<> close_drains_accepted(
       {.outstanding = 1},
       [&](auto& append, auto&, auto& segments, auto& targets, auto& work)
         -> seastar::future<> {
+          caller client{append, budget, work, drive};
           std::vector<local_append_stages> pending;
           for (std::uint64_t logical : {100U, 101U})
-              pending.push_back(append.append(
-                *targets[0],
-                co_await request(child_wire(logical), budget, work),
-                work));
+              pending.push_back(
+                co_await client.submit(*targets[0], child_wire(logical)));
           for (auto& stages : pending)
-              require(
-                (co_await drive.lifecycle(std::move(stages.accepted)))
-                  .accepted(),
-                "request rejected before close");
+              co_await client.accepted(stages, "request rejected before close");
           auto closing = append.close();
-          auto late = append.append(
-            *targets[0], co_await request(child_wire(102), budget, work), work);
+          auto late = co_await client.submit(*targets[0], child_wire(102));
           const auto refused = co_await drive.lifecycle(
             std::move(late.accepted));
           take(co_await drive.lifecycle(std::move(closing)));
           for (auto& stages : pending)
-              static_cast<void>(
-                durable(co_await drive.lifecycle(std::move(stages.result))));
+              static_cast<void>(co_await client.durable(stages));
           static_cast<void>(co_await drive.lifecycle(std::move(late.result)));
           require(
             !refused.accepted() && refused.failure.error()
@@ -1151,29 +1155,21 @@ seastar::future<> quiesce_drains_one_attachment(
       {.outstanding = 1, .segments = 2},
       [&](auto& append, auto&, auto& segments, auto& targets, auto& work)
         -> seastar::future<> {
+          caller client{append, budget, work, drive};
           std::vector<local_append_stages> pending;
           for (std::uint64_t logical : {100U, 101U})
-              pending.push_back(append.append(
-                *targets[0],
-                co_await request(child_wire(logical), budget, work),
-                work));
+              pending.push_back(
+                co_await client.submit(*targets[0], child_wire(logical)));
           for (auto& stages : pending)
-              require(
-                (co_await drive.lifecycle(std::move(stages.accepted)))
-                  .accepted(),
-                "request rejected before its attachment was quiesced");
+              co_await client.accepted(
+                stages, "request rejected before its attachment was quiesced");
           auto quiet = append.quiesce(*targets[0]);
           auto joined = append.quiesce(*targets[0]);
-          auto late = append.append(
-            *targets[0], co_await request(child_wire(102), budget, work), work);
+          auto late = co_await client.submit(*targets[0], child_wire(102));
           const auto refused = co_await drive.lifecycle(
             std::move(late.accepted));
-          const auto meanwhile = co_await settle(
-            append.append(
-              *targets[1],
-              co_await request(child_wire(100, 2), budget, work),
-              work),
-            drive);
+          const auto meanwhile = co_await client.settle(
+            *targets[1], child_wire(100, 2));
           take(co_await drive.lifecycle(std::move(quiet)));
           // Idle, so both accepted requests are behind their barriers.
           const auto drained = segments[0]->progress()->durable.blocks;
@@ -1182,15 +1178,10 @@ seastar::future<> quiesce_drains_one_attachment(
           const auto stale = co_await drive.lifecycle(
             append.quiesce(*targets[0]));
           for (auto& stages : pending)
-              static_cast<void>(
-                durable(co_await drive.lifecycle(std::move(stages.result))));
+              static_cast<void>(co_await client.durable(stages));
           static_cast<void>(co_await drive.lifecycle(std::move(late.result)));
-          const auto afterwards = co_await settle(
-            append.append(
-              *targets[1],
-              co_await request(child_wire(101, 2), budget, work),
-              work),
-            drive);
+          const auto afterwards = co_await client.settle(
+            *targets[1], child_wire(101, 2));
           static_cast<void>(durable(meanwhile));
           static_cast<void>(durable(afterwards));
           require(
@@ -1232,18 +1223,13 @@ seastar::future<> barrier_coalescing(
       {.outstanding = 3},
       [&](auto& append, auto&, auto& segments, auto& targets, auto& work)
         -> seastar::future<> {
+          caller client{append, budget, work, drive};
           // Each request forms its own group before the next arrives.
           std::vector<local_append_stages> staged;
-          for (std::uint64_t logical : {100U, 101U, 102U}) {
-              staged.push_back(append.append(
-                *targets[0],
-                co_await request(child_wire(logical), budget, work),
-                work));
-              require(
-                (co_await drive.lifecycle(std::move(staged.back().accepted)))
-                  .accepted(),
-                "request rejected");
-          }
+          for (std::uint64_t logical : {100U, 101U, 102U})
+              staged.push_back(
+                co_await client.accept(
+                  *targets[0], child_wire(logical), "request rejected"));
           std::vector<local_append_outcome> outcomes;
           for (auto& stages : staged)
               outcomes.push_back(
@@ -1296,25 +1282,15 @@ seastar::future<> independent_segment_outcomes(
       {.outstanding = 1, .segments = 2, .fenced = 2, .failures = &failures},
       [&](auto& append, auto& writer, auto& segments, auto& targets, auto& work)
         -> seastar::future<> {
-          auto blocker = append.append(
-            *targets[0], co_await request(child_wire(100), budget, work), work);
-          require(
-            (co_await drive.lifecycle(std::move(blocker.accepted))).accepted(),
-            "blocking request rejected");
+          caller client{append, budget, work, drive};
+          auto blocker = co_await client.accept(
+            *targets[0], child_wire(100), "blocking request rejected");
           // A1 and B1 form one group behind the blocker.
-          auto a1 = append.append(
-            *targets[0], co_await request(child_wire(101), budget, work), work);
-          auto b1 = append.append(
-            *targets[1],
-            co_await request(child_wire(100, 2), budget, work),
-            work);
+          auto a1 = co_await client.submit(*targets[0], child_wire(101));
+          auto b1 = co_await client.submit(*targets[1], child_wire(100, 2));
           for (auto* stages : {&a1, &b1})
-              require(
-                (co_await drive.lifecycle(std::move(stages->accepted)))
-                  .accepted(),
-                "grouped request rejected");
-          const auto head = durable(
-            co_await drive.lifecycle(std::move(blocker.result)));
+              co_await client.accepted(*stages, "grouped request rejected");
+          const auto head = co_await client.durable(blocker);
           const auto kept = co_await drive.lifecycle(std::move(a1.result));
           const auto lost = co_await drive.lifecycle(std::move(b1.result));
           const auto& a = durable(kept);
@@ -1330,20 +1306,14 @@ seastar::future<> independent_segment_outcomes(
               && lost.failure.failed() && segments[1]->failure().failed(),
             "a failed segment barrier did not leave its member uncertain");
           // The failure is sticky for that segment only.
-          const auto later = co_await settle(
-            append.append(
-              *targets[0],
-              co_await request(child_wire(102), budget, work),
-              work),
-            drive);
+          const auto later = co_await client.settle(
+            *targets[0], child_wire(102));
           require(
             durable(later).block.records.bytes().begin()
               == a.segment.boundary().end().bytes,
             "the healthy segment did not continue after the failure");
-          auto refused = append.append(
-            *targets[1],
-            co_await request(child_wire(101, 2), budget, work),
-            work);
+          auto refused = co_await client.submit(
+            *targets[1], child_wire(101, 2));
           const auto decision = co_await drive.lifecycle(
             std::move(refused.accepted));
           const auto outcome = co_await drive.lifecycle(
@@ -1363,9 +1333,7 @@ seastar::future<> independent_segment_outcomes(
             "the segment failure was not reported once and classified");
           // Only the failed segment group keeps the WAL file obligated: the
           // discharged prefix stops where that group's PREPAREs begin.
-          std::vector<local_obligation> open;
-          const auto obligated = take(append.obligations(
-            [&open](const local_obligation& one) { open.push_back(one); }));
+          const auto [open, obligated] = obligations(append);
           const auto file = writer.progress()->reserved.incarnation();
           require(
             open.size() == 1 && obligated.obligations == 1
@@ -1406,6 +1374,7 @@ seastar::future<> interest_ends_without_cancelling(
       [&](auto& append, auto&, auto& segments, auto& targets, auto& work)
         -> seastar::future<> {
           using interest = local_append_interest<Timer>;
+          caller client{append, budget, work, drive};
           const auto empty = segments[0]->progress()->reserved;
           const auto charged = budget.snapshot();
           const auto rejected = [&](
@@ -1426,36 +1395,33 @@ seastar::future<> interest_ends_without_cancelling(
               co_await rejected(
                 append.append(
                   *targets[0],
-                  co_await request(child_wire(100), budget, work),
+                  co_await client.request(child_wire(100)),
                   work,
                   interest{timer, gone, std::nullopt}),
                 errc::aborted);
           }
           {
-              seastar::abort_source caller;
+              seastar::abort_source waiting;
               co_await rejected(
                 append.append(
                   *targets[0],
-                  co_await request(child_wire(100), budget, work),
+                  co_await client.request(child_wire(100)),
                   work,
-                  interest{timer, caller, Clock::now()}),
+                  interest{timer, waiting, Clock::now()}),
                 errc::timed_out);
           }
           require(
             segments[0]->progress()->reserved == empty
-              && budget.snapshot().bytes == charged.bytes
-              && budget.snapshot().tasks == charged.tasks,
+              && uncharged(budget, charged),
             "a rejected interest left positions or charges behind");
-          seastar::abort_source caller;
+          seastar::abort_source waiting;
           auto watched = append.append(
             *targets[0],
-            co_await request(child_wire(100), budget, work),
+            co_await client.request(child_wire(100)),
             work,
-            interest{timer, caller, std::nullopt});
-          require(
-            (co_await drive.lifecycle(std::move(watched.accepted))).accepted(),
-            "watched request rejected");
-          caller.request_abort();
+            interest{timer, waiting, std::nullopt});
+          co_await client.accepted(watched, "watched request rejected");
+          waiting.request_abort();
           const auto ended = co_await drive.lifecycle(
             std::move(watched.result));
           if (deterministic || !ended)
@@ -1464,22 +1430,11 @@ seastar::future<> interest_ends_without_cancelling(
                 "an aborted interest did not end with aborted");
           else
               static_cast<void>(durable(*ended));
-          {
-              auto dropped = append.append(
-                *targets[0],
-                co_await request(child_wire(101), budget, work),
-                work);
-              require(
-                (co_await drive.lifecycle(std::move(dropped.accepted)))
-                  .accepted(),
-                "dropped request rejected");
-          }
-          const auto next = co_await settle(
-            append.append(
-              *targets[0],
-              co_await request(child_wire(102), budget, work),
-              work),
-            drive);
+          // Accepted, then its result dropped.
+          static_cast<void>(co_await client.accept(
+            *targets[0], child_wire(101), "dropped request rejected"));
+          const auto next = co_await client.settle(
+            *targets[0], child_wire(102));
           const auto& receipt = durable(next);
           require(
             receipt.batch.context.logical_span().begin()
@@ -1517,35 +1472,26 @@ seastar::future<> deadline_detaches_waiter(
       {.outstanding = 1},
       [&](auto& append, auto&, auto& segments, auto& targets, auto& work)
         -> seastar::future<> {
-          auto blocker = append.append(
-            *targets[0], co_await request(child_wire(100), budget, work), work);
-          require(
-            (co_await drive.lifecycle(std::move(blocker.accepted))).accepted(),
-            "blocking request rejected");
-          seastar::abort_source caller;
+          caller client{append, budget, work, drive};
+          auto blocker = co_await client.accept(
+            *targets[0], child_wire(100), "blocking request rejected");
+          seastar::abort_source waiting;
           const auto deadline = Clock::now().checked_add(
             runtime::monotonic_duration{1});
           require(deadline.has_value(), "deadline overflow");
           auto timed = append.append(
             *targets[0],
-            co_await request(child_wire(101), budget, work),
+            co_await client.request(child_wire(101)),
             work,
-            local_append_interest<Timer>{timer, caller, *deadline});
-          require(
-            (co_await drive.lifecycle(std::move(timed.accepted))).accepted(),
-            "timed request rejected");
+            local_append_interest<Timer>{timer, waiting, *deadline});
+          co_await client.accepted(timed, "timed request rejected");
           const auto ended = co_await drive.lifecycle(std::move(timed.result));
           require(
             !ended && ended.error().code() == errc::timed_out,
             "the deadline did not end the caller's interest");
-          const auto head = durable(
-            co_await drive.lifecycle(std::move(blocker.result)));
-          const auto next = co_await settle(
-            append.append(
-              *targets[0],
-              co_await request(child_wire(102), budget, work),
-              work),
-            drive);
+          const auto head = co_await client.durable(blocker);
+          const auto next = co_await client.settle(
+            *targets[0], child_wire(102));
           require(
             durable(next).block.records.bytes().begin()
                 > head.segment.boundary().end().bytes
@@ -1594,18 +1540,11 @@ seastar::future<> completed_retry_facts(
       {},
       [&](auto& append, auto&, auto& segments, auto& targets, auto& work)
         -> seastar::future<> {
-          const auto first = co_await settle(
-            append.append(
-              *targets[0],
-              co_await request(child_wire(100), budget, work),
-              work),
-            drive);
-          const auto second = co_await settle(
-            append.append(
-              *targets[0],
-              co_await request(child_wire(101), budget, work),
-              work),
-            drive);
+          caller client{append, budget, work, drive};
+          const auto first = co_await client.settle(
+            *targets[0], child_wire(100));
+          const auto second = co_await client.settle(
+            *targets[0], child_wire(101));
           const auto one = completed_fact(durable(first));
           const auto two = completed_fact(durable(second));
           const auto record = [&](const completed_retry& fact) {
@@ -1670,7 +1609,7 @@ seastar::future<> completed_retry_facts(
             !elsewhere && elsewhere.error().code() == errc::wrong_context,
             "an out-of-scope fact was recorded");
           // Two appends reserved two entries: a third identity rejects.
-          auto unappended = co_await request(child_wire(102), budget, work);
+          auto unappended = co_await client.request(child_wire(102));
           const auto info = unappended.batch.info();
           const auto beyond = record(
             completed_retry::make(
@@ -1685,8 +1624,7 @@ seastar::future<> completed_retry_facts(
             "a fact beyond the reserved capacity was recorded");
           // A completion fact is no WAL obligation.
           require(
-            take(append.obligations([](const local_obligation&) {})).obligations
-              == 0,
+            obligations(append).second.obligations == 0,
             "a completed-retry fact opened a WAL obligation");
           auto detached = take(append.detach(*targets[0]));
           // The attachment's newest durable footer leaves with it.
@@ -1753,65 +1691,40 @@ seastar::future<> obligations_track_segments(
       {.outstanding = 1, .segments = 2},
       [&](auto& append, auto& writer, auto& segments, auto& targets, auto& work)
         -> seastar::future<> {
+          caller client{append, budget, work, drive};
           const auto start = writer.progress()->reserved;
           const auto file = start.incarnation();
-          const auto collect = [&] {
-              std::vector<local_obligation> open;
-              auto snapshot = take(append.obligations(
-                [&open](const local_obligation& one) { open.push_back(one); }));
-              return std::pair{std::move(open), snapshot};
-          };
-          auto blocker = append.append(
-            *targets[0], co_await request(child_wire(100), budget, work), work);
-          require(
-            (co_await drive.lifecycle(std::move(blocker.accepted))).accepted(),
-            "blocking request rejected");
-          auto a1 = append.append(
-            *targets[0], co_await request(child_wire(101), budget, work), work);
-          auto b1 = append.append(
-            *targets[1],
-            co_await request(child_wire(100, 2), budget, work),
-            work);
+          auto blocker = co_await client.accept(
+            *targets[0], child_wire(100), "blocking request rejected");
+          auto a1 = co_await client.submit(*targets[0], child_wire(101));
+          auto b1 = co_await client.submit(*targets[1], child_wire(100, 2));
           for (auto* stages : {&a1, &b1})
-              require(
-                (co_await drive.lifecycle(std::move(stages->accepted)))
-                  .accepted(),
-                "grouped request rejected");
+              co_await client.accepted(*stages, "grouped request rejected");
           if (ordered) {
               // Only the blocker's group reached the WAL so far.
-              const auto [early, during] = collect();
+              const auto [early, during] = obligations(append);
               require(
                 early.size() == 1 && early[0].wal == file
                   && early[0].segment == context(1) && early[0].pending == 1
                   && early[0].pinned == 0 && during.discharged == start,
                 "an in-flight group's obligation was not open");
               // No barrier has covered a group yet: nothing to pin.
-              std::uint32_t reported = 0;
-              append.durable_boundaries(
-                [&reported](const local_durable_boundary&) { ++reported; });
               require(
-                reported == 0, "a footer was reported before its barrier");
+                newest_footers(append).empty(),
+                "a footer was reported before its barrier");
           }
           require(
             !append.reclaimable(file), "the WAL's head file was called free");
-          static_cast<void>(
-            durable(co_await drive.lifecycle(std::move(blocker.result))));
-          static_cast<void>(
-            durable(co_await drive.lifecycle(std::move(a1.result))));
-          static_cast<void>(
-            durable(co_await drive.lifecycle(std::move(b1.result))));
-          const auto [late, after] = collect();
+          for (auto* stages : {&blocker, &a1, &b1})
+              static_cast<void>(co_await client.durable(*stages));
+          const auto [late, after] = obligations(append);
           require(
             late.empty() && after.obligations == 0
               && after.discharged == writer.progress()->reserved
               && after.wal_durable == writer.progress()->durable,
             "segment-durable groups left obligations open");
           // Each attachment reports its own newest durable footer.
-          std::vector<local_durable_boundary> newest;
-          append.durable_boundaries(
-            [&newest](const local_durable_boundary& one) {
-                newest.push_back(one);
-            });
+          const auto newest = newest_footers(append);
           require(newest.size() == 2, "an attachment's footer is missing");
           for (std::uint32_t i = 0; i != 2; ++i)
               require(
@@ -1848,22 +1761,18 @@ seastar::future<> shutdown_stops_admission(
       {.outstanding = 1},
       [&](auto& append, auto&, auto& segments, auto& targets, auto& work)
         -> seastar::future<> {
+          caller client{append, budget, work, drive};
           seastar::abort_source environment;
           take(append.bind_shutdown(environment));
-          auto accepted = append.append(
-            *targets[0], co_await request(child_wire(100), budget, work), work);
-          require(
-            (co_await drive.lifecycle(std::move(accepted.accepted))).accepted(),
-            "request rejected before shutdown");
+          auto accepted = co_await client.accept(
+            *targets[0], child_wire(100), "request rejected before shutdown");
           environment.request_abort();
-          auto late = append.append(
-            *targets[0], co_await request(child_wire(101), budget, work), work);
+          auto late = co_await client.submit(*targets[0], child_wire(101));
           const auto refused = co_await drive.lifecycle(
             std::move(late.accepted));
           const auto unwritten = co_await drive.lifecycle(
             std::move(late.result));
-          static_cast<void>(
-            durable(co_await drive.lifecycle(std::move(accepted.result))));
+          static_cast<void>(co_await client.durable(accepted));
           seastar::abort_source again;
           require(
             !refused.accepted() && refused.failure.error()
@@ -1917,17 +1826,13 @@ seastar::future<> barrier_order(
       {.outstanding = 1},
       [&](auto& append, auto& writer, auto& segments, auto& targets, auto& work)
         -> seastar::future<> {
+          caller client{append, budget, work, drive};
           const auto start = writer.progress()->reserved;
-          auto stages = append.append(
-            *targets[0], co_await request(child_wire(100), budget, work), work);
-          require(
-            (co_await drive.lifecycle(std::move(stages.accepted))).accepted(),
-            "request rejected");
+          auto stages = co_await client.accept(
+            *targets[0], child_wire(100), "request rejected");
           co_await probe(
             drive, timer, Clock::now().checked_add(half_second).value());
-          std::vector<local_obligation> open;
-          const auto snapshot = take(append.obligations(
-            [&open](const local_obligation& one) { open.push_back(one); }));
+          const auto [open, snapshot] = obligations(append);
           const auto wal = *writer.progress();
           require(
             !stages.result.available(),
@@ -1988,26 +1893,18 @@ seastar::future<> reordered_completions(
       {.outstanding = 1, .segments = 2},
       [&](auto& append, auto&, auto&, auto& targets, auto& work)
         -> seastar::future<> {
-          auto a1 = append.append(
-            *targets[0], co_await request(child_wire(100), budget, work), work);
-          auto b1 = append.append(
-            *targets[1],
-            co_await request(child_wire(100, 2), budget, work),
-            work);
+          caller client{append, budget, work, drive};
+          auto a1 = co_await client.submit(*targets[0], child_wire(100));
+          auto b1 = co_await client.submit(*targets[1], child_wire(100, 2));
           for (auto* stages : {&a1, &b1})
-              require(
-                (co_await drive.lifecycle(std::move(stages->accepted)))
-                  .accepted(),
-                "request rejected");
+              co_await client.accepted(*stages, "request rejected");
           co_await probe(
             drive, timer, Clock::now().checked_add(half_second).value());
           require(
             b1.result.available() && !a1.result.available(),
             "a slow segment held back another segment's result");
-          static_cast<void>(
-            durable(co_await drive.lifecycle(std::move(b1.result))));
-          static_cast<void>(
-            durable(co_await drive.lifecycle(std::move(a1.result))));
+          static_cast<void>(co_await client.durable(b1));
+          static_cast<void>(co_await client.durable(a1));
       });
 }
 
@@ -2039,16 +1936,12 @@ seastar::future<> wal_failure_after_segment(
       {.outstanding = 1, .failures = &failures, .tolerate_close = true},
       [&](auto& append, auto&, auto& segments, auto& targets, auto& work)
         -> seastar::future<> {
-          auto stages = append.append(
-            *targets[0], co_await request(child_wire(100), budget, work), work);
-          require(
-            (co_await drive.lifecycle(std::move(stages.accepted))).accepted(),
-            "request rejected");
+          caller client{append, budget, work, drive};
+          auto stages = co_await client.accept(
+            *targets[0], child_wire(100), "request rejected");
           const auto outcome = co_await drive.lifecycle(
             std::move(stages.result));
-          std::vector<local_obligation> open;
-          static_cast<void>(take(append.obligations(
-            [&open](const local_obligation& one) { open.push_back(one); })));
+          const auto open = obligations(append).first;
           require(
             outcome.status == local_append_status::uncertain && !outcome.receipt
               && outcome.failure.failed()
@@ -2060,16 +1953,68 @@ seastar::future<> wal_failure_after_segment(
               && failures[0].detail == runtime::file_failure_detail::device_io,
             "the WAL failure was not reported once and classified");
           const auto later = co_await drive.lifecycle(
-            append
-              .append(
-                *targets[0],
-                co_await request(child_wire(101), budget, work),
-                work)
-              .result);
+            (co_await client.submit(*targets[0], child_wire(101))).result);
           require(
             later.status == local_append_status::not_written
               && append.failure().failed(),
             "a failed WAL accepted later work or left the owner unlatched");
+      });
+}
+
+// A segment's barrier flush fails, and then the WAL's: each failure is
+// reported, though the owner had already reported one. The first reported
+// stays the owner's. The caller's environment fails the second segment's
+// next flush and the WAL's second.
+template<
+  runtime::monotonic_clock Clock,
+  typename Backend,
+  typename Owner,
+  typename Driver,
+  typename Timer>
+seastar::future<> every_failure_reported(
+  Backend& files,
+  Owner& owner,
+  const local_device_spec& spec,
+  workload_budget& budget,
+  Driver drive,
+  Timer& timer) {
+    std::vector<local_storage_failure> failures;
+    co_await with_local_append<Clock>(
+      files,
+      owner,
+      spec,
+      budget,
+      drive,
+      timer,
+      {.outstanding = 1,
+       .segments = 2,
+       .failures = &failures,
+       .tolerate_close = true},
+      [&](auto& append, auto&, auto& segments, auto& targets, auto& work)
+        -> seastar::future<> {
+          caller client{append, budget, work, drive};
+          auto lost = co_await client.accept(
+            *targets[1], child_wire(100, 2), "request rejected");
+          const auto first = co_await drive.lifecycle(std::move(lost.result));
+          require(
+            first.status == local_append_status::uncertain
+              && segments[1]->failure().failed() && failures.size() == 1
+              && failures[0].path == local_storage_path::segment
+              && failures[0].segment == context(2),
+            "the segment failure was not reported");
+          auto later = co_await client.accept(
+            *targets[0],
+            child_wire(100),
+            "a healthy segment refused a request");
+          const auto second = co_await drive.lifecycle(std::move(later.result));
+          require(
+            second.status == local_append_status::uncertain
+              && failures.size() == 2
+              && failures[1].path == local_storage_path::wal
+              && failures[1].detail == runtime::file_failure_detail::device_io
+              && append.storage_failure()
+              && append.storage_failure()->path == local_storage_path::segment,
+            "a WAL failure after a segment failure was not reported");
       });
 }
 
@@ -2115,11 +2060,9 @@ seastar::future<> crash_history(
           const auto data_start
             = segments[0]->progress()->reserved.bytes.value();
           const auto incarnation = writer.prepared_head()->incarnation;
-          auto stages = append.append(
-            *targets[0], co_await request(child_wire(100), budget, work), work);
-          require(
-            (co_await drive.lifecycle(std::move(stages.accepted))).accepted(),
-            "request rejected");
+          caller client{append, budget, work, drive};
+          auto stages = co_await client.accept(
+            *targets[0], child_wire(100), "request rejected");
           std::optional<local_append_outcome> outcome;
           if (history == survival_history::both)
               outcome.emplace(
@@ -2215,18 +2158,15 @@ seastar::future<> concurrent_pipeline(
           staged.reserve(requests);
           std::vector<local_append_outcome> outcomes;
           outcomes.reserve(requests);
+          caller client{append, budget, work, drive};
           for (std::uint32_t i = 0; i != requests; ++i) {
               if (i >= window)
                   outcomes.push_back(
                     co_await settle(std::move(staged[i - window]), drive));
               const auto logical = std::uint64_t{100} + i / 2;
-              staged.push_back(append.append(
-                *targets[i % 2],
-                co_await request(
-                  i % 2 == 0 ? child_wire(logical) : child_wire(logical, 2),
-                  budget,
-                  work),
-                work));
+              staged.push_back(
+                co_await client.submit(
+                  *targets[i % 2], child_wire(logical, 1 + i % 2)));
           }
           for (std::uint32_t i = requests - window; i != requests; ++i)
               outcomes.push_back(co_await settle(std::move(staged[i]), drive));
@@ -2278,21 +2218,16 @@ seastar::future<> close_during_slow_flush(
       {},
       [&](auto& append, auto&, auto& segments, auto& targets, auto& work)
         -> seastar::future<> {
+          caller client{append, budget, work, drive};
           std::vector<local_append_stages> pending;
           for (std::uint64_t logical = 100; logical != 104; ++logical)
-              pending.push_back(append.append(
-                *targets[0],
-                co_await request(child_wire(logical), budget, work),
-                work));
+              pending.push_back(
+                co_await client.submit(*targets[0], child_wire(logical)));
           for (auto& stages : pending)
-              require(
-                (co_await drive.lifecycle(std::move(stages.accepted)))
-                  .accepted(),
-                "request rejected before close");
+              co_await client.accepted(stages, "request rejected before close");
           take(co_await drive.lifecycle(append.close()));
           for (auto& stages : pending)
-              static_cast<void>(
-                durable(co_await drive.lifecycle(std::move(stages.result))));
+              static_cast<void>(co_await client.durable(stages));
           require(
             segments[0]->progress()->durable.blocks == 4,
             "close did not wait for requests blocked on a slow flush");
@@ -2329,8 +2264,9 @@ seastar::future<bool> acceptance_allocation_cut(
       {.outstanding = 1},
       [&](auto& append, auto&, auto& segments, auto& targets, auto& work)
         -> seastar::future<> {
+          caller client{append, budget, work, drive};
           const auto empty = segments[0]->progress()->reserved;
-          auto input = co_await request(child_wire(100), budget, work);
+          auto input = co_await client.request(child_wire(100));
           auto& injector = seastar::memory::local_failure_injector();
           auto cancel = seastar::defer(
             [&injector] noexcept { injector.cancel(); });
@@ -2355,12 +2291,8 @@ seastar::future<bool> acceptance_allocation_cut(
                 outcome.status == local_append_status::not_written
                   && segments[0]->progress()->reserved == empty,
                 "a rejected request left an effect");
-          const auto next = co_await settle(
-            append.append(
-              *targets[0],
-              co_await request(child_wire(written ? 101 : 100), budget, work),
-              work),
-            drive);
+          const auto next = co_await client.settle(
+            *targets[0], child_wire(written ? 101 : 100));
           require(
             durable(next).block.records.bytes().begin()
               == (written ? outcome.receipt->segment.boundary().end().bytes
@@ -2406,8 +2338,9 @@ seastar::future<> wal_stops_before_acceptance(
        .wal_shutdown = &wal_stop},
       [&](auto& append, auto& writer, auto& segments, auto& targets, auto& work)
         -> seastar::future<> {
+          caller client{append, budget, work, drive};
           const auto wal_start = writer.progress()->reserved;
-          auto input = co_await request(child_wire(100), budget, work);
+          auto input = co_await client.request(child_wire(100));
           // Acceptance and formation complete; the group's task has not run.
           auto stages = uninterrupted(
             [&] { return append.append(*targets[0], std::move(input), work); });
@@ -2428,12 +2361,7 @@ seastar::future<> wal_stops_before_acceptance(
               && segments[0]->failure().failed(),
             "a WAL stop before acceptance left a PREPARE or claimed success");
           const auto later = co_await drive.lifecycle(
-            append
-              .append(
-                *targets[0],
-                co_await request(child_wire(100), budget, work),
-                work)
-              .result);
+            (co_await client.submit(*targets[0], child_wire(100))).result);
           require(
             later.status == local_append_status::not_written,
             "the owner accepted work after its WAL stopped");
@@ -2476,7 +2404,8 @@ seastar::future<> close_before_group_runs(
       {},
       [&](auto& append, auto&, auto& segments, auto& targets, auto& work)
         -> seastar::future<> {
-          auto input = co_await request(child_wire(100), budget, work);
+          caller client{append, budget, work, drive};
+          auto input = co_await client.request(child_wire(100));
           auto stages = uninterrupted(
             [&] { return append.append(*targets[0], std::move(input), work); });
           require(
@@ -2484,11 +2413,8 @@ seastar::future<> close_before_group_runs(
             "the request did not form its group synchronously");
           auto closing = append.close();
           take(co_await drive.lifecycle(std::move(closing)));
-          require(
-            (co_await drive.lifecycle(std::move(stages.accepted))).accepted(),
-            "request rejected");
-          static_cast<void>(
-            durable(co_await drive.lifecycle(std::move(stages.result))));
+          co_await client.accepted(stages, "request rejected");
+          static_cast<void>(co_await client.durable(stages));
           require(
             segments[0]->progress()->durable.blocks == 1,
             "close dropped a formed group");
@@ -2522,7 +2448,8 @@ seastar::future<> identity_and_rejections(
       {},
       [&](auto& append, auto&, auto& segments, auto& targets, auto& work)
         -> seastar::future<> {
-          auto input = co_await request(child_wire(100), budget, work);
+          caller client{append, budget, work, drive};
+          auto input = co_await client.request(child_wire(100));
           const auto identity = input.batch.info();
           const auto first = co_await settle(
             append.append(*targets[0], std::move(input), work), drive);
@@ -2535,44 +2462,26 @@ seastar::future<> identity_and_rejections(
           co_await retired<Clock>(append, *segments[0], drive, timer);
           const auto reserved = segments[0]->progress()->reserved;
           const auto charged = budget.snapshot();
-          const auto rejected =
-            [&](local_append_request offered, errc code) -> seastar::future<> {
-              auto stages = append.append(
-                *targets[0], std::move(offered), work);
-              const auto decision = co_await drive.lifecycle(
-                std::move(stages.accepted));
-              const auto outcome = co_await drive.lifecycle(
-                std::move(stages.result));
-              require(
-                !decision.accepted() && decision.failure.error()
-                  && decision.failure.error()->code() == code
-                  && outcome.status == local_append_status::not_written,
-                "an unauthorized child was not rejected");
-          };
           // Sparse data, even at its original placement.
-          co_await rejected(
-            co_await request(assigned_wire(false, 32, true), budget, work),
+          co_await client.refused(
+            co_await client.submit(*targets[0], assigned_wire(false, 32, true)),
             errc::invalid_argument);
           // Bound to another generation: a relocation needs an installer.
-          co_await rejected(
-            co_await request(child_wire(101, 2), budget, work),
+          co_await client.refused(
+            co_await client.submit(*targets[0], child_wire(101, 2)),
             errc::wrong_context);
           // A routing epoch the child was not bound under.
-          auto rerouted = co_await request(child_wire(101), budget, work);
+          auto rerouted = co_await client.request(child_wire(101));
           rerouted.routing_epoch = model::range_routing_epoch::make(2).value();
-          co_await rejected(std::move(rerouted), errc::wrong_context);
+          co_await client.refused(
+            append.append(*targets[0], std::move(rerouted), work),
+            errc::wrong_context);
           require(
             segments[0]->progress()->reserved == reserved
-              && budget.snapshot().bytes == charged.bytes
-              && budget.snapshot().tasks == charged.tasks
-              && !segments[0]->failure().failed(),
+              && uncharged(budget, charged) && !segments[0]->failure().failed(),
             "a rejected child left positions, charges or a fence behind");
-          const auto next = co_await settle(
-            append.append(
-              *targets[0],
-              co_await request(child_wire(101), budget, work),
-              work),
-            drive);
+          const auto next = co_await client.settle(
+            *targets[0], child_wire(101));
           require(
             durable(next).block.records.bytes().begin()
               == head.segment.boundary().end().bytes,

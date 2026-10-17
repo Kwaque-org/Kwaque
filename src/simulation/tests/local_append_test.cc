@@ -627,6 +627,26 @@ SEASTAR_TEST_CASE(local_append_fake_wal_failure_after_segment) {
         failed_flush(runtime::fault_action::file_failure_after_effect))});
 }
 
+SEASTAR_TEST_CASE(local_append_fake_every_failure_reported) {
+    const auto targets = co_await calibrate(2);
+    BOOST_REQUIRE_NE(targets.segments[1].object, 0U);
+    co_await with_local_store(
+      [](auto&&... shared) {
+          return contract::every_failure_reported<simulation::monotonic_clock>(
+            shared...);
+      },
+      {flush_fault(
+         1,
+         targets.segments[1],
+         1,
+         failed_flush(runtime::fault_action::file_failure_before_effect)),
+       flush_fault(
+         2,
+         targets.wal,
+         2,
+         failed_flush(runtime::fault_action::file_failure_after_effect))});
+}
+
 SEASTAR_TEST_CASE(local_append_fake_crash_histories) {
     using history = contract::survival_history;
     const auto targets = co_await calibrate(1);

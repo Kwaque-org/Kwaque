@@ -18,7 +18,6 @@
 #include <seastar/core/gate.hh>
 #include <seastar/core/io_intent.hh>
 #include <seastar/core/semaphore.hh>
-#include <seastar/core/shared_future.hh>
 #include <seastar/core/shared_ptr.hh>
 
 #include <compare>
@@ -346,15 +345,12 @@ enum class file_access : std::uint8_t {
     read_write,
 };
 
-enum class file_close_policy : std::uint8_t { legacy, checked };
-
 struct file_open_options final {
     file_access access{file_access::read_only};
     bool create{false};
     bool exclusive{false};
     bool truncate{false};
     std::uint16_t permissions{0600U};
-    file_close_policy close_policy{file_close_policy::legacy};
     // Each completed write is durable, with the metadata needed to read it
     // back; flush has nothing left to do. Writes that allocate blocks or grow
     // the file pay for that metadata on every write, so pair this with space
@@ -437,8 +433,9 @@ private:
 // Owns one native file on one shard. The type removes seastar::file's copyable
 // shared ownership and adds explicit drain/close state, while all file
 // operations still dispatch through the native Seastar implementation.
-// A qualified write/flush/truncate failure fences further mutations. Reads can
-// still inspect the file, and default close still releases its native handle.
+// A failed write/flush/truncate/allocate fences further mutations, unless it
+// was refused before anything was dispatched. Reads can still inspect the
+// file. The native file must support checked close.
 class file final {
 public:
     // Holds a real metadata-admission unit for a later barrier. The file must
@@ -468,7 +465,6 @@ public:
       seastar::file&& native_file,
       file_io_limits limits = {},
       operation_statistics_owner statistics = {},
-      file_close_policy close_policy = file_close_policy::legacy,
       file_flight_ptr flight = {});
     file(file&& other) noexcept;
     file& operator=(file&&) = delete;
@@ -548,9 +544,12 @@ public:
     [[nodiscard]] seastar::future<result<void>>
     allocate(file_position position, byte_count length);
     [[nodiscard]] seastar::future<result<std::uint64_t>> size();
-    // Checked close drains accepted work without initiating abort. There is one
-    // closing caller; concurrent checked close rejects with queue_full. After
-    // completion, calls return the cached first outcome without another I/O.
+    // Drains accepted work, cancelling nothing (request_abort() first to
+    // cancel), then releases the native file once, even when its close fails;
+    // a failed close is never retried. Answers the first mutation failure,
+    // else the native close's. There is one closing caller: a close while
+    // closing is refused with queue_full. Afterwards it answers the cached
+    // outcome without I/O. Close implies no flush.
     [[nodiscard]] seastar::future<result<void>> close();
 
     [[nodiscard]] file_state state() const;
@@ -623,10 +622,10 @@ private:
         }
         return std::nullopt;
     }
+    // Work admitted before close began continues while the file drains.
     [[nodiscard]] std::optional<operation_error>
     mutation_rejection(bool admitted = false) const {
-        if (!(admitted && close_policy_ == file_close_policy::checked
-              && state_ == file_state::closing && !abort_requested_)) {
+        if (!(admitted && state_ == file_state::closing && !abort_requested_)) {
             if (auto rejected = operation_rejection()) return rejected;
         }
         if (first_failure_.exception())
@@ -660,7 +659,6 @@ private:
       seastar::gate::holder holder,
       file_operation metric);
     [[nodiscard]] seastar::future<result<void>> close_once();
-    [[nodiscard]] seastar::future<result<void>> close_checked_once();
 
     // An admitted operation: counted, and in its device's order.
     [[nodiscard]] file_operation admit() noexcept {
@@ -690,9 +688,7 @@ private:
     std::uint64_t disk_overwrite_dma_alignment_;
     std::uint64_t native_write_max_length_;
     std::uint64_t append_chunk_limit_;
-    std::optional<seastar::shared_promise<result<void>>> close_done_;
     first_failure first_failure_;
-    file_close_policy close_policy_;
     file_state state_{file_state::open};
     bool abort_requested_{false};
     bool moved_from_{false};
@@ -712,8 +708,7 @@ concept file_system_backend
       file_open_options options,
       directory_listing_limits limits) {
            {
-               file_system.open_directory(
-                 std::move(path), file_close_policy::checked)
+               file_system.open_directory(std::move(path))
            } -> std::same_as<seastar::future<
              result<typename FileSystem::directory_cursor_type>>>;
            {
@@ -747,8 +742,7 @@ concept file_system_backend
                  file_rename_policy::no_replace)
            } -> std::same_as<seastar::future<result<void>>>;
            {
-               file_system.sync_directory(
-                 std::move(path), file_close_policy::checked)
+               file_system.sync_directory(std::move(path))
            } -> std::same_as<seastar::future<result<void>>>;
        };
 

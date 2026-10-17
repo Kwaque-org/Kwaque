@@ -9,7 +9,7 @@ diff --git a/src/core/reactor.cc b/src/core/reactor.cc
  #endif
  
  #include <sys/mman.h>
-@@ -2936,8 +2937,38 @@
+@@ -2936,8 +2937,34 @@
  namespace {
  
  #ifdef SEASTAR_SHUFFLE_TASK_QUEUE
@@ -33,12 +33,8 @@ diff --git a/src/core/reactor.cc b/src/core/reactor.cc
 +std::mt19937_64 make_shuffle_generator() {
 +    static const uint64_t base_seed = shuffle_base_seed();
 +    const auto shard = this_shard_id();
-+    try {
-+        memory::scoped_critical_alloc_section section;
-+        seastar_logger.info("task queue shuffle seed {} on shard {}; replay with SEASTAR_SHUFFLE_TASK_QUEUE_SEED={}",
-+                base_seed, shard, base_seed);
-+    } catch (...) {
-+    }
++    seastar_logger.info("task queue shuffle seed {} on shard {}; replay with SEASTAR_SHUFFLE_TASK_QUEUE_SEED={}",
++            base_seed, shard, base_seed);
 +    std::seed_seq sequence{uint32_t(base_seed), uint32_t(base_seed >> 32), uint32_t(shard)};
 +    return std::mt19937_64{sequence};
 +}

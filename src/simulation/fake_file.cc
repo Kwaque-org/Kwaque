@@ -62,7 +62,7 @@ T native_value(runtime::result<T> result) {
                   == runtime::operation_context_key::detail)
                     throw runtime::detail::file_operation_exception{original};
         }
-        // Retain legacy broad results without inventing a device errno.
+        // Transport a broad result without inventing a device errno.
         auto code = original.code();
         switch (code) {
         case errc::not_found:
@@ -450,12 +450,7 @@ seastar::future<runtime::result<void>> fake_directory_cursor::close() {
 }
 
 seastar::future<runtime::result<fake_directory_cursor>>
-fake_file_system::open_directory(
-  runtime::file_path path, runtime::file_close_policy policy) {
-    if (
-      policy != runtime::file_close_policy::legacy
-      && policy != runtime::file_close_policy::checked)
-        co_return runtime::failure(file_error(errc::invalid_argument));
+fake_file_system::open_directory(runtime::file_path path) {
     assert_current();
     auto canonical = resolve(path.value());
     if (!canonical) co_return runtime::failure(canonical.error());
@@ -477,7 +472,6 @@ fake_file_system::open_directory(
     auto& metadata = operation.payload.emplace<metadata_operation>();
     metadata.path = std::move(*canonical);
     metadata.cursor = cursor.get();
-    operation.fault_b = static_cast<std::uint8_t>(policy);
     operation.open_slot = true;
     const auto existing = lookup(*metadata.path);
     if (existing) operation.object = *existing;
@@ -1455,7 +1449,6 @@ seastar::future<runtime::result<runtime::file>> fake_file_system::open(
     auto& metadata = operation.payload.emplace<metadata_operation>();
     metadata.path = std::move(*canonical);
     metadata.open_options = options;
-    operation.fault_b = static_cast<std::uint8_t>(options.close_policy);
     operation.open_slot = true;
     if (existing) {
         operation.object = *existing;
@@ -1863,32 +1856,7 @@ seastar::future<runtime::result<void>> fake_file_system::rename(
 }
 
 seastar::future<runtime::result<void>>
-fake_file_system::sync_directory_checked(runtime::file_path path) {
-    auto opened = co_await open_directory(
-      path, runtime::file_close_policy::checked);
-    if (!opened) co_return runtime::failure(opened.error());
-    auto cursor = std::move(*opened);
-    runtime::first_failure failed;
-    try {
-        failed.observe(co_await sync_directory(std::move(path)));
-    } catch (...) {
-        failed.observe(std::current_exception());
-    }
-    try {
-        failed.observe(co_await cursor.close());
-    } catch (...) {
-        failed.observe(std::current_exception());
-    }
-    co_return failed.outcome();
-}
-
-seastar::future<runtime::result<void>> fake_file_system::sync_directory(
-  runtime::file_path path, runtime::file_close_policy policy) {
-    if (policy == runtime::file_close_policy::checked)
-        return sync_directory_checked(std::move(path));
-    if (policy != runtime::file_close_policy::legacy)
-        return seastar::make_ready_future<runtime::result<void>>(
-          runtime::failure(file_error(errc::invalid_argument)));
+fake_file_system::sync_directory(runtime::file_path path) {
     assert_current();
     auto canonical = resolve(path.value());
     if (!canonical) {
@@ -5091,7 +5059,6 @@ fake_file_system::apply_open(metadata_operation& metadata, bool& open_slot) {
     return pending_open{
       std::move(native),
       std::move(statistics),
-      metadata.open_options.close_policy,
       flights_.under(metadata.path->bytes())};
 }
 
