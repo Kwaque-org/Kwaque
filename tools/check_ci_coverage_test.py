@@ -487,9 +487,11 @@ def shipped_artifact_errors(workflow: str) -> list[str]:
         if "sudo sysctl -w fs.aio-max-nr=1048576" not in commands:
             errors.append(f"{name}: allow linux-aio reactors")
         flags = tuple(
-            ARM_RELEASE_EXCLUSION
-            if name == "arm-build" and flag.startswith("--build_tag_filters=")
-            else flag
+            (
+                ARM_RELEASE_EXCLUSION
+                if name == "arm-build" and flag.startswith("--build_tag_filters=")
+                else flag
+            )
             for flag in SHIPPED_FLAGS
         )
         if not any(

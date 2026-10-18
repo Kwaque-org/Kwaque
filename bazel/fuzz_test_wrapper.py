@@ -15,7 +15,6 @@ from pathlib import Path
 
 from bazel.native_test_environment import normalized_environment, resolve_runfile
 
-
 # Each target bounds its own input with -max_len, sized to what it parses.
 # This ceiling only rejects a campaign whose inputs would not be bounded.
 MAXIMUM_INPUT_BYTES = 1 << 20
