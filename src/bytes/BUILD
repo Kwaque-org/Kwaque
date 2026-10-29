@@ -109,7 +109,7 @@ kwaque_cc_fuzz_test(
     srcs = ["fragmented_buffer_fuzz.cc"],
     args = [
         "-max_len=4096",
-        "-rss_limit_mb=512",
+        "-rss_limit_mb=1024",
     ],
     corpus = [
         "testdata/fragmented_buffer_fuzz_corpus/append_parse.bin",
@@ -117,7 +117,11 @@ kwaque_cc_fuzz_test(
         "testdata/fragmented_buffer_fuzz_corpus/deep_marks_high_offsets.bin",
         "testdata/fragmented_buffer_fuzz_corpus/trim_share.bin",
     ],
-    tags = ["fuzz-campaign"],
+    tags = [
+        "fuzz-campaign",
+        "resources:cpu:1",
+        "resources:memory:1024",
+    ],
     deps = [
         ":fragmented_buffer",
         ":fragmented_buffer_builder",
