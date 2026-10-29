@@ -39,6 +39,7 @@ constexpr invariant_id fake_storage_drained_invariant{
 // Precedes a crash policy's chosen survivors where they are hashed. No field
 // hashed in its place takes this value.
 constexpr std::uint64_t namespace_survivors_tag{UINT64_C(0x6e616d6573757276)};
+constexpr std::uint64_t write_zeroes_tag{UINT64_C(0x77727a65726f6573)};
 
 [[nodiscard]] runtime::operation_error file_error(errc code) noexcept {
     return runtime::operation_error{code, runtime::operation_kind::file};
@@ -667,6 +668,8 @@ public:
               std::system_error(
                 std::make_error_code(std::errc::permission_denied)));
         }
+        if (owner_->write_observer_)
+            owner_->write_observer_(object_, position, length);
         return owner_
           ->submit_file_operation(
             pending_kind::write,
@@ -721,6 +724,8 @@ public:
               std::system_error(
                 std::make_error_code(std::errc::permission_denied)));
         }
+        if (owner_->read_observer_)
+            owner_->read_observer_(object_, position, length);
         return owner_
           ->submit_file_operation(
             pending_kind::read,
@@ -760,6 +765,8 @@ public:
               seastar::temporary_buffer<std::uint8_t>>(std::system_error(
               std::make_error_code(std::errc::permission_denied)));
         }
+        if (owner_->read_observer_)
+            owner_->read_observer_(object_, position, length);
         return owner_
           ->submit_file_operation(
             pending_kind::bulk_read,
@@ -815,6 +822,28 @@ public:
         owner_->assert_current();
         handle_->assert_current();
         return unsupported<>();
+    }
+
+    // The runtime refuses a range starting before the end, and serializes
+    // writes on its handle, so a supported call is a zero-extension: the
+    // modeled truncate, with its faults, crash and durability rules.
+    seastar::future<>
+    write_zeroes(std::uint64_t position, std::uint64_t length) final {
+        owner_->assert_current();
+        handle_->assert_current();
+        if (!owner_->config_.write_zeroes) return unsupported<>();
+        if (access_ == runtime::file_access::read_only) {
+            return seastar::make_exception_future<>(std::system_error(
+              std::make_error_code(std::errc::permission_denied)));
+        }
+        if (length > std::numeric_limits<std::uint64_t>::max() - position) {
+            return seastar::make_exception_future<>(std::system_error(
+              std::make_error_code(std::errc::file_too_large)));
+        }
+        return void_operation(
+          pending_kind::truncate,
+          runtime::builtin_fault_point::file_truncate,
+          position + length);
     }
 
     seastar::future<std::uint64_t> size() final {
@@ -1306,7 +1335,8 @@ runtime::result<std::unique_ptr<fake_file_system>> fake_file_system::make(
       .kind = trace_event_kind::filesystem,
       .stable_id = config.device_scope,
       .effect = trace_action::storage_configuration};
-    if (config.crash_policy || config.device_scope != 1) {
+    if (
+      config.crash_policy || config.device_scope != 1 || config.write_zeroes) {
         codec::sha256_hasher hash;
         auto field = [&hash](std::uint64_t value) {
             std::array<std::uint8_t, 8> encoded{};
@@ -1363,6 +1393,8 @@ runtime::result<std::unique_ptr<fake_file_system>> fake_file_system::make(
         field(
           config.space_error ? static_cast<std::uint64_t>(*config.space_error)
                              : 0U);
+        // Only when it is set: a configuration without it hashes as before.
+        if (config.write_zeroes) field(write_zeroes_tag);
         configuration = storage_digest_fields(std::move(hash).final());
         auto reserved = event_scheduler.reserve_effect(
           descriptor, *configuration);

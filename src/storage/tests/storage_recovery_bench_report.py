@@ -39,10 +39,13 @@ ACTIONS = ("stop", "retain", "publish_recovering", "activate_successor")
 CLASSIFICATIONS = (
     "satisfied",
     "footer_only",
+    "materialize",
     "candidate",
     "suffix",
     "conflict",
     "content",
+    "materialized",
+    "repaired",
     "uncertified_tail",
     "corruption",
     "slack",
@@ -275,8 +278,11 @@ def validate(row: dict) -> None:
 
 
 def signature(row: dict) -> tuple:
+    # A wide case is run at the width each run sets: each width is a store
+    # of its own.
     return (
         row["case"],
+        row["segments"],
         row["state"],
         row["window_bytes"],
         row["read_ahead"],

@@ -18,8 +18,11 @@ inline constexpr std::uint64_t zero_write_chunks = 64;
 // so its size, not the zero-written range, bounds the backing.
 [[nodiscard]] bytes::fragmented_buffer make_zero_chunk(byte_count size);
 
-// Zero-writes [begin, end) through bounded runtime writes of at most
-// zero_write_chunks shares of chunk, which is borrowed until completion.
+// Zero-writes [begin, end). A range aligned to the file's writes and starting
+// at or past its end is zeroed in place where the file system and device
+// offer it; otherwise through bounded runtime writes of at most
+// zero_write_chunks shares of chunk, which is borrowed until completion. The
+// bytes are the same either way.
 [[nodiscard]] seastar::future<runtime::result<void>> zero_fill(
   runtime::file& file,
   bytes::fragmented_buffer& chunk,

@@ -66,7 +66,9 @@ COUNTERS = (
 )
 FLAGS = ("one_bucket", "timing_only", "ndebug", "libcxx_hardening_none", "complete")
 # What the start reported, beside its state and whether it restarted. All
-# but `recovered` and `wal_files` count work a clean stop leaves none of.
+# but `recovered` and `wal_files` count work a clean stop leaves none of:
+# among them what the start would write back from the WAL, since a clean
+# stop synced every run its segments held.
 START_COUNTERS = (
     "recovered",
     "unadopted",
@@ -77,6 +79,10 @@ START_COUNTERS = (
     "refused",
     "sealing",
     "unresolved",
+    "materialized",
+    "repaired",
+    "candidates",
+    "uncertified_tails",
     "wal_files",
 )
 UNFOUND = (
@@ -88,6 +94,10 @@ UNFOUND = (
     "refused",
     "sealing",
     "unresolved",
+    "materialized",
+    "repaired",
+    "candidates",
+    "uncertified_tails",
 )
 KIND_COUNTERS = (
     "reads",

@@ -28,8 +28,10 @@
 //  - the engine's removal cut after every scheduler event, every crash
 //    sweep, and every history with a crash in it: a native device cannot be
 //    crashed or stepped one event at a time;
-//  - the checkpoint and retry-snapshot runs cut at every event, and the
-//    checkpoint regressions: the same;
+//  - the checkpoint runs cut at every event, and the checkpoint
+//    regressions: the same;
+//  - a segment refused for the streams it holds: the limit is reached
+//    before any I/O, so the backend changes nothing;
 //  - the append cases that fail or delay a chosen flush (pressure before a
 //    freeze, coalesced barriers, independent segment outcomes, a detached
 //    deadline, barrier order, reordered completions, a WAL failure after a
@@ -113,6 +115,30 @@ seastar::future<> on_the_image(bool sealed) {
               });
         }));
 }
+// The same image after a crash lost segment A's blocks, and the engine
+// started on it twice.
+seastar::future<> materialized_on_the_image() {
+    co_await seastar::tmp_dir::do_with(
+      runtime::testing::test_directory_template(),
+      seastar::coroutine::lambda(
+        [](seastar::tmp_dir& directory) -> seastar::future<> {
+            const auto& base = directory.get_path();
+            co_await broker::testing::with_native_devices(
+              std::array{base / "w", base / "a", base / "b"},
+              image::devices,
+              [](
+                auto& files,
+                auto& owner,
+                const auto& devices,
+                auto& budget,
+                auto& reserve,
+                auto drive,
+                auto& timer) {
+                  return image::materialized_on_the_image<clock_type>(
+                    files, owner, devices, budget, reserve, drive, timer);
+              });
+        }));
+}
 } // namespace
 
 SEASTAR_TEST_CASE(local_engine_native_started_and_restarted) {
@@ -122,10 +148,38 @@ SEASTAR_TEST_CASE(local_engine_native_started_and_restarted) {
     });
 }
 
+SEASTAR_TEST_CASE(local_engine_native_prepared_restarted) {
+    co_await with_reserved_store([](auto&&... shared) {
+        return storage::testing::local_engine_contract::prepared_restarted<
+          clock_type>(shared...);
+    });
+}
+
+SEASTAR_TEST_CASE(local_engine_native_derived_segments) {
+    co_await with_reserved_store([](auto&&... shared) {
+        return storage::testing::local_engine_contract::derived_segments<
+          clock_type>(shared...);
+    });
+}
+
+SEASTAR_TEST_CASE(local_engine_native_placed_by_default) {
+    co_await with_reserved_store([](auto&&... shared) {
+        return storage::testing::local_engine_contract::placed_by_default<
+          clock_type>(shared...);
+    });
+}
+
 SEASTAR_TEST_CASE(local_engine_native_stale_control_record_refused) {
     co_await with_reserved_store([](auto&&... shared) {
         return storage::testing::local_engine_contract::
           stale_control_record_refused<clock_type>(shared...);
+    });
+}
+
+SEASTAR_TEST_CASE(local_engine_native_stale_control_check_passes_spares) {
+    co_await with_reserved_store([](auto&&... shared) {
+        return storage::testing::local_engine_contract::
+          stale_control_check_passes_spares<clock_type>(shared...);
     });
 }
 
@@ -138,6 +192,23 @@ SEASTAR_TEST_CASE(local_checkpoint_native_detached_boundary_pinned) {
 SEASTAR_TEST_CASE(local_checkpoint_native_reclaims_within_the_retained_limit) {
     co_await with_reserved_store([](auto&&... shared) {
         return successor::retained_wal_reclaimed<clock_type>(shared...);
+    });
+}
+
+SEASTAR_TEST_CASE(local_checkpoint_native_retained_wal_synced) {
+    for (const auto hold : {byte_count{}, byte_count{64_KiB}})
+        co_await with_reserved_store([hold](auto&&... shared) {
+            return successor::retained_wal_synced<clock_type>(shared..., hold);
+        });
+}
+
+SEASTAR_TEST_CASE(local_checkpoint_native_after_sync) {
+    co_await with_reserved_store([](auto&&... shared) {
+        return successor::checkpoint_after_sync<clock_type>(
+          shared...,
+          [](const runtime::file_path&) -> std::optional<std::uint64_t> {
+              return std::nullopt;
+          });
     });
 }
 
@@ -270,4 +341,10 @@ SEASTAR_TEST_CASE(engine_fixture_native_started_on_the_image) {
 // requests the image holds, byte for byte.
 SEASTAR_TEST_CASE(engine_fixture_native_sealed_segment_read_from_the_image) {
     co_await on_the_image(true);
+}
+
+// The same image after a crash lost segment A's blocks while the WAL kept
+// their PREPAREs: the start writes them back before it publishes A.
+SEASTAR_TEST_CASE(engine_fixture_native_lost_blocks_written_from_the_wal) {
+    co_await materialized_on_the_image();
 }

@@ -45,6 +45,9 @@ struct interval final {
 // are not additive latency components; busy time counts overlap once.
 struct kind_sample final {
     std::uint64_t calls{0}, bytes{0}, flushes{0};
+    // Writes through a handle opened for synchronized writes: each is
+    // durable when it completes, so the barrier it ends needs no flush.
+    std::uint64_t synchronized_calls{0};
     std::uint64_t active{0}, depth{0}, flushing{0}, flush_depth{0};
     std::uint64_t write_service_ns{0}, write_busy_ns{0}, write_busy_start{0};
     std::uint64_t flush_service_ns{0};
@@ -90,11 +93,13 @@ public:
       seastar::file native,
       io_sample* sample,
       file_kind kind,
-      seastar::semaphore* cap)
+      seastar::semaphore* cap,
+      bool synchronized)
       : file_(std::move(native))
       , sample_(sample)
       , kind_(kind)
-      , cap_(cap) {
+      , cap_(cap)
+      , synchronized_(synchronized) {
         _memory_dma_alignment = static_cast<unsigned>(
           file_.memory_dma_alignment());
         _disk_read_dma_alignment = static_cast<unsigned>(
@@ -116,6 +121,7 @@ private:
         const auto started = observed ? measurement_time() : 0;
         if (sample) {
             ++sample->calls;
+            if (synchronized_) ++sample->synchronized_calls;
             sample->bytes += len;
             sample->depth = std::max(sample->depth, ++sample->active);
             if (sample->active == 1) sample->write_busy_start = started;
@@ -242,6 +248,7 @@ private:
     io_sample* sample_;
     file_kind kind_;
     seastar::semaphore* cap_;
+    bool synchronized_;
 };
 
 // The production directory cursor, counting the syncs and pages it serves
@@ -324,7 +331,11 @@ public:
             auto* cap = cap_ ? &*cap_ : nullptr;
             auto file = observe_ || (cap && kind == file_kind::data)
                           ? seastar::file{seastar::make_shared<measured_file>(
-                              native, observe_ ? &sample : nullptr, kind, cap)}
+                              native,
+                              observe_ ? &sample : nullptr,
+                              kind,
+                              cap,
+                              options.synchronous)}
                           : native;
             co_return runtime::file{
               std::move(file), runtime::file_io_limits{}, statistics_};

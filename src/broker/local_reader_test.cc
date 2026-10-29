@@ -255,6 +255,30 @@ SEASTAR_TEST_CASE(local_wal_scan_head_tails_native) {
             files, owner, spec, budget, drive);
       });
 }
+SEASTAR_TEST_CASE(local_wal_scan_proven_heads_native) {
+    co_await with_readers(
+      51,
+      [](auto& files, auto& owner, const auto& spec, auto& budget, auto drive) {
+          return storage::testing::scan_contract::proven_heads(
+            files, owner, spec, budget, drive);
+      });
+}
+SEASTAR_TEST_CASE(local_wal_scan_packed_writes_native) {
+    co_await with_readers(
+      51,
+      [](auto& files, auto& owner, const auto& spec, auto& budget, auto drive) {
+          return storage::testing::scan_contract::packed_writes(
+            files, owner, spec, budget, drive);
+      });
+}
+SEASTAR_TEST_CASE(local_wal_scan_recycled_head_native) {
+    co_await with_readers(
+      51,
+      [](auto& files, auto& owner, const auto& spec, auto& budget, auto drive) {
+          return storage::testing::scan_contract::recycled_head(
+            files, owner, spec, budget, drive);
+      });
+}
 SEASTAR_TEST_CASE(local_wal_scan_rotated_chain_native) {
     co_await with_readers(
       51,
@@ -268,6 +292,22 @@ SEASTAR_TEST_CASE(local_wal_scan_target_resolution_native) {
       51,
       [](auto& files, auto& owner, const auto& spec, auto& budget, auto drive) {
           return storage::testing::scan_contract::target_resolution(
+            files, owner, spec, budget, drive);
+      });
+}
+SEASTAR_TEST_CASE(local_segment_scan_stale_objects_native) {
+    co_await with_readers(
+      51,
+      [](auto& files, auto& owner, const auto& spec, auto& budget, auto drive) {
+          return storage::testing::segment_scan_contract::stale_objects(
+            files, owner, spec, budget, drive);
+      });
+}
+SEASTAR_TEST_CASE(local_segment_scan_stale_tails_native) {
+    co_await with_readers(
+      51,
+      [](auto& files, auto& owner, const auto& spec, auto& budget, auto drive) {
+          return storage::testing::segment_scan_contract::stale_tails(
             files, owner, spec, budget, drive);
       });
 }
@@ -345,6 +385,15 @@ SEASTAR_TEST_CASE(local_recovery_reconstruction_native) {
             files, owner, spec, budget, drive);
       });
 }
+SEASTAR_TEST_CASE(local_recovery_reconstruction_residues_native) {
+    co_await with_readers(
+      51,
+      [](auto& files, auto& owner, const auto& spec, auto& budget, auto drive) {
+          return storage::testing::recovery_contract::reconstruction_residues<
+            runtime::production::monotonic_clock>(
+            files, owner, spec, budget, drive);
+      });
+}
 SEASTAR_TEST_CASE(local_recovery_interruptions_native) {
     co_await with_readers(
       51,
@@ -359,6 +408,15 @@ SEASTAR_TEST_CASE(local_recovering_publication_native) {
       51,
       [](auto& files, auto& owner, const auto& spec, auto& budget, auto drive) {
           return storage::testing::recovery_contract::recovering_publication<
+            runtime::production::monotonic_clock>(
+            files, owner, spec, budget, drive);
+      });
+}
+SEASTAR_TEST_CASE(local_recovery_materialization_native) {
+    co_await with_readers(
+      51,
+      [](auto& files, auto& owner, const auto& spec, auto& budget, auto drive) {
+          return storage::testing::recovery_contract::materialization<
             runtime::production::monotonic_clock>(
             files, owner, spec, budget, drive);
       });

@@ -8,6 +8,7 @@
 #include "src/model/batch_context.h"
 #include "src/model/batch_identity.h"
 #include "src/model/position.h"
+#include "src/runtime/time.h"
 
 #include <utility>
 
@@ -43,6 +44,12 @@ public:
         return fingerprint_;
     }
     [[nodiscard]] item_count header_count() const noexcept { return headers_; }
+    // The latest record time these bytes hold: the maximum over their records
+    // of the timestamp base plus the record's delta. Derived, never on the
+    // wire.
+    [[nodiscard]] runtime::wall_time max_record_time() const noexcept {
+        return max_record_time_;
+    }
     [[nodiscard]] const bytes::fragmented_buffer& records() const& noexcept {
         return records_;
     }
@@ -59,15 +66,18 @@ private:
       submitted_batch_context context,
       codec::semantic_batch_digest fingerprint,
       item_count headers,
+      runtime::wall_time max_record_time,
       bytes::fragmented_buffer&& records) noexcept
       : context_(context)
       , fingerprint_(fingerprint)
       , headers_(headers)
+      , max_record_time_(max_record_time)
       , records_(std::move(records)) {}
 
     submitted_batch_context context_;
     codec::semantic_batch_digest fingerprint_;
     item_count headers_;
+    runtime::wall_time max_record_time_;
     bytes::fragmented_buffer records_;
 };
 
@@ -96,6 +106,7 @@ public:
           *context,
           submitted.fingerprint(),
           submitted.header_count(),
+          submitted.max_record_time(),
           std::move(submitted).release_records()};
     }
 
@@ -112,6 +123,10 @@ public:
         return fingerprint_;
     }
     [[nodiscard]] item_count header_count() const noexcept { return headers_; }
+    // Over the retained records only, as for a submission.
+    [[nodiscard]] runtime::wall_time max_record_time() const noexcept {
+        return max_record_time_;
+    }
     [[nodiscard]] const bytes::fragmented_buffer& records() const& noexcept {
         return records_;
     }
@@ -128,15 +143,18 @@ private:
       assigned_batch_context context,
       codec::semantic_batch_digest fingerprint,
       item_count headers,
+      runtime::wall_time max_record_time,
       bytes::fragmented_buffer&& records) noexcept
       : context_(context)
       , fingerprint_(fingerprint)
       , headers_(headers)
+      , max_record_time_(max_record_time)
       , records_(std::move(records)) {}
 
     assigned_batch_context context_;
     codec::semantic_batch_digest fingerprint_;
     item_count headers_;
+    runtime::wall_time max_record_time_;
     bytes::fragmented_buffer records_;
 };
 

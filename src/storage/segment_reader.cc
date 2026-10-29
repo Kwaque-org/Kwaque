@@ -56,13 +56,13 @@ sparse_index_answer fed_answer(
 }
 } // namespace
 
-segment_read_index active_read_index(
-  const active_sparse_index& index, runtime::file_position bound) {
+segment_read_index active_read_index(const active_sparse_index& index) {
     return segment_read_index{
-      [&index, bound](
+      [&index](
         model::range_logical_offset target,
         seastar::abort_source&,
-        sparse_index_place&) {
+        sparse_index_place&,
+        runtime::file_position bound) {
           return seastar::make_ready_future<
             runtime::result<sparse_index_answer>>(
             fed_answer(index, bound, target));
@@ -72,9 +72,10 @@ segment_read_index active_read_index(
       // says why.
       [](const sparse_index_answer&, runtime::operation_error) noexcept {},
       // It is all in memory.
-      [&index, bound](
+      [&index](
         model::range_logical_offset target,
-        const sparse_index_place&) noexcept {
+        const sparse_index_place&,
+        runtime::file_position bound) noexcept {
           return std::optional{fed_answer(index, bound, target)};
       }};
 }
@@ -87,12 +88,14 @@ struct segment_reader::state final : detail::segment_session_link {
       segment_read_bounds bounds,
       segment_read_index index,
       workload_budget& budget,
-      segment_reader_config config) noexcept
+      segment_reader_config config,
+      segment_read_held held) noexcept
       : runs(runs)
       , entered(std::move(entered))
       , source(std::move(source))
       , bounds(bounds)
       , index(std::move(index))
+      , held(std::move(held))
       , budget(budget)
       , config(config) {}
     state(const state&) = delete;
@@ -107,8 +110,13 @@ struct segment_reader::state final : detail::segment_session_link {
     std::optional<segment_data_source> source;
     segment_read_bounds bounds;
     segment_read_index index;
+    // Nothing once the segment is sealed, or for a session that reads only
+    // what its writer has written.
+    segment_read_held held;
     workload_budget& budget;
     segment_reader_config config;
+    // Where the last batch it returned ends: a seal never ends before it.
+    model::range_logical_end given{};
     // The list of its segment's owner, while the session is in it.
     segment_sessions* among{nullptr};
     bool reading{false};
@@ -147,10 +155,12 @@ struct segment_reader::state final : detail::segment_session_link {
         used_run = run.begin();
         held.use();
     }
-    // A run the cache keeps is being read, and its reader `waited` for it
-    // or found it there. The second in a row asks for those after it.
-    void enter(const segment_run& run, bool waited);
-    void ahead(const segment_run& run);
+    // A run the cache keeps is being read under `bound`, and its reader
+    // `waited` for it or found it there. The second in a row asks for those
+    // after it.
+    void enter(
+      const segment_run& run, bool waited, const segment_read_bounds& bound);
+    void ahead(const segment_run& run, const segment_read_bounds& bound);
 
     void leave() noexcept {
         if (auto* list = std::exchange(among, nullptr))
@@ -161,6 +171,7 @@ struct segment_reader::state final : detail::segment_session_link {
         if (std::exchange(released, true)) return;
         place = {};
         index = {};
+        held = {};
         source.reset();
         entered.release();
     }
@@ -180,7 +191,9 @@ segment_sessions::~segment_sessions() {
 
 void segment_sessions::move(
   const segment_data_source& sealed,
-  const seastar::noncopyable_function<segment_read_index()>& lookups) noexcept {
+  const seastar::noncopyable_function<segment_read_index()>& lookups,
+  runtime::file_position end,
+  model::range_logical_end records) noexcept {
     for (auto next = open_.begin(); next != open_.end();) {
         auto& session = static_cast<segment_reader::state&>(*next++);
         bool moved = false;
@@ -190,6 +203,11 @@ void segment_sessions::move(
                 if (found.locate && found.report && found.peek) {
                     session.source.emplace(std::move(*shared));
                     session.index = std::move(found);
+                    // Every byte of it is in the file.
+                    session.held = {};
+                    session.bounds.durable = std::max(
+                      session.bounds.durable, end);
+                    session.bounds.sealed = records;
                     moved = true;
                 }
             }
@@ -211,7 +229,8 @@ runtime::result<segment_reader> segment_reader::open(
   segment_read_index index,
   workload_budget& budget,
   segment_reader_config config,
-  segment_sessions* among) {
+  segment_sessions* among,
+  segment_read_held held) {
     if (
       !index.locate || !index.report || !index.peek
       || config.output_bytes.value() < sizeof(segment_read_batch)
@@ -230,7 +249,8 @@ runtime::result<segment_reader> segment_reader::open(
           bounds,
           std::move(index),
           budget,
-          config}};
+          config,
+          std::move(held)}};
         made->reach = made->opening();
         if (among) {
             among->open_.push_back(*made);
@@ -257,12 +277,36 @@ const segment_read_bounds& segment_reader::bounds() const& noexcept {
 }
 bool segment_reader::revoked() const noexcept { return state_->revoked; }
 
+runtime::result<void>
+segment_reader::extend(const segment_read_bounds& bounds) noexcept {
+    auto& session = *state_;
+    if (session.revoked) return runtime::failure(read_error(errc::closed));
+    const auto& now = session.bounds;
+    // A bound that was cut to what this copy holds is a cut, not a
+    // watermark: it is not moved.
+    bool refused = now.short_of_visibility || bounds.short_of_visibility
+                   || bounds.durable < now.durable
+                   || bounds.visible < now.visible;
+    if (now.sealed)
+        refused = refused || bounds.sealed != now.sealed
+                  || bounds.durable != now.durable;
+    else if (bounds.sealed)
+        refused = refused || *bounds.sealed < session.given
+                  || *bounds.sealed < session.runs.history().logical_origin;
+    else
+        refused = refused || bounds.durable > session.runs.durable_position();
+    if (refused) return runtime::failure(read_error(errc::invalid_argument));
+    session.bounds = bounds;
+    return {};
+}
+
 seastar::future<segment_read> segment_reader::read(
   segment_read_request request, seastar::abort_source& caller) {
     return state_->read(request, caller);
 }
 
-void segment_reader::state::enter(const segment_run& run, bool waited) {
+void segment_reader::state::enter(
+  const segment_run& run, bool waited, const segment_read_bounds& bound) {
     if (config.read_ahead == 0 || !config.fill || run.blocks().empty()) return;
     if (entered_run == std::optional{run.begin()}) return;
     const bool follows = last_end == std::optional{run.begin()};
@@ -275,10 +319,11 @@ void segment_reader::state::enter(const segment_run& run, bool waited) {
     // What was asked for was not there when its reader came: it looks one
     // run further from here on.
     if (waited && config.read_ahead_grows && reach < config.read_ahead) ++reach;
-    if (run.end() < bounds.durable) ahead(run);
+    if (run.end() < bound.durable) ahead(run, bound);
 }
 
-void segment_reader::state::ahead(const segment_run& run) {
+void segment_reader::state::ahead(
+  const segment_run& run, const segment_read_bounds& bound) {
     std::optional<model::range_logical_offset> base;
     if (
       const auto first = model::range_logical_offset::make(
@@ -286,21 +331,23 @@ void segment_reader::state::ahead(const segment_run& run) {
         base = *first;
     auto begins = run.end();
     std::uint64_t asked = 0;
+    // Only what is in the file is asked for.
+    const auto in_file = std::min(bound.durable, runs.written_position());
     for (std::uint32_t looked_at = 0; base && looked_at < reach; ++looked_at) {
-        if (bounds.visible <= base->as_end()) return;
+        if (bound.visible <= base->as_end()) return;
         // What the index holds in memory or the session stands in, and
         // nothing it would have to read or wait for.
-        const auto answer = index.peek(*base, place);
+        const auto answer = index.peek(*base, place, bound.durable);
         if (!answer || !answer->position) return;
         const auto start = segment_run_at(
           runs.history(), answer->position->anchor);
         const auto end = answer->position->end;
         // The run that begins where the one before it ends, whole, and
-        // below the session's bounds.
+        // below the session's bounds and in the file.
         if (
           !start || start->position != begins || start->base != *base
-          || !(
-            end < bounds.durable || (end == bounds.durable && bounds.sealed)))
+          || !(end < bound.durable || (end == bound.durable && bound.sealed))
+          || in_file < end)
             return;
         // No further ahead than the window, the first run whatever its
         // length: runs that are longer are fewer.
@@ -317,7 +364,7 @@ void segment_reader::state::ahead(const segment_run& run) {
               : config.behind + 1U;
         if (
           !runs.holds(start->base)
-          && !runs.prefetch(*start, end, *source, bounds.durable, readers))
+          && !runs.prefetch(*start, end, *source, in_file, readers))
             return;
         base = answer->next;
         begins = end;
@@ -372,17 +419,19 @@ seastar::future<segment_read> segment_reader::state::read(
         out.stop = segment_read_stop::below_start;
         co_return out;
     }
-    const auto durable = bounds.durable;
-    const auto visible = bounds.visible.value();
+    // What this read keeps to, whatever extend() gives the reads after it.
+    const segment_read_bounds bound = bounds;
+    const auto durable = bound.durable;
+    const auto visible = bound.visible.value();
     // What a read stops for at the end of a sealed copy: the end of the
     // segment, unless what its caller may see was cut to what this copy
     // holds, and that is where it was cut.
-    const auto sealed_end = bounds.short_of_visibility && bounds.sealed
-                                && bounds.visible <= *bounds.sealed
+    const auto sealed_end = bound.short_of_visibility && bound.sealed
+                                && bound.visible <= *bound.sealed
                               ? segment_read_stop::short_of_visibility
                               : segment_read_stop::end_of_segment;
     // And when the next offset is past what its caller may see.
-    const auto unseen = bounds.short_of_visibility
+    const auto unseen = bound.short_of_visibility
                           ? segment_read_stop::short_of_visibility
                           : segment_read_stop::not_yet_visible;
     auto cursor = request.from.offset.value();
@@ -390,7 +439,7 @@ seastar::future<segment_read> segment_reader::state::read(
     // segment. One that waits at its end for more to see is.
     if (config.fill) runs.touch();
     // Neither answer needs anything of the budget or of the device.
-    if (bounds.sealed && cursor >= bounds.sealed->value()) {
+    if (bound.sealed && cursor >= bound.sealed->value()) {
         out.stop = sealed_end;
         co_return out;
     }
@@ -423,7 +472,7 @@ seastar::future<segment_read> segment_reader::state::read(
         hint.reset();
         if (out.batches.empty()) out.next.block.reset();
     };
-    if (hint && !history.alignment.aligned(*hint)) forget_hint();
+    if (hint && *hint < history.data_start) forget_hint();
     std::uint64_t spent = 0;
     // The runs this read's batches keep in the cache, and the one charged
     // last: each is charged once.
@@ -548,7 +597,7 @@ seastar::future<segment_read> segment_reader::state::read(
                     stop_at(segment_read_stop::limit);
                 break;
             }
-            if (bounds.sealed && cursor >= bounds.sealed->value()) {
+            if (bound.sealed && cursor >= bound.sealed->value()) {
                 stop_at(sealed_end);
                 break;
             }
@@ -578,7 +627,7 @@ seastar::future<segment_read> segment_reader::state::read(
                 if (auto kept = runs.floor(*wanted, false)) {
                     if (kept->seek(*wanted) < kept->blocks().size()) {
                         use(*kept, kept);
-                        enter(*kept, false);
+                        enter(*kept, false, bound);
                         const bool cached = !kept.funded();
                         const auto& run = *kept;
                         stepped.emplace(take(run, kept, durable, cached));
@@ -615,8 +664,12 @@ seastar::future<segment_read> segment_reader::state::read(
                     if (exhausted) break;
                     continue;
                 }
+                // What its writer handed over that the feed has not taken
+                // yet: taken now, and looked for again.
+                if (runs.catch_up(*wanted)) continue;
                 // The index, which is waited for when it is owed.
-                auto answer = co_await index.locate(*wanted, caller, place);
+                auto answer = co_await index.locate(
+                  *wanted, caller, place, durable);
                 // A caller that left while it was looked up is not read
                 // for.
                 if (caller.abort_requested()) {
@@ -646,7 +699,7 @@ seastar::future<segment_read> segment_reader::state::read(
                 // A run the cache keeps reaches the next anchor, or the
                 // end of a sealed extent, and lies below this session's
                 // bound.
-                whole = end < durable || (end == durable && bounds.sealed);
+                whole = end < durable || (end == durable && bound.sealed);
                 answered.emplace(*answer);
             }
             if (start->position >= durable) break;
@@ -665,9 +718,14 @@ seastar::future<segment_read> segment_reader::state::read(
                                 && *hint < until;
             bool hinted = false;
             bool alone = true;
-            if (whole && config.fill) {
+            // Where what is in the segment's file ends now, which only
+            // grows: what lies past it is read from the writer's memory.
+            const auto in_file = [this, durable] {
+                return std::min(durable, runs.written_position());
+            };
+            if (whole && config.fill && end <= in_file()) {
                 loaded = co_await runs.fetch(
-                  *start, end, *source, durable, caller, config.behind);
+                  *start, end, *source, end, caller, config.behind);
                 // No room for it: read all the same, once for everyone who
                 // misses it together, unless this reader goes on from a
                 // place inside it.
@@ -676,12 +734,13 @@ seastar::future<segment_read> segment_reader::state::read(
                       *start,
                       end,
                       *source,
-                      durable,
+                      end,
                       caller,
                       config.behind,
                       &budget);
                 alone = !loaded;
             }
+            std::optional<runtime::file_position> held_from;
             if (!loaded && unkept(loaded.error().code())) {
                 // For this reader alone.
                 auto from = *start;
@@ -694,12 +753,29 @@ seastar::future<segment_read> segment_reader::state::read(
                         hinted = true;
                     }
                 }
-                loaded = co_await runs.read_alone(
-                  from, until, *source, durable, budget, caller);
+                if (const auto device = in_file(); from.position < device) {
+                    loaded = co_await runs.read_alone(
+                      from,
+                      std::min(until, device),
+                      *source,
+                      device,
+                      budget,
+                      caller);
+                } else {
+                    held_from = from.position;
+                    loaded = co_await runs.read_held(
+                      from, until, held, budget, caller);
+                }
                 if (hinted) start = from;
             }
             if (!loaded) {
                 const auto code = loaded.error().code();
+                // Its writer wrote what this read went to its memory for,
+                // and let go of it: it is read from the file.
+                if (
+                  held_from && code == errc::out_of_range
+                  && runs.written_position() > *held_from)
+                    continue;
                 // Whatever a place that was handed back led to, short of
                 // the caller's leaving or a refusal, says the place was
                 // wrong before it says anything of the data: it is
@@ -736,7 +812,7 @@ seastar::future<segment_read> segment_reader::state::read(
                 // Its own load is not a use, and one it joined was marked
                 // where it joined.
                 used_run = run.begin();
-                enter(run, true);
+                enter(run, true, bound);
             }
             const auto before = out.batches.size();
             const auto stepped = take(
@@ -775,12 +851,13 @@ seastar::future<segment_read> segment_reader::state::read(
     // Nothing more of this copy lay below the durable bound. That is the
     // end of a sealed segment only where its records end.
     if (drained)
-        out.stop = bounds.sealed && cursor >= bounds.sealed->value()
+        out.stop = bound.sealed && cursor >= bound.sealed->value()
                      ? sealed_end
                      : segment_read_stop::short_of_visibility;
     // The charge lasts as long as any batch does.
     for (auto& batch : out.batches)
         batch.charged.emplace(out.held->share());
+    if (!out.batches.empty()) given = std::max(given, out.next.offset);
     co_return out;
 }
 

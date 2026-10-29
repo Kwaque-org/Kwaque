@@ -45,6 +45,8 @@ TEST(EncodedBatchTest, ExactValidationRetainsBytesAndCheckedOriginalFacts) {
               sparse ? 5U : 1U);
             EXPECT_EQ(info.header_count, item_count{});
             EXPECT_EQ(
+              info.max_record_time.unix_nanoseconds(), max_record_time(wire));
+            EXPECT_EQ(
               info.verification,
               sparse ? model::batch_fingerprint_verification::carried
                      : model::batch_fingerprint_verification::recomputed);
@@ -128,6 +130,16 @@ TEST(
                   get(wire, 32 + 156, 1), static_cast<std::uint8_t>(encoding));
                 if (encoding == compression::codec_id::none)
                     EXPECT_EQ(wire, assigned_wire());
+                // The encoder and the validator derive the same information
+                // from the same bytes.
+                auto bytes = buffer(wire);
+                const auto memory = reserve(bytes, work);
+                const auto again
+                  = validate_encoded_assigned_batch(
+                      std::move(bytes), batch_expected(), memory, work)
+                      .get();
+                ASSERT_TRUE(again.has_value());
+                EXPECT_EQ(again->info(), encoded->info());
             }
         }
     }

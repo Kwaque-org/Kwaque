@@ -15,14 +15,17 @@ struct wal_member_memory final {
     byte_count input, additional, codec_bytes, retained;
     item_count fragments;
 };
+// One PREPARE's memory with `padding` bytes ending its write.
 [[nodiscard]] runtime::result<wal_member_memory> wal_prepare_memory(
   const encoded_assigned_batch&,
-  aligned_envelope_layout,
+  byte_count padding,
   const codec::limits&,
   bytes::allocation_charge_fn);
 struct wal_group_member final {
     admitted_wal_batch::contents input;
     wal_child_expectation expected;
+    // The target segment's certified end when the member's group froze.
+    runtime::file_position target_certified_end;
     std::optional<wal_prepare_expectation> reserved;
     std::optional<wal_member_memory> memory;
 };
@@ -52,8 +55,13 @@ public:
     wal_group& operator=(wal_group&&) = delete;
     wal_group(const wal_group&) = delete;
     wal_group& operator=(const wal_group&) = delete;
-    [[nodiscard]] runtime::result<void>
-      append(admitted_wal_batch, wal_child_expectation);
+    // `target_certified_end` is where the target segment's durable bytes
+    // ended when the member's group froze, which its PREPARE states: on the
+    // target's alignment, from its data start to the member's final target.
+    [[nodiscard]] runtime::result<void> append(
+      admitted_wal_batch,
+      wal_child_expectation,
+      runtime::file_position target_certified_end);
     [[nodiscard]] std::size_t size() const noexcept {
         owner_.assert_current();
         return members_.size();

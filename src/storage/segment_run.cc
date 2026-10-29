@@ -2,6 +2,7 @@
 
 #include "src/base/allocation.h"
 #include "src/base/invariant.h"
+#include "src/bytes/fragmented_buffer_builder.h"
 #include "src/bytes/fragmented_buffer_parser.h"
 #include "src/codec/envelope.h"
 #include "src/codec/envelope_integrity.h"
@@ -20,6 +21,7 @@
 #include <array>
 #include <limits>
 #include <new>
+#include <optional>
 #include <system_error>
 #include <utility>
 
@@ -61,6 +63,51 @@ runtime::operation_error object_error(errc code, bool first) noexcept {
     default:
         return run_error(errc::malformed_data);
     }
+}
+// Whether a fed fragment is shared rather than copied: its bytes fill at
+// least three quarters of the allocation it keeps alive, so that what a run
+// keeps is never more than 4/3 of what it presents. A sparse one, a small
+// batch in a large frame, is copied.
+bool dense(const bytes::fragmented_buffer& bytes, std::size_t at) noexcept {
+    const auto presented = bytes.fragment_at(at);
+    const auto backing = bytes.fragment_retained_bytes(at);
+    return presented && backing
+           && 4 * std::uint64_t{presented->size()} >= 3 * backing->value();
+}
+// `bytes`, sharing each stretch of dense fragments and copying each stretch
+// of the others into allocations of its own. Nothing when it cannot be made.
+std::optional<bytes::fragmented_buffer>
+shared_or_copied(bytes::fragmented_buffer bytes) {
+    if (bytes.empty()) return bytes;
+    bytes::fragmented_buffer_builder joined{
+      {.initial_fragment_bytes = byte_count{1},
+       .max_fragment_bytes = byte_count{1},
+       .max_total_bytes = bytes.size(),
+       .max_retained_bytes = bytes::max_builder_total_bytes}};
+    while (!bytes.empty()) {
+        std::size_t count = 0;
+        while (count < bytes.fragment_count() && dense(bytes, count))
+            ++count;
+        if (count != 0) {
+            if (!joined.append_fragments(bytes, item_count{count}))
+                return std::nullopt;
+            continue;
+        }
+        std::uint64_t length = 0;
+        while (count < bytes.fragment_count() && !dense(bytes, count))
+            length += bytes.fragment_at(count++)->size();
+        auto stretch = bytes.share(byte_count{0}, byte_count{length});
+        if (!stretch) return std::nullopt;
+        auto copied = stretch->copy();
+        if (
+          !bytes.trim_front(byte_count{length})
+          || !joined.append_fragments(
+            copied, item_count{copied.fragment_count()}))
+            return std::nullopt;
+    }
+    auto made = joined.finish();
+    if (!made) return std::nullopt;
+    return std::move(*made);
 }
 // Whether a read failed because its device did: an I/O error, a read-only
 // filesystem, a device that is gone.
@@ -226,11 +273,10 @@ seastar::future<runtime::result<checked_segment_run>> check_segment_run(
   const workload_budget& budget,
   codec::cooperative_work& work) {
     using output = runtime::result<checked_segment_run>;
+    // Blocks are packed and only a footer pads, to its own end: a run starts
+    // at any block and its objects have any length.
     const auto total = bytes.size().value();
-    const auto unit = history.alignment.bytes().value();
-    if (
-      total == 0 || total % unit != 0
-      || !history.alignment.aligned(start.position))
+    if (total == 0 || start.position < history.data_start)
         co_return output{runtime::failure(run_error(errc::invalid_argument))};
     // Every alias of the bytes is priced against what the bytes cost whole.
     const auto backing = budget.buffer_charge(bytes);
@@ -295,7 +341,7 @@ seastar::future<runtime::result<checked_segment_run>> check_segment_run(
             refusal = prefix->error().code();
         } else {
             length = (*prefix)->encoded_bytes().value();
-            if (length == 0 || length % unit != 0) {
+            if (length == 0) {
                 refusal = errc::malformed_data;
             } else if (length > remaining) {
                 if (!whole) {
@@ -542,7 +588,7 @@ segment_runs::tail(model::range_logical_offset target) noexcept {
     for (auto at = pending_.size(); at-- != 0;) {
         auto& run = *pending_[at];
         if (target < run.base) continue;
-        return segment_tail{&run.building.run(), run.load.hold(), durable_};
+        return segment_tail{&run.building.run(), run.load.hold(), readable_};
     }
     return std::nullopt;
 }
@@ -592,6 +638,7 @@ seastar::future<runtime::result<segment_run>> segment_runs::load(
     const auto working = budget_.try_reserve(
       byte_count{limits.working_bytes.value() + limits.metadata_bytes.value()});
     if (!working) co_return output{runtime::failure(working.error())};
+    device_read(start.position);
     auto read = co_await source.read(
       start.position, byte_count{end.value() - start.position.value()}, bound);
     if (!read) co_return output{runtime::failure(read.error())};
@@ -627,7 +674,7 @@ seastar::future<runtime::result<cache_ref<segment_run>>> segment_runs::fetch(
     // to wait for it.
     if (runs_.loading(start.base))
         co_return co_await runs_.join(start.base, caller);
-    const auto admitted = estimate(length);
+    const auto admitted = estimate(enclosing(start.position, length));
     if (!admitted) co_return output{runtime::failure(admitted.error())};
     // What reads the run owns its own right to the source: the read may
     // still be running when its caller has left.
@@ -703,7 +750,7 @@ segment_runs::read_alone(
     // Once more, with exactly its length, for a first block that one read's
     // worth does not hold.
     for (int attempt = 0; attempt < 2; ++attempt) {
-        const auto admitted = estimate(wanted);
+        const auto admitted = estimate(enclosing(start.position, wanted));
         if (!admitted) co_return output{runtime::failure(admitted.error())};
         // The run's own, for as long as anything holds it: what it is
         // estimated at, and room for what its buffers' bookkeeping and its
@@ -714,6 +761,7 @@ segment_runs::read_alone(
         cache_slot<segment_run> place;
         auto led = place.lead(cache_, *admitted, std::move(*kept));
         if (!led) co_return output{runtime::failure(led.error())};
+        device_read(start.position);
         auto read = co_await source.read(
           start.position, byte_count{wanted}, bound);
         if (!read) {
@@ -748,6 +796,76 @@ segment_runs::read_alone(
     co_return output{runtime::failure(run_error(errc::malformed_data))};
 }
 
+seastar::future<runtime::result<cache_ref<segment_run>>>
+segment_runs::read_held(
+  segment_run_start start,
+  runtime::file_position end,
+  const segment_read_held& held,
+  workload_budget& budget,
+  seastar::abort_source& caller) {
+    using output = runtime::result<cache_ref<segment_run>>;
+    assert_current();
+    if (closing_) co_return output{runtime::failure(run_error(errc::closed))};
+    if (caller.abort_requested())
+        co_return output{runtime::failure(run_error(errc::aborted))};
+    if (end <= start.position)
+        co_return output{runtime::failure(run_error(errc::out_of_range))};
+    const auto joined = loads_.hold();
+    const auto& limits = config_.limits;
+    codec::cooperative_work work{limits.policy, caller};
+    const auto working = budget.try_reserve(
+      byte_count{limits.working_bytes.value() + limits.metadata_bytes.value()});
+    if (!working) co_return output{runtime::failure(working.error())};
+    auto wanted = std::min(
+      end.value() - start.position.value(), limits.run_bytes.value());
+    // Once more, with exactly its length, for a first block that one read's
+    // worth does not hold.
+    for (int attempt = 0; attempt < 2; ++attempt) {
+        // A seal that moved the session meanwhile let go of the writer:
+        // everything is in the file.
+        if (!held)
+            co_return output{runtime::failure(run_error(errc::out_of_range))};
+        auto bytes = held(
+          start.position,
+          runtime::file_position{start.position.value() + wanted});
+        if (!bytes) co_return output{runtime::failure(bytes.error())};
+        // The run's own, for as long as anything holds it: what the shares
+        // keep alive, and room for its entry and its tables.
+        const auto admitted = budget.buffer_charge(*bytes);
+        if (!admitted) co_return output{runtime::failure(admitted.error())};
+        auto kept = budget.try_reserve(
+          byte_count{admitted->value() + admitted->value() / 8 + 4_KiB});
+        if (!kept) co_return output{runtime::failure(kept.error())};
+        cache_slot<segment_run> place;
+        auto led = place.lead(cache_, *admitted, std::move(*kept));
+        if (!led) co_return output{runtime::failure(led.error())};
+        auto checked = co_await check_segment_run(
+          std::move(*bytes), history_, start, false, limits, budget, work);
+        if (!checked) {
+            std::move(*led).fail(checked.error());
+            co_return output{runtime::failure(checked.error())};
+        }
+        // Nothing fit: the first object is longer than one read's worth.
+        if (checked->run.end() == start.position) {
+            const auto whole = checked->cut.value_or(byte_count{});
+            std::move(*led).fail(run_error(errc::out_of_range));
+            if (
+              attempt != 0 || whole.value() <= wanted
+              || whole.value() > end.value() - start.position.value())
+                co_return output{
+                  runtime::failure(run_error(errc::malformed_data))};
+            wanted = whole.value();
+            continue;
+        }
+        if (auto sized = led->resize(checked->run.charge()); !sized) {
+            std::move(*led).fail(sized.error());
+            co_return output{runtime::failure(sized.error())};
+        }
+        co_return output{std::move(*led).publish_held(std::move(checked->run))};
+    }
+    co_return output{runtime::failure(run_error(errc::malformed_data))};
+}
+
 bool segment_runs::prefetch(
   segment_run_start start,
   runtime::file_position end,
@@ -761,7 +879,7 @@ bool segment_runs::prefetch(
     // keep: nothing is asked for.
     if (length > config_.limits.run_bytes.value() || runs_.holds(start.base))
         return false;
-    const auto admitted = estimate(length);
+    const auto admitted = estimate(enclosing(start.position, length));
     if (!admitted) return false;
     auto shared = source.share();
     if (!shared) return false;
@@ -787,18 +905,24 @@ void segment_runs::seal() noexcept {
     if (closing_ || sealed_) return;
     sealed_ = true;
     wanted_ = false;
+    // All of a sealed segment is in its file, wherever its writer's bytes
+    // had reached: a seal while the shard runs writes through a handle of
+    // its own, of which the writer's observer is never told.
+    written_.reset();
     stir();
 }
 
 segment_block_observer
 segment_runs::observer(active_sparse_index& index) noexcept {
-    return segment_block_observer{
+    // Nothing of its writer's is in the file yet.
+    written_ = history_.data_start;
+    segment_block_observer told{
       [this, &index](std::span<const segment_block_layout> blocks) noexcept {
           note(blocks, index);
       },
       [this, &index](runtime::file_position end) noexcept {
-          index.durable(end);
-          durable(end);
+          durable_ = end;
+          readable(index);
       },
       [this](
         runtime::file_position begin,
@@ -807,6 +931,15 @@ segment_runs::observer(active_sparse_index& index) noexcept {
           feed(begin, bytes, paid);
       },
       &wanted_};
+    told.written = [this](runtime::file_position end) noexcept {
+        written_ = end;
+    };
+    told.reported = [this, &index](runtime::file_position end) noexcept {
+        reported_ = end;
+        readable(index);
+    };
+    told.admit = [&index](std::uint32_t blocks) { return index.admit(blocks); };
+    return told;
 }
 
 void segment_runs::note(
@@ -815,6 +948,8 @@ void segment_runs::note(
     assert_current();
     noted_.clear();
     torn_ = false;
+    // A group may have no blocks: the footer that closes a held run.
+    noted_group_ = true;
     for (const auto& block : blocks) {
         const bool chosen = index.written(block.records);
         if (!wanted_ || torn_) continue;
@@ -831,6 +966,7 @@ void segment_runs::drop() noexcept {
     gap_ = true;
     ++dropped_;
     noted_.clear();
+    noted_group_ = false;
 }
 
 void segment_runs::feed(
@@ -854,7 +990,7 @@ void segment_runs::feed(
     }
     const auto size = bytes.size().value();
     if (
-      torn_ || noted_.empty() || waiting_.size() >= maximum_fed_groups
+      torn_ || !noted_group_ || waiting_.size() >= maximum_fed_groups
       || size > config_.limits.run_bytes.value()
       || size > config_.feed_bytes.value() - waiting_bytes_) {
         drop();
@@ -869,15 +1005,25 @@ void segment_runs::feed(
         return;
     }
     noted_.clear();
+    noted_group_ = false;
     gap_ = false;
     waiting_bytes_ += size;
     stir();
 }
 
-void segment_runs::durable(runtime::file_position end) noexcept {
+void segment_runs::readable(active_sparse_index& index) noexcept {
     assert_current();
-    durable_ = end;
+    const auto end = std::max(durable_, reported_);
+    if (end <= readable_) return;
+    readable_ = end;
+    // Where a group ends, whichever told it: no block lies across it.
+    index.durable(end);
     if (!pending_.empty()) stir();
+}
+
+void segment_runs::device_read(runtime::file_position at) noexcept {
+    if (!pending_.empty() && at >= pending_.front()->building.run().begin())
+        ++tail_device_reads_;
 }
 
 void segment_runs::abandon() noexcept {
@@ -891,7 +1037,7 @@ void segment_runs::abandon() noexcept {
 void segment_runs::publish() noexcept {
     while (!pending_.empty()) {
         auto& oldest = *pending_.front();
-        if (!oldest.closed || durable_ < oldest.building.run().end()) return;
+        if (!oldest.closed || readable_ < oldest.building.run().end()) return;
         std::move(oldest.load).publish(std::move(oldest.building).finish());
         pending_.pop_front();
     }
@@ -942,15 +1088,32 @@ bool segment_runs::append(
       run.end().value() - run.begin().value() + length
       > config_.limits.run_bytes.value())
         return false;
-    // Taken before the copy, and made exact once the copy is there.
-    const auto room = estimate(length);
-    if (!room) return false;
-    if (!filling.load.resize(byte_count{run.charge().value() + room->value()}))
-        return false;
     try {
         auto slice = group.bytes.share(byte_count{from}, byte_count{length});
         if (!slice) return false;
-        if (!filling.building.part(slice->copy())) return false;
+        // What the part keeps alive is taken before it is made, and made
+        // exact once it is there: the allocations of the fragments it
+        // shares, and copies of the others.
+        std::uint64_t room = 0, copying = 0;
+        for (std::size_t at = 0; at < slice->fragment_count(); ++at) {
+            if (config_.copy_fed || !dense(*slice, at)) {
+                copying += slice->fragment_at(at)->size();
+                continue;
+            }
+            const auto cost = slice->allocation_cost(
+              at, 1, config_.limits.charge);
+            if (!cost) return false;
+            room += cost->backing.value() + cost->share_controls.value();
+        }
+        const auto copies = estimate(copying);
+        if (!copies) return false;
+        if (!filling.load.resize(
+              byte_count{run.charge().value() + room + copies->value()}))
+            return false;
+        auto part = config_.copy_fed ? std::optional{slice->copy()}
+                                     : shared_or_copied(std::move(*slice));
+        if (!part || !filling.building.part(std::move(*part))) return false;
+        copied_ += copying;
     } catch (const std::bad_alloc&) {
         return false;
     }
@@ -1029,19 +1192,53 @@ seastar::future<> segment_runs::copy() {
             co_await wake_.when();
             continue;
         }
-        auto group = std::move(waiting_.front());
-        waiting_.pop_front();
-        waiting_bytes_ -= group.bytes.size().value();
-        try {
-            take(group);
-        } catch (...) {
-            // Whatever kept a group from being copied, its run is read
-            // from the device instead.
-            abandon();
-        }
-        publish();
+        take_front();
         co_await seastar::coroutine::maybe_yield();
     }
+}
+
+void segment_runs::take_front() noexcept {
+    auto group = std::move(waiting_.front());
+    waiting_.pop_front();
+    waiting_bytes_ -= group.bytes.size().value();
+    try {
+        take(group);
+    } catch (...) {
+        // Whatever kept a group from being taken, its run is read from the
+        // device instead.
+        abandon();
+    }
+    publish();
+}
+
+bool segment_runs::catch_up(model::range_logical_offset target) noexcept {
+    assert_current();
+    if (closing_ || finished_ || lapsed_) return false;
+    // The first group waiting whose blocks reach past `target`: it holds
+    // `target` unless that lies before it, in a group already taken or one
+    // that was not kept.
+    std::size_t holder = 0;
+    while (holder < waiting_.size()
+           && (waiting_[holder].blocks.empty()
+               || waiting_[holder].blocks.back().records.logical().end().value()
+                    <= target.value()))
+        ++holder;
+    if (
+      holder == waiting_.size()
+      || waiting_[holder].blocks.front().records.logical().begin().value()
+           > target.value())
+        return false;
+    const auto copied = copied_;
+    bool took = false;
+    for (std::size_t taken = 0; taken <= holder; ++taken) {
+        if (
+          waiting_.front().after_gap || lapsed_
+          || copied_ - copied >= config_.limits.run_bytes.value())
+            break;
+        take_front();
+        took = true;
+    }
+    return took;
 }
 
 seastar::future<runtime::result<void>> segment_runs::close() {

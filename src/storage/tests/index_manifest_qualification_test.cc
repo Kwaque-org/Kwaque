@@ -236,7 +236,7 @@ void qualify_manifest(std::size_t h, std::uint64_t a, bool underfilled) {
     const auto cap = range_manifest_page_capacity(
                        byte_count{h}, alignment(a), work.policy())
                        .value();
-    EXPECT_EQ(cap, h == 32 ? 628U : 589U);
+    EXPECT_EQ(cap, h == 32 ? 545U : 511U);
     const auto count_per_page = underfilled ? 256U : cap;
     std::vector<page_ref> refs;
     refs.reserve((65536U + count_per_page - 1U) / count_per_page);
@@ -271,7 +271,7 @@ void qualify_manifest(std::size_t h, std::uint64_t a, bool underfilled) {
         first += count;
         seastar::thread::maybe_yield();
     }
-    EXPECT_EQ(refs.size(), underfilled ? 256U : h == 32 ? 105U : 112U);
+    EXPECT_EQ(refs.size(), underfilled ? 256U : h == 32 ? 121U : 129U);
     const auto rh = mi::root_header(
       65536, static_cast<std::uint32_t>(refs.size()), mi::mc(), 100, 65636);
     auto root = [&] {
@@ -499,11 +499,11 @@ TEST(
         exercise(root, wire);
     }
     {
-        const auto entries = manifest_entries(0, 628);
-        const auto header = mi::page_header(628, mi::mc(), 100, 728);
+        const auto entries = manifest_entries(0, 545);
+        const auto header = mi::page_header(545, mi::mc(), 100, 645);
         const auto wire = mi::expected_page(header, entries);
         const std::array refs{mi::manifest_page_reference(wire, header)};
-        const auto rh = mi::root_header(628, 1, mi::mc(), 100, 728);
+        const auto rh = mi::root_header(545, 1, mi::mc(), 100, 645);
         const auto root = mi::pin(mi::expected_root(rh, refs), rh, work);
         exercise(root, wire);
     }

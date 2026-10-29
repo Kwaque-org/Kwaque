@@ -21,6 +21,7 @@
 
 #include <boost/test/unit_test.hpp>
 
+#include <algorithm>
 #include <bit>
 #include <utility>
 
@@ -108,6 +109,54 @@ void stabilize(fake_file_system& files, const runtime::file_path& path) {
       fake_file_test_access::sync_directory(
         files, take(fake_file_test_access::resolve(files, path.value()))));
 }
+// The bytes the fake reads from each object while attached, as asked, and
+// how many writes it is asked for in all; a contract asks them by path and
+// in total.
+class counted_io final {
+public:
+    explicit counted_io(fake_file_system& files)
+      : files_(files) {
+        fake_file_test_access::observe_reads(
+          files_,
+          [this](
+            fake_object_id object, std::uint64_t, std::size_t length) noexcept {
+              if (object.value() < bytes_.size())
+                  bytes_[object.value()] += length;
+          });
+        fake_file_test_access::observe_writes(
+          files_, [this](fake_object_id, std::uint64_t, std::size_t) noexcept {
+              ++writes_;
+          });
+    }
+    counted_io(const counted_io&) = delete;
+    counted_io& operator=(const counted_io&) = delete;
+    ~counted_io() {
+        fake_file_test_access::observe_reads(files_, {});
+        fake_file_test_access::observe_writes(files_, {});
+    }
+    [[nodiscard]] auto reads() {
+        return [this](const runtime::file_path& path) noexcept
+                 -> std::optional<std::uint64_t> {
+            const auto resolved = fake_file_test_access::resolve(
+              files_, path.value());
+            if (!resolved) return std::nullopt;
+            const auto object = fake_file_test_access::lookup(
+              files_, *resolved);
+            if (!object || object->value() >= bytes_.size())
+                return std::nullopt;
+            return bytes_[object->value()];
+        };
+    }
+    [[nodiscard]] auto writes() {
+        return
+          [this]() noexcept -> std::optional<std::uint64_t> { return writes_; };
+    }
+
+private:
+    fake_file_system& files_;
+    std::vector<std::uint64_t> bytes_ = std::vector<std::uint64_t>(4096);
+    std::uint64_t writes_{0};
+};
 void seed_bytes(
   fake_file_system& files,
   const runtime::file_path& path,
@@ -127,6 +176,20 @@ void seed_bytes(
       take(
         runtime::file_path::make(
           path.value().substr(0, path.value().rfind('/')))));
+}
+// Folds a group's blocks, appended after those already folded, into what a
+// footer or sealed root covering them records.
+void fold_times(boundary_times& times, const segment_frozen_group& group) {
+    for (const auto& block : group.blocks()) {
+        const auto stamped = block.descriptor();
+        const auto record = stamped.batch().max_record_time;
+        if (times.first_append == runtime::wall_time{}) {
+            times.first_append = stamped.stamps().append_time;
+            times.max_record = record;
+        }
+        times.max_append = stamped.stamps().append_time;
+        times.max_record = std::max(times.max_record, record);
+    }
 }
 
 template<typename Func>
@@ -2261,6 +2324,7 @@ SEASTAR_TEST_CASE(segment_writer_fake_rejects_incompatible_data_geometry) {
               spec,
               0,
               description,
+              contract::logical_origin(),
               budget,
               contract::configuration()));
           runtime::first_failure failed;
@@ -2303,6 +2367,342 @@ SEASTAR_TEST_CASE(segment_writer_fake_execution) {
       byte_count{18_MiB},
       resource::workload_class::foreground_protocol,
       64);
+}
+
+// Every write to the data file, as the device sees it, starts and ends on
+// the segment's alignment, and none touches bytes an earlier one wrote.
+SEASTAR_TEST_CASE(segment_writer_fake_packed_spans) {
+    co_await with_store_environment(
+      config(),
+      [](auto& env, auto& budget, auto drive) -> seastar::future<> {
+          auto& files = env.file_system();
+          const auto root = take(runtime::file_path::make("/kwaque/store"));
+          take(co_await drive.lifecycle(files.create_directories(root)));
+          stabilize(files, take(runtime::file_path::make("/kwaque")));
+          const auto spec = specification(root, {1, 1}, 68);
+          const std::array specs{spec};
+          ownership_input owner{specs};
+          struct write final {
+              std::uint64_t object, position, length;
+          };
+          std::vector<write> writes;
+          writes.reserve(4096);
+          fake_file_test_access::observe_writes(
+            files,
+            [&writes](
+              fake_object_id object,
+              std::uint64_t position,
+              std::size_t length) noexcept {
+                if (writes.size() < writes.capacity())
+                    writes.push_back({object.value(), position, length});
+            });
+          co_await storage::testing::segment_writer_contract::packed_spans<
+            simulation::monotonic_clock>(files, owner, spec, budget, drive);
+          fake_file_test_access::observe_writes(files, {});
+          const auto description
+            = storage::testing::segment_writer_contract::descriptor();
+          const auto path = take(take(local_paths::make(root))
+                                   .segment_file(
+                                     0,
+                                     {description.segment.segment(),
+                                      description.segment.generation()},
+                                     local_segment_file::data));
+          const auto data = take(
+            fake_file_test_access::lookup(
+              files,
+              take(fake_file_test_access::resolve(files, path.value()))));
+          const auto unit = description.alignment.bytes().value();
+          std::size_t seen = 0;
+          for (std::size_t i = 0; i < writes.size(); ++i) {
+              const auto& one = writes[i];
+              if (one.object != data.value()) continue;
+              ++seen;
+              require(
+                one.position % unit == 0 && one.length % unit == 0,
+                "a segment write did not start and end on its alignment");
+              for (std::size_t j = 0; j < i; ++j) {
+                  const auto& earlier = writes[j];
+                  require(
+                    earlier.object != data.value()
+                      || one.position >= earlier.position + earlier.length
+                      || one.position + one.length <= earlier.position,
+                    "a segment write touched bytes an earlier one wrote");
+              }
+          }
+          require(
+            seen > 1 && writes.size() < writes.capacity(),
+            "the segment's writes were not all seen");
+      },
+      byte_count{18_MiB},
+      resource::workload_class::foreground_protocol,
+      64);
+}
+
+// A run of held groups reaches the device as one write, from the run's start
+// to its footer's padding, and nothing of it before.
+SEASTAR_TEST_CASE(segment_writer_fake_held_runs) {
+    co_await with_store_environment(
+      config(),
+      [](auto& env, auto& budget, auto drive) -> seastar::future<> {
+          auto& files = env.file_system();
+          const auto root = take(runtime::file_path::make("/kwaque/store"));
+          take(co_await drive.lifecycle(files.create_directories(root)));
+          stabilize(files, take(runtime::file_path::make("/kwaque")));
+          const auto spec = specification(root, {1, 1}, 68);
+          const std::array specs{spec};
+          ownership_input owner{specs};
+          struct write final {
+              std::uint64_t object, position, length;
+          };
+          std::vector<write> writes;
+          writes.reserve(4096);
+          fake_file_test_access::observe_writes(
+            files,
+            [&writes](
+              fake_object_id object,
+              std::uint64_t position,
+              std::size_t length) noexcept {
+                if (writes.size() < writes.capacity())
+                    writes.push_back({object.value(), position, length});
+            });
+          std::optional<model::file_byte_span> run;
+          co_await storage::testing::segment_writer_contract::held_runs<
+            simulation::monotonic_clock>(
+            files, owner, spec, budget, drive, &run);
+          require(run.has_value(), "the held run's span was not given");
+          fake_file_test_access::observe_writes(files, {});
+          const auto description
+            = storage::testing::segment_writer_contract::descriptor();
+          const auto path = take(take(local_paths::make(root))
+                                   .segment_file(
+                                     0,
+                                     {description.segment.segment(),
+                                      description.segment.generation()},
+                                     local_segment_file::data));
+          const auto data = take(
+            fake_file_test_access::lookup(
+              files,
+              take(fake_file_test_access::resolve(files, path.value()))));
+          std::size_t whole = 0, inside = 0;
+          for (const auto& one : writes) {
+              if (one.object != data.value()) continue;
+              if (
+                one.position == run->begin().value()
+                && one.length == run->size().value())
+                  ++whole;
+              else if (
+                one.position < run->end().value()
+                && one.position + one.length > run->begin().value())
+                  ++inside;
+          }
+          require(
+            whole == 1 && inside == 0 && writes.size() < writes.capacity(),
+            "a held run was not written as one write");
+      },
+      byte_count{18_MiB},
+      resource::workload_class::foreground_protocol,
+      64);
+}
+
+// The run closes while the extension the writer started is writing its
+// zeros: its one write is submitted before the extension's last.
+SEASTAR_TEST_CASE(segment_writer_fake_held_run_beside_extension) {
+    co_await with_store_environment(
+      config(),
+      [](auto& env, auto& budget, auto drive) -> seastar::future<> {
+          auto& files = env.file_system();
+          const auto root = take(runtime::file_path::make("/kwaque/store"));
+          take(co_await drive.lifecycle(files.create_directories(root)));
+          stabilize(files, take(runtime::file_path::make("/kwaque")));
+          const auto spec = specification(root, {1, 1}, 68);
+          const std::array specs{spec};
+          ownership_input owner{specs};
+          struct write final {
+              std::uint64_t object, position, length;
+          };
+          std::vector<write> writes;
+          writes.reserve(8192);
+          fake_file_test_access::observe_writes(
+            files,
+            [&writes](
+              fake_object_id object,
+              std::uint64_t position,
+              std::size_t length) noexcept {
+                if (writes.size() < writes.capacity())
+                    writes.push_back({object.value(), position, length});
+            });
+          std::optional<model::file_byte_span> run;
+          co_await storage::testing::segment_writer_contract::
+            held_run_beside_extension<simulation::monotonic_clock>(
+              files, owner, spec, budget, drive, &run);
+          require(run.has_value(), "the held run's span was not given");
+          fake_file_test_access::observe_writes(files, {});
+          const auto description
+            = storage::testing::segment_writer_contract::descriptor();
+          const auto path = take(take(local_paths::make(root))
+                                   .segment_file(
+                                     0,
+                                     {description.segment.segment(),
+                                      description.segment.generation()},
+                                     local_segment_file::data));
+          const auto data = take(
+            fake_file_test_access::lookup(
+              files,
+              take(fake_file_test_access::resolve(files, path.value()))));
+          std::optional<std::size_t> whole, last;
+          std::uint64_t furthest = 0;
+          for (std::size_t i = 0; i != writes.size(); ++i) {
+              const auto& one = writes[i];
+              if (one.object != data.value()) continue;
+              if (
+                one.position == run->begin().value()
+                && one.length == run->size().value())
+                  whole = i;
+              if (one.position + one.length > furthest) {
+                  furthest = one.position + one.length;
+                  last = i;
+              }
+          }
+          require(
+            whole && last && *whole < *last && furthest > run->end().value()
+              && writes.size() < writes.capacity(),
+            "a held run inside the zero-written range waited for the "
+            "extension");
+      },
+      byte_count{18_MiB},
+      resource::workload_class::foreground_protocol,
+      64);
+}
+
+SEASTAR_TEST_CASE(segment_writer_fake_held_closes) {
+    co_await with_store_environment(
+      config(),
+      [](auto& env, auto& budget, auto drive) -> seastar::future<> {
+          auto& files = env.file_system();
+          const auto root = take(runtime::file_path::make("/kwaque/store"));
+          take(co_await drive.lifecycle(files.create_directories(root)));
+          stabilize(files, take(runtime::file_path::make("/kwaque")));
+          const auto spec = specification(root, {1, 1}, 68);
+          const std::array specs{spec};
+          ownership_input owner{specs};
+          co_await storage::testing::segment_writer_contract::held_closes<
+            simulation::monotonic_clock>(files, owner, spec, budget, drive);
+      },
+      byte_count{18_MiB},
+      resource::workload_class::foreground_protocol,
+      64);
+}
+
+SEASTAR_TEST_CASE(segment_writer_fake_append_order) {
+    co_await with_store_environment(
+      config(),
+      [](auto& env, auto& budget, auto drive) -> seastar::future<> {
+          auto& files = env.file_system();
+          const auto root = take(runtime::file_path::make("/kwaque/store"));
+          take(co_await drive.lifecycle(files.create_directories(root)));
+          stabilize(files, take(runtime::file_path::make("/kwaque")));
+          const auto spec = specification(root, {1, 1}, 68);
+          const std::array specs{spec};
+          ownership_input owner{specs};
+          co_await storage::testing::segment_writer_contract::append_order<
+            simulation::monotonic_clock>(files, owner, spec, budget, drive);
+      },
+      byte_count{18_MiB},
+      resource::workload_class::foreground_protocol,
+      64);
+}
+
+SEASTAR_TEST_CASE(segment_writer_fake_certified_stamps) {
+    co_await with_store_environment(
+      config(),
+      [](auto& env, auto& budget, auto drive) -> seastar::future<> {
+          auto& files = env.file_system();
+          const auto root = take(runtime::file_path::make("/kwaque/store"));
+          take(co_await drive.lifecycle(files.create_directories(root)));
+          stabilize(files, take(runtime::file_path::make("/kwaque")));
+          const auto spec = specification(root, {1, 1}, 68);
+          const std::array specs{spec};
+          ownership_input owner{specs};
+          co_await storage::testing::segment_writer_contract::certified_stamps<
+            simulation::monotonic_clock>(files, owner, spec, budget, drive);
+      },
+      byte_count{18_MiB},
+      resource::workload_class::foreground_protocol,
+      64);
+}
+
+SEASTAR_TEST_CASE(segment_writer_fake_exact_fit) {
+    co_await with_store_environment(
+      config(),
+      [](auto& env, auto& budget, auto drive) -> seastar::future<> {
+          auto& files = env.file_system();
+          const auto root = take(runtime::file_path::make("/kwaque/store"));
+          take(co_await drive.lifecycle(files.create_directories(root)));
+          stabilize(files, take(runtime::file_path::make("/kwaque")));
+          const auto spec = specification(root, {1, 1}, 68);
+          const std::array specs{spec};
+          ownership_input owner{specs};
+          co_await storage::testing::segment_writer_contract::exact_fit<
+            simulation::monotonic_clock>(files, owner, spec, budget, drive);
+      },
+      byte_count{18_MiB},
+      resource::workload_class::foreground_protocol,
+      64);
+}
+
+// Each alignment in a store of its own. A 64-block group holds a reservation
+// per child: two tasks per block.
+SEASTAR_TEST_CASE(segment_writer_fake_prepared_extent) {
+    for (const std::uint64_t unit : {4096U, 8192U})
+        co_await with_store_environment(
+          config(),
+          [unit](auto& env, auto& budget, auto drive) -> seastar::future<> {
+              auto& files = env.file_system();
+              const auto root = take(runtime::file_path::make("/kwaque/store"));
+              take(co_await drive.lifecycle(files.create_directories(root)));
+              stabilize(files, take(runtime::file_path::make("/kwaque")));
+              const auto spec = specification(root, {1, 1}, 68);
+              const std::array specs{spec};
+              ownership_input owner{specs};
+              co_await storage::testing::segment_writer_contract::
+                prepared_extent<simulation::monotonic_clock>(
+                  files, owner, spec, budget, drive, unit);
+          },
+          byte_count{18_MiB},
+          resource::workload_class::foreground_protocol,
+          128);
+}
+
+// Unsynced bytes kept or dropped in 512-byte granules under a 4 KiB
+// alignment: nothing a completed barrier certified changes.
+SEASTAR_TEST_CASE(segment_writer_fake_certified_spans_survive_crashes) {
+    for (const unsigned kept : {0U, 50U, 100U}) {
+        BOOST_TEST_CONTEXT("data_percent=" << kept) {
+            const fake_crash_policy survival{
+              .data_percent = static_cast<std::uint8_t>(kept),
+              .eof_percent = static_cast<std::uint8_t>(kept),
+              .granule_bytes = 512};
+            co_await with_store_environment(
+              config({}, runtime::fault_action::error, 1, {}, survival),
+              [](auto& env, auto& budget, auto drive) -> seastar::future<> {
+                  auto& files = env.file_system();
+                  const auto root = take(
+                    runtime::file_path::make("/kwaque/store"));
+                  take(
+                    co_await drive.lifecycle(files.create_directories(root)));
+                  stabilize(files, take(runtime::file_path::make("/kwaque")));
+                  const auto spec = specification(root, {1, 1}, 68);
+                  const std::array specs{spec};
+                  ownership_input owner{specs};
+                  co_await storage::testing::segment_writer_contract::
+                    certified_spans<simulation::monotonic_clock>(
+                      files, owner, spec, budget, drive);
+              },
+              byte_count{18_MiB},
+              resource::workload_class::foreground_protocol,
+              64);
+        }
+    }
 }
 
 SEASTAR_TEST_CASE(segment_writer_fake_barriers) {
@@ -2727,6 +3127,140 @@ SEASTAR_TEST_CASE(segment_reader_fake_fed_tail) {
       64);
 }
 
+SEASTAR_TEST_CASE(segment_reader_fake_established_tail) {
+    co_await with_store_environment(
+      config(),
+      [](auto& env, auto& budget, auto drive) -> seastar::future<> {
+          auto& files = env.file_system();
+          const auto root = take(runtime::file_path::make("/kwaque/store"));
+          take(co_await drive.lifecycle(files.create_directories(root)));
+          stabilize(files, take(runtime::file_path::make("/kwaque")));
+          const auto spec = specification(root, {1, 1}, 68);
+          const std::array specs{spec};
+          ownership_input owner{specs};
+          co_await storage::testing::segment_reader_contract::established_tail<
+            simulation::monotonic_clock>(files, owner, spec, budget, drive);
+      },
+      byte_count{18_MiB},
+      resource::workload_class::foreground_protocol,
+      64);
+}
+
+SEASTAR_TEST_CASE(segment_reader_fake_woken_tail) {
+    co_await with_store_environment(
+      config(),
+      [](auto& env, auto& budget, auto drive) -> seastar::future<> {
+          auto& files = env.file_system();
+          const auto root = take(runtime::file_path::make("/kwaque/store"));
+          take(co_await drive.lifecycle(files.create_directories(root)));
+          stabilize(files, take(runtime::file_path::make("/kwaque")));
+          const auto spec = specification(root, {1, 1}, 68);
+          const std::array specs{spec};
+          ownership_input owner{specs};
+          co_await storage::testing::segment_reader_contract::woken_tail<
+            simulation::monotonic_clock>(files, owner, spec, budget, drive);
+      },
+      byte_count{18_MiB},
+      resource::workload_class::foreground_protocol,
+      64);
+}
+
+SEASTAR_TEST_CASE(segment_reader_fake_extended_session) {
+    co_await with_store_environment(
+      config(),
+      [](auto& env, auto& budget, auto drive) -> seastar::future<> {
+          auto& files = env.file_system();
+          const auto root = take(runtime::file_path::make("/kwaque/store"));
+          take(co_await drive.lifecycle(files.create_directories(root)));
+          stabilize(files, take(runtime::file_path::make("/kwaque")));
+          const auto spec = specification(root, {1, 1}, 68);
+          const std::array specs{spec};
+          ownership_input owner{specs};
+          co_await storage::testing::segment_reader_contract::extended_session<
+            simulation::monotonic_clock>(files, owner, spec, budget, drive);
+      },
+      byte_count{18_MiB},
+      resource::workload_class::foreground_protocol,
+      64);
+}
+
+SEASTAR_TEST_CASE(segment_reader_fake_steady_tail) {
+    co_await with_store_environment(
+      config(),
+      [](auto& env, auto& budget, auto drive) -> seastar::future<> {
+          auto& files = env.file_system();
+          const auto root = take(runtime::file_path::make("/kwaque/store"));
+          take(co_await drive.lifecycle(files.create_directories(root)));
+          stabilize(files, take(runtime::file_path::make("/kwaque")));
+          const auto spec = specification(root, {1, 1}, 68);
+          const std::array specs{spec};
+          ownership_input owner{specs};
+          co_await storage::testing::segment_reader_contract::steady_tail<
+            simulation::monotonic_clock>(files, owner, spec, budget, drive);
+      },
+      byte_count{18_MiB},
+      resource::workload_class::foreground_protocol,
+      64);
+}
+
+SEASTAR_TEST_CASE(segment_reader_fake_reported_before_made) {
+    co_await with_store_environment(
+      config(),
+      [](auto& env, auto& budget, auto drive) -> seastar::future<> {
+          auto& files = env.file_system();
+          const auto root = take(runtime::file_path::make("/kwaque/store"));
+          take(co_await drive.lifecycle(files.create_directories(root)));
+          stabilize(files, take(runtime::file_path::make("/kwaque")));
+          const auto spec = specification(root, {1, 1}, 68);
+          const std::array specs{spec};
+          ownership_input owner{specs};
+          co_await storage::testing::segment_reader_contract::
+            reported_before_made<simulation::monotonic_clock>(
+              files, owner, spec, budget, drive);
+      },
+      byte_count{18_MiB},
+      resource::workload_class::foreground_protocol,
+      64);
+}
+
+SEASTAR_TEST_CASE(segment_reader_fake_held_reads) {
+    co_await with_store_environment(
+      config(),
+      [](auto& env, auto& budget, auto drive) -> seastar::future<> {
+          auto& files = env.file_system();
+          const auto root = take(runtime::file_path::make("/kwaque/store"));
+          take(co_await drive.lifecycle(files.create_directories(root)));
+          stabilize(files, take(runtime::file_path::make("/kwaque")));
+          const auto spec = specification(root, {1, 1}, 68);
+          const std::array specs{spec};
+          ownership_input owner{specs};
+          co_await storage::testing::segment_reader_contract::held_reads<
+            simulation::monotonic_clock>(files, owner, spec, budget, drive);
+      },
+      byte_count{18_MiB},
+      resource::workload_class::foreground_protocol,
+      64);
+}
+
+SEASTAR_TEST_CASE(segment_reader_fake_packed_reads) {
+    co_await with_store_environment(
+      config(),
+      [](auto& env, auto& budget, auto drive) -> seastar::future<> {
+          auto& files = env.file_system();
+          const auto root = take(runtime::file_path::make("/kwaque/store"));
+          take(co_await drive.lifecycle(files.create_directories(root)));
+          stabilize(files, take(runtime::file_path::make("/kwaque")));
+          const auto spec = specification(root, {1, 1}, 68);
+          const std::array specs{spec};
+          ownership_input owner{specs};
+          co_await storage::testing::segment_reader_contract::packed_reads<
+            simulation::monotonic_clock>(files, owner, spec, budget, drive);
+      },
+      byte_count{18_MiB},
+      resource::workload_class::foreground_protocol,
+      64);
+}
+
 SEASTAR_TEST_CASE(segment_reader_fake_read_edges) {
     co_await with_store_environment(
       config(),
@@ -3025,6 +3559,26 @@ SEASTAR_TEST_CASE(segment_writer_fake_preallocated_execution) {
       64);
 }
 
+SEASTAR_TEST_CASE(segment_writer_fake_zero_written_by_default) {
+    co_await with_store_environment(
+      config(),
+      [](auto& env, auto& budget, auto drive) -> seastar::future<> {
+          auto& files = env.file_system();
+          const auto root = take(runtime::file_path::make("/kwaque/store"));
+          take(co_await drive.lifecycle(files.create_directories(root)));
+          stabilize(files, take(runtime::file_path::make("/kwaque")));
+          const auto spec = specification(root, {1, 1}, 68);
+          const std::array specs{spec};
+          ownership_input owner{specs};
+          co_await storage::testing::segment_writer_contract::
+            zero_written_by_default<simulation::monotonic_clock>(
+              files, owner, spec, budget, drive);
+      },
+      byte_count{18_MiB},
+      resource::workload_class::foreground_protocol,
+      64);
+}
+
 SEASTAR_TEST_CASE(segment_writer_fake_concurrent_execution) {
     co_await with_store_environment(
       config(),
@@ -3137,6 +3691,7 @@ seastar::future<segment_write_fault_target> segment_write_history(
           spec,
           0,
           contract::descriptor(),
+          contract::logical_origin(),
           resources,
           contract::configuration()));
     runtime::first_failure failed;
@@ -3173,10 +3728,13 @@ seastar::future<segment_write_fault_target> segment_write_history(
         take(co_await writer->encode_group(group, work));
         const auto block_bytes = storage::testing::flat(
           group.blocks()[0].bytes());
+        boundary_times times;
+        fold_times(times, group);
         const auto footer = storage::testing::footer_wire(
           {cut.covered(),
            cut.end().blocks,
            group.layout().blocks().back().records,
+           times,
            storage::testing::crc(block_bytes)},
           {cut.history(), cut.footer()->begin()});
         const auto expected_bytes = block_bytes + footer;
@@ -3348,7 +3906,14 @@ seastar::future<segment_barrier_targets> segment_barrier_history(
         ownership_input,
         simulation::monotonic_clock>::
         make_new(
-          files, owner, spec, 0, contract::descriptor(), resources, options));
+          files,
+          owner,
+          spec,
+          0,
+          contract::descriptor(),
+          contract::logical_origin(),
+          resources,
+          options));
     runtime::first_failure failed;
     segment_barrier_targets targets;
     try {
@@ -3800,7 +4365,14 @@ seastar::future<std::vector<segment_seal_fault>> segment_seal_failure_history(
         ownership_input,
         simulation::monotonic_clock>::
         make_new(
-          files, owner, spec, 0, contract::descriptor(), resources, options));
+          files,
+          owner,
+          spec,
+          0,
+          contract::descriptor(),
+          contract::logical_origin(),
+          resources,
+          options));
     const auto paths = local_paths::make(root).value();
     const local_segment_name name{
       contract::descriptor().segment.segment(),
@@ -3842,8 +4414,14 @@ seastar::future<std::vector<segment_seal_fault>> segment_seal_failure_history(
         const auto cut = group.layout().boundary();
         const auto block = storage::testing::flat(group.blocks()[0].bytes());
         const auto last = group.layout().blocks()[0].records;
+        boundary_times times;
+        fold_times(times, group);
         const auto footer = storage::testing::footer_wire(
-          {cut.covered(), cut.end().blocks, last, storage::testing::crc(block)},
+          {cut.covered(),
+           cut.end().blocks,
+           last,
+           times,
+           storage::testing::crc(block)},
           {cut.history(), cut.footer()->begin()});
         const auto extent = block + footer;
         const footer_expectation root_location{cut.history(), cut.end().bytes};
@@ -3858,13 +4436,11 @@ seastar::future<std::vector<segment_seal_fault>> segment_seal_failure_history(
             .value()};
         expected_data = storage::testing::header_wire(
                           segment_header::make(
-                            cut.context(),
-                            cut.history().logical_origin,
-                            cut.history().alignment)
+                            cut.context(), cut.history().alignment)
                             .value())
                         + extent
                         + storage::testing::sealed_wire(
-                          {coverage, cut.end().blocks, last, 0},
+                          {coverage, cut.end().blocks, last, times, 0},
                           storage::testing::exact_digest(extent),
                           refs,
                           root_location);
@@ -3885,15 +4461,19 @@ seastar::future<std::vector<segment_seal_fault>> segment_seal_failure_history(
         std::uint32_t calls = 0;
         std::vector<completed_retry> facts{storage::testing::retry()};
         auto held = take(resources.try_reserve(byte_count{4_KiB}));
+        // The seal slot's grants, reserved before admission closes.
+        segment_seal_grants grants;
+        take(grants.fill(resources, writer->config().metadata));
         const auto before = resources.snapshot();
         resources.close_admission();
         auto sealing = writer->seal(
           contract::completed_source{std::move(held), std::move(facts), &calls},
           1,
-          0,
-          work);
+          work,
+          segment_no_index{},
+          &grants);
         auto joined = writer->seal(
-          contract::completed_source{{}, {}, &calls}, 0, 0, work);
+          contract::completed_source{{}, {}, &calls}, 0, work);
         abort.request_abort();
         std::array<std::optional<seastar::future<runtime::result<void>>>, 8>
           closing;
@@ -3928,7 +4508,7 @@ seastar::future<std::vector<segment_seal_fault>> segment_seal_failure_history(
               "uncertain seal manufactured evidence or reopened append");
             const auto after = take(fake_file_test_access::state_digest(files));
             const auto repeated = co_await drive.lifecycle(writer->seal(
-              contract::completed_source{{}, {}, &calls}, 0, 0, work));
+              contract::completed_source{{}, {}, &calls}, 0, work));
             require(
               repeated.failure.error() == result->failure.error()
                 && take(fake_file_test_access::state_digest(files)) == after,
@@ -4096,6 +4676,7 @@ SEASTAR_TEST_CASE(segment_writer_fake_idle_reader_serialization_and_close) {
                 spec,
                 0,
                 contract::descriptor(),
+                contract::logical_origin(),
                 budget,
                 options));
           runtime::first_failure failed;
@@ -4103,7 +4684,7 @@ SEASTAR_TEST_CASE(segment_writer_fake_idle_reader_serialization_and_close) {
               take(co_await drive.lifecycle(writer->create_new(work)));
               std::uint32_t calls = 0;
               const auto seal = co_await drive.lifecycle(writer->seal(
-                contract::completed_source{{}, {}, &calls}, 0, 0, work));
+                contract::completed_source{{}, {}, &calls}, 0, work));
               take(seal.failure.outcome());
               const auto position = seal.boundary->position();
               const auto length = seal.boundary->bytes();
@@ -4261,7 +4842,15 @@ seastar::future<segment_write_fault_target> segment_ordering_history(
         fake_file_system,
         ownership_input,
         simulation::monotonic_clock>::
-        make_new(files, owner, spec, 0, description, resources, options));
+        make_new(
+          files,
+          owner,
+          spec,
+          0,
+          description,
+          contract::logical_origin(),
+          resources,
+          options));
     const auto paths = local_paths::make(root).value();
     const auto sc = contract::descriptor().segment;
     const auto path = take(paths.segment_file(
@@ -4297,11 +4886,17 @@ seastar::future<segment_write_fault_target> segment_ordering_history(
         target.occurrence = before.occurrences[writes] + 1;
         std::vector<segment_frozen_group> groups;
         groups.reserve(4);
+        boundary_times times;
+        // The first group's block (4,401 bytes) and footer span two
+        // units, so its write is two native chunks: the delayed first one
+        // and a second that completes before it. The rest take one each.
         for (std::uint64_t i = 0; i < 4; ++i) {
             groups.push_back(
               co_await contract::freeze_child(
                 *writer,
-                co_await contract::execution_child(100 + i, work),
+                i == 0
+                  ? co_await contract::valued_execution_child(100, 4000, work)
+                  : co_await contract::execution_child(100 + i, work),
                 resources,
                 work));
             take(co_await writer->encode_group(groups.back(), work));
@@ -4310,10 +4905,12 @@ seastar::future<segment_write_fault_target> segment_ordering_history(
             const auto block = storage::testing::flat(
               group.blocks()[0].bytes());
             expected += block;
+            fold_times(times, group);
             expected += storage::testing::footer_wire(
               {cut.covered(),
                cut.end().blocks,
                group.layout().blocks().back().records,
+               times,
                storage::testing::crc(expected)},
               {cut.history(), cut.footer()->begin()});
         }
@@ -4666,16 +5263,15 @@ seastar::future<std::size_t> segment_crash_history(
     co_await installation_contract::bootstrap(
       files, owner, spec, resources, work, drive);
     const auto description = contract::descriptor();
+    const auto origin = contract::logical_origin();
     const auto head = segment_header::make(
-                        description.segment,
-                        description.logical_origin,
-                        description.alignment)
+                        description.segment, description.alignment)
                         .value();
     const segment_history_context history{
       description.segment,
       description.alignment,
       runtime::file_position{8192},
-      description.logical_origin,
+      origin,
       description.physical_origin};
     const auto block = block_wire(
       assigned_wire(),
@@ -4687,18 +5283,28 @@ seastar::future<std::size_t> segment_crash_history(
          .value(),
        history.data_start,
        batch_expected()});
-    const auto block_span = scope(100, 101, 0, 1, 8192, 16384);
+    // The block packs from the data start; the footer after it pads the
+    // span to 16384, where the sealed root begins.
+    const auto block_end = 8192 + block.size();
+    const auto block_span = scope(100, 101, 0, 1, 8192, block_end);
+    const boundary_times times{
+      runtime::wall_time{1},
+      runtime::wall_time{1},
+      runtime::wall_time{max_record_time(assigned_wire())}};
     const auto footer = footer_wire(
-      {block_span, 1, block_span, crc(block)},
-      {history, runtime::file_position{16384}});
+      {block_span, 1, block_span, times, crc(block)},
+      {history, runtime::file_position{block_end}});
     const auto extent_bytes = block + footer;
-    const auto covered = scope(100, 101, 0, 1, 8192, 24576);
-    const footer_expectation location{history, runtime::file_position{24576}};
+    const auto covered = scope(100, 101, 0, 1, 8192, 16384);
+    const footer_expectation location{history, runtime::file_position{16384}};
     const std::array facts{retry()};
     const auto page_bytes = retry_page_wire(facts, location);
     const std::array refs{reference(page_bytes)};
     const auto sealed_bytes = sealed_wire(
-      {covered, 1, block_span, 0}, exact_digest(extent_bytes), refs, location);
+      {covered, 1, block_span, times, 0},
+      exact_digest(extent_bytes),
+      refs,
+      location);
     const auto digest = codec::immutable_object_digest{
       exact_digest(sealed_bytes)};
     const auto root_ref = local_root_reference::make(
@@ -4730,7 +5336,7 @@ seastar::future<std::size_t> segment_crash_history(
     crash_file_session session{files};
     auto writer = take(
       writer_type::make_new(
-        session, owner, spec, 0, description, resources, options));
+        session, owner, spec, 0, description, origin, resources, options));
     bool received_data = false, received_seal = false;
     auto activity = [&]() -> seastar::future<runtime::first_failure> {
         runtime::first_failure outcome;
@@ -4757,7 +5363,6 @@ seastar::future<std::size_t> segment_crash_history(
               contract::completed_source{
                 std::move(held), std::move(completed), &calls},
               1,
-              0,
               work);
             outcome = sealed.failure;
             received_seal = !outcome.failed() && sealed.extent
@@ -4865,6 +5470,7 @@ seastar::future<std::size_t> segment_crash_history(
       local_publication_generation::make(sealed ? 2 : 1).value(),
       publication,
       description,
+      origin,
       sealed ? std::span<const local_bundle_context>{contexts}
              : std::span<const local_bundle_context>{}};
     std::optional<segment_immutable_expectation> immutable;
@@ -5011,7 +5617,14 @@ seastar::future<index_history_steps> index_crash_history(
     crash_file_session session{files};
     auto writer = take(
       writer_type::make_new(
-        session, owner, spec, 0, description, resources, options));
+        session,
+        owner,
+        spec,
+        0,
+        description,
+        contract::logical_origin(),
+        resources,
+        options));
     std::vector<complete_block_descriptor> blocks;
     blocks.reserve(2);
     bool began = false, sealed_returned = false, named_returned = false;
@@ -5044,7 +5657,6 @@ seastar::future<index_history_steps> index_crash_history(
             auto sealed = co_await writer->seal(
               contract::completed_source{{}, {}, &calls},
               0,
-              2,
               work,
               sparse_index_seal{
                 &index, late ? local_object_sequence{} : object});
@@ -5140,6 +5752,7 @@ seastar::future<index_history_steps> index_crash_history(
           spec,
           0,
           description,
+          contract::logical_origin(),
           resources,
           limits(),
           recovered_work));
@@ -5404,6 +6017,7 @@ SEASTAR_TEST_CASE(
                     spec,
                     0,
                     contract::descriptor(),
+                    contract::logical_origin(),
                     budget,
                     contract::configuration()));
               const auto created = co_await drive.lifecycle(
@@ -5465,7 +6079,53 @@ SEASTAR_TEST_CASE(local_wal_scan_head_tails_fake) {
           const auto spec = specification(root, {1, 1}, 51);
           const std::array specs{spec};
           ownership_input owner{specs};
+          counted_io counted{files};
           co_await storage::testing::scan_contract::head_tails(
+            files, owner, spec, budget, drive, counted.reads());
+      });
+}
+
+SEASTAR_TEST_CASE(local_wal_scan_proven_heads_fake) {
+    co_await with_store_environment(
+      config(), [](auto& env, auto& budget, auto drive) -> seastar::future<> {
+          auto& files = env.file_system();
+          const auto root = take(runtime::file_path::make("/kwaque/store"));
+          take(co_await drive.lifecycle(files.create_directories(root)));
+          stabilize(files, take(runtime::file_path::make("/kwaque")));
+          const auto spec = specification(root, {1, 1}, 51);
+          const std::array specs{spec};
+          ownership_input owner{specs};
+          co_await storage::testing::scan_contract::proven_heads(
+            files, owner, spec, budget, drive);
+      });
+}
+
+SEASTAR_TEST_CASE(local_wal_scan_packed_writes_fake) {
+    co_await with_store_environment(
+      config(), [](auto& env, auto& budget, auto drive) -> seastar::future<> {
+          auto& files = env.file_system();
+          const auto root = take(runtime::file_path::make("/kwaque/store"));
+          take(co_await drive.lifecycle(files.create_directories(root)));
+          stabilize(files, take(runtime::file_path::make("/kwaque")));
+          const auto spec = specification(root, {1, 1}, 51);
+          const std::array specs{spec};
+          ownership_input owner{specs};
+          co_await storage::testing::scan_contract::packed_writes(
+            files, owner, spec, budget, drive);
+      });
+}
+
+SEASTAR_TEST_CASE(local_wal_scan_recycled_head_fake) {
+    co_await with_store_environment(
+      config(), [](auto& env, auto& budget, auto drive) -> seastar::future<> {
+          auto& files = env.file_system();
+          const auto root = take(runtime::file_path::make("/kwaque/store"));
+          take(co_await drive.lifecycle(files.create_directories(root)));
+          stabilize(files, take(runtime::file_path::make("/kwaque")));
+          const auto spec = specification(root, {1, 1}, 51);
+          const std::array specs{spec};
+          ownership_input owner{specs};
+          co_await storage::testing::scan_contract::recycled_head(
             files, owner, spec, budget, drive);
       });
 }
@@ -5500,6 +6160,36 @@ SEASTAR_TEST_CASE(local_wal_scan_target_resolution_fake) {
       });
 }
 
+SEASTAR_TEST_CASE(local_segment_scan_stale_objects_fake) {
+    co_await with_store_environment(
+      config(), [](auto& env, auto& budget, auto drive) -> seastar::future<> {
+          auto& files = env.file_system();
+          const auto root = take(runtime::file_path::make("/kwaque/store"));
+          take(co_await drive.lifecycle(files.create_directories(root)));
+          stabilize(files, take(runtime::file_path::make("/kwaque")));
+          const auto spec = specification(root, {1, 1}, 51);
+          const std::array specs{spec};
+          ownership_input owner{specs};
+          co_await storage::testing::segment_scan_contract::stale_objects(
+            files, owner, spec, budget, drive);
+      });
+}
+
+SEASTAR_TEST_CASE(local_segment_scan_stale_tails_fake) {
+    co_await with_store_environment(
+      config(), [](auto& env, auto& budget, auto drive) -> seastar::future<> {
+          auto& files = env.file_system();
+          const auto root = take(runtime::file_path::make("/kwaque/store"));
+          take(co_await drive.lifecycle(files.create_directories(root)));
+          stabilize(files, take(runtime::file_path::make("/kwaque")));
+          const auto spec = specification(root, {1, 1}, 51);
+          const std::array specs{spec};
+          ownership_input owner{specs};
+          co_await storage::testing::segment_scan_contract::stale_tails(
+            files, owner, spec, budget, drive);
+      });
+}
+
 SEASTAR_TEST_CASE(local_segment_scan_resume_and_tails_fake) {
     co_await with_store_environment(
       config(), [](auto& env, auto& budget, auto drive) -> seastar::future<> {
@@ -5510,8 +6200,9 @@ SEASTAR_TEST_CASE(local_segment_scan_resume_and_tails_fake) {
           const auto spec = specification(root, {1, 1}, 51);
           const std::array specs{spec};
           ownership_input owner{specs};
+          counted_io counted{files};
           co_await storage::testing::segment_scan_contract::resume_and_tails(
-            files, owner, spec, budget, drive);
+            files, owner, spec, budget, drive, counted.reads());
       });
 }
 
@@ -5585,8 +6276,15 @@ SEASTAR_TEST_CASE(local_recovery_plan_cases_fake) {
           const auto spec = specification(root, {1, 1}, 51);
           const std::array specs{spec};
           ownership_input owner{specs};
+          counted_io counted{files};
           co_await storage::testing::recovery_contract::plan_cases(
-            files, owner, spec, budget, drive);
+            files,
+            owner,
+            spec,
+            budget,
+            drive,
+            counted.reads(),
+            counted.writes());
       });
 }
 
@@ -5666,6 +6364,21 @@ SEASTAR_TEST_CASE(local_recovery_reconstruction_fake) {
       });
 }
 
+SEASTAR_TEST_CASE(local_recovery_reconstruction_residues_fake) {
+    co_await with_store_environment(
+      config(), [](auto& env, auto& budget, auto drive) -> seastar::future<> {
+          auto& files = env.file_system();
+          const auto root = take(runtime::file_path::make("/kwaque/store"));
+          take(co_await drive.lifecycle(files.create_directories(root)));
+          stabilize(files, take(runtime::file_path::make("/kwaque")));
+          const auto spec = specification(root, {1, 1}, 51);
+          const std::array specs{spec};
+          ownership_input owner{specs};
+          co_await storage::testing::recovery_contract::reconstruction_residues<
+            simulation::monotonic_clock>(files, owner, spec, budget, drive);
+      });
+}
+
 SEASTAR_TEST_CASE(local_recovery_interruptions_fake) {
     co_await with_store_environment(
       config(), [](auto& env, auto& budget, auto drive) -> seastar::future<> {
@@ -5718,6 +6431,88 @@ SEASTAR_TEST_CASE(local_recovering_publication_fake) {
           const std::array specs{spec};
           ownership_input owner{specs};
           co_await storage::testing::recovery_contract::recovering_publication<
+            simulation::monotonic_clock>(files, owner, spec, budget, drive);
+      });
+}
+
+// Restart's write-back fails at its first write, and then at its flush:
+// each time the shard stays out of ready with the WAL unchanged, and the
+// next restart publishes. A run with nothing failing finds the data file
+// and how often it was written and flushed before the write-back.
+SEASTAR_TEST_CASE(local_recovery_materialization_failure_fake) {
+    const auto run =
+      [](environment_config chosen, auto ready) -> seastar::future<> {
+        co_await with_store_environment(
+          std::move(chosen),
+          [ready](
+            auto& env, auto& budget, auto drive) mutable -> seastar::future<> {
+              auto& files = env.file_system();
+              const auto root = take(runtime::file_path::make("/kwaque/store"));
+              take(co_await drive.lifecycle(files.create_directories(root)));
+              stabilize(files, take(runtime::file_path::make("/kwaque")));
+              const auto spec = specification(root, {1, 1}, 51);
+              const std::array specs{spec};
+              ownership_input owner{specs};
+              co_await storage::testing::recovery_contract::
+                materialization_failure<simulation::monotonic_clock>(
+                  files,
+                  owner,
+                  spec,
+                  budget,
+                  drive,
+                  [&files, &ready](const runtime::file_path& path) {
+                      return ready(files, path);
+                  });
+          });
+    };
+    struct {
+        std::uint64_t object{0}, writes{0}, flushes{0};
+    } found;
+    co_await run(
+      config(), [&found](auto& files, const runtime::file_path& path) {
+          const auto object = take(
+            fake_file_test_access::lookup(
+              files,
+              take(fake_file_test_access::resolve(files, path.value()))));
+          found.object = object.value();
+          found.writes = take(
+            fake_file_test_access::occurrences(
+              files, object, runtime::builtin_fault_point::file_write));
+          found.flushes = take(
+            fake_file_test_access::occurrences(
+              files, object, runtime::builtin_fault_point::file_flush));
+          return false;
+      });
+    BOOST_REQUIRE_NE(found.object, 0U);
+    const auto armed = [](auto&, const runtime::file_path&) { return true; };
+    const auto key = runtime::fault_object_key::from_u64(found.object);
+    co_await run(
+      config(
+        runtime::builtin_fault_point::file_write,
+        runtime::fault_action::file_failure_before_effect,
+        found.writes + 1,
+        key),
+      armed);
+    co_await run(
+      config(
+        runtime::builtin_fault_point::file_flush,
+        runtime::fault_action::file_failure_before_effect,
+        found.flushes + 1,
+        key),
+      armed);
+}
+
+SEASTAR_TEST_CASE(local_recovery_materialization_fake) {
+    co_await with_store_environment(
+      config(), [](auto& env, auto& budget, auto drive) -> seastar::future<> {
+          auto& files = env.file_system();
+          const auto root = take(runtime::file_path::make("/kwaque/store"));
+          take(co_await drive.lifecycle(files.create_directories(root)));
+          stabilize(files, take(runtime::file_path::make("/kwaque")));
+          const auto spec = specification(root, {1, 1}, 51);
+          const std::array specs{spec};
+          ownership_input owner{specs};
+          co_await storage::testing::recovery_contract::materialization<
             simulation::monotonic_clock>(files, owner, spec, budget, drive);
       });
 }
@@ -5797,8 +6592,8 @@ seastar::future<runtime::result<recovered_publications>> publish_a(
   workload_budget& budget,
   simulation::testing::scheduler_driver drive,
   std::uint64_t retry) {
-    const std::array catalog{
-      recovery_catalog_entry{recovery::descriptor(), recovery::segment_head()}};
+    const std::array catalog{recovery_catalog_entry{
+      recovery::descriptor(), recovery::segment_head(), recovery::origin()}};
     auto found = take(
       co_await recovery::inventory(
         files,
@@ -5808,8 +6603,16 @@ seastar::future<runtime::result<recovered_publications>> publish_a(
         catalog,
         std::span<const recovery_decision_record>{},
         drive));
+    recovery_tails tails;
     auto planned = co_await recovery::plan(
-      files, owner, spec, budget, found.targets, drive);
+      files,
+      owner,
+      spec,
+      budget,
+      found.targets,
+      drive,
+      recovery::head_control(),
+      &tails);
     require(
       planned.ready()
         && planned.segments()[0].action
@@ -5822,6 +6625,7 @@ seastar::future<runtime::result<recovered_publications>> publish_a(
       budget,
       planned,
       found,
+      tails,
       std::span<const recovery_visibility>{},
       retry,
       drive);

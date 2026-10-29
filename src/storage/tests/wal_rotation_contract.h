@@ -1,13 +1,17 @@
 #pragma once
 
 #include "src/base/units.h"
+#include "src/storage/retained_wal.h"
 #include "src/storage/tests/wal_append_contract.h"
+#include "src/storage/wal_reclaimer.h"
 
 #include <array>
 #include <cstdint>
 #include <initializer_list>
 #include <optional>
+#include <string>
 #include <type_traits>
+#include <vector>
 
 namespace kwaque::storage::testing::wal_rotation_contract {
 using store_contract::require;
@@ -475,6 +479,230 @@ seastar::future<> retention(
               && writer.statistics().rotations == 2
               && writer.prepared_head() != head,
             "the rotation did not go through once a file was removed");
+      });
+}
+
+// At the defaults a head's successor is made while it is the head: a fresh
+// file zero-written whole under a temporary name, its incarnation allocated
+// and its handles open. The rotation that takes it writes its header
+// through the synchronized handle, names it and syncs its directory; with
+// every group a synchronized write the rotation flushes nothing, and the
+// successor holds its exact header and zeros to its capacity. Each
+// rotation takes the one made ahead, and the next is made at once.
+template<typename Backend, typename Owner, typename Driver>
+seastar::future<> ready_successor(
+  Backend& files,
+  Owner& ownership,
+  const local_device_spec& spec,
+  workload_budget& budget,
+  Driver drive) {
+    const auto config = wal_writer_contract::with_defaults();
+    co_await append::with_writer(
+      files,
+      ownership,
+      spec,
+      budget,
+      drive,
+      config,
+      [&](auto& writer, auto& work) -> seastar::future<> {
+          const auto paths = take(local_paths::make(spec.root));
+          for (std::uint64_t rotated = 1; rotated <= 2; ++rotated) {
+              require(
+                co_await drive.lifecycle(writer.successor_made()),
+                "no successor was made ahead of its rotation");
+              auto group = co_await submit_one(
+                writer, budget, spec.owner.cluster(), work);
+              auto done = co_await drive.lifecycle(std::move(group.written));
+              take(done.failure.outcome());
+              take(
+                co_await drive.lifecycle(
+                  writer.rotate(group.boundary, byte_count{8_KiB}, work)));
+              const auto stats = writer.statistics();
+              require(
+                stats.rotations == rotated && stats.ahead_rotations == rotated
+                  && stats.flush_calls == 0 && stats.spares_taken == 0,
+                "a rotation did not take the successor made ahead, or "
+                "flushed");
+              const auto next = *writer.prepared_head();
+              const auto header = wal_writer_contract::header_bytes(
+                spec, 0, next.incarnation, group.boundary.cursor());
+              const auto stored = co_await store_contract::read_all_bytes(
+                files, take(paths.wal(0, next.incarnation)), drive);
+              require(
+                stored.size() == config.capacity_bytes.value()
+                  && stored.substr(0, header.size()) == header
+                  && stored.find_first_not_of('\0', header.size())
+                       == std::string::npos
+                  && writer.progress()->reserved.position().value()
+                       == header.size(),
+                "the successor made ahead is not its header and zeros");
+          }
+      });
+}
+
+// A successor whose making ahead fails is let go, and the rotation makes
+// its successor itself, as with none made ahead: a file holding its exact
+// header and zeros, which the next group is written to. `ready(spec)` is
+// asked once the making ahead is over, and says whether it was set to fail.
+template<typename Backend, typename Owner, typename Driver, typename Ready>
+seastar::future<> failed_body_falls_back(
+  Backend& files,
+  Owner& ownership,
+  const local_device_spec& spec,
+  workload_budget& budget,
+  Driver drive,
+  Ready ready) {
+    const auto config = wal_writer_contract::with_defaults();
+    co_await append::with_writer(
+      files,
+      ownership,
+      spec,
+      budget,
+      drive,
+      config,
+      [&](auto& writer, auto& work) -> seastar::future<> {
+          const auto made = co_await drive.lifecycle(writer.successor_made());
+          const bool armed = ready(spec);
+          require(
+            made != armed,
+            "a successor whose making failed was taken as made, or one with "
+            "nothing failing was not made");
+          auto group = co_await submit_one(
+            writer, budget, spec.owner.cluster(), work);
+          take((co_await drive.lifecycle(std::move(group.written)))
+                 .failure.outcome());
+          take(
+            co_await drive.lifecycle(
+              writer.rotate(group.boundary, byte_count{8_KiB}, work)));
+          const auto stats = writer.statistics();
+          const auto next = *writer.prepared_head();
+          const auto header = wal_writer_contract::header_bytes(
+            spec, 0, next.incarnation, group.boundary.cursor());
+          const auto stored = co_await store_contract::read_all_bytes(
+            files,
+            take(take(local_paths::make(spec.root)).wal(0, next.incarnation)),
+            drive);
+          require(
+            stats.rotations == 1 && stats.ahead_rotations == (armed ? 0U : 1U)
+              && !writer.failure().failed()
+              && stored.size() == config.capacity_bytes.value()
+              && stored.substr(0, header.size()) == header
+              && stored.find_first_not_of('\0', header.size())
+                   == std::string::npos,
+            "a rotation after a failed making did not make its successor "
+            "itself");
+          auto after = co_await submit_one(
+            writer, budget, spec.owner.cluster(), work);
+          take((co_await drive.lifecycle(std::move(after.written)))
+                 .failure.outcome());
+          take((co_await drive.lifecycle(writer.barrier(after.boundary)))
+                 .failure.outcome());
+      });
+}
+
+// A file the checkpoint reclaims is kept as a spare while the WAL's spares
+// have room, and unlinked otherwise; the next file is made of the spare.
+// The spare is the reclaimed file under a new name, its bytes unchanged,
+// and the file made of it is that file again: its header written over the
+// old one and everything after it the old file's, never read, with its
+// groups synchronized writes over blocks written already.
+template<typename Backend, typename Owner, typename Driver>
+seastar::future<> recycled_files(
+  Backend& files,
+  Owner& ownership,
+  const local_device_spec& spec,
+  workload_budget& budget,
+  Driver drive) {
+    auto config = wal_writer_contract::with_defaults();
+    // Each successor is made at its rotation, which takes the spare.
+    config.prepare_ahead = false;
+    config.spares = 1;
+    co_await append::with_writer(
+      files,
+      ownership,
+      spec,
+      budget,
+      drive,
+      config,
+      [&](auto& writer, auto& work) -> seastar::future<> {
+          using writer_type = std::remove_reference_t<decltype(writer)>;
+          // What reclaims the WAL holds of its writer, as the append owner
+          // gives it.
+          struct reclaiming final {
+              writer_type* writer;
+              [[nodiscard]] const storage::retained_wal&
+              retained_wal() const noexcept {
+                  return writer->retained();
+              }
+              void wal_released() noexcept { writer->release_oldest(); }
+              [[nodiscard]] auto& wal_spares() noexcept {
+                  return writer->spares();
+              }
+          } holder{&writer};
+          const auto paths = take(local_paths::make(spec.root));
+          const auto write_one = [&]() -> seastar::future<wal_submission> {
+              auto group = co_await submit_one(
+                writer, budget, spec.owner.cluster(), work);
+              auto done = co_await drive.lifecycle(std::move(group.written));
+              take(done.failure.outcome());
+              co_return group;
+          };
+          std::vector<model::wal_incarnation_id> made{
+            writer.prepared_head()->incarnation};
+          for (int i = 0; i != 2; ++i) {
+              const auto group = co_await write_one();
+              take(
+                co_await drive.lifecycle(
+                  writer.rotate(group.boundary, byte_count{8_KiB}, work)));
+              made.push_back(writer.prepared_head()->incarnation);
+          }
+          const auto oldest = take(paths.wal(0, made[0]));
+          const auto second = take(paths.wal(0, made[1]));
+          const auto old_bytes = co_await store_contract::read_all_bytes(
+            files, oldest, drive);
+          // Both files before the head lie below a cutoff at its start.
+          const auto reclaimed = co_await drive.lifecycle(reclaim_wal_prefix(
+            files, spec, 0, writer.progress()->reserved, holder));
+          const auto spare = take(paths.spare(0, made[0]));
+          require(
+            !reclaimed.failed && reclaimed.removed == 2
+              && reclaimed.recycled == 1 && reclaimed.owed == 0
+              && writer.spares().size() == 1 && writer.retained().files() == 1
+              && !take(co_await drive.lifecycle(files.exists(oldest)))
+              && !take(co_await drive.lifecycle(files.exists(second)))
+              && (co_await store_contract::read_all_bytes(files, spare, drive))
+                   == old_bytes,
+            "a reclaimed file was not kept as a spare below the bound, or "
+            "was kept above it");
+          // The next file is made of the spare.
+          const auto group = co_await write_one();
+          take(
+            co_await drive.lifecycle(
+              writer.rotate(group.boundary, byte_count{8_KiB}, work)));
+          const auto next = *writer.prepared_head();
+          const auto header = wal_writer_contract::header_bytes(
+            spec, 0, next.incarnation, group.boundary.cursor());
+          const auto remade = co_await store_contract::read_all_bytes(
+            files, take(paths.wal(0, next.incarnation)), drive);
+          require(
+            writer.statistics().spares_taken == 1 && writer.spares().size() == 0
+              && !take(co_await drive.lifecycle(files.exists(spare)))
+              && remade.size() == old_bytes.size()
+              && remade.substr(0, header.size()) == header
+              && remade.substr(header.size())
+                   == old_bytes.substr(header.size()),
+            "the next file was not the spare with its own header over the old "
+            "one");
+          const auto synchronized = writer.statistics().synchronized_writes;
+          const auto flushes = writer.statistics().flush_calls;
+          const auto last = co_await write_one();
+          auto durable = co_await drive.lifecycle(
+            writer.barrier(last.boundary));
+          take(durable.failure.outcome());
+          require(
+            writer.statistics().synchronized_writes == synchronized + 1
+              && writer.statistics().flush_calls == flushes,
+            "a group in a file made of a spare was not a synchronized write");
       });
 }
 } // namespace kwaque::storage::testing::wal_rotation_contract

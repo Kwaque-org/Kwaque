@@ -4,6 +4,7 @@
 #include "src/storage/local_control.h"
 #include "src/storage/local_discovery.h"
 #include "src/storage/local_paths.h"
+#include "src/storage/local_spares.h"
 #include "src/storage/retained_wal.h"
 
 #include <seastar/core/coroutine.hh>
@@ -19,8 +20,8 @@ namespace kwaque::storage {
 
 // What removing the WAL's prefix did.
 struct wal_reclaim_outcome final {
-    // Files removed by this call.
-    std::uint32_t removed{0};
+    // Files removed by this call, and of them those kept as spares.
+    std::uint32_t removed{0}, recycled{0};
     // Files below the cutoff's file that are still there: debt, tried again
     // by the next call.
     std::uint32_t owed{0};
@@ -33,11 +34,14 @@ struct wal_reclaim_outcome final {
 // above the cutoff needs every file, and below it a hole would only hide
 // debt. The names are the WAL writer's own, kept as each file became the
 // head; `holder` gives them as retained_wal() and is told of each removal
-// through wal_released(). No directory sync is awaited. The durable cutoff
-// is the authority: a name that comes back after a crash is below it and is
-// removed again at the next open, and incarnations are never used twice. A
-// file already gone counts as removed. Nothing here reports space as
-// durably released.
+// through wal_released(). While the WAL's spares, which `holder` gives as
+// wal_spares(), have room, a file is moved in among them instead, under one
+// turn of theirs for the call, and the spare directory is synced once
+// after the moves; one unlinked awaits no directory sync. The durable
+// cutoff is the authority: a name that comes back after a crash is below it
+// and is taken again at the next open, and incarnations are never used
+// twice. A file already gone counts as removed. Nothing here reports space
+// as durably released.
 template<runtime::file_system_backend Backend, typename Holder>
 seastar::future<wal_reclaim_outcome> reclaim_wal_prefix(
   Backend& files,
@@ -52,17 +56,31 @@ seastar::future<wal_reclaim_outcome> reclaim_wal_prefix(
         if (output.owed != 0) output.failed = paths.error();
         co_return output;
     }
+    auto& spares = holder.wal_spares();
+    const auto turn = co_await spares.turn();
+    seastar::abort_source abort;
+    codec::cooperative_work work{codec::limits::defaults(), abort};
     while (holder.retained_wal().below(cutoff) != 0) {
-        const auto path = paths->wal(shard, *holder.retained_wal().oldest());
+        const auto oldest = *holder.retained_wal().oldest();
+        const auto path = paths->wal(shard, oldest);
         if (!path) {
             output.failed = path.error();
             break;
         }
         try {
-            const auto removed = co_await files.remove_file(*path);
-            if (!removed && removed.error().code() != errc::not_found) {
-                output.failed = removed.error();
+            const auto kept = co_await spares.move_in(*path, oldest, work);
+            if (!kept) {
+                output.failed = kept.error();
                 break;
+            }
+            if (*kept) {
+                ++output.recycled;
+            } else {
+                const auto removed = co_await files.remove_file(*path);
+                if (!removed && removed.error().code() != errc::not_found) {
+                    output.failed = removed.error();
+                    break;
+                }
             }
         } catch (...) {
             output.failed = detail::recognized_or_rethrown();
@@ -71,20 +89,56 @@ seastar::future<wal_reclaim_outcome> reclaim_wal_prefix(
         holder.wal_released();
         ++output.removed;
     }
+    try {
+        // A spare whose move is not durable comes back under its old name
+        // below the cutoff, and is taken again at the next open.
+        if (const auto settled = co_await spares.settle(work); !settled)
+            if (!output.failed) output.failed = settled.error();
+    } catch (...) {
+        if (!output.failed) output.failed = detail::recognized_or_rethrown();
+    }
     output.owed = holder.retained_wal().below(cutoff);
     co_return output;
 }
 
 // What a reopen removed below the durable cutoff.
 struct wal_reopen_outcome final {
-    // Names below the cutoff's file, removed unread.
-    std::uint32_t removed{0};
+    // Names below the cutoff's file, removed unread, and of them those kept
+    // as spares.
+    std::uint32_t removed{0}, recycled{0};
     // Names at or above it, left for the chain walk.
     std::uint32_t kept{0};
-    // Names that are not WAL files: temporaries of interrupted publications
-    // and anything unknown. They are left for their own owner.
+    // Temporaries of WAL files: bodies made ahead that no rotation took, and
+    // what interrupted publications left. With the WAL's spares each is
+    // kept as one or removed; without, each counts among the other names.
+    std::uint32_t temporaries{0};
+    // Names that are not WAL files and anything unknown. They are left for
+    // their own owner.
     std::uint32_t other{0};
+    // What the spare directory held.
+    local_spares_found spares{};
 };
+
+namespace detail {
+// Takes in a WAL file nothing reads again: as a spare while `spares` has
+// room, else by its removal. True when it was kept.
+template<runtime::file_system_backend Backend>
+seastar::future<runtime::result<bool>> retire_wal_file(
+  Backend& files,
+  local_spares<Backend, model::wal_incarnation_id>* spares,
+  const runtime::file_path& path,
+  model::wal_incarnation_id name,
+  codec::cooperative_work& work) {
+    if (spares) {
+        auto kept = co_await spares->move_in(path, name, work);
+        if (!kept || *kept) co_return kept;
+    }
+    auto removed = co_await files.remove_file(path);
+    if (!removed && removed.error().code() != errc::not_found)
+        co_return runtime::failure(removed.error());
+    co_return false;
+}
+} // namespace detail
 
 // At reopen: every WAL name of the shard below the file the durable cutoff
 // lies in is removed without being opened, whatever it holds. Such a name is
@@ -95,7 +149,14 @@ struct wal_reopen_outcome final {
 // needs. A name at or above the cutoff is left for the chain walk, which
 // fails when one of them is missing. Names are compared as incarnations,
 // never guessed from a neighbour. The first removal that fails is returned.
-// With no checkpoint there is no cutoff and nothing is removed.
+// With no checkpoint there is no cutoff and nothing below it is removed.
+//
+// Given the WAL's spares, under one turn of theirs: the spares their
+// directory holds are taken in first, those of no more than `capacity`
+// bytes up to their bound, and the rest removed unread; then a name below
+// the cutoff, and a temporary of a WAL file at any place, which nothing
+// names and no rotation took, is moved in among them while there is room
+// and removed otherwise. None is ever read or promoted by its name.
 //
 // A restart calls this only once its plan is ready. A plan that stops
 // permits no mutation, and a name that came back below the cutoff is then
@@ -107,23 +168,32 @@ seastar::future<runtime::result<wal_reopen_outcome>> remove_wal_below(
   const local_device_spec& spec,
   std::uint32_t shard,
   const local_control_owner<Backend, Owner>& head,
-  codec::cooperative_work& work) {
+  codec::cooperative_work& work,
+  local_spares<Backend, model::wal_incarnation_id>* spares = nullptr,
+  byte_count capacity = {}) {
     if (auto valid = validate_local_device_spec(spec); !valid)
         co_return runtime::failure(valid.error());
     const auto durable = head.checkpoint_end();
-    if (!durable) co_return wal_reopen_outcome{};
-    const auto cutoff = *durable;
+    if (!durable && !spares) co_return wal_reopen_outcome{};
     if (!spec.shard_owner(shard) || !spec.controls())
         co_return runtime::failure(detail::path_error(errc::wrong_context));
     if (auto valid = co_await ownership.validate(spec); !valid)
         co_return runtime::failure(valid.error());
+    std::optional<seastar::semaphore_units<>> turn;
+    wal_reopen_outcome output;
+    if (spares) {
+        turn.emplace(co_await spares->turn());
+        auto found = co_await spares->adopt(
+          [capacity](byte_count bytes) { return bytes <= capacity; }, work);
+        if (!found) co_return runtime::failure(found.error());
+        output.spares = *found;
+    }
     const auto paths = local_paths::make(spec.root);
     if (!paths) co_return runtime::failure(paths.error());
     const auto root = paths->buckets(shard, local_bucket_kind::wal);
     if (!root) co_return runtime::failure(root.error());
     using cursor = typename Backend::directory_cursor_type;
     std::optional<cursor> buckets, names;
-    wal_reopen_outcome output;
     runtime::first_failure failed;
     try {
         do {
@@ -189,15 +259,31 @@ seastar::future<runtime::result<wal_reopen_outcome>> remove_wal_below(
                         }
                         last = entries->end();
                         for (const auto& entry : entries->entries()) {
-                            const auto file = parse_local_wal_name(
-                              entry.name.value(), *number);
+                            const auto& name = entry.name.value();
+                            auto file = parse_local_wal_name(name, *number);
+                            bool temporary = false;
+                            if (!file && spares && name.size() > 24) {
+                                const auto target = runtime::file_name::make(
+                                  std::string_view{name}.substr(
+                                    0, name.size() - 24));
+                                if (
+                                  target
+                                  && parse_local_temporary_name(
+                                    name, *target)) {
+                                    file = parse_local_wal_name(
+                                      target->value(), *number);
+                                    temporary = file.has_value();
+                                }
+                            }
                             if (
                               !file
                               || entry.kind != runtime::file_kind::regular) {
                                 ++output.other;
                                 continue;
                             }
-                            if (!file->canonical_less(cutoff.incarnation())) {
+                            if (
+                              !temporary
+                              && (!durable || !file->canonical_less(durable->incarnation()))) {
                                 ++output.kept;
                                 continue;
                             }
@@ -206,14 +292,17 @@ seastar::future<runtime::result<wal_reopen_outcome>> remove_wal_below(
                                 failed.observe(path);
                                 break;
                             }
-                            auto removed = co_await files.remove_file(*path);
-                            if (
-                              !removed
-                              && removed.error().code() != errc::not_found) {
-                                failed.observe(removed);
+                            auto retired = co_await detail::retire_wal_file(
+                              files, spares, *path, *file, work);
+                            if (!retired) {
+                                failed.observe(retired);
                                 break;
                             }
-                            ++output.removed;
+                            if (temporary)
+                                ++output.temporaries;
+                            else
+                                ++output.removed;
+                            if (*retired) ++output.recycled;
                         }
                     }
                     failed.observe(co_await names->close());
@@ -235,6 +324,13 @@ seastar::future<runtime::result<wal_reopen_outcome>> remove_wal_below(
     if (buckets) {
         try {
             failed.observe(co_await buckets->close());
+        } catch (...) {
+            failed.observe(std::current_exception());
+        }
+    }
+    if (spares && !failed.failed()) {
+        try {
+            failed.observe(co_await spares->settle(work));
         } catch (...) {
             failed.observe(std::current_exception());
         }

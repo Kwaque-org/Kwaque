@@ -171,6 +171,30 @@ BOOST_AUTO_TEST_CASE(storage_recovery_fuzz_each_rule_can_break) {
     other.device = 2;
     other.b_recovering = true;
     BOOST_CHECK_EQUAL(recovery_verdict(other), "spared");
+    auto written_back = baseline;
+    written_back.changed = written_back.dropped = true;
+    written_back.device = 1;
+    written_back.materialized = 2;
+    BOOST_CHECK(recovery_verdict(written_back).empty());
+    auto kept_out = written_back;
+    kept_out.materialized = 0;
+    BOOST_CHECK_EQUAL(recovery_verdict(kept_out), "lost");
+    kept_out = written_back;
+    kept_out.ready = false;
+    kept_out.untouched = true;
+    BOOST_CHECK_EQUAL(recovery_verdict(kept_out), "lost");
+}
+
+// Segment A's blocks dropped while the WAL held them are written back from
+// their PREPAREs before the start publishes A.
+SEASTAR_THREAD_TEST_CASE(storage_recovery_fuzz_dropped_blocks_are_written) {
+    const auto result = exercise_recovery_case(
+      control(0, image_damage::dropped), {});
+    say("dropped", result);
+    BOOST_CHECK_MESSAGE(
+      result.word.empty(), result.word << " about " << result.about);
+    BOOST_CHECK(result.seen.dropped && result.seen.ready);
+    BOOST_CHECK_EQUAL(result.seen.materialized, 2U);
 }
 
 // With nothing done to it the image is started on as the engine's own case
@@ -209,7 +233,7 @@ SEASTAR_THREAD_TEST_CASE(storage_recovery_fuzz_every_seed_breaks_no_rule) {
             << ": " << result.word << " about " << result.about);
         ++seeds;
     }
-    BOOST_CHECK_EQUAL(seeds, 33U);
+    BOOST_CHECK_EQUAL(seeds, 34U);
 }
 
 // An earlier control record in the newer one's place says the store was

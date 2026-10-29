@@ -16,6 +16,21 @@ constexpr auto block_family = static_cast<std::uint16_t>(
 constexpr auto footer_family = static_cast<std::uint16_t>(
   codec::format_family::durable_boundary_footer);
 
+// A block or footer refused for its segment context, which its codec checks
+// before anything else of the object: another segment wrote it.
+bool names_another_segment(const codec::error& error) noexcept {
+    if (error.code() != errc::wrong_context) return false;
+    const auto field = error.field();
+    if (error.family() == block_family)
+        return field >= static_cast<std::uint16_t>(segment_field::cluster)
+               && field
+                    <= static_cast<std::uint16_t>(segment_field::generation);
+    if (error.family() == footer_family)
+        return field >= static_cast<std::uint16_t>(footer_field::cluster)
+               && field <= static_cast<std::uint16_t>(footer_field::generation);
+    return false;
+}
+
 segment_scan_stop slot_stop(scan_slot_kind kind) noexcept {
     switch (kind) {
     case scan_slot_kind::zero:
@@ -119,7 +134,8 @@ segment_scanner::segment_scanner(
   , history_(history)
   , limits_(limits)
   , working_(std::move(working))
-  , physical_(history.physical_origin) {}
+  , physical_(history.physical_origin)
+  , stamp_(history.data_start) {}
 
 segment_scanner::~segment_scanner() {
     KWAQUE_INVARIANT(
@@ -170,6 +186,10 @@ segment_scanner::make(
     report.pin = pin;
     const auto start = pin ? pin->position() : history.data_start;
     report.content_end = start;
+    report.proven_end
+      = pin ? runtime::
+                file_position{pin->position().value() + pin->bytes().value()}
+            : history.data_start;
     if (start.value() > bound) {
         // The certified footer, or the data itself, lies past the file end.
         output->stop(segment_scan_stop::torn, std::nullopt);
@@ -227,11 +247,15 @@ runtime::result<codec::decode_budget> segment_scanner::budget_for(
 }
 
 void segment_scanner::stop(
-  segment_scan_stop kind, std::optional<codec::error> cause, bool intact) {
+  segment_scan_stop kind,
+  std::optional<codec::error> cause,
+  bool intact,
+  bool stale) {
     stopped_ = true;
     report_.stop = kind;
     report_.cause = cause;
     report_.intact = intact;
+    report_.stale = stale;
     report_.verdict = kind == segment_scan_stop::end
                         ? segment_scan_verdict::clean
                         : segment_scan_verdict::uncertified_tail;
@@ -317,10 +341,12 @@ segment_scanner::next(codec::cooperative_work& work) {
         co_return co_await take_block(*slot, work);
     if (slot->prefix->family == footer_family)
         co_return co_await take_footer(*slot, work);
+    // No block or footer: no write of this segment put it here.
     stop(
       segment_scan_stop::foreign,
       codec::error{
         errc::wrong_context, slot->prefix->family, 0, slot->position.value()},
+      true,
       true);
     co_return output{};
 }
@@ -336,7 +362,11 @@ segment_scanner::take_block(scan_slot slot, codec::cooperative_work& work) {
                           bool decoded = false) -> runtime::result<output> {
         const auto kind = detail::segment_decode_stop(error);
         if (!kind) return runtime::failure(path_error(error.code()));
-        stop(*kind, error, decoded || *kind != segment_scan_stop::corrupt);
+        stop(
+          *kind,
+          error,
+          decoded || *kind != segment_scan_stop::corrupt,
+          !decoded && names_another_segment(error));
         return output{};
     };
     auto location = segment_write_context::make(
@@ -358,11 +388,23 @@ segment_scanner::take_block(scan_slot slot, codec::cooperative_work& work) {
       context,
       codec::input_boundary::complete);
     if (!decoded) co_return damage(decoded.error());
+    // A writer's certified end never moves back along its file.
+    const auto certified = decoded->value.descriptor().stamps().certified_end;
+    if (certified < stamp_)
+        co_return damage(
+          codec::error{
+            errc::malformed_data,
+            block_family,
+            static_cast<std::uint16_t>(segment_field::certified_end),
+            slot.position.value()},
+          true);
     // The verifier reuses the codec's validation and extends the prefix.
     auto added = co_await verifier_->add_block(
       decoded->value, batch, decoded->remaining, work, context);
     if (!added) co_return damage(added.error(), true);
     physical_ = decoded->value.descriptor().coverage().physical().end();
+    stamp_ = certified;
+    report_.proven_end = std::max(report_.proven_end, certified);
     ++report_.suffix_blocks;
     report_.content_end = runtime::file_position{
       slot.position.value() + length.value()};
@@ -380,7 +422,11 @@ segment_scanner::take_footer(scan_slot slot, codec::cooperative_work& work) {
                           bool decoded = false) -> runtime::result<output> {
         const auto kind = detail::segment_decode_stop(error);
         if (!kind) return runtime::failure(path_error(error.code()));
-        stop(*kind, error, decoded || *kind != segment_scan_stop::corrupt);
+        stop(
+          *kind,
+          error,
+          decoded || *kind != segment_scan_stop::corrupt,
+          !decoded && names_another_segment(error));
         return output{};
     };
     auto bytes = reader_->object();
@@ -473,6 +519,7 @@ segment_scanner::restart(runtime::file_position at) {
     report_.stop = segment_scan_stop::end;
     report_.cause.reset();
     report_.intact = false;
+    report_.stale = false;
     report_.verdict = segment_scan_verdict::clean;
     report_.content_end = at;
     auto size = co_await data_.size();
@@ -514,6 +561,8 @@ seastar::future<runtime::result<segment_block>> segment_scanner::substitute(
       {.origin = at.value()});
     if (!added) co_return runtime::failure(path_error(added.error().code()));
     physical_ = covered.physical().end();
+    stamp_ = std::max(stamp_, block.descriptor().stamps().certified_end);
+    report_.proven_end = std::max(report_.proven_end, stamp_);
     ++report_.suffix_blocks;
     if (auto restarted = co_await restart(covered.bytes().end()); !restarted)
         co_return runtime::failure(restarted.error());
@@ -563,6 +612,61 @@ segment_scanner::substitute(
       !restarted)
         co_return runtime::failure(restarted.error());
     co_return std::move(footer);
+}
+
+seastar::future<runtime::result<void>>
+segment_scanner::prove(codec::cooperative_work& work) {
+    if (closed_ || !stopped_)
+        co_return runtime::failure(path_error(errc::invalid_argument));
+    if (report_.stop == segment_scan_stop::end || !reader_)
+        co_return runtime::result<void>{};
+    block_.reset();
+    const auto unit = history_.alignment.bytes().value();
+    for (;;) {
+        auto slot = co_await reader_->next(work);
+        if (!slot) co_return runtime::failure(slot.error());
+        if (slot->kind == scan_slot_kind::end) break;
+        if (slot->kind == scan_slot_kind::object) {
+            if (slot->prefix->family == block_family) {
+                auto bytes = reader_->object();
+                if (!bytes) co_return runtime::failure(bytes.error());
+                bytes::fragmented_buffer_parser input{std::move(*bytes)};
+                auto memory = budget_for(
+                  input, slot->prefix->encoded_bytes(), work.policy());
+                if (!memory) co_return runtime::failure(memory.error());
+                auto stamps = co_await peek_segment_block_stamps(
+                  input,
+                  history_.segment,
+                  history_.alignment,
+                  history_.data_start,
+                  slot->position,
+                  *memory,
+                  work,
+                  {.origin = slot->position.value()},
+                  codec::input_boundary::complete);
+                if (stamps) {
+                    report_.proven_end = std::max(
+                      report_.proven_end, stamps->certified_end);
+                } else if (!detail::segment_decode_stop(stamps.error())) {
+                    // Pressure, a caller's error or a format this build
+                    // cannot read: nothing about the bytes.
+                    co_return runtime::failure(
+                      path_error(stamps.error().code()));
+                }
+            }
+            if (auto moved = reader_->advance(); !moved)
+                co_return runtime::failure(moved.error());
+            continue;
+        }
+        // No length here can be trusted: on where a write can begin.
+        const auto next = (slot->position.value() / unit + 1) * unit;
+        if (next >= reader_->end().value()) break;
+        if (
+          auto skipped = reader_->skip_to(runtime::file_position{next});
+          !skipped)
+            co_return runtime::failure(skipped.error());
+    }
+    co_return runtime::result<void>{};
 }
 
 seastar::future<> segment_scanner::close() noexcept {

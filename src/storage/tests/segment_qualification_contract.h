@@ -74,7 +74,14 @@ seastar::future<> with_segment(
       files, owner, spec, resources, work, drive);
     auto writer = take(
       segment_writer<Backend, Owner, Clock>::make_new(
-        files, owner, spec, 0, descriptor, resources, config));
+        files,
+        owner,
+        spec,
+        0,
+        descriptor,
+        contract::logical_origin(),
+        resources,
+        config));
     runtime::first_failure failed;
     try {
         take(co_await drive.lifecycle(writer->create_new(work)));
@@ -180,7 +187,10 @@ seastar::future<> age_boundaries(
           std::vector<admitted_wal_batch> children;
           children.push_back(take(
             admitted_wal_batch::make(
-              std::move(next), std::move(held), charge)));
+              std::move(next),
+              std::move(held),
+              contract::child_append_time,
+              charge)));
           controlled_clock::current
             = first.checked_add(description.maximum_lifetime).value();
           const auto rejected = co_await writer.freeze_group(
@@ -220,6 +230,7 @@ seastar::future<> age_boundaries(
                 local_publication_generation::make(1).value(),
                 {description.segment, local_object_state::active, {}, {}},
                 description,
+                contract::logical_origin(),
                 {}};
               using reopened_type
                 = segment_writer<Backend, Owner, controlled_clock>;
@@ -271,8 +282,8 @@ seastar::future<> age_boundaries(
               co_return;
           }
           std::uint32_t calls = 0;
-          const auto sealed = co_await drive.lifecycle(writer.seal(
-            contract::completed_source{{}, {}, &calls}, 0, 1, work));
+          const auto sealed = co_await drive.lifecycle(
+            writer.seal(contract::completed_source{{}, {}, &calls}, 0, work));
           take(sealed.failure.outcome());
           take(co_await drive.lifecycle(writer.reopen_read_handle(work)));
           take(co_await drive.lifecycle(writer.evict_read_handle()));
@@ -324,6 +335,8 @@ seastar::future<> reserved_completion(
           require(
             count != 0 && count < pressure.size(),
             "native metadata pressure did not saturate");
+          segment_seal_grants grants;
+          take(grants.fill(resources, writer.config().metadata));
           const auto before = resources.snapshot();
           resources.close_admission();
           const auto barrier = co_await drive.lifecycle(writer.barrier(cut));
@@ -337,14 +350,16 @@ seastar::future<> reserved_completion(
             "held metadata unit did not cover the accepted barrier");
           std::uint32_t calls = 0;
           const auto sealed = co_await drive.lifecycle(writer.seal(
-            contract::completed_source{{}, {}, &calls}, 0, 1, work));
+            contract::completed_source{{}, {}, &calls},
+            0,
+            work,
+            segment_no_index{},
+            &grants));
           take(sealed.failure.outcome());
           require(
-            sealed.extent && sealed.unresolved == 1
-              && resources.snapshot().accepted == before.accepted
+            sealed.extent && resources.snapshot().accepted == before.accepted
               && resources.snapshot().rejected == before.rejected,
-            "finalization reacquired ordinary admission or lost unresolved "
-            "facts");
+            "finalization reacquired ordinary admission");
       });
 }
 
@@ -380,7 +395,10 @@ seastar::future<> freeze_allocation_cut(
           std::vector<admitted_wal_batch> children;
           children.push_back(take(
             admitted_wal_batch::make(
-              std::move(batch), std::move(held), charge)));
+              std::move(batch),
+              std::move(held),
+              contract::child_append_time,
+              charge)));
           const auto before = take(writer.capture());
           std::optional<seastar::future<runtime::result<segment_frozen_group>>>
             pending;
@@ -473,7 +491,10 @@ seastar::future<> close_entered_preflight(
           std::vector<admitted_wal_batch> children;
           children.push_back(take(
             admitted_wal_batch::make(
-              std::move(batch), std::move(held), charge)));
+              std::move(batch),
+              std::move(held),
+              contract::child_append_time,
+              charge)));
           const auto before = writer.progress()->reserved;
           auto pending = [&] {
               seastar::internal::preemption_monitor requested{};
@@ -494,10 +515,7 @@ seastar::future<> close_entered_preflight(
           std::optional<seastar::future<runtime::result<void>>> close;
           if (sealing)
               seal.emplace(writer.seal(
-                contract::completed_source{{}, {}, &calls},
-                0,
-                0,
-                seal_admission));
+                contract::completed_source{{}, {}, &calls}, 0, seal_admission));
           else
               close.emplace(writer.close());
           const auto frozen = co_await drive.lifecycle(std::move(pending));
@@ -552,6 +570,7 @@ seastar::future<> paged_seal_and_retained_results(
           std::vector<completed_retry> facts;
           facts.reserve(32);
           codec::crc32c checksum;
+          contract::written_prefix records;
           codec::xxh3_128_hasher hash;
           std::optional<storage::coverage> last;
           std::optional<segment_captured_boundary> end;
@@ -563,6 +582,7 @@ seastar::future<> paged_seal_and_retained_results(
                   steady_tasks = resources.snapshot().tasks;
               }
               auto batch = co_await contract::execution_child(100 + i, work);
+              records.add(batch);
               const auto info = batch.info();
               const auto original = info.context.submitted();
               facts.push_back(
@@ -583,7 +603,11 @@ seastar::future<> paged_seal_and_retained_results(
               checksum.extend(std::span<const char>{block});
               hash.update(block.data(), block.size());
               const auto footer = footer_wire(
-                {cut.covered(), cut.end().blocks, last, checksum.value()},
+                {cut.covered(),
+                 cut.end().blocks,
+                 last,
+                 contract::appended_times(records.max_record),
+                 checksum.value()},
                 {cut.history(), cut.footer()->begin()});
               checksum.extend(std::span<const char>{footer});
               hash.update(footer.data(), footer.size());
@@ -640,7 +664,16 @@ seastar::future<> paged_seal_and_retained_results(
             refs.size() == 2,
             "qualified page geometry did not cross a page boundary");
           const auto expected = sealed_wire(
-            {coverage, 32, last, 0}, digest, refs, location);
+            {coverage,
+             32,
+             last,
+             contract::appended_times(records.max_record),
+             0},
+            digest,
+            refs,
+            location);
+          segment_seal_grants grants;
+          take(grants.fill(resources, writer.config().metadata));
           const auto before = resources.snapshot();
           resources.close_admission();
           std::uint32_t calls = 0;
@@ -648,8 +681,9 @@ seastar::future<> paged_seal_and_retained_results(
             contract::completed_source{
               std::move(fact_grant), std::move(facts), &calls},
             32,
-            0,
-            work));
+            work,
+            segment_no_index{},
+            &grants));
           take(sealed.failure.outcome());
           require(
             sealed.extent && sealed.boundary && sealed.retry

@@ -5,13 +5,48 @@
 #include "src/model/batch_identity.h"
 #include "src/model/position.h"
 
+#include <utility>
+
 namespace kwaque::storage {
 
 inline constexpr byte_count completed_retry_wire_bytes{160};
 
-// Persisted completed-result representation. Only the completed-request owner
-// may supply these facts: parsing a batch, PREPARE or footer does not establish
-// completion. There is intentionally no pending state, clock or eviction rule.
+// One producer stream of one epoch: every batch identity of the stream
+// shares it, and only the sequence tells its batches apart.
+struct retry_prefix final {
+    model::producer_id producer;
+    model::producer_epoch epoch;
+    model::producer_stream_id stream;
+
+    [[nodiscard]] static retry_prefix of(const model::batch_id& id) noexcept {
+        return {id.producer(), id.epoch(), id.stream()};
+    }
+    // The order of their batch identities, as model::batch_id::canonical_less.
+    [[nodiscard]] bool
+    canonical_less(const retry_prefix& other) const noexcept {
+        if (producer != other.producer)
+            return producer.canonical_less(other.producer);
+        if (epoch != other.epoch) return epoch < other.epoch;
+        return stream < other.stream;
+    }
+    bool operator==(const retry_prefix&) const noexcept = default;
+    template<typename H>
+    friend H AbslHashValue(H state, const retry_prefix& value) {
+        return H::combine(
+          std::move(state), value.producer, value.epoch, value.stream);
+    }
+};
+
+// Persisted completed-result representation. A completed fact describes a
+// batch inside a decided boundary of its segment generation: the end a live
+// seal takes once its appends drained, the end a recovered seal's decision
+// fixed, or the reported boundary a failed segment is sealed at. That
+// decision commits every batch inside it, acknowledged or not, so the fact is
+// derived from the batch itself: its identity, original binding, semantic
+// digest and assigned span. While a segment is appended to, a footer or
+// PREPARE alone proves nothing about commitment: facts are made only for the
+// reported prefix, and the seal decides which stand. A segment keeps the last
+// R of each stream; there is no clock and no other eviction.
 class completed_retry final {
 public:
     [[nodiscard]] static result<completed_retry> make(

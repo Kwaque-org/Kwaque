@@ -8,6 +8,7 @@
 #include "src/runtime/testing/test_directory.h"
 #include "src/storage/local_append.h"
 #include "src/storage/local_paths.h"
+#include "src/storage/tests/local_append_test_access.h"
 #include "src/storage/tests/local_storage_bench_file.h"
 #include "src/storage/tests/segment_bench_fixture.h"
 #include "src/storage/tests/segment_writer_contract.h"
@@ -33,6 +34,7 @@
 #include <cstdlib>
 #include <deque>
 #include <filesystem>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <set>
@@ -40,22 +42,6 @@
 #include <string>
 #include <string_view>
 #include <vector>
-
-namespace kwaque::storage {
-// Holds the formation entrance as a formation in progress holds it: requests
-// accepted meanwhile join one forming group, which forms on release.
-class local_append_test_access final {
-public:
-    template<
-      runtime::file_system_backend Backend,
-      typename Owner,
-      runtime::monotonic_clock Clock>
-    static seastar::future<seastar::semaphore_units<>>
-    hold_formation(local_append<Backend, Owner, Clock>& owner) {
-        return seastar::get_units(owner.form_lock_, 1);
-    }
-};
-} // namespace kwaque::storage
 
 namespace kwaque::storage::testing::local_storage_bench_support {
 namespace {
@@ -82,7 +68,27 @@ constexpr std::size_t flush_records = 1024;
 // in a straight line, either overlapped as the owner overlaps them or with
 // each segment write held back until the WAL barrier. The sequential
 // composition exists only here, to measure what the overlap is worth.
-enum class scope : std::uint8_t { candidate, baseline, sequential };
+//
+// Two more compositions store the same segment bytes with one barrier per
+// group instead of two, to measure what each durable place would cost before
+// the append owner is changed to choose one:
+// - segment_placed: no WAL record; a group is acknowledged when its segment
+//   barriers succeed.
+// - wal_placed: a group is acknowledged when its WAL barrier succeeds; its
+//   segment groups are written at once and made durable by one barrier per
+//   segment after the last group, inside the timed region.
+// - wal_held: acknowledged the same way, but its segment groups are frozen
+//   and held unwritten until every group is acknowledged; then they are
+//   written together, gathered as the writer gathers queued groups, and made
+//   durable by one barrier per segment.
+enum class scope : std::uint8_t {
+    candidate,
+    baseline,
+    sequential,
+    segment_placed,
+    wal_placed,
+    wal_held
+};
 const char* scope_name(scope value) noexcept {
     switch (value) {
     case scope::candidate:
@@ -91,6 +97,12 @@ const char* scope_name(scope value) noexcept {
         return "baseline";
     case scope::sequential:
         return "sequential";
+    case scope::segment_placed:
+        return "segment_placed";
+    case scope::wal_placed:
+        return "wal_placed";
+    case scope::wal_held:
+        return "wal_held";
     }
     std::abort();
 }
@@ -168,6 +180,9 @@ codec::decode_budget memory() {
 model::range_routing_epoch routing() {
     return model::range_routing_epoch::make(1).value();
 }
+// The broker time every request is assigned at, as the segment fixture
+// stamps its blocks.
+constexpr runtime::wall_time request_time{1};
 template<std::size_t Octets>
 std::array<char, 2 * Octets + 1>
 hex_digest(std::array<unsigned char, Octets> digest) {
@@ -181,23 +196,31 @@ hex_digest(std::array<unsigned char, Octets> digest) {
 }
 
 // One request: its input until it is offered, a shared copy of its child for
-// the exact-byte check, and where its block was stored.
+// the exact-byte check, where its block was stored and the certified end its
+// block and PREPARE state.
 struct pending final {
     std::uint32_t segment{0};
     std::optional<local_append_request> request;
     std::optional<encoded_assigned_batch> alias;
     std::optional<segment_block_layout> block;
+    std::optional<runtime::file_position> certified;
 };
 struct request_sample final {
     std::uint64_t planned{0}, started{0}, accepted{0}, terminal{0};
 };
 
 struct measurement final {
+    // When the last request was acknowledged, on the timer that measures
+    // `epoch`. A wal_placed run is still syncing its segments after it.
+    std::uint64_t acknowledged{0};
     std::uint64_t epoch{0}, elapsed{0}, cpu{0}, allocations{0}, tasks{0},
       runtime_operations{0};
     std::uint64_t foreground_turns{0}, peak_admission{0};
     std::uint64_t wal_groups{0}, wal_flushes{0}, wal_writes{0}, footers{0},
       blocks{0};
+    // WAL writes durable at completion: a WAL barrier covering only these
+    // issues no flush.
+    std::uint64_t wal_synchronized{0};
     wal_bench_support::reactor_io io;
     codec::testing::allocation_observation memory;
 };
@@ -272,11 +295,35 @@ struct stack final {
     std::vector<local_append_target> targets;
 };
 
+// A segment's workspace for validating a group's children: the contract's,
+// or four times the child from 1 MiB, the ratio the WAL benchmark's 32 MiB
+// gives 8 MiB children.
+byte_count segment_working(const case_shape& selected) {
+    if (selected.payload_bytes >= 4_MiB) return fixture::working_bytes;
+    if (selected.payload_bytes >= 1_MiB) return byte_count{4_MiB};
+    return byte_count{1_MiB};
+}
+
+// The zero-written range a synchronized run's writes fit inside: every child
+// with its envelopes and padding, and every footer, rounded up to whole MiB
+// and capped by the file's limit. It is written and made durable when the
+// file is made, before the timed region, as a recycled file would already be.
+byte_count synchronized_window(
+  const case_shape& selected, std::uint32_t requests, byte_count limit) {
+    const std::uint64_t child = std::max<std::uint64_t>(
+      selected.payload_bytes, 4_KiB);
+    const std::uint64_t wanted = std::uint64_t{requests} * (child + 16_KiB)
+                                 + 1_MiB;
+    const std::uint64_t rounded = (wanted + 1_MiB - 1) / 1_MiB * 1_MiB;
+    return byte_count{std::min(rounded, limit.value())};
+}
+
 seastar::future<> open_stack(
   stack& s,
   const case_shape& selected,
   std::span<fixture::extent_input> inputs,
-  scope chosen) {
+  scope chosen,
+  bool synchronized) {
     s.control = take(
       co_await control_type::open(
         s.files,
@@ -294,6 +341,9 @@ seastar::future<> open_stack(
     auto wal = wal_writer_contract::configuration();
     wal.capacity_bytes = byte_count{128_MiB};
     if (large) wal.children.working_bytes = byte_count{16_MiB};
+    if (synchronized)
+        wal.preallocation_bytes = synchronized_window(
+          selected, selected.requests, wal.capacity_bytes);
     s.writer = take(
       wal_type::make(
         *s.control,
@@ -316,8 +366,12 @@ seastar::future<> open_stack(
         auto config = segment_writer_contract::configuration();
         config.retry_object = local_object_sequence::make(45 + i).value();
         config.policy = s.work.policy();
-        config.admission.working_bytes = large ? fixture::working_bytes
-                                               : byte_count{1_MiB};
+        config.admission.working_bytes = segment_working(selected);
+        if (synchronized)
+            config.preallocation_bytes = synchronized_window(
+              selected,
+              selected.per_segment(),
+              inputs[i].descriptor.maximum_data_bytes);
         s.segments.push_back(take(
           segment_type::make_new(
             s.files,
@@ -325,6 +379,7 @@ seastar::future<> open_stack(
             s.data_spec,
             0,
             inputs[i].descriptor,
+            inputs[i].history.logical_origin,
             s.budget,
             config)));
         auto& created = *s.segments.back();
@@ -337,6 +392,11 @@ seastar::future<> open_stack(
     local_append_config config;
     config.maximum_requests = 128;
     config.policy = s.work.policy();
+    // Every group in the WAL and written at once, as the compositions it is
+    // compared with.
+    config.segment_placement_bytes = byte_count{
+      std::numeric_limits<std::uint64_t>::max()};
+    config.held_run_bytes = byte_count{};
     s.append = take(append_type::make(s.budget, *s.commit, *s.writer, config));
     s.targets.reserve(selected.segments);
     for (auto& segment : s.segments)
@@ -374,6 +434,84 @@ seastar::future<> close_stack(stack& s, runtime::first_failure& failed) {
     s.control.reset();
 }
 
+// A wal_placed run's segment groups written but not yet durable: each
+// segment's newest submitted boundary, and every write still to join. A
+// wal_held run's groups are also kept frozen here, in order, until settled.
+struct deferred_segments final {
+    std::vector<std::optional<segment_captured_boundary>> cuts;
+    std::vector<seastar::future<segment_write_completion>> written;
+    std::vector<std::pair<std::size_t, segment_frozen_group>> held;
+};
+
+// Held groups are submitted first, in the order they were frozen. Then one
+// barrier per segment covers every group written to it since the last, and
+// every write is joined. A failed step still joins what was entered; a held
+// group never submitted is abandoned, which fails its writer.
+// A group published by its WAL barrier is synced in its segment only when
+// asked. The interval asks and holds it, as it holds the compositions' last
+// barriers.
+seastar::future<> settle_owner(append_type& owner) {
+    for (;;) {
+        local_append_test_access::sync_all(owner);
+        bool open = owner.groups() != 0;
+        if (!open)
+            static_cast<void>(
+              take(owner.obligations([&open](const local_obligation& one) {
+                  open = open || one.pending != 0;
+              })));
+        if (!open) co_return;
+        co_await seastar::sleep(std::chrono::microseconds{10});
+    }
+}
+
+seastar::future<> settle_deferred(
+  stack& s,
+  deferred_segments& deferred,
+  std::deque<codec::cooperative_work>& branches) {
+    runtime::first_failure failed;
+    try {
+        for (auto& [f, group] : deferred.held) {
+            auto submission = take(
+              s.segments[f]->submit(std::move(group), branches[f]));
+            deferred.cuts[f].emplace(submission.boundary);
+            deferred.written.push_back(std::move(submission.written));
+        }
+    } catch (...) {
+        failed.observe(std::current_exception());
+    }
+    deferred.held.clear();
+    std::vector<std::optional<seastar::future<segment_barrier_outcome>>>
+      barriers(deferred.cuts.size());
+    for (std::size_t f = 0; f < deferred.cuts.size(); ++f) {
+        if (!deferred.cuts[f]) continue;
+        barriers[f].emplace(s.segments[f]->barrier(*deferred.cuts[f]));
+        deferred.cuts[f].reset();
+    }
+    std::size_t expected = 0, receipts = 0;
+    for (auto& waiting : barriers) {
+        if (!waiting) continue;
+        ++expected;
+        try {
+            const auto outcome = co_await std::move(*waiting);
+            receipts += outcome.receipt.has_value() ? 1 : 0;
+            failed.observe(outcome.failure.outcome());
+        } catch (...) {
+            failed.observe(std::current_exception());
+        }
+    }
+    for (auto& waiting : deferred.written) {
+        try {
+            failed.observe((co_await std::move(waiting)).failure.outcome());
+        } catch (...) {
+            failed.observe(std::current_exception());
+        }
+    }
+    deferred.written.clear();
+    take(failed.outcome());
+    require(
+      receipts == expected, "a deferred segment barrier returned no receipt");
+}
+
 // The calls the local append owner makes for one group, composed in a
 // straight line: validation and aliasing per member, one preparation per
 // segment, the WAL admission, the freeze, the offer at final positions and
@@ -381,12 +519,22 @@ seastar::future<> close_stack(stack& s, runtime::first_failure& failed) {
 // barrier, or after it when sequential; the WAL result and one barrier per
 // segment complete every member. Each segment group has its own work
 // account, as concurrent branches must.
+//
+// segment_placed leaves out the WAL admission, offer and barrier: its members
+// are complete when their segment barriers are. wal_placed leaves the segment
+// barriers to settle_deferred: its members are complete when the WAL barrier
+// is. Both keep the validation and aliasing every path shares.
 seastar::future<> compose_group(
   stack& s,
   std::span<pending> members,
-  bool sequential,
+  scope chosen,
   std::deque<codec::cooperative_work>& branches,
+  deferred_segments& deferred,
   measurement& observed) {
+    const bool sequential = chosen == scope::sequential;
+    const bool logged = chosen != scope::segment_placed;
+    const bool held = chosen == scope::wal_held;
+    const bool synced = chosen != scope::wal_placed && !held;
     const auto count = members.size();
     const auto segments = s.segments.size();
     std::vector<wal_prepared_children> prepared;
@@ -422,6 +570,7 @@ seastar::future<> compose_group(
               admitted_wal_batch::make(
                 std::move(request.batch),
                 std::move(request.backing),
+                request.append_time,
                 s.writer->child_limits().charge));
             prepared.push_back(take(
               co_await prepare_wal_children(
@@ -450,19 +599,26 @@ seastar::future<> compose_group(
               "a composed group does not fit its segment");
             preparations[f].emplace(std::move(*plan.prepared));
         }
-        std::array<wal_admission_member, maximum_wal_group_members> admission{};
-        for (std::size_t i = 0; i < count; ++i)
-            admission[i] = {&prepared[i].wal.batch(), &prepared[i].expected};
-        auto admitted = take(s.commit->template admit<clock>(
-          *s.writer,
-          std::span{admission}.first(count),
-          s.work.policy(),
-          clock::now()));
-        require(
-          admitted.admission.has_value(),
-          "the WAL did not admit a composed group");
-        auto offer = take(
-          wal_group::make(s.budget, static_cast<std::uint32_t>(count)));
+        std::optional<wal_commit_admission> admitted;
+        std::optional<wal_group> offer;
+        if (logged) {
+            std::array<wal_admission_member, maximum_wal_group_members>
+              admission{};
+            for (std::size_t i = 0; i < count; ++i)
+                admission[i] = {
+                  &prepared[i].wal.batch(), &prepared[i].expected};
+            auto outcome = take(s.commit->template admit<clock>(
+              *s.writer,
+              std::span{admission}.first(count),
+              s.work.policy(),
+              clock::now()));
+            require(
+              outcome.admission.has_value(),
+              "the WAL did not admit a composed group");
+            admitted.emplace(std::move(*outcome.admission));
+            offer.emplace(take(
+              wal_group::make(s.budget, static_cast<std::uint32_t>(count))));
+        }
         observed.peak_admission = std::max(
           observed.peak_admission, s.budget.snapshot().bytes);
         for (std::size_t f = 0; f < segments; ++f) {
@@ -481,6 +637,7 @@ seastar::future<> compose_group(
                 if (members[i].segment != f) continue;
                 const auto& block = layout.blocks()[k++];
                 members[i].block.emplace(block);
+                members[i].certified = layout.certified_end();
                 prepared[i].expected.target
                   = segment_write_context::make(
                       history.segment,
@@ -492,16 +649,19 @@ seastar::future<> compose_group(
             encoded[f].emplace(
               s.segments[f]->encode_group(*frozen[f], branches[f]));
         }
-        for (std::size_t i = 0; i < count; ++i)
-            take(
-              offer.append(std::move(prepared[i].wal), prepared[i].expected));
-        auto ticket = take(
-          co_await s.commit->template submit<clock>(
-            *s.writer,
-            std::move(offer),
-            std::move(*admitted.admission),
-            s.work));
-        wal_result.emplace(take(ticket.observe()));
+        if (logged) {
+            for (std::size_t i = 0; i < count; ++i)
+                take(offer->append(
+                  std::move(prepared[i].wal),
+                  prepared[i].expected,
+                  *members[i].certified));
+            auto ticket = take(
+              co_await s.commit->template submit<clock>(
+                *s.writer, std::move(*offer), std::move(*admitted), s.work));
+            offer.reset();
+            admitted.reset();
+            wal_result.emplace(take(ticket.observe()));
+        }
         std::optional<wal_commit_result> wal;
         if (sequential) {
             auto waiting = std::move(*wal_result);
@@ -513,15 +673,27 @@ seastar::future<> compose_group(
             auto waiting = std::move(*encoded[f]);
             encoded[f].reset();
             take(co_await std::move(waiting));
+            if (held) {
+                deferred.held.emplace_back(f, std::move(*frozen[f]));
+                frozen[f].reset();
+                continue;
+            }
             submitted[f].emplace(
               take(s.segments[f]->submit(std::move(*frozen[f]), branches[f])));
             frozen[f].reset();
         }
-        for (std::size_t f = 0; f < segments; ++f)
-            if (submitted[f])
+        for (std::size_t f = 0; f < segments; ++f) {
+            if (!submitted[f]) continue;
+            if (synced) {
                 barriers[f].emplace(
                   s.segments[f]->barrier(submitted[f]->boundary));
-        if (!sequential) {
+                continue;
+            }
+            deferred.cuts[f].emplace(submitted[f]->boundary);
+            deferred.written.push_back(std::move(submitted[f]->written));
+            submitted[f].reset();
+        }
+        if (logged && !sequential) {
             auto waiting = std::move(*wal_result);
             wal_result.reset();
             wal.emplace(co_await std::move(waiting));
@@ -536,10 +708,13 @@ seastar::future<> compose_group(
               outcome.receipt.has_value(),
               "a composed segment barrier returned no receipt");
         }
-        take(wal->failure().outcome());
-        require(
-          wal->receipt().has_value(),
-          "a composed WAL barrier returned no receipt");
+        if (logged) {
+            take(wal->failure().outcome());
+            require(
+              wal->receipt().has_value(),
+              "a composed WAL barrier returned no receipt");
+        }
+        observed.acknowledged = measurement_time();
     } catch (...) {
         failed.observe(std::current_exception());
     }
@@ -601,8 +776,28 @@ std::vector<std::uint32_t> fixed_cuts(const case_shape& selected) {
     return std::vector<std::uint32_t>(selected.per_segment(), 1);
 }
 
-// The data file holds exactly the expected extent: the fixture's own for a
-// fixed cut, otherwise the same children encoded under the cut that formed.
+// A little-endian field of `count` bytes stored at `at`.
+template<typename File>
+seastar::future<std::uint64_t>
+stored_field(File& file, std::uint64_t at, std::uint64_t count) {
+    auto read = take(
+      co_await file.read(runtime::file_position{at}, byte_count{count}));
+    require(read.data().size().value() == count, "a stored field was short");
+    std::uint64_t value = 0, shift = 0;
+    for (auto part : read.data())
+        for (std::size_t i = 0; i < part.size(); ++i, shift += 8)
+            value |= std::uint64_t{static_cast<unsigned char>(part.data()[i])}
+                     << shift;
+    co_return value;
+}
+
+// The data file holds exactly the expected extent: the children encoded
+// under the cut that formed, which for a fixed case is the fixed one. Each
+// block states where its file's certified prefix ended when its group
+// formed, which depends on which barriers had completed then: the stamp is
+// read back and held to its rule (on a boundary between the data start and
+// the block, never decreasing, and the one its PREPARE states), and every
+// other byte is compared exactly.
 seastar::future<std::array<char, 33>> verify_data(
   stack& s,
   const case_shape& selected,
@@ -611,26 +806,12 @@ seastar::future<std::array<char, 33>> verify_data(
   std::span<pending> members,
   codec::cooperative_work& work) {
     const auto cuts = cuts_of(members, segment);
-    std::optional<verified_extent> proof;
-    if (selected.fixed()) {
+    if (selected.fixed())
         require(
           cuts == fixed_cuts(selected),
           "the stored group cut differs from the fixed equal-work cut");
-        proof.emplace(*input.proof);
-    } else {
-        std::vector<encoded_assigned_batch> children;
-        for (auto& member : members)
-            if (member.segment == segment)
-                children.push_back(
-                  (co_await member.alias->share(memory(), work)).value());
-        proof.emplace(
-          co_await fixture::encode_cut_extent(input, children, cuts, work));
-    }
-    const auto begin = input.history.data_start.value();
-    const auto end = proof->boundary().coverage.bytes().end().value();
-    require(
-      s.segments[segment]->progress()->durable.bytes.value() == end,
-      "the durable segment end differs from the expected extent");
+    const auto& history = input.history;
+    const auto begin = history.data_start.value();
     const auto path = take(take(local_paths::make(s.data_spec.root))
                              .segment_file(
                                0,
@@ -639,8 +820,34 @@ seastar::future<std::array<char, 33>> verify_data(
                                local_segment_file::data));
     auto file = take(co_await s.files.open(path, {}));
     runtime::first_failure checked;
+    std::optional<verified_extent> proof;
     codec::xxh3_128_hasher actual;
     try {
+        std::vector<encoded_assigned_batch> children;
+        std::vector<runtime::file_position> certified;
+        auto floor = history.data_start;
+        for (auto& member : members) {
+            if (member.segment != segment) continue;
+            children.push_back(
+              (co_await member.alias->share(memory(), work)).value());
+            const auto at = member.block->records.bytes().begin();
+            const runtime::file_position stamp{
+              co_await stored_field(file, at.value() + 32 + 128, 8)};
+            require(
+              floor <= stamp && stamp <= at && history.alignment.aligned(stamp)
+                && (!member.certified || *member.certified == stamp),
+              "a block's certified end is off its boundary, past its block, "
+              "decreasing, or not the one its PREPARE states");
+            certified.push_back(stamp);
+            floor = stamp;
+        }
+        proof.emplace(
+          co_await fixture::encode_cut_extent(
+            input, children, cuts, certified, work));
+        const auto end = proof->boundary().coverage.bytes().end().value();
+        require(
+          s.segments[segment]->progress()->durable.bytes.value() == end,
+          "the durable segment end differs from the expected extent");
         for (auto position = begin; position != end;) {
             auto read = take(
               co_await file.read(
@@ -669,7 +876,8 @@ seastar::future<std::array<char, 33>> verify_data(
 }
 
 // The WAL holds each request's exact PREPARE, in call order, naming the
-// block it was stored as, and nothing after them.
+// block it was stored as, and nothing after them. Members of one group lie
+// back to back and the last ends the write.
 seastar::future<std::array<char, 33>> verify_wal(
   stack& s,
   const local_wal_cursor& start,
@@ -687,29 +895,57 @@ seastar::future<std::array<char, 33>> verify_wal(
               = take(s.segments[member.segment]->capture()).history();
             const auto& block = *member.block;
             auto alias = (co_await member.alias->share(memory(), work)).value();
-            auto encoded
-              = (co_await encode_wal_prepare(
-                   std::move(alias),
-                   {wal_write_context::make(
-                      start.incarnation(),
-                      alignment(8192),
-                      runtime::file_position{position})
-                      .value(),
-                    segment_write_context::make(
-                      history.segment,
-                      history.alignment,
-                      block.records.physical().begin(),
-                      block.records.bytes().begin())
-                      .value(),
-                    history.data_start,
-                    routing(),
-                    {history.segment.topic(), history.segment.range()},
-                    s.writer->profile(),
-                    history.profile},
-                   work,
-                   byte_count{32_MiB},
-                   charge))
-                  .value();
+            // The run starts on a WAL file nothing was written to, so the
+            // start is where its header ends.
+            const wal_prepare_expectation expected{
+              wal_write_context::make(
+                start.incarnation(),
+                alignment(8192),
+                runtime::file_position{position})
+                .value(),
+              start.position(),
+              segment_write_context::make(
+                history.segment,
+                history.alignment,
+                block.records.physical().begin(),
+                block.records.bytes().begin())
+                .value(),
+              history.data_start,
+              routing(),
+              {history.segment.topic(), history.segment.range()},
+              s.writer->profile(),
+              history.profile};
+            // Whether it ends its write, and where each file's certified
+            // prefix ended when its group formed, depend on how groups
+            // formed and which barriers had completed: they are read back
+            // and held to their rules, and every other byte is compared
+            // exactly. Its block must state the same target stamp.
+            const bool ends = co_await stored_field(
+                                file, position + 32 + 126, 2)
+                              != 0;
+            const runtime::file_position target{
+              co_await stored_field(file, position + 32 + 144, 8)};
+            const runtime::file_position certified{
+              co_await stored_field(file, position + 32 + 152, 8)};
+            require(
+              history.data_start <= target
+                && target <= block.records.bytes().begin()
+                && history.alignment.aligned(target)
+                && (!member.certified || *member.certified == target)
+                && start.position() <= certified
+                && certified.value() <= position
+                && certified.value() % 8192 == 0,
+              "a PREPARE's certified ends are off their boundaries or past "
+              "what they may claim");
+            member.certified = target;
+            auto encoded = (co_await encode_wal_prepare(
+                              std::move(alias),
+                              expected,
+                              {ends, request_time, target, certified},
+                              work,
+                              byte_count{32_MiB},
+                              charge))
+                             .value();
             for (auto part : encoded)
                 expected_hash.update(part.data(), part.size());
             std::uint64_t offset = 0;
@@ -756,7 +992,16 @@ struct native_settings final {
     // the same values exactly.
     bool zero_timestamps{false};
     bool memory{false}, foreground{false};
+    // Both files zero-written before the timed region, so writes inside them
+    // overwrite and small ones go through a synchronized handle.
+    bool synchronized{false};
 };
+
+wal_bench_support::barrier_kind
+barrier_of(const native_settings& settings) noexcept {
+    return settings.synchronized ? wal_bench_support::barrier_kind::synchronized
+                                 : wal_bench_support::barrier_kind::extending;
+}
 
 // Only the observing build reports native work.
 [[maybe_unused]] void
@@ -766,7 +1011,8 @@ print_kind(const char* name, const kind_sample& sample, std::uint64_t epoch) {
       ",\"flushes\":%" PRIu64 ",\"depth\":%" PRIu64 ",\"flush_depth\":%" PRIu64
       ",\"write_service_ns\":%" PRIu64 ",\"write_busy_ns\":%" PRIu64
       ",\"flush_service_ns\":%" PRIu64 ",\"cap_waits\":%" PRIu64
-      ",\"cap_wait_ns\":%" PRIu64 ",\"flush_times_complete\":%s"
+      ",\"cap_wait_ns\":%" PRIu64 ",\"synchronized_calls\":%" PRIu64
+      ",\"flush_times_complete\":%s"
       ",\"flush_times\":[",
       name,
       sample.calls,
@@ -779,6 +1025,7 @@ print_kind(const char* name, const kind_sample& sample, std::uint64_t epoch) {
       sample.flush_service_ns,
       sample.cap_waits,
       sample.cap_wait_ns,
+      sample.synchronized_calls,
       sample.flush_times_overflowed ? "false" : "true");
     for (std::size_t i = 0; i < sample.flushes_recorded; ++i)
         std::printf(
@@ -831,6 +1078,9 @@ void print_measurement(
     number("data_device", data_device);
     number("child_bytes", child_bytes);
     number("elapsed_ns", value.elapsed);
+    number(
+      "ack_ns",
+      value.acknowledged ? value.acknowledged - value.epoch : value.elapsed);
     number("reactor_cpu_ns", value.cpu);
     number("allocations", value.allocations);
     number("tasks", value.tasks);
@@ -843,14 +1093,14 @@ void print_measurement(
     number("wal_writes", value.wal_writes);
     number("footers", value.footers);
     number("blocks", value.blocks);
-    // Neither file is preallocated here: each barrier follows writes that
-    // grew its file.
+    // Without synchronized writes neither file is preallocated: each barrier
+    // follows writes that grew its file. With them both files are
+    // zero-written, and small writes inside need no flush.
     std::printf(
       ",\"wal_barrier\":\"%s\",\"data_barrier\":\"%s\"",
-      wal_bench_support::barrier_name(
-        wal_bench_support::barrier_kind::extending),
-      wal_bench_support::barrier_name(
-        wal_bench_support::barrier_kind::extending));
+      wal_bench_support::barrier_name(barrier_of(settings)),
+      wal_bench_support::barrier_name(barrier_of(settings)));
+    number("wal_synchronized_writes", value.wal_synchronized);
     number("reactor_flushes", value.io.flushes);
     number("reactor_writes", value.io.writes);
     number("reactor_write_bytes", value.io.write_bytes);
@@ -959,9 +1209,14 @@ struct local_storage_bench {
                           != nullptr;
         settings.foreground
           = std::getenv("KWAQUE_LOCAL_APPEND_FOREGROUND_PROBE") != nullptr;
+        settings.synchronized = std::getenv("KWAQUE_LOCAL_APPEND_SYNCHRONIZED")
+                                != nullptr;
         require(
           !settings.memory || !timing_only,
           "native observation requires local_storage_bench");
+        require(
+          !settings.synchronized || !timing_only,
+          "synchronized writes are counted only by local_storage_bench");
         require(
           !settings.fixture || (selected.segments == 1 && selected.fixed()),
           "fixture export requires one segment and a fixed group cut");
@@ -1068,14 +1323,20 @@ private:
         // metadata workspace, about 8 MiB, for its lifetime. It also keeps its
         // creation publications and two prepared publishers, so it takes the
         // segment benchmark's 16 handles per owner. The WAL owners take the
-        // WAL benchmark's 32.
+        // WAL benchmark's 32. Each request's backing, and each segment's
+        // workspace for validating a group, are charged on top. The whole
+        // must stay within the foreground class's share of the reactor's
+        // memory: about 282 MiB at the smoke test's 1 GiB.
         const std::uint64_t owners = selected.segments;
         workload_budget budget{
           manager.acquire_workload(
             resource::workload_class::foreground_protocol),
           {.tasks = 1024,
            .bytes
-           = byte_count{std::max<std::uint64_t>(96, 32 + 8 * owners) << 20U},
+           = byte_count{(std::max<std::uint64_t>(96, 32 + 8 * owners) << 20U)
+                        + std::uint64_t{selected.requests}
+                            * selected.payload_bytes
+                        + owners * segment_working(selected).value()},
            .handles = static_cast<std::uint32_t>(32 + 16 * owners)},
           charge};
         auto shape = data_shape(selected);
@@ -1124,6 +1385,7 @@ private:
                 std::move(backing),
                 {history.segment.topic(), history.segment.range()},
                 routing(),
+                request_time,
                 std::nullopt});
         }
 
@@ -1142,17 +1404,22 @@ private:
             }
         };
         std::optional<seastar::semaphore_units<>> hold;
+        deferred_segments deferred;
         // Requests in flight together never share a work account: each has
         // its own, made before any interval and kept until the owners close.
         std::deque<codec::cooperative_work> accounts;
         try {
-            co_await open_stack(s, selected, inputs, chosen);
+            co_await open_stack(
+              s, selected, inputs, chosen, settings.synchronized);
             if (chosen == scope::candidate)
                 for (std::uint32_t i = 0; i < selected.requests; ++i)
                     accounts.emplace_back(work.policy(), abort);
             std::deque<codec::cooperative_work> branches;
             for (std::uint32_t f = 0; f < selected.segments; ++f)
                 branches.emplace_back(work.policy(), abort);
+            deferred.cuts.resize(selected.segments);
+            deferred.written.reserve(selected.requests + selected.segments);
+            deferred.held.reserve(selected.requests + selected.segments);
             const auto start = take(s.writer->positions()).reserved;
             const auto wal_before = s.writer->statistics();
             std::vector<std::uint64_t> footers_before;
@@ -1167,24 +1434,25 @@ private:
             result.peak_admission = budget.snapshot().bytes;
             {
                 measure_scope interval{files, result, settings.memory};
-                if (chosen == scope::candidate)
+                if (chosen == scope::candidate) {
                     co_await run_candidate(
                       s, selected, members, accounts, samples, hold, result);
-                else if (selected.profile == arrival::held)
+                    result.acknowledged = measurement_time();
+                    co_await settle_owner(*s.append);
+                } else if (selected.profile == arrival::held)
                     co_await compose_group(
-                      s,
-                      members,
-                      chosen == scope::sequential,
-                      branches,
-                      result);
+                      s, members, chosen, branches, deferred, result);
                 else
                     for (std::uint32_t i = 0; i < selected.requests; ++i)
                         co_await compose_group(
                           s,
                           std::span{members}.subspan(i, 1),
-                          chosen == scope::sequential,
+                          chosen,
                           branches,
+                          deferred,
                           result);
+                if (chosen == scope::wal_placed || chosen == scope::wal_held)
+                    co_await settle_deferred(s, deferred, branches);
                 require(
                   files.sample.active() == 0,
                   "timing stopped with native writes or flushes in flight");
@@ -1195,11 +1463,20 @@ private:
                                 - wal_before.accepted_groups;
             result.wal_flushes = wal_after.flush_calls - wal_before.flush_calls;
             result.wal_writes = wal_after.write_calls - wal_before.write_calls;
+            result.wal_synchronized = wal_after.synchronized_writes
+                                      - wal_before.synchronized_writes;
             // Each barrier claimed reached the device: the shard issued at
-            // least the WAL's own flushes.
+            // least the WAL's own flushes, and a synchronized run completed
+            // synchronized writes as well, or flushed where it could not.
+            std::uint64_t synchronized_writes = result.wal_synchronized;
+            if constexpr (!timing_only)
+                synchronized_writes
+                  += files.sample[file_kind::data].synchronized_calls;
             require(
               wal_bench_support::barrier_evident(
-                wal_bench_support::barrier_kind::extending, result.io, 0)
+                barrier_of(settings),
+                result.io,
+                result.io.flushes + synchronized_writes)
                 && result.io.flushes >= result.wal_flushes,
               "claimed barrier reached no device");
             for (std::size_t f = 0; f < s.segments.size(); ++f) {
@@ -1213,9 +1490,17 @@ private:
             if (selected.fixed())
                 require(
                   result.wal_groups
-                    == (selected.profile == arrival::held ? 1 : selected.requests),
+                    == (chosen == scope::segment_placed ? 0
+                        : selected.profile == arrival::held
+                          ? 1
+                          : selected.requests),
                   "the WAL group count differs from the fixed cut");
-            digests.wal = co_await verify_wal(s, start, members, work);
+            digests.wal = co_await verify_wal(
+              s,
+              start,
+              chosen == scope::segment_placed ? std::span<pending>{}
+                                              : std::span<pending>{members},
+              work);
             for (std::uint32_t f = 0; f < selected.segments; ++f)
                 digests.segments.push_back(
                   co_await verify_data(
@@ -1224,6 +1509,18 @@ private:
             execution.observe(std::current_exception());
         }
         hold.reset();
+        // A failed run abandons the groups it still held, then joins every
+        // deferred write it entered.
+        deferred.held.clear();
+        for (auto& waiting : deferred.written) {
+            try {
+                execution.observe(
+                  (co_await std::move(waiting)).failure.outcome());
+            } catch (...) {
+                execution.observe(std::current_exception());
+            }
+        }
+        deferred.written.clear();
         stop_foreground = true;
         if (foreground_work) {
             try {
@@ -1447,6 +1744,65 @@ LOCAL_PAIR(many_segments, .requests = 32, .segments = 8)
 // segment owners need more memory than the paired driver's fixed profile.
 LOCAL_PAIR(wide_segments, .requests = 48, .segments = 24)
 #undef LOCAL_PAIR
+
+struct two_barrier_placement : local_storage_bench {};
+struct segment_placement : local_storage_bench {};
+struct wal_placement : local_storage_bench {};
+struct wal_held_placement : local_storage_bench {};
+
+// One barrier per group against today's two, on one fixed cut: the same
+// segment bytes stored by today's composition, with no WAL record, or
+// acknowledged on the WAL with the segment barriers left to the end, the
+// segment writes either issued at once or held until every group is
+// acknowledged. A held
+// case is one group across every segment; a serial case is one request a
+// group. A child of `payload_bytes` carries about 1 KiB less record value.
+// The widest cases are as wide as the budget's share of the smoke test's
+// 1 GiB allows: 24 segments, or 16 with 1 MiB children.
+#define LOCAL_PLACEMENT(Name, ...)                                             \
+    PERF_TEST_F(two_barrier_placement, Name) {                                 \
+        return run_case(LOCAL_CASE(Name, __VA_ARGS__), scope::baseline);       \
+    }                                                                          \
+    PERF_TEST_F(segment_placement, Name) {                                     \
+        return run_case(LOCAL_CASE(Name, __VA_ARGS__), scope::segment_placed); \
+    }                                                                          \
+    PERF_TEST_F(wal_placement, Name) {                                         \
+        return run_case(LOCAL_CASE(Name, __VA_ARGS__), scope::wal_placed);     \
+    }                                                                          \
+    PERF_TEST_F(wal_held_placement, Name) {                                    \
+        return run_case(LOCAL_CASE(Name, __VA_ARGS__), scope::wal_held);       \
+    }
+LOCAL_PLACEMENT(small_one, .payload_bytes = 2_KiB, .requests = 64)
+LOCAL_PLACEMENT(
+  small_eight, .payload_bytes = 2_KiB, .requests = 64, .segments = 8)
+LOCAL_PLACEMENT(
+  small_wide, .payload_bytes = 2_KiB, .requests = 48, .segments = 24)
+LOCAL_PLACEMENT(medium_one, .payload_bytes = 16_KiB, .requests = 64)
+LOCAL_PLACEMENT(
+  medium_eight, .payload_bytes = 16_KiB, .requests = 64, .segments = 8)
+LOCAL_PLACEMENT(
+  medium_wide, .payload_bytes = 16_KiB, .requests = 48, .segments = 24)
+LOCAL_PLACEMENT(large_one, .payload_bytes = 1_MiB, .requests = 8)
+LOCAL_PLACEMENT(
+  large_eight, .payload_bytes = 1_MiB, .requests = 8, .segments = 8)
+LOCAL_PLACEMENT(
+  large_wide, .payload_bytes = 1_MiB, .requests = 16, .segments = 16)
+LOCAL_PLACEMENT(
+  small_serial,
+  .payload_bytes = 2_KiB,
+  .requests = 32,
+  .profile = arrival::serial)
+LOCAL_PLACEMENT(
+  medium_serial,
+  .payload_bytes = 16_KiB,
+  .requests = 32,
+  .profile = arrival::serial)
+LOCAL_PLACEMENT(
+  large_serial,
+  .payload_bytes = 1_MiB,
+  .requests = 8,
+  .profile = arrival::serial)
+#undef LOCAL_PLACEMENT
 
 // Arrival-to-result latency of the owner, without and with the WAL group
 // commit's 1-ms batching window.

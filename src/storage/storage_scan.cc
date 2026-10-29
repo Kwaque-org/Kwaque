@@ -144,6 +144,16 @@ seastar::future<runtime::result<void>> scan_reader::fill(
         broken_ = false;
         buffered_end_ = runtime::file_position{
           pending.at.value() + pending.length.value()};
+        // Bytes before the cursor are never examined again: a skip over
+        // many windows keeps no more of them than one read does.
+        if (buffered_begin_ < cursor_) {
+            const auto through = std::min(cursor_, buffered_end_);
+            if (!buffered_.trim_front(
+                  byte_count{through.value() - buffered_begin_.value()}))
+                co_return runtime::failure(
+                  path_error(errc::invariant_violation));
+            buffered_begin_ = through;
+        }
         issue();
         if (auto ready = work.poll(); !ready)
             co_return runtime::failure(path_error(ready.error().code()));
@@ -275,6 +285,20 @@ runtime::result<void> scan_reader::advance() {
     buffered_begin_ = cursor_;
     current_.reset();
     object_reservation_.reset();
+    return {};
+}
+
+runtime::result<void> scan_reader::skip_to(runtime::file_position at) {
+    if (closed_ || at < cursor_ || at > end_)
+        return runtime::failure(path_error(errc::invalid_argument));
+    current_.reset();
+    object_reservation_.reset();
+    cursor_ = at;
+    const auto through = std::min(cursor_, buffered_end_);
+    if (!buffered_.trim_front(
+          byte_count{through.value() - buffered_begin_.value()}))
+        return runtime::failure(path_error(errc::invariant_violation));
+    buffered_begin_ = through;
     return {};
 }
 

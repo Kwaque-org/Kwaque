@@ -5,7 +5,6 @@
 #include "src/codec/integer.h"
 #include "src/codec/transaction.h"
 #include "src/runtime/time.h"
-#include "src/storage/completed_retry.h"
 #include "src/storage/local_metadata_layout.h"
 #include "src/storage/local_types.h"
 
@@ -113,18 +112,24 @@ struct local_wal_descriptor final {
     byte_count capacity_bytes;
     bool operator==(const local_wal_descriptor&) const = default;
 };
+// Fixed when the segment is created. Where it starts in its range is not:
+// its owner's activation record names that origin.
 struct local_segment_descriptor final {
     segment_context segment;
-    model::range_logical_end logical_origin;
     model::segment_relative_end physical_origin;
     storage_alignment alignment;
     storage_profile profile;
     std::uint16_t record_profile;
     local_layout_kind layout;
+    // Completed-retry facts kept per producer stream, 1 to 32.
+    std::uint8_t retry_depth;
     byte_count maximum_data_bytes;
     runtime::monotonic_duration maximum_lifetime;
     bool operator==(const local_segment_descriptor&) const = default;
 };
+inline constexpr std::uint8_t maximum_retry_depth = 32;
+// What a segment's owner gives a new segment unless it chooses otherwise.
+inline constexpr std::uint8_t default_retry_depth = 8;
 struct local_object_publication final {
     segment_context segment;
     local_object_state state;
@@ -209,21 +214,6 @@ struct local_boundary_evidence final {
                && retry == other.retry;
     }
 };
-struct local_completed_retry_root final {
-    segment_context segment;
-    local_footer_reference footer;
-    std::uint32_t retry_count;
-    std::vector<page_ref> pages;
-    bool operator==(const local_completed_retry_root&) const = default;
-};
-struct local_completed_retry_page final {
-    segment_context segment;
-    local_object_sequence sequence;
-    page_ordinal ordinal;
-    std::uint32_t first_entry;
-    std::vector<completed_retry> entries;
-    bool operator==(const local_completed_retry_page&) const = default;
-};
 using local_metadata_payload = std::variant<
   local_store_identity,
   local_shard_control,
@@ -234,9 +224,7 @@ using local_metadata_payload = std::variant<
   local_checkpoint_page,
   local_deletion_intent,
   local_recovery_decision,
-  local_boundary_evidence,
-  local_completed_retry_root,
-  local_completed_retry_page>;
+  local_boundary_evidence>;
 
 // Expected context comes from configuration/path/publication, never copied
 // from the input being authenticated. Pinned roots/pages/evidence and WAL
@@ -249,12 +237,9 @@ struct local_metadata_expectation final {
     std::optional<storage_alignment> segment_alignment;
     std::optional<model::wal_incarnation_id> wal_incarnation;
     std::optional<device_store_id> data_device;
-    // Required when boundary evidence references another device.
-    std::optional<storage_alignment> data_metadata_alignment;
     std::optional<codec::immutable_object_digest> digest;
     std::optional<byte_count> encoded_bytes;
     std::optional<page_ref> page;
-    std::optional<model::batch_id> previous_retry;
     // The last entry of the page before a checkpoint page.
     std::optional<local_checkpoint_entry> previous_checkpoint;
 };
@@ -317,8 +302,6 @@ struct local_metadata_encoding final {
     storage_alignment alignment;
     // Required for SC-bearing records; independent of metadata alignment.
     std::optional<storage_alignment> segment_alignment;
-    // Boundary evidence can reside on a different metadata device.
-    std::optional<storage_alignment> data_metadata_alignment;
 };
 
 // Inputs/work stay alive, unmoved and exclusive until joined completion.

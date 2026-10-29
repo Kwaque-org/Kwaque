@@ -160,6 +160,7 @@ kwaque_cc_seastar_gtest(
     deps = [
         "//src/base",
         "//src/base:error",
+        "//src/bytes:allocation_test_profile",
         "//src/bytes:fragmented_buffer",
         "//src/bytes:fragmented_buffer_parser",
         "//src/codec:cooperative",
@@ -167,6 +168,7 @@ kwaque_cc_seastar_gtest(
         "//src/codec:error",
         "//src/codec:integer",
         "//src/codec:limits",
+        "//src/compression",
         "//src/model:batch",
         "//src/model:batch_builder",
         "//src/model:batch_codec",

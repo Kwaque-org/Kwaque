@@ -42,6 +42,9 @@ template<
 class segment_writer;
 
 inline constexpr std::uint32_t maximum_segment_group_blocks = 64;
+// The most a run of held groups may hold before it is written: its copies
+// then take at most half of one write's fragments.
+inline constexpr byte_count maximum_segment_hold_bytes{8_MiB};
 
 enum class segment_handle_state : std::uint8_t {
     closed,
@@ -58,8 +61,11 @@ struct segment_writer_position final {
     std::uint32_t blocks{0}, footers{0}, retry_entries{0};
     bool operator==(const segment_writer_position&) const noexcept = default;
 };
+// reported is the end of what the append owner published as durable in at
+// least one place, its WAL included: never past reserved, and possibly past
+// written while its groups are held.
 struct segment_writer_positions final {
-    segment_writer_position reserved, written, durable;
+    segment_writer_position reserved, written, durable, reported;
 };
 
 // What a reader of a segment that is still written is given: the right to
@@ -68,10 +74,13 @@ struct segment_writer_positions final {
 // snapshot, which later appends do not move. Bytes below it never change,
 // so they are read without their writer and stay readable when the segment
 // is sealed. A reader that wants what was appended since asks again.
+// `written` is where its bytes in the file ended then, and `reported` where
+// what its owner published ended, as far as the groups made then reach:
+// the bytes between the two are only in the writer's memory and its WAL.
 struct segment_data_view final {
     segment_data_pin pin;
     segment_history_context history;
-    runtime::file_position durable;
+    runtime::file_position durable, written, reported;
 };
 
 // Captured by one owner, not constructible from caller-selected coordinates.
@@ -158,21 +167,22 @@ struct segment_block_layout final {
     aligned_envelope_layout envelope;
 };
 // Follows a segment's blocks, on the owner's shard, for state derived from
-// them. Neither call may throw and neither can fail the segment: nothing a
-// caller derives here is part of an append's result. Both run inside the
-// owner's own steps and must not call back into it.
+// them. No call may throw and none can fail the segment: nothing a caller
+// derives here is part of an append's result. All run inside the owner's
+// own steps and must not call back into it.
 struct segment_block_observer final {
-    // The blocks of one written group, in file order. Their bytes are in the
-    // file and may not be durable yet. Borrowed for the call.
+    // The blocks of one group, in file order, once its bytes are final: they
+    // may still be held for a later write, and may not be durable. Borrowed
+    // for the call.
     seastar::noncopyable_function<void(
       std::span<const segment_block_layout>) noexcept>
-      written;
+      blocks;
     // Every block that begins below this position is durable.
     seastar::noncopyable_function<void(runtime::file_position) noexcept>
       durable;
-    // The bytes of the group `written` was just told of, its blocks and the
-    // footer after them as they lie in the file from the position given, for
-    // whoever keeps what was just written for those reading behind the
+    // The bytes of the group `blocks` was just told of, its blocks and the
+    // footer after them if it has one, as they will lie in the file from the
+    // position given, for whoever keeps them for those reading behind the
     // writer. Called only while `*wanted` is true, which costs a segment
     // nobody reads one branch. The bytes are borrowed for the call and may
     // be shared: nothing here waits, copies or fails. The reservation is
@@ -184,6 +194,18 @@ struct segment_block_observer final {
       const workload_reservation&) noexcept>
       fed{};
     const bool* wanted{nullptr};
+    // Every byte below this position is in the file. Optional.
+    seastar::noncopyable_function<void(runtime::file_position) noexcept>
+      written{};
+    // The owner published everything below this position as durable in at
+    // least one place, and every group below it is made: its bytes are in
+    // the file or in the writer's memory. Optional.
+    seastar::noncopyable_function<void(runtime::file_position) noexcept>
+      reported{};
+    // Before a group of this many blocks freezes: admits what keeping them
+    // will take, inside the group's own admission. A refusal refuses the
+    // group. Optional.
+    seastar::noncopyable_function<runtime::result<void>(std::uint32_t)> admit{};
 };
 // The eventual frozen handoff binds all blocks and the footer to one captured
 // owner. A prospective capacity check does not mint this value.
@@ -202,6 +224,12 @@ public:
         return blocks_;
     }
     std::span<const segment_block_layout> blocks() const&& = delete;
+    // Where the segment's durable bytes ended when the group froze: the end
+    // of the newest barrier's cut, or the data start. Each of its blocks
+    // carries it, and so does each PREPARE made for them.
+    [[nodiscard]] runtime::file_position certified_end() const noexcept {
+        return certified_end_;
+    }
 
 private:
     friend class detail::segment_write_descriptor;
@@ -213,13 +241,16 @@ private:
     segment_group_layout(
       segment_captured_boundary boundary,
       std::vector<segment_block_layout> blocks,
+      runtime::file_position certified_end,
       workload_reservation held)
       : held_(std::move(held))
       , boundary_(std::move(boundary))
-      , blocks_(std::move(blocks)) {}
+      , blocks_(std::move(blocks))
+      , certified_end_(certified_end) {}
     workload_reservation held_;
     segment_captured_boundary boundary_;
     std::vector<segment_block_layout> blocks_;
+    runtime::file_position certified_end_;
 };
 
 struct segment_admission_limits final {
@@ -245,8 +276,8 @@ enum class segment_roll_reason : std::uint8_t {
     size,
     // Its blocks, footers or records are as many as a segment holds.
     count,
-    // Its completed-retry facts are as many as its seal can publish, or as
-    // its budget holds beside the group.
+    // Its seal can publish no more completed-retry entries, or it holds as
+    // many streams as its retry depth allows.
     retry_state,
     // Its lifetime ended.
     age,
@@ -298,9 +329,13 @@ struct segment_left final {
     // of exactly this size is taken, and one byte more is not; a group of
     // more blocks may find less, since the root grows with their facts.
     byte_count bytes;
-    // Blocks it may still take, by its counts and its completed-retry
-    // facts; none when it has no byte for one.
+    // Blocks it may still take, by its counts; none when it has no byte for
+    // one.
     std::uint32_t blocks{0};
+    // Completed-retry entries its seal can still publish. A batch takes one
+    // while its stream holds fewer than the retry depth, so a stream that
+    // is new to the segment needs one.
+    std::uint32_t retry_entries{0};
     // When its lifetime ends. None before its first accepted group.
     std::optional<runtime::monotonic_time> deadline;
 };
@@ -325,12 +360,11 @@ struct segment_disk_obligation final {
 struct segment_capacity_plan final {
     segment_capacity_decision decision{segment_capacity_decision::impossible};
     std::optional<segment_writer_position> end;
-    byte_count blocks, footer, sealed_root;
+    // The footer that closes a run held open before the group, its blocks
+    // and the footer after them.
+    byte_count closing, blocks, footer, sealed_root;
     byte_count staging_bytes;
     std::uint32_t retry_pages{0}, retry_page_entries{0};
-    // Only this group's new full-BID facts. Earlier groups retain their own
-    // admission; finalizer PageRefs are covered by the held seal working set.
-    byte_count retry_metadata;
     segment_disk_obligation disk{};
     // Every reason a roll_required decision has; none otherwise.
     segment_roll_reasons reasons{};
@@ -338,8 +372,9 @@ struct segment_capacity_plan final {
 
 // Pure, bounded lookahead. Borrow exact children only for this call. Neither
 // this value nor its projected positions freeze coordinates, validate children
-// under a new policy, or authorize an append. Capacity is per full batch/BID,
-// independently of the number of records retained by that batch.
+// under a new policy, or authorize an append. `retry_entries` is how many
+// completed-retry entries the group adds to the seal, at most one per full
+// batch/BID whatever records it retains; absent, each batch adds one.
 [[nodiscard]] runtime::result<segment_capacity_plan> plan_segment_capacity(
   const local_segment_descriptor&,
   runtime::file_position data_start,
@@ -349,7 +384,8 @@ struct segment_capacity_plan final {
   const codec::limits&,
   bytes::allocation_charge_fn,
   storage_alignment metadata_alignment,
-  byte_count finalization_bytes);
+  byte_count finalization_bytes,
+  std::optional<std::uint32_t> retry_entries = std::nullopt);
 
 // The most a segment of this descriptor may come to hold on its device: its
 // whole extent, and the retry bundle of a seal that holds as many facts as
@@ -420,13 +456,14 @@ struct segment_capacity_constants final {
     // Work limits admit no group at all.
     bool tiny{false};
     codec::envelope_extent_limits block_limits{};
-    // Absent when the durable footer cannot be laid out or staged.
-    std::optional<byte_count> footer_bytes, footer_staging;
+    // A durable footer's bytes before the padding that ends its span; absent
+    // when even one that begins on a boundary cannot be laid out or staged.
+    std::optional<byte_count> footer_bytes;
+    // The most a footer's staging costs, wherever it begins.
+    std::optional<byte_count> closing_staging;
     // Absent unless every publication-pointer shape fits its workspace.
     std::optional<byte_count> pointer_bytes;
     std::optional<byte_count> descriptor_bytes;
-    // Served grant node charge, absent when the charge is rejected.
-    std::optional<byte_count> fact_control;
     // Retry entries per page on the wire; zero when none fit.
     std::uint32_t retry_wire_capacity{0};
     std::array<std::optional<byte_count>, maximum_segment_group_blocks + 1>
@@ -435,10 +472,14 @@ struct segment_capacity_constants final {
     std::optional<std::uint64_t> root_asked;
     std::optional<byte_count> root_kept;
 };
+// `open`: blocks since the last footer end at `current`, so a footer that
+// closes them is counted before the group. `retry_entries` as above.
 [[nodiscard]] runtime::result<segment_capacity_plan> plan_segment_capacity(
   segment_capacity_constants&,
   segment_writer_position current,
-  std::span<const encoded_assigned_batch* const>);
+  std::span<const encoded_assigned_batch* const>,
+  bool open = false,
+  std::optional<std::uint32_t> retry_entries = std::nullopt);
 } // namespace detail
 
 // A rejectable resource preparation. It owns prospective work/metadata units,
@@ -452,6 +493,13 @@ public:
         return plan_;
     }
     const segment_capacity_plan& plan() const&& = delete;
+    // The bytes its freeze would take: from the reserved end it was
+    // measured at to the end of its footer's padding, with the footer that
+    // closes a run held open there.
+    [[nodiscard]] model::file_byte_span extent() const noexcept {
+        return model::file_byte_span::make(base_.end().bytes, plan_.end->bytes)
+          .value();
+    }
 
 private:
     template<
@@ -461,34 +509,38 @@ private:
     friend class segment_writer;
     segment_prepared_group(
       segment_captured_boundary base,
+      std::optional<segment_captured_boundary> closed,
       segment_capacity_plan plan,
       std::vector<detail::segment_plan_input> inputs,
       workload_reservation held,
-      workload_reservation retries,
       workload_reservation control,
       byte_count retained,
-      codec::limits policy)
+      codec::limits policy,
+      std::uint32_t retry_entries)
       : held_(std::move(held))
-      , retries_(std::move(retries))
       , control_(std::move(control))
       , base_(std::move(base))
+      , closed_(std::move(closed))
       , plan_(std::move(plan))
       , inputs_(std::move(inputs))
       , retained_(retained)
-      , policy_(policy) {}
+      , policy_(policy)
+      , retry_entries_(retry_entries) {}
     workload_reservation held_;
-    // Retry facts can remain needed after the group's codec/write workspace
-    // has been released. Never make their lifetime pin that larger allowance.
-    workload_reservation retries_;
     // The queue node the freeze installs, held so the freeze takes no fresh
     // ordinary admission after its awaits.
     workload_reservation control_;
     segment_captured_boundary base_;
+    // Measured over a run held open: the base once that run is closed by
+    // its own footer, from which the group freezes as planned.
+    std::optional<segment_captured_boundary> closed_;
     segment_capacity_plan plan_;
     std::vector<detail::segment_plan_input> inputs_;
     // Staging plus the children's retained bytes the freeze adds as pending.
     byte_count retained_;
     codec::limits policy_;
+    // Completed-retry entries the group adds to the seal.
+    std::uint32_t retry_entries_;
 };
 struct segment_group_preparation final {
     segment_capacity_decision decision;

@@ -74,8 +74,7 @@ discover_local_records(
               limits,
               work,
               (kind == local_entry_kind::wal
-               || kind == local_entry_kind::checkpoint
-               || kind == local_entry_kind::object)
+               || kind == local_entry_kind::checkpoint)
                 ? local_metadata_extent::first_envelope
                 : local_metadata_extent::exact_file,
               [expected](
@@ -131,10 +130,9 @@ discover_local_records(
                     observation.decoded.emplace(std::move(*loaded));
             }
         } else if (kind != local_entry_kind::object) {
-            // Objects may be a family-8 root, family-7 page-only file,
-            // including zero bytes, or family-11 bundle. Without an independent
-            // reference do not guess which encoding gives those bytes
-            // authority.
+            // Objects may be a family-8 root or a family-7 page-only file,
+            // including zero bytes. Without an independent reference do not
+            // guess which encoding gives those bytes authority.
             auto raw = co_await read_local_metadata_file(
               files,
               spec.root,
@@ -296,8 +294,12 @@ seastar::future<runtime::result<local_inventory_progress>> walk_local_wal_chain(
         if (cutoff && incarnation.canonical_less(cutoff->incarnation()))
             co_return runtime::failure(detail::path_error(errc::wrong_context));
         const bool at_cutoff = cutoff && incarnation == cutoff->incarnation();
-        if (at_cutoff && (cutoff->position().value() < descriptor.data_start.value() || cutoff->position().value() > end
-            || cutoff->position().value() % descriptor.alignment.bytes().value() != 0))
+        // A cutoff is a PREPARE boundary, anywhere in a packed write; a
+        // sealed end is a write's end, on a boundary.
+        if (
+          at_cutoff
+          && (cutoff->position().value() < descriptor.data_start.value()
+              || cutoff->position().value() > end))
             co_return runtime::failure(detail::path_error(errc::wrong_context));
         ++progress.visited;
         const local_wal_chain_entry entry{*loaded, head, sealed_end};

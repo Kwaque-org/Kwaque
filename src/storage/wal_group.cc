@@ -53,13 +53,19 @@ wal_group::wal_group(wal_group&& other) noexcept
   , additional_bytes_(other.additional_bytes_)
   , retained_bound_(other.retained_bound_)
   , fragment_bound_(other.fragment_bound_) {}
-runtime::result<void>
-wal_group::append(admitted_wal_batch batch, wal_child_expectation expected) {
+runtime::result<void> wal_group::append(
+  admitted_wal_batch batch,
+  wal_child_expectation expected,
+  runtime::file_position target_certified_end) {
     owner_.assert_current();
     if (capacity_ == 0) return runtime::failure(group_error(errc::closed));
     if (members_.size() == capacity_)
         return runtime::failure(group_error(errc::queue_full));
-    if (batch.batch().bytes().empty())
+    if (
+      batch.batch().bytes().empty()
+      || target_certified_end < expected.target_data_start
+      || target_certified_end > expected.target.position()
+      || !expected.target.alignment().aligned(target_certified_end))
         return runtime::failure(group_error(errc::invalid_argument));
     const auto& bytes = batch.batch().bytes();
     const auto logical = offered_bytes_.checked_add(bytes.size());
@@ -72,7 +78,11 @@ wal_group::append(admitted_wal_batch batch, wal_child_expectation expected) {
         return runtime::failure(group_error(errc::resource_exhausted));
     members_.push_back(
       detail::wal_group_member{
-        std::move(batch).release(), std::move(expected), {}, {}});
+        std::move(batch).release(),
+        std::move(expected),
+        target_certified_end,
+        {},
+        {}});
     offered_bytes_ = *logical;
     offered_retained_ = *retained;
     offered_fragments_ = fragments;
@@ -82,7 +92,7 @@ wal_group::append(admitted_wal_batch batch, wal_child_expectation expected) {
 namespace detail {
 runtime::result<wal_member_memory> wal_prepare_memory(
   const encoded_assigned_batch& child,
-  aligned_envelope_layout layout,
+  byte_count padding,
   const codec::limits& policy,
   bytes::allocation_charge_fn charge) {
     const auto bad = [](errc code) {
@@ -97,7 +107,7 @@ runtime::result<wal_member_memory> wal_prepare_memory(
       wal_prepare_fixed_bytes, policy, charge);
     if (!prefix) return bad(prefix.error().code());
     const auto nodes = child.bytes().fragment_count() + prefix->fragments
-                       + (layout.padding_bytes().value() != 0 ? 1U : 0U);
+                       + (padding.value() != 0 ? 1U : 0U);
     const auto limits = policy.config();
     if (
       nodes > limits.max_buffer_fragments.value()
@@ -107,10 +117,9 @@ runtime::result<wal_member_memory> wal_prepare_memory(
       || limits.max_work_bytes.value() < 512)
         return bad(errc::resource_exhausted);
     auto new_backing = prefix->backing;
-    if (layout.padding_bytes().value() != 0) {
-        const auto request = layout.padding_bytes();
-        const auto served = charge(request);
-        if (served < request) return bad(errc::invalid_argument);
+    if (padding.value() != 0) {
+        const auto served = charge(padding);
+        if (served < padding) return bad(errc::invalid_argument);
         if (!policy.validate_allocation(served))
             return bad(errc::resource_exhausted);
         new_backing = *new_backing.checked_add(served);
@@ -134,7 +143,7 @@ runtime::result<wal_member_memory> wal_prepare_memory(
     // One final descriptor array overlaps the input, private prefix owners and
     // optional padding. There are no checksum or splice aliases.
     const auto small_owners = prefix->fragments
-                              + (layout.padding_bytes().value() != 0 ? 1U : 0U);
+                              + (padding.value() != 0 ? 1U : 0U);
     const byte_count extra{
       new_backing.value() + descriptors.value()
       + small_owners * (small_descriptor.value() + control.value())};

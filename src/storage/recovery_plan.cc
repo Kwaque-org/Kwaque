@@ -9,15 +9,16 @@ using detail::path_error;
 } // namespace
 
 runtime::result<recovery_planner> recovery_planner::make(
-  std::span<const recovery_target> targets, workload_budget& budget) {
+  table_view<recovery_target> targets, workload_budget& budget) {
     if (auto valid = detail::validate_recovery_targets(targets); !valid)
         return runtime::failure(valid.error());
     byte_count total;
-    for (const auto bytes :
-         {targets.size() * sizeof(recovery_segment_plan),
-          targets.size() * sizeof(observed)}) {
-        if (bytes == 0) continue;
-        auto charged = budget.allocation_charge(byte_count{bytes});
+    for (const auto element :
+         {sizeof(recovery_segment_plan),
+          sizeof(observed),
+          sizeof(std::uint32_t)}) {
+        auto charged = chunked_allocation_charge(
+          budget, targets.size(), element);
         if (!charged) return runtime::failure(charged.error());
         auto next = total.checked_add(*charged);
         if (!next) return runtime::failure(path_error(errc::out_of_range));
@@ -25,17 +26,30 @@ runtime::result<recovery_planner> recovery_planner::make(
     }
     auto held = budget.try_reserve(total);
     if (!held) return runtime::failure(held.error());
-    std::vector<recovery_segment_plan> segments;
+    seastar::chunked_vector<recovery_segment_plan> segments;
+    seastar::chunked_vector<observed> reports;
+    seastar::chunked_vector<std::uint32_t> order;
     segments.reserve(targets.size());
+    reports.reserve(targets.size());
+    order.reserve(targets.size());
     for (const auto& target : targets) {
         recovery_segment_plan plan{target.descriptor.segment};
-        plan.recovered_end = target.descriptor.logical_origin;
+        plan.recovered_end = target.logical_origin;
+        order.push_back(static_cast<std::uint32_t>(segments.size()));
         segments.push_back(plan);
+        reports.emplace_back();
     }
+    std::sort(
+      order.begin(),
+      order.end(),
+      [&segments](std::uint32_t a, std::uint32_t b) {
+          return segments[a].segment.canonical_less(segments[b].segment);
+      });
     return recovery_planner{
       std::move(*held),
       std::move(segments),
-      std::vector<observed>(targets.size())};
+      std::move(reports),
+      std::move(order)};
 }
 
 runtime::result<void> recovery_planner::observe(const recovery_item& item) {
@@ -44,14 +58,18 @@ runtime::result<void> recovery_planner::observe(const recovery_item& item) {
       [this](const auto& value) -> runtime::result<void> {
           using T = std::remove_cvref_t<decltype(value)>;
           if constexpr (std::is_same_v<T, recovery_segment_report>) {
-              const auto found = std::find_if(
-                segments_.begin(), segments_.end(), [&](const auto& plan) {
-                    return plan.segment == value.segment;
+              const auto found = std::lower_bound(
+                order_.begin(),
+                order_.end(),
+                value.segment,
+                [this](std::uint32_t index, const segment_context& wanted) {
+                    return segments_[index].segment.canonical_less(wanted);
                 });
-              if (found == segments_.end())
+              if (
+                found == order_.end()
+                || segments_[*found].segment != value.segment)
                   return runtime::failure(path_error(errc::invalid_argument));
-              auto& slot
-                = reports_[static_cast<std::size_t>(found - segments_.begin())];
+              auto& slot = reports_[*found];
               if (slot.report)
                   return runtime::failure(path_error(errc::invalid_argument));
               slot.report = value;
@@ -77,8 +95,13 @@ namespace detail {
 runtime::result<recovery_segment_plan>
 plan_recovery_segment(const recovery_segment_report& report) {
     recovery_segment_plan plan{report.segment};
+    plan.materialized = report.materialize;
+    plan.repaired = report.repaired;
     plan.candidates = report.candidates;
     plan.suffix = report.suffix;
+    plan.uncertified_tail = report.scanned
+                            && report.stop != segment_scan_stop::end
+                            && report.verdict != segment_scan_verdict::corrupt;
     const auto stop = [&plan](recovery_plan_reason reason) {
         plan.action = recovery_plan_action::stop;
         plan.reason = reason;

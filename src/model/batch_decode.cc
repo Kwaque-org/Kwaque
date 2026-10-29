@@ -83,6 +83,8 @@ struct fixed_fields final {
     byte_count encoded_records;
     byte_count expanded_records;
     compression::codec_id encoding;
+    // Set by the record walk, over the records it walked.
+    runtime::wall_time max_record_time{};
 };
 
 template<bool Assigned, std::size_t N>
@@ -344,7 +346,7 @@ seastar::future<codec::result<fixed_fields<Assigned>>> read_body(
         co_return codec::failure(ready.error());
     if (auto ready = work.poll(anchor); !ready)
         co_return codec::failure(ready.error());
-    const auto fields = parse_fixed<Assigned>(
+    auto fields = parse_fixed<Assigned>(
       fixed, expected, work.policy(), context);
     if (!fields) co_return codec::failure(fields.error());
     const auto submitted = [&] {
@@ -479,6 +481,7 @@ seastar::future<codec::result<fixed_fields<Assigned>>> read_body(
               field_context{0, context.family, static_cast<std::uint16_t>(batch_field::records)}
           : context;
     std::uint64_t headers = 0;
+    std::int64_t latest = 0;
     std::optional<range_logical_count> previous;
     const bool dense = retained.value() == submitted.original_count().value();
     for (std::uint64_t index = 0; index < retained.value(); ++index) {
@@ -518,6 +521,8 @@ seastar::future<codec::result<fixed_fields<Assigned>>> read_body(
               batch_field::records,
               compressed ? fixed.size() : record->encoded.offset.value()));
         previous = delta;
+        if (index == 0 || record->fields.timestamp_delta > latest)
+            latest = record->fields.timestamp_delta;
         headers += record->headers().size();
         if (headers > fields->headers.value())
             co_return codec::failure(at(
@@ -532,6 +537,14 @@ seastar::future<codec::result<fixed_fields<Assigned>>> read_body(
     if (headers != fields->headers.value())
         co_return codec::failure(
           at(errc::malformed_data, context, batch_field::header_count, 152));
+    // Each record's time was checked representable when it was walked.
+    const auto latest_time = checked_timestamp_from_delta(
+      submitted.original_timestamp_base(), latest);
+    KWAQUE_INVARIANT(
+      invariant_id{"KQ-BATCH-DECODE-RECORD-TIME"},
+      latest_time.has_value(),
+      "a walked record time is not representable");
+    fields->max_record_time = *latest_time;
     if (dense) {
         const auto fingerprint_anchor = at(
           errc::success, context, batch_field::fingerprint, 104);
@@ -641,6 +654,7 @@ public:
                 fields.context,
                 fields.digest,
                 fields.headers,
+                fields.max_record_time,
                 std::move(records)},
               *remaining,
               verification};
@@ -650,6 +664,7 @@ public:
                 fields.context,
                 fields.digest,
                 fields.headers,
+                fields.max_record_time,
                 std::move(records)},
               *remaining};
         }

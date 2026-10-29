@@ -48,6 +48,12 @@ struct sparse_index_stride final {
     bool operator==(const sparse_index_stride&) const noexcept = default;
 };
 
+// The most blocks from one anchor to the next: a run, which the cache reads
+// from an anchor to the next, lists no more. A block is also an anchor once
+// this many lie between it and the last anchor's block, whatever the stride:
+// packed small blocks reach it long before a byte stride.
+inline constexpr std::uint32_t maximum_anchor_blocks = 2048;
+
 // Anchors in one persisted page: 16 KiB of entries. A reader admits a page's
 // entries as one array, and this is what the default reader budget holds
 // however its allocator rounds; it also divides a chunk of the table, so a
@@ -159,7 +165,8 @@ private:
 };
 
 // The most anchors a segment can hold: one per block, and under a byte
-// stride alone no more than one per stride of its data file.
+// stride alone no more than one per stride of its data file and one per
+// maximum_anchor_blocks of the blocks it can hold.
 [[nodiscard]] std::uint32_t sparse_index_capacity(
   sparse_index_stride,
   byte_count maximum_data_bytes,
@@ -172,10 +179,13 @@ private:
 // bases and the file positions of the complete blocks that begin there, in
 // file order, held in memory only.
 //
-// Its memory is admitted in full when it is made, and allocated a chunk at a
-// time as the segment grows. A chunk that cannot be allocated costs anchors,
-// never a block's result: the block is passed over and the next one is tried,
-// so the index only becomes sparser.
+// Its memory is admitted a chunk at a time: the first when it is made, and
+// each later one with the group of its segment whose blocks could first need
+// it (admit()), so that an idle segment holds one chunk and a budget with no
+// room refuses a group, never an anchor. A chunk is allocated when the first
+// anchor in it is chosen. A chunk that cannot be allocated, or was never
+// admitted, costs anchors, never a block's result: the block is passed over
+// and the next one is tried, so the index only becomes sparser.
 //
 // A block is offered when its bytes are written and becomes an anchor only
 // once it is durable. Nothing here returns an entry before that, and none is
@@ -190,9 +200,17 @@ public:
     // `capacity` is the most anchors it will hold; see sparse_index_capacity.
     [[nodiscard]] static runtime::result<active_sparse_index>
     make(sparse_index_stride, std::uint32_t capacity, workload_budget&);
-    // What an index of `capacity` anchors is admitted for when it is made.
+    // What an index of `capacity` anchors is admitted for when it is made:
+    // its list of chunks and its first chunk.
     [[nodiscard]] static runtime::result<byte_count>
     admission(std::uint32_t capacity, const workload_budget&) noexcept;
+    // Before a group of `blocks` blocks of its segment freezes: admits from
+    // the budget it was made with the chunks those blocks could fill beyond
+    // the chunks admitted, counting the blocks of groups admitted before and
+    // not offered yet. A budget with no room refuses, and its group is
+    // refused with it. What is admitted stays for later blocks, whatever
+    // becomes of the group.
+    [[nodiscard]] runtime::result<void> admit(std::uint32_t blocks);
     active_sparse_index(active_sparse_index&&) noexcept;
     active_sparse_index& operator=(active_sparse_index&&) = delete;
     active_sparse_index(const active_sparse_index&) = delete;
@@ -252,10 +270,13 @@ private:
     active_sparse_index(
       sparse_index_stride stride,
       std::uint32_t capacity,
-      workload_reservation held) noexcept
+      workload_reservation held,
+      workload_budget& budget) noexcept
       : held_(std::move(held))
+      , budget_(&budget)
       , stride_(stride)
-      , capacity_(capacity) {}
+      , capacity_(capacity)
+      , admitted_(std::min(capacity, chunk_entries)) {}
     [[nodiscard]] const sparse_index_entry&
     chosen(std::uint32_t entry) const noexcept {
         return chunks_[entry / chunk_entries][entry % chunk_entries];
@@ -263,22 +284,28 @@ private:
     // How many anchors lie at or before an offset.
     [[nodiscard]] std::uint32_t
       upto(model::range_logical_offset) const noexcept;
-    // 64 KiB of entries, so that a chunk stays within the contiguous
-    // allocation ceiling however its allocator rounds it.
-    static constexpr std::uint32_t chunk_entries = 4096;
+    // One page of the sealed form's entries, 16 KiB: a page lies in one
+    // chunk, and a segment that holds few anchors is admitted one page's
+    // worth, not more.
+    static constexpr std::uint32_t chunk_entries = sparse_index_page_entries;
     workload_reservation held_;
+    workload_budget* budget_{nullptr};
     // Anchors, then the blocks chosen that are not durable yet. The list is
     // sized when the index is made, so only a chunk is ever allocated later.
     std::vector<std::vector<sparse_index_entry>> chunks_;
     sparse_index_stride stride_;
     std::uint32_t capacity_;
     std::uint32_t chosen_{0}, anchors_{0};
+    // Entries whose chunks are admitted, and blocks of admitted groups not
+    // offered yet.
+    std::uint32_t admitted_{0}, promised_{0};
     std::uint64_t skipped_{0};
     bool frozen_{false};
     // Where the last chosen block begins, and where the last offered one
-    // ends.
+    // ends; blocks offered since the last chosen one, the latest included.
     runtime::file_position chosen_bytes_{}, offered_end_{};
     model::segment_relative_end chosen_records_{};
+    std::uint32_t since_{0};
 };
 
 // What a shard asks of the budget that funds the indexes of the segments it
@@ -293,10 +320,12 @@ struct sparse_index_demand final {
     byte_count reserved_bytes{};
 };
 
-// Whether the budget can hold that demand: every index is admitted in full
-// when its segment is made, and holds that admission while the segment is
-// written. A shard checks its configured counts with this before it creates
-// any owner, as it checks its handles. A stride and a segment count the
+// Whether the budget can hold that demand: every index is admitted its list
+// and first chunk when its segment is made, and holds that admission while
+// the segment is written; a later chunk is admitted with the group that
+// needs it, and a budget with no room refuses that group. A shard checks its
+// configured counts with this before it creates any owner, as it checks its
+// handles. A stride and a segment count the
 // budget cannot hold together are then a configuration error at start,
 // carrying the limit and what the configuration expects of it, and not a
 // refusal at the first segment that no longer fits.

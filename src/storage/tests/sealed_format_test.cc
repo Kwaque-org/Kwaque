@@ -24,7 +24,14 @@ TEST(SealedFormatTest, IndependentGoldenAndExternalRootPin) {
     const auto wire = one_root(refs);
     EXPECT_EQ(
       wire.substr(0, 32),
-      hex("4b5142460700010001002000e00100000000000000000000c4b1d20685258410"));
+      hex("4b5142460700010001002000e001000000000000000000006a510dad6dc348a6"));
+    // The times sit at the footer's distance from the last block; the
+    // digest, counts and padding follow them.
+    EXPECT_EQ(get(wire, 32 + 188, 8), 1U);
+    EXPECT_EQ(get(wire, 32 + 196, 8), 1U);
+    EXPECT_EQ(get(wire, 32 + 204, 8), 0U);
+    EXPECT_EQ(get(wire, 32 + 244, 4), 1U);
+    EXPECT_EQ(get(wire, 32 + 248, 4), 1U);
     const auto evidence = hashed_evidence(work);
     const auto encoded = encode_sealed_footer(
                            evidence,
@@ -55,6 +62,7 @@ TEST(SealedFormatTest, IndependentGoldenAndExternalRootPin) {
     EXPECT_EQ(decoded->value.coverage(), evidence.boundary().coverage);
     EXPECT_EQ(decoded->value.block_count(), 1U);
     EXPECT_EQ(decoded->value.last_block(), evidence.boundary().last_block);
+    EXPECT_EQ(decoded->value.times(), evidence.boundary().times);
     EXPECT_EQ(decoded->value.extent_digest(), *evidence.digest());
     EXPECT_EQ(decoded->value.retry_count(), 1U);
     ASSERT_EQ(decoded->value.pages().size(), 1U);
@@ -69,26 +77,29 @@ TEST(
   SealedFormatTest, DigestCoversInterleavedFootersOnceAndNoBytesOutsideExtent) {
     seastar::abort_source abort;
     codec::cooperative_work work{codec::limits::defaults(), abort};
+    // A block, the footer ending its write at 1536, and a second block.
+    const auto first = data_block();
+    const auto second = data_block(101, 1, 1536);
+    const auto end = 1536U + second.size();
     auto verifier = extent_verifier::make(
                       history(),
-                      scope(100, 102, 0, 2, 512, 2048),
+                      scope(100, 102, 0, 2, 512, end),
                       work.policy(),
                       extent_layout_kind::initial_append,
                       {},
                       extent_integrity::crc32c_and_digest)
                       .value();
-    const auto first = data_block();
     ASSERT_TRUE(feed_block(verifier, first, work));
     const auto prefix = verifier.checkpoint(work).value();
     EXPECT_FALSE(prefix.digest());
     const auto footer = footer_wire(
-      prefix.boundary(), {history(), runtime::file_position{1024}});
+      prefix.boundary(),
+      {history(), runtime::file_position{512 + first.size()}});
     ASSERT_TRUE(feed_footer(verifier, footer, work));
     auto moved = std::move(verifier);
     // The documented move closes the source and preserves the stable native
     // owner. NOLINTNEXTLINE(bugprone-use-after-move)
     EXPECT_TRUE(verifier.closed());
-    const auto second = data_block(101, 1, 1536);
     ASSERT_TRUE(feed_block(moved, second, work));
     const auto evidence = moved.finish(work).value();
     ASSERT_TRUE(evidence.digest());
@@ -104,7 +115,7 @@ TEST(
     ASSERT_TRUE(encoded.has_value());
     const auto root = pin_root(flat(encoded->bytes), work, location);
     EXPECT_TRUE(validate_sealed_footer(root, evidence));
-    EXPECT_EQ(root.coverage().bytes().end().value(), 2048U);
+    EXPECT_EQ(root.coverage().bytes().end().value(), end);
     EXPECT_NE(
       evidence.digest()->bytes(),
       exact_digest(first + footer + second + flat(encoded->bytes)));
@@ -115,8 +126,10 @@ TEST(SealedFormatTest, RemovedDataPreservesOriginalCoverageAndCompletedResult) {
         seastar::abort_source abort;
         codec::cooperative_work work{codec::limits::defaults(), abort};
         const auto h = history(0x80, 2);
-        const auto extent = all_removed ? scope(100, 110, 0, 0, 512, 512)
-                                        : scope(100, 110, 0, 2, 512, 1024);
+        const auto kept = data_block(102, 0, 512, true, 0x80, 2);
+        const auto extent = all_removed
+                              ? scope(100, 110, 0, 0, 512, 512)
+                              : scope(100, 110, 0, 2, 512, 512 + kept.size());
         auto verifier = extent_verifier::make(
                           h,
                           extent,
@@ -127,7 +140,7 @@ TEST(SealedFormatTest, RemovedDataPreservesOriginalCoverageAndCompletedResult) {
                           .value();
         std::string supplied;
         if (!all_removed) {
-            supplied = data_block(102, 0, 512, true, 0x80, 2);
+            supplied = kept;
             ASSERT_TRUE(feed_block(verifier, supplied, work));
         }
         const auto evidence = verifier.finish(work).value();
@@ -160,6 +173,9 @@ TEST(SealedFormatTest, RemovedDataPreservesOriginalCoverageAndCompletedResult) {
         EXPECT_EQ(root.coverage().logical(), extent.logical());
         EXPECT_EQ(root.block_count(), all_removed ? 0U : 1U);
         EXPECT_EQ(root.last_block().has_value(), !all_removed);
+        // Times are kept as found, and are zero with no block left.
+        EXPECT_EQ(root.times(), evidence.boundary().times);
+        EXPECT_EQ(root.times() == boundary_times{}, all_removed);
         if (!all_removed)
             EXPECT_EQ(root.last_block()->logical().end().value(), 107U);
         retry_summary_verifier summary{root, work.policy()};
@@ -266,7 +282,7 @@ TEST(SealedFormatTest, PrefixPackingPreservesSmallAllocationAndWorkLimits) {
     ASSERT_TRUE(bounded);
     EXPECT_EQ(flat(bounded->bytes), flat(baseline->bytes));
     EXPECT_EQ(bounded->bytes.fragment_at(0)->size(), 32U);
-    EXPECT_EQ(bounded->bytes.fragment_at(1)->size(), 232U);
+    EXPECT_EQ(bounded->bytes.fragment_at(1)->size(), 256U);
     const auto cost = bounded->bytes.allocation_cost(profile);
     ASSERT_TRUE(cost);
     EXPECT_LE(cost->largest_allocation, byte_count{512});
@@ -277,7 +293,7 @@ TEST(SealedFormatTest, ParsedDigestAndHistoryClaimsNeedIndependentEvidence) {
     codec::cooperative_work work{codec::limits::defaults(), abort};
     const auto evidence = hashed_evidence(work);
     auto wire = one_root();
-    wire[32 + 188] ^= 1;
+    wire[32 + 212] ^= 1;
     repair(wire);
     const auto altered = pin_root(wire, work);
     const auto result = validate_sealed_footer(altered, evidence);
@@ -341,12 +357,12 @@ TEST(
         std::uint64_t value;
     };
     constexpr mutation cases[]{
-      {0, 2, 0},     {0, 2, 2},   {0, 2, 3},      {2, 2, 1},
-      {4, 1, 0x51},  {68, 8, 0},  {68, 8, 2},     {76, 8, 1024},
-      {84, 8, 102},  {100, 8, 2}, {116, 8, 0},    {124, 8, 2048},
-      {132, 4, 0},   {132, 4, 2}, {136, 1, 2},    {137, 1, 1},
-      {140, 8, 99},  {156, 8, 2}, {180, 8, 1536}, {220, 4, 1},
-      {224, 4, 257}, {228, 4, 0}};
+      {0, 2, 0},   {0, 2, 2},      {0, 2, 3},     {2, 2, 1},      {4, 1, 0x51},
+      {68, 8, 0},  {68, 8, 2},     {76, 8, 1024}, {84, 8, 102},   {100, 8, 2},
+      {116, 8, 0}, {124, 8, 2048}, {132, 4, 0},   {132, 4, 2},    {136, 1, 2},
+      {137, 1, 1}, {140, 8, 99},   {156, 8, 2},   {180, 8, 1536}, {188, 8, 0},
+      {188, 8, 2}, {196, 8, 0},    {228, 1, 1},   {244, 4, 1},    {248, 4, 257},
+      {252, 4, 0}};
     for (const auto change : cases) {
         auto wrong = wire;
         put(wrong, 32 + change.offset, change.value, change.width);
@@ -373,7 +389,7 @@ TEST(SealedFormatTest, ReferenceCountsLengthsAndIndicesAreCheckedAtTheRoot) {
       reference(retry_page_wire(entry, root_location(), 1, 1), 1, 1)};
     const auto wire = one_root(refs);
     for (const auto offset :
-         {220U, 224U, 232U, 236U, 240U, 244U, 280U, 284U, 288U, 292U}) {
+         {244U, 248U, 256U, 260U, 264U, 268U, 304U, 308U, 312U, 316U}) {
         auto wrong = wire;
         put(wrong, 32 + offset, get(wrong, 32 + offset, 4) + 1U, 4);
         repair(wrong);
@@ -488,11 +504,19 @@ TEST(
     const std::array entries{retry()};
     const auto page = retry_page_wire(entries, location);
     const std::array refs{reference(page)};
+    const boundary_times times{
+      runtime::wall_time{0x0102030405060708},
+      runtime::wall_time{0x0102030405060799},
+      runtime::wall_time{-0x0a0b0c0d0e0f1011}};
     const auto wire = sealed_wire(
-      {extent, 2, last, 0},
+      {extent, 2, last, times, 0},
       exact_digest("supplied extent digest"),
       refs,
       location);
+    EXPECT_EQ(get(wire, 32 + 188, 8), 0x0102030405060708U);
+    EXPECT_EQ(get(wire, 32 + 196, 8), 0x0102030405060799U);
+    EXPECT_EQ(
+      get(wire, 32 + 204, 8), static_cast<std::uint64_t>(-0x0a0b0c0d0e0f1011));
     const auto root = pin_root(wire, work, location);
     EXPECT_EQ(
       root.location().history.segment.generation().value(),
@@ -502,6 +526,7 @@ TEST(
     EXPECT_EQ(root.coverage().physical(), extent.physical());
     EXPECT_EQ(root.coverage().bytes(), extent.bytes());
     EXPECT_EQ(root.last_block(), last);
+    EXPECT_EQ(root.times(), times);
     EXPECT_EQ(root.block_count(), 2U);
     EXPECT_EQ(
       root.extent_digest().bytes(), exact_digest("supplied extent digest"));

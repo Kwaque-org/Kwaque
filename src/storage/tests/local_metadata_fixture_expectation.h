@@ -62,13 +62,11 @@ inline local_metadata_expectation expectation(const local_fixture_case& test) {
     if (!test.wal.empty())
         result.wal_incarnation = literal_id<model::wal_incarnation_id>(
           test.wal);
-    if (test.data_device) {
+    if (test.data_device)
         result.data_device = id<device_store_id>(test.data_device);
-        result.data_metadata_alignment = alignment(4096);
-    }
     result.digest = literal_digest(test.digest);
     result.encoded_bytes = byte_count{test.bytes};
-    if (test.kind == 7 || test.kind == 12)
+    if (test.kind == 7)
         result.page = page_ref::make(
                         page_ordinal::make(test.ordinal).value(),
                         test.first,

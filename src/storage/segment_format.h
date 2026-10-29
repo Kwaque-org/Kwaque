@@ -9,7 +9,7 @@ class segment_codec;
 }
 
 inline constexpr byte_count segment_header_fixed_bytes{96};
-inline constexpr byte_count segment_block_fixed_bytes{120};
+inline constexpr byte_count segment_block_fixed_bytes{144};
 
 enum class segment_field : std::uint16_t {
     fixed_body = 160,
@@ -18,7 +18,6 @@ enum class segment_field : std::uint16_t {
     range,
     segment,
     generation,
-    logical_origin,
     storage_profile,
     record_profile,
     alignment,
@@ -31,19 +30,21 @@ enum class segment_field : std::uint16_t {
     logical_end,
     assigned_bytes,
     assigned_batch,
+    append_time,
+    max_record_time,
+    certified_end,
 };
 
+// The file's identity and layout. It names no logical origin: a segment can
+// be created before the offset it starts at is known, and its owner's
+// activation record supplies that origin.
 class segment_header final {
 public:
     [[nodiscard]] static result<segment_header> make(
       segment_context context,
-      model::range_logical_end logical_origin,
       storage_alignment alignment,
       storage_profile profile = storage_profile::v1) noexcept;
     [[nodiscard]] segment_context context() const noexcept { return context_; }
-    [[nodiscard]] model::range_logical_end logical_origin() const noexcept {
-        return logical_origin_;
-    }
     [[nodiscard]] storage_alignment alignment() const noexcept {
         return alignment_;
     }
@@ -53,15 +54,12 @@ public:
 private:
     segment_header(
       segment_context context,
-      model::range_logical_end origin,
       storage_alignment alignment,
       storage_profile profile) noexcept
       : context_(context)
-      , logical_origin_(origin)
       , alignment_(alignment)
       , profile_(profile) {}
     segment_context context_;
-    model::range_logical_end logical_origin_;
     storage_alignment alignment_;
     storage_profile profile_;
 };
@@ -82,6 +80,20 @@ struct segment_block_expectation final {
     storage_profile profile{storage_profile::v1};
 };
 
+// What the writer stamps on a block, beside what the child determines.
+struct segment_block_stamps final {
+    // Broker time at assignment, at least 1 ns. It never decreases along a
+    // segment's blocks.
+    runtime::wall_time append_time;
+    // Where the file's certified prefix ended when the block's group formed:
+    // every byte below it was covered by a completed barrier. It lies on an
+    // alignment boundary between the data start and the block, and the data
+    // start claims nothing. A block made from a PREPARE carries the PREPARE's
+    // target stamp.
+    runtime::file_position certified_end;
+    bool operator==(const segment_block_stamps&) const noexcept = default;
+};
+
 // Minted only after complete block/child/padding validation. A descriptor alone
 // cannot authenticate another buffer or establish fdatasync/ACK completion.
 class complete_block_descriptor final {
@@ -92,6 +104,9 @@ public:
           batch_.context.logical_span(), physical_, bytes_};
     }
     [[nodiscard]] assigned_batch_info batch() const noexcept { return batch_; }
+    [[nodiscard]] segment_block_stamps stamps() const noexcept {
+        return stamps_;
+    }
     bool operator==(const complete_block_descriptor&) const noexcept = default;
 
 private:
@@ -100,15 +115,18 @@ private:
       segment_context context,
       model::segment_relative_span physical,
       model::file_byte_span bytes,
-      assigned_batch_info batch) noexcept
+      assigned_batch_info batch,
+      segment_block_stamps stamps) noexcept
       : context_(context)
       , physical_(physical)
       , bytes_(bytes)
-      , batch_(batch) {}
+      , batch_(batch)
+      , stamps_(stamps) {}
     segment_context context_;
     model::segment_relative_span physical_;
     model::file_byte_span bytes_;
     assigned_batch_info batch_;
+    segment_block_stamps stamps_;
 };
 
 // Immutable owning pair: these exact outer bytes produced this descriptor.
@@ -170,6 +188,9 @@ struct checked_segment_block final {
     // From the block's first byte to its child's.
     byte_count child_offset;
     byte_count child_bytes;
+    segment_block_stamps stamps;
+    // As the owner wrote it: no record is walked to recompute it.
+    runtime::wall_time max_record_time;
     bool operator==(const checked_segment_block&) const noexcept = default;
 };
 
@@ -190,7 +211,7 @@ encode_segment_header(
   kwaque::bytes::allocation_charge_fn charge,
   codec::field_context context = {});
 
-// expected is independently pinned, including logical origin and profile.
+// expected is independently pinned, including the profile.
 // The caller supplies the actual file position; only zero is valid for a
 // header. Reserve the input once before entry. Shared work/abort/input remain
 // alive, unmoved and exclusive until joined completion. Failure restores
@@ -210,10 +231,12 @@ decode_segment_header(
 // child's backing/metadata and new fixed/padding/envelope staging. Other live
 // owners and verified native/frame costs are excluded. Exact child bytes pass
 // through unchanged; narrower semantic policy revalidates without re-encoding.
+// A block never pads: the envelope after it in its write starts where it ends.
 [[nodiscard]] seastar::future<codec::result<segment_block>>
 encode_segment_block(
   encoded_assigned_batch&& child,
   segment_block_expectation expected,
+  segment_block_stamps stamps,
   codec::cooperative_work& work,
   byte_count parent_remaining,
   kwaque::bytes::allocation_charge_fn charge,
@@ -254,6 +277,25 @@ decode_segment_block(
 check_segment_block(
   kwaque::bytes::fragmented_buffer_parser& input,
   segment_block_expectation expected,
+  codec::decode_budget memory,
+  codec::cooperative_work& work,
+  codec::field_context context = {},
+  codec::input_boundary boundary = codec::input_boundary::open);
+
+// The stamps of a block where only its position is known: after a segment's
+// first damage, where the physical begin of what follows is not. The
+// envelope's checksums first, then that the block names `segment` and lies at
+// `position`, then its stamps against the data start and that position. No
+// child byte is decoded. Wrong context means another segment's or another
+// position's block, which is no evidence of this segment's. The same borrow
+// and transaction contract as decode_segment_block().
+[[nodiscard]] seastar::future<codec::result<segment_block_stamps>>
+peek_segment_block_stamps(
+  kwaque::bytes::fragmented_buffer_parser& input,
+  segment_context segment,
+  storage_alignment alignment,
+  runtime::file_position data_start,
+  runtime::file_position position,
   codec::decode_budget memory,
   codec::cooperative_work& work,
   codec::field_context context = {},

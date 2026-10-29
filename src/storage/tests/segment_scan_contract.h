@@ -8,6 +8,7 @@
 #include "src/storage/tests/wal_scan_contract.h"
 
 #include <algorithm>
+#include <array>
 #include <map>
 #include <string>
 #include <vector>
@@ -54,12 +55,14 @@ inline std::string active_a() {
            + local_fixture::read("footer_a");
 }
 // One request of segment A, framed for this store's segment exactly as the
-// block fixtures are.
+// block fixtures are: A1 appended at 1 ns, A2 and every later request at
+// 2 ns, each certifying nothing.
 inline std::string block_a(
   std::uint64_t logical,
   std::uint64_t physical,
   std::uint64_t position,
-  bool compressed = false) {
+  bool compressed = false,
+  std::int64_t append_time = 1) {
     return block_wire(
       data_child(logical, false, compressed),
       {segment_write_context::make(
@@ -69,21 +72,45 @@ inline std::string block_a(
          runtime::file_position{position})
          .value(),
        runtime::file_position{4096},
-       batch_expected()});
+       batch_expected()},
+      32,
+      segment_block_stamps{
+        runtime::wall_time{append_time}, runtime::file_position{4096}});
 }
-// A third request of segment A after footer_a, at 16384.
-inline std::string block_a3() { return block_a(102, 2, 16384); }
-// The footer naming the prefix through block_a3, at 20480.
+// Where A2 and footer_a lie in active_a(): its blocks pack from the data
+// start, and footer_a closes their write at 8192.
+inline std::uint64_t a2_at() {
+    return 4096 + local_fixture::read("block_a1").size();
+}
+inline std::uint64_t footer_a_at() {
+    return a2_at() + local_fixture::read("block_a2").size();
+}
+// A third request of segment A after footer_a, at 8192, and where the footer
+// that closes it begins; that footer ends at 12288.
+inline std::string block_a3() { return block_a(102, 2, 8192, false, 2); }
+inline std::uint64_t footer_a3_at() { return 8192 + block_a3().size(); }
+// What a footer over segment A's blocks records of their times: A1 first
+// appended at 1 ns, the latest at 2 ns, and every child's records at the
+// same time.
+inline boundary_times times_a() {
+    return {
+      runtime::wall_time{1},
+      runtime::wall_time{2},
+      runtime::wall_time{max_record_time(data_child())}};
+}
+// The footer naming the prefix through block_a3, right after it.
 inline std::string footer_a3(std::uint32_t crc_delta = 0) {
     const auto stored = local_fixture::read("block_a1")
                         + local_fixture::read("block_a2")
                         + local_fixture::read("footer_a") + block_a3();
+    const auto at = footer_a3_at();
     return footer_wire(
-      {scope(100, 103, 0, 3, 4096, 20480),
+      {scope(100, 103, 0, 3, 4096, at),
        3,
-       scope(102, 103, 2, 3, 16384, 20480),
+       scope(102, 103, 2, 3, 8192, at),
+       times_a(),
        crc(stored) + crc_delta},
-      {history_a(), runtime::file_position{20480}});
+      {history_a(), runtime::file_position{at}});
 }
 inline local_footer_reference
 footer_reference(const std::string& footer, std::uint64_t position) {
@@ -147,12 +174,76 @@ seastar::future<segment_scan_report> walk(
         observe_objects{&out})));
 }
 
-// A walk resumes after its pinned footer without reading the prefix it
-// covers, checks every later footer in the same pass, and ends at its first
-// damage with the last verifying footer as the recovered boundary. No byte
-// changes.
+// The walk restart runs: to the first damage, then on through the rest of
+// the file, once, for the stamps of intact blocks of the segment.
 template<typename Backend, typename Owner, typename Driver>
-seastar::future<> resume_and_tails(
+seastar::future<segment_scan_report> proving_walk(
+  Backend& files,
+  Owner& owner,
+  const local_device_spec& spec,
+  workload_budget& budget,
+  std::optional<local_footer_reference> pin,
+  Driver drive,
+  segment_history_context history = history_a()) {
+    seastar::abort_source abort;
+    codec::cooperative_work work{codec::limits::defaults(), abort};
+    auto handle = take(
+      budget.try_reserve(scan_limits().metadata.execution_bytes));
+    auto file = take(
+      co_await drive.lifecycle(
+        storage::detail::open_local_segment_data(
+          files, owner, spec, 0, history, handle, work)));
+    runtime::first_failure failed;
+    std::optional<segment_scan_report> report;
+    std::unique_ptr<segment_scanner> scanner;
+    try {
+        scanner = take(
+          co_await drive.lifecycle(
+            segment_scanner::make(
+              file, budget, history, pin, scan_limits(), work)));
+        while (take(co_await drive.lifecycle(scanner->next(work)))) {
+        }
+        take(co_await drive.lifecycle(scanner->prove(work)));
+        report = scanner->report();
+    } catch (...) {
+        failed.observe(std::current_exception());
+    }
+    if (scanner) co_await drive.lifecycle(scanner->close());
+    scanner.reset();
+    failed.observe(co_await drive.lifecycle(file.close()));
+    take(failed.outcome());
+    co_return *report;
+}
+// A block of `target` at `position` whose stamp says a barrier had covered
+// its segment up to `certified` when its group formed.
+inline std::string stamped_block(
+  std::uint64_t logical,
+  std::uint64_t physical,
+  std::uint64_t position,
+  std::uint64_t certified,
+  segment_context target = segment()) {
+    return block_wire(
+      data_child(logical),
+      {segment_write_context::make(
+         target,
+         alignment(4096),
+         model::segment_relative_end{physical},
+         runtime::file_position{position})
+         .value(),
+       runtime::file_position{4096},
+       batch_expected()},
+      32,
+      segment_block_stamps{
+        runtime::wall_time{2}, runtime::file_position{certified}});
+}
+
+// A recycled file's earlier bytes are another segment's: where this
+// segment's next object belongs, another segment's intact block or another
+// family's object ends an uncertified tail and is marked stale, never
+// content and never damage. An intact object of this segment that the walk
+// refuses is not stale.
+template<typename Backend, typename Owner, typename Driver>
+seastar::future<> stale_objects(
   Backend& files,
   Owner& owner,
   const local_device_spec& spec,
@@ -160,13 +251,209 @@ seastar::future<> resume_and_tails(
   Driver drive) {
     co_await scan_contract::seed_targets(files, owner, spec, budget, drive);
     const auto path = data_path(spec, segment());
+    const auto header = local_fixture::read("data_header_a");
+    std::vector<scanned> out;
+    struct stale_case final {
+        std::string object;
+        bool stale;
+    };
+    const std::array cases{
+      // Segment B's first block, where segment A's first block belongs.
+      stale_case{local_fixture::read("block_b1"), true},
+      // Another segment's sealed root: no block or footer at all.
+      stale_case{local_fixture::read("empty_sealed"), true},
+      // Segment A's own block, at another physical ordinal.
+      stale_case{block_a(100, 1, 4096), false}};
+    for (const auto& item : cases) {
+        co_await write_bytes(files, path, header + item.object, drive);
+        const auto report = co_await walk(
+          files, owner, spec, budget, history_a(), std::nullopt, out, drive);
+        require(
+          report.complete && out.empty() && report.suffix_blocks == 0
+            && report.content_end.value() == 4096 && !report.boundary
+            && report.stop == segment_scan_stop::foreign && report.intact
+            && report.stale == item.stale
+            && report.verdict == segment_scan_verdict::uncertified_tail,
+          "a recycled file's earlier bytes were misread");
+        require(
+          (co_await read_bytes(files, path, drive)) == header + item.object,
+          "the walk changed a recycled file");
+    }
+}
+
+// Segment B's groups as a recycled file still holds them past where segment
+// A's writes ended: from `position` to `end`, one block and the footer that
+// pads it to its unit a group, each block's stamp certifying B's bytes up to
+// the block itself.
+inline std::string stale_b(std::uint64_t position, std::uint64_t end) {
+    std::string out;
+    std::uint64_t logical = 1001;
+    std::uint64_t physical = 1;
+    for (auto at = position; at < end; at += 4096, ++logical, ++physical) {
+        const auto block = stamped_block(
+          logical, physical, at, at, segment_b());
+        const auto footer_at = at + block.size();
+        out
+          += block
+             + footer_wire(
+               {scope(1000, logical + 1, 0, physical + 1, 4096, footer_at),
+                static_cast<std::uint32_t>(physical + 1),
+                scope(
+                  logical, logical + 1, physical, physical + 1, at, footer_at),
+                times_a(),
+                crc(block)},
+               {history_b(), runtime::file_position{footer_at}});
+    }
+    return out;
+}
+
+// A recycled file's earlier life past this segment's own writes: a whole
+// earlier segment's blocks and footers at the positions it wrote them, or
+// its footer alone right after this segment's last. The walk ends at the
+// first of them, an uncertified tail, with this segment's last footer as the
+// boundary: a stale footer is never the boundary, and a stale block's stamp
+// proves nothing, also when restart's walk reads on through the file. A
+// torn first write that mixes new sectors with stale ones is an uncertified
+// tail with no boundary: where a new sector ends inside a block the block is
+// corrupt, and where the first sector is stale the walk ends there.
+template<typename Backend, typename Owner, typename Driver>
+seastar::future<> stale_tails(
+  Backend& files,
+  Owner& owner,
+  const local_device_spec& spec,
+  workload_budget& budget,
+  Driver drive) {
+    co_await scan_contract::seed_targets(files, owner, spec, budget, drive);
+    const auto path = data_path(spec, segment());
+    const auto header = local_fixture::read("data_header_a");
+    const auto a1 = local_fixture::read("block_a1");
+    // Segment B's first write, where segment A's first write lies.
+    const auto b_first = local_fixture::read("block_b1")
+                         + local_fixture::read("footer_b");
+    const auto first_write = active_a().substr(4096);
+    const auto through_a3 = active_a() + block_a3() + footer_a3();
+    const auto b_footer = [](std::uint64_t at) {
+        return footer_wire(
+          {scope(1000, 1001, 0, 1, 4096, at),
+           1,
+           scope(1000, 1001, 0, 1, 4096, at),
+           times_a(),
+           crc(local_fixture::read("block_b1"))},
+          {history_b(), runtime::file_position{at}});
+    };
+    struct stale_tail final {
+        std::string bytes;
+        std::optional<std::uint64_t> boundary;
+        std::uint32_t suffix;
+        std::uint64_t content_end;
+        segment_scan_stop stop;
+        bool stale;
+        const char* message;
+    };
+    const std::array cases{
+      stale_tail{
+        active_a() + stale_b(8192, 16384),
+        footer_a_at(),
+        0,
+        8192,
+        segment_scan_stop::foreign,
+        true,
+        "an earlier segment's groups after this segment's own were read as "
+        "its tail"},
+      stale_tail{
+        active_a() + b_footer(8192),
+        footer_a_at(),
+        0,
+        8192,
+        segment_scan_stop::foreign,
+        true,
+        "a stale footer after this segment's last became its boundary"},
+      stale_tail{
+        through_a3 + b_footer(12288) + stale_b(16384, 20480),
+        footer_a3_at(),
+        0,
+        12288,
+        segment_scan_stop::foreign,
+        true,
+        "a stale footer after this segment's later footer became its "
+        "boundary"},
+      stale_tail{
+        header + first_write.substr(0, 512) + b_first.substr(512),
+        std::nullopt,
+        1,
+        4096 + a1.size(),
+        segment_scan_stop::corrupt,
+        false,
+        "a first write whose later sectors are stale was not an uncertified "
+        "tail after its last whole block"},
+      stale_tail{
+        header + b_first.substr(0, 512) + first_write.substr(512),
+        std::nullopt,
+        0,
+        4096,
+        segment_scan_stop::foreign,
+        true,
+        "a first write whose first sector is stale was not an uncertified "
+        "tail at its start"},
+    };
+    std::vector<scanned> out;
+    for (const auto& test : cases) {
+        co_await write_bytes(files, path, test.bytes, drive);
+        const auto walked = co_await walk(
+          files, owner, spec, budget, history_a(), std::nullopt, out, drive);
+        const auto proved = co_await proving_walk(
+          files, owner, spec, budget, std::nullopt, drive);
+        // Only the visiting walk says whether it went to the end.
+        require(walked.complete, test.message);
+        for (const auto* report : {&walked, &proved})
+            require(
+              report->suffix_blocks == test.suffix
+                && report->content_end.value() == test.content_end
+                && report->stop == test.stop && report->stale == test.stale
+                && report->verdict == segment_scan_verdict::uncertified_tail
+                && report->proven_end.value() == 4096
+                && (test.boundary
+                      ? report->boundary
+                          && report->boundary->footer.position().value()
+                               == *test.boundary
+                      : !report->boundary),
+              test.message);
+        require(
+          (co_await read_bytes(files, path, drive)) == test.bytes,
+          "walking a recycled file changed it");
+    }
+}
+
+// A walk resumes after its pinned footer without reading the prefix it
+// covers, checks every later footer in the same pass, and ends at its first
+// damage with the last verifying footer as the recovered boundary. No byte
+// changes.
+template<
+  typename Backend,
+  typename Owner,
+  typename Driver,
+  typename Reads = store_contract::uncounted_reads>
+seastar::future<> resume_and_tails(
+  Backend& files,
+  Owner& owner,
+  const local_device_spec& spec,
+  workload_budget& budget,
+  Driver drive,
+  Reads reads = {}) {
+    co_await scan_contract::seed_targets(files, owner, spec, budget, drive);
+    const auto path = data_path(spec, segment());
     const auto footer_a = local_fixture::read("footer_a");
-    const auto pin = footer_reference(footer_a, 12288);
+    const auto pin = footer_reference(footer_a, footer_a_at());
     require(pin == active_boundary(), "pinned footer reference changed");
     require(
       block_a(100, 0, 4096) == local_fixture::read("block_a1")
-        && block_a(101, 1, 8192) == local_fixture::read("block_a2"),
+        && block_a(101, 1, a2_at(), false, 2)
+             == local_fixture::read("block_a2"),
       "segment A blocks are not framed as the block fixtures");
+    require(
+      footer_a_at() + footer_a.size() == 8192
+        && footer_a3_at() + footer_a3().size() == 12288,
+      "segment A's writes do not end on the boundaries the cases need");
     const auto header = local_fixture::read("data_header_a");
     std::vector<scanned> out;
     const auto expect = [&](
@@ -190,20 +477,26 @@ seastar::future<> resume_and_tails(
 
     // From the data start: two blocks under footer_a.
     co_await write_bytes(files, path, active_a(), drive);
+    auto read_before = reads(path);
     auto report = co_await walk(
       files, owner, spec, budget, history_a(), std::nullopt, out, drive);
+    // Each byte after the header is read once.
+    if (auto read_after = reads(path); read_after && read_before)
+        require(
+          *read_after - *read_before == active_a().size() - header.size(),
+          "an unpinned walk read a byte twice");
     expect(
       report,
-      12288,
+      footer_a_at(),
       0,
-      16384,
+      8192,
       segment_scan_stop::end,
       segment_scan_verdict::clean,
       "unpinned walk lost its footer-covered history");
     require(
       report.boundary->footer == pin
         && report.boundary->fields.coverage
-             == scope(100, 102, 0, 2, 4096, 12288)
+             == scope(100, 102, 0, 2, 4096, footer_a_at())
         && report.boundary->fields.block_count == 2
         && report.boundary->fields.data_crc32c
              == crc(
@@ -212,40 +505,48 @@ seastar::future<> resume_and_tails(
       "recovered boundary differs from the footer's independent fields");
     require(
       out.size() == 3 && out[0].block && out[0].position == 4096 && out[1].block
-        && out[1].position == 8192 && !out[2].block && out[2].position == 12288,
+        && out[1].position == a2_at() && !out[2].block
+        && out[2].position == footer_a_at(),
       "walk did not visit complete objects in file order");
 
     // Resumed at the pin: only later objects are visited, and their footer
     // verifies against the seeded prefix.
     const auto full = active_a() + block_a3() + footer_a3();
     co_await write_bytes(files, path, full, drive);
+    read_before = reads(path);
     report = co_await walk(
       files, owner, spec, budget, history_a(), pin, out, drive);
+    // The pinned footer is read once to check its digest, then each byte
+    // after it once; nothing the pin covers is read.
+    if (auto read_after = reads(path); read_after && read_before)
+        require(
+          *read_after - *read_before == footer_a.size() + full.size() - 8192,
+          "a resumed walk read the prefix its pin covers, or a byte twice");
     expect(
       report,
-      20480,
+      footer_a3_at(),
       0,
-      24576,
+      12288,
       segment_scan_stop::end,
       segment_scan_verdict::clean,
       "resumed walk did not reach the later footer");
     require(
       report.pin == pin && out.size() == 2 && out[0].block
-        && out[0].position == 16384 && !out[1].block
+        && out[0].position == 8192 && !out[1].block
         && report.boundary->fields.coverage
-             == scope(100, 103, 0, 3, 4096, 20480),
+             == scope(100, 103, 0, 3, 4096, footer_a3_at()),
       "resumed walk visited the pinned prefix or lost the later footer");
     // The pinned prefix is never read again: zeroing it changes nothing.
-    const auto hollow = header + std::string(8192, '\0') + footer_a + block_a3()
-                        + footer_a3();
+    const auto hollow = header + std::string(footer_a_at() - 4096, '\0')
+                        + footer_a + block_a3() + footer_a3();
     co_await write_bytes(files, path, hollow, drive);
     report = co_await walk(
       files, owner, spec, budget, history_a(), pin, out, drive);
     expect(
       report,
-      20480,
+      footer_a3_at(),
       0,
-      24576,
+      12288,
       segment_scan_stop::end,
       segment_scan_verdict::clean,
       "resumed walk read the pinned prefix");
@@ -266,8 +567,9 @@ seastar::future<> resume_and_tails(
 
     // Tails after the pin: each ends the content at its first damage, the
     // pin stays the boundary and a later valid object is never evidence.
+    // The file ends inside block_a3.
     auto torn_block = block_a3();
-    torn_block.resize(2048);
+    torn_block.resize(torn_block.size() / 2);
     auto corrupt_block = block_a3();
     corrupt_block[40] ^= 1;
     struct tail final {
@@ -276,39 +578,41 @@ seastar::future<> resume_and_tails(
         std::uint64_t content_end;
         segment_scan_stop stop;
     };
+    const auto a3_end = footer_a3_at();
     const std::array tails{
-      tail{std::string(8192, '\0'), 0, 16384, segment_scan_stop::unwritten},
+      tail{std::string(8192, '\0'), 0, 8192, segment_scan_stop::unwritten},
       tail{
         std::string(4096, '\0') + block_a3() + footer_a3(),
         0,
-        16384,
+        8192,
         segment_scan_stop::unwritten},
       tail{
         block_a3() + std::string(4096, '\0'),
         1,
-        20480,
+        a3_end,
         segment_scan_stop::unwritten},
-      tail{torn_block, 0, 16384, segment_scan_stop::torn},
-      tail{corrupt_block + footer_a3(), 0, 16384, segment_scan_stop::corrupt},
+      tail{torn_block, 0, 8192, segment_scan_stop::torn},
+      tail{corrupt_block + footer_a3(), 0, 8192, segment_scan_stop::corrupt},
       // A footer whose data CRC does not cover the scanned bytes.
-      tail{block_a3() + footer_a3(1), 1, 20480, segment_scan_stop::corrupt},
+      tail{block_a3() + footer_a3(1), 1, a3_end, segment_scan_stop::corrupt},
       // A footer naming another prefix than the one scanned.
       tail{
         block_a3()
           + footer_wire(
-            {scope(100, 102, 0, 2, 4096, 12288),
+            {scope(100, 102, 0, 2, 4096, footer_a_at()),
              2,
-             scope(101, 102, 1, 2, 8192, 12288),
+             scope(101, 102, 1, 2, a2_at(), footer_a_at()),
+             times_a(),
              crc(
                local_fixture::read("block_a1")
                + local_fixture::read("block_a2"))},
-            {history_a(), runtime::file_position{20480}}),
+            {history_a(), runtime::file_position{a3_end}}),
         1,
-        20480,
+        a3_end,
         segment_scan_stop::malformed},
       // Another segment's block at the next slot.
       tail{
-        local_fixture::read("block_b1"), 0, 16384, segment_scan_stop::foreign},
+        local_fixture::read("block_b1"), 0, 8192, segment_scan_stop::foreign},
     };
     for (const auto& test : tails) {
         const auto bytes = active_a() + test.bytes;
@@ -317,7 +621,7 @@ seastar::future<> resume_and_tails(
           files, owner, spec, budget, history_a(), pin, out, drive);
         expect(
           report,
-          12288,
+          footer_a_at(),
           test.suffix,
           test.content_end,
           test.stop,
@@ -336,7 +640,7 @@ seastar::future<> resume_and_tails(
       {{header + local_fixture::read("block_a1")
           + local_fixture::read("block_a2") + changed,
         segment_scan_stop::corrupt},
-       {active_a().substr(0, 14336), segment_scan_stop::torn},
+       {active_a().substr(0, footer_a_at() + 1024), segment_scan_stop::torn},
        {header + local_fixture::read("block_a1")
           + local_fixture::read("block_a2") + std::string(4096, '\0'),
         segment_scan_stop::unwritten}}};
@@ -349,13 +653,96 @@ seastar::future<> resume_and_tails(
             && !report.boundary && out.empty(),
           "damage to the pinned footer was not proven corruption");
     }
-    co_await write_bytes(files, path, active_a().substr(0, 8192), drive);
+    co_await write_bytes(
+      files, path, active_a().substr(0, footer_a_at()), drive);
     report = co_await walk(
       files, owner, spec, budget, history_a(), pin, out, drive);
     require(
       report.verdict == segment_scan_verdict::corrupt
         && report.stop == segment_scan_stop::torn,
       "a file shorter than its pin was not proven corruption");
+
+    // Stamps are evidence wherever an intact block of this segment holds
+    // them, its checksums, context and position checked first. Restart reads
+    // on after the first damage, once: an object whose header checksum holds
+    // is passed over by its verified length, so what follows a body that
+    // fails its checksum still counts.
+    const auto a1 = local_fixture::read("block_a1");
+    auto bad_a2 = local_fixture::read("block_a2");
+    bad_a2[300] ^= 1;
+    const auto broken = header + a1 + bad_a2 + footer_a;
+    auto flipped = stamped_block(102, 2, 8192, 8192);
+    flipped[32 + 128] ^= 1;
+    struct proof final {
+        std::string bytes;
+        std::optional<local_footer_reference> pin;
+        std::uint64_t content_end, proven_end;
+        segment_scan_stop stop;
+        const char* message;
+    };
+    const std::array proofs{
+      proof{
+        active_a() + torn_block,
+        pin,
+        8192,
+        8192,
+        segment_scan_stop::torn,
+        "a torn tail with nothing after it was proven"},
+      proof{
+        broken + stamped_block(102, 2, 8192, 8192),
+        std::nullopt,
+        a2_at(),
+        8192,
+        segment_scan_stop::corrupt,
+        "a later block's stamp did not prove the damage before it"},
+      proof{
+        broken + flipped,
+        std::nullopt,
+        a2_at(),
+        4096,
+        segment_scan_stop::corrupt,
+        "a stamp that failed its checksum counted"},
+      proof{
+        broken + stamped_block(102, 0, 8192, 8192, segment_b()),
+        std::nullopt,
+        a2_at(),
+        4096,
+        segment_scan_stop::corrupt,
+        "another segment's stamp counted"},
+      proof{
+        broken + std::string(4096, '\0') + stamped_block(102, 2, 12288, 12288),
+        std::nullopt,
+        a2_at(),
+        12288,
+        segment_scan_stop::corrupt,
+        "a stamp after zeros did not count"},
+      // A stamp that moves back along verified content is malformed. The
+      // write ends on its unit: the walk admits objects only below the file
+      // size rounded down to one.
+      proof{
+        active_a() + stamped_block(102, 2, 8192, 8192)
+          + stamped_block(103, 3, 8192 + block_a3().size(), 4096)
+          + std::string(4096 - 2 * block_a3().size(), '\0'),
+        pin,
+        8192 + block_a3().size(),
+        8192,
+        segment_scan_stop::malformed,
+        "a decreasing stamp was accepted"},
+    };
+    for (const auto& test : proofs) {
+        co_await write_bytes(files, path, test.bytes, drive);
+        report = co_await proving_walk(
+          files, owner, spec, budget, test.pin, drive);
+        require(
+          report.content_end.value() == test.content_end
+            && report.proven_end.value() == test.proven_end
+            && report.stop == test.stop
+            && report.verdict == segment_scan_verdict::uncertified_tail,
+          test.message);
+        require(
+          (co_await read_bytes(files, path, drive)) == test.bytes,
+          "proving a tail changed segment bytes");
+    }
 }
 
 template<typename Backend, typename Owner, typename Driver>
@@ -369,7 +756,15 @@ seastar::future<local_recovery_generation> open_generation(
     codec::cooperative_work work{codec::limits::defaults(), abort};
     co_return take(
       co_await drive.lifecycle(open_recovery_generation(
-        files, owner, spec, 0, descriptor(), budget, limits(), work)));
+        files,
+        owner,
+        spec,
+        0,
+        descriptor(),
+        history_a().logical_origin,
+        budget,
+        limits(),
+        work)));
 }
 template<typename Backend, typename Owner, typename Driver>
 seastar::future<runtime::result<void>> try_open_generation(
@@ -381,7 +776,15 @@ seastar::future<runtime::result<void>> try_open_generation(
     seastar::abort_source abort;
     codec::cooperative_work work{codec::limits::defaults(), abort};
     auto opened = co_await drive.lifecycle(open_recovery_generation(
-      files, owner, spec, 0, descriptor(), budget, limits(), work));
+      files,
+      owner,
+      spec,
+      0,
+      descriptor(),
+      history_a().logical_origin,
+      budget,
+      limits(),
+      work));
     if (!opened) co_return runtime::failure(opened.error());
     if (opened->owner) {
         opened->owner->retire();
@@ -431,15 +834,6 @@ seastar::future<> publication_pins(
         && generation.history == history_a(),
       "active publication did not yield its pinned resume point");
     co_await close_generation(generation, drive);
-    co_await write_bytes(
-      files, published, local_fixture::read("publication_snapshot"), drive);
-    generation = co_await open_generation(files, owner, spec, budget, drive);
-    require(
-      generation.resume == active_boundary() && generation.owner
-        && generation.owner->pin()->root(
-          local_root_kind::completed_retry_snapshot),
-      "active publication lost its completed-retry snapshot");
-    co_await close_generation(generation, drive);
 
     // Sealed, with every root.
     co_await write_bytes(
@@ -470,7 +864,6 @@ seastar::future<> publication_pins(
     // Mandatory evidence: missing, or a valid object other than the pinned
     // one, rejects.
     const auto retry = object(41);
-    const auto snapshot = object(40);
     const auto rejects = [&](const char* message) -> seastar::future<> {
         auto result = co_await try_open_generation(
           files, owner, spec, budget, drive);
@@ -479,23 +872,10 @@ seastar::future<> publication_pins(
     take(co_await drive.lifecycle(files.remove_file(retry)));
     co_await rejects("a missing sealed retry root was accepted");
     co_await write_bytes(
-      files, retry, local_fixture::read("snapshot_page"), drive);
+      files, retry, local_fixture::read("index_page"), drive);
     co_await rejects("another valid object stood in for sealed retry pages");
     co_await write_bytes(
       files, retry, local_fixture::read("sealed_retry_page"), drive);
-    co_await write_bytes(
-      files,
-      snapshot,
-      local_fixture::read("root_page_digest")
-        + local_fixture::read("snapshot_page"),
-      drive);
-    co_await rejects("a snapshot root with another identity was accepted");
-    co_await write_bytes(
-      files,
-      snapshot,
-      local_fixture::read("snapshot_root")
-        + local_fixture::read("snapshot_page"),
-      drive);
     const auto data = data_path(spec, segment());
     auto sealed = local_fixture::read("sealed_a");
     sealed[1000] ^= 1;
@@ -603,8 +983,8 @@ struct classify_prepares final {
           found->blocks.begin(), found->blocks.end(), [&](const auto& kept) {
               return kept.position == position;
           });
-        slot.placed = found->history.alignment.aligned(target.position())
-                      && target.position() >= found->history.data_start
+        // Blocks pack: a slot may begin anywhere after the data start.
+        slot.placed = target.position() >= found->history.data_start
                       && (block != found->blocks.end() || !slot.covered);
         std::optional<segment_block> decoded;
         if (block != found->blocks.end()) {
@@ -773,13 +1153,16 @@ seastar::future<> recovery_classification(
         "@content",
         "@uncertified_tail",
         "a PREPARE after the head's first damage became a candidate"},
+      // The write of A1, A2 and footer_a tore after A2: the rest of its unit
+      // was never written.
       shape{
-        active_a().substr(0, 12288),
+        active_a().substr(0, footer_a_at())
+          + std::string(8192 - footer_a_at(), '\0'),
         interleaved,
-        {"@suffix_sourced", "@suffix_sourced", "@satisfied"},
+        {"@found_candidate", "@found_candidate", "@satisfied"},
+        "@uncertified_tail",
         "@content",
-        "@content",
-        "blocks after the boundary were not an unresolved suffix"},
+        "blocks after the boundary with no footer were not candidates"},
       shape{
         header_a,
         interleaved,
@@ -790,10 +1173,10 @@ seastar::future<> recovery_classification(
       // The same request encoded differently at A2's slot; footer_a no
       // longer covers those bytes.
       shape{
-        header_a + local_fixture::read("block_a1") + block_a(101, 1, 8192, true)
-          + local_fixture::read("footer_a"),
+        header_a + local_fixture::read("block_a1")
+          + block_a(101, 1, a2_at(), true, 2) + local_fixture::read("footer_a"),
         interleaved,
-        {"@suffix_sourced", "@differing_copies", "@satisfied"},
+        {"@found_candidate", "@differing_copies", "@satisfied"},
         "@uncertified_tail",
         "@content",
         "differing copies of one slot were not a conflict"},
@@ -805,7 +1188,7 @@ seastar::future<> recovery_classification(
           files, owner, spec, budget, drive);
         require(
           label(first.slots, segment(), 4096) == test.slots[0]
-            && label(first.slots, segment(), 8192) == test.slots[1]
+            && label(first.slots, segment(), a2_at()) == test.slots[1]
             && label(first.slots, segment_b(), 4096) == test.slots[2],
           test.message);
         require(

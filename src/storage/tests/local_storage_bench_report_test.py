@@ -218,6 +218,133 @@ class LocalStorageReportTest(unittest.TestCase):
             with self.assertRaises(ValueError):
                 report.pairs([baseline, changed])
 
+    def test_placed_scopes_keep_their_own_cut(self):
+        segment = placed("segment_placed")
+        report.validate(segment)
+        report.validate(placed("wal_placed"))
+        for mutate in (
+            lambda r: r.update(wal_groups=1, wal_flushes=1),
+            lambda r: r.update(footers=2),
+            lambda r: r.update(ack_ns=0),
+            lambda r: r.update(ack_ns=r["elapsed_ns"] + 1),
+        ):
+            row = copy.deepcopy(segment)
+            mutate(row)
+            with self.assertRaises(ValueError):
+                report.validate(row)
+        with self.assertRaises(ValueError):
+            report.validate(placed("wal_placed") | {"wal_groups": 0, "wal_flushes": 0})
+
+    def test_placement_compares_equal_segment_work(self):
+        baseline = placed("baseline")
+        segment = placed("segment_placed") | {
+            "ack_ns": 500,
+            "elapsed_ns": 500,
+            "reactor_write_bytes": 4096,
+        }
+        wal = placed("wal_placed") | {"ack_ns": 250, "elapsed_ns": 900}
+        held = placed("wal_held") | {"ack_ns": 200, "elapsed_ns": 800}
+        result = report.placement([baseline, segment, wal, held])
+        self.assertAlmostEqual(
+            result[0]["wal_held"]["ack_ns_per_request_to_baseline"], 0.2
+        )
+        with self.assertRaises(ValueError):
+            report.placement([baseline, held | {"wal_digest": "c" * 32}])
+        self.assertEqual(len(result), 1)
+        self.assertAlmostEqual(
+            result[0]["segment_placed"]["ack_ns_per_request_to_baseline"], 0.5
+        )
+        self.assertAlmostEqual(
+            result[0]["segment_placed"]["device_write_bytes_to_baseline"], 0.5
+        )
+        self.assertAlmostEqual(
+            result[0]["wal_placed"]["ack_ns_per_request_to_baseline"], 0.25
+        )
+        self.assertAlmostEqual(
+            result[0]["wal_placed"]["elapsed_ns_per_request_to_baseline"], 0.9
+        )
+        for scope, mutate in (
+            ("segment_placed", lambda r: r.update(segment_digest=["c" * 32])),
+            ("segment_placed", lambda r: r.update(child_bytes=401)),
+            ("wal_placed", lambda r: r.update(wal_digest="c" * 32)),
+        ):
+            changed = copy.deepcopy(segment if scope == "segment_placed" else wal)
+            mutate(changed)
+            with self.assertRaises(ValueError):
+                report.placement([baseline, changed])
+        unmeasured = copy.deepcopy(baseline)
+        del unmeasured["ack_ns"]
+        with self.assertRaises(ValueError):
+            report.placement([unmeasured, segment])
+
+
+class SynchronizedWritesTest(unittest.TestCase):
+    def test_a_synchronized_barrier_needs_writes_or_a_flush(self):
+        report.validate(synchronized())
+        report.validate(synchronized("segment_placed"))
+        for mutate in (
+            lambda r: r.update(wal_synchronized_writes=0),
+            lambda r: r["data"].update(synchronized_calls=0),
+            lambda r: r["data"].update(synchronized_calls=5),
+            lambda r: r.update(wal_barrier="extending", data_barrier="extending"),
+        ):
+            row = synchronized()
+            mutate(row)
+            with self.assertRaises(ValueError):
+                report.validate(row)
+
+    def test_writes_compares_zero_written_against_growing_files(self):
+        growing = placed("baseline")
+        zeroed = synchronized() | {"ack_ns": 400, "elapsed_ns": 500}
+        result = report.writes([growing, zeroed])
+        self.assertEqual(len(result), 1)
+        self.assertAlmostEqual(
+            result[0]["zero_written"]["ack_ns_per_request_to_growing"], 0.4
+        )
+        self.assertEqual(result[0]["zero_written"]["data_synchronized_writes"], 1)
+        changed = copy.deepcopy(zeroed)
+        changed["segment_digest"] = ["c" * 32]
+        with self.assertRaises(ValueError):
+            report.writes([growing, changed])
+        # Placement keeps the two kinds of file apart.
+        self.assertEqual(report.placement([growing, zeroed]), [])
+
+
+def synchronized(scope="baseline"):
+    row = placed(scope)
+    row.update(
+        wal_barrier="synchronized",
+        data_barrier="synchronized",
+        wal_flushes=0,
+        wal_synchronized_writes=1,
+        reactor_flushes=0,
+    )
+    row["wal"] = kind([]) | {"calls": 1, "synchronized_calls": 1}
+    row["data"] = kind([]) | {"calls": 1, "synchronized_calls": 1}
+    if scope == "segment_placed":
+        row.update(wal_synchronized_writes=0)
+        row["wal"] = kind([])
+    return row
+
+
+def placed(scope):
+    row = measurement(scope)
+    row.update(
+        case="small_one",
+        ack_ns=1000,
+        wal_barrier="extending",
+        data_barrier="extending",
+        reactor_flushes=2,
+        reactor_writes=2,
+        reactor_write_bytes=8192,
+        reactor_reads=0,
+        reactor_read_bytes=0,
+    )
+    if scope == "segment_placed":
+        row.update(wal_groups=0, wal_flushes=0, wal_writes=0, reactor_flushes=1)
+        row["wal"] = kind([])
+    return row
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -93,7 +93,7 @@ TEST(LocalMetadataFuzzCasesTest, EveryKindHasARecord) {
     std::set<std::uint16_t> kinds;
     for (const auto record : one_of_each_kind())
         kinds.insert(local_fixture_cases[record].kind);
-    EXPECT_EQ(kinds.size(), 12U);
+    EXPECT_EQ(kinds.size(), 10U);
 }
 
 // Every single bit of one record of each kind, flipped with nothing made

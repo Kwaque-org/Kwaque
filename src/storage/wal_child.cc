@@ -31,8 +31,9 @@ runtime::result<void> wal_child_limits::validate() const noexcept {
 runtime::result<admitted_wal_batch> admitted_wal_batch::make(
   encoded_assigned_batch batch,
   workload_reservation backing,
+  runtime::wall_time append_time,
   bytes::allocation_charge_fn charge) {
-    if (batch.bytes().empty())
+    if (batch.bytes().empty() || append_time.unix_nanoseconds() < 1)
         return runtime::failure(child_error(errc::invalid_argument));
     auto cost = batch.bytes().allocation_cost(charge);
     if (!cost) return runtime::failure(child_error(cost.error()));
@@ -40,7 +41,8 @@ runtime::result<admitted_wal_batch> admitted_wal_batch::make(
     if (total) total = total->checked_add(cost->share_controls);
     if (!total || *total > backing.retained_bytes())
         return runtime::failure(child_error(errc::resource_exhausted));
-    return admitted_wal_batch{{std::move(backing), {}, std::move(batch)}};
+    return admitted_wal_batch{
+      {std::move(backing), {}, std::move(batch), append_time}};
 }
 
 seastar::future<runtime::result<wal_prepared_children>> prepare_wal_children(
@@ -140,7 +142,8 @@ seastar::future<runtime::result<wal_prepared_children>> prepare_wal_children(
     admitted_wal_batch second{
       {input->value_.backing.share(),
        std::move(alias_reservation),
-       std::move(*alias)}};
+       std::move(*alias),
+       input->value_.append_time}};
     co_return wal_prepared_children{
       std::move(preparation),
       std::move(*input),

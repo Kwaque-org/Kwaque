@@ -1,6 +1,7 @@
 #pragma once
 
 #include "src/runtime/shard_affinity.h"
+#include "src/storage/placement_statistics.h"
 #include "src/storage/segment_writer_state.h"
 #include "src/storage/wal_child.h"
 
@@ -8,6 +9,8 @@
 #include <seastar/core/gate.hh>
 
 namespace kwaque::storage {
+// A group frozen to be held completes once its run keeps its bytes, with
+// nothing written: whatever barrier covers the run tells how its write went.
 struct segment_write_completion final {
     std::optional<workload_reservation> reservation;
     runtime::first_failure failure;
@@ -44,6 +47,8 @@ public:
     void fail(std::exception_ptr) noexcept;
     void abandon() noexcept;
     void notify() noexcept;
+    // The bytes its write covers: its own, after those of the run it
+    // closes.
     [[nodiscard]] model::file_byte_span extent() const noexcept;
 
     workload_reservation control;
@@ -68,8 +73,21 @@ public:
     seastar::gate execution;
     runtime::first_failure failure;
     byte_count gather_credit{}, retained_bound{};
+    // Where the run it closes begins, once it has taken that run's bytes,
+    // and what those copies are charged to until they are hashed.
+    std::optional<runtime::file_position> run_begin;
+    std::optional<workload_reservation> run_memory;
+    // A held group's run: the chunks it reserved for its copies.
+    std::uint32_t run_chunks{0};
+    // The run held open before it, closed by its freeze, and why.
+    std::optional<segment_run_close> closed_run;
     segment_write_state state{segment_write_state::frozen};
     bool linked{false}, observed{false}, notified{false};
+    // wanted: its durability is wanted now, so its write may go through the
+    // synchronized handle. held: it has no footer, and at assembly its
+    // bytes are copied into its run and everything else of it is let go;
+    // absorbed: that happened.
+    bool wanted{false}, held{false}, absorbed{false};
 };
 } // namespace detail
 
@@ -90,6 +108,12 @@ public:
     const segment_group_layout& layout() const&& = delete;
     [[nodiscard]] std::span<const segment_block> blocks() const& noexcept;
     std::span<const segment_block> blocks() const&& = delete;
+    // Whether its blocks wait unwritten in the run held open.
+    [[nodiscard]] bool held() const noexcept;
+    // The run held open before it, if its freeze closed that run, and why:
+    // with a footer of the run's own before this group, or with this
+    // group's footer once the run reached its hold with it.
+    [[nodiscard]] std::optional<segment_run_close> closed() const noexcept;
 
 private:
     template<

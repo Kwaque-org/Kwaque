@@ -26,7 +26,7 @@ static_assert(!std::default_initializable<range_manifest_root_header>);
 static_assert(!std::default_initializable<range_manifest_page_header>);
 static_assert(
   !std::same_as<model::range_manifest_generation, model::segment_generation>);
-static_assert(628U * sizeof(range_manifest_entry) <= 131072);
+static_assert(545U * sizeof(range_manifest_entry) <= 131072);
 
 template<typename T>
 void error(const codec::result<T>& value, errc code) {
@@ -71,51 +71,105 @@ TEST(RangeManifestFormatTest, EntriesKeepNonAffineAndEmptyPhysicalExtents) {
     EXPECT_TRUE(empty.coverage().physical().empty());
     EXPECT_TRUE(empty.coverage().bytes().empty());
     EXPECT_EQ(empty.digest().bytes(), manifest_digest(""));
+    EXPECT_EQ(data.max_append_time(), runtime::wall_time{1000});
+    EXPECT_EQ(data.max_record_time(), runtime::wall_time{900});
+    EXPECT_EQ(empty.max_append_time(), runtime::wall_time{});
+    EXPECT_EQ(empty.max_record_time(), runtime::wall_time{});
+    const runtime::wall_time none{}, at{1000}, record{900};
     EXPECT_TRUE(
       range_manifest_entry::make(
         data.segment(),
         data.generation(),
         data.coverage(),
-        codec::extent_digest{codec::content_digest{}}));
+        codec::extent_digest{codec::content_digest{}},
+        at,
+        record));
     EXPECT_TRUE(
       range_manifest_entry::make(
         data.segment(),
         data.generation(),
         extent_scope(100, 105, 0, 2, 512, 1024),
-        data.digest()));
+        data.digest(),
+        at,
+        record));
     EXPECT_TRUE(
       range_manifest_entry::make(
         data.segment(),
         data.generation(),
         extent_scope(100, 105, 0, 0, 512, 1024),
-        codec::extent_digest{manifest_digest("footer")}));
+        codec::extent_digest{manifest_digest("footer")},
+        none,
+        none));
     EXPECT_FALSE(
       range_manifest_entry::make(
-        {}, data.generation(), data.coverage(), data.digest()));
+        {}, data.generation(), data.coverage(), data.digest(), at, record));
     EXPECT_FALSE(
       range_manifest_entry::make(
-        data.segment(), {}, data.coverage(), data.digest()));
+        data.segment(), {}, data.coverage(), data.digest(), at, record));
     EXPECT_FALSE(
       range_manifest_entry::make(
         data.segment(),
         data.generation(),
         extent_scope(100, 100, 0, 0, 512, 512),
-        codec::extent_digest{manifest_digest("")}));
+        codec::extent_digest{manifest_digest("")},
+        none,
+        none));
     EXPECT_FALSE(
       range_manifest_entry::make(
         data.segment(),
         data.generation(),
         extent_scope(100, 101, 0, 2, 512, 1024),
-        data.digest()));
+        data.digest(),
+        at,
+        record));
     EXPECT_FALSE(
       range_manifest_entry::make(
         data.segment(),
         data.generation(),
         extent_scope(100, 101, 0, 1, 512, 512),
-        codec::extent_digest{manifest_digest("")}));
+        codec::extent_digest{manifest_digest("")},
+        at,
+        record));
     EXPECT_FALSE(
       range_manifest_entry::make(
-        data.segment(), data.generation(), empty.coverage(), data.digest()));
+        data.segment(),
+        data.generation(),
+        empty.coverage(),
+        data.digest(),
+        none,
+        none));
+    // Times are zero exactly when no record remains; an extent with records
+    // has an append time of at least 1 ns and any record time.
+    EXPECT_TRUE(
+      range_manifest_entry::make(
+        data.segment(),
+        data.generation(),
+        data.coverage(),
+        data.digest(),
+        runtime::wall_time{1},
+        runtime::wall_time{-7}));
+    for (const auto& [append, latest] :
+         std::array<std::pair<runtime::wall_time, runtime::wall_time>, 2>{
+           {{none, record}, {runtime::wall_time{-1}, record}}})
+        EXPECT_FALSE(
+          range_manifest_entry::make(
+            data.segment(),
+            data.generation(),
+            data.coverage(),
+            data.digest(),
+            append,
+            latest));
+    for (const auto& [append, latest] :
+         std::array<std::pair<runtime::wall_time, runtime::wall_time>, 2>{
+           {{at, none}, {none, record}}})
+        EXPECT_FALSE(
+          range_manifest_entry::make(
+            empty.segment(),
+            empty.generation(),
+            empty.coverage(),
+            empty.digest(),
+            append,
+            latest));
 }
 
 TEST(RangeManifestFormatTest, HeadersValidateEmptyRootAndNonemptyPageCounts) {
@@ -195,11 +249,15 @@ TEST(RangeManifestFormatTest, IndependentGoldenRootAndPagePreserveEveryField) {
     const auto wire = expected_page(header, entries);
     EXPECT_EQ(
       wire.substr(0, 32),
-      hex("4b5142460900010001002000e0010000000000000000000046f253c392dc68c6"));
+      hex("4b5142460900010001002000e00100000000000000000000513e48b517dd597b"));
     EXPECT_TRUE(
       std::ranges::equal(
         std::bit_cast<std::array<char, 16>>(manifest_digest(wire)),
-        hex("3817de09f6e1549f9f4488c63b08b58e")));
+        hex("a29c1990b9e622ce960640538c4edfb5")));
+    // Each entry's times follow its digest.
+    EXPECT_EQ(get(wire, 32 + 92 + 104, 8), 1000U);
+    EXPECT_EQ(get(wire, 32 + 92 + 112, 8), 900U);
+    EXPECT_EQ(get(wire, 32 + 92 + 120 + 104, 8), 0U);
     EXPECT_EQ(flat(page->bytes), wire);
     EXPECT_EQ(page->reference, manifest_page_reference(wire, header));
     EXPECT_EQ(header.context(), mc());
@@ -220,13 +278,65 @@ TEST(RangeManifestFormatTest, IndependentGoldenRootAndPagePreserveEveryField) {
     const auto root_wire = expected_root(root_header(), refs);
     EXPECT_EQ(
       root_wire.substr(0, 32),
-      hex("4b5142460900010001002000e0010000000000000000000001699720e60fbd13"));
+      hex("4b5142460900010001002000e001000000000000000000008eb365f6331ab9d8"));
     EXPECT_TRUE(
       std::ranges::equal(
         std::bit_cast<std::array<char, 16>>(manifest_digest(root_wire)),
-        hex("70c7860502b7b86966fead2dd0b2f899")));
+        hex("1e257a62b8c7b8f5d51245b9e40285cf")));
     EXPECT_EQ(flat(root->bytes), root_wire);
     EXPECT_EQ(root->digest.bytes(), manifest_digest(root_wire));
+}
+
+// A time search picks an extent by its latest append time, so entries that
+// hold records never go back in it; equal times are allowed, and an empty
+// extent between them carries none.
+TEST(RangeManifestFormatTest, EntriesHoldingRecordsNeverGoBackInAppendTime) {
+    seastar::abort_source abort;
+    codec::cooperative_work work{codec::limits::defaults(), abort};
+    const std::array ordered{
+      item(100, 102, false, 0x30, 7, 1000),
+      item(102, 103, true, 0x80, 9),
+      item(103, 105, false, 0x31, 7, 1000)};
+    const std::array reversed{
+      item(100, 102, false, 0x30, 7, 2000),
+      item(102, 103, true, 0x80, 9),
+      item(103, 105, false, 0x31, 7, 1000)};
+    const auto header = page_header(3);
+    const auto accepted = encode_range_manifest_page(
+                            header,
+                            ordered,
+                            alignment(),
+                            work,
+                            budget().operation_remaining,
+                            charge)
+                            .get();
+    ASSERT_TRUE(accepted.has_value());
+    EXPECT_EQ(flat(accepted->bytes), expected_page(header, ordered));
+    error(
+      encode_range_manifest_page(
+        header,
+        reversed,
+        alignment(),
+        work,
+        budget().operation_remaining,
+        charge)
+        .get(),
+      errc::invalid_argument);
+    // A page whose bytes say otherwise is refused when read.
+    const auto wire = expected_page(header, reversed);
+    const std::array refs{manifest_page_reference(wire, header)};
+    const auto root = pin(
+      expected_root(root_header(3), refs), root_header(3), work);
+    fragmented_buffer_parser input{buffer(wire)};
+    const auto decoded = decode_range_manifest_page(
+                           input,
+                           root,
+                           page_ordinal::make(0).value(),
+                           page_memory(input, root, work),
+                           work)
+                           .get();
+    ASSERT_FALSE(decoded.has_value());
+    EXPECT_EQ(decoded.error().code(), errc::malformed_data);
 }
 
 TEST(RangeManifestFormatTest, MetadataAlignmentDoesNotRewriteExtentLocations) {
@@ -292,7 +402,9 @@ TEST(
                           UINT64_MAX,
                           (std::uint64_t{1} << 48U),
                           (std::uint64_t{1} << 48U) + 512),
-                        codec::extent_digest{manifest_digest("wide")})
+                        codec::extent_digest{manifest_digest("wide")},
+                        runtime::wall_time{INT64_MAX},
+                        runtime::wall_time{INT64_MIN})
                         .value();
     const std::array entries{wide};
     const auto header = page_header(
@@ -336,10 +448,10 @@ TEST(
     ASSERT_TRUE(second.has_value());
     EXPECT_NE(first->reference.digest(), second->reference.digest());
     EXPECT_EQ(
-      flat(first->bytes).substr(32 + 92, 208),
-      flat(second->bytes).substr(32 + 92, 208));
+      flat(first->bytes).substr(32 + 92, 240),
+      flat(second->bytes).substr(32 + 92, 240));
     EXPECT_EQ(get(flat(first->bytes), 32 + 92 + 32, 8), 7U);
-    EXPECT_EQ(get(flat(first->bytes), 32 + 92 + 104 + 32, 8), 9U);
+    EXPECT_EQ(get(flat(first->bytes), 32 + 92 + 120 + 32, 8), 9U);
 }
 
 TEST(
@@ -475,11 +587,11 @@ TEST(RangeManifestFormatTest, RootRequiresExactReferenceTopologyAndTotals) {
       errc::invalid_argument);
     const std::array oversized{
       page_ref::make(
-        page_ordinal::make(0).value(), 0, 628, byte_count{512}, digest)
+        page_ordinal::make(0).value(), 0, 545, byte_count{512}, digest)
         .value()};
     error(
       encode_range_manifest_root(
-        root_header(628, 1, mc(), 0, 628),
+        root_header(545, 1, mc(), 0, 545),
         oversized,
         alignment(),
         work,
@@ -495,21 +607,21 @@ TEST(RangeManifestFormatTest, PageCapacityAndNarrowerPoliciesBoundOutput) {
     EXPECT_EQ(
       range_manifest_page_capacity(byte_count{32}, alignment(), work.policy())
         .value(),
-      628U);
+      545U);
     EXPECT_EQ(
       range_manifest_page_capacity(
         byte_count{4_KiB}, alignment(65536), work.policy())
         .value(),
-      589U);
+      511U);
     std::vector<range_manifest_entry> entries;
-    entries.reserve(629);
-    for (std::uint32_t i = 0; i < 629; ++i)
+    entries.reserve(546);
+    for (std::uint32_t i = 0; i < 546; ++i)
         entries.push_back(item(100U + i, 101U + i, true));
     for (const std::uint64_t a : {512U, 65536U}) {
-        const auto header = page_header(628, mc(), 100, 728);
+        const auto header = page_header(545, mc(), 100, 645);
         const auto page = encode_range_manifest_page(
                             header,
-                            std::span{entries}.first(628),
+                            std::span{entries}.first(545),
                             alignment(a),
                             work,
                             budget().operation_remaining,
@@ -519,11 +631,11 @@ TEST(RangeManifestFormatTest, PageCapacityAndNarrowerPoliciesBoundOutput) {
         EXPECT_LE(page->bytes.size().value(), 65536U);
         EXPECT_EQ(
           flat(page->bytes),
-          expected_page(header, std::span{entries}.first(628), a));
+          expected_page(header, std::span{entries}.first(545), a));
     }
     error(
       encode_range_manifest_page(
-        page_header(629, mc(), 100, 729),
+        page_header(546, mc(), 100, 646),
         entries,
         alignment(),
         work,

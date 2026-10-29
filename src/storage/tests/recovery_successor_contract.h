@@ -3,11 +3,12 @@
 #include "src/base/units.h"
 #include "src/bytes/test_allocation_profile.h"
 #include "src/storage/checkpoint.h"
+#include "src/storage/local_bundle.h"
 #include "src/storage/recovery_inventory.h"
 #include "src/storage/recovery_publication.h"
 #include "src/storage/recovery_successor.h"
 #include "src/storage/retry_lookup.h"
-#include "src/storage/retry_snapshot.h"
+#include "src/storage/retry_summary.h"
 #include "src/storage/tests/checkpoint_coverage_oracle.h"
 #include "src/storage/tests/local_append_contract.h"
 
@@ -16,6 +17,7 @@
 #include <algorithm>
 #include <array>
 #include <cstdint>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <string>
@@ -72,6 +74,19 @@ struct chain_link final {
     model::wal_incarnation_id incarnation;
     std::optional<runtime::file_position> sealed_end;
 };
+// What a crash leaves of a segment whose write at `lost` went astray: from
+// there on the file holds the block at `first` again, then zeros. Those are
+// intact bytes of the segment that its prefix rejects, so restart fills
+// nothing over them, and the PREPARE naming `lost` stays a candidate.
+inline std::string misdirected(
+  std::string image, const model::file_byte_span& first, std::uint64_t lost) {
+    const auto begin = first.begin().value();
+    const auto copy = image.substr(begin, first.end().value() - begin);
+    std::fill(
+      image.begin() + static_cast<std::ptrdiff_t>(lost), image.end(), '\0');
+    image.replace(lost, copy.size(), copy);
+    return image;
+}
 
 // A restart reads everything before it changes anything: the device, every
 // durable decision and the catalog's segments. Then the recovered segment
@@ -134,8 +149,11 @@ seastar::future<> recovered_successor(
                   work),
                 drive);
               const auto& receipt = append_contract::durable(outcome);
+              // Either barrier may publish it; once both have run, the WAL's
+              // durable end is where its group's PREPAREs end.
+              co_await append_contract::covered<Clock>(append, drive, timer);
               before.push_back(
-                {start, receipt.wal.boundary().cursor(), receipt.block});
+                {start, writer.progress()->durable, receipt.block});
           }
       });
     require(
@@ -146,13 +164,13 @@ seastar::future<> recovered_successor(
       spec, old_head->incarnation);
     const auto old_segment = append_contract::segment_path(spec, 1);
 
-    // The crash loses the second group's block and footer: its PREPARE is a
-    // candidate.
-    auto damaged = co_await append_contract::read_segment(
-      files, spec, 1, drive);
+    // The crash loses the second group's block and footer to a write gone
+    // astray: its PREPARE is a candidate.
     const auto lost = before[1].block.records.bytes().begin().value();
-    std::fill(
-      damaged.begin() + static_cast<std::ptrdiff_t>(lost), damaged.end(), '\0');
+    const auto damaged = misdirected(
+      co_await append_contract::read_segment(files, spec, 1, drive),
+      before[0].block.records.bytes(),
+      lost);
     co_await store_contract::write_bytes(files, old_segment, damaged, drive);
     const auto old_bytes = co_await append_contract::read_wal(
       files, spec, old_head->incarnation, drive);
@@ -190,6 +208,10 @@ seastar::future<> recovered_successor(
     std::unique_ptr<segment_type> recovered, fresh;
     std::unique_ptr<append_type> append;
     std::unique_ptr<local_checkpoint<Backend, Owner, Clock>> checkpoint;
+    // Owners a case makes for itself; one a failed check leaves open is
+    // closed below with the others.
+    std::unique_ptr<writer_type> attempt;
+    std::unique_ptr<append_type> small, pair;
     runtime::first_failure failed;
     try {
         // Every durable decision, then the catalog's segments, then
@@ -217,11 +239,9 @@ seastar::future<> recovered_successor(
           "a restart without decisions found one");
         const std::array catalog{recovery_catalog_entry{
           described(1),
-          segment_header::make(
-            append_contract::context(1),
-            model::range_logical_end{100},
-            alignment(8192))
-            .value()}};
+          segment_header::make(append_contract::context(1), alignment(8192))
+            .value(),
+          append_contract::segment_origin()}};
         auto found = take(
           co_await drive.lifecycle(open_recovery_inventory(
             files,
@@ -240,6 +260,7 @@ seastar::future<> recovered_successor(
           "the catalog's segment was not opened as written");
         auto planner = take(recovery_planner::make(targets, budget));
         std::vector<recovery_obligation> rows;
+        recovery_tails tails;
         auto merged = take(
           co_await drive.lifecycle(reconcile_local_recovery(
             files,
@@ -253,7 +274,9 @@ seastar::future<> recovered_successor(
             budget,
             merge_limits(),
             work,
-            restart_view{&planner, &rows})));
+            restart_view{&planner, &rows},
+            std::nullopt,
+            &tails)));
         take(planner.finish(merged));
         const auto content_end = before[1].end;
         require(
@@ -284,6 +307,8 @@ seastar::future<> recovered_successor(
               0,
               planner,
               found,
+              tails,
+              spec,
               std::span<const recovery_visibility>{},
               budget,
               segment_configuration(45),
@@ -310,7 +335,7 @@ seastar::future<> recovered_successor(
         // A cursor the head's bytes do not hold activates nothing and
         // changes nothing; nor does a plan that is not ready.
         {
-            auto attempt = take(
+            attempt = take(
               writer_type::make(
                 *control,
                 *ids,
@@ -346,6 +371,7 @@ seastar::future<> recovered_successor(
               !beyond && beyond.error().code() == errc::wrong_context,
               "a successor was activated past the head's bytes");
             static_cast<void>(co_await drive.lifecycle(attempt->close()));
+            attempt.reset();
         }
         require(
           take(control->snapshot()).fields.wal_head == *old_head,
@@ -419,7 +445,7 @@ seastar::future<> recovered_successor(
         take(commit->template start<Clock>(timer));
 
         // Restored obligations take table rows; a table without room for
-        // them all takes none.
+        // them all takes none. One request and one segment give three.
         const auto pinned =
           [&](std::uint64_t generation, local_wal_cursor first) {
               return local_pinned_obligation{
@@ -429,7 +455,7 @@ seastar::future<> recovered_successor(
                 first};
           };
         {
-            auto small = take(
+            small = take(
               append_type::make(
                 budget,
                 *commit,
@@ -439,16 +465,17 @@ seastar::future<> recovered_successor(
             const auto count = [&visited](const local_obligation&) {
                 ++visited;
             };
-            const std::array three{
+            const std::array four{
               pinned(1, before[1].begin),
               pinned(3, before[0].begin),
-              pinned(4, before[1].begin)};
-            auto full = small->restore_pinned(three);
+              pinned(4, before[1].begin),
+              pinned(6, before[0].begin)};
+            auto full = small->restore_pinned(four);
             require(
               !full && full.error().code() == errc::resource_exhausted
                 && take(small->obligations(count)).obligations == 0,
               "obligations without room were partly restored");
-            take(small->restore_pinned(std::span{three}.first(2)));
+            take(small->restore_pinned(std::span{four}.first(2)));
             const auto snapshot = take(small->obligations(count));
             require(
               snapshot.obligations == 2
@@ -481,13 +508,14 @@ seastar::future<> recovered_successor(
                 && repeated.error().code() == errc::not_found,
               "a sealed publication did not release exactly its pins");
             failed.observe(co_await drive.lifecycle(small->close()));
+            small.reset();
         }
         // A discard decision names one PREPARE and releases that one. With
         // two candidates of a segment pinned, discarding the older leaves
         // the other holding the WAL where it begins; one decision never
         // releases both.
         {
-            auto pair = take(
+            pair = take(
               append_type::make(
                 budget,
                 *commit,
@@ -537,9 +565,19 @@ seastar::future<> recovered_successor(
               take(pair->obligations(none)).obligations == 0,
               "the last candidate's discard did not release it");
             failed.observe(co_await drive.lifecycle(pair->close()));
+            pair.reset();
         }
 
-        append = take(append_type::make(budget, *commit, *writer, {}));
+        // In the WAL, whose files a checkpoint retires, and written at once:
+        // each append ends with the footer a checkpoint pins.
+        append = take(
+          append_type::make(
+            budget,
+            *commit,
+            *writer,
+            {.segment_placement_bytes
+             = byte_count{std::numeric_limits<std::uint64_t>::max()},
+             .held_run_bytes = byte_count{}}));
         const std::array restored{local_pinned_obligation{
           rows[0].wal, rows[0].segment, rows[0].pinned, *rows[0].first_pinned}};
         take(append->restore_pinned(restored));
@@ -569,6 +607,7 @@ seastar::future<> recovered_successor(
                 boundary,
                 {}},
                described(1),
+               append_contract::segment_origin(),
                {}},
               budget,
               segment_configuration(46),
@@ -583,6 +622,7 @@ seastar::future<> recovered_successor(
             spec,
             0,
             described(2),
+            append_contract::segment_origin(),
             budget,
             segment_configuration(47)));
         take(co_await drive.lifecycle(fresh->create_new(work)));
@@ -595,8 +635,9 @@ seastar::future<> recovered_successor(
             work),
           drive);
         const auto& receipt = append_contract::durable(outcome);
+        co_await append_contract::covered<Clock>(*append, drive, timer);
         require(
-          receipt.wal.boundary().cursor().incarnation() == head->incarnation,
+          writer->progress()->durable.incarnation() == head->incarnation,
           "a new append did not use the successor");
         auto again = append->restore_pinned(restored);
         require(
@@ -621,7 +662,9 @@ seastar::future<> recovered_successor(
 
         // The rebuilt rows fold to the one pin per segment that was restored.
         const auto shard = writer->progress()->owner;
-        const auto folded = take(fold_pinned_obligations(rows, shard));
+        seastar::chunked_vector<local_pinned_obligation> folded;
+        for (const auto& row : rows)
+            take(fold_pinned_obligation(folded, row, shard));
         require(
           folded.size() == 1 && folded[0].wal == restored[0].wal
             && folded[0].segment == restored[0].segment
@@ -698,7 +741,7 @@ seastar::future<> recovered_successor(
           [&durable](const local_durable_boundary& one) {
               durable.push_back(one);
           });
-        const auto& cut = receipt.segment.boundary();
+        const auto& cut = receipt.boundary;
         require(
           durable.size() == 1 && durable[0].device == spec.owner.device()
             && durable[0].history == cut.history()
@@ -927,7 +970,9 @@ seastar::future<> recovered_successor(
               append_contract::child_wire(101, 2), budget, work),
             work),
           drive);
-        const auto& grown = append_contract::durable(more).segment.boundary();
+        const auto& grown = append_contract::durable(more).boundary;
+        // Its segment's barrier may follow the WAL's that published it.
+        co_await append_contract::covered<Clock>(*append, drive, timer);
         // A hold keeps the cutoff, as for a scan that reads from it.
         {
             const auto hold = take(checkpoint->hold_cutoff());
@@ -987,6 +1032,7 @@ seastar::future<> recovered_successor(
                 append_contract::child_wire(102, 2), budget, work),
               work),
             drive)));
+        co_await append_contract::covered<Clock>(*append, drive, timer);
         {
             auto racing = checkpoint->request();
             const auto hold = take(checkpoint->hold_cutoff());
@@ -1078,417 +1124,145 @@ seastar::future<> recovered_successor(
               "a checkpoint that moves the cutoff back was installed");
         }
 
-        // Completed-retry facts become durable only through a cut: one
-        // immutable snapshot beside the segment, then the segment's own
-        // publication pointing at it.
+        // Completed facts are derived as their batches are published, and
+        // nothing beside the segment holds them until its seal writes its
+        // summary. On the sealed segment a lookup returns each original, a
+        // stream's newest with one page read, and nothing for a batch never
+        // appended.
         {
-            auto retries = take(
-              retry_snapshot<Backend, Owner, Clock>::make(
-                files,
-                owner,
-                std::span<const local_device_spec>{specs},
-                0,
-                *append,
-                target,
-                *fresh,
-                *ids,
-                budget,
-                store_contract::limits(),
-                codec::limits::defaults()));
-            runtime::first_failure cutting;
-            try {
-                const auto demand = [&](bool forced) {
-                    return drive.lifecycle(retries->request(forced));
-                };
-                const auto object_path = [&](const local_root_reference& root) {
-                    return take(take(local_paths::make(spec.root))
-                                  .object(
-                                    0,
-                                    {append_contract::context(2).segment(),
-                                     append_contract::context(2).generation()},
-                                    root.sequence()));
-                };
-                const auto published =
-                  [&]() -> seastar::future<local_object_publication> {
-                    auto selected = take(
-                      co_await drive.lifecycle(
-                        storage::detail::select_recovery_publication(
-                          files,
-                          spec,
-                          0,
-                          described(2),
-                          budget,
-                          store_contract::limits(),
-                          work)));
-                    co_return std::move(selected.second);
-                };
-                // With nothing recorded even a forced demand writes nothing.
-                const auto none = take(co_await demand(true));
-                require(
-                  !none.cut && none.durable == 0 && none.unsaved == 0
-                    && !none.snapshot && retries->durable() == 0
-                    && (co_await published()).roots.empty(),
-                  "a cut was written without a recorded fact");
-                const auto one = append_contract::completed_fact(receipt);
-                const auto two = append_contract::completed_fact(
-                  append_contract::durable(more));
-                take(append->record_completed_retry(target, one));
-                // Recording alone makes nothing durable.
-                require(
-                  retries->durable() == 0
-                    && (co_await published()).roots.empty(),
-                  "a recorded fact was durable before any cut");
-                const auto first_cut = take(co_await demand(false));
-                require(
-                  first_cut.cut && first_cut.durable == 1
-                    && first_cut.unsaved == 0 && first_cut.written == 1
-                    && first_cut.snapshot && first_cut.boundary
-                    && !first_cut.unretired && retries->durable() == 1
-                    && take(
-                      co_await drive.lifecycle(
-                        files.exists(object_path(*first_cut.snapshot)))),
-                  "the first fact was not cut into a durable snapshot");
-                const auto pointed = co_await published();
-                require(
-                  pointed.state == local_object_state::active
-                    && pointed.boundary == first_cut.boundary
-                    && pointed.roots.size() == 1
-                    && pointed.roots[0] == *first_cut.snapshot
-                    && first_cut.snapshot->kind()
-                         == local_root_kind::completed_retry_snapshot,
-                  "the segment's publication does not point at the snapshot");
-                // The unsaved facts are as many as the saved: a cut is due.
-                take(append->record_completed_retry(target, two));
-                const auto second_cut = take(co_await demand(false));
-                require(
-                  second_cut.cut && second_cut.durable == 2
-                    && second_cut.written == 2 && second_cut.unsaved == 0
-                    && second_cut.snapshot != first_cut.snapshot
-                    && !second_cut.unretired
-                    && !take(
-                      co_await drive.lifecycle(
-                        files.exists(object_path(*first_cut.snapshot))))
-                    && take(
-                      co_await drive.lifecycle(
-                        files.exists(object_path(*second_cut.snapshot)))),
-                  "a doubled fact set was not cut, or kept the old snapshot");
-                // One unsaved fact against two saved is not due unless
-                // forced.
-                auto extra = co_await append_contract::settle(
-                  append->append(
-                    target,
-                    co_await append_contract::request(
-                      append_contract::child_wire(103, 2), budget, work),
-                    work),
-                  drive);
-                const auto three = append_contract::completed_fact(
-                  append_contract::durable(extra));
-                take(append->record_completed_retry(target, three));
-                const auto waiting = take(co_await demand(false));
-                require(
-                  !waiting.cut && waiting.durable == 2 && waiting.unsaved == 1
-                    && waiting.written == 0
-                    && waiting.snapshot == second_cut.snapshot
-                    && (co_await published()).roots[0] == *second_cut.snapshot,
-                  "a demand that was not due cut a snapshot");
-                // Demands made while a cut is in flight are served together
-                // by the one cut after it.
-                auto leading = retries->request(true);
-                auto joining = retries->request(false);
-                require(retries->running(), "a forced cut did not start");
-                const auto third_cut = take(
-                  co_await drive.lifecycle(std::move(leading)));
-                const auto joined = take(
-                  co_await drive.lifecycle(std::move(joining)));
-                const auto final_pointer = co_await published();
-                require(
-                  third_cut.cut && third_cut.durable == 3
-                    && third_cut.written == 3 && third_cut.unsaved == 0
-                    && !joined.cut && joined.durable == 3 && joined.written == 0
-                    && joined.snapshot == third_cut.snapshot
-                    && !retries->running()
-                    && final_pointer.boundary == third_cut.boundary
-                    && final_pointer.roots.size() == 1
-                    && final_pointer.roots[0] == *third_cut.snapshot
-                    && third_cut.boundary->position()
-                         >= second_cut.boundary->position(),
-                  "a forced cut did not save every recorded fact");
-                take(co_await drive.lifecycle(retries->close()));
-
-                // At seal the snapshot leaves the publication, so the seal's
-                // source must hold every fact it does: one with fewer is
-                // refused before anything is written.
-                struct no_facts final {
-                    seastar::future<
-                      runtime::result<std::vector<completed_retry>>>
-                    read(std::uint32_t, std::uint32_t, codec::cooperative_work&)
-                      const {
-                        return seastar::make_ready_future<
-                          runtime::result<std::vector<completed_retry>>>(
-                          std::vector<completed_retry>{});
-                    }
-                };
-                const auto reserved = fresh->progress()->reserved.retry_entries;
-                const auto dropped = co_await drive.lifecycle(
-                  fresh->seal(no_facts{}, 2, reserved - 2, work));
-                require(
-                  dropped.failure.error()
-                    && dropped.failure.error()->code() == errc::invalid_argument
-                    && (co_await published()).roots[0] == *third_cut.snapshot,
-                  "a seal source that lacks durable facts was accepted");
-                auto detached = take(append->detach(target));
-                const auto completed = detached.retry.completed();
-                const auto sealed = co_await drive.lifecycle(fresh->seal(
-                  std::move(detached.retry),
-                  completed,
-                  reserved - completed,
-                  work));
-                require(
-                  !sealed.failure.failed() && completed == 3 && sealed.retry
-                    && sealed.boundary,
-                  "the segment did not seal with its recorded facts");
-                // The sealed summary holds the facts now; the snapshot left
-                // the publication and went only after it was durable.
-                const auto summarized = co_await published();
-                require(
-                  summarized.state == local_object_state::sealed
-                    && summarized.boundary == sealed.boundary
-                    && summarized.roots.size() == 1
-                    && summarized.roots[0] == *sealed.retry
-                    && !take(
-                      co_await drive.lifecycle(
-                        files.exists(object_path(*third_cut.snapshot)))),
-                  "the seal did not supersede the snapshot");
-
-                // A fact supplied after the seal goes to a snapshot beside
-                // the summary that holds only what the summary lacks. Lookup
-                // asks that snapshot first, then the sealed summary.
-                const auto late_fact = [&one](std::uint64_t offset) {
-                    const auto id = one.id();
-                    return completed_retry::make(
-                             model::batch_id::make(
-                               id.producer(),
-                               id.epoch(),
-                               id.stream(),
-                               model::batch_sequence{
-                                 id.sequence().value() + offset})
-                               .value(),
-                             one.submitted_digest(),
-                             one.original_binding(),
-                             one.returned_span(),
-                             one.ack_generation())
-                      .value();
-                };
-                const auto fourth = late_fact(1000), fifth = late_fact(2000);
-                // The descriptor is borrowed until the open is joined, so it
-                // outlives the call that starts it.
-                const auto sealed_descriptor = described(2);
-                const auto generation_of = [&] {
-                    return drive.lifecycle(open_recovery_generation(
+            const auto published =
+              [&]() -> seastar::future<local_object_publication> {
+                auto selected = take(
+                  co_await drive.lifecycle(
+                    storage::detail::select_recovery_publication(
                       files,
-                      owner,
                       spec,
                       0,
-                      sealed_descriptor,
+                      described(2),
                       budget,
                       store_contract::limits(),
-                      work));
-                };
-                std::optional<local_recovery_generation> reopened;
-                std::unique_ptr<late_retry_snapshot<Backend, Owner, Clock>>
-                  late;
-                runtime::first_failure reading;
-                const auto release = [&]() -> seastar::future<> {
-                    if (late) {
-                        reading.observe(
-                          co_await drive.lifecycle(late->close()));
-                        late.reset();
-                    }
-                    if (reopened && reopened->owner) {
-                        reopened->owner->retire();
-                        reading.observe(
-                          co_await drive.lifecycle(reopened->owner->close()));
-                    }
-                    reopened.reset();
-                };
-                try {
-                    reopened.emplace(take(co_await generation_of()));
+                      work)));
+                co_return std::move(selected.second);
+            };
+            const auto one = append_contract::completed_fact(receipt);
+            const auto two = append_contract::completed_fact(
+              append_contract::durable(more));
+            auto extra = co_await append_contract::settle(
+              append->append(
+                target,
+                co_await append_contract::request(
+                  append_contract::child_wire(103, 2), budget, work),
+                work),
+              drive);
+            const auto four = append_contract::completed_fact(
+              append_contract::durable(extra));
+            co_await append_contract::covered<Clock>(*append, drive, timer);
+            const auto* derived = take(append->completed_retries(target));
+            require(
+              derived->facts() == 4 && derived->find(one.id()) == one
+                && derived->find(two.id()) == two
+                && derived->last(retry_prefix::of(four.id())) == four,
+              "a published batch's fact was not derived");
+            require(
+              (co_await published()).roots.empty(),
+              "a fact was durable beside the segment before its seal");
+            auto detached = take(append->detach(target));
+            const auto completed = detached.retry.facts();
+            auto summary = take(
+              co_await drive.lifecycle(
+                retry_summary_builder::seal(std::move(detached.retry), work)));
+            const auto sealed = co_await drive.lifecycle(
+              fresh->seal(std::move(summary), completed, work));
+            require(
+              !sealed.failure.failed() && completed == 4 && sealed.retry
+                && sealed.boundary,
+              "the segment did not seal with its derived facts");
+            const auto summarized = co_await published();
+            require(
+              summarized.state == local_object_state::sealed
+                && summarized.boundary == sealed.boundary
+                && summarized.roots.size() == 1
+                && summarized.roots[0] == *sealed.retry,
+              "the seal did not publish its summary");
+
+            const auto id = one.id();
+            const auto never = model::batch_id::make(
+                                 id.producer(),
+                                 id.epoch(),
+                                 id.stream(),
+                                 model::batch_sequence{
+                                   id.sequence().value() + 1000})
+                                 .value();
+            // The descriptor is borrowed until the open is joined, so it
+            // outlives the call that starts it.
+            const auto sealed_descriptor = described(2);
+            std::optional<local_recovery_generation> reopened;
+            runtime::first_failure reading;
+            try {
+                reopened.emplace(take(
+                  co_await drive.lifecycle(open_recovery_generation(
+                    files,
+                    owner,
+                    spec,
+                    0,
+                    sealed_descriptor,
+                    append_contract::segment_origin(),
+                    budget,
+                    store_contract::limits(),
+                    work))));
+                require(
+                  reopened->owner
+                    && reopened->publication.state
+                         == local_object_state::sealed,
+                  "the sealed segment did not reopen under its pins");
+                {
+                    const auto pin = take(reopened->owner->pin());
+                    auto lookup = take(
+                      co_await drive.lifecycle(
+                        completed_retry_lookup::open(pin, budget, work)));
+                    const auto cold = lookup.pages_read();
+                    const auto found = take(
+                      co_await drive.lifecycle(lookup.find(two.id(), work)));
+                    const auto absent = take(
+                      co_await drive.lifecycle(lookup.find(never, work)));
+                    const auto read = lookup.pages_read();
+                    const auto newest = take(
+                      co_await drive.lifecycle(
+                        lookup.find_stream_last(retry_prefix::of(id), work)));
+                    const auto last_read = lookup.pages_read() - read;
+                    std::vector<completed_retry> walked;
+                    const bool whole = take(
+                      co_await drive.lifecycle(lookup.enumerate(
+                        [&walked](const completed_retry& fact) {
+                            walked.push_back(fact);
+                            return true;
+                        },
+                        work)));
                     require(
-                      reopened->owner
-                        && reopened->publication.state
-                             == local_object_state::sealed,
-                      "the sealed segment did not reopen under its pins");
-                    {
-                        const auto pin = take(reopened->owner->pin());
-                        auto lookup = take(
-                          co_await drive.lifecycle(
-                            completed_retry_lookup::open(pin, budget, work)));
-                        const auto cold = lookup.pages_read();
-                        const auto found = take(
-                          co_await drive.lifecycle(
-                            lookup.find(two.id(), work)));
-                        const auto absent = take(
-                          co_await drive.lifecycle(
-                            lookup.find(fourth.id(), work)));
-                        std::vector<completed_retry> walked;
-                        const bool whole = take(
-                          co_await drive.lifecycle(lookup.enumerate(
-                            [&walked](
-                              const completed_retry& fact, retry_source) {
-                                walked.push_back(fact);
-                                return true;
-                            },
-                            work)));
-                        require(
-                          !lookup.snapshot() && lookup.summary()
-                            && lookup.facts() == 3 && cold == 1 && found
-                            && found->fact == two
-                            && found->source == retry_source::summary && !absent
-                            && whole && walked.size() == 3
-                            && walked[0].id().canonical_less(walked[1].id())
-                            && walked[1].id().canonical_less(walked[2].id()),
-                          "the sealed summary did not return its originals");
-                        auto summary = take(
-                          co_await drive.lifecycle(
-                            retry_root_reader::open(
-                              take(pin.root(local_root_kind::sealed_retry)),
-                              budget,
-                              work)));
-                        const auto current = reopened->publication;
-                        late = take(
-                          co_await drive.lifecycle(
-                            late_retry_snapshot<Backend, Owner, Clock>::open(
-                              files,
-                              owner,
-                              std::span<const local_device_spec>{specs},
-                              0,
-                              *fresh,
-                              described(2),
-                              current,
-                              std::move(summary),
-                              *ids,
-                              budget,
-                              store_contract::limits(),
-                              codec::limits::defaults(),
-                              8)));
-                    }
-                    const auto record = [&](const completed_retry& fact) {
-                        return drive.lifecycle(late->record(fact, work));
-                    };
-                    // What the summary holds is not kept again, and a
-                    // differing fact names its first differing field.
-                    const auto known = take(co_await record(two));
-                    auto digest = two.submitted_digest().bytes();
-                    digest[0] ^= 1U;
-                    const auto differing = take(
-                      co_await record(
-                        completed_retry::make(
-                          two.id(),
-                          codec::semantic_batch_digest{digest},
-                          two.original_binding(),
-                          two.returned_span(),
-                          two.ack_generation())
-                          .value()));
-                    require(
-                      known.status == completed_retry_status::exists
-                        && known.stored == two
-                        && differing.status
-                             == completed_retry_status::
-                               exists_with_different_submitted_digest
-                        && differing.stored == two && late->unsaved() == 0,
-                      "a fact the sealed summary holds was kept again");
-                    const auto created = take(co_await record(fourth));
-                    const auto repeated = take(co_await record(fourth));
-                    require(
-                      created.status == completed_retry_status::created
-                        && repeated.status == completed_retry_status::exists
-                        && late->unsaved() == 1 && late->durable() == 0
-                        && (co_await published()).roots.size() == 1,
-                      "a late fact was not kept apart from what is durable");
-                    const auto late_cut = take(
-                      co_await drive.lifecycle(late->request(false)));
-                    const auto beside = co_await published();
-                    require(
-                      late_cut.cut && late_cut.durable == 1
-                        && late_cut.written == 1 && late_cut.unsaved == 0
-                        && late_cut.snapshot
-                        && late_cut.boundary == sealed.boundary
-                        && beside.state == local_object_state::sealed
-                        && beside.boundary == sealed.boundary
-                        && beside.roots.size() == 2
-                        && beside.roots[0] == *sealed.retry
-                        && beside.roots[1] == *late_cut.snapshot,
-                      "a late snapshot did not carry the sealed roots");
-                    // Durable now: found in the snapshot, not kept again. The
-                    // next cut merges the snapshot with what was kept since.
-                    const auto saved = take(co_await record(fourth));
-                    const auto second = take(co_await record(fifth));
-                    const auto merged_cut = take(
-                      co_await drive.lifecycle(late->request(false)));
-                    const auto replaced = co_await published();
-                    require(
-                      saved.status == completed_retry_status::exists
-                        && saved.stored == fourth
-                        && second.status == completed_retry_status::created
-                        && merged_cut.cut && merged_cut.durable == 2
-                        && merged_cut.written == 2 && merged_cut.unsaved == 0
-                        && merged_cut.snapshot != late_cut.snapshot
-                        && !merged_cut.unretired && replaced.roots.size() == 2
-                        && replaced.roots[0] == *sealed.retry
-                        && replaced.roots[1] == *merged_cut.snapshot
-                        && !take(
-                          co_await drive.lifecycle(
-                            files.exists(object_path(*late_cut.snapshot))))
-                        && take(
-                          co_await drive.lifecycle(
-                            files.exists(object_path(*merged_cut.snapshot)))),
-                      "a late cut did not merge the snapshot it replaced");
-                    co_await release();
-                    // Under the new publication a lookup finds late facts in
-                    // the snapshot and the others in the summary.
-                    reopened.emplace(take(co_await generation_of()));
-                    {
-                        const auto pin = take(reopened->owner->pin());
-                        auto lookup = take(
-                          co_await drive.lifecycle(
-                            completed_retry_lookup::open(pin, budget, work)));
-                        const auto early = take(
-                          co_await drive.lifecycle(
-                            lookup.find(one.id(), work)));
-                        const auto newest = take(
-                          co_await drive.lifecycle(
-                            lookup.find(fifth.id(), work)));
-                        const auto never = take(
-                          co_await drive.lifecycle(
-                            lookup.find(late_fact(3000).id(), work)));
-                        require(
-                          lookup.snapshot() && lookup.summary()
-                            && lookup.facts() == 5 && early
-                            && early->fact == one
-                            && early->source == retry_source::summary && newest
-                            && newest->fact == fifth
-                            && newest->source == retry_source::snapshot
-                            && !never,
-                          "a lookup did not ask the snapshot, then the "
-                          "summary");
-                    }
-                    // Nothing in the segment's directory is unreferenced.
-                    require(
-                      take(
-                        co_await drive.lifecycle(remove_unreferenced_objects(
-                          files, owner, spec, 0, reopened->publication, work)))
-                        == 0,
-                      "a referenced bundle was taken for debris");
-                } catch (...) {
-                    reading.observe(std::current_exception());
+                      lookup.summary() && lookup.facts() == 4 && cold == 1
+                        && found == two && !absent && newest == four
+                        && last_read == 1 && whole && walked.size() == 4
+                        && walked[0] == one && walked[1] == two
+                        && walked[3] == four,
+                      "the sealed summary did not return its originals");
                 }
-                co_await release();
-                take(reading.outcome());
+                // Nothing in the segment's directory is unreferenced.
+                require(
+                  take(
+                    co_await drive.lifecycle(remove_unreferenced_objects(
+                      files, owner, spec, 0, reopened->publication, work)))
+                    == 0,
+                  "a referenced bundle was taken for debris");
             } catch (...) {
-                cutting.observe(std::current_exception());
+                reading.observe(std::current_exception());
             }
-            cutting.observe(co_await drive.lifecycle(retries->close()));
-            take(cutting.outcome());
+            if (reopened && reopened->owner) {
+                reopened->owner->retire();
+                reading.observe(
+                  co_await drive.lifecycle(reopened->owner->close()));
+            }
+            reopened.reset();
+            take(reading.outcome());
         }
 
         // A reopen reads the head's bundle whole, under the control's
@@ -1683,6 +1457,12 @@ seastar::future<> recovered_successor(
             failed.observe(std::current_exception());
         }
     };
+    if (pair) co_await close(pair->close());
+    pair.reset();
+    if (small) co_await close(small->close());
+    small.reset();
+    if (attempt) co_await close(attempt->close());
+    attempt.reset();
     if (checkpoint) co_await close(checkpoint->close());
     checkpoint.reset();
     if (append) co_await close(append->close());
@@ -1753,20 +1533,23 @@ seastar::future<> repeated_restarts(
                   work),
                 drive);
               const auto& receipt = append_contract::durable(outcome);
+              // Either barrier may publish it; once both have run, the WAL's
+              // durable end is where its group's PREPAREs end.
+              co_await append_contract::covered<Clock>(append, drive, timer);
               before.push_back(
-                {start, receipt.wal.boundary().cursor(), receipt.block});
+                {start, writer.progress()->durable, receipt.block});
           }
       });
     require(
       old_head && before.size() == 2
         && before[1].begin.incarnation() == old_head->incarnation,
       "the requests before the crash were not durable in one WAL file");
-    // The crash loses the second group's block and footer.
-    auto damaged = co_await append_contract::read_segment(
-      files, spec, 1, drive);
-    const auto lost = before[1].block.records.bytes().begin().value();
-    std::fill(
-      damaged.begin() + static_cast<std::ptrdiff_t>(lost), damaged.end(), '\0');
+    // The crash loses the second group's block and footer to a write gone
+    // astray.
+    const auto damaged = misdirected(
+      co_await append_contract::read_segment(files, spec, 1, drive),
+      before[0].block.records.bytes(),
+      before[1].block.records.bytes().begin().value());
     co_await store_contract::write_bytes(
       files, append_contract::segment_path(spec, 1), damaged, drive);
     const auto old_bytes = co_await append_contract::read_wal(
@@ -1776,11 +1559,9 @@ seastar::future<> repeated_restarts(
     const std::array descriptors{described(1)};
     const std::array catalog{recovery_catalog_entry{
       described(1),
-      segment_header::make(
-        append_contract::context(1),
-        model::range_logical_end{100},
-        alignment(8192))
-        .value()}};
+      segment_header::make(append_contract::context(1), alignment(8192))
+        .value(),
+      append_contract::segment_origin()}};
     std::optional<local_footer_reference> pinned;
     auto head = old_head;
     for (std::uint32_t restart = 0; restart != 3; ++restart) {
@@ -1856,6 +1637,7 @@ seastar::future<> repeated_restarts(
               "the recovered segment's pin moved across a restart");
             auto planner = take(recovery_planner::make(targets, budget));
             std::vector<recovery_obligation> rows;
+            recovery_tails tails;
             auto merged = take(
               co_await drive.lifecycle(reconcile_local_recovery(
                 files,
@@ -1869,7 +1651,9 @@ seastar::future<> repeated_restarts(
                 budget,
                 merge_limits(),
                 work,
-                restart_view{&planner, &rows})));
+                restart_view{&planner, &rows},
+                std::nullopt,
+                &tails)));
             take(planner.finish(merged));
             const auto& planned = planner.segments()[0];
             require(
@@ -1896,6 +1680,8 @@ seastar::future<> repeated_restarts(
                   0,
                   planner,
                   found,
+                  tails,
+                  spec,
                   std::span<const recovery_visibility>{},
                   budget,
                   segment_configuration(45 + restart),
@@ -2015,8 +1801,10 @@ seastar::future<bool> checkpoint_crash(
                       work),
                     drive);
                   const auto& receipt = append_contract::durable(outcome);
+                  co_await append_contract::covered<Clock>(
+                    append, drive, timer);
                   seen.appended(
-                    receipt.wal.boundary().cursor(),
+                    writer.progress()->durable,
                     append_contract::context(1),
                     receipt.block.records.bytes().end());
               }
@@ -2213,190 +2001,6 @@ seastar::future<bool> checkpoint_crash(
     co_return finished;
 }
 
-// One crash history of a completed-retry snapshot cut. A first cut completes,
-// so the cut under test replaces a snapshot. It is cut after `cut` scheduler
-// events and the device crashes: before, inside or after the bundle's
-// publication, the pointer's, and the removal of the snapshot it replaces.
-// Then the segment is reopened twice, a crash before each. Its publication
-// names the old snapshot or the new one, whole and readable through the pins
-// it carries, and a cut that returned before the crash is never lost. A
-// bundle the publication does not name is debris and is removed; nothing it
-// names is. Returns whether the cut finished before the crash.
-template<
-  runtime::monotonic_clock Clock,
-  typename Backend,
-  typename Owner,
-  typename Driver,
-  typename Timer,
-  typename Step>
-seastar::future<bool> retry_snapshot_crash(
-  Backend& files,
-  Owner& owner,
-  const local_device_spec& spec,
-  workload_budget& budget,
-  Driver drive,
-  Timer& timer,
-  std::uint32_t cut,
-  Step step) {
-    const std::array specs{spec};
-    std::optional<local_root_reference> before;
-    bool finished = false;
-    co_await append_contract::with_local_append<Clock>(
-      files,
-      owner,
-      spec,
-      budget,
-      drive,
-      timer,
-      {.fenced = 1, .tolerate_close = true},
-      [&](
-        auto& append,
-        auto&,
-        auto& segments,
-        auto& targets,
-        auto& work,
-        auto&,
-        auto& ids) -> seastar::future<> {
-          std::array<std::optional<completed_retry>, 2> facts;
-          for (std::size_t i = 0; i != facts.size(); ++i)
-              facts[i] = append_contract::completed_fact(
-                append_contract::durable(
-                  co_await append_contract::settle(
-                    append.append(
-                      *targets[0],
-                      co_await append_contract::request(
-                        append_contract::child_wire(100 + i), budget, work),
-                      work),
-                    drive)));
-          auto retries = take(
-            retry_snapshot<Backend, Owner, Clock>::make(
-              files,
-              owner,
-              std::span<const local_device_spec>{specs},
-              0,
-              append,
-              *targets[0],
-              *segments[0],
-              ids,
-              budget,
-              store_contract::limits(),
-              codec::limits::defaults()));
-          runtime::first_failure failed;
-          try {
-              take(append.record_completed_retry(*targets[0], *facts[0]));
-              const auto first = take(
-                co_await drive.lifecycle(retries->request(true)));
-              require(
-                first.cut && first.durable == 1 && first.snapshot,
-                "the first snapshot was not cut");
-              before = first.snapshot;
-              take(append.record_completed_retry(*targets[0], *facts[1]));
-              auto pending = retries->request(false);
-              std::uint32_t steps = 0;
-              while (steps != cut && co_await step(pending))
-                  ++steps;
-              finished = pending.available();
-              require(
-                finished || steps == cut, "a cut stopped without a result");
-              take(co_await drive.lifecycle(files.crash()));
-              try {
-                  // Joined before anything closes; what it returns after
-                  // the crash is not a result anyone received.
-                  static_cast<void>(
-                    co_await drive.lifecycle(std::move(pending)));
-              } catch (...) {
-                  // A cut the crash broke may end in an exception.
-                  static_cast<void>(std::current_exception());
-              }
-          } catch (...) {
-              failed.observe(std::current_exception());
-          }
-          static_cast<void>(co_await drive.lifecycle(retries->close()));
-          retries.reset();
-          take(failed.outcome());
-      });
-    require(before.has_value(), "the history did not reach its cut");
-
-    std::optional<local_root_reference> reopened;
-    for (unsigned restart = 0; restart != 2; ++restart) {
-        // The owners above kept running after the first crash; only what
-        // survives another one is what a restart sees.
-        take(co_await drive.lifecycle(files.crash()));
-        seastar::abort_source abort;
-        codec::cooperative_work work{codec::limits::defaults(), abort};
-        auto generation = take(
-          co_await drive.lifecycle(open_recovery_generation(
-            files,
-            owner,
-            spec,
-            0,
-            described(1),
-            budget,
-            store_contract::limits(),
-            work)));
-        runtime::first_failure failed;
-        try {
-            const auto& publication = generation.publication;
-            require(
-              generation.owner
-                && publication.state == local_object_state::active
-                && publication.boundary && publication.roots.size() == 1
-                && publication.roots[0].kind()
-                     == local_root_kind::completed_retry_snapshot
-                && generation.resume == publication.boundary,
-              "a crash left a publication that pins no whole snapshot");
-            const auto current = publication.roots[0];
-            {
-                const auto pin = take(generation.owner->pin());
-                auto lookup = take(
-                  co_await drive.lifecycle(
-                    completed_retry_lookup::open(pin, budget, work)));
-                // The old snapshot holds one fact and the new one both.
-                require(
-                  lookup.snapshot() && !lookup.summary()
-                    && (current == *before ? lookup.facts() == 1 : lookup.facts() == 2),
-                  "a crash left a snapshot that is neither the old nor the "
-                  "new one");
-            }
-            require(
-              !finished || !(current == *before),
-              "a cut that returned before the crash was lost");
-            require(
-              !reopened || *reopened == current,
-              "a second crash changed the segment's snapshot");
-            reopened = current;
-            // At most the replaced snapshot, whose removal the crash undid,
-            // and one whose pointer never moved.
-            const auto debris = take(
-              co_await drive.lifecycle(remove_unreferenced_objects(
-                files, owner, spec, 0, publication, work)));
-            const auto clean = take(
-              co_await drive.lifecycle(remove_unreferenced_objects(
-                files, owner, spec, 0, publication, work)));
-            require(
-              debris <= 2 && clean == 0
-                && take(
-                  co_await drive.lifecycle(
-                    files.exists(take(take(local_paths::make(spec.root))
-                                        .object(
-                                          0,
-                                          {publication.segment.segment(),
-                                           publication.segment.generation()},
-                                          current.sequence()))))),
-              "a crash left more bundles than one cut can, or lost the one "
-              "the publication names");
-        } catch (...) {
-            failed.observe(std::current_exception());
-        }
-        if (generation.owner) {
-            generation.owner->retire();
-            failed.observe(co_await drive.lifecycle(generation.owner->close()));
-        }
-        take(failed.outcome());
-    }
-    co_return finished;
-}
-
 // What a checkpoint must never do, on one store, and what its durable head
 // guarantees afterwards.
 //
@@ -2410,9 +2014,9 @@ seastar::future<bool> retry_snapshot_crash(
 // continue it is refused. Every PREPARE the driver saw below the cutoff is
 // covered by the pin, and by nothing else here, so the pin is what replaced
 // the WAL. Then the pinned footer is damaged. With the WAL that covered it
-// gone, a restart that resumed from the segment's publication alone would
-// read a shorter history; resuming from the checkpoint's pin, it reports
-// proven corruption and plans nothing for the segment.
+// gone, a restart resuming from the checkpoint's pin reports proven
+// corruption and plans nothing for the segment; so does one resuming from
+// the segment's publication alone, which the later stamps tell.
 template<
   runtime::monotonic_clock Clock,
   typename Backend,
@@ -2463,8 +2067,9 @@ seastar::future<> checkpoint_regressions(
                   work),
                 drive);
               const auto& receipt = append_contract::durable(outcome);
+              co_await append_contract::covered<Clock>(append, drive, timer);
               seen.appended(
-                receipt.wal.boundary().cursor(),
+                writer.progress()->durable,
                 append_contract::context(1),
                 receipt.block.records.bytes().end());
           };
@@ -2734,11 +2339,9 @@ seastar::future<> checkpoint_regressions(
           files, append_contract::segment_path(spec, 1), data, drive);
         const std::array catalog{recovery_catalog_entry{
           descriptor,
-          segment_header::make(
-            append_contract::context(1),
-            model::range_logical_end{100},
-            alignment(8192))
-            .value()}};
+          segment_header::make(append_contract::context(1), alignment(8192))
+            .value(),
+          append_contract::segment_origin()}};
         // One restart's read-only plan, resuming from the checkpoint's pin
         // or from the publication alone, and the PREPAREs it read.
         struct planned final {
@@ -2797,8 +2400,12 @@ seastar::future<> checkpoint_regressions(
         require(
           unpinned.prepares == 1 && resumed.prepares == 1,
           "a restart read PREPAREs below the durable cutoff");
+        // Resumed from the publication alone, the walk ends before the
+        // damaged footer, but the PREPARE above the cutoff was formed after
+        // that footer's barrier, and its stamp proves the footer certified.
         require(
-          unpinned.segment.reason != recovery_plan_reason::corruption
+          unpinned.segment.action == recovery_plan_action::stop
+            && unpinned.segment.reason == recovery_plan_reason::corruption
             && resumed.segment.action == recovery_plan_action::stop
             && resumed.segment.reason == recovery_plan_reason::corruption,
           "a pinned footer damaged after reclamation was not reported as "
@@ -2912,6 +2519,7 @@ seastar::future<> retained_wal_reclaimed(
                   work),
                 drive);
               static_cast<void>(append_contract::durable(outcome));
+              co_await append_contract::covered<Clock>(append, drive, timer);
           };
           {
               auto shared = make(budget);
@@ -2972,6 +2580,198 @@ seastar::future<> retained_wal_reclaimed(
                   && !checkpoint->failure().failed(),
                 "a shard nothing pins met its retained limit, or kept a "
                 "closed WAL file");
+          } catch (...) {
+              failed.observe(std::current_exception());
+          }
+          failed.observe(co_await drive.lifecycle(checkpoint->close()));
+          take(failed.outcome());
+      });
+}
+
+// A shard that never asks for a sync still stays within its retained limit:
+// each rotation syncs the segment whose WAL-placed groups the closed file
+// holds, a checkpoint then passes them, and the file goes. Twelve requests,
+// settled with nothing synced by the caller, fill six files under a limit of
+// two, held or not, and none is refused. A slow segment flush (the caller's
+// environment may delay some) only makes a rotation at the limit wait for
+// it, and never deadlocks it.
+template<
+  runtime::monotonic_clock Clock,
+  typename Backend,
+  typename Owner,
+  typename Driver,
+  typename Timer>
+seastar::future<> retained_wal_synced(
+  Backend& files,
+  Owner& owner,
+  const local_device_spec& spec,
+  workload_budget& budget,
+  workload_budget& reserve,
+  Driver drive,
+  Timer& timer,
+  byte_count hold) {
+    using checkpoint_type = local_checkpoint<Backend, Owner, Clock>;
+    const std::array specs{spec};
+    std::vector<local_retention_pressure> reports;
+    co_await append_contract::with_local_append<Clock>(
+      files,
+      owner,
+      spec,
+      budget,
+      drive,
+      timer,
+      {.wal_capacity = byte_count{24_KiB},
+       .retained_files = 2,
+       .pressure = &reports,
+       .control_budget = &reserve,
+       .hold = hold},
+      [&](
+        auto& append,
+        auto& writer,
+        auto&,
+        auto& targets,
+        auto& work,
+        auto& control,
+        auto& ids) -> seastar::future<> {
+          const auto origin = writer.progress()->reserved;
+          auto checkpoint = take(
+            checkpoint_type::make(
+              files,
+              owner,
+              std::span<const local_device_spec>{specs},
+              spec,
+              0,
+              control,
+              ids,
+              append,
+              reserve,
+              {.pins = {}, .metadata = store_contract::limits()},
+              codec::limits::defaults(),
+              origin));
+          runtime::first_failure failed;
+          try {
+              take(checkpoint->bind_retention());
+              for (std::uint64_t logical = 100; logical != 112; ++logical) {
+                  const auto outcome = co_await append_contract::settle(
+                    append.append(
+                      *targets[0],
+                      co_await append_contract::request(
+                        append_contract::child_wire(logical), budget, work),
+                      work),
+                    drive);
+                  static_cast<void>(append_contract::durable(outcome));
+                  require(
+                    append.retention().files <= 2,
+                    "the shard held more WAL files than its limit");
+              }
+              co_await append_contract::covered<Clock>(append, drive, timer);
+              const auto last = take(
+                co_await drive.lifecycle(checkpoint->request()));
+              require(
+                reports.empty() && !append.retention_pressure()
+                  && writer.statistics().rotations == 5
+                  && append.retention() == wal_retention{1, 2}
+                  && last.wal_owed == 0
+                  && last.end == writer.progress()->durable
+                  && !checkpoint->failure().failed(),
+                "a shard whose segments synced only at rotation met its "
+                "retained limit, or kept a closed WAL file");
+          } catch (...) {
+              failed.observe(std::current_exception());
+          }
+          failed.observe(co_await drive.lifecycle(checkpoint->close()));
+          take(failed.outcome());
+      });
+}
+
+// A checkpoint flushes nothing, and so passes no WAL-placed PREPARE whose
+// segment has not synced it: the WAL below a cutoff never holds the only
+// copy of anything. With a request held in its segment and published by
+// its WAL barrier, a run's cutoff stays where its PREPARE begins, which is
+// where the checkpoints begin, so it publishes nothing, though the WAL is
+// durable past the PREPARE, and it issues no flush of the segment; after a
+// sync of the segment, the next run passes the PREPARE. `flushes` counts a
+// file's flushes where the backend can.
+template<
+  runtime::monotonic_clock Clock,
+  typename Backend,
+  typename Owner,
+  typename Driver,
+  typename Timer,
+  typename Count>
+seastar::future<> checkpoint_after_sync(
+  Backend& files,
+  Owner& owner,
+  const local_device_spec& spec,
+  workload_budget& budget,
+  workload_budget& reserve,
+  Driver drive,
+  Timer& timer,
+  Count flushes) {
+    using checkpoint_type = local_checkpoint<Backend, Owner, Clock>;
+    const std::array specs{spec};
+    co_await append_contract::with_local_append<Clock>(
+      files,
+      owner,
+      spec,
+      budget,
+      drive,
+      timer,
+      {.control_budget = &reserve, .hold = byte_count{64_KiB}},
+      [&](
+        auto& append,
+        auto& writer,
+        auto&,
+        auto& targets,
+        auto& work,
+        auto& control,
+        auto& ids) -> seastar::future<> {
+          const auto origin = writer.progress()->reserved;
+          auto checkpoint = take(
+            checkpoint_type::make(
+              files,
+              owner,
+              std::span<const local_device_spec>{specs},
+              spec,
+              0,
+              control,
+              ids,
+              append,
+              reserve,
+              {.pins = {}, .metadata = store_contract::limits()},
+              codec::limits::defaults(),
+              origin));
+          runtime::first_failure failed;
+          try {
+              const auto path = append_contract::segment_path(spec, 1);
+              const auto begins = writer.progress()->reserved;
+              const auto outcome = co_await append_contract::settle(
+                append.append(
+                  *targets[0],
+                  co_await append_contract::request(
+                    append_contract::child_wire(100), budget, work),
+                  work),
+                drive);
+              require(
+                append_contract::durable(outcome).wal
+                  && !append_contract::durable(outcome).segment,
+                "the request was not published by its WAL barrier alone");
+              const auto before = flushes(path);
+              const auto unsynced = take(
+                co_await drive.lifecycle(checkpoint->request()));
+              require(
+                !unsynced.published && unsynced.end == begins
+                  && flushes(path) == before,
+                "a checkpoint passed a PREPARE its segment had not synced, or "
+                "flushed the segment");
+              take(co_await drive.lifecycle(append.sync(*targets[0])));
+              const auto synced = take(
+                co_await drive.lifecycle(checkpoint->request()));
+              require(
+                synced.published && synced.end == writer.progress()->durable
+                  && !(synced.end == begins),
+                "a checkpoint after the segment's sync did not pass its "
+                "PREPARE");
           } catch (...) {
               failed.observe(std::current_exception());
           }
@@ -3053,6 +2853,7 @@ seastar::future<> retained_wal_pressure(
           const auto request = [&](std::uint64_t logical) -> seastar::future<> {
               const auto outcome = co_await settled(logical);
               static_cast<void>(append_contract::durable(outcome));
+              co_await append_contract::covered<Clock>(append, drive, timer);
           };
           const auto held_here = [&]() -> seastar::future<bool> {
               co_return take(
@@ -3260,6 +3061,8 @@ seastar::future<> detached_boundary_pinned(
                   work),
                 drive);
               static_cast<void>(append_contract::durable(outcome));
+              // Detaching needs every barrier owed to have run.
+              co_await append_contract::covered<Clock>(append, drive, timer);
           };
           co_await request(0, 100);
           co_await request(1, 100);

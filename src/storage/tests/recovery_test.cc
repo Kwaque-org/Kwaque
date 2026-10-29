@@ -60,8 +60,8 @@ TEST(RecoveryCasesTest, EveryPatternMatchesOneCaseOrIsImpossible) {
         EXPECT_GT(hits[candidate.label], 0U) << candidate.label;
         possible += hits[candidate.label];
     }
-    EXPECT_EQ(possible, 26U);
-    EXPECT_EQ(impossible, 2022U);
+    EXPECT_EQ(possible, 46U);
+    EXPECT_EQ(impossible, 8146U);
 }
 
 struct copies final {
@@ -114,6 +114,24 @@ TEST(RecoveryCasesTest, ExactCopiesAreComparedFieldByField) {
         prepare, make.block(block_wire(assigned_wire(true))))
         .value(),
       recovery_copy_difference::length);
+    // The same request and child under another append time: the block its
+    // PREPARE rebuilds would differ, so the copies do.
+    const auto later = make.block(block_wire(
+      assigned_wire(),
+      block_expected(0x30, 1, 512, 0, 512),
+      32,
+      segment_block_stamps{
+        runtime::wall_time{2}, runtime::file_position{512}}));
+    EXPECT_EQ(
+      compare_recovery_copies(prepare, later).value(),
+      recovery_copy_difference::stamps);
+    EXPECT_EQ(
+      compare_recovery_claims(
+        recovery_identity(
+          prepare, codec::immutable_object_digest{codec::content_digest{}}),
+        later)
+        .value(),
+      recovery_copy_difference::stamps);
 }
 
 TEST(RecoveryCasesTest, MatrixRowsClassifyFromTheirEvidence) {
@@ -127,10 +145,19 @@ TEST(RecoveryCasesTest, MatrixRowsClassifyFromTheirEvidence) {
     EXPECT_EQ(
       label({&prepare, nullptr, true, true, true, true}), "@satisfied_pinned");
     EXPECT_EQ(label({nullptr, &block, false, true}), "@footer_only");
+    // After the recovered boundary: below the boundary restart publishes,
+    // or behind a slot nothing fills.
     EXPECT_EQ(
-      label({&prepare, nullptr, false, false, true, true}), "@candidate");
+      label({&prepare, nullptr, false, false, true, true, true}),
+      "@materialize");
     EXPECT_EQ(
-      label({&prepare, &block, false, false, true, true}), "@suffix_sourced");
+      label({&prepare, nullptr, false, false, true, true, false}),
+      "@candidate");
+    EXPECT_EQ(
+      label({&prepare, &block, false, false, true, true, true}), "@adopt");
+    EXPECT_EQ(
+      label({&prepare, &block, false, false, true, true, false}),
+      "@found_candidate");
     EXPECT_EQ(label({nullptr, &block, false, false}), "@suffix_unsourced");
     EXPECT_EQ(
       label(
@@ -140,6 +167,7 @@ TEST(RecoveryCasesTest, MatrixRowsClassifyFromTheirEvidence) {
          true,
          true,
          true,
+         false,
          recovery_copy_difference::child}),
       "@differing_copies");
     EXPECT_EQ(
@@ -148,15 +176,24 @@ TEST(RecoveryCasesTest, MatrixRowsClassifyFromTheirEvidence) {
     EXPECT_EQ(
       label({&prepare, nullptr, false, true, true, false}),
       "@covered_misplaced");
-    const auto region = [](bool slack, bool damage, bool certified) {
-        return classify_recovery(region_parameters(slack, damage, certified))
-          .classification;
-    };
-    EXPECT_EQ(region(false, false, true), recovery_classification::content);
+    const auto region =
+      [](bool slack, bool damage, bool certified, bool filled) {
+          return classify_recovery(
+                   region_parameters(slack, damage, certified, filled))
+            .classification;
+      };
     EXPECT_EQ(
-      region(false, true, false), recovery_classification::uncertified_tail);
-    EXPECT_EQ(region(false, true, true), recovery_classification::corruption);
-    EXPECT_EQ(region(true, true, false), recovery_classification::slack);
+      region(false, false, true, false), recovery_classification::content);
+    EXPECT_EQ(
+      region(false, true, false, false),
+      recovery_classification::uncertified_tail);
+    EXPECT_EQ(
+      region(false, true, true, false), recovery_classification::corruption);
+    EXPECT_EQ(
+      region(false, true, false, true), recovery_classification::materialized);
+    EXPECT_EQ(
+      region(false, true, true, true), recovery_classification::repaired);
+    EXPECT_EQ(region(true, true, false, false), recovery_classification::slack);
 }
 
 TEST(RecoveryCasesTest, PredicatesOfAnAbsentCopyAreFalse) {
@@ -171,6 +208,9 @@ TEST(RecoveryCasesTest, PredicatesOfAnAbsentCopyAreFalse) {
     EXPECT_FALSE(orphan[at(recovery_predicate::ordered)]);
     EXPECT_FALSE(orphan[at(recovery_predicate::placed)]);
     EXPECT_FALSE(orphan[at(recovery_predicate::identical)]);
+    EXPECT_FALSE(
+      batch_parameters({nullptr, &block, false, true, true, true, true})[at(
+        recovery_predicate::contiguous)]);
     const auto alone = batch_parameters(
       {&prepare, nullptr, false, false, true, true});
     EXPECT_TRUE(alone[at(recovery_predicate::ordered)]);
@@ -221,20 +261,16 @@ TEST(RecoveryPinsTest, PublicationStateAndPinsAgree) {
     const auto root = footer_at(16384, 7);
     const auto index = root_of(local_root_kind::index, 42);
     const auto retry = root_of(local_root_kind::sealed_retry, 41);
-    const auto snapshot = root_of(
-      local_root_kind::completed_retry_snapshot, 40);
     const auto checkpoint = root_of(local_root_kind::checkpoint, 43);
     EXPECT_TRUE(valid(active, std::nullopt, {}));
-    EXPECT_TRUE(valid(active, footer, {snapshot}));
+    EXPECT_TRUE(valid(active, footer, {}));
     EXPECT_TRUE(valid(recovering, footer, {}));
-    // A snapshot root names a footer the publication must pin too.
-    EXPECT_FALSE(valid(active, std::nullopt, {snapshot}));
     EXPECT_FALSE(valid(active, root, {}));
     EXPECT_FALSE(valid(recovering, footer, {index}));
     EXPECT_FALSE(valid(active, footer, {retry}));
     EXPECT_TRUE(valid(sealed, root, {retry}));
-    EXPECT_TRUE(valid(sealed, root, {index, retry, snapshot}));
-    EXPECT_FALSE(valid(sealed, root, {index, snapshot}));
+    EXPECT_TRUE(valid(sealed, root, {index, retry}));
+    EXPECT_FALSE(valid(sealed, root, {index}));
     EXPECT_FALSE(valid(sealed, footer, {retry}));
     EXPECT_FALSE(valid(sealed, std::nullopt, {retry}));
     EXPECT_FALSE(valid(sealed, root, {retry, retry}));
@@ -246,7 +282,7 @@ TEST(RecoveryCasesTest, ScalarEvidenceMatchesTheCopies) {
     copies make;
     const auto prepare = make.prepare();
     const auto block = make.block(block_wire());
-    for (unsigned bits = 0; bits < 64; ++bits) {
+    for (unsigned bits = 0; bits < 128; ++bits) {
         const auto bit = [bits](unsigned i) { return ((bits >> i) & 1U) != 0; };
         const recovery_slot slot{
           bit(0) ? &prepare : nullptr,
@@ -255,6 +291,7 @@ TEST(RecoveryCasesTest, ScalarEvidenceMatchesTheCopies) {
           bit(3),
           bit(4),
           bit(5),
+          bit(6),
           recovery_copy_difference::length};
         const recovery_slot_evidence evidence{
           bit(0),
@@ -263,6 +300,7 @@ TEST(RecoveryCasesTest, ScalarEvidenceMatchesTheCopies) {
           bit(3),
           bit(4),
           bit(5),
+          bit(6),
           recovery_copy_difference::length};
         EXPECT_EQ(batch_parameters(slot), batch_parameters(evidence)) << bits;
     }
@@ -271,12 +309,12 @@ TEST(RecoveryCasesTest, ScalarEvidenceMatchesTheCopies) {
 local_segment_descriptor descriptor_of(segment_context context) {
     return {
       context,
-      model::range_logical_end{100},
       model::segment_relative_end{},
       alignment(),
       storage_profile::v1,
       1,
       local_layout_kind::initial,
+      default_retry_depth,
       byte_count{64_MiB},
       runtime::monotonic_duration{3600000000000ULL}};
 }
@@ -287,8 +325,8 @@ recovery_target target(
   std::uint64_t generation = 1) {
     return {
       descriptor_of(context),
-      segment_header::make(context, model::range_logical_end{100}, alignment())
-        .value(),
+      segment_header::make(context, alignment()).value(),
+      model::range_logical_end{100},
       state,
       local_publication_generation::make(generation).value(),
       pin};
@@ -310,9 +348,7 @@ TEST(RecoveryMergeTest, TargetsAreIndependentAndConsistent) {
     EXPECT_FALSE(valid({target(sc(), active, root)}));
     EXPECT_FALSE(valid({target(sc(), deleting)}));
     auto mismatched = target(sc(), active);
-    mismatched.header = segment_header::make(
-                          sc(0x31), model::range_logical_end{100}, alignment())
-                          .value();
+    mismatched.header = segment_header::make(sc(0x31), alignment()).value();
     EXPECT_FALSE(valid({mismatched}));
 }
 
@@ -363,7 +399,13 @@ recovery_segment_report report_of(
     if (boundary)
         report.boundary = segment_scan_boundary{
           footer_at(*boundary, state == local_object_state::sealed ? 7 : 6),
-          {scope(100, 102, 0, 2, 512, *boundary), 2, std::nullopt, 0}};
+          {scope(100, 102, 0, 2, 512, *boundary),
+           2,
+           std::nullopt,
+           {runtime::wall_time{1},
+            runtime::wall_time{1},
+            runtime::wall_time{0}},
+           0}};
     report.scanned = state != local_object_state::sealed;
     return report;
 }
@@ -706,15 +748,15 @@ TEST(RecoveryMergeTest, LimitsBoundWalksAndHeldState) {
     limits = bounded();
     limits.obligations = 0;
     EXPECT_FALSE(limits.validate());
-    // Each fixed table is one contiguous allocation: the largest that fits is
-    // valid and one row more is not.
+    // The obligation rows grow as they appear, up to a row for each segment
+    // a catalog may list in each WAL file a shard may keep.
     limits = bounded();
-    limits.obligations = static_cast<std::uint32_t>(
-      maximum_contiguous_allocation_bytes
-      / sizeof(detail::recovery_obligation_row));
+    limits.obligations = maximum_recovery_obligations;
     EXPECT_TRUE(limits.validate());
     ++limits.obligations;
     EXPECT_FALSE(limits.validate());
+    // A segment's queue holds at most what one allocation would: the
+    // largest such bound is valid and one more is not.
     limits = bounded();
     limits.pending = static_cast<std::uint32_t>(
       maximum_contiguous_allocation_bytes / sizeof(detail::recovery_queued));

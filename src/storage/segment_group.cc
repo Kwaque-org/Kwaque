@@ -29,7 +29,8 @@ segment_write_descriptor::~segment_write_descriptor() {
 model::file_byte_span segment_write_descriptor::extent() const noexcept {
     owner.assert_current();
     return model::file_byte_span::make(
-             before.end().bytes, layout.boundary().end().bytes)
+             run_begin.value_or(before.end().bytes),
+             layout.boundary().end().bytes)
       .value();
 }
 void segment_write_descriptor::fail(runtime::operation_error error) noexcept {
@@ -67,7 +68,7 @@ void segment_write_descriptor::notify() noexcept {
           segment_write_completion{
             control.share(),
             failure,
-            failure.failed() ? byte_count{} : extent().size()});
+            failure.failed() || absorbed ? byte_count{} : extent().size()});
 }
 } // namespace detail
 segment_frozen_group::~segment_frozen_group() {
@@ -86,5 +87,17 @@ std::span<const segment_block> segment_frozen_group::blocks() const& noexcept {
       "segment blocks borrowed before joined encoding");
     node_->owner.assert_current();
     return node_->blocks;
+}
+bool segment_frozen_group::held() const noexcept {
+    KWAQUE_INVARIANT(
+      invariant_id{"KQ-SEGMENT-HANDOFF"}, node_, "empty segment handoff");
+    node_->owner.assert_current();
+    return node_->held;
+}
+std::optional<segment_run_close> segment_frozen_group::closed() const noexcept {
+    KWAQUE_INVARIANT(
+      invariant_id{"KQ-SEGMENT-HANDOFF"}, node_, "empty segment handoff");
+    node_->owner.assert_current();
+    return node_->closed_run;
 }
 } // namespace kwaque::storage

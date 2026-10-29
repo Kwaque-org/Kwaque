@@ -13,17 +13,4 @@ runtime::result<runtime::file_position> recovered_seal_end(
     return decision.target_position;
 }
 
-bool recovered_layout_failure(errc code) noexcept {
-    switch (code) {
-    case errc::wrong_context:
-    case errc::malformed_data:
-    case errc::out_of_range:
-    case errc::truncated_data:
-    case errc::corrupt_data:
-        return true;
-    default:
-        return false;
-    }
-}
-
 } // namespace kwaque::storage::detail

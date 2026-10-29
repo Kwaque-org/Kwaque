@@ -17,7 +17,7 @@
 // Allocation failure swept through the owners a shard's engine runs, one
 // step of a history at a time: its start on a store never used, after a
 // stop and after a crash; a creation; a reader of a segment that is written
-// and of a sealed one; a seal; a cut of the completed-retry snapshot; a
+// and of a sealed one; a seal, with the completed facts it derives; a
 // checkpoint; a removal of a sealed segment and of a recovered one; and the
 // stop.
 //
@@ -192,16 +192,6 @@ TEST(EngineAllocationTest, AReaderOfASealedSegment) {
       life.history,
       life.operation(
         history_op::read, first(life.history, history_op::seal), 0));
-}
-
-// No request of the history is recorded as a completed retry, so the cut
-// that is swept has no fact to save: it is the cut's own path and no page.
-TEST(EngineAllocationTest, ACutOfTheRetrySnapshot) {
-    const whole_life life;
-    sweep(
-      "a retry snapshot cut",
-      life.history,
-      life.operation(history_op::cut, 0, 0));
 }
 
 TEST(EngineAllocationTest, ACheckpoint) {

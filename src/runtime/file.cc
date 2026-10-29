@@ -1575,6 +1575,67 @@ file::allocate(file_position position, byte_count length) {
     }
 }
 
+seastar::future<result<write_zeroes_outcome>>
+file::write_zeroes(file_position position, byte_count length) {
+    owner_.assert_current();
+    if (length.value() == 0 || !position.checked_add(length)) {
+        statistics_->reject();
+        co_return failure(file_error(errc::invalid_argument));
+    }
+    if (auto rejected = mutation_rejection()) {
+        statistics_->reject();
+        co_return failure(std::move(*rejected));
+    }
+    auto serialization = seastar::try_get_units(
+      write_serialization_, write_slots_);
+    std::optional<admission_reservation> queued;
+    if (!serialization) {
+        queued = try_acquire_queued_write(byte_count{});
+        if (!queued) {
+            statistics_->reject();
+            co_return failure(make_file_error(
+              errc::queue_full, file_failure_detail::admission_not_dispatched));
+        }
+    }
+    auto holder = operations_.try_hold();
+    KWAQUE_INVARIANT(
+      file_gate_invariant,
+      holder.has_value(),
+      "open file rejected operation gate entry");
+    [[maybe_unused]] auto metric = admit();
+    try {
+        if (!serialization) {
+            serialization.emplace(
+              co_await seastar::coroutine::without_preemption_check(
+                seastar::get_units(write_serialization_, write_slots_)));
+        }
+        queued.reset();
+        static_cast<void>(*serialization);
+        if (auto rejected = mutation_rejection(true)) {
+            co_return failure(std::move(*rejected));
+        }
+        // Never let the zeroing primitive reach existing bytes.
+        if (position.value() < co_await native_file_.size()) {
+            co_return failure(file_error(errc::invalid_argument));
+        }
+        try {
+            co_await native_file_.write_zeroes(
+              position.value(), length.value());
+        } catch (const std::system_error& error) {
+            // A kernel, file system or device without the mode refuses it
+            // with EOPNOTSUPP, or EINVAL for a mode it does not know.
+            if (
+              error.code() == std::errc::operation_not_supported
+              || error.code() == std::errc::invalid_argument)
+                co_return write_zeroes_outcome::unsupported;
+            throw;
+        }
+        co_return write_zeroes_outcome::written;
+    } catch (...) {
+        co_return failure(remember_io_failure(std::current_exception()));
+    }
+}
+
 seastar::future<result<std::uint64_t>> file::size() {
     owner_.assert_current();
     if (auto rejected = operation_rejection()) {

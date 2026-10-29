@@ -1,0 +1,156 @@
+diff --git a/include/seastar/core/file.hh b/include/seastar/core/file.hh
+--- a/include/seastar/core/file.hh
++++ b/include/seastar/core/file.hh
+@@ -240,6 +240,7 @@
+     virtual future<int> fcntl(int op, uintptr_t arg) noexcept;
+     virtual future<int> fcntl_short(int op, uintptr_t arg) noexcept;
+     virtual future<> allocate(uint64_t position, uint64_t length) = 0;
++    virtual future<> write_zeroes(uint64_t position, uint64_t length);
+     virtual future<file_mapping> mmap(size_t length, mmap_prot prot, mmap_private priv, size_t offset) noexcept;
+     virtual future<uint64_t> size() = 0;
+     virtual future<> close() = 0;
+@@ -508,6 +509,18 @@
+     /// \return future that becomes ready when the operation completes.
+     future<> allocate(uint64_t position, uint64_t length) noexcept;
+ 
++    /// Writes zeros to a byte range and extends the file to the range's end
++    /// without transferring data, where the file system and device offer
++    /// fallocate(FALLOC_FL_WRITE_ZEROES). Later writes into the range are
++    /// pure overwrites, needing no further change to the file's mapping
++    /// metadata. Unlike allocate(), an implementation or file system without
++    /// the primitive fails with EOPNOTSUPP and changes nothing.
++    ///
++    /// \param position beginning of the range to zero.
++    /// \param length length of the range to zero.
++    /// \return future that becomes ready when the operation completes.
++    future<> write_zeroes(uint64_t position, uint64_t length) noexcept;
++
+     /// Discard unneeded data from the file.
+     ///
+     /// The discard operation tells the file system that a range of offsets
+diff --git a/src/core/file-impl.hh b/src/core/file-impl.hh
+--- a/src/core/file-impl.hh
++++ b/src/core/file-impl.hh
+@@ -120,6 +120,7 @@
+     future<int> fcntl(int op, uintptr_t arg) noexcept override;
+     future<int> fcntl_short(int op, uintptr_t arg) noexcept override;
+     virtual future<> allocate(uint64_t position, uint64_t length) noexcept override;
++    virtual future<> write_zeroes(uint64_t position, uint64_t length) noexcept override;
+     future<file_mapping> mmap(size_t length, mmap_prot prot, mmap_private priv, size_t offset) noexcept override;
+     future<uint64_t> size() noexcept override;
+     // close() never fails. It just reports errors and swallows them.
+@@ -221,6 +222,7 @@
+         truncate,
+         flush,
+         allocate,
++        write_zeroes,
+     };
+     struct op {
+         opcode type;
+@@ -293,6 +295,7 @@
+     future<> truncate(uint64_t length) noexcept override;
+     future<uint64_t> size() noexcept override;
+     virtual future<> allocate(uint64_t position, uint64_t length) noexcept override;
++    virtual future<> write_zeroes(uint64_t position, uint64_t length) noexcept override;
+     future<> close() noexcept override;
+     future<> close_checked() noexcept override;
+ private:
+diff --git a/src/core/file.cc b/src/core/file.cc
+--- a/src/core/file.cc
++++ b/src/core/file.cc
+@@ -29,6 +29,7 @@
+ #include <functional>
+ #include <memory>
+ #include <optional>
++#include <unordered_set>
+ #include <vector>
+ #include <seastar/util/assert.hh>
+ 
+@@ -396,6 +397,32 @@
+ #endif
+ }
+ 
++#ifndef FALLOC_FL_WRITE_ZEROES
++// Linux 6.17 <linux/falloc.h>; older headers lack it.
++#define FALLOC_FL_WRITE_ZEROES 0x80
++#endif
++
++future<>
++posix_file_impl::write_zeroes(uint64_t position, uint64_t length) noexcept {
++    // Devices whose file system refused the mode, per shard. The refusal is
++    // reported to every caller; unlike allocate(), it never becomes success.
++    static thread_local std::unordered_set<dev_t> refused;
++    if (refused.contains(_device_id)) {
++        co_await coroutine::return_exception_ptr(std::make_exception_ptr(
++            std::system_error(std::make_error_code(std::errc::operation_not_supported))));
++    }
++    auto sr = co_await engine()._thread_pool->submit<syscall_result<int>>(
++            internal::thread_pool_submit_reason::file_operation, [this, position, length] () mutable {
++        return wrap_syscall<int>(::fallocate(_fd, FALLOC_FL_WRITE_ZEROES, position, length));
++    });
++    if (sr.failed()) {
++        if (sr.error == EOPNOTSUPP) {
++            refused.insert(_device_id);
++        }
++        co_await coroutine::return_exception_ptr(sr.make_system_error_ptr());
++    }
++}
++
+ future<file_mapping>
+ posix_file_impl::mmap(size_t length, mmap_prot prot, mmap_private priv, size_t offset) noexcept {
+     auto sr = co_await engine()._thread_pool->submit<syscall_result<void*>>(
+@@ -879,6 +906,7 @@
+     // checks if candidate is a non-write, size-changing operation.
+     return (candidate.type == opcode::truncate)
+             || (candidate.type == opcode::allocate)
++            || (candidate.type == opcode::write_zeroes)
+             || (candidate.type == opcode::flush && (_fsync_is_exclusive || _sloppy_size));
+ }
+ 
+@@ -1123,6 +1151,20 @@
+         );
+ }
+ 
++future<>
++append_challenged_posix_file_impl::write_zeroes(uint64_t position, uint64_t length) noexcept {
++    return enqueue<>(
++            opcode::write_zeroes,
++            position,
++            length,
++            [this, position, length] () {
++                return posix_file_impl::write_zeroes(position, length).then([this, position, length] {
++                    commit_size(position + length);
++                });
++            }
++        );
++}
++
+ future<struct stat>
+ append_challenged_posix_file_impl::stat() noexcept {
+     // FIXME: can this conflict with anything?
+@@ -1543,6 +1585,10 @@
+     return make_exception_future<>(std::system_error(std::make_error_code(std::errc::operation_not_supported)));
+ }
+ 
++future<> file_impl::write_zeroes(uint64_t, uint64_t) {
++    return make_exception_future<>(std::system_error(std::make_error_code(std::errc::operation_not_supported)));
++}
++
+ bool file::supports_checked_close() const noexcept {
+     return _file_impl && _file_impl->supports_checked_close();
+ }
+@@ -1639,6 +1685,14 @@
+   } catch (...) {
+     return current_exception_as_future();
+   }
++}
++
++future<> file::write_zeroes(uint64_t position, uint64_t length) noexcept {
++  try {
++    return _file_impl->write_zeroes(position, length);
++  } catch (...) {
++    return current_exception_as_future();
++  }
+ }
+ 
+ future<file_mapping> file::mmap(size_t length, mmap_prot prot, mmap_private priv, size_t offset) noexcept {

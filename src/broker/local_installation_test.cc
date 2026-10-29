@@ -228,6 +228,105 @@ SEASTAR_TEST_CASE(segment_writer_native_grouped_execution) {
       64);
 }
 
+SEASTAR_TEST_CASE(segment_writer_native_held_runs) {
+    co_await with_installation(
+      68,
+      [](auto& files, auto& owner, const auto& spec, auto& budget, auto drive) {
+          return storage::testing::segment_writer_contract::held_runs<
+            runtime::production::monotonic_clock>(
+            files, owner, spec, budget, drive);
+      },
+      byte_count{48_MiB},
+      resource::workload_class::foreground_protocol,
+      64);
+}
+
+SEASTAR_TEST_CASE(segment_writer_native_held_closes) {
+    co_await with_installation(
+      68,
+      [](auto& files, auto& owner, const auto& spec, auto& budget, auto drive) {
+          return storage::testing::segment_writer_contract::held_closes<
+            runtime::production::monotonic_clock>(
+            files, owner, spec, budget, drive);
+      },
+      byte_count{48_MiB},
+      resource::workload_class::foreground_protocol,
+      64);
+}
+
+SEASTAR_TEST_CASE(segment_writer_native_packed_spans) {
+    co_await with_installation(
+      68,
+      [](auto& files, auto& owner, const auto& spec, auto& budget, auto drive) {
+          return storage::testing::segment_writer_contract::packed_spans<
+            runtime::production::monotonic_clock>(
+            files, owner, spec, budget, drive);
+      },
+      byte_count{48_MiB},
+      resource::workload_class::foreground_protocol,
+      64);
+}
+
+SEASTAR_TEST_CASE(segment_writer_native_append_order) {
+    co_await with_installation(
+      68,
+      [](auto& files, auto& owner, const auto& spec, auto& budget, auto drive) {
+          return storage::testing::segment_writer_contract::append_order<
+            runtime::production::monotonic_clock>(
+            files, owner, spec, budget, drive);
+      },
+      byte_count{48_MiB},
+      resource::workload_class::foreground_protocol,
+      64);
+}
+
+SEASTAR_TEST_CASE(segment_writer_native_certified_stamps) {
+    co_await with_installation(
+      68,
+      [](auto& files, auto& owner, const auto& spec, auto& budget, auto drive) {
+          return storage::testing::segment_writer_contract::certified_stamps<
+            runtime::production::monotonic_clock>(
+            files, owner, spec, budget, drive);
+      },
+      byte_count{48_MiB},
+      resource::workload_class::foreground_protocol,
+      64);
+}
+
+SEASTAR_TEST_CASE(segment_writer_native_exact_fit) {
+    co_await with_installation(
+      68,
+      [](auto& files, auto& owner, const auto& spec, auto& budget, auto drive) {
+          return storage::testing::segment_writer_contract::exact_fit<
+            runtime::production::monotonic_clock>(
+            files, owner, spec, budget, drive);
+      },
+      byte_count{48_MiB},
+      resource::workload_class::foreground_protocol,
+      64);
+}
+
+// Each alignment in a store of its own. A 64-block group holds a reservation
+// per child: two tasks per block.
+SEASTAR_TEST_CASE(segment_writer_native_prepared_extent) {
+    for (const std::uint64_t unit : {4096U, 8192U})
+        co_await with_installation(
+          68,
+          [unit](
+            auto& files,
+            auto& owner,
+            const auto& spec,
+            auto& budget,
+            auto drive) {
+              return storage::testing::segment_writer_contract::prepared_extent<
+                runtime::production::monotonic_clock>(
+                files, owner, spec, budget, drive, unit);
+          },
+          byte_count{48_MiB},
+          resource::workload_class::foreground_protocol,
+          128);
+}
+
 SEASTAR_TEST_CASE(sparse_index_native_active_feed) {
     co_await with_installation(
       68,
@@ -475,6 +574,97 @@ SEASTAR_TEST_CASE(segment_reader_native_fed_tail) {
       64);
 }
 
+SEASTAR_TEST_CASE(segment_reader_native_established_tail) {
+    co_await with_installation(
+      68,
+      [](auto& files, auto& owner, const auto& spec, auto& budget, auto drive) {
+          return storage::testing::segment_reader_contract::established_tail<
+            runtime::production::monotonic_clock>(
+            files, owner, spec, budget, drive);
+      },
+      byte_count{48_MiB},
+      resource::workload_class::foreground_protocol,
+      64);
+}
+
+SEASTAR_TEST_CASE(segment_reader_native_woken_tail) {
+    co_await with_installation(
+      68,
+      [](auto& files, auto& owner, const auto& spec, auto& budget, auto drive) {
+          return storage::testing::segment_reader_contract::woken_tail<
+            runtime::production::monotonic_clock>(
+            files, owner, spec, budget, drive);
+      },
+      byte_count{48_MiB},
+      resource::workload_class::foreground_protocol,
+      64);
+}
+
+SEASTAR_TEST_CASE(segment_reader_native_extended_session) {
+    co_await with_installation(
+      68,
+      [](auto& files, auto& owner, const auto& spec, auto& budget, auto drive) {
+          return storage::testing::segment_reader_contract::extended_session<
+            runtime::production::monotonic_clock>(
+            files, owner, spec, budget, drive);
+      },
+      byte_count{48_MiB},
+      resource::workload_class::foreground_protocol,
+      64);
+}
+
+SEASTAR_TEST_CASE(segment_reader_native_steady_tail) {
+    co_await with_installation(
+      68,
+      [](auto& files, auto& owner, const auto& spec, auto& budget, auto drive) {
+          return storage::testing::segment_reader_contract::steady_tail<
+            runtime::production::monotonic_clock>(
+            files, owner, spec, budget, drive);
+      },
+      byte_count{48_MiB},
+      resource::workload_class::foreground_protocol,
+      64);
+}
+
+SEASTAR_TEST_CASE(segment_reader_native_reported_before_made) {
+    co_await with_installation(
+      68,
+      [](auto& files, auto& owner, const auto& spec, auto& budget, auto drive) {
+          return storage::testing::segment_reader_contract::
+            reported_before_made<runtime::production::monotonic_clock>(
+              files, owner, spec, budget, drive);
+      },
+      byte_count{48_MiB},
+      resource::workload_class::foreground_protocol,
+      64);
+}
+
+SEASTAR_TEST_CASE(segment_reader_native_held_reads) {
+    co_await with_installation(
+      68,
+      [](auto& files, auto& owner, const auto& spec, auto& budget, auto drive) {
+          return storage::testing::segment_reader_contract::held_reads<
+            runtime::production::monotonic_clock>(
+            files, owner, spec, budget, drive);
+      },
+      byte_count{48_MiB},
+      resource::workload_class::foreground_protocol,
+      64);
+}
+
+SEASTAR_TEST_CASE(segment_reader_native_packed_reads) {
+    co_await with_installation(
+      68,
+      [](auto& files, auto& owner, const auto& spec, auto& budget, auto drive) {
+          return storage::testing::segment_reader_contract::packed_reads<
+            runtime::production::monotonic_clock>(
+            files, owner, spec, budget, drive);
+      },
+      byte_count{48_MiB},
+      resource::workload_class::foreground_protocol,
+      64);
+}
+
 SEASTAR_TEST_CASE(segment_reader_native_read_edges) {
     co_await with_installation(
       68,
@@ -591,6 +781,19 @@ SEASTAR_TEST_CASE(segment_writer_native_preallocated_execution) {
       [](auto& files, auto& owner, const auto& spec, auto& budget, auto drive) {
           return storage::testing::segment_writer_contract::
             preallocated_execution<runtime::production::monotonic_clock>(
+              files, owner, spec, budget, drive);
+      },
+      byte_count{48_MiB},
+      resource::workload_class::foreground_protocol,
+      64);
+}
+
+SEASTAR_TEST_CASE(segment_writer_native_zero_written_by_default) {
+    co_await with_installation(
+      68,
+      [](auto& files, auto& owner, const auto& spec, auto& budget, auto drive) {
+          return storage::testing::segment_writer_contract::
+            zero_written_by_default<runtime::production::monotonic_clock>(
               files, owner, spec, budget, drive);
       },
       byte_count{48_MiB},

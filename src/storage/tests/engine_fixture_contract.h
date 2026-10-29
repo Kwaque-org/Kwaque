@@ -81,9 +81,10 @@ inline std::string publication_b(bool boundary = true) {
     wire.replace(152, 16, std::string(16, '\x31'));
     put(wire, 168, 2, 8);
     if (boundary) {
-        put(wire, 188, 8192, 8);
+        put(wire, 188, 4535, 8);
+        put(wire, 196, local_fixture::read("footer_b").size(), 4);
         const auto footer = installation::literal_digest(
-                              "26379b17a9588439bcd93421bbe88ca4")
+                              "1bcba7cd20d822da9bb4a69fb965e9f6")
                               .bytes();
         for (std::size_t i = 0; i != footer.size(); ++i)
             wire[204 + i] = std::bit_cast<char>(footer[i]);
@@ -232,10 +233,6 @@ seastar::future<> lay_out(
         const auto paths = take(local_paths::make(devices[1].root));
         const local_segment_name name{a.segment(), a.generation()};
         co_await put(
-          take(paths.object(0, name, reader::snapshot_ref().sequence())),
-          local_fixture::read("snapshot_root")
-            + local_fixture::read("snapshot_page"));
-        co_await put(
           take(paths.object(0, name, reader::sealed_ref().sequence())),
           local_fixture::read("sealed_retry_page"));
         co_await put(
@@ -250,6 +247,27 @@ seastar::future<> lay_out(
       "descriptor_b",
       recovery_contract::segment_b_bytes(),
       publication_b());
+}
+
+// Segment A as a crash before its first sync leaves it, its blocks reported
+// by their WAL barrier alone: its data file back to its header and its
+// publication the one it was made with. The WAL keeps their PREPAREs.
+template<typename Backend, typename Driver>
+seastar::future<> drop_blocks_a(
+  Backend& files, std::span<const local_device_spec, 3> devices, Driver drive) {
+    const auto a = installation::segment();
+    const auto paths = take(local_paths::make(devices[1].root));
+    const local_segment_name name{a.segment(), a.generation()};
+    co_await store_contract::write_bytes(
+      files,
+      take(paths.segment_file(0, name, local_segment_file::data)),
+      local_fixture::read("data_header_a"),
+      drive);
+    co_await store_contract::write_bytes(
+      files,
+      take(paths.segment_file(0, name, local_segment_file::published)),
+      local_fixture::read("publication_empty"),
+      drive);
 }
 
 // A record of a file, at `record` in it, made to say its body is `extra`
@@ -303,6 +321,8 @@ struct image_start final {
     bool restarted{false};
     std::uint32_t recovered{0};
     std::uint64_t unresolved{0};
+    // Slots the start wrote from the WAL before it published them.
+    std::uint64_t materialized{0};
     // The table holds the segment as one a restart recovered.
     bool a_recovering{false}, b_recovering{false};
 };
@@ -332,9 +352,15 @@ seastar::future<image_start> start_on_the_image(
     const auto b = scan::segment_b();
     const std::array catalog{
       recovery_catalog_entry{
-        installation::descriptor(), installation::segment_head(), std::nullopt},
+        installation::descriptor(),
+        installation::segment_head(),
+        model::range_logical_end{100},
+        std::nullopt},
       recovery_catalog_entry{
-        scan::descriptor_b(), scan::segment_head_b(), std::nullopt}};
+        scan::descriptor_b(),
+        scan::segment_head_b(),
+        model::range_logical_end{1000},
+        std::nullopt}};
     lifecycle::told heard;
     auto engine = take(
       engine_type::make(
@@ -359,6 +385,7 @@ seastar::future<image_start> start_on_the_image(
         seen.restarted = began.restarted;
         seen.recovered = began.recovered;
         seen.unresolved = began.unresolved;
+        seen.materialized = began.materialized;
         if (auto* table = engine->table()) {
             seen.a_recovering = table->life(a) == segment_life::recovering;
             seen.b_recovering = table->life(b) == segment_life::recovering;
@@ -406,9 +433,15 @@ seastar::future<> started_on_the_image(
     const auto b = scan::segment_b();
     const std::array catalog{
       recovery_catalog_entry{
-        installation::descriptor(), installation::segment_head(), std::nullopt},
+        installation::descriptor(),
+        installation::segment_head(),
+        model::range_logical_end{100},
+        std::nullopt},
       recovery_catalog_entry{
-        scan::descriptor_b(), scan::segment_head_b(), std::nullopt}};
+        scan::descriptor_b(),
+        scan::segment_head_b(),
+        model::range_logical_end{1000},
+        std::nullopt}};
     const auto held =
       [&](const local_device_spec& device, const segment_context& context) {
           const auto paths = take(local_paths::make(device.root));
@@ -458,7 +491,7 @@ seastar::future<> started_on_the_image(
             && data_b.starts_with(recovery_contract::segment_b_bytes()),
           "a start changed a block of the image");
         if (sealed) {
-            const auto roots = reader::contexts(devices[1]);
+            const auto roots = reader::contexts();
             const sealed_segment_expectation expected{
               devices[1].owner.device(),
               take(local_publication_generation::make(3)),
@@ -466,11 +499,11 @@ seastar::future<> started_on_the_image(
               installation::descriptor(),
               {roots.begin(), roots.end()},
               reader::history(),
-              {scope(100, 102, 0, 2, 4096, 16384),
+              {scope(100, 102, 0, 2, 4096, 8192),
                codec::extent_digest{installation::literal_digest(
-                                      "eca717818b53c4ae00458133840519cc")
+                                      "7a4e89e84ab06576682af14e02ae43bd")
                                       .bytes()},
-               runtime::file_position{20480}}};
+               runtime::file_position{12288}}};
             auto opened = co_await drive.lifecycle(
               engine->table()->open_session(
                 a, lifecycle::sight(1U << 20U), budget, work, &expected));
@@ -497,6 +530,89 @@ seastar::future<> started_on_the_image(
     }
     failed.observe(co_await drive.lifecycle(engine->stop()));
     take(failed.outcome());
+}
+
+// The image as a crash leaves it when segment A held its two requests
+// unwritten: its data file holds only its header and its publication no
+// boundary, while the WAL keeps both PREPAREs. The restart writes A1, A2
+// and the footer that closes them from those PREPAREs before it publishes A
+// as recovering, so its file is the image's byte for byte, and the
+// checkpoint the start takes passes the PREPAREs: nothing the WAL reported
+// is lost, and nothing pins the file they lie in. The next start finds A
+// published and writes nothing.
+template<
+  runtime::monotonic_clock Clock,
+  typename Backend,
+  typename Owner,
+  typename Driver,
+  typename Timer>
+seastar::future<> materialized_on_the_image(
+  Backend& files,
+  Owner& owner,
+  std::span<const local_device_spec, 3> devices,
+  workload_budget& budget,
+  workload_budget& reserve,
+  Driver drive,
+  Timer& timer) {
+    using engine_type = local_engine<Backend, Owner, Clock>;
+    co_await lay_out(files, devices, false, drive);
+    const auto a = installation::segment();
+    const auto paths = take(local_paths::make(devices[1].root));
+    const local_segment_name name{a.segment(), a.generation()};
+    const auto data = take(
+      paths.segment_file(0, name, local_segment_file::data));
+    co_await drop_blocks_a(files, devices, drive);
+    const std::array catalog{
+      recovery_catalog_entry{
+        installation::descriptor(),
+        installation::segment_head(),
+        model::range_logical_end{100},
+        std::nullopt},
+      recovery_catalog_entry{
+        scan::descriptor_b(),
+        scan::segment_head_b(),
+        model::range_logical_end{1000},
+        std::nullopt}};
+    for (const std::uint64_t written : {2U, 0U}) {
+        lifecycle::told heard;
+        auto engine = take(
+          engine_type::make(
+            {files,
+             owner,
+             std::span<const local_device_spec>{devices},
+             devices[0],
+             0,
+             budget,
+             budget,
+             reserve,
+             budget},
+            engines::configuration()));
+        runtime::first_failure failed;
+        try {
+            const auto began = co_await drive.lifecycle(
+              engine->start(timer, catalog, {heard.sink(), {}, {}}));
+            take(began.failure.outcome());
+            require(
+              began.state == engine_state::ready && began.restarted
+                && began.recovered == 2 && began.unresolved == 0
+                && began.materialized == written && began.repaired == 0
+                && began.candidates == 0 && began.uncertified_tails == 0
+                && engine->table()->life(a) == segment_life::recovering,
+              "a start did not write and publish what the WAL reported");
+            const auto end = engine->checkpoint()->end();
+            require(
+              end && end->incarnation() != reader::wal(1),
+              "the start's checkpoint did not pass the PREPAREs it wrote");
+            require(
+              (co_await store_contract::read_all_bytes(files, data, drive))
+                == segment_scan_contract::active_a(),
+              "the written segment is not the image's byte for byte");
+        } catch (...) {
+            failed.observe(std::current_exception());
+        }
+        failed.observe(co_await drive.lifecycle(engine->stop()));
+        take(failed.outcome());
+    }
 }
 
 } // namespace kwaque::storage::testing::engine_fixture_contract

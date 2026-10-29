@@ -301,8 +301,10 @@ Id numbered(std::uint8_t fill, std::uint32_t ordinal) {
         bytes[12 + at] = static_cast<std::uint8_t>(ordinal >> (8 * (3 - at)));
     return Id::make(bytes).value();
 }
-// Segment `ordinal` of the store. Its first offset lies just below 2^32, so
-// that a segment of a few thousand records has offsets on both sides of it.
+// Where every segment of the store starts: just below 2^32, so that a
+// segment of a few thousand records has offsets on both sides of it.
+constexpr model::range_logical_end segment_origin{(1ULL << 32U) - 1024};
+// Segment `ordinal` of the store, which starts at segment_origin.
 local_segment_descriptor
 describe(std::uint32_t ordinal, byte_count maximum_data_bytes) {
     auto value = installation::descriptor();
@@ -313,7 +315,6 @@ describe(std::uint32_t ordinal, byte_count maximum_data_bytes) {
                       numbered<model::segment_id>(0x30, ordinal),
                       value.segment.generation())
                       .value();
-    value.logical_origin = model::range_logical_end{(1ULL << 32U) - 1024};
     value.maximum_data_bytes = maximum_data_bytes;
     return value;
 }
@@ -397,6 +398,7 @@ seastar::future<sealed> write_segment(
         env.spec,
         0,
         out.descriptor,
+        segment_origin,
         env.writing,
         config));
     constexpr std::uint32_t window = 8;
@@ -409,7 +411,7 @@ seastar::future<sealed> write_segment(
             [&writer, &work] { return writer->create_new(work); }));
         take(writer->observe_blocks(out.memory->observer()));
         const fixture::shape shape{.name = "index"};
-        auto logical = out.descriptor.logical_origin;
+        auto logical = segment_origin;
         auto sequence = std::uint64_t{plan.ordinal} << 32U;
         while (out.blocks < plan.blocks && !out.filled) {
             std::optional<segment_captured_boundary> cut;
@@ -453,7 +455,10 @@ seastar::future<sealed> write_segment(
                       env.writing.try_reserve_buffer(batch.bytes()));
                     children.push_back(take(
                       admitted_wal_batch::make(
-                        std::move(batch), std::move(backing), charge)));
+                        std::move(batch),
+                        std::move(backing),
+                        segments::child_append_time,
+                        charge)));
                 }
                 auto group = take(
                   co_await writer->freeze_group(
@@ -481,7 +486,6 @@ seastar::future<sealed> write_segment(
         const auto outcome = co_await writer->seal(
           segments::completed_source{{}, {}, &calls},
           0,
-          out.blocks,
           work,
           sparse_index_seal{
             out.memory.get(),
@@ -1408,6 +1412,8 @@ seastar::future<hole_extent> make_holes(
       every_block, byte_count{1_GiB}, count);
     extent.memory = std::make_unique<active_sparse_index>(take(
       active_sparse_index::make(every_block, extent.capacity, env.writing)));
+    // As a writer admits each group's blocks before they are offered.
+    take(extent.memory->admit(count));
     choices drawn{0x401e};
     auto base = history.logical_origin.value();
     auto ordinal = history.physical_origin.value();
@@ -1759,7 +1765,7 @@ many_segments_case(environment env, side measured) {
         // Every index answers afterwards, whether its root stayed open.
         for (std::uint32_t s = 0; s < count; ++s) {
             const auto first = model::range_logical_offset::make(
-                                 stored[s].descriptor.logical_origin.value())
+                                 segment_origin.value())
                                  .value();
             std::optional<sparse_index_position> found;
             if (measured == side::candidate)
@@ -2533,6 +2539,7 @@ seastar::future<std::unique_ptr<read_world>> open_world(
            *segment.boundary,
            {*segment.index, *segment.retry}},
           segment.descriptor,
+          segment.history->logical_origin,
           contexts};
         made->generation = take(
           co_await local_generation_owner::open(
@@ -2764,10 +2771,7 @@ seastar::future<std::size_t> read_stride_case(environment env) {
                     measure_scope scope{env.files, timed};
                     if (scanned) {
                         done = co_await read_through(
-                          reader,
-                          segment.descriptor.logical_origin,
-                          byte_count{1_MiB},
-                          asking);
+                          reader, segment_origin, byte_count{1_MiB}, asking);
                         co_return;
                     }
                     for (std::uint32_t q = 0; q < seeks; ++q) {
@@ -2854,10 +2858,7 @@ seastar::future<std::size_t> ahead_case(environment env) {
                 measure_scope scope{env.files, timed};
                 // A consumer's fetch: a few batches at a time.
                 done = co_await read_through(
-                  reader,
-                  segment.descriptor.logical_origin,
-                  byte_count{16_KiB},
-                  asking);
+                  reader, segment_origin, byte_count{16_KiB}, asking);
             };
             co_await seastar::with_scheduling_group(
               env.indexing.scheduling_group(), [&unit] { return unit(); });
@@ -2931,10 +2932,7 @@ seastar::future<std::size_t> held_case(environment env, bool held) {
             before = world->cache->snapshot();
             measure_scope scope{env.files, timed};
             done = co_await read_through(
-              reader,
-              segment.descriptor.logical_origin,
-              byte_count{1_MiB},
-              asking);
+              reader, segment_origin, byte_count{1_MiB}, asking);
         };
         co_await seastar::with_scheduling_group(
           env.indexing.scheduling_group(), [&unit] { return unit(); });
@@ -3024,9 +3022,10 @@ seastar::future<> scan_beside(
 // readers: as many bytes of batches as were appended. It reads through a
 // file system of its own, so that a reader's device reads are its own, and
 // the shard's counts hold both. A read that no file was read for is a hit.
-// The append's own time is reported apart from the reads'.
+// The append's own time is reported apart from the reads'. With `copied`
+// the feed copies what it takes rather than sharing what it can.
 seastar::future<std::size_t>
-tail_case(environment env, feeding how, bool scanned) {
+tail_case(environment env, feeding how, bool scanned, bool copied = false) {
     const auto chosen = chosen_reads();
     seastar::abort_source abort;
     codec::cooperative_work work{codec::limits::defaults(), abort};
@@ -3070,7 +3069,7 @@ tail_case(environment env, feeding how, bool scanned) {
     std::array<lagging, lags.size()> readers{};
     measurement timed;
     std::uint64_t append_ns = 0, read_ns = 0;
-    std::uint64_t dropped = 0;
+    std::uint64_t dropped = 0, tail_reads = 0;
     page_cache_snapshot after;
     foreground probe;
     std::optional<seastar::future<>> turning;
@@ -3091,6 +3090,7 @@ tail_case(environment env, feeding how, bool scanned) {
             env.spec,
             0,
             descriptor,
+            segment_origin,
             env.writing,
             config));
         take(
@@ -3098,7 +3098,7 @@ tail_case(environment env, feeding how, bool scanned) {
             env.writing.scheduling_group(),
             [&writer, &work] { return writer->create_new(work); }));
         const auto history = take(co_await writer->pin_data(work)).history;
-        segment_runs_config fed{.limits = run_limits()};
+        segment_runs_config fed{.limits = run_limits(), .copy_fed = copied};
         if (how == feeding::untold)
             fed.now = []() noexcept {
                 return runtime::monotonic_time{measurement_time()};
@@ -3112,17 +3112,14 @@ tail_case(environment env, feeding how, bool scanned) {
         if (scanned) {
             scanning.emplace(session(*beside, scanner, {.fill = false}));
             scanned_by.emplace(scan_beside(
-              *scanning,
-              {cold->descriptor.logical_origin, std::nullopt},
-              pace,
-              scan_abort));
+              *scanning, {segment_origin, std::nullopt}, pace, scan_abort));
         }
         // Where each group begins and ends, in offsets.
         std::vector<std::uint64_t> begins, ends;
         begins.reserve(chosen.groups);
         ends.reserve(chosen.groups);
         const fixture::shape shape{.name = "index"};
-        auto logical = descriptor.logical_origin;
+        auto logical = segment_origin;
         std::uint64_t sequence = 0;
         if (env.chosen.foreground) turning.emplace(foreground_loop(probe));
         {
@@ -3163,7 +3160,10 @@ tail_case(environment env, feeding how, bool scanned) {
                       env.writing.try_reserve_buffer(batch.bytes()));
                     children.push_back(take(
                       admitted_wal_batch::make(
-                        std::move(batch), std::move(backing), charge)));
+                        std::move(batch),
+                        std::move(backing),
+                        segments::child_append_time,
+                        charge)));
                 }
                 auto group = take(
                   co_await writer->freeze_group(
@@ -3201,7 +3201,7 @@ tail_case(environment env, feeding how, bool scanned) {
                         {.durable = view.durable,
                          .sealed = std::nullopt,
                          .visible = model::range_logical_end{ends[wanted]}},
-                        active_read_index(*index, view.durable),
+                        active_read_index(*index),
                         env.indexing));
                     const auto then = counted(
                       env.files.sample, file_kind::data);
@@ -3235,6 +3235,7 @@ tail_case(environment env, feeding how, bool scanned) {
         }
         after = cache->snapshot();
         dropped = runs->dropped();
+        tail_reads = runs->tail_device_reads();
     } catch (...) {
         failed.observe(std::current_exception());
     }
@@ -3292,7 +3293,7 @@ tail_case(environment env, feeding how, bool scanned) {
     {
         row out{
           scanned ? "read_tail_scanned" : "read_tail",
-          feeding_name(how),
+          copied ? "told_copied" : feeding_name(how),
           family};
         out.number("groups", chosen.groups)
           .number("group_blocks", group_blocks)
@@ -3302,6 +3303,7 @@ tail_case(environment env, feeding how, bool scanned) {
           .number("scan_ns", pace.ns)
           .number("scanned_batches", pace.batches)
           .number("feed_dropped", dropped)
+          .number("tail_device_reads", tail_reads)
           .number("foreground_turns", probe.turns)
           .number("longest_wait_ns", probe.longest);
         for (std::size_t r = 0; r < lags.size(); ++r) {
@@ -3349,6 +3351,11 @@ PERF_TEST_F(read_path, tail_untold) {
 PERF_TEST_F(read_path, tail_told) {
     return run_store(
       [](environment env) { return tail_case(env, feeding::told, false); });
+}
+PERF_TEST_F(read_path, tail_told_copied) {
+    return run_store([](environment env) {
+        return tail_case(env, feeding::told, false, true);
+    });
 }
 PERF_TEST_F(read_path, tail_untold_scanned) {
     return run_store(

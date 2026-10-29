@@ -421,6 +421,54 @@ result<void> fragmented_buffer_builder::reserve_fragments(item_count count) {
     return {};
 }
 
+result<fragmented_buffer>
+fragmented_buffer_builder::share(byte_count offset, byte_count length) {
+    if (finished_) {
+        return failure(errc::closed);
+    }
+    const auto end = offset.checked_add(length);
+    if (!end || *end > size_) {
+        return failure(errc::out_of_range);
+    }
+    if (length.value() == 0) {
+        return fragmented_buffer{};
+    }
+    fragmented_buffer::fragment_storage shared;
+    byte_count retained;
+    std::uint64_t skip = offset.value();
+    std::uint64_t remaining = length.value();
+    for (std::size_t index = 0; index < fragments_.size() && remaining != 0;
+         ++index) {
+        auto& fragment = fragments_[index];
+        // Every fragment but the tail presents what was written to it.
+        const auto used = index + 1 == fragments_.size()
+                            ? tail_used_
+                            : static_cast<std::uint64_t>(
+                                fragment.storage.size());
+        if (skip >= used) {
+            skip -= used;
+            continue;
+        }
+        const auto take = std::min(used - skip, remaining);
+        if (shared.size() == max_buffer_fragments) {
+            return failure(errc::resource_exhausted);
+        }
+        shared.push_back(
+          fragmented_buffer::owned_fragment{
+            .storage = fragment.storage.share(
+              static_cast<std::size_t>(skip), static_cast<std::size_t>(take)),
+            .retained_bytes = fragment.retained_bytes,
+          });
+        retained = *retained.checked_add(fragment.retained_bytes);
+        skip = 0;
+        remaining -= take;
+    }
+    if (remaining != 0) {
+        return failure(errc::out_of_range);
+    }
+    return fragmented_buffer{std::move(shared), length, retained};
+}
+
 result<fragmented_buffer> fragmented_buffer_builder::finish() {
     if (finished_) {
         return failure(errc::closed);

@@ -106,10 +106,7 @@ seastar::future<runtime::result<void>> validate_local_root_page(
     } else {
         auto expected = std::get<local_metadata_expectation>(bundle.context());
         expected.header = local_metadata_header::make(
-                            bundle.reference().kind()
-                                == local_root_kind::checkpoint
-                              ? local_metadata_kind::checkpoint_page
-                              : local_metadata_kind::completed_retry_page,
+                            local_metadata_kind::checkpoint_page,
                             expected.header.owner(),
                             expected.header.generation())
                             .value();
@@ -262,36 +259,17 @@ seastar::future<runtime::result<local_retry_page>> read_retry_page(
       input, state->bundle.limits(), work);
     if (!memory)
         co_return runtime::failure(detail::path_error(memory.error().code()));
-    if (
-      const auto* summary = std::get_if<sealed_footer>(&state->bundle.root())) {
-        auto page = co_await decode_retry_page(
-          input,
-          *summary,
-          ordinal,
-          *memory,
-          work,
-          {},
-          codec::input_boundary::complete);
-        if (!page)
-            co_return runtime::failure(detail::path_error(page.error().code()));
-        if (!input.at_end())
-            co_return runtime::failure(
-              detail::path_error(errc::malformed_data));
-        co_return local_retry_page{
-          std::move(held), std::move(pin), std::move(page->value)};
-    }
-    auto expected = std::get<local_metadata_expectation>(
-      state->bundle.context());
-    expected.header = local_metadata_header::make(
-                        local_metadata_kind::completed_retry_page,
-                        expected.header.owner(),
-                        expected.header.generation())
-                        .value();
-    expected.digest = reference.digest();
-    expected.encoded_bytes = reference.encoded_bytes();
-    expected.page = reference;
-    auto page = co_await decode_local_metadata(
-      input, expected, *memory, work, {}, codec::input_boundary::complete);
+    const auto* summary = std::get_if<sealed_footer>(&state->bundle.root());
+    if (!summary)
+        co_return runtime::failure(detail::path_error(errc::wrong_context));
+    auto page = co_await decode_retry_page(
+      input,
+      *summary,
+      ordinal,
+      *memory,
+      work,
+      {},
+      codec::input_boundary::complete);
     if (!page)
         co_return runtime::failure(detail::path_error(page.error().code()));
     if (!input.at_end())
@@ -367,11 +345,7 @@ seastar::future<runtime::result<local_index_page>> local_root_pin::read_index(
       std::move(*pin), state_, ordinal, std::move(*held), work);
 }
 std::span<const completed_retry> local_retry_page::entries() const& noexcept {
-    if (const auto* summary = std::get_if<retry_page>(&value))
-        return summary->entries();
-    return std::get<local_completed_retry_page>(
-             std::get<local_metadata_record>(value).payload())
-      .entries;
+    return value.entries();
 }
 seastar::future<runtime::result<local_retry_page>> local_root_pin::read_retries(
   page_ordinal ordinal, codec::cooperative_work& work) const {
@@ -380,10 +354,7 @@ seastar::future<runtime::result<local_retry_page>> local_root_pin::read_retries(
         return seastar::make_ready_future<runtime::result<local_retry_page>>(
           runtime::failure(error));
     };
-    const auto kind = state_->bundle.reference().kind();
-    if (
-      kind != local_root_kind::sealed_retry
-      && kind != local_root_kind::completed_retry_snapshot)
+    if (state_->bundle.reference().kind() != local_root_kind::sealed_retry)
         return reject(detail::path_error(errc::wrong_context));
     if (auto at = position(ordinal); !at) return reject(at.error());
     const auto limits = state_->bundle.limits();

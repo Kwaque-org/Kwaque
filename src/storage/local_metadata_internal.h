@@ -2,7 +2,6 @@
 
 #include "src/storage/local_metadata.h"
 #include "src/storage/page_internal.h"
-#include "src/storage/retry_entry_internal.h"
 
 namespace kwaque::storage::detail {
 inline constexpr auto local_family = codec::format_family::local_storage;
@@ -28,10 +27,8 @@ local_payload_segment(const local_metadata_payload&) noexcept;
   const local_metadata_payload&,
   aligned_envelope_layout,
   std::optional<storage_alignment> segment_alignment,
-  std::optional<storage_alignment> data_metadata_alignment,
   codec::cooperative_work&,
-  codec::field_context,
-  bool writing = false);
+  codec::field_context);
 [[nodiscard]] codec::result<void> validate_local_expectation(
   const local_metadata_expectation&, codec::field_context);
 [[nodiscard]] codec::result<void> match_local_expectation(

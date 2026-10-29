@@ -16,6 +16,8 @@
 
 namespace kwaque::storage::testing::wal_bench_support {
 using store_contract::require;
+// The broker time every benchmark child was assigned at.
+inline constexpr runtime::wall_time child_time{1};
 inline void initialize() {
     static const bool profile_reported = [] {
         codec::testing::report_profile();

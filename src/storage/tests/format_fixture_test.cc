@@ -13,16 +13,34 @@ using namespace testing;
 namespace fixture = codec::testing::format_fixture;
 using bytes::fragmented_buffer_parser;
 
+// The fixtures are one sealed segment: the block packed at [512, 911), the
+// durable footer that ends its write at [911, 1536), and the sealed root at
+// 1536 over the block and the footer.
+constexpr std::uint64_t block_end = 911;
+constexpr std::uint64_t extent_end = 1536;
+
+// What the durable footer names: the block alone.
+verified_extent block_extent(codec::cooperative_work& work) {
+    auto verifier = extent_verifier::make(
+                      history(),
+                      scope(100, 101, 0, 1, 512, block_end),
+                      work.policy())
+                      .value();
+    feed_block(verifier, fixture::read("segment_block"), work).value();
+    return verifier.finish(work).value();
+}
+// What the sealed root, index and manifest name: the block and its footer.
 verified_extent fixture_extent(codec::cooperative_work& work) {
     auto verifier = extent_verifier::make(
                       history(),
-                      scope(100, 101, 0, 1, 512, 1024),
+                      scope(100, 101, 0, 1, 512, extent_end),
                       work.policy(),
                       extent_layout_kind::initial_append,
                       {},
                       extent_integrity::crc32c_and_digest)
                       .value();
     feed_block(verifier, fixture::read("segment_block"), work).value();
+    feed_footer(verifier, fixture::read("durable_footer"), work).value();
     return verifier.finish(work).value();
 }
 
@@ -64,11 +82,12 @@ TEST(
             EXPECT_EQ(decoded->value.descriptor().context(), sc());
             EXPECT_EQ(
               decoded->value.descriptor().coverage(),
-              scope(100, 101, 0, 1, 512, 1024));
+              scope(100, 101, 0, 1, 512, block_end));
             EXPECT_EQ(
               decoded->value.descriptor().batch().fingerprint.bytes(),
               fixture::digest("batch_digest"));
-            EXPECT_EQ(wire.substr(152, child.size()), child);
+            EXPECT_EQ(decoded->value.descriptor().stamps(), block_stamps());
+            EXPECT_EQ(wire.substr(176, child.size()), child);
         }
         {
             const auto wire = fixture::read("wal_prepare");
@@ -82,7 +101,8 @@ TEST(
             EXPECT_EQ(decoded->value.wal(), wal_expected().wal);
             EXPECT_EQ(decoded->value.target(), wal_expected().target);
             EXPECT_EQ(decoded->value.routing_epoch().value(), 1U);
-            EXPECT_EQ(decoded->value.wal_extent().end().value(), 512U);
+            EXPECT_EQ(decoded->value.stamps(), wal_stamps());
+            EXPECT_EQ(decoded->value.wal_extent().end().value(), 1024U);
             EXPECT_TRUE(decoded->value.batch().bytes().content_equals(child));
         }
     }
@@ -97,21 +117,19 @@ TEST(
     ASSERT_TRUE(evidence.digest());
     EXPECT_EQ(evidence.digest()->bytes(), fixture::digest("extent_digest"));
     {
+        const auto named = block_extent(work);
+        const footer_expectation at{
+          history(), runtime::file_position{block_end}};
         const auto wire = fixture::read("durable_footer");
+        EXPECT_EQ(block_end + wire.size(), extent_end);
         fragmented_buffer_parser input{buffer(wire, 7)};
         const auto decoded
-          = decode_durable_footer(
-              input, root_location(), reserve(input, work), work)
-              .get();
+          = decode_durable_footer(input, at, reserve(input, work), work).get();
         ASSERT_TRUE(decoded.has_value());
         EXPECT_TRUE(input.at_end());
-        EXPECT_TRUE(validate_durable_footer(*decoded, evidence));
+        EXPECT_TRUE(validate_durable_footer(*decoded, named));
         auto encoded = encode_durable_footer(
-                         evidence,
-                         root_location(),
-                         work,
-                         budget().operation_remaining,
-                         charge)
+                         named, at, work, budget().operation_remaining, charge)
                          .get();
         ASSERT_TRUE(encoded.has_value());
         EXPECT_TRUE(encoded->bytes().content_equals(wire));
@@ -272,7 +290,7 @@ TEST(
     for (const bool wal : {false, true}) {
         const auto original = fixture::read(
           wal ? "wal_prepare" : "segment_block");
-        const std::size_t child_at = wal ? 168 : 152;
+        const std::size_t child_at = wal ? 200 : 176;
         for (const auto& mutation : fixture::record_mutations) {
             for (const std::size_t width : {7U, 67U}) {
                 SCOPED_TRACE(
@@ -322,20 +340,21 @@ TEST(
     }
 }
 
-TEST(
-  StorageFormatFixtureTest, HeaderExtensionsAndPaddingBelongToTheExactDigest) {
+TEST(StorageFormatFixtureTest, HeaderExtensionsBelongToTheExactDigest) {
     const auto child = fixture::read("assigned_dense");
     const auto plain = fixture::read("segment_block");
     const auto extended = block_wire(child, block_expected(), 41);
-    ASSERT_EQ(plain.size(), extended.size());
+    // A block has no padding to absorb the extension.
+    ASSERT_EQ(extended.size(), plain.size() + 9U);
     EXPECT_NE(exact_digest(plain), exact_digest(extended));
     for (const auto& wire : {plain, extended}) {
         for (const std::size_t width : {1U, 67U}) {
             seastar::abort_source abort;
             codec::cooperative_work work{codec::limits::defaults(), abort};
+            const auto end = 512U + wire.size();
             auto verifier = extent_verifier::make(
                               history(),
-                              scope(100, 101, 0, 1, 512, 1024),
+                              scope(100, 101, 0, 1, 512, end),
                               work.policy(),
                               extent_layout_kind::initial_append,
                               {},
@@ -362,7 +381,7 @@ TEST(
             EXPECT_EQ(evidence.digest()->bytes(), exact_digest(wire));
             EXPECT_EQ(evidence.boundary().block_count, 1U);
             EXPECT_EQ(
-              evidence.boundary().coverage, scope(100, 101, 0, 1, 512, 1024));
+              evidence.boundary().coverage, scope(100, 101, 0, 1, 512, end));
         }
     }
 }

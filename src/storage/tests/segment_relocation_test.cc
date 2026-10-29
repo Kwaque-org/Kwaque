@@ -24,6 +24,7 @@ TEST(SegmentRelocationTest, SparseAndDenseRelocationPreserveOriginalIdentity) {
             auto encoded = encode_segment_block(
                              std::move(child),
                              relocated,
+                             {runtime::wall_time{1}, relocated.data_start},
                              work,
                              budget().operation_remaining,
                              charge)
@@ -63,7 +64,7 @@ TEST(SegmentRelocationTest, SparseAndDenseRelocationPreserveOriginalIdentity) {
                 .value(),
               1U);
             EXPECT_EQ(
-              flat(decoded->value.bytes()).substr(32 + 120, bytes.size()),
+              flat(decoded->value.bytes()).substr(32 + 144, bytes.size()),
               bytes);
         }
     }
@@ -150,11 +151,15 @@ TEST(
                    .value();
     const auto original = child.info();
     EXPECT_EQ(original.fingerprint, fingerprint);
-    auto block
-      = encode_segment_block(
-          std::move(child), current, work, budget().operation_remaining, charge)
-          .get()
-          .value();
+    auto block = encode_segment_block(
+                   std::move(child),
+                   current,
+                   {runtime::wall_time{1}, current.data_start},
+                   work,
+                   budget().operation_remaining,
+                   charge)
+                   .get()
+                   .value();
     EXPECT_EQ(block.descriptor().batch(), original);
     EXPECT_EQ(block.descriptor().coverage().logical(), context.logical_span());
     EXPECT_EQ(block.descriptor().coverage().physical().count().value(), 2U);
@@ -187,6 +192,7 @@ TEST(
     auto encoded = encode_segment_block(
                      std::move(child),
                      block_expected(),
+                     {runtime::wall_time{1}, block_expected().data_start},
                      work,
                      budget().operation_remaining,
                      charge)

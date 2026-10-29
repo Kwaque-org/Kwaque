@@ -57,10 +57,10 @@ TEST(SegmentFormatTest, IndependentCrcAndInterconnectedGoldenBytes) {
       hex("4b5142460200010001002000bf0000000000000000000000922bdcd3d25123f9"));
     EXPECT_EQ(
       header_wire().substr(0, 32),
-      hex("4b5142460300010001002000e001000000000000000000003d7d385d496f3b42"));
+      hex("4b5142460300010001002000e00100000000000000000000f6a7926f1cf432be"));
     EXPECT_EQ(
       block_wire().substr(0, 32),
-      hex("4b5142460400010001002000e00100000000000000000000e36534a2f32ba3d9"));
+      hex("4b51424604000100010020006f0100000000000000000000d0ddedf1a6cef7d9"));
     seastar::abort_source abort;
     codec::cooperative_work work{codec::limits::defaults(), abort};
     auto encoded_header
@@ -74,15 +74,17 @@ TEST(SegmentFormatTest, IndependentCrcAndInterconnectedGoldenBytes) {
     auto encoded_block = encode_segment_block(
                            std::move(child),
                            block_expected(),
+                           block_stamps(),
                            work,
                            budget().operation_remaining,
                            charge)
                            .get();
     ASSERT_TRUE(encoded_block.has_value());
     EXPECT_EQ(flat(encoded_block->bytes()), block_wire());
+    // 32 + 144 + 223: a block carries no padding.
     const auto coverage = encoded_block->descriptor().coverage();
     EXPECT_EQ(coverage.bytes().begin().value(), 512U);
-    EXPECT_EQ(coverage.bytes().end().value(), 1024U);
+    EXPECT_EQ(coverage.bytes().end().value(), 911U);
     EXPECT_EQ(coverage.physical().begin().value(), 0U);
     EXPECT_EQ(coverage.physical().end().value(), 1U);
     EXPECT_EQ(coverage.logical().begin().value(), 100U);
@@ -99,11 +101,8 @@ TEST(SegmentFormatTest, HeaderAllFieldsAlignmentExtensionsAndDataStart) {
           model::segment_generation::make(0x1020304050607080).value())
           .value();
     for (std::uint64_t a = 512; a <= 65536; a *= 2U) {
-        const auto expected = segment_header::make(
-                                context,
-                                model::range_logical_end{0x1122334455667788},
-                                alignment(a))
-                                .value();
+        const auto expected
+          = segment_header::make(context, alignment(a)).value();
         for (const std::size_t h : {32U, 40U, 4096U}) {
             seastar::abort_source abort;
             codec::cooperative_work work{codec::limits::defaults(), abort};
@@ -123,8 +122,7 @@ TEST(SegmentFormatTest, HeaderAllFieldsAlignmentExtensionsAndDataStart) {
             EXPECT_EQ(
               decoded->value.context().generation().value(),
               0x1020304050607080U);
-            EXPECT_EQ(
-              decoded->value.logical_origin().value(), 0x1122334455667788U);
+            EXPECT_EQ(get(literal, h + 72, 8), 0U);
             EXPECT_EQ(decoded->value.profile(), storage_profile::v1);
             EXPECT_EQ(decoded->value.alignment().bytes().value(), a);
             EXPECT_EQ(decoded->bytes.begin().value(), 0U);
@@ -156,7 +154,9 @@ TEST(SegmentFormatTest, HeaderInvalidFieldsAndExpectedIdentityAfterIntegrity) {
       {48, 1, 0x31, errc::wrong_context},
       {64, 8, 2, errc::wrong_context},
       {64, 8, 0, errc::malformed_data},
-      {72, 8, 101, errc::wrong_context},
+      {72, 8, 101, errc::malformed_data},
+      {72, 1, 1, errc::malformed_data},
+      {79, 1, 0x80, errc::malformed_data},
       {80, 2, 0, errc::malformed_data},
       {80, 2, 2, errc::unsupported_format},
       {82, 2, 0, errc::malformed_data},
@@ -244,70 +244,84 @@ TEST(SegmentFormatTest, HeaderEveryTruncationAndFilePosition) {
 }
 
 TEST(SegmentFormatTest, ExactChildBytesAndOuterExtensionsSurviveAllOwners) {
-    for (const bool compressed : {false, true}) {
-        for (const std::size_t inner_header : {32U, 40U, 4096U}) {
-            const auto child_wire = assigned_wire(compressed, inner_header);
-            seastar::abort_source abort;
-            codec::cooperative_work work{codec::limits::defaults(), abort};
-            auto child = checked_child(work, compressed, inner_header);
-            auto encoded = encode_segment_block(
-                             std::move(child),
-                             block_expected(),
-                             work,
-                             budget().operation_remaining,
-                             charge)
-                             .get();
-            ASSERT_TRUE(encoded.has_value());
-            EXPECT_EQ(flat(encoded->bytes()), block_wire(child_wire));
-            for (const std::size_t outer_header : {32U, 40U, 4096U}) {
-                const auto literal = block_wire(
-                  child_wire, block_expected(), outer_header);
-                const codec::field_context context{
-                  .origin = UINT64_MAX - literal.size() - 2U};
-                auto result = [&] {
-                    fragmented_buffer_parser input{
-                      buffer("p" + literal + "s", 67)};
-                    input.skip(byte_count{1}).value();
-                    input.push_checkpoint().value();
-                    const auto memory = reserve(input, work, context);
-                    auto decoded
-                      = decode_segment_block(
-                          input, block_expected(), memory, work, context)
-                          .get()
-                          .value();
-                    EXPECT_EQ(
-                      input.bytes_consumed().value(), literal.size() + 1U);
-                    EXPECT_EQ(input.checkpoint_depth(), 1U);
-                    const auto cost
-                      = decoded.value.bytes().allocation_cost(charge).value();
-                    EXPECT_EQ(
-                      memory.operation_remaining.value()
-                        - decoded.remaining.operation_remaining.value(),
-                      cost.descriptors.value());
-                    EXPECT_EQ(
-                      memory.metadata_remaining.value()
-                        - decoded.remaining.metadata_remaining.value(),
-                      cost.descriptors.value());
-                    return decoded;
-                }();
-                const auto complete = flat(result.value.bytes());
-                EXPECT_EQ(complete, literal);
+    for (const bool compressed : {false, true})
+        for (const bool sparse : {false, true}) {
+            for (const std::size_t inner_header : {32U, 40U, 4096U}) {
+                const auto child_wire = assigned_wire(
+                  compressed, inner_header, sparse);
+                seastar::abort_source abort;
+                codec::cooperative_work work{codec::limits::defaults(), abort};
+                auto child = checked_child(
+                  work, compressed, inner_header, sparse);
                 EXPECT_EQ(
-                  complete.substr(outer_header + 120, child_wire.size()),
-                  child_wire);
-                EXPECT_EQ(
-                  result.value.descriptor()
-                    .batch()
-                    .context.logical_span()
-                    .begin()
-                    .value(),
-                  100U);
-                EXPECT_EQ(
-                  result.value.descriptor().batch().verification,
-                  model::batch_fingerprint_verification::recomputed);
+                  child.info().max_record_time.unix_nanoseconds(),
+                  max_record_time(child_wire));
+                auto encoded = encode_segment_block(
+                                 std::move(child),
+                                 block_expected(),
+                                 block_stamps(),
+                                 work,
+                                 budget().operation_remaining,
+                                 charge)
+                                 .get();
+                ASSERT_TRUE(encoded.has_value());
+                EXPECT_EQ(flat(encoded->bytes()), block_wire(child_wire));
+                for (const std::size_t outer_header : {32U, 40U, 4096U}) {
+                    const auto literal = block_wire(
+                      child_wire, block_expected(), outer_header);
+                    const codec::field_context context{
+                      .origin = UINT64_MAX - literal.size() - 2U};
+                    auto result = [&] {
+                        fragmented_buffer_parser input{
+                          buffer("p" + literal + "s", 67)};
+                        input.skip(byte_count{1}).value();
+                        input.push_checkpoint().value();
+                        const auto memory = reserve(input, work, context);
+                        auto decoded
+                          = decode_segment_block(
+                              input, block_expected(), memory, work, context)
+                              .get()
+                              .value();
+                        EXPECT_EQ(
+                          input.bytes_consumed().value(), literal.size() + 1U);
+                        EXPECT_EQ(input.checkpoint_depth(), 1U);
+                        const auto cost = decoded.value.bytes()
+                                            .allocation_cost(charge)
+                                            .value();
+                        EXPECT_EQ(
+                          memory.operation_remaining.value()
+                            - decoded.remaining.operation_remaining.value(),
+                          cost.descriptors.value());
+                        EXPECT_EQ(
+                          memory.metadata_remaining.value()
+                            - decoded.remaining.metadata_remaining.value(),
+                          cost.descriptors.value());
+                        return decoded;
+                    }();
+                    const auto complete = flat(result.value.bytes());
+                    EXPECT_EQ(complete, literal);
+                    EXPECT_EQ(
+                      complete.substr(outer_header + 144, child_wire.size()),
+                      child_wire);
+                    EXPECT_EQ(
+                      complete.size(), outer_header + 144 + child_wire.size());
+                    EXPECT_EQ(
+                      result.value.descriptor()
+                        .batch()
+                        .context.logical_span()
+                        .begin()
+                        .value(),
+                      100U);
+                    EXPECT_EQ(
+                      result.value.descriptor().batch().verification,
+                      sparse
+                        ? model::batch_fingerprint_verification::carried
+                        : model::batch_fingerprint_verification::recomputed);
+                    EXPECT_EQ(
+                      result.value.descriptor().stamps(), block_stamps());
+                }
             }
         }
-    }
 }
 
 TEST(
@@ -332,17 +346,19 @@ TEST(
                     const auto encoded = encode_segment_block(
                                            std::move(child),
                                            expected,
+                                           block_stamps(expected),
                                            work,
                                            budget().operation_remaining,
                                            charge)
                                            .get();
                     ASSERT_TRUE(encoded);
+                    // Unpadded at every alignment: the next envelope of the
+                    // write starts where it ends.
                     EXPECT_EQ(
                       flat(encoded->bytes()), block_wire(wire, expected));
-                    if (
-                      bytes::testing::native_charge_profile
-                      && header_bytes <= 40 && alignment >= 8192)
-                        EXPECT_EQ(encoded->bytes().fragment_count(), 1U);
+                    EXPECT_EQ(
+                      encoded->descriptor().coverage().bytes().size().value(),
+                      32U + 144U + wire.size());
                 }
             }
         }
@@ -366,12 +382,22 @@ TEST(SegmentFormatTest, BlockFixedFieldsAndInnerFailureRollback) {
       {88, 8, 2, errc::malformed_data},
       {96, 8, 99, errc::malformed_data},
       {104, 8, 102, errc::malformed_data},
-      {112, 4, 0, errc::malformed_data},
-      {112, 4, 222, errc::malformed_data},
-      {112, 4, 0xffffffffU, errc::resource_exhausted},
-      {116, 4, 136, errc::malformed_data},
-      {120, 1, 0, errc::malformed_data},
-      {343, 1, 1, errc::malformed_data}};
+      // An append time below 1 ns, and a negative one.
+      {112, 8, 0, errc::malformed_data},
+      {112, 8, std::uint64_t{1} << 63U, errc::malformed_data},
+      // A stored maximum record time the records do not give.
+      {120, 8, 5, errc::malformed_data},
+      // A certified end off the alignment, past the block, below the data
+      // start.
+      {128, 8, 513, errc::malformed_data},
+      {128, 8, 1024, errc::malformed_data},
+      {128, 8, 0, errc::malformed_data},
+      {136, 4, 0, errc::malformed_data},
+      {136, 4, 222, errc::malformed_data},
+      {136, 4, 0xffffffffU, errc::resource_exhausted},
+      // A block never pads.
+      {140, 4, 1, errc::malformed_data},
+      {144, 1, 0, errc::malformed_data}};
     for (const auto& change : cases) {
         SCOPED_TRACE(change.offset);
         auto wire = block_wire();
@@ -416,7 +442,18 @@ TEST(SegmentFormatTest, BlockDistinctMultibyteFieldsHaveIndependentOffsets) {
     put(child_wire, 4096 + 176, logical + 5U, 8);
     repair(child_wire);
     const auto expected = block_expected(0x80, generation, position, physical);
-    const auto literal = block_wire(child_wire, expected, 40);
+    // Distinct stamps: an append time and an aligned certified end below the
+    // block.
+    const segment_block_stamps distinct{
+      runtime::wall_time{0x4455667788990011},
+      runtime::file_position{position - 0x200000U}};
+    const auto literal = block_wire(child_wire, expected, 40, distinct);
+    EXPECT_EQ(get(literal, 40 + 112, 8), 0x4455667788990011U);
+    EXPECT_EQ(get(literal, 40 + 128, 8), position - 0x200000U);
+    // The sparse child's record deltas are -1 and -2 over a zero base.
+    EXPECT_EQ(get(literal, 40 + 120, 8), std::uint64_t{0} - 1U);
+    EXPECT_EQ(get(literal, 40 + 136, 4), child_wire.size());
+    EXPECT_EQ(get(literal, 40 + 140, 4), 0U);
     seastar::abort_source abort;
     codec::cooperative_work work{codec::limits::defaults(), abort};
     fragmented_buffer_parser input{buffer(literal)};
@@ -424,6 +461,8 @@ TEST(SegmentFormatTest, BlockDistinctMultibyteFieldsHaveIndependentOffsets) {
       = decode_segment_block(input, expected, reserve(input, work), work).get();
     ASSERT_TRUE(decoded.has_value());
     const auto descriptor = decoded->value.descriptor();
+    EXPECT_EQ(descriptor.stamps(), distinct);
+    EXPECT_EQ(descriptor.batch().max_record_time.unix_nanoseconds(), -1);
     EXPECT_EQ(descriptor.context().cluster(), sc().cluster());
     EXPECT_EQ(descriptor.context().topic(), sc().topic());
     EXPECT_EQ(descriptor.context().range(), sc().range());
@@ -446,12 +485,14 @@ TEST(SegmentFormatTest, BlockDistinctMultibyteFieldsHaveIndependentOffsets) {
     auto encoded = encode_segment_block(
                      std::move(child),
                      expected,
+                     distinct,
                      work,
                      budget().operation_remaining,
                      charge)
                      .get();
     ASSERT_TRUE(encoded.has_value());
-    EXPECT_EQ(flat(encoded->bytes()), block_wire(child_wire, expected));
+    EXPECT_EQ(
+      flat(encoded->bytes()), block_wire(child_wire, expected, 32, distinct));
 }
 
 TEST(
@@ -476,11 +517,13 @@ TEST(
 }
 
 TEST(SegmentFormatTest, ExactFragmentLimitsAndPositionOverflow) {
+    // The child's fragments and the prefix's; a block has no padding
+    // fragment.
     const auto separate
-      = charge(byte_count{32}).checked_add(charge(byte_count{120})).value();
+      = charge(byte_count{32}).checked_add(charge(byte_count{144})).value();
     const std::uint64_t fragments
-      = assigned_wire().size() + (charge(byte_count{152}) <= separate ? 1U : 2U)
-        + 1U;
+      = assigned_wire().size()
+        + (charge(byte_count{176}) <= separate ? 1U : 2U);
     for (const std::uint64_t limit : {fragments - 1U, fragments}) {
         seastar::abort_source abort;
         codec::cooperative_work prepare{codec::limits::defaults(), abort};
@@ -496,6 +539,7 @@ TEST(SegmentFormatTest, ExactFragmentLimitsAndPositionOverflow) {
         const auto result = encode_segment_block(
                               std::move(child),
                               block_expected(),
+                              block_stamps(),
                               work,
                               budget().operation_remaining,
                               charge)
@@ -514,10 +558,11 @@ TEST(SegmentFormatTest, ExactFragmentLimitsAndPositionOverflow) {
         auto child = checked_child(work);
         const auto expected = physical
                                 ? block_expected(0x30, 1, 512, UINT64_MAX)
-                                : block_expected(0x30, 1, UINT64_MAX - 511U);
+                                : block_expected(0x30, 1, UINT64_MAX - 300U);
         const auto result = encode_segment_block(
                               std::move(child),
                               expected,
+                              block_stamps(),
                               work,
                               budget().operation_remaining,
                               charge)
@@ -529,7 +574,7 @@ TEST(SegmentFormatTest, ExactFragmentLimitsAndPositionOverflow) {
 
 TEST(SegmentFormatTest, BlockTruncationsBudgetsAndCheckpointCapacity) {
     const auto wire = block_wire();
-    for (const std::size_t length : {0U, 31U, 32U, 151U, 152U, 374U, 511U}) {
+    for (const std::size_t length : {0U, 31U, 32U, 175U, 176U, 374U, 398U}) {
         seastar::abort_source abort;
         codec::cooperative_work work{codec::limits::defaults(), abort};
         fragmented_buffer_parser input{
@@ -629,6 +674,7 @@ TEST(SegmentFormatTest, EncodingRechecksNarrowPolicyAndWireCoordinates) {
     const auto rejected = encode_segment_block(
                             std::move(child),
                             block_expected(),
+                            block_stamps(),
                             narrow,
                             budget().operation_remaining,
                             charge,
@@ -679,6 +725,7 @@ TEST(SegmentFormatTest, EncodingAllocationFailuresReleasePartialStaging) {
                     succeeded = encode_segment_block(
                                   std::move(*child),
                                   block_expected(),
+                                  block_stamps(),
                                   work,
                                   budget().operation_remaining,
                                   charge)
@@ -794,7 +841,11 @@ TEST(SegmentFormatTest, IntegrityCheckAgreesWithTheDecoderAndWalksNoRecord) {
     ASSERT_TRUE(decoded.has_value());
     ASSERT_TRUE(checked.has_value());
     EXPECT_EQ(checked->coverage, decoded->value.descriptor().coverage());
-    EXPECT_EQ(checked->child_offset, byte_count{header + 120U});
+    EXPECT_EQ(checked->child_offset, byte_count{header + 144U});
+    EXPECT_EQ(checked->stamps, decoded->value.descriptor().stamps());
+    EXPECT_EQ(
+      checked->max_record_time,
+      decoded->value.descriptor().batch().max_record_time);
     EXPECT_EQ(checked->child_bytes, byte_count{child_wire.size()});
     EXPECT_EQ(
       literal.substr(
@@ -803,7 +854,7 @@ TEST(SegmentFormatTest, IntegrityCheckAgreesWithTheDecoderAndWalksNoRecord) {
 
     // One byte of the child changed: the block's body checksum says so.
     auto flipped = literal;
-    flipped[header + 120U + inner + 100U] ^= 1;
+    flipped[header + 144U + inner + 100U] ^= 1;
     const auto damaged = check(flipped, expected);
     ASSERT_FALSE(damaged.has_value());
     EXPECT_EQ(damaged.error().code(), errc::corrupt_data);
@@ -851,17 +902,123 @@ TEST(SegmentFormatTest, IntegrityCheckAgreesWithTheDecoderAndWalksNoRecord) {
     // A child that is not as long as the block says, and a block whose
     // child is not an assigned batch.
     auto shorter = literal;
-    put(shorter, header + 120U + 12U, get(child_wire, 12, 4) - 1U, 4);
+    put(shorter, header + 144U + 12U, get(child_wire, 12, 4) - 1U, 4);
     repair(shorter);
     const auto cut = check(shorter, expected);
     ASSERT_FALSE(cut.has_value());
     EXPECT_EQ(cut.error().code(), errc::malformed_data);
     auto another = literal;
-    put(another, header + 120U + 4U, 3, 2);
+    put(another, header + 144U + 4U, 3, 2);
     repair(another);
     const auto misnamed = check(another, expected);
     ASSERT_FALSE(misnamed.has_value());
     EXPECT_EQ(misnamed.error().code(), errc::malformed_data);
+
+    // No record is walked, so a stored maximum record time is taken as the
+    // owner wrote it; the decoder recomputes and refuses it.
+    auto later = literal;
+    put(later, header + 120U, 77, 8);
+    repair(later);
+    const auto trusted = check(later, expected);
+    ASSERT_TRUE(trusted.has_value());
+    EXPECT_EQ(trusted->max_record_time, runtime::wall_time{77});
+    const auto recomputed = decode(later);
+    ASSERT_FALSE(recomputed.has_value());
+    EXPECT_EQ(recomputed.error().code(), errc::malformed_data);
+    EXPECT_EQ(
+      recomputed.error().field(),
+      static_cast<std::uint16_t>(segment_field::max_record_time));
+    // Stamps are checked as the decoder checks them.
+    auto unstamped = literal;
+    put(unstamped, header + 112U, 0, 8);
+    repair(unstamped);
+    const auto refused = check(unstamped, expected);
+    ASSERT_FALSE(refused.has_value());
+    EXPECT_EQ(
+      refused.error().field(),
+      static_cast<std::uint16_t>(segment_field::append_time));
+}
+
+// Blocks pack: one starts wherever the envelope before it in its write
+// ended, so its position need not be aligned, and only that position is it.
+TEST(SegmentFormatTest, PackedBlocksLieAtAnyPositionAndOnlyThere) {
+    seastar::abort_source abort;
+    codec::cooperative_work work{codec::limits::defaults(), abort};
+    for (const std::uint64_t position : {911U, 513U, 1023U, 4096U + 7U}) {
+        for (const bool compressed : {false, true}) {
+            const auto expected = block_expected(0x30, 1, position);
+            const auto wire = assigned_wire(compressed);
+            auto encoded = encode_segment_block(
+                             checked_child(work, compressed),
+                             expected,
+                             block_stamps(expected),
+                             work,
+                             budget().operation_remaining,
+                             charge)
+                             .get();
+            ASSERT_TRUE(encoded.has_value());
+            const auto literal = block_wire(wire, expected);
+            EXPECT_EQ(flat(encoded->bytes()), literal);
+            EXPECT_EQ(
+              encoded->descriptor().coverage().bytes().end().value(),
+              position + literal.size());
+            fragmented_buffer_parser input{buffer(literal)};
+            EXPECT_TRUE(
+              decode_segment_block(input, expected, reserve(input, work), work)
+                .get()
+                .has_value());
+            fragmented_buffer_parser moved{buffer(literal)};
+            const auto elsewhere = decode_segment_block(
+                                     moved,
+                                     block_expected(0x30, 1, position + 1U),
+                                     reserve(moved, work),
+                                     work)
+                                     .get();
+            ASSERT_FALSE(elsewhere.has_value());
+            EXPECT_EQ(elsewhere.error().code(), errc::wrong_context);
+        }
+    }
+}
+
+TEST(SegmentFormatTest, EncodingRefusesStampsOutsideTheirDomains) {
+    seastar::abort_source abort;
+    codec::cooperative_work work{codec::limits::defaults(), abort};
+    const auto expected = block_expected(0x30, 1, 1536);
+    const std::array refused{
+      segment_block_stamps{runtime::wall_time{0}, expected.data_start},
+      segment_block_stamps{runtime::wall_time{-5}, expected.data_start},
+      segment_block_stamps{runtime::wall_time{1}, runtime::file_position{0}},
+      segment_block_stamps{runtime::wall_time{1}, runtime::file_position{513}},
+      segment_block_stamps{
+        runtime::wall_time{1}, runtime::file_position{2048}}};
+    for (const auto& stamps : refused) {
+        const auto result = encode_segment_block(
+                              checked_child(work),
+                              expected,
+                              stamps,
+                              work,
+                              budget().operation_remaining,
+                              charge)
+                              .get();
+        ASSERT_FALSE(result.has_value());
+        EXPECT_EQ(result.error().code(), errc::invalid_argument);
+    }
+    // The block's own position is the highest end it can claim.
+    const segment_block_stamps highest{
+      runtime::wall_time{1}, runtime::file_position{1536}};
+    const auto result = encode_segment_block(
+                          checked_child(work),
+                          expected,
+                          highest,
+                          work,
+                          budget().operation_remaining,
+                          charge)
+                          .get();
+    ASSERT_TRUE(result.has_value());
+    EXPECT_EQ(result->descriptor().stamps(), highest);
+    EXPECT_EQ(
+      flat(result->bytes()),
+      block_wire(assigned_wire(), expected, 32, highest));
 }
 } // namespace
 } // namespace kwaque::storage

@@ -123,8 +123,10 @@ private:
 
 // A wire cursor carries no owner. Its enclosing record supplies the store;
 // comparisons require both independently selected owner contexts.
-// The minimum supported alignment is checked; the actual file alignment and
-// membership in its complete prefix still require the independently opened WAL.
+// It names a PREPARE boundary, which packed writes place at any position at
+// or after the file's data start, so only that floor is checked here; its
+// file and membership in its complete prefix still require the
+// independently opened WAL.
 class local_wal_cursor final {
 public:
     [[nodiscard]] static result<local_wal_cursor>
@@ -154,8 +156,7 @@ enum class local_root_kind : std::uint16_t {
     index = 1,
     sealed_retry = 2,
     checkpoint = 3,
-    manifest = 4,
-    completed_retry_snapshot = 5
+    manifest = 4
 };
 [[nodiscard]] result<local_root_kind>
 parse_local_root_kind(std::uint16_t) noexcept;
@@ -224,6 +225,8 @@ public:
     [[nodiscard]] codec::immutable_object_digest digest() const noexcept {
         return digest_;
     }
+    // A footer ends its write on a boundary wherever it starts. Its family is
+    // checked when the reference is followed.
     [[nodiscard]] result<void>
       validate_alignment(storage_alignment) const noexcept;
     bool operator==(const local_footer_reference&) const = default;

@@ -701,6 +701,34 @@ kwaque_cc_seastar_test(
     ],
 )
 
+kwaque_cc_seastar_test(
+    name = "local_engine_wide_test",
+    timeout = "long",
+    srcs = [
+        "local_engine_wide_test.cc",
+        "native_store_test_support.h",
+    ],
+    memory = "4GiB",
+    deps = [
+        ":storage_directories",
+        "//src/base",
+        "//src/resource:resource_config",
+        "//src/resource:resource_manager",
+        "//src/resource:resource_registry",
+        "//src/resource:workload_class",
+        "//src/runtime:file",
+        "//src/runtime/production:clocks",
+        "//src/runtime/production:file",
+        "//src/runtime/production:timer",
+        "//src/runtime/testing:reactor_tasks",
+        "//src/runtime/testing:test_directory",
+        "//src/storage:local_store_config",
+        "//src/storage:workload_budget",
+        "//src/storage/tests:local_engine_contract",
+        "//src/storage/tests:local_store_contract",
+    ],
+)
+
 kwaque_cc_binary(
     name = "engine_durability_probe",
     testonly = True,

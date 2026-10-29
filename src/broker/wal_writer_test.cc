@@ -133,6 +133,15 @@ SEASTAR_TEST_CASE(wal_writer_native_zero_written_file) {
       });
 }
 
+SEASTAR_TEST_CASE(wal_writer_native_zero_written_by_default) {
+    co_await with_wal(
+      0x33,
+      [](auto& files, auto& owner, const auto& spec, auto& budget, auto drive) {
+          return storage::testing::wal_append_contract::zero_written_by_default(
+            files, owner, spec, budget, drive);
+      });
+}
+
 SEASTAR_TEST_CASE(wal_writer_native_allocator_rounded_staging) {
     co_await with_wal(
       0x33,
@@ -172,6 +181,25 @@ SEASTAR_TEST_CASE(wal_writer_native_construction_failure_joins_providers) {
             construction_failure_cleanup(files, owner, spec, budget, drive);
       });
 }
+SEASTAR_TEST_CASE(wal_writer_native_packed_groups) {
+    co_await with_wal(
+      0x33,
+      [](auto& files, auto& owner, const auto& spec, auto& budget, auto drive) {
+          return storage::testing::wal_append_contract::packed_groups(
+            files, owner, spec, budget, drive);
+      },
+      128);
+}
+
+SEASTAR_TEST_CASE(wal_writer_native_certified_stamps) {
+    co_await with_wal(
+      0x33,
+      [](auto& files, auto& owner, const auto& spec, auto& budget, auto drive) {
+          return storage::testing::wal_append_contract::certified_stamps(
+            files, owner, spec, budget, drive);
+      });
+}
+
 SEASTAR_TEST_CASE(wal_writer_native_whole_group_capacity) {
     co_await with_wal(
       0x33,
@@ -204,6 +232,24 @@ SEASTAR_TEST_CASE(wal_writer_native_rotation_publication_pressure) {
       0x33,
       [](auto& files, auto& owner, const auto& spec, auto& budget, auto drive) {
           return storage::testing::wal_rotation_contract::pressure(
+            files, owner, spec, budget, drive);
+      });
+}
+
+SEASTAR_TEST_CASE(wal_writer_native_rotation_ready_successor) {
+    co_await with_wal(
+      0x33,
+      [](auto& files, auto& owner, const auto& spec, auto& budget, auto drive) {
+          return storage::testing::wal_rotation_contract::ready_successor(
+            files, owner, spec, budget, drive);
+      });
+}
+
+SEASTAR_TEST_CASE(wal_writer_native_rotation_recycled_files) {
+    co_await with_wal(
+      0x33,
+      [](auto& files, auto& owner, const auto& spec, auto& budget, auto drive) {
+          return storage::testing::wal_rotation_contract::recycled_files(
             files, owner, spec, budget, drive);
       });
 }
@@ -367,6 +413,16 @@ SEASTAR_TEST_CASE(wal_group_commit_native_preacceptance_allocation_cuts) {
       0x33,
       [](auto& files, auto& owner, const auto& spec, auto& budget, auto drive) {
           return storage::testing::wal_group_commit_contract::allocation_cuts<
+            runtime::production::monotonic_clock>(
+            files, owner, spec, budget, drive);
+      });
+}
+
+SEASTAR_TEST_CASE(wal_group_commit_native_admitted_shrink) {
+    co_await with_wal(
+      0x33,
+      [](auto& files, auto& owner, const auto& spec, auto& budget, auto drive) {
+          return storage::testing::wal_group_commit_contract::admitted_shrink<
             runtime::production::monotonic_clock>(
             files, owner, spec, budget, drive);
       });

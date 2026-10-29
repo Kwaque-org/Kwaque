@@ -37,8 +37,14 @@ enum class image_damage : std::uint8_t {
     appended,
     // The file gone.
     removed,
+    // Segment A's blocks lost by a crash before anything synced them, as a
+    // crash leaves blocks reported by their PREPAREs' WAL barrier alone:
+    // its data file back to its header and its publication the one it was
+    // made with. The WAL still holds their PREPAREs. The file the control
+    // names is not what this damages.
+    dropped,
 };
-inline constexpr std::uint8_t image_damage_count = 11;
+inline constexpr std::uint8_t image_damage_count = 12;
 
 // The eight bytes that begin an input: which file of the image, the damage,
 // where in the file (low then high), how long a run or how much of a sector
@@ -72,6 +78,10 @@ struct recovery_seen final {
     bool a_recovering{false}, b_recovering{false};
     // The image when the start had answered is the image it was given.
     bool untouched{false};
+    // Segment A's blocks were dropped, and the slots the start wrote from
+    // the WAL.
+    bool dropped{false};
+    std::uint64_t materialized{0};
     std::optional<std::string> failure;
 };
 
@@ -83,6 +93,9 @@ struct recovery_seen final {
 //  - `wrote`: a start that does not leave the shard ready changed nothing.
 //  - `spared`: when one data device was damaged and the shard is ready, the
 //    segment on the other data device is still held as recovered.
+//  - `lost`: when segment A's blocks were dropped while the WAL held them,
+//    the start writes both back from their PREPAREs and is ready, with
+//    both segments recovered.
 [[nodiscard]] std::string_view recovery_verdict(const recovery_seen&) noexcept;
 
 struct recovery_case_result final {

@@ -14,8 +14,7 @@
 
 namespace kwaque::storage {
 
-// The batch identities one page of a retry summary or snapshot begins and
-// ends with.
+// The batch identities one page of a retry summary begins and ends with.
 struct retry_page_span final {
     model::batch_id first, last;
 };
@@ -50,6 +49,11 @@ public:
     // between two pages or after the last.
     [[nodiscard]] std::optional<std::uint32_t>
     find(const model::batch_id& id) const noexcept;
+    // The page holding the greatest entry at or below `id`: the last page that
+    // begins at or before it, wherever that page ends. Nothing before the
+    // first page.
+    [[nodiscard]] std::optional<std::uint32_t>
+    floor(const model::batch_id& id) const noexcept;
 
 private:
     retry_page_directory(
@@ -65,14 +69,16 @@ private:
 // The entry with this identity among one page's, which are in order.
 [[nodiscard]] const completed_retry* find_completed_retry(
   std::span<const completed_retry> entries, const model::batch_id& id) noexcept;
+// The greatest entry at or below this identity among one page's.
+[[nodiscard]] const completed_retry* find_completed_retry_floor(
+  std::span<const completed_retry> entries, const model::batch_id& id) noexcept;
 
-// Exact lookup and page-wise reading of one opened root: a sealed retry
-// summary or a completed-retry snapshot. Opening reads each page once, checks
-// that the pages continue one another in batch identity order, and keeps only
-// their directory. A lookup then reads at most one page, and none when the
-// directory already excludes the identity. No history is kept in memory and
-// nothing here expires an entry: how long a result is retained is its
-// owner's decision.
+// Exact and floor lookups and page-wise reading of one opened sealed retry
+// summary. Opening reads each page once, checks that the pages continue one
+// another in batch identity order, and keeps only their directory. A lookup
+// then reads at most one page, and none when the directory already excludes
+// the identity. No history is kept in memory and nothing here expires an
+// entry: how long a result is retained is its owner's decision.
 class retry_root_reader final {
 public:
     [[nodiscard]] static seastar::future<runtime::result<retry_root_reader>>
@@ -100,6 +106,11 @@ public:
     [[nodiscard]] seastar::future<
       runtime::result<std::optional<completed_retry>>>
     find(model::batch_id id, codec::cooperative_work& work);
+    // The newest stored entry of one stream: the greatest at or below the
+    // stream's largest identity, when it is the stream's. One page read.
+    [[nodiscard]] seastar::future<
+      runtime::result<std::optional<completed_retry>>>
+    find_stream_last(retry_prefix prefix, codec::cooperative_work& work);
     // One page, for a walk in batch identity order.
     [[nodiscard]] seastar::future<runtime::result<local_retry_page>>
     page(std::uint32_t ordinal, codec::cooperative_work& work);
@@ -120,27 +131,13 @@ private:
     std::uint64_t read_;
 };
 
-enum class retry_source : std::uint8_t {
-    // A completed-retry snapshot beside the segment.
-    snapshot,
-    // The sealed extent's own summary.
-    summary,
-};
-struct retry_lookup_result final {
-    // The full original result as it was stored: its binding and
-    // acknowledgement generation are the original ones, whatever generation
-    // holds the entry now.
-    completed_retry fact;
-    retry_source source;
-};
-
 // The durable completed-retry state of one pinned segment generation: its
-// snapshot, when it has one, then its sealed summary. A snapshot beside a
-// sealed summary holds only what the summary lacks, so an identity is in at
-// most one of them and the snapshot is asked first.
+// sealed summary, which a generation has once it is sealed. Each original
+// result is returned as it was stored: its binding and acknowledgement
+// generation are the original ones, whatever generation holds it now.
 class completed_retry_lookup final {
 public:
-    // Opens whichever of the two roots the generation's publication pins.
+    // Opens the summary the generation's publication pins, if it has one.
     [[nodiscard]] static seastar::future<
       runtime::result<completed_retry_lookup>>
     open(
@@ -153,55 +150,45 @@ public:
     completed_retry_lookup(const completed_retry_lookup&) = delete;
     completed_retry_lookup& operator=(const completed_retry_lookup&) = delete;
 
-    [[nodiscard]] std::optional<retry_root_reader>& snapshot() & noexcept {
-        return snapshot_;
-    }
     [[nodiscard]] std::optional<retry_root_reader>& summary() & noexcept {
         return summary_;
     }
-    // Durable facts in both roots.
     [[nodiscard]] std::uint32_t facts() const noexcept {
-        return (snapshot_ ? snapshot_->facts() : 0U)
-               + (summary_ ? summary_->facts() : 0U);
+        return summary_ ? summary_->facts() : 0U;
     }
     [[nodiscard]] std::uint64_t pages_read() const noexcept {
-        return (snapshot_ ? snapshot_->pages_read() : 0U)
-               + (summary_ ? summary_->pages_read() : 0U);
+        return summary_ ? summary_->pages_read() : 0U;
     }
 
     [[nodiscard]] seastar::future<
-      runtime::result<std::optional<retry_lookup_result>>>
+      runtime::result<std::optional<completed_retry>>>
     find(model::batch_id id, codec::cooperative_work& work);
+    [[nodiscard]] seastar::future<
+      runtime::result<std::optional<completed_retry>>>
+    find_stream_last(retry_prefix prefix, codec::cooperative_work& work);
 
-    // Every durable fact once, a page at a time: the snapshot's in batch
-    // identity order, then the summary's. visit(const completed_retry&,
-    // retry_source) returns false to stop; the result says whether the walk
-    // ran to the end.
+    // Every durable fact once, in batch identity order, a page at a time.
+    // visit(const completed_retry&) returns false to stop; the result says
+    // whether the walk ran to the end.
     template<typename Visit>
     [[nodiscard]] seastar::future<runtime::result<bool>>
     enumerate(Visit visit, codec::cooperative_work& work) {
-        for (auto* reader : {&snapshot_, &summary_}) {
-            if (!*reader) continue;
-            const auto source = reader == &snapshot_ ? retry_source::snapshot
-                                                     : retry_source::summary;
-            for (std::uint32_t ordinal = 0; ordinal != (*reader)->pages();
-                 ++ordinal) {
-                auto page = co_await (*reader)->page(ordinal, work);
-                if (!page) co_return runtime::failure(page.error());
-                for (const auto& fact : page->entries())
-                    if (!visit(fact, source)) co_return false;
-            }
+        if (!summary_) co_return true;
+        for (std::uint32_t ordinal = 0; ordinal != summary_->pages();
+             ++ordinal) {
+            auto page = co_await summary_->page(ordinal, work);
+            if (!page) co_return runtime::failure(page.error());
+            for (const auto& fact : page->entries())
+                if (!visit(fact)) co_return false;
         }
         co_return true;
     }
 
 private:
-    completed_retry_lookup(
-      std::optional<retry_root_reader> snapshot,
+    explicit completed_retry_lookup(
       std::optional<retry_root_reader> summary) noexcept
-      : snapshot_(std::move(snapshot))
-      , summary_(std::move(summary)) {}
-    std::optional<retry_root_reader> snapshot_, summary_;
+      : summary_(std::move(summary)) {}
+    std::optional<retry_root_reader> summary_;
 };
 
 } // namespace kwaque::storage

@@ -53,7 +53,7 @@ result<void> local_store_context::validate_expected(
 }
 result<local_wal_cursor> local_wal_cursor::make(
   model::wal_incarnation_id id, runtime::file_position position) noexcept {
-    if (id.is_nil() || position.value() == 0 || position.value() % 512U != 0)
+    if (id.is_nil() || position.value() < minimum_storage_alignment_bytes)
         return failure(errc::invalid_argument);
     return local_wal_cursor{id, position};
 }
@@ -72,7 +72,7 @@ result<std::strong_ordering> local_wal_cursor::compare(
 }
 result<local_root_kind> parse_local_root_kind(std::uint16_t value) noexcept {
     if (value == 0) return failure(errc::invalid_argument);
-    if (value > 5) return failure(errc::unsupported_format);
+    if (value > 4) return failure(errc::unsupported_format);
     return static_cast<local_root_kind>(value);
 }
 result<local_root_reference> local_root_reference::make(
@@ -115,9 +115,9 @@ result<local_footer_reference> local_footer_reference::make(
 }
 result<void> local_footer_reference::validate_alignment(
   storage_alignment alignment) const noexcept {
-    if (
-      !alignment.aligned(position_)
-      || bytes_.value() % alignment.bytes().value() != 0)
+    // make() checked that the end is representable.
+    if (!alignment.aligned(
+          runtime::file_position{position_.value() + bytes_.value()}))
         return failure(errc::invalid_argument);
     return {};
 }

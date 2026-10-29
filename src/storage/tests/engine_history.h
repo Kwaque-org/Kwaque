@@ -48,7 +48,9 @@ struct history_header final {
 enum class history_op : std::uint8_t {
     // Offers `b` % 4 + 1 requests to the `a`-th segment that takes
     // appends, without waiting for them. With the high bit of `c`, to the
-    // `a`-th segment that takes none any more: each is to be refused.
+    // `a`-th segment that takes none any more: each is to be refused. With
+    // the bit below it, each request is large: its portion is placed in its
+    // segment, where a small one's is placed in the WAL.
     append,
     // Waits for the result of every request offered.
     settle,
@@ -60,9 +62,6 @@ enum class history_op : std::uint8_t {
     seal,
     // Takes a checkpoint.
     checkpoint,
-    // Cuts the completed-retry snapshot of the `a`-th segment that takes
-    // appends.
-    cut,
     // Removes the `a`-th segment that is not gone. One that still takes
     // appends is to be refused.
     remove,
@@ -73,7 +72,7 @@ enum class history_op : std::uint8_t {
     // Crashes the device, stops the shard and starts it again.
     crash,
 };
-inline constexpr std::uint8_t history_op_count = 11;
+inline constexpr std::uint8_t history_op_count = 10;
 
 struct history_operation final {
     history_op op{history_op::append};
@@ -171,6 +170,19 @@ encode_history(const engine_history& history) {
        {history_op::remove, 0}}};
 }
 
+// One segment's requests placed by size, each offered before the one ahead
+// of it has its result: a small one in the WAL, a large one in the segment
+// alone, whose footer also covers the first, and a small one again.
+[[nodiscard]] inline engine_history placed_history() {
+    return {
+      {},
+      {{history_op::create},
+       {history_op::append, 0, 0},
+       {history_op::append, 0, 0, 0x40},
+       {history_op::append, 0, 0},
+       {history_op::settle}}};
+}
+
 // One life with everything a history can ask of a store, a clean restart,
 // and a second life on what the first left. Nothing in it waits on a race:
 // every request is settled before what follows depends on it.
@@ -189,7 +201,6 @@ encode_history(const engine_history& history) {
        {history_op::append, 0, 0},
        {history_op::settle},
        {history_op::read, 0},
-       {history_op::cut, 0},
        {history_op::checkpoint},
        {history_op::advance, 3},
        {history_op::remove, 1},

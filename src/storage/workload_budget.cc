@@ -5,6 +5,7 @@
 
 #include <seastar/core/semaphore.hh>
 
+#include <algorithm>
 #include <initializer_list>
 #include <limits>
 #include <stdexcept>
@@ -309,6 +310,38 @@ runtime::result<workload_reservation> workload_budget::try_reserve_buffer(
         return runtime::failure(budget_error(errc::out_of_range));
     }
     return try_reserve(*total);
+}
+
+runtime::result<byte_count> chunked_allocation_charge(
+  const workload_budget& budget,
+  std::size_t count,
+  std::size_t element) noexcept {
+    if (count == 0 || element == 0) return byte_count{};
+    const auto per = chunked_fragment_elements(element);
+    // An element larger than a fragment makes no table of fragments.
+    if (per == 0) return runtime::failure(budget_error(errc::invalid_argument));
+    const auto fragments = (count + per - 1) / per;
+    // The first fragment is reserved at its size; every later one is
+    // allocated whole.
+    const auto first = budget.allocation_charge(
+      byte_count{std::min(count, per) * element});
+    if (!first) return runtime::failure(first.error());
+    auto total = *first;
+    if (fragments > 1) {
+        const auto whole = budget.allocation_charge(byte_count{per * element});
+        if (!whole) return runtime::failure(whole.error());
+        const auto rest = whole->checked_mul(fragments - 1);
+        if (!rest) return runtime::failure(budget_error(errc::out_of_range));
+        const auto sum = total.checked_add(*rest);
+        if (!sum) return runtime::failure(budget_error(errc::out_of_range));
+        total = *sum;
+    }
+    const auto list = budget.allocation_charge(
+      byte_count{fragments * 3 * sizeof(void*)});
+    if (!list) return runtime::failure(list.error());
+    const auto sum = total.checked_add(*list);
+    if (!sum) return runtime::failure(budget_error(errc::out_of_range));
+    return *sum;
 }
 
 } // namespace kwaque::storage

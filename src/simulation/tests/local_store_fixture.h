@@ -137,7 +137,8 @@ seastar::future<> with_store(
   Func function,
   std::vector<fault_rule> faults = {},
   std::optional<fake_crash_policy> crash = std::nullopt,
-  bool long_run = false) {
+  bool long_run = false,
+  std::uint32_t handles = 32) {
     auto target = take(
       environment::make(config(std::move(faults), crash, long_run)));
     ordered_driver drive{target->event_scheduler()};
@@ -147,7 +148,7 @@ seastar::future<> with_store(
         workload_budget budget{
           target->resource_manager().acquire_workload(
             resource::workload_class::foreground_protocol),
-          {.tasks = 128, .bytes = byte_count{32_MiB}, .handles = 32},
+          {.tasks = 128, .bytes = byte_count{32_MiB}, .handles = handles},
           bytes::testing::charge};
         auto& files = target->file_system();
         const auto root = take(runtime::file_path::make("/kwaque/store"));
@@ -193,9 +194,11 @@ template<typename Func>
 seastar::future<> with_local_store(
   Func function,
   std::vector<fault_rule> faults = {},
-  std::optional<fake_crash_policy> crash = std::nullopt) {
+  std::optional<fake_crash_policy> crash = std::nullopt,
+  bool long_run = false,
+  std::uint32_t handles = 32) {
     return with_store<false, Func>(
-      std::move(function), std::move(faults), crash);
+      std::move(function), std::move(faults), crash, long_run, handles);
 }
 template<typename Func>
 seastar::future<> with_reserved_store(

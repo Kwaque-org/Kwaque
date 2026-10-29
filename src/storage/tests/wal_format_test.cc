@@ -51,6 +51,7 @@ TEST(WalFormatTest, FragmentedValidatedChildAndWidePaddingKeepExactCrcBytes) {
                     const auto encoded = encode_wal_prepare(
                                            std::move(child),
                                            expected,
+                                           wal_stamps(expected),
                                            work,
                                            budget().operation_remaining,
                                            charge)
@@ -67,7 +68,7 @@ TEST(WalFormatTest, IndependentGoldenAndCompletePayload) {
     ASSERT_EQ(literal.size(), 512U);
     EXPECT_EQ(
       literal.substr(0, 32),
-      hex("4b5142460500010001002000e00100000000000000000000a3dbc7ea631d6d9f"));
+      hex("4b5142460500010001002000e00100000000000000000000a66b6d2b1f5cb6e0"));
     seastar::abort_source abort;
     codec::cooperative_work work{codec::limits::defaults(), abort};
     auto child = checked_child(work);
@@ -75,6 +76,7 @@ TEST(WalFormatTest, IndependentGoldenAndCompletePayload) {
     auto encoded = encode_wal_prepare(
                      std::move(child),
                      wal_expected(),
+                     wal_stamps(),
                      work,
                      budget().operation_remaining,
                      charge)
@@ -89,20 +91,22 @@ TEST(WalFormatTest, IndependentGoldenAndCompletePayload) {
     EXPECT_TRUE(input.at_end());
     EXPECT_EQ(
       decoded->value.wal().incarnation(), id<model::wal_incarnation_id>(0x70));
-    EXPECT_EQ(decoded->value.wal().position().value(), 0U);
+    EXPECT_EQ(decoded->value.wal().position().value(), 512U);
     EXPECT_EQ(decoded->value.wal().alignment().bytes().value(), 512U);
     EXPECT_EQ(decoded->value.target(), wal_expected().target);
     EXPECT_EQ(decoded->value.routing_epoch().value(), 1U);
     EXPECT_EQ(decoded->value.profile(), replay_profile::v1);
     EXPECT_EQ(decoded->value.target_profile(), storage_profile::v1);
-    EXPECT_EQ(decoded->value.wal_extent().begin().value(), 0U);
-    EXPECT_EQ(decoded->value.wal_extent().end().value(), 512U);
+    EXPECT_EQ(decoded->value.wal_extent().begin().value(), 512U);
+    EXPECT_EQ(decoded->value.wal_extent().end().value(), 1024U);
+    EXPECT_EQ(decoded->value.stamps(), wal_stamps());
     EXPECT_EQ(decoded->value.batch().info(), info);
     EXPECT_EQ(flat(decoded->value.batch().bytes()), assigned_wire());
 }
 
 TEST(WalFormatTest, CombinedPrefixPreservesChildWithAndWithoutPadding) {
-    for (const std::size_t header_bytes : {32U, 153U}) {
+    // 32 + 168 + (121 + 184 + 7) ends exactly on a boundary.
+    for (const std::size_t header_bytes : {32U, 121U}) {
         seastar::abort_source abort;
         codec::cooperative_work preparation{codec::limits::defaults(), abort};
         const auto wire = assigned_wire(false, header_bytes);
@@ -122,26 +126,35 @@ TEST(WalFormatTest, CombinedPrefixPreservesChildWithAndWithoutPadding) {
         const auto layout = preflight_wal_prepare(
                               child,
                               expected,
+                              envelope_placement::ends_span,
                               work.policy(),
                               {byte_count{512}, byte_count{512}})
                               .value();
-        EXPECT_EQ(layout.padding_bytes().value() == 0, header_bytes == 153);
+        EXPECT_EQ(layout.padding_bytes().value() == 0, header_bytes == 121);
         auto too_small = policy;
         too_small.max_work_items = item_count{63};
         const auto rejected = kwaque::storage::detail::wal_prepare_memory(
-          child, layout, codec::limits::make(too_small).value(), charge);
+          child,
+          layout.padding_bytes(),
+          codec::limits::make(too_small).value(),
+          charge);
         ASSERT_FALSE(rejected);
         EXPECT_EQ(rejected.error().code(), errc::resource_exhausted);
-        const auto cost = detail::wal_prepare_memory(
-                            child, layout, work.policy(), charge)
-                            .value();
-        auto encoded
-          = encode_wal_prepare(
-              std::move(child), expected, work, cost.codec_bytes, charge)
-              .get();
+        const auto cost
+          = detail::wal_prepare_memory(
+              child, layout.padding_bytes(), work.policy(), charge)
+              .value();
+        auto encoded = encode_wal_prepare(
+                         std::move(child),
+                         expected,
+                         wal_stamps(expected),
+                         work,
+                         cost.codec_bytes,
+                         charge)
+                         .get();
         ASSERT_TRUE(encoded);
         EXPECT_EQ(flat(*encoded), wal_wire(wire, expected));
-        EXPECT_EQ(encoded->fragment_at(0)->size(), 168U);
+        EXPECT_EQ(encoded->fragment_at(0)->size(), 200U);
         EXPECT_EQ(encoded->fragment_at(1)->data(), backing);
         EXPECT_TRUE(alias.bytes().content_equals(wire));
     }
@@ -238,7 +251,8 @@ TEST(WalFormatTest, IndependentAlignmentsAndFutureHeadersPreserveExactChild) {
                   decoded.value.target().alignment(),
                   context.target.alignment());
                 EXPECT_EQ(
-                  decoded.value.wal_extent().end().value(), literal.size());
+                  decoded.value.wal_extent().end().value(),
+                  context.wal.position().value() + literal.size());
                 EXPECT_EQ(
                   decoded.value.batch().info().verification,
                   model::batch_fingerprint_verification::carried);
@@ -246,6 +260,7 @@ TEST(WalFormatTest, IndependentAlignmentsAndFutureHeadersPreserveExactChild) {
                 const auto encoded = encode_wal_prepare(
                                        std::move(child),
                                        context,
+                                       wal_stamps(context),
                                        work,
                                        budget().operation_remaining,
                                        charge)
@@ -266,7 +281,7 @@ TEST(WalFormatTest, ContextAndPaddingErrorsAreCheckedAfterIntegrity) {
     constexpr mutation cases[]{
       {0, 1, 0x71, errc::wrong_context},
       {15, 1, 0x71, errc::wrong_context},
-      {16, 8, 512, errc::wrong_context},
+      {16, 8, 1024, errc::wrong_context},
       {24, 1, 0x51, errc::wrong_context},
       {40, 1, 0x11, errc::wrong_context},
       {56, 1, 0x21, errc::wrong_context},
@@ -281,13 +296,29 @@ TEST(WalFormatTest, ContextAndPaddingErrorsAreCheckedAfterIntegrity) {
       {120, 4, 1024, errc::wrong_context},
       {124, 2, 0, errc::malformed_data},
       {124, 2, 2, errc::unsupported_format},
-      {126, 2, 1, errc::malformed_data},
-      {128, 4, 0, errc::malformed_data},
-      {128, 4, 222, errc::malformed_data},
-      {128, 4, 0xffffffffU, errc::resource_exhausted},
-      {132, 4, 120, errc::malformed_data},
-      {136, 1, 0, errc::malformed_data},
-      {359, 1, 1, errc::malformed_data},
+      // Only bit 0 of the write flags is defined; clearing it leaves a pad
+      // that a PREPARE inside its write may not carry.
+      {126, 2, 2, errc::malformed_data},
+      {126, 2, 0x8001, errc::malformed_data},
+      {126, 2, 0, errc::malformed_data},
+      // An append time below 1 ns; a stored maximum record time the records
+      // do not give.
+      {128, 8, 0, errc::malformed_data},
+      {128, 8, std::uint64_t{1} << 63U, errc::malformed_data},
+      {136, 8, 5, errc::malformed_data},
+      // Stamps outside [data start, own position] or off the alignment.
+      {144, 8, 0, errc::malformed_data},
+      {144, 8, 513, errc::malformed_data},
+      {144, 8, 1024, errc::malformed_data},
+      {152, 8, 0, errc::malformed_data},
+      {152, 8, 513, errc::malformed_data},
+      {152, 8, 1024, errc::malformed_data},
+      {160, 4, 0, errc::malformed_data},
+      {160, 4, 222, errc::malformed_data},
+      {160, 4, 0xffffffffU, errc::resource_exhausted},
+      {164, 4, 120, errc::malformed_data},
+      {168, 1, 0, errc::malformed_data},
+      {391, 1, 1, errc::malformed_data},
       {479, 1, 1, errc::malformed_data}};
     for (const auto& change : cases) {
         SCOPED_TRACE(change.offset);
@@ -346,7 +377,19 @@ TEST(WalFormatTest, DistinctMultibyteReplayFieldsHaveIndependentOffsets) {
     put(child_wire, 4096 + 72, routing, 8);
     child_wire.replace(4096 + 104, 16, hex("c6f365b544be1cbbd36da0a55a1d9cfb"));
     repair(child_wire);
-    const auto literal = wal_wire(child_wire, context, 40);
+    const wal_prepare_stamps distinct{
+      true,
+      runtime::wall_time{0x0a0b0c0d0e0f1011},
+      runtime::file_position{target_position - 0x1000U},
+      runtime::file_position{wal_position - 0x10000U}};
+    const auto literal = wal_wire(child_wire, context, 40, distinct);
+    EXPECT_EQ(get(literal, 40 + 126, 2), 1U);
+    EXPECT_EQ(get(literal, 40 + 128, 8), 0x0a0b0c0d0e0f1011U);
+    // The sparse child's record deltas are -1 and -2 over a zero base.
+    EXPECT_EQ(get(literal, 40 + 136, 8), std::uint64_t{0} - 1U);
+    EXPECT_EQ(get(literal, 40 + 144, 8), target_position - 0x1000U);
+    EXPECT_EQ(get(literal, 40 + 152, 8), wal_position - 0x10000U);
+    EXPECT_EQ(get(literal, 40 + 160, 4), child_wire.size());
     seastar::abort_source abort;
     codec::cooperative_work work{codec::limits::defaults(), abort};
     fragmented_buffer_parser input{buffer(literal, 67)};
@@ -371,14 +414,21 @@ TEST(WalFormatTest, DistinctMultibyteReplayFieldsHaveIndependentOffsets) {
     EXPECT_EQ(decoded->value.routing_epoch().value(), routing);
     EXPECT_EQ(decoded->value.wal().alignment().bytes().value(), 4096U);
     EXPECT_EQ(decoded->value.target().alignment().bytes().value(), 512U);
+    EXPECT_EQ(decoded->value.stamps(), distinct);
+    EXPECT_EQ(
+      decoded->value.batch().info().max_record_time.unix_nanoseconds(), -1);
     EXPECT_EQ(flat(decoded->value.batch().bytes()), child_wire);
     auto child = std::move(decoded->value).release_batch();
-    const auto encoded
-      = encode_wal_prepare(
-          std::move(child), context, work, budget().operation_remaining, charge)
-          .get();
+    const auto encoded = encode_wal_prepare(
+                           std::move(child),
+                           context,
+                           distinct,
+                           work,
+                           budget().operation_remaining,
+                           charge)
+                           .get();
     ASSERT_TRUE(encoded.has_value());
-    EXPECT_EQ(flat(*encoded), wal_wire(child_wire, context));
+    EXPECT_EQ(flat(*encoded), wal_wire(child_wire, context, 32, distinct));
 }
 
 TEST(
@@ -435,10 +485,14 @@ TEST(WalFormatTest, RelocatedPrepareFeedsSegmentWriterWithoutReencodingChild) {
           result.value.batch().info().context.submitted().binding().segment(),
           id<model::segment_id>(0x30));
         const auto original = result.value.batch().info();
+        // The block made from a PREPARE carries its append time and target
+        // stamp, so restart can make the same block again.
+        const auto stamps = result.value.stamps();
         auto child = std::move(result.value).release_batch();
         const auto block = encode_segment_block(
                              std::move(child),
                              block_expected(0x80, 2, 8192, 17),
+                             {stamps.append_time, stamps.target_certified_end},
                              work,
                              budget().operation_remaining,
                              charge)
@@ -446,11 +500,134 @@ TEST(WalFormatTest, RelocatedPrepareFeedsSegmentWriterWithoutReencodingChild) {
         ASSERT_TRUE(block.has_value());
         EXPECT_EQ(block->descriptor().batch(), original);
         EXPECT_EQ(
-          flat(block->bytes()).substr(32 + 120, child_wire.size()), child_wire);
+          flat(block->bytes()).substr(32 + 144, child_wire.size()), child_wire);
+        EXPECT_EQ(
+          flat(block->bytes()),
+          block_wire(
+            child_wire,
+            block_expected(0x80, 2, 8192, 17),
+            32,
+            segment_block_stamps{
+              stamps.append_time, stamps.target_certified_end}));
         EXPECT_EQ(block->descriptor().coverage().logical().count().value(), 5U);
         EXPECT_EQ(
           block->descriptor().coverage().physical().count().value(), 2U);
     }
+}
+
+// Inside a WAL write the PREPAREs are contiguous; only the last sets
+// ends_write and pads to the next boundary. One padding value is accepted
+// per PREPARE, so the middle of a write never reads as its end.
+TEST(WalFormatTest, EndsWriteFlagDecidesThePaddingAtAnyPosition) {
+    // 1113 + 423 ends exactly on a boundary.
+    for (const std::uint64_t position :
+         {512U, 935U, 1023U, 1113U, 4096U + 7U}) {
+        for (const bool ends : {true, false}) {
+            SCOPED_TRACE(position);
+            auto context = wal_expected();
+            context.wal = wal_write_context::make(
+                            context.wal.incarnation(),
+                            alignment(),
+                            runtime::file_position{position})
+                            .value();
+            auto stamps = wal_stamps(context);
+            stamps.ends_write = ends;
+            const auto literal = wal_wire(assigned_wire(), context, 32, stamps);
+            const auto unpadded = 32U + 168U + assigned_wire().size();
+            const auto end = position + unpadded;
+            EXPECT_EQ(
+              get(literal, 32 + 164, 4),
+              ends ? (512U - end % 512U) % 512U : 0U);
+            if (ends)
+                EXPECT_EQ((position + literal.size()) % 512U, 0U);
+            else
+                EXPECT_EQ(literal.size(), unpadded);
+            seastar::abort_source abort;
+            codec::cooperative_work work{codec::limits::defaults(), abort};
+            auto encoded = encode_wal_prepare(
+                             checked_child(work),
+                             context,
+                             stamps,
+                             work,
+                             budget().operation_remaining,
+                             charge)
+                             .get();
+            ASSERT_TRUE(encoded.has_value());
+            EXPECT_EQ(flat(*encoded), literal);
+            fragmented_buffer_parser input{buffer(literal)};
+            auto decoded = decode_wal_prepare(
+                             input, context, reserve(input, work), work)
+                             .get();
+            ASSERT_TRUE(decoded.has_value());
+            EXPECT_EQ(decoded->value.stamps(), stamps);
+            EXPECT_EQ(
+              decoded->value.wal_extent().end().value(),
+              position + literal.size());
+            // The other flag value under the same bytes: its padding no
+            // longer agrees with the flag.
+            auto flipped = literal;
+            put(flipped, 32 + 126, ends ? 0U : 1U, 2);
+            repair(flipped);
+            fragmented_buffer_parser other{buffer(flipped)};
+            const auto refused = decode_wal_prepare(
+                                   other, context, reserve(other, work), work)
+                                   .get();
+            if (end % 512U == 0) {
+                // Already on a boundary: either flag means no padding.
+                ASSERT_TRUE(refused.has_value());
+                continue;
+            }
+            ASSERT_FALSE(refused.has_value());
+            EXPECT_EQ(refused.error().code(), errc::malformed_data);
+        }
+    }
+}
+
+TEST(WalFormatTest, EncodingRefusesStampsOutsideTheirDomains) {
+    seastar::abort_source abort;
+    codec::cooperative_work work{codec::limits::defaults(), abort};
+    auto context = wal_expected(512, 512);
+    context.wal = wal_write_context::make(
+                    context.wal.incarnation(),
+                    alignment(),
+                    runtime::file_position{2048})
+                    .value();
+    context.target = block_expected(0x30, 1, 1536).location;
+    const auto base = wal_stamps(context);
+    std::vector<wal_prepare_stamps> refused(7, base);
+    refused[0].append_time = runtime::wall_time{0};
+    refused[1].target_certified_end = runtime::file_position{0};
+    refused[2].target_certified_end = runtime::file_position{1025};
+    refused[3].target_certified_end = runtime::file_position{2048};
+    refused[4].wal_certified_end = runtime::file_position{0};
+    refused[5].wal_certified_end = runtime::file_position{1537};
+    refused[6].wal_certified_end = runtime::file_position{2560};
+    for (const auto& stamps : refused) {
+        const auto result = encode_wal_prepare(
+                              checked_child(work),
+                              context,
+                              stamps,
+                              work,
+                              budget().operation_remaining,
+                              charge)
+                              .get();
+        ASSERT_FALSE(result.has_value());
+        EXPECT_EQ(result.error().code(), errc::invalid_argument);
+    }
+    // Each file's own position is the highest end it can claim.
+    auto highest = base;
+    highest.target_certified_end = runtime::file_position{1536};
+    highest.wal_certified_end = runtime::file_position{2048};
+    const auto result = encode_wal_prepare(
+                          checked_child(work),
+                          context,
+                          highest,
+                          work,
+                          budget().operation_remaining,
+                          charge)
+                          .get();
+    ASSERT_TRUE(result.has_value());
+    EXPECT_EQ(flat(*result), wal_wire(assigned_wire(), context, 32, highest));
 }
 
 TEST(WalFormatTest, OnlyOneAssignedEnvelopeAndExpectedFamilyAreAccepted) {
@@ -486,7 +663,7 @@ TEST(WalFormatTest, AdjacentPreparesShareTheParentRemainder) {
     second_context.wal = wal_write_context::make(
                            second_context.wal.incarnation(),
                            alignment(),
-                           runtime::file_position{512})
+                           runtime::file_position{1024})
                            .value();
     second_context.target = block_expected(0x30, 1, 1024, 1).location;
     const auto one = wal_wire();
@@ -519,7 +696,7 @@ TEST(WalFormatTest, AdjacentPreparesShareTheParentRemainder) {
 }
 
 TEST(WalFormatTest, InvalidCallerContextAndExhaustedBudgetLeaveInputUnchanged) {
-    for (int mode = 0; mode < 8; ++mode) {
+    for (int mode = 0; mode < 11; ++mode) {
         auto context = wal_expected();
         if (mode == 0) context.routing_epoch = {};
         if (mode == 1) context.target_data_start = {};
@@ -527,9 +704,13 @@ TEST(WalFormatTest, InvalidCallerContextAndExhaustedBudgetLeaveInputUnchanged) {
         if (mode == 3) context.target_data_start = runtime::file_position{1024};
         if (mode == 4) context.batch.topic = {};
         if (mode == 5) context.target_profile = static_cast<storage_profile>(0);
+        // The WAL file's data start: nonzero, aligned, not past the PREPARE.
+        if (mode == 6) context.wal_data_start = {};
+        if (mode == 7) context.wal_data_start = runtime::file_position{513};
+        if (mode == 8) context.wal_data_start = runtime::file_position{1024};
         auto memory = budget();
-        if (mode == 6) memory.operation_remaining = {};
-        if (mode == 7) memory.metadata_remaining = {};
+        if (mode == 9) memory.operation_remaining = {};
+        if (mode == 10) memory.metadata_remaining = {};
         seastar::abort_source abort;
         codec::cooperative_work work{codec::limits::defaults(), abort};
         fragmented_buffer_parser input{buffer(wal_wire())};
@@ -539,7 +720,7 @@ TEST(WalFormatTest, InvalidCallerContextAndExhaustedBudgetLeaveInputUnchanged) {
         ASSERT_FALSE(result.has_value());
         EXPECT_EQ(
           result.error().code(),
-          mode >= 6 ? errc::resource_exhausted : errc::invalid_argument);
+          mode >= 9 ? errc::resource_exhausted : errc::invalid_argument);
         EXPECT_EQ(input.bytes_consumed(), byte_count{});
         EXPECT_EQ(input.checkpoint_depth(), 1U);
     }
@@ -568,6 +749,7 @@ TEST(WalFormatTest, StricterPolicyAndPositionOverflowRejectBeforePublication) {
         const auto result = encode_wal_prepare(
                               std::move(child),
                               context,
+                              wal_stamps(context),
                               work,
                               budget().operation_remaining,
                               charge,
@@ -608,6 +790,7 @@ TEST(WalFormatTest, AllocationFailuresJoinOwnersAndRestoreExistingMarks) {
                     succeeded = encode_wal_prepare(
                                   std::move(*child),
                                   wal_expected(),
+                                  wal_stamps(),
                                   work,
                                   budget().operation_remaining,
                                   charge)
@@ -657,6 +840,7 @@ TEST(WalFormatTest, FinalBodyAndFragmentLimitsIncludeHeadersAndPadding) {
         const auto output = encode_wal_prepare(
                               std::move(child),
                               wal_expected(),
+                              wal_stamps(),
                               work,
                               budget().operation_remaining,
                               charge)
@@ -685,6 +869,7 @@ TEST(WalFormatTest, FinalBodyAndFragmentLimitsIncludeHeadersAndPadding) {
         const auto output = encode_wal_prepare(
                               std::move(child),
                               wal_expected(),
+                              wal_stamps(),
                               work,
                               budget().operation_remaining,
                               charge)
@@ -719,6 +904,7 @@ TEST(
             auto pending = encode_wal_prepare(
               std::move(child),
               wal_expected(),
+              wal_stamps(),
               work,
               budget().operation_remaining,
               charge);
@@ -835,18 +1021,24 @@ TEST(WalFormatTest, PreflightSharesContextAndGeometryWithoutConsumingTheChild) {
                      .value();
     const codec::envelope_extent_limits cap{
       byte_count{64_KiB}, byte_count{64_KiB}};
-    auto layout = preflight_wal_prepare(child, expected, work.policy(), cap);
+    auto layout = preflight_wal_prepare(
+      child, expected, envelope_placement::ends_span, work.policy(), cap);
     ASSERT_TRUE(layout);
     EXPECT_EQ(layout->encoded_bytes(), byte_count{8_KiB});
     EXPECT_EQ(
       layout->at(expected.wal.position())->end(),
       runtime::file_position{16384});
     auto tight = preflight_wal_prepare(
-      child, expected, work.policy(), {byte_count{4_KiB}, byte_count{4_KiB}});
+      child,
+      expected,
+      envelope_placement::ends_span,
+      work.policy(),
+      {byte_count{4_KiB}, byte_count{4_KiB}});
     EXPECT_FALSE(tight);
     auto wrong = expected;
     wrong.routing_epoch = model::range_routing_epoch::make(9).value();
-    auto rejected = preflight_wal_prepare(child, wrong, work.policy(), cap);
+    auto rejected = preflight_wal_prepare(
+      child, wrong, envelope_placement::ends_span, work.policy(), cap);
     ASSERT_FALSE(rejected);
     EXPECT_EQ(rejected.error().code(), errc::wrong_context);
     auto exhausted = expected;
@@ -855,13 +1047,15 @@ TEST(WalFormatTest, PreflightSharesContextAndGeometryWithoutConsumingTheChild) {
                       alignment(8192),
                       runtime::file_position{UINT64_MAX - 8191})
                       .value();
-    rejected = preflight_wal_prepare(child, exhausted, work.policy(), cap);
+    rejected = preflight_wal_prepare(
+      child, exhausted, envelope_placement::ends_span, work.policy(), cap);
     ASSERT_FALSE(rejected);
     EXPECT_EQ(rejected.error().code(), errc::out_of_range);
     EXPECT_TRUE(child.bytes().content_equals(assigned_wire(true, 48, true)));
     auto encoded = encode_wal_prepare(
                      std::move(child),
                      expected,
+                     wal_stamps(expected),
                      work,
                      budget().operation_remaining,
                      charge)
@@ -909,11 +1103,12 @@ TEST(WalFormatTest, GroupMemoryBoundCoversTheEncoderAtTheFragmentCeiling) {
             auto layout = preflight_wal_prepare(
               *checked,
               expected,
+              envelope_placement::ends_span,
               work.policy(),
               {byte_count{64_KiB}, byte_count{64_KiB}});
             ASSERT_TRUE(layout);
             auto bound = kwaque::storage::detail::wal_prepare_memory(
-              *checked, *layout, work.policy(), charge);
+              *checked, layout->padding_bytes(), work.policy(), charge);
             if (extra != 0) {
                 ASSERT_FALSE(bound);
                 EXPECT_EQ(bound.error().code(), errc::resource_exhausted);
@@ -924,6 +1119,7 @@ TEST(WalFormatTest, GroupMemoryBoundCoversTheEncoderAtTheFragmentCeiling) {
             auto encoded = encode_wal_prepare(
                              std::move(*checked),
                              expected,
+                             wal_stamps(expected),
                              work,
                              bound->codec_bytes,
                              charge)
@@ -980,6 +1176,8 @@ TEST(
     EXPECT_EQ(claims.routing_epoch, expected.routing_epoch);
     EXPECT_EQ(claims.physical_begin, expected.target.physical_begin());
     EXPECT_EQ(claims.target_position, expected.target.position());
+    EXPECT_EQ(claims.stamps, wal_stamps(expected));
+    EXPECT_EQ(claims.max_record_time, runtime::wall_time{0});
     EXPECT_EQ(decoded->value.target(), expected.target);
 
     // Integrity and scalar syntax come first: no claims escape damage.
@@ -992,7 +1190,7 @@ TEST(
     EXPECT_TRUE(untouched.seen.empty());
     EXPECT_EQ(kept.value(), 0U);
     auto reserved = wal_wire();
-    put(reserved, 32 + 126, 1, 2);
+    put(reserved, 32 + 126, 3, 2);
     repair(reserved);
     auto [malformed, unused] = decode(reserved, untouched);
     ASSERT_FALSE(malformed);
@@ -1001,7 +1199,7 @@ TEST(
     // So do its size and layout where it lies: padding that disagrees with
     // the envelope never reaches the resolver, whatever segment it names.
     auto padded = wal_wire();
-    put(padded, 32 + 132, 120, 4);
+    put(padded, 32 + 164, 120, 4);
     repair(padded);
     recorder unrouted{expected};
     auto [unpadded, left] = decode(padded, unrouted);
@@ -1023,7 +1221,7 @@ TEST(
     moved.wal = wal_write_context::make(
                   expected.wal.incarnation(),
                   expected.wal.alignment(),
-                  runtime::file_position{512})
+                  runtime::file_position{1024})
                   .value();
     recorder elsewhere{moved};
     auto [foreign, none] = decode(wal_wire(), elsewhere);

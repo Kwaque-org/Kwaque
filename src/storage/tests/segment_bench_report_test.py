@@ -167,6 +167,16 @@ class SegmentReportTest(unittest.TestCase):
             report.summarize([row])["native_write_amplification_over_child_wire"], 92.16
         )
 
+    def test_one_batch_groups_are_held_to_the_packed_layout(self):
+        # Two groups of a 200-byte child: block, footer and padding fill one
+        # 8 KiB unit each; the measured 32 KiB is twice that.
+        summary = report.summarize([measurement()])
+        self.assertEqual(summary["packed_device_bytes"], 16384)
+        self.assertEqual(summary["native_bytes_over_packed"], 2.0)
+        row = measurement()
+        row.update(blocks=2, batches=4)
+        self.assertNotIn("packed_device_bytes", report.summarize([row]))
+
     def test_scope_identity_and_run_context_cannot_be_mixed(self):
         row = measurement(True)
         for change in (

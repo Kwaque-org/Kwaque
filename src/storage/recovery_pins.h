@@ -32,9 +32,8 @@ struct local_recovery_generation final {
 
 namespace detail {
 // State and pins agree. An active or recovering publication pins at most a
-// durable footer and a completed-retry snapshot, which needs that footer. A
-// sealed one pins its sealed root and exactly one sealed retry root, and may
-// add an index and a snapshot. Each kind appears once.
+// durable footer. A sealed one pins its sealed root and exactly one sealed
+// retry root, and may add an index. Each kind appears once.
 [[nodiscard]] runtime::result<void>
 validate_recovery_publication(const local_object_publication&);
 // Each root's context from independent state only: the verified history, the
@@ -125,7 +124,11 @@ seastar::future<runtime::result<local_recovery_generation>> open_recovery_pins(
       spec, shard, history, publication, sealed ? &*sealed : nullptr);
     if (!contexts) co_return runtime::failure(contexts.error());
     const local_generation_expectation expected{
-      output.generation, publication, descriptor, *contexts};
+      output.generation,
+      publication,
+      descriptor,
+      history.logical_origin,
+      *contexts};
     auto opened = co_await local_generation_owner::open(
       files, ownership, spec, shard, expected, budget, limits, work, readers);
     if (!opened) co_return runtime::failure(opened.error());
@@ -160,8 +163,8 @@ seastar::future<runtime::result<local_recovery_generation>> open_recovery_pins(
 // against its pins, and opens its boundary and roots through the generation
 // owner: each boundary and root must match its pinned identity and position
 // exactly, so a correct checksum on the wrong object, digest, page or
-// position rejects. The descriptor is the independent catalog entry; nothing
-// is inferred from names. Reads only.
+// position rejects. The descriptor and origin are the independent catalog
+// entry; nothing is inferred from names. Reads only.
 template<runtime::file_system_backend Backend, local_directory_owner Owner>
 seastar::future<runtime::result<local_recovery_generation>>
 open_recovery_generation(
@@ -170,6 +173,7 @@ open_recovery_generation(
   const local_device_spec& spec,
   std::uint32_t shard,
   const local_segment_descriptor& descriptor,
+  model::range_logical_end logical_origin,
   workload_budget& budget,
   local_store_io_limits limits,
   codec::cooperative_work& work,
@@ -180,10 +184,7 @@ open_recovery_generation(
     if (!owner)
         co_return runtime::failure(detail::path_error(errc::wrong_context));
     auto header = segment_header::make(
-      descriptor.segment,
-      descriptor.logical_origin,
-      descriptor.alignment,
-      descriptor.profile);
+      descriptor.segment, descriptor.alignment, descriptor.profile);
     if (!header)
         co_return runtime::failure(detail::path_error(errc::invalid_argument));
     auto segment = co_await load_local_segment(
@@ -193,7 +194,7 @@ open_recovery_generation(
       descriptor.segment,
       descriptor.alignment,
       segment->header.bytes.end(),
-      descriptor.logical_origin,
+      logical_origin,
       descriptor.physical_origin,
       descriptor.profile};
     const auto paths = local_paths::make(spec.root);

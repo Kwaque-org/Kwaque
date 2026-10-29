@@ -95,6 +95,7 @@ TAIL = (
         "scan_ns",
         "scanned_batches",
         "feed_dropped",
+        "tail_device_reads",
         "foreground_turns",
         "longest_wait_ns",
     )
@@ -131,7 +132,7 @@ CASES = {
         for side in ("fixed", "growing")
     },
     "read_held": {"held": SEALED, "kept": SEALED},
-    "read_tail": {side: TAIL for side in ("unfed", "untold", "told")},
+    "read_tail": {side: TAIL for side in ("unfed", "untold", "told", "told_copied")},
     "read_tail_scanned": {side: TAIL for side in ("untold", "told")},
 }
 
@@ -213,8 +214,11 @@ def check(row: dict) -> None:
             reads, hits = row[f"lag{lag}_reads"], row[f"lag{lag}_hits"]
             if hits > reads or reads != max(0, row["groups"] - lag):
                 raise ValueError(f"{where} lag {lag} does not add up")
-        if observed and side == "told" and row["lag0_device_reads"]:
+        told = side in ("told", "told_copied")
+        if observed and told and row["lag0_device_reads"]:
             raise ValueError(f"{where} read a fed tail from the device")
+        if told and row["tail_device_reads"]:
+            raise ValueError(f"{where} read the tail its feed holds from the device")
         if observed and side == "unfed" and row["lag0_hits"]:
             raise ValueError(f"{where} hit a tail nothing fed")
         if case == "read_tail" and (row["scan_ns"] or row["scanned_batches"]):
@@ -299,6 +303,7 @@ def summarize_group(rows: list[dict]) -> dict:
         out["read_ns"] = median(rows, "read_ns")
         out["probed"] = bool(first["foreground_turns"])
         out["feed_dropped"] = median(rows, "feed_dropped")
+        out["tail_device_reads"] = median(rows, "tail_device_reads")
         out["cache_evicted"] = median(rows, "cache_evicted")
         out["longest_wait_ns"] = max(row["longest_wait_ns"] for row in rows)
         for lag in LAGS if observed else ():

@@ -27,6 +27,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <span>
@@ -52,9 +53,9 @@ struct segment_run_block final {
 };
 
 // The most blocks one run holds, so that its table stays one allocation
-// within the contiguous ceiling, and the most parts a run that is fed is
-// built from.
-inline constexpr std::uint32_t maximum_run_blocks = 2048;
+// within the contiguous ceiling: the index takes an anchor at least that
+// often. And the most parts a run that is fed is built from.
+inline constexpr std::uint32_t maximum_run_blocks = maximum_anchor_blocks;
 inline constexpr std::uint32_t maximum_run_parts = 64;
 
 // What reading and checking a run may take.
@@ -244,14 +245,23 @@ private:
     std::variant<local_generation_pin, segment_data_pin> pin_;
 };
 
+// How a reader of a segment that is still appended to reads what is durable
+// in at least one place and not in the segment's file yet: the bytes from a
+// position to an end, as shares of what the segment's writer holds of them.
+// Refused with out_of_range when any of them is in the file by now, or was
+// never made. Whatever it refers to outlives the session it is given to.
+using segment_read_held
+  = seastar::noncopyable_function<runtime::result<bytes::fragmented_buffer>(
+    runtime::file_position, runtime::file_position)>;
+
 // A run the writer fed that the cache does not answer with yet, as far as it
 // may be read. The run is borrowed until its caller next waits; `held` keeps
 // whatever is taken of it charged for as long as it lives, and is no way to
-// the run: its entry has no value until the run is whole and durable.
+// the run: its entry has no value until the run is whole and readable.
 struct segment_tail final {
     const segment_run* run;
     cache_hold<segment_run> held;
-    // Blocks that end at or below this are durable.
+    // Blocks that end at or below this are durable in at least one place.
     runtime::file_position readable;
 };
 
@@ -280,6 +290,10 @@ struct segment_runs_config final {
     seastar::noncopyable_function<void(
       const runtime::operation_error&) noexcept>
       failed{};
+    // Whether what is fed is copied whole. Otherwise a fragment that fills
+    // at least three quarters of the allocation it keeps alive is shared,
+    // and only the others are copied.
+    bool copy_fed{false};
 };
 
 // The cached runs of one segment, and the tail its writer feeds.
@@ -292,14 +306,21 @@ struct segment_runs_config final {
 // that reader's budget.
 //
 // While something reads the segment its writer's observer hands over a share
-// of each written group. The bytes are copied here, off the writer's path,
-// into the run the segment is filling, which ends where the index chooses
-// the next anchor: a fed run and one read back from the device are the same
-// entry under the same key. Each part's cost is taken before it is copied,
-// and a run there is no room for is dropped and read from the device later.
-// A fed run answers from the cache once the segment's durable position has
-// passed it; until then, and while it is still filling, what lies below the
-// durable position is read through tail().
+// of each group once its bytes are made. They are taken here, off the
+// writer's path, into the run the segment is filling, which ends where the
+// index chooses the next anchor: a fed run and one read back from the device
+// are the same entry under the same key. Each part's cost is taken before it
+// is made, and a run there is no room for is dropped and read later from the
+// device or from the writer. A reader that comes before the feed's own work
+// took what it wants takes it itself; see catch_up().
+//
+// What may be read is what is durable in at least one place: below where the
+// segment's own barriers reached, or where its owner reported it durable,
+// its WAL included. A fed run answers from the cache once that has passed
+// it; until then, and while it is still filling, what lies below it is read
+// through tail(). The device is read only below where the writer's bytes in
+// the file end; what lies between there and what may be read is in the
+// writer's memory.
 //
 // `cache` and `budget` outlive it, and it outlives the writer whose observer
 // it gave. close() is joined before it is destroyed.
@@ -340,6 +361,18 @@ public:
     void establish(std::uint32_t readers) noexcept;
     [[nodiscard]] bool fed() const noexcept { return wanted_; }
 
+    // Of a segment whose writer reports here: where what is durable in at
+    // least one place ends, and where its bytes in the file end. Nothing is
+    // readable of one that never had a writer report here, and all of what
+    // is readable of it is in its file.
+    [[nodiscard]] runtime::file_position durable_position() const noexcept {
+        return readable_;
+    }
+    [[nodiscard]] runtime::file_position written_position() const noexcept {
+        return written_.value_or(
+          runtime::file_position{std::numeric_limits<std::uint64_t>::max()});
+    }
+
     // The run the cache keeps that begins with the greatest offset at or
     // below `target`, held. This is a use of it unless `use` says it is
     // not: a reader that looks first and uses what it found only when the
@@ -353,6 +386,16 @@ public:
     // below `target` and is not answered by floor() yet.
     [[nodiscard]] std::optional<segment_tail>
     tail(model::range_logical_offset target) noexcept;
+    // A reader that neither of those answered takes, before it reads
+    // anything, what the writer handed over and the feed's own work has
+    // not taken yet: in order and as that work would, up to the group that
+    // holds `target`. It stops short at a group after one that was not kept,
+    // at a lapse the feed's work has not handled, once the segment is
+    // drained or its seal handled, and once one run's worth of bytes was
+    // copied; the rest is the feed's own work. Nothing is taken when no
+    // group waiting holds `target`. True when something was taken: the
+    // reader looks again.
+    bool catch_up(model::range_logical_offset target) noexcept;
 
     // The run from `start` to `end`, held: from the cache, from the load in
     // flight, or read once as the cache's own work for everyone who asks
@@ -388,6 +431,18 @@ public:
       runtime::file_position bound,
       workload_budget& budget,
       seastar::abort_source& caller);
+    // As read_alone(), from what `held` gives of the writer's memory: for
+    // what is durable in at least one place and not in the file yet. The
+    // run keeps shares of the writer's bytes, and is charged what they keep
+    // alive. Refused as `held` refuses, and with out_of_range when there is
+    // no `held`, which a seal's move takes away.
+    [[nodiscard]] seastar::future<runtime::result<cache_ref<segment_run>>>
+    read_held(
+      segment_run_start start,
+      runtime::file_position end,
+      const segment_read_held& held,
+      workload_budget& budget,
+      seastar::abort_source& caller);
 
     // Starts the read of the run from `start` to `end` for nobody in
     // particular: the run a reader expects to want next. As fetch() reads
@@ -405,6 +460,11 @@ public:
     [[nodiscard]] std::uint64_t prefetches() const noexcept {
         return prefetched_;
     }
+    // Reads of the device that began at or past where the oldest run the
+    // writer is feeding begins: of a tail the feed holds, or should.
+    [[nodiscard]] std::uint64_t tail_device_reads() const noexcept {
+        return tail_device_reads_;
+    }
     // Whether the run that begins with `base` is the cache's, is being
     // read, or is being fed. Not a use of it.
     [[nodiscard]] bool holds(model::range_logical_offset base) const noexcept {
@@ -412,24 +472,29 @@ public:
         return runs_.holds(base);
     }
 
-    // The segment is sealed: nothing more is written to it. The run that
-    // was filling is whole, and answers from the cache like any other once
-    // it is durable; nothing a reader holds changes, and the runs the cache
-    // keeps are the sealed segment's runs. Called once the seal is done.
+    // The segment is sealed: nothing more is written to it, and all of it is
+    // in its file. The run that was filling is whole, and answers from the
+    // cache like any other once it is readable; nothing a reader holds
+    // changes, and the runs the cache keeps are the sealed segment's runs.
+    // Called once the seal is done.
     void seal() noexcept;
 
     // What the segment's writer is given to report to: `index` chooses the
-    // anchors and is told as its own observer would tell it, and what is
-    // written while the segment is fed is handed over here.
+    // anchors and is told what may be read, and what is made while the
+    // segment is fed is handed over here.
     [[nodiscard]] segment_block_observer
     observer(active_sparse_index& index) noexcept;
 
-    // Resolves once everything the writer handed over so far is copied, and
-    // every run that is complete and durable answers from the cache.
+    // Resolves once everything the writer handed over so far is taken, and
+    // every run that is complete and readable answers from the cache.
     [[nodiscard]] seastar::future<> settled();
     // Runs the writer fed that the cache does not answer with yet.
     [[nodiscard]] std::size_t pending() const noexcept {
         return pending_.size();
+    }
+    // Groups the writer handed over that are not taken yet.
+    [[nodiscard]] std::size_t waiting() const noexcept {
+        return waiting_.size();
     }
     // Written groups that were not kept: there was no room for them, or
     // they could not be shared.
@@ -496,6 +561,15 @@ private:
     // charged what it holds once it is there.
     [[nodiscard]] runtime::result<byte_count>
     estimate(std::uint64_t length) const noexcept;
+    // What reading `length` bytes at `position` holds: the aligned span that
+    // encloses them, which the runtime reads and keeps whole.
+    [[nodiscard]] std::uint64_t enclosing(
+      runtime::file_position position, std::uint64_t length) const noexcept {
+        const auto unit = history_.alignment.bytes().value();
+        const auto begin = position.value() - position.value() % unit;
+        const auto end = position.value() + length;
+        return (end + unit - 1) / unit * unit - begin;
+    }
     seastar::future<runtime::result<segment_run>> load(
       const segment_data_source& source,
       segment_run_start start,
@@ -513,11 +587,17 @@ private:
     void drop() noexcept;
     // Wakes the feed's own work.
     void stir() noexcept;
-    void durable(runtime::file_position end) noexcept;
-    // The feed's own work: copies what the writer handed over, in order.
+    // What may be read reaches at least where the segment's own barriers
+    // or its owner's reports have; `index` is told.
+    void readable(active_sparse_index& index) noexcept;
+    // Counts a read of the device from `at`; see tail_device_reads().
+    void device_read(runtime::file_position at) noexcept;
+    // The feed's own work: takes what the writer handed over, in order.
     seastar::future<> copy();
+    // Takes the group the writer handed over first.
+    void take_front() noexcept;
     void take(fed_group& group);
-    // Copies `[from, until)` of a group, which holds `count` of its blocks
+    // Takes `[from, until)` of a group, which holds `count` of its blocks
     // from `first`, into the run that is filling.
     [[nodiscard]] bool append(
       fed_group& group,
@@ -560,10 +640,20 @@ private:
     bool lapsed_{false};
     std::uint32_t established_{0};
     runtime::monotonic_time read_{};
-    runtime::file_position durable_{};
+    // Where the segment's own barriers reached, where its owner reported,
+    // the greater of the two, and where its bytes in the file end: nothing
+    // until a writer reports here.
+    runtime::file_position durable_{}, reported_{}, readable_{};
+    std::optional<runtime::file_position> written_;
     std::uint64_t waiting_bytes_{0};
     std::uint64_t dropped_{0};
+    // Bytes the feed copied rather than shared, and reads of the device
+    // into a tail it feeds.
+    std::uint64_t copied_{0};
+    std::uint64_t tail_device_reads_{0};
     std::vector<noted_block> noted_;
+    // The group the next feed is of was noted.
+    bool noted_group_{false};
     seastar::circular_buffer<fed_group> waiting_;
     // Oldest first; only the last may still be filling.
     seastar::circular_buffer<std::unique_ptr<fed_run>> pending_;

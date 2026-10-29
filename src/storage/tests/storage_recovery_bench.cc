@@ -36,10 +36,12 @@
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <set>
 #include <span>
+#include <stdexcept>
 #include <string>
 #include <variant>
 #include <vector>
@@ -79,7 +81,7 @@ enum class store_state : std::uint8_t {
     // its end.
     damaged,
     // Every segment lost the data after its header while the WAL kept every
-    // PREPARE, so each one is a candidate.
+    // PREPARE, so restart writes each one again from it.
     lost_data,
     // Recovered once and stopped again without appends: each segment resumes
     // at its recovering pin. No checkpoint exists yet, so the whole WAL chain
@@ -129,23 +131,31 @@ const char* verdict_name(recovery_store_verdict value) noexcept {
     }
     std::abort();
 }
-constexpr std::array<const char*, 9> classification_names{
+constexpr std::array<const char*, 12> classification_names{
   "satisfied",
   "footer_only",
+  "materialize",
   "candidate",
   "suffix",
   "conflict",
   "content",
+  "materialized",
+  "repaired",
   "uncertified_tail",
   "corruption",
   "slack"};
+static_assert(
+  static_cast<std::size_t>(recovery_classification::slack) + 1
+  == classification_names.size());
 
-// Request i targets segment i % segments.
+// Request i targets segment i % segments. A wide case takes its segments
+// from KWAQUE_STORAGE_RECOVERY_SEGMENTS, with as many requests each.
 struct case_shape final {
     const char* name;
     std::size_t payload_bytes{0};
     std::uint32_t requests{0}, segments{0};
     store_state state{store_state::stopped};
+    bool wide{false};
     [[nodiscard]] std::uint32_t per_segment() const noexcept {
         return segments == 0 ? 0 : requests / segments;
     }
@@ -161,9 +171,19 @@ struct native_driver final {
 model::range_routing_epoch routing() {
     return model::range_routing_epoch::make(1).value();
 }
+// The broker time every request is assigned at, as the segment fixture
+// stamps its blocks.
+constexpr runtime::wall_time request_time{1};
 wal_writer_config wal_configuration(const case_shape& selected) {
     auto wal = wal_writer_contract::configuration();
-    wal.capacity_bytes = byte_count{128_MiB};
+    // Every request's PREPARE in one file, whatever the case's width.
+    const std::uint64_t each = std::max<std::uint64_t>(
+                                 selected.payload_bytes, 1_KiB)
+                               + 16_KiB;
+    const std::uint64_t needed = std::uint64_t{selected.requests} * each
+                                 + 1_MiB;
+    wal.capacity_bytes = byte_count{
+      std::max<std::uint64_t>(128_MiB, (needed + 1_MiB - 1) / 1_MiB * 1_MiB)};
     if (selected.large()) wal.children.working_bytes = byte_count{16_MiB};
     return wal;
 }
@@ -258,11 +278,8 @@ seastar::future<written_store> write_store(
         store.descriptors.push_back(descriptor);
         store.catalog.push_back(
           {descriptor,
-           take(
-             segment_header::make(
-               descriptor.segment,
-               descriptor.logical_origin,
-               descriptor.alignment))});
+           take(segment_header::make(descriptor.segment, descriptor.alignment)),
+           inputs.back().history.logical_origin});
         store.data_starts.push_back(inputs.back().history.data_start);
     }
     store.requests.resize(selected.requests);
@@ -314,7 +331,14 @@ seastar::future<written_store> write_store(
                                                : byte_count{1_MiB};
             segments.push_back(take(
               segment_type::make_new(
-                files, owner, spec, 0, inputs[f].descriptor, budget, config)));
+                files,
+                owner,
+                spec,
+                0,
+                inputs[f].descriptor,
+                inputs[f].history.logical_origin,
+                budget,
+                config)));
             auto& created = *segments.back();
             take(
               co_await seastar::with_scheduling_group(
@@ -325,6 +349,11 @@ seastar::future<written_store> write_store(
             local_append_config config;
             config.maximum_requests = 128;
             config.policy = work.policy();
+            // Every group in the WAL, whose replay this measures, and
+            // written at once.
+            config.segment_placement_bytes = byte_count{
+              std::numeric_limits<std::uint64_t>::max()};
+            config.held_run_bytes = byte_count{};
             append = take(append_type::make(budget, *commit, *writer, config));
             std::vector<local_append_target> targets;
             targets.reserve(selected.segments);
@@ -348,6 +377,7 @@ seastar::future<written_store> write_store(
                     std::move(backing),
                     {history.segment.topic(), history.segment.range()},
                     routing(),
+                    request_time,
                     std::nullopt},
                   work);
                 const auto acceptance = co_await std::move(stages.accepted);
@@ -362,7 +392,9 @@ seastar::future<written_store> write_store(
                     && outcome.receipt.has_value(),
                   "a store request did not become locally durable");
                 const auto& receipt = *outcome.receipt;
-                record.end = receipt.wal.boundary().cursor();
+                // Either barrier may publish it; its group's PREPAREs end
+                // where the WAL is reserved now, with nothing after them.
+                record.end = writer->progress()->reserved;
                 const auto at = receipt.block.records.bytes().begin().value();
                 const auto& envelope = receipt.block.envelope;
                 record.block_body = at + envelope.header_bytes().value();
@@ -498,7 +530,7 @@ struct expected_segment final {
     recovery_plan_action action{recovery_plan_action::publish_recovering};
     // The logical end of the recovered boundary; absent without a boundary.
     std::optional<model::range_logical_end> boundary_end;
-    std::uint32_t satisfied{0}, footer_only{0}, candidates{0};
+    std::uint32_t satisfied{0}, footer_only{0}, materialize{0}, candidates{0};
 };
 struct expectation final {
     std::vector<expected_segment> segments;
@@ -525,19 +557,16 @@ expectation expect(const written_store& store, const case_shape& selected) {
             segment.action = recovery_plan_action::retain;
             break;
         case store_state::lost_data:
-            segment.boundary_end.reset();
             segment.satisfied = 0;
-            segment.candidates = n;
+            segment.materialize = n;
             break;
         case store_state::damaged:
-            if (f == 0) {
-                segment.boundary_end = request(0, 0).logical_end;
-                segment.satisfied = 1;
-                segment.candidates = n - 1;
-            } else if (f == 1) {
-                segment.boundary_end = request(1, n - 2).logical_end;
+            // The damaged block is written again from its PREPARE: under the
+            // intact footers after it in the first segment, and under the
+            // footer derived after it in the second.
+            if (f == 0 || f == 1) {
                 segment.satisfied = n - 1;
-                segment.candidates = 1;
+                segment.materialize = 1;
             } else if (f == selected.segments - 1) {
                 segment.satisfied = n - 1;
                 segment.footer_only = 1;
@@ -797,6 +826,7 @@ seastar::future<> run_restart(
         work));
     mark_step();
     out.planner.emplace(take(recovery_planner::make(found.targets, budget)));
+    recovery_tails tails;
     out.merged = take(
       co_await reconcile_local_recovery(
         files,
@@ -810,7 +840,9 @@ seastar::future<> run_restart(
         budget,
         merge_limits(settings),
         work,
-        restart_view{&*out.planner, &out, &budget}));
+        restart_view{&*out.planner, &out, &budget},
+        std::nullopt,
+        &tails));
     take(out.planner->finish(out.merged));
     require(out.planner->ready(), "a store's restart plan stopped");
     mark_step();
@@ -830,6 +862,8 @@ seastar::future<> run_restart(
         0,
         *out.planner,
         found,
+        tails,
+        spec,
         std::span<const recovery_visibility>{},
         budget,
         publication_configuration(),
@@ -889,6 +923,7 @@ void verify(
         require(
           planned.action == want.action && planned.candidates == want.candidates
             && planned.suffix == 0 && report->satisfied == want.satisfied
+            && report->materialize == want.materialize
             && report->footer_only == want.footer_only && report->conflicts == 0
             && report->unresolved == 0,
           "a segment was classified otherwise than its store determines");
@@ -901,7 +936,7 @@ void verify(
             require(
               !planned.boundary
                 && planned.recovered_end.value()
-                     == store.descriptors[f].logical_origin.value(),
+                     == store.catalog[f].logical_origin->value(),
               "a segment without a footer recovered a boundary");
         if (planned.action == recovery_plan_action::publish_recovering)
             ++publishing;
@@ -1135,12 +1170,29 @@ struct storage_recovery_bench {
     }
 
     seastar::future<std::size_t> run_case(case_shape selected) {
+        if (selected.wide) {
+            const auto per_segment = selected.per_segment();
+            if (
+              const auto* chosen = std::getenv(
+                "KWAQUE_STORAGE_RECOVERY_SEGMENTS")) {
+                const auto width = std::strtoul(chosen, nullptr, 10);
+                require(
+                  width >= 1 && width <= fixture::maximum_wide_extent_segments,
+                  "a wide case takes from 1 to 1,024 segments");
+                selected.segments = static_cast<std::uint32_t>(width);
+                selected.requests = selected.segments * per_segment;
+            }
+        }
         require(
-          selected.segments <= fixture::maximum_extent_segments
+          selected.segments
+              <= (selected.wide ? fixture::maximum_wide_extent_segments
+                                : fixture::maximum_extent_segments)
             && (selected.segments == 0) == (selected.requests == 0)
             && (selected.segments == 0
                 || (selected.requests % selected.segments == 0 && selected.per_segment() <= fixture::maximum_batches))
-            && (selected.state == store_state::stopped || selected.segments >= 3)
+            && (selected.state == store_state::stopped
+                || selected.state == store_state::lost_data
+                || selected.segments >= 3)
             && (selected.state != store_state::damaged || selected.per_segment() >= 3),
           "restart benchmark shape exceeds its bound");
         native_settings settings;
@@ -1233,20 +1285,33 @@ private:
         // Appends are produce-path work, admitted as the local append
         // benchmark admits them.
         const std::uint64_t owners = selected.segments;
+        // Past the first extents each idle segment owner holds its handle
+        // credits and a small reservation: a quarter of a MiB covers it.
+        const std::uint64_t writing_bytes
+          = owners <= fixture::maximum_extent_segments
+              ? std::max<std::uint64_t>(96, 32 + 8 * owners) << 20U
+              : (std::uint64_t{288} << 20U) + owners * 256_KiB;
+        // Each idle segment writer also holds four reservations, and its
+        // retry summary one more once a producer stream has written to it.
         workload_budget writing{
           manager.acquire_workload(
             resource::workload_class::foreground_protocol),
-          {.tasks = 1024,
-           .bytes
-           = byte_count{std::max<std::uint64_t>(96, 32 + 8 * owners) << 20U},
+          {.tasks = static_cast<std::uint32_t>(1024 + 5 * owners),
+           .bytes = byte_count{writing_bytes},
            .handles = static_cast<std::uint32_t>(32 + 16 * owners)},
           charge};
         // Restart is metadata work: up to two segment walks and the WAL
         // scan, each with its decode workspace and read-ahead, then eight
-        // publications at a time beside the successor.
+        // publications at a time beside the successor; and for each segment
+        // its tables, the PREPAREs queued for its walk and its tail, within
+        // the shard's metadata lease.
+        auto metadata = manager.acquire_workload(
+          resource::workload_class::metadata);
+        const auto restart_bytes = std::min<std::uint64_t>(
+          metadata.hard_budget().value(), 64_MiB + owners * 64_KiB);
         workload_budget restarting{
-          manager.acquire_workload(resource::workload_class::metadata),
-          {.tasks = 256, .bytes = byte_count{64_MiB}, .handles = 64},
+          std::move(metadata),
+          {.tasks = 256, .bytes = byte_count{restart_bytes}, .handles = 64},
           charge};
         {
             seastar::abort_source abort;
@@ -1333,6 +1398,43 @@ private:
                   "timing stopped with native writes or flushes in flight");
             }
             verify(store, selected, out, restarting_files, result);
+            // A restart that writes the WAL's copies scans the WAL twice,
+            // each scan asking for at most a window past each file's end,
+            // and reads each PREPARE twice more at its cursor, to prove it
+            // and to write it, and once more if its segment was refused
+            // admission beside other publication jobs and published again
+            // alone; it writes at least every child it holds back to its
+            // segment.
+            if constexpr (!timing_only)
+                if (selected.state == store_state::lost_data) {
+                    std::uint64_t children = 0, prepares = 0;
+                    for (const auto& record : store.requests) {
+                        children += record.child_bytes;
+                        prepares += record.end->position().value()
+                                    - record.begin->position().value();
+                    }
+                    const auto scans = 2
+                                       * (wal_file_bytes
+                                          + store.wal_files.size()
+                                              * settings.reader.window_bytes
+                                                  .value());
+                    const auto read
+                      = restarting_files.sample[file_kind::wal].read_bytes;
+                    const auto written
+                      = restarting_files.sample[file_kind::data].bytes;
+                    if (read > scans + 3 * prepares)
+                        throw std::runtime_error(
+                          "a restart read " + std::to_string(read)
+                          + " WAL bytes, more than two scans of "
+                          + std::to_string(wal_file_bytes)
+                          + " and three reads of each PREPARE of "
+                          + std::to_string(prepares) + " allow");
+                    if (written < children)
+                        throw std::runtime_error(
+                          "a restart wrote back " + std::to_string(written)
+                          + " bytes, less than its requests hold ("
+                          + std::to_string(children) + ")");
+                }
         } catch (...) {
             execution.observe(std::current_exception());
         }
@@ -1387,6 +1489,25 @@ RESTART_CASE(
   .state = store_state::lost_data)
 RESTART_CASE(
   clean_stop, .requests = 128, .segments = 8, .state = store_state::restarted)
+// Held runs lost: every segment's data after its header lost, as a crash
+// leaves runs nothing synced, while the WAL kept each PREPARE, so the
+// restart writes every request again from it before it publishes. Four
+// requests of 1 KiB a segment, and one a segment just under the default
+// placement threshold. Eight segments unless the run sets the width.
+RESTART_CASE(
+  held_lost_1k,
+  .payload_bytes = 1_KiB,
+  .requests = 32,
+  .segments = 8,
+  .state = store_state::lost_data,
+  .wide = true)
+RESTART_CASE(
+  held_lost_255k,
+  .payload_bytes = 255_KiB,
+  .requests = 8,
+  .segments = 8,
+  .state = store_state::lost_data,
+  .wide = true)
 #undef RESTART_CASE
 } // namespace
 } // namespace kwaque::storage::testing::storage_recovery_bench_support

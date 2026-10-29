@@ -35,7 +35,8 @@ using namespace kwaque;
 using namespace kwaque::storage;
 constexpr auto workload = resource::workload_class::metadata;
 constexpr std::uint64_t stride_bytes = 32_KiB;
-constexpr std::uint64_t chunk_entries = 4096;
+// An active index's chunk: one page of the sealed form's entries.
+constexpr std::uint64_t chunk_entries = sparse_index_page_entries;
 
 template<typename Func>
 seastar::future<> with_budget(Func body) {
@@ -132,13 +133,14 @@ bool boom(seastar::future<T>& settled) {
     }
 }
 
-// Writes dense blocks one after another, as a segment does, and keeps where
-// each began.
+// Writes dense blocks one after another, as a segment does, each a group
+// the index admits before it is written, and keeps where each began.
 struct feeder final {
     active_sparse_index& index;
     std::uint64_t base, position, ordinal{0};
     std::map<std::uint64_t, std::uint64_t> begins{};
     void add(std::uint64_t records, std::uint64_t size) {
+        BOOST_REQUIRE(index.admit(1).has_value());
         index.written(block(base, ordinal, records, position, size));
         begins.emplace(base, position);
         base += records;
@@ -186,8 +188,9 @@ void check(
 
 SEASTAR_TEST_CASE(sparse_index_capacity_follows_the_stride_and_the_blocks) {
     constexpr byte_count data{1_GiB};
+    // One per stride, and one per 2,048 of the blocks the file holds.
     BOOST_CHECK_EQUAL(
-      sparse_index_capacity({}, data, maximum_object_entries), 32769U);
+      sparse_index_capacity({}, data, maximum_object_entries), 32801U);
     BOOST_CHECK_EQUAL(
       sparse_index_capacity({byte_count{4_KiB}}, data, maximum_object_entries),
       maximum_object_entries);
@@ -196,33 +199,40 @@ SEASTAR_TEST_CASE(sparse_index_capacity_follows_the_stride_and_the_blocks) {
       maximum_object_entries);
     BOOST_CHECK_EQUAL(
       sparse_index_capacity({}, byte_count{128_MiB}, maximum_object_entries),
-      4097U);
-    // No more anchors than blocks, whatever the stride.
+      4129U);
+    // No more anchors than blocks, whatever the stride; no more blocks than
+    // the file holds of the smallest.
     BOOST_CHECK_EQUAL(sparse_index_capacity({}, data, 100), 100U);
-    BOOST_CHECK_EQUAL(sparse_index_capacity({}, data, UINT32_MAX), 32769U);
+    BOOST_CHECK_EQUAL(sparse_index_capacity({}, data, UINT32_MAX), 35289U);
     // Every block may be an anchor.
     BOOST_CHECK_EQUAL(
       sparse_index_capacity({byte_count{0}}, data, maximum_object_entries),
       maximum_object_entries);
     BOOST_CHECK_EQUAL(
       sparse_index_capacity({byte_count{32_KiB}, 1000}, data, 4096), 4096U);
-    // A stride longer than the file leaves the first block.
+    // A stride longer than the file leaves the first block, and one per
+    // 2,048 blocks.
     BOOST_CHECK_EQUAL(
       sparse_index_capacity({byte_count{2_GiB}}, data, maximum_object_entries),
-      1U);
+      33U);
     const byte_count most{std::numeric_limits<std::uint64_t>::max()};
     BOOST_CHECK_EQUAL(
       sparse_index_capacity({byte_count{1}}, most, maximum_object_entries),
       maximum_object_entries);
     BOOST_CHECK_EQUAL(
-      sparse_index_capacity({most}, most, maximum_object_entries), 2U);
+      sparse_index_capacity({most}, most, maximum_object_entries), 34U);
     const sparse_index_stride standard;
     BOOST_CHECK_EQUAL(standard.bytes.value(), stride_bytes);
     BOOST_CHECK_EQUAL(standard.records, 0U);
     co_return;
 }
 
-SEASTAR_TEST_CASE(sparse_index_admits_its_whole_table_when_made) {
+// An index is admitted its list and its first chunk when it is made, and
+// each later chunk with the group whose blocks could first need it, the
+// blocks of groups admitted before counting until they are written. Without
+// that admission a block past its chunks is passed over. A budget with no
+// room for a chunk refuses the group.
+SEASTAR_TEST_CASE(sparse_index_admits_a_chunk_with_the_group_that_needs_it) {
     co_await with_budget([](workload_budget& budget) {
         const auto zero = active_sparse_index::make({}, 0, budget);
         BOOST_REQUIRE(!zero);
@@ -243,29 +253,49 @@ SEASTAR_TEST_CASE(sparse_index_admits_its_whole_table_when_made) {
         BOOST_CHECK_LE(charged(chunk), maximum_contiguous_allocation_bytes);
         const auto list = sizeof(std::vector<sparse_index_entry>);
         {
-            // One whole chunk and the one entry past it, each at its size.
-            const auto small = make(budget, {}, 4097);
-            BOOST_CHECK_EQUAL(small.capacity(), 4097U);
+            // The first chunk when made; a group of its blocks takes no
+            // more, and one more block admits the one entry past it, at its
+            // size, under the same reservation.
+            auto small = make(budget, {}, chunk_entries + 1);
+            BOOST_CHECK_EQUAL(small.capacity(), chunk_entries + 1);
+            const auto first = reserved(charged(2 * list) + charged(chunk));
+            BOOST_CHECK_EQUAL(budget.snapshot().bytes, first);
+            BOOST_CHECK_EQUAL(budget.snapshot().tasks, 1U);
+            BOOST_REQUIRE(small.admit(chunk_entries).has_value());
+            BOOST_CHECK_EQUAL(budget.snapshot().bytes, first);
+            BOOST_REQUIRE(small.admit(1).has_value());
             BOOST_CHECK_EQUAL(
               budget.snapshot().bytes,
-              reserved(
-                charged(2 * list) + charged(chunk)
-                + charged(sizeof(sparse_index_entry))));
+              first + charged(sizeof(sparse_index_entry)));
             BOOST_CHECK_EQUAL(budget.snapshot().tasks, 1U);
         }
         BOOST_CHECK_EQUAL(budget.snapshot().bytes, 0U);
         {
-            const auto full = make(budget, {}, maximum_object_entries);
+            // A block past the first chunk that no group admitted is
+            // passed over.
+            auto index = make(budget, {byte_count{0}}, chunk_entries + 1);
+            feeder segment{index, 100, 4096};
+            for (std::uint32_t i = 0; i < chunk_entries; ++i)
+                segment.add(1, 512);
+            index.written(
+              block(segment.base, segment.ordinal, 1, segment.position, 512));
+            BOOST_CHECK_EQUAL(index.skipped(), 1U);
+        }
+        {
+            auto full = make(budget, {}, maximum_object_entries);
+            BOOST_REQUIRE(full.admit(maximum_object_entries).has_value());
             const auto used = budget.snapshot().bytes;
+            constexpr auto chunks = maximum_object_entries / chunk_entries;
             BOOST_CHECK_EQUAL(
-              used, reserved(charged(16 * list) + 16 * charged(chunk)));
+              used, reserved(charged(chunks * list) + chunks * charged(chunk)));
             BOOST_CHECK_GE(
               used, maximum_object_entries * sizeof(sparse_index_entry));
-            // Leave less than a second one needs.
+            // Leave less than a second one needs: it is made, and the group
+            // that needs the rest of its chunks is refused.
             auto held = budget.try_reserve(byte_count{4_MiB - used - used / 2});
             BOOST_REQUIRE(held.has_value());
-            const auto refused = active_sparse_index::make(
-              {}, maximum_object_entries, budget);
+            auto second = make(budget, {}, maximum_object_entries);
+            const auto refused = second.admit(maximum_object_entries);
             BOOST_REQUIRE(!refused);
             BOOST_CHECK(refused.error().code() == errc::queue_full);
         }
@@ -433,6 +463,32 @@ SEASTAR_TEST_CASE(sparse_index_record_stride_forces_anchors) {
     });
 }
 
+// Packed small blocks reach the most a run lists long before a byte stride:
+// a block is an anchor once maximum_anchor_blocks lie since the last, so no
+// run between two anchors lists more.
+SEASTAR_TEST_CASE(sparse_index_anchors_at_least_every_run_of_blocks) {
+    co_await with_budget([](workload_budget& budget) {
+        const sparse_index_stride rule{byte_count{4_MiB}};
+        auto index = make(
+          budget,
+          rule,
+          sparse_index_capacity(
+            rule, byte_count{64_MiB}, maximum_object_entries));
+        feeder blocks{index, 100, 4096};
+        for (std::uint32_t i = 0; i != 2 * maximum_anchor_blocks + 1; ++i)
+            blocks.add(1, 399);
+        blocks.sync();
+        BOOST_REQUIRE_EQUAL(index.size(), 3U);
+        BOOST_CHECK_EQUAL(index.skipped(), 0U);
+        for (std::uint32_t anchor = 0; anchor != 3; ++anchor)
+            check(
+              index,
+              anchor,
+              100 + anchor * maximum_anchor_blocks,
+              4096 + anchor * maximum_anchor_blocks * 399);
+    });
+}
+
 // The stride's rule and the capacity it is sized by, together: a table sized
 // for a stride and a data file is never short of room for the blocks that
 // stride chooses in that file, whatever their sizes, and the blocks it
@@ -452,15 +508,21 @@ SEASTAR_TEST_CASE(sparse_index_sized_by_its_stride_never_fills) {
                 auto index = make(budget, rule, capacity);
                 std::map<std::uint64_t, std::uint64_t> chosen;
                 std::uint64_t position = 0, base = 100, ordinal = 0, last = 0;
+                std::uint32_t since = 0;
                 for (;;) {
                     const auto size = exact
                                         ? std::max<std::uint64_t>(stride, 64)
                                         : 64 * (1 + choice.uniform(192));
                     if (position + size > cap) break;
-                    if (chosen.empty() || position - last >= stride) {
+                    ++since;
+                    if (
+                      chosen.empty() || position - last >= stride
+                      || since >= maximum_anchor_blocks) {
                         chosen.emplace(position, base);
                         last = position;
+                        since = 0;
                     }
+                    BOOST_REQUIRE(index.admit(1).has_value());
                     index.written(block(base, ordinal, 1, position, size));
                     position += size;
                     base += 1 + choice.uniform(3);
@@ -547,8 +609,13 @@ SEASTAR_TEST_CASE(sparse_index_keeps_whole_coordinates) {
     });
 }
 
-SEASTAR_TEST_CASE(sparse_index_grows_by_chunks_under_its_first_admission) {
+// Chunks are admitted with the groups that need them, each under the
+// index's one reservation, until the table is whole.
+SEASTAR_TEST_CASE(sparse_index_grows_by_chunks_admitted_with_its_groups) {
     co_await with_budget([](workload_budget& budget) {
+        const auto charged = [&budget](std::uint64_t bytes) {
+            return budget.allocation_charge(byte_count{bytes}).value().value();
+        };
         auto index = make(budget, {byte_count{0}}, maximum_object_entries);
         const auto admitted = budget.snapshot();
         feeder segment{index, 1000, 4096};
@@ -569,8 +636,15 @@ SEASTAR_TEST_CASE(sparse_index_grows_by_chunks_under_its_first_admission) {
         }
         BOOST_CHECK(same);
         BOOST_CHECK_EQUAL(index.skipped(), 0U);
-        BOOST_CHECK_EQUAL(budget.snapshot().bytes, admitted.bytes);
-        BOOST_CHECK_EQUAL(budget.snapshot().accepted, admitted.accepted);
+        constexpr std::uint64_t later = maximum_object_entries / chunk_entries
+                                        - 1;
+        BOOST_CHECK_EQUAL(
+          budget.snapshot().bytes,
+          admitted.bytes
+            + later * charged(chunk_entries * sizeof(sparse_index_entry)));
+        BOOST_CHECK_EQUAL(budget.snapshot().tasks, admitted.tasks);
+        BOOST_CHECK_EQUAL(
+          budget.snapshot().accepted, admitted.accepted + later);
         BOOST_CHECK_EQUAL(budget.snapshot().rejected, admitted.rejected);
         // A table that is full passes blocks over and keeps what it has.
         segment.add(2, 512);
@@ -1252,20 +1326,21 @@ SEASTAR_TEST_CASE(sparse_index_budget_is_checked_before_any_segment) {
                    && wants.value == expected;
         };
         const auto bytes = limits.bytes.value();
-        const auto most = static_cast<std::uint32_t>(bytes / each);
+        // Fewer indexes than the budget has admissions, with the rest of
+        // its bytes reserved for whatever else draws on it.
+        const auto most = limits.tasks - 1;
         BOOST_REQUIRE_GE(most, 1U);
-        BOOST_REQUIRE_LT(most, limits.tasks);
+        BOOST_REQUIRE_LE(std::uint64_t{most} * each, bytes);
         const auto full = [](std::uint32_t segments) {
             return sparse_index_demand{segments, maximum_object_entries};
         };
-        // As many whole indexes as the bytes hold, and not one more.
-        BOOST_CHECK(validate_sparse_index_budget(budget, full(most)));
-        BOOST_CHECK(
-          refused(full(most + 1), bytes, std::uint64_t{most + 1} * each));
-        // Whatever else draws on the budget is counted beside them.
         auto shared = full(most);
         shared.reserved_bytes = byte_count{bytes - most * each};
         BOOST_CHECK(validate_sparse_index_budget(budget, shared));
+        // Not one more index, and not one more byte beside them.
+        auto more = full(most + 1);
+        more.reserved_bytes = shared.reserved_bytes;
+        BOOST_CHECK(refused(more, bytes, bytes + each));
         shared.reserved_bytes = byte_count{bytes - most * each + 1};
         BOOST_CHECK(refused(shared, bytes, bytes + 1));
         shared.reserved_bytes = byte_count{

@@ -376,10 +376,8 @@ seastar::future<> shutdown(
             spec, 0, head.incarnation);
           expected += append::prepare_bytes(
             assigned_wire(true, 48), head, spec.owner.cluster(), 8192);
-          expected += append::prepare_bytes(
-            records[0], head, spec.owner.cluster(), 16384);
-          expected += append::prepare_bytes(
-            records[1], head, spec.owner.cluster(), 24576);
+          expected += append::group_bytes(
+            records, head, spec.owner.cluster(), 16384);
           require(
             (co_await store_contract::read_bytes(
               files,

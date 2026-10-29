@@ -31,6 +31,10 @@ enum class local_sequence_file : std::uint8_t {
     deletion
 };
 enum class local_bucket_kind : std::uint8_t { wal, segment };
+// What a shard's spare directory on a device keeps: bodies of WAL files, on
+// the control device, or data files of segments, on a data device. Each is
+// a file a removal gave back to be made into a later one.
+enum class local_spare_kind : std::uint8_t { wal, segment };
 struct local_segment_name final {
     model::segment_id segment;
     model::segment_generation generation;
@@ -53,6 +57,13 @@ parse_local_segment_name(std::string_view, std::uint8_t bucket);
 parse_local_deleting_name(std::string_view, std::uint8_t bucket);
 [[nodiscard]] runtime::result<std::uint64_t>
 parse_local_sequence_name(std::string_view, bool metadata);
+// A spare's name: the identity its file had last, then ".spare". No spare's
+// name is a WAL file's or a segment directory's, so nothing that walks the
+// buckets ever takes one for either.
+[[nodiscard]] runtime::result<model::wal_incarnation_id>
+  parse_local_wal_spare(std::string_view);
+[[nodiscard]] runtime::result<local_segment_name>
+  parse_local_segment_spare(std::string_view);
 [[nodiscard]] runtime::result<std::uint32_t>
   parse_local_shard_name(std::string_view);
 [[nodiscard]] runtime::result<void>
@@ -100,6 +111,14 @@ public:
       std::uint32_t shard, local_segment_name, local_object_sequence) const;
     [[nodiscard]] runtime::result<runtime::file_path> sequence_file(
       std::uint32_t shard, local_sequence_file, std::uint64_t sequence) const;
+    // A shard's spare directory of one kind on this device, and a spare in
+    // it under the identity its file had last.
+    [[nodiscard]] runtime::result<runtime::file_path>
+    spares(std::uint32_t shard, local_spare_kind) const;
+    [[nodiscard]] runtime::result<runtime::file_path>
+    spare(std::uint32_t shard, model::wal_incarnation_id) const;
+    [[nodiscard]] runtime::result<runtime::file_path>
+    spare(std::uint32_t shard, local_segment_name) const;
 
 private:
     explicit local_paths(runtime::file_path root) noexcept

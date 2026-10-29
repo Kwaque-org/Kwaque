@@ -188,6 +188,14 @@ class StorageRecoveryBenchReportTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "different stores"):
             report.summarize([first, changed])
 
+    def test_widths_of_one_case_summarize_apart(self):
+        narrow, wide = measurement(), measurement()
+        wide.update(segments=4, requests=32)
+        wide["classification"]["slots"]["satisfied"] = 32
+        wide["classification"]["prepares"] = 32
+        self.assertNotEqual(report.signature(narrow), report.signature(wide))
+        self.assertEqual(report.summarize([wide])["store"]["segments"], 4)
+
     def test_reads_rows_with_their_profile(self):
         row = measurement()
         del row["build_profile"]

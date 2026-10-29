@@ -39,12 +39,15 @@ inline storage::coverage extent_scope(
         runtime::file_position{b0}, runtime::file_position{b1})
         .value()};
 }
+// An empty extent carries no times; one with records has both.
 inline range_manifest_entry item(
   std::uint64_t begin = 100,
   std::uint64_t end = 102,
   bool empty = false,
   std::uint8_t segment = 0x30,
-  std::uint64_t generation = 7) {
+  std::uint64_t generation = 7,
+  std::int64_t append_time = 1000,
+  std::int64_t record_time = 900) {
     return range_manifest_entry::make(
              id<model::segment_id>(segment),
              model::segment_generation::make(generation).value(),
@@ -55,7 +58,9 @@ inline range_manifest_entry item(
                empty ? 10U : end - begin,
                empty ? 4096U : 512U,
                empty ? 4096U : 1536U),
-             codec::extent_digest{manifest_digest(empty ? "" : "data")})
+             codec::extent_digest{manifest_digest(empty ? "" : "data")},
+             runtime::wall_time{empty ? 0 : append_time},
+             runtime::wall_time{empty ? 0 : record_time})
       .value();
 }
 inline auto items() {
@@ -126,7 +131,7 @@ inline std::string expected_page(
     put(body, 80, header.first_entry(), 4);
     put(body, 84, header.entry_count(), 4);
     for (const auto& entry : entries) {
-        std::string bytes(104, '\0');
+        std::string bytes(120, '\0');
         const auto c = entry.coverage();
         put(bytes, 0, c.logical().begin().value(), 8);
         put(bytes, 8, c.logical().end().value(), 8);
@@ -139,6 +144,18 @@ inline std::string expected_page(
         const auto digest = entry.digest().bytes();
         for (std::size_t i = 0; i < digest.size(); ++i)
             bytes[72 + i] = std::bit_cast<char>(digest[i]);
+        put(
+          bytes,
+          104,
+          static_cast<std::uint64_t>(
+            entry.max_append_time().unix_nanoseconds()),
+          8);
+        put(
+          bytes,
+          112,
+          static_cast<std::uint64_t>(
+            entry.max_record_time().unix_nanoseconds()),
+          8);
         body += bytes;
     }
     return manifest_frame(std::move(body), 88, a, h);

@@ -9,9 +9,11 @@
 
 #include <gtest/gtest.h>
 
+#include <array>
 #include <chrono>
 #include <memory>
 #include <type_traits>
+#include <utility>
 
 namespace kwaque::storage {
 namespace {
@@ -21,26 +23,44 @@ static_assert(!std::is_copy_constructible_v<extent_verifier>);
 static_assert(!std::is_move_assignable_v<extent_verifier>);
 static_assert(sizeof(extent_verifier) < 2048);
 
+// Packed layouts: a block carries no padding, so the next object of its write
+// starts where it ends; a footer pads from its position to the next boundary.
+// data_block() lies at [512, 911) and a footer after it at [911, 1536).
+constexpr std::uint64_t first_end = 911;
+std::uint64_t aligned_up(std::uint64_t value) {
+    return (value + 511U) / 512U * 512U;
+}
+// Where a footer that starts at `at` ends.
+std::uint64_t footer_end(std::uint64_t at) {
+    return aligned_up(at + 32U + durable_footer_fixed_bytes.value());
+}
+
 TEST(
   ExtentVerifierTest, TwoGroupsHashEarlierFooterBytesOnceAndCountOnlyBlocks) {
     seastar::abort_source abort;
     codec::cooperative_work work{codec::limits::defaults(), abort};
+    const auto first = data_block();
+    ASSERT_EQ(512U + first.size(), first_end);
+    // The next write starts on the boundary the footer padded to.
+    const auto second = data_block(101, 1, 1536);
+    const auto second_end = 1536U + second.size();
     auto verifier = extent_verifier::make(
                       history(),
-                      scope(100, 102, 0, 2, 512, 2048),
+                      scope(100, 102, 0, 2, 512, second_end),
                       work.policy())
                       .value();
-    const auto first = data_block();
     ASSERT_TRUE(feed_block(verifier, first, work));
     const auto first_evidence = verifier.checkpoint(work).value();
     const auto middle = footer_wire(
-      first_evidence.boundary(), {history(), runtime::file_position{1024}});
+      first_evidence.boundary(),
+      {history(), runtime::file_position{first_end}});
+    ASSERT_EQ(first_end + middle.size(), 1536U);
     ASSERT_TRUE(feed_footer(verifier, middle, work, first_evidence));
     const auto middle_evidence = verifier.checkpoint(work).value();
     EXPECT_EQ(middle_evidence.boundary().block_count, 1U);
     EXPECT_EQ(middle_evidence.boundary().coverage.physical().end().value(), 1U);
     EXPECT_EQ(
-      middle_evidence.boundary().last_block->bytes().end().value(), 1024U);
+      middle_evidence.boundary().last_block->bytes().end().value(), first_end);
     EXPECT_EQ(middle_evidence.boundary().coverage.bytes().end().value(), 1536U);
     EXPECT_EQ(middle_evidence.boundary().data_crc32c, crc(first + middle));
     // A last block may precede an included earlier footer at the data end.
@@ -51,17 +71,17 @@ TEST(
                   budget().operation_remaining,
                   charge)
                   .get());
-    const auto second = data_block(101, 1, 1536);
     ASSERT_TRUE(feed_block(verifier, second, work));
     const auto evidence = verifier.finish(work).value();
     EXPECT_TRUE(verifier.closed());
     EXPECT_EQ(evidence.boundary().block_count, 2U);
     EXPECT_EQ(
       evidence.boundary().last_block,
-      std::optional{scope(101, 102, 1, 2, 1536, 2048)});
+      std::optional{scope(101, 102, 1, 2, 1536, second_end)});
     EXPECT_EQ(evidence.boundary().data_crc32c, crc(first + middle + second));
     EXPECT_NE(evidence.boundary().data_crc32c, crc(first + second));
-    const footer_expectation expected{history(), runtime::file_position{2560}};
+    const footer_expectation expected{
+      history(), runtime::file_position{second_end}};
     fragmented_buffer_parser input{
       buffer(footer_wire(evidence.boundary(), expected))};
     const auto footer = decode_durable_footer(
@@ -79,19 +99,20 @@ TEST(
         codec::cooperative_work work{codec::limits::defaults(), abort};
         auto verifier = extent_verifier::make(
                           history(),
-                          scope(100, 102, 0, 2, 512, 1536),
+                          scope(100, 102, 0, 2, 512, first_end + 399U),
                           work.policy())
                           .value();
         if (mode == 0) {
-            EXPECT_FALSE(feed_block(verifier, data_block(101, 1, 1024), work));
+            EXPECT_FALSE(
+              feed_block(verifier, data_block(101, 1, first_end), work));
         } else {
             ASSERT_TRUE(feed_block(verifier, data_block(), work));
-            auto next = data_block(101, 1, 1024);
+            auto next = data_block(101, 1, first_end);
             if (mode == 1) next = data_block();
-            if (mode == 2) next = data_block(102, 1, 1024);
-            if (mode == 3) next = data_block(101, 2, 1024);
+            if (mode == 2) next = data_block(102, 1, first_end);
+            if (mode == 3) next = data_block(101, 2, first_end);
             if (mode == 4) next.pop_back();
-            if (mode == 5) next = data_block(101, 1, 1024, false, 0x30, 2);
+            if (mode == 5) next = data_block(101, 1, first_end, false, 0x30, 2);
             EXPECT_FALSE(feed_block(verifier, next, work));
         }
         EXPECT_TRUE(verifier.closed());
@@ -113,12 +134,13 @@ TEST(ExtentVerifierTest, ClaimedSpanCannotOmitTailOrAcceptExtraObjects) {
                             0,
                             extra ? 1U : 2U,
                             512,
-                            extra ? 1024U : 1536U),
+                            extra ? first_end : first_end + 399U),
                           work.policy())
                           .value();
         ASSERT_TRUE(feed_block(verifier, data_block(), work));
         if (extra)
-            EXPECT_FALSE(feed_block(verifier, data_block(101, 1, 1024), work));
+            EXPECT_FALSE(
+              feed_block(verifier, data_block(101, 1, first_end), work));
         const auto proof = verifier.finish(work);
         EXPECT_FALSE(proof.has_value());
         EXPECT_TRUE(verifier.closed());
@@ -126,25 +148,30 @@ TEST(ExtentVerifierTest, ClaimedSpanCannotOmitTailOrAcceptExtraObjects) {
     seastar::abort_source abort;
     codec::cooperative_work work{codec::limits::defaults(), abort};
     auto joined = extent_verifier::make(
-                    history(), scope(100, 102, 0, 2, 512, 1536), work.policy())
+                    history(),
+                    scope(100, 102, 0, 2, 512, first_end + 399U),
+                    work.policy())
                     .value();
     EXPECT_FALSE(
-      feed_block(joined, data_block() + data_block(101, 1, 1024), work));
+      feed_block(joined, data_block() + data_block(101, 1, first_end), work));
     EXPECT_TRUE(joined.closed());
 }
 
 TEST(ExtentVerifierTest, OriginalAndRewriteHistoriesHaveDifferentLogicalRules) {
+    const auto first = data_block(102, 0, 512, true, 0x80, 2, true);
+    const auto at = 512U + first.size();
+    const auto second = data_block(109, 2, at, true, 0x80, 2);
+    const auto end = at + second.size();
     for (const bool rewrite : {false, true}) {
         seastar::abort_source abort;
         codec::cooperative_work work{codec::limits::defaults(), abort};
         auto verifier = extent_verifier::make(
                           history(0x80, 2),
-                          scope(100, 115, 0, 4, 512, 1536),
+                          scope(100, 115, 0, 4, 512, end),
                           work.policy(),
                           rewrite ? extent_layout_kind::rewrite
                                   : extent_layout_kind::initial_append)
                           .value();
-        const auto first = data_block(102, 0, 512, true, 0x80, 2, true);
         const auto accepted = feed_block(verifier, first, work);
         if (!rewrite) {
             EXPECT_FALSE(accepted.has_value());
@@ -152,17 +179,16 @@ TEST(ExtentVerifierTest, OriginalAndRewriteHistoriesHaveDifferentLogicalRules) {
             continue;
         }
         ASSERT_TRUE(accepted.has_value());
-        ASSERT_TRUE(
-          feed_block(verifier, data_block(109, 2, 1024, true, 0x80, 2), work));
+        ASSERT_TRUE(feed_block(verifier, second, work));
         const auto proof = verifier.finish(work).value();
-        EXPECT_EQ(proof.boundary().coverage, scope(100, 115, 0, 4, 512, 1536));
+        EXPECT_EQ(proof.boundary().coverage, scope(100, 115, 0, 4, 512, end));
         EXPECT_EQ(proof.boundary().block_count, 2U);
         EXPECT_EQ(proof.boundary().last_block->logical().end().value(), 114U);
         // Trailing original coverage belongs to a rewritten extent, not a
         // fabricated last retained batch or an originally empty boundary.
         EXPECT_FALSE(encode_durable_footer(
                        proof,
-                       {history(0x80, 2), runtime::file_position{1536}},
+                       {history(0x80, 2), runtime::file_position{end}},
                        work,
                        budget().operation_remaining,
                        charge)
@@ -174,14 +200,14 @@ TEST(
   ExtentVerifierTest, RewriteCannotInferRemovedCoverageOrEscapeSuppliedBounds) {
     seastar::abort_source abort;
     codec::cooperative_work work{codec::limits::defaults(), abort};
+    const auto beyond = data_block(101, 0, 512, true, 0x80, 2);
     auto verifier = extent_verifier::make(
                       history(0x80, 2),
-                      scope(100, 105, 0, 2, 512, 1024),
+                      scope(100, 105, 0, 2, 512, 512 + beyond.size()),
                       work.policy(),
                       extent_layout_kind::rewrite)
                       .value();
-    EXPECT_FALSE(
-      feed_block(verifier, data_block(101, 0, 512, true, 0x80, 2), work));
+    EXPECT_FALSE(feed_block(verifier, beyond, work));
     EXPECT_TRUE(verifier.closed());
     auto empty = extent_verifier::make(
                    history(),
@@ -242,7 +268,7 @@ TEST(ExtentVerifierTest, KnownPrefixFooterCannotLieAboutSuppliedHistory) {
     claim.data_crc32c ^= 1U;
     EXPECT_FALSE(feed_footer(
       verifier,
-      footer_wire(claim, {history(), runtime::file_position{1024}}),
+      footer_wire(claim, {history(), runtime::file_position{first_end}}),
       work));
     EXPECT_TRUE(verifier.closed());
 }
@@ -253,7 +279,7 @@ TEST(
     codec::cooperative_work work{codec::limits::defaults(), abort};
     auto verifier = extent_verifier::make(
                       history(),
-                      scope(100, 102, 0, 2, 512, 1536),
+                      scope(100, 102, 0, 2, 512, first_end + 399U),
                       work.policy())
                       .value();
     ASSERT_TRUE(feed_block(verifier, data_block(), work));
@@ -262,11 +288,11 @@ TEST(
     // A moved verifier is explicitly closed by contract.
     // NOLINTNEXTLINE(bugprone-use-after-move)
     EXPECT_TRUE(verifier.closed());
-    ASSERT_TRUE(feed_block(moved, data_block(101, 1, 1024), work));
+    ASSERT_TRUE(feed_block(moved, data_block(101, 1, first_end), work));
     const auto all = moved.finish(work).value();
     EXPECT_EQ(all.boundary().block_count, 2U);
     EXPECT_EQ(prefix.boundary().block_count, 1U);
-    EXPECT_EQ(prefix.boundary().coverage.bytes().end().value(), 1024U);
+    EXPECT_EQ(prefix.boundary().coverage.bytes().end().value(), first_end);
     EXPECT_FALSE(moved.checkpoint(work));
 }
 
@@ -277,7 +303,7 @@ TEST(
         codec::cooperative_work work{codec::limits::defaults(), abort};
         auto verifier = extent_verifier::make(
                           history(),
-                          scope(100, 101, 0, 1, 512, 1024),
+                          scope(100, 101, 0, 1, 512, first_end),
                           work.policy(),
                           extent_layout_kind::initial_append,
                           {},
@@ -318,16 +344,19 @@ TEST(ExtentVerifierTest, AllocationFailuresCloseEvenAfterAValidPrefix) {
     for (std::uint64_t ordinal = 0; ordinal < 384 && !completed; ++ordinal) {
         seastar::abort_source abort;
         codec::cooperative_work work{codec::limits::defaults(), abort};
+        const auto compressed = data_block(
+          101, 1, first_end, false, 0x30, 1, true);
         auto verifier = extent_verifier::make(
                           history(),
-                          scope(100, 102, 0, 2, 512, 1536),
+                          scope(
+                            100, 102, 0, 2, 512, first_end + compressed.size()),
                           work.policy(),
                           extent_layout_kind::initial_append,
                           {},
                           extent_integrity::crc32c_and_digest)
                           .value();
         ASSERT_TRUE(feed_block(verifier, data_block(), work));
-        auto bytes = buffer(data_block(101, 1, 1024, false, 0x30, 1, true));
+        auto bytes = buffer(compressed);
         const auto memory = reserve(bytes, work);
         auto& injector = seastar::memory::local_failure_injector();
         bool threw = false, succeeded = false;
@@ -370,7 +399,7 @@ TEST(
     codec::cooperative_work work{codec::limits::defaults(), abort};
     auto verifier = extent_verifier::make(
                       history(),
-                      scope(100, 101, 0, 1, 512, 1024),
+                      scope(100, 101, 0, 1, 512, first_end),
                       work.policy(),
                       extent_layout_kind::initial_append,
                       {},
@@ -418,13 +447,21 @@ TEST(
           {},
           extent_integrity::crc32c_and_digest)
           .value();
+    // Each group is one write: a block and the footer that ends it on the
+    // next boundary, so every group spans one unit.
     codec::xxh3_128_hasher expected_hasher;
     for (std::uint64_t i = 0; i < objects; ++i) {
+        const auto at = (i + 1) * width;
         const auto wire = data_block(
-          100 + i, i, (i + 1) * width, false, 0x30, 1, false, width);
-        ASSERT_EQ(wire.size(), width);
+          100 + i, i, at, false, 0x30, 1, false, width);
         expected_hasher.update(wire.data(), wire.size());
         ASSERT_TRUE(feed_block(verifier, wire, work, width));
+        const auto prefix = verifier.checkpoint(work).value();
+        const auto footer = footer_wire(
+          prefix.boundary(), {h, runtime::file_position{at + wire.size()}});
+        ASSERT_EQ(at + wire.size() + footer.size(), at + width);
+        expected_hasher.update(footer.data(), footer.size());
+        ASSERT_TRUE(feed_footer(verifier, footer, work, prefix));
         seastar::thread::maybe_yield();
     }
     const auto proof = verifier.finish(work).value();
@@ -448,16 +485,16 @@ TEST(ExtentVerifierTest, FragmentAndWorkBoundariesKeepTheCompleteDigest) {
             codec::cooperative_work work{
               codec::limits::make(config).value(), abort};
             const auto h = history(0x30, 1, 8192);
+            const auto wire = data_block(
+              100, 0, 8192, false, 0x30, 1, false, 8192);
             auto verifier = extent_verifier::make(
                               h,
-                              scope(100, 101, 0, 1, 8192, 16384),
+                              scope(100, 101, 0, 1, 8192, 8192 + wire.size()),
                               work.policy(),
                               extent_layout_kind::initial_append,
                               {},
                               extent_integrity::crc32c_and_digest)
                               .value();
-            const auto wire = data_block(
-              100, 0, 8192, false, 0x30, 1, false, 8192);
             codec::xxh3_128_hasher expected;
             expected.update(wire.data(), wire.size());
             const auto fed = feed_block(verifier, wire, work, width);
@@ -627,6 +664,7 @@ TEST(
     auto block = encode_segment_block(
                    checked_child(original, true),
                    block_expected(),
+                   block_stamps(),
                    original,
                    budget().operation_remaining,
                    charge)
@@ -678,6 +716,7 @@ TEST(
         auto block = encode_segment_block(
                        checked_child(work),
                        block_expected(),
+                       block_stamps(),
                        work,
                        budget().operation_remaining,
                        charge)
@@ -717,9 +756,17 @@ TEST(
                      {},
                      extent_integrity::crc32c_and_digest)
                      .value();
+    // Each group is one write: its block, then its footer to the boundary.
+    std::array<std::string, 2> blocks;
+    std::array<std::uint64_t, 3> begins{512};
+    for (std::uint64_t group = 0; group != 2; ++group) {
+        blocks[group] = data_block(
+          100 + group, group, begins[group], false, 0x30, 1, group != 0);
+        begins[group + 1] = footer_end(begins[group] + blocks[group].size());
+    }
     auto finite = extent_verifier::make(
                     history(),
-                    scope(100, 102, 0, 2, 512, 2560),
+                    scope(100, 102, 0, 2, 512, begins[2]),
                     work.policy(),
                     extent_layout_kind::initial_append,
                     {},
@@ -729,12 +776,11 @@ TEST(
     EXPECT_FALSE(growing.checkpoint(work).value().digest());
     std::string all;
     for (std::uint64_t group = 0; group != 2; ++group) {
-        const auto begin = 512 + group * 1024;
+        const auto begin = begins[group];
         const auto expected = scope(
-          100, 101 + group, 0, 1 + group, 512, begin + 1024);
+          100, 101 + group, 0, 1 + group, 512, begins[group + 1]);
         ASSERT_TRUE(growing.extend_expected(expected, work));
-        const auto block = data_block(
-          100 + group, group, begin, false, 0x30, 1, group != 0);
+        const auto& block = blocks[group];
         ASSERT_TRUE(feed_block(growing, block, work));
         ASSERT_TRUE(feed_block(finite, block, work));
         all += block;
@@ -743,7 +789,8 @@ TEST(
           prefix.boundary(), finite.checkpoint(work).value().boundary());
         EXPECT_EQ(prefix.boundary().data_crc32c, crc(all));
         const auto footer = footer_wire(
-          prefix.boundary(), {history(), runtime::file_position{begin + 512}});
+          prefix.boundary(),
+          {history(), runtime::file_position{begin + block.size()}});
         ASSERT_TRUE(feed_footer(growing, footer, work, prefix));
         ASSERT_TRUE(feed_footer(finite, footer, work, prefix));
         all += footer;
@@ -770,7 +817,9 @@ TEST(
     seastar::abort_source abort;
     codec::cooperative_work work{codec::limits::defaults(), abort};
     auto walk = extent_verifier::make(
-                  history(), scope(100, 101, 0, 1, 512, 1024), work.policy())
+                  history(),
+                  scope(100, 101, 0, 1, 512, first_end),
+                  work.policy())
                   .value();
     const auto block = data_block();
     ASSERT_TRUE(feed_block(walk, block, work));
@@ -778,7 +827,7 @@ TEST(
     ASSERT_TRUE(walk.extend_expected(prefix.boundary().coverage, work));
     ASSERT_TRUE(walk.extend_expected(scope(100, 101, 0, 1, 512, 1536), work));
     const auto footer = footer_wire(
-      prefix.boundary(), {history(), runtime::file_position{1024}});
+      prefix.boundary(), {history(), runtime::file_position{first_end}});
     ASSERT_TRUE(feed_footer(walk, footer, work, prefix));
     const auto final = walk.finish(work).value();
     EXPECT_EQ(final.boundary().block_count, 1U);
@@ -801,24 +850,26 @@ TEST(
         codec::cooperative_work work{codec::limits::defaults(), abort};
         auto walk = extent_verifier::make(
                       history(),
-                      scope(100, 101, 0, 1, 512, 1024),
+                      scope(100, 101, 0, 1, 512, first_end),
                       work.policy(),
                       mode == 8 ? extent_layout_kind::rewrite
                                 : extent_layout_kind::initial_append)
                       .value();
         if (mode != 7 && mode != 12)
             ASSERT_TRUE(feed_block(walk, data_block(), work));
-        auto next = scope(100, 102, 0, 2, 512, 1536);
-        if (mode == 0) next = scope(99, 102, 0, 3, 512, 1536);
-        if (mode == 1) next = scope(100, 102, 1, 3, 512, 1536);
-        if (mode == 2) next = scope(100, 102, 0, 2, 0, 1536);
-        if (mode == 3) next = scope(100, 100, 0, 0, 512, 1536);
+        constexpr auto two = first_end + 399U;
+        auto next = scope(100, 102, 0, 2, 512, two);
+        if (mode == 0) next = scope(99, 102, 0, 3, 512, two);
+        if (mode == 1) next = scope(100, 102, 1, 3, 512, two);
+        if (mode == 2) next = scope(100, 102, 0, 2, 0, two);
+        if (mode == 3) next = scope(100, 100, 0, 0, 512, two);
         if (mode == 4) next = scope(100, 101, 0, 1, 512, 512);
-        if (mode == 5) next = scope(100, 102, 0, 2, 512, 1537);
-        if (mode == 6) next = scope(100, 103, 0, 2, 512, 1536);
-        if (mode == 9) next = scope(100, 102, 0, 2, 512, 1024);
+        // Below the bytes already accepted.
+        if (mode == 5) next = scope(100, 102, 0, 2, 512, first_end - 1U);
+        if (mode == 6) next = scope(100, 103, 0, 2, 512, two);
+        if (mode == 9) next = scope(100, 102, 0, 2, 512, first_end);
         if (mode == 10) abort.request_abort();
-        if (mode == 12) next = scope(100, 101, 0, 1, 512, 1024);
+        if (mode == 12) next = scope(100, 101, 0, 1, 512, first_end);
         auto narrower = work.policy().config();
         narrower.max_record_bytes = byte_count{64_KiB};
         codec::cooperative_work other{
@@ -839,7 +890,7 @@ TEST(ExtentVerifierTest, GrowthDuringAnActiveAddCannotDestroyItsHashState) {
     codec::cooperative_work work{codec::limits::defaults(), abort};
     auto walk = extent_verifier::make(
                   history(),
-                  scope(100, 101, 0, 1, 512, 1024),
+                  scope(100, 101, 0, 1, 512, first_end),
                   work.policy(),
                   extent_layout_kind::initial_append,
                   {},
@@ -857,7 +908,7 @@ TEST(ExtentVerifierTest, GrowthDuringAnActiveAddCannotDestroyItsHashState) {
       std::move(source), batch_expected(), memory, work);
     const bool pending = !adding.available();
     const auto grown = walk.extend_expected(
-      scope(100, 102, 0, 2, 512, 1536), work);
+      scope(100, 102, 0, 2, 512, first_end + 399U), work);
     const bool kept_open = !walk.closed();
     const auto added = adding.get();
     ASSERT_TRUE(pending);
@@ -883,7 +934,7 @@ TEST(ExtentVerifierTest, GrowingToTheTerminalLogicalEndDoesNotOverflow) {
     repair(child);
     const auto wire = block_wire(child);
     ASSERT_TRUE(walk.extend_expected(
-      scope(UINT64_MAX - 1, UINT64_MAX, 0, 1, 512, 1024), work));
+      scope(UINT64_MAX - 1, UINT64_MAX, 0, 1, 512, 512 + wire.size()), work));
     ASSERT_TRUE(feed_block(walk, wire, work));
     const auto result = walk.finish(work).value();
     EXPECT_EQ(result.boundary().coverage.logical().end().value(), UINT64_MAX);
@@ -998,21 +1049,37 @@ TEST(ExtentVerifierTest, TypedFooterCannotBypassPlacementPolicyOrCancellation) {
 TEST(ExtentVerifierTest, TypedFooterStillChecksTheActualHistoryCrc) {
     seastar::abort_source abort;
     codec::cooperative_work work{codec::limits::defaults(), abort};
+    // Two blocks of one size, times and coverage that differ only in their
+    // certified end, so only the checksum tells their footers apart. A block
+    // at 1024 may certify the data start or itself.
+    const auto expected = block_expected(0x30, 1, 1024);
+    const auto mine = block_wire(data_child(), expected);
+    const auto theirs = block_wire(
+      data_child(),
+      expected,
+      32,
+      segment_block_stamps{
+        runtime::wall_time{1}, runtime::file_position{1024}});
+    ASSERT_EQ(mine.size(), theirs.size());
+    ASSERT_NE(mine, theirs);
+    const auto end = 1024U + mine.size();
     auto walk = extent_verifier::make(
-                  history(), scope(100, 101, 0, 1, 512, 1536), work.policy())
+                  history(),
+                  scope(100, 101, 0, 1, 1024, footer_end(end)),
+                  work.policy())
                   .value();
-    ASSERT_TRUE(feed_block(walk, data_block(), work));
+    ASSERT_TRUE(feed_block(walk, mine, work));
     const auto prefix = walk.checkpoint(work).value();
     auto other = extent_verifier::make(
-                   history(), scope(100, 101, 0, 1, 512, 1024), work.policy())
+                   history(), scope(100, 101, 0, 1, 1024, end), work.policy())
                    .value();
-    ASSERT_TRUE(
-      feed_block(other, data_block(100, 0, 512, false, 0x30, 1, true), work));
+    ASSERT_TRUE(feed_block(other, theirs, work));
     const auto different = other.finish(work).value();
     ASSERT_NE(prefix.boundary().data_crc32c, different.boundary().data_crc32c);
+    EXPECT_EQ(prefix.boundary().times, different.boundary().times);
     auto footer = encode_durable_footer(
                     different,
-                    {history(), runtime::file_position{1024}},
+                    {history(), runtime::file_position{end}},
                     work,
                     budget().operation_remaining,
                     charge)
@@ -1025,6 +1092,64 @@ TEST(ExtentVerifierTest, TypedFooterStillChecksTheActualHistoryCrc) {
     EXPECT_EQ(rejected.error().code(), errc::corrupt_data);
     EXPECT_TRUE(walk.closed());
     EXPECT_FALSE(footer.bytes().empty());
+}
+
+// Append times never decrease along a segment's blocks, as a time index
+// never goes back; equal ones are accepted. Record times may go either way.
+// A recycled file's earlier block, of another segment, where this segment's
+// next block belongs: another context, never damage, and nothing of it is
+// taken.
+TEST(ExtentVerifierTest, AnotherSegmentsBlockIsAnotherContextNotDamage) {
+    seastar::abort_source abort;
+    codec::cooperative_work work{codec::limits::defaults(), abort};
+    const auto first = data_block();
+    const auto stale = data_block(101, 1, first_end, false, 0x31, 1);
+    auto walk = extent_verifier::make(
+                  history(),
+                  scope(100, 102, 0, 2, 512, first_end + stale.size()),
+                  work.policy())
+                  .value();
+    ASSERT_TRUE(feed_block(walk, first, work));
+    const auto fed = feed_block(walk, stale, work);
+    ASSERT_FALSE(fed.has_value());
+    EXPECT_EQ(fed.error().code(), errc::wrong_context);
+    EXPECT_TRUE(walk.closed());
+}
+
+TEST(ExtentVerifierTest, AppendTimesNeverDecreaseAlongASegment) {
+    for (const auto& times :
+         std::array<std::pair<std::int64_t, std::int64_t>, 3>{
+           {{2, 2}, {2, 7}, {7, 2}}}) {
+        seastar::abort_source abort;
+        codec::cooperative_work work{codec::limits::defaults(), abort};
+        const auto first = data_block(
+          100, 0, 512, false, 0x30, 1, false, 512, times.first);
+        const auto second = data_block(
+          101, 1, first_end, false, 0x30, 1, false, 512, times.second);
+        auto walk = extent_verifier::make(
+                      history(),
+                      scope(100, 102, 0, 2, 512, first_end + second.size()),
+                      work.policy())
+                      .value();
+        ASSERT_TRUE(feed_block(walk, first, work));
+        const auto fed = feed_block(walk, second, work);
+        if (times.second < times.first) {
+            ASSERT_FALSE(fed.has_value());
+            EXPECT_EQ(fed.error().code(), errc::malformed_data);
+            EXPECT_TRUE(walk.closed());
+            continue;
+        }
+        ASSERT_TRUE(fed.has_value());
+        const auto evidence = walk.finish(work).value();
+        // Both blocks hold the same records, so they share the latest
+        // record time.
+        EXPECT_EQ(
+          evidence.boundary().times,
+          (boundary_times{
+            runtime::wall_time{times.first},
+            runtime::wall_time{times.second},
+            runtime::wall_time{max_record_time(data_child())}}));
+    }
 }
 
 codec::immutable_object_digest identity(std::string_view bytes) {
@@ -1056,10 +1181,10 @@ TEST(ExtentVerifierTest, FinishAtThePrefixMatchesTheSuppliedExtent) {
     seastar::abort_source abort;
     codec::cooperative_work work{codec::limits::defaults(), abort};
     const auto first = data_block();
-    const auto second = data_block(101, 1, 1024);
+    const auto second = data_block(101, 1, first_end);
     auto exact = extent_verifier::make(
                    history(),
-                   scope(100, 102, 0, 2, 512, 1536),
+                   scope(100, 102, 0, 2, 512, first_end + second.size()),
                    work.policy(),
                    extent_layout_kind::initial_append,
                    {},
@@ -1087,11 +1212,12 @@ TEST(ExtentVerifierTest, FinishAtThePrefixMatchesTheSuppliedExtent) {
     EXPECT_EQ(
       prefix.digest()->bytes(), codec::xxh3_128(bytes.data(), bytes.size()));
     // Closed by finishing.
-    EXPECT_FALSE(feed_block(open, data_block(102, 2, 1536), work));
+    EXPECT_FALSE(
+      feed_block(open, data_block(102, 2, first_end + second.size()), work));
     // A rewrite's coverage is never inferred from a prefix.
     auto rewrite = extent_verifier::make(
                      history(),
-                     scope(100, 102, 0, 2, 512, 1536),
+                     scope(100, 102, 0, 2, 512, first_end + second.size()),
                      work.policy(),
                      extent_layout_kind::rewrite)
                      .value();
@@ -1106,25 +1232,31 @@ TEST(ExtentVerifierTest, ResumeAfterAPinnedFooterMatchesTheFullWalk) {
     const auto expected = scope(100, 102, 0, 2, 512, 2560);
     auto full
       = extent_verifier::make(history(), expected, work.policy()).value();
-    const auto first = data_block();
+    const auto first = data_block(100, 0, 512, false, 0x30, 1, false, 512, 3);
     ASSERT_TRUE(feed_block(full, first, work));
     const auto pinned = full.checkpoint(work).value();
     const auto middle = footer_wire(
-      pinned.boundary(), {history(), runtime::file_position{1024}});
+      pinned.boundary(), {history(), runtime::file_position{first_end}});
     ASSERT_TRUE(feed_footer(full, middle, work, pinned));
-    const auto second = data_block(101, 1, 1536);
+    // The next write starts at 1536; its block ends at 1935 and its footer
+    // pads to 2560.
+    const auto second = data_block(101, 1, 1536, false, 0x30, 1, false, 512, 5);
     ASSERT_TRUE(feed_block(full, second, work));
     const auto prefix = full.checkpoint(work).value();
     const auto last = footer_wire(
-      prefix.boundary(), {history(), runtime::file_position{2048}});
+      prefix.boundary(),
+      {history(), runtime::file_position{1536 + second.size()}});
     ASSERT_TRUE(feed_footer(full, last, work, prefix));
     const auto whole = full.finish(work).value();
 
-    // Only the pinned footer and later objects are supplied.
-    auto resumed
-      = resume_after(middle, 1024, identity(middle), expected, work).value();
+    // Only the pinned footer and later objects are supplied; the walk
+    // carries on with the pinned footer's times.
+    auto resumed = resume_after(
+                     middle, first_end, identity(middle), expected, work)
+                     .value();
     EXPECT_EQ(resumed.footer.boundary(), pinned.boundary());
-    EXPECT_EQ(resumed.footer.location().position.value(), 1024U);
+    EXPECT_EQ(resumed.footer.boundary().times, pinned.boundary().times);
+    EXPECT_EQ(resumed.footer.location().position.value(), first_end);
     auto& walk = resumed.verifier;
     ASSERT_TRUE(feed_block(walk, second, work));
     EXPECT_EQ(walk.checkpoint(work).value().boundary(), prefix.boundary());
@@ -1133,7 +1265,22 @@ TEST(ExtentVerifierTest, ResumeAfterAPinnedFooterMatchesTheFullWalk) {
     EXPECT_EQ(finished.boundary(), whole.boundary());
     EXPECT_EQ(
       finished.boundary().data_crc32c, crc(first + middle + second + last));
+    EXPECT_EQ(
+      finished.boundary().times,
+      (boundary_times{
+        runtime::wall_time{3}, runtime::wall_time{5}, runtime::wall_time{0}}));
     EXPECT_FALSE(finished.digest());
+
+    // A block after the pin that goes back in append time is refused, as it
+    // is in a full walk.
+    auto again = resume_after(
+                   middle, first_end, identity(middle), expected, work)
+                   .value();
+    const auto earlier = data_block(
+      101, 1, 1536, false, 0x30, 1, false, 512, 2);
+    const auto refused = feed_block(again.verifier, earlier, work);
+    ASSERT_FALSE(refused.has_value());
+    EXPECT_EQ(refused.error().code(), errc::malformed_data);
 }
 
 TEST(ExtentVerifierTest, ResumeAcceptsOnlyThePinnedFooterNamingItsPrefix) {
@@ -1145,12 +1292,12 @@ TEST(ExtentVerifierTest, ResumeAcceptsOnlyThePinnedFooterNamingItsPrefix) {
     ASSERT_TRUE(feed_block(full, data_block(), work));
     const auto pinned = full.checkpoint(work).value();
     const auto middle = footer_wire(
-      pinned.boundary(), {history(), runtime::file_position{1024}});
+      pinned.boundary(), {history(), runtime::file_position{first_end}});
     // Other bytes than the pinned ones are never decoded.
     auto other = middle;
     other[100] ^= 1;
     const auto changed = resume_after(
-      other, 1024, identity(middle), expected, work);
+      other, first_end, identity(middle), expected, work);
     ASSERT_FALSE(changed);
     EXPECT_EQ(changed.error().code(), errc::corrupt_data);
     // The pinned bytes at another position name another footer.
@@ -1167,7 +1314,11 @@ TEST(ExtentVerifierTest, ResumeAcceptsOnlyThePinnedFooterNamingItsPrefix) {
     EXPECT_EQ(gap.error().code(), errc::malformed_data);
     // The independent extent must contain the pinned footer.
     const auto outside = resume_after(
-      middle, 1024, identity(middle), scope(100, 101, 0, 1, 512, 1024), work);
+      middle,
+      first_end,
+      identity(middle),
+      scope(100, 101, 0, 1, 512, first_end),
+      work);
     ASSERT_FALSE(outside);
     EXPECT_EQ(outside.error().code(), errc::invalid_argument);
 }

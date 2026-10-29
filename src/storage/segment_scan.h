@@ -59,6 +59,11 @@ struct segment_scan_report final {
     std::uint32_t suffix_blocks{0};
     // The end of the last complete object accepted.
     runtime::file_position content_end;
+    // Where the segment's certified bytes provably end: the pin's end, or the
+    // furthest an intact block of this segment says a barrier had covered
+    // when its group formed, wherever the block lies; after the first damage
+    // too, once prove() has read on. Damage below it was certified.
+    runtime::file_position proven_end;
     std::uint64_t file_bytes{0};
     segment_scan_stop stop{segment_scan_stop::end};
     std::optional<codec::error> cause;
@@ -66,6 +71,11 @@ struct segment_scan_report final {
     // names another context, is malformed or names another history: bytes
     // someone wrote, never damage.
     bool intact{false};
+    // That intact object belongs to no write of this segment: an object of
+    // another family, or a block or footer whose segment context names
+    // another segment. A recycled file's earlier bytes, as unwritten as
+    // zeros for this segment.
+    bool stale{false};
     segment_scan_verdict verdict{segment_scan_verdict::clean};
     // False when a visitor stopped the walk early.
     bool complete{false};
@@ -153,6 +163,15 @@ public:
     substitute(segment_block block, codec::cooperative_work& work);
     [[nodiscard]] seastar::future<runtime::result<encoded_durable_footer>>
     substitute(encoded_durable_footer footer, codec::cooperative_work& work);
+    // Once the walk stopped at damage: reads the rest of what it may read,
+    // once, for intact blocks of this segment, and raises proven_end by
+    // their stamps. An object whose header checksum holds is checked and
+    // passed over by that verified length, a block's body checksum and
+    // identity before its stamp; anywhere else the probe goes on at the
+    // next alignment boundary, where a write can begin. Nothing else of the
+    // walk changes, and it stays stopped.
+    [[nodiscard]] seastar::future<runtime::result<void>>
+    prove(codec::cooperative_work& work);
     [[nodiscard]] seastar::future<> close() noexcept;
 
 private:
@@ -180,7 +199,8 @@ private:
     void stop(
       segment_scan_stop kind,
       std::optional<codec::error> cause,
-      bool intact = false);
+      bool intact = false,
+      bool stale = false);
 
     runtime::file& data_;
     workload_budget& budget_;
@@ -190,8 +210,9 @@ private:
     std::optional<runtime::file_position> end_;
     std::unique_ptr<scan_reader> reader_;
     std::optional<extent_verifier> verifier_;
-    // The physical begin of the next block.
+    // The physical begin of the next block, and the stamp of the last one.
     model::segment_relative_end physical_;
+    runtime::file_position stamp_;
     std::optional<segment_block> block_;
     segment_scan_report report_;
     bool pending_advance_{false}, stopped_{false}, closed_{false};
@@ -206,6 +227,7 @@ segment_decode_stop(const codec::error&) noexcept;
 [[nodiscard]] runtime::operation_error
 segment_short_walk(const segment_scan_report&) noexcept;
 
+// With `access` read_write, for a restart that writes what its WAL fills.
 template<runtime::file_system_backend Backend, local_directory_owner Owner>
 seastar::future<runtime::result<runtime::file>> open_local_segment_data(
   Backend& files,
@@ -214,7 +236,8 @@ seastar::future<runtime::result<runtime::file>> open_local_segment_data(
   std::uint32_t shard,
   const segment_history_context& history,
   workload_reservation& handle,
-  codec::cooperative_work& work) {
+  codec::cooperative_work& work,
+  runtime::file_access access = runtime::file_access::read_only) {
     if (auto valid = co_await ownership.validate(spec); !valid)
         co_return runtime::failure(valid.error());
     const auto paths = local_paths::make(spec.root);
@@ -231,7 +254,7 @@ seastar::future<runtime::result<runtime::file>> open_local_segment_data(
         files, spec.root, *path, runtime::file_kind::regular, work);
       !inspected)
         co_return runtime::failure(inspected.error());
-    co_return co_await files.open(*path, {});
+    co_return co_await files.open(*path, {.access = access});
 }
 
 // The walk behind scan_local_segment and verify_local_segment_extent: opens

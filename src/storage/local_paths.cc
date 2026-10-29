@@ -177,6 +177,30 @@ parse_local_sequence_name(std::string_view name, bool metadata) {
         return runtime::failure(detail::path_error(errc::invalid_argument));
     return *value;
 }
+namespace {
+constexpr std::string_view spare_suffix = ".spare";
+} // namespace
+runtime::result<model::wal_incarnation_id>
+parse_local_wal_spare(std::string_view name) {
+    if (
+      name.size() != 32 + spare_suffix.size() || !name.ends_with(spare_suffix))
+        return runtime::failure(detail::path_error(errc::invalid_argument));
+    return parse_id<model::wal_incarnation_id>(name.substr(0, 32));
+}
+runtime::result<local_segment_name>
+parse_local_segment_spare(std::string_view name) {
+    if (
+      name.size() != 49 + spare_suffix.size() || !name.ends_with(spare_suffix)
+      || name[32] != segment_separator)
+        return runtime::failure(detail::path_error(errc::invalid_argument));
+    auto id = parse_id<model::segment_id>(name.substr(0, 32));
+    auto generation = parse_hex(name.substr(33, 16), 16);
+    if (!id) return runtime::failure(id.error());
+    if (!generation || *generation == 0)
+        return runtime::failure(detail::path_error(errc::invalid_argument));
+    return local_segment_name{
+      *id, model::segment_generation::make(*generation).value()};
+}
 runtime::result<local_paths> local_paths::make(runtime::file_path root) {
     if (auto valid = validate_local_path(root); !valid)
         return runtime::failure(valid.error());
@@ -306,5 +330,33 @@ runtime::result<runtime::file_path> local_paths::sequence_file(
       *base,
       hex(sequence, 16)
         + (kind == local_sequence_file::checkpoint ? ".obj" : ".meta"));
+}
+runtime::result<runtime::file_path>
+local_paths::spares(std::uint32_t n, local_spare_kind kind) const {
+    if (kind != local_spare_kind::wal && kind != local_spare_kind::segment)
+        return runtime::failure(detail::path_error(errc::invalid_argument));
+    auto base = shard(n);
+    if (!base) return runtime::failure(base.error());
+    return append(
+      *base, kind == local_spare_kind::wal ? "wal-spares" : "segment-spares");
+}
+runtime::result<runtime::file_path>
+local_paths::spare(std::uint32_t n, model::wal_incarnation_id id) const {
+    if (id.is_nil())
+        return runtime::failure(detail::path_error(errc::invalid_argument));
+    auto base = spares(n, local_spare_kind::wal);
+    if (!base) return runtime::failure(base.error());
+    return append(*base, hex_id(id) + std::string{spare_suffix});
+}
+runtime::result<runtime::file_path>
+local_paths::spare(std::uint32_t n, local_segment_name name) const {
+    if (name.segment.is_nil() || !name.generation.is_valid())
+        return runtime::failure(detail::path_error(errc::invalid_argument));
+    auto base = spares(n, local_spare_kind::segment);
+    if (!base) return runtime::failure(base.error());
+    return append(
+      *base,
+      hex_id(name.segment) + segment_separator
+        + hex(name.generation.value(), 16) + std::string{spare_suffix});
 }
 } // namespace kwaque::storage

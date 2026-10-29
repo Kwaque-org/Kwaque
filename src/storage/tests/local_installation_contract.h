@@ -239,22 +239,24 @@ inline segment_context segment() {
              model::segment_generation::make(1).value())
       .value();
 }
+// Where the segment `descriptor()` describes starts in its range.
+inline model::range_logical_end origin() {
+    return model::range_logical_end{100};
+}
 inline local_segment_descriptor descriptor() {
     return {
       segment(),
-      model::range_logical_end{100},
       model::segment_relative_end{},
       alignment(4096),
       storage_profile::v1,
       1,
       local_layout_kind::initial,
+      default_retry_depth,
       byte_count{64_MiB},
       runtime::monotonic_duration{3600000000000ULL}};
 }
 inline segment_header segment_head() {
-    return segment_header::make(
-             segment(), model::range_logical_end{100}, alignment(4096))
-      .value();
+    return segment_header::make(segment(), alignment(4096)).value();
 }
 template<typename Backend, typename Owner, typename Driver>
 seastar::future<> descriptors(
@@ -310,7 +312,9 @@ seastar::future<> descriptors(
       "immutable descriptor was overwritten");
     for (unsigned field = 0; field < 8; ++field) {
         auto wrong = expected;
-        if (field == 0) wrong.logical_origin = model::range_logical_end{101};
+        if (field == 0)
+            wrong.retry_depth = static_cast<std::uint8_t>(
+              default_retry_depth + 1);
         if (field == 1) wrong.physical_origin = model::segment_relative_end{1};
         if (field == 2) wrong.maximum_data_bytes = byte_count{32_MiB};
         if (field == 3) wrong.record_profile = 2;
@@ -331,7 +335,14 @@ seastar::future<> descriptors(
     }
     auto wrong_header = header_wire(
       segment_header::make(
-        segment(), model::range_logical_end{101}, alignment(4096))
+        segment_context::make(
+          segment().cluster(),
+          segment().topic(),
+          segment().range(),
+          segment().segment(),
+          model::segment_generation::make(2).value())
+          .value(),
+        alignment(4096))
         .value());
     co_await write_bytes(
       files,
@@ -340,7 +351,7 @@ seastar::future<> descriptors(
       drive);
     auto result = co_await drive.lifecycle(load_local_segment(
       files, owner, spec, 0, expected, header, budget, limits(), work));
-    require(!result, "CRC-valid wrong data origin opened");
+    require(!result, "CRC-valid wrong data header opened");
 }
 
 // Test source retains only fixture names and constructs one bounded page per
@@ -380,7 +391,7 @@ inline local_root_reference checkpoint_reference() {
              runtime::file_position{},
              byte_count{4_KiB},
              page_count::make(1).value(),
-             literal_digest("0d622f91ae31c4950ca3f49b54cbbdda"))
+             literal_digest("43b59d62dd36395e2ad3e9d023d2897c"))
       .value();
 }
 inline local_metadata_expectation
@@ -525,55 +536,34 @@ seastar::future<> segment_bundles(
       local_fixture::read("data_header_a") + local_fixture::read("block_a1")
         + local_fixture::read("block_a2") + local_fixture::read("footer_a"),
       drive);
-    // Exact accepted local snapshot and existing index encodings stay
-    // unchanged.
-    for (unsigned kind = 0; kind < 2; ++kind) {
-        const auto is_index = kind == 0;
+    // An existing index encoding stays unchanged.
+    {
         const auto ref = take(
           local_root_reference::make(
-            is_index ? local_root_kind::index
-                     : local_root_kind::completed_retry_snapshot,
-            local_object_sequence::make(is_index ? 41 : 40).value(),
+            local_root_kind::index,
+            local_object_sequence::make(41).value(),
             runtime::file_position{},
             byte_count{4_KiB},
             page_count::make(1).value(),
-            literal_digest(
-              is_index ? "8e20d4aa0f5e9fea105fab317cf06154"
-                       : "58032fdff862aa9a3dc5869021e05dfc")));
+            literal_digest("d27d642484957b030146bd059794b528")));
         const auto index_context
           = sparse_index_context::make(
               segment(),
-              scope(100, 102, 0, 2, 4096, 16384),
+              scope(100, 102, 0, 2, 4096, 8192),
               codec::extent_digest{
-                literal_digest("eca717818b53c4ae00458133840519cc").bytes()},
+                literal_digest("7a4e89e84ab06576682af14e02ae43bd").bytes()},
               alignment(4096))
               .value();
-        local_metadata_expectation local{
-          local_metadata_header::make(
-            local_metadata_kind::completed_retry_root,
-            spec.shard_owner(0).value(),
-            local_publication_generation::make(40).value())
-            .value(),
-          alignment(4096),
-          segment(),
-          alignment(4096)};
-        local.digest = ref.digest();
-        local.encoded_bytes = ref.bytes();
-        local_bundle_context context = is_index
-                                         ? local_bundle_context{index_context}
-                                         : local_bundle_context{local};
         auto bundle = take(
           co_await local_bundle::make(
             ref,
-            context,
-            co_await buffer_async(
-              local_fixture::read(is_index ? "index_root" : "snapshot_root")),
+            local_bundle_context{index_context},
+            co_await buffer_async(local_fixture::read("index_root")),
             budget,
             limits(),
             work));
         const auto path = take(bundle.path(spec, 0));
-        const std::array<std::string_view, 1> names{
-          is_index ? "index_page" : "snapshot_page"};
+        const std::array<std::string_view, 1> names{"index_page"};
         auto published = co_await drive.lifecycle(publish_local_bundle(
           files,
           owner,
@@ -588,7 +578,7 @@ seastar::future<> segment_bundles(
         require(published.reference == ref, "root reference mismatch");
         require(
           (co_await read_bytes(files, path, drive))
-            == local_fixture::read(is_index ? "index_root" : "snapshot_root")
+            == local_fixture::read("index_root")
                  + local_fixture::read(names[0]),
           "bundle changed root/page bytes");
     }
@@ -604,17 +594,17 @@ seastar::future<> segment_bundles(
           local_root_reference::make(
             local_root_kind::sealed_retry,
             local_object_sequence::make(45).value(),
-            runtime::file_position{16384},
+            runtime::file_position{8192},
             byte_count{4_KiB},
             page_count::make(1).value(),
-            literal_digest("23f26dfc1ea13edbe500c410124c229c")));
+            literal_digest("ce3d48e2534348af6d0252a246162909")));
         footer_expectation context{
           {segment(),
            alignment(4096),
            runtime::file_position{4096},
            model::range_logical_end{100},
            model::segment_relative_end{0}},
-          runtime::file_position{16384}};
+          runtime::file_position{8192}};
         auto bundle = take(
           co_await local_bundle::make(
             ref,
@@ -654,11 +644,8 @@ seastar::future<> segment_bundles(
     auto description = descriptor();
     description.segment = sc;
     description.layout = local_layout_kind::rewrite;
-    description.logical_origin = model::range_logical_end{300};
     description.physical_origin = model::segment_relative_end{9};
-    const auto header = segment_header::make(
-                          sc, description.logical_origin, alignment(4096))
-                          .value();
+    const auto header = segment_header::make(sc, alignment(4096)).value();
     {
         auto installed = co_await drive.lifecycle(
           publish_local_segment_descriptor(
@@ -694,7 +681,7 @@ seastar::future<> segment_bundles(
         runtime::file_position{4096},
         byte_count{4_KiB},
         page_count::make(0).value(),
-        literal_digest("6d93f4087752ba9c90cdc90796a30851")));
+        literal_digest("bf81e622ce0d845072560600fbe6014c")));
     auto bundle = take(
       co_await local_bundle::make(
         ref,

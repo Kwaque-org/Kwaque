@@ -150,13 +150,7 @@ runtime::result<void> validate_generation_root(
           || sealed->location().position != expected->location().position)
             return wrong();
     } else {
-        const auto* snapshot = std::get_if<local_completed_retry_root>(
-          &std::get<local_metadata_record>(root).payload());
-        if (
-          !snapshot
-          || reference.kind() != local_root_kind::completed_retry_snapshot
-          || snapshot->segment != history.segment)
-            return wrong();
+        return wrong();
     }
     return {};
 }

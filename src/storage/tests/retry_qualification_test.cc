@@ -92,7 +92,7 @@ TEST(RetryQualificationTest, CompleteMaximumSummaryKeepsOnlyOnePage) {
         EXPECT_EQ(proof->entry_count(), total);
         EXPECT_EQ(total, 65536U);
         auto over = one_root(refs);
-        put(over, 32 + 220, 65537, 4);
+        put(over, 32 + 244, 65537, 4);
         repair(over);
         fragmented_buffer_parser input{buffer(over)};
         const auto result = decode_sealed_footer(

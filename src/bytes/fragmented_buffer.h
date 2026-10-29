@@ -303,6 +303,10 @@ public:
       allocation_charge_fn charge) const noexcept;
 
     [[nodiscard]] result<fragment_view> fragment_at(std::size_t index) const;
+    // The bytes of the allocation a fragment keeps alive: its own presented
+    // bytes, or more when it presents part of a larger one.
+    [[nodiscard]] result<byte_count>
+    fragment_retained_bytes(std::size_t index) const;
     [[nodiscard]] const_iterator begin() const noexcept {
         return const_iterator{fragments_.cbegin()};
     }

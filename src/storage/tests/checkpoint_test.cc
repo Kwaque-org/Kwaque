@@ -14,6 +14,7 @@
 #include <array>
 #include <exception>
 #include <optional>
+#include <span>
 #include <vector>
 
 namespace {
@@ -222,6 +223,18 @@ SEASTAR_TEST_CASE(checkpoint_cutoff_is_the_lowest_bound) {
     co_return;
 }
 
+namespace {
+// Folds the rows in turn, as a restart folds each one its merge delivers.
+runtime::result<seastar::chunked_vector<local_pinned_obligation>> fold_all(
+  std::span<const recovery_obligation> rows, const local_store_context& owner) {
+    seastar::chunked_vector<local_pinned_obligation> pins;
+    for (const auto& row : rows)
+        if (auto folded = fold_pinned_obligation(pins, row, owner); !folded)
+            return runtime::failure(folded.error());
+    return pins;
+}
+} // namespace
+
 // Rebuilt rows fold to one pin per segment: every pinned PREPARE it has
 // across WAL files, at the oldest of them.
 SEASTAR_TEST_CASE(checkpoint_folds_rebuilt_rows_per_segment) {
@@ -240,7 +253,7 @@ SEASTAR_TEST_CASE(checkpoint_folds_rebuilt_rows_per_segment) {
       // Satisfied PREPAREs alone pin nothing.
       row(1, 2, 0, std::nullopt),
       row(2, 2, 1, at(2, 8192))};
-    const auto folded = fold_pinned_obligations(rows, shard).value();
+    const auto folded = fold_all(rows, shard).value();
     BOOST_REQUIRE_EQUAL(folded.size(), 2U);
     BOOST_CHECK(
       folded[0].wal == wal(1) && folded[0].segment == segment(1)
@@ -248,23 +261,19 @@ SEASTAR_TEST_CASE(checkpoint_folds_rebuilt_rows_per_segment) {
     BOOST_CHECK(
       folded[1].wal == wal(2) && folded[1].segment == segment(2)
       && folded[1].pinned == 1 && folded[1].first == at(2, 8192));
-    BOOST_CHECK(fold_pinned_obligations({}, shard).value().empty());
+    BOOST_CHECK(fold_all({}, shard).value().empty());
 
     // A pinned row names where its oldest PREPARE begins, in its own file.
     const std::array unplaced{row(1, 1, 1, std::nullopt)};
-    BOOST_CHECK(
-      code(fold_pinned_obligations(unplaced, shard)) == errc::invalid_argument);
+    BOOST_CHECK(code(fold_all(unplaced, shard)) == errc::invalid_argument);
     const std::array misfiled{row(1, 1, 1, at(2, 4096))};
-    BOOST_CHECK(
-      code(fold_pinned_obligations(misfiled, shard)) == errc::invalid_argument);
+    BOOST_CHECK(code(fold_all(misfiled, shard)) == errc::invalid_argument);
     const std::array overflow{
       row(1, 1, UINT32_MAX, at(1, 4096)), row(2, 1, 1, at(2, 4096))};
-    BOOST_CHECK(
-      code(fold_pinned_obligations(overflow, shard)) == errc::out_of_range);
+    BOOST_CHECK(code(fold_all(overflow, shard)) == errc::out_of_range);
     const std::array pair{row(1, 1, 1, at(1, 4096)), row(2, 1, 1, at(2, 4096))};
     BOOST_CHECK(
-      code(fold_pinned_obligations(pair, owner(local_store_shard)))
-      == errc::wrong_context);
+      code(fold_all(pair, owner(local_store_shard))) == errc::wrong_context);
     co_return;
 }
 
@@ -875,17 +884,16 @@ recovery_target reconciled(
     return recovery_target{
       local_segment_descriptor{
         segment(generation),
-        model::range_logical_end{100},
         model::segment_relative_end{},
         alignment,
         storage_profile::v1,
         1,
         local_layout_kind::initial,
+        default_retry_depth,
         byte_count{64_MiB},
         runtime::monotonic_duration{3600000000000ULL}},
-      segment_header::make(
-        segment(generation), model::range_logical_end{100}, alignment)
-        .value(),
+      segment_header::make(segment(generation), alignment).value(),
+      model::range_logical_end{100},
       state,
       local_publication_generation::make(1).value(),
       pin,

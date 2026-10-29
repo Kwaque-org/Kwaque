@@ -11,6 +11,9 @@ struct local_generation_expectation final {
     local_publication_generation generation;
     local_object_publication publication;
     local_segment_descriptor descriptor;
+    // Where the segment starts in its range: its owner's record, which the
+    // descriptor does not hold.
+    model::range_logical_end logical_origin;
     // Same bounded order as publication.roots; inputs remain stable until open
     // joins.
     std::span<const local_bundle_context> roots;
@@ -164,7 +167,6 @@ local_generation_owner::open(
         co_return runtime::failure(handles.error());
     auto header = segment_header::make(
       expected.descriptor.segment,
-      expected.descriptor.logical_origin,
       expected.descriptor.alignment,
       expected.descriptor.profile);
     if (!header)
@@ -184,7 +186,7 @@ local_generation_owner::open(
       expected.descriptor.segment,
       expected.descriptor.alignment,
       segment->header.bytes.end(),
-      expected.descriptor.logical_origin,
+      expected.logical_origin,
       expected.descriptor.physical_origin,
       expected.descriptor.profile};
     const auto paths = local_paths::make(spec.root).value();
@@ -304,19 +306,6 @@ local_generation_owner::open(
                 if (!valid) {
                     failed.observe(valid);
                     break;
-                }
-                if (
-                  pin->reference().kind()
-                  == local_root_kind::completed_retry_snapshot) {
-                    const auto& root = std::get<local_completed_retry_root>(
-                      std::get<local_metadata_record>(pin->metadata())
-                        .payload());
-                    auto footer = co_await detail::read_local_boundary(
-                      *data, history, root.footer, limits, work);
-                    if (!footer) {
-                        failed.observe(footer);
-                        break;
-                    }
                 }
             }
             if (failed.failed()) break;

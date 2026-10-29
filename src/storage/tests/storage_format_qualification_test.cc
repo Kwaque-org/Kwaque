@@ -12,12 +12,13 @@ using bytes::fragmented_buffer_parser;
 
 std::string shortened_child(const storage_fixture& fixture, std::size_t count) {
     const bool wal = fixture.kind == storage_case::wal;
-    const std::size_t fixed = wal ? 136U : 120U;
+    const std::size_t fixed = wal ? 168U : 144U;
     auto body = fixture.wire.substr(32, fixed);
-    put(body, wal ? 128U : 112U, count, 4);
+    put(body, wal ? 160U : 136U, count, 4);
     body += fixture.child.substr(0, count);
-    const auto padding = (512U - (32U + body.size()) % 512U) % 512U;
-    put(body, wal ? 132U : 116U, padding, 4);
+    // The aligned PREPARE ends its write; a block never pads.
+    const auto padding = wal ? (512U - (32U + body.size()) % 512U) % 512U : 0U;
+    put(body, wal ? 164U : 140U, padding, 4);
     body.append(padding, '\0');
     return frame(std::move(body), wal ? std::uint16_t{5} : std::uint16_t{4});
 }
@@ -39,7 +40,11 @@ TEST(
         EXPECT_EQ(misplaced.error->code(), errc::wrong_context);
         EXPECT_EQ(misplaced.consumed, byte_count{});
         auto padding = fixture.wire;
-        padding.back() ^= 1;
+        // A block never pads, so its padding count is what breaks.
+        if (fixture.kind == storage_case::block)
+            put(padding, 32 + 140, 1, 4);
+        else
+            padding.back() ^= 1;
         repair(padding);
         const auto nonzero = observe_storage(fixture, padding, 7);
         ASSERT_TRUE(nonzero.error);
@@ -91,7 +96,9 @@ TEST(StorageQualificationTest, RecycledObjectsDoNotSkipToALaterValidEnvelope) {
     EXPECT_TRUE(input.at_end());
     auto context = wal_expected();
     context.wal = wal_write_context::make(
-                    id<model::wal_incarnation_id>(0x71), alignment(), {})
+                    id<model::wal_incarnation_id>(0x71),
+                    alignment(),
+                    context.wal_data_start)
                     .value();
     const auto old_wal = wal_wire();
     fragmented_buffer_parser wal{
@@ -117,13 +124,14 @@ TEST(StorageQualificationTest, ExactAndOneShortRootPageAndWrapperLimits) {
           storage_case::retry}) {
         SCOPED_TRACE(static_cast<unsigned>(kind));
         const storage_fixture fixture{kind};
-        for (const std::uint64_t body : {479U, 480U}) {
+        const std::uint64_t exact = fixture.wire.size() - 32U;
+        for (const std::uint64_t body : {exact - 1U, exact}) {
             SCOPED_TRACE(body);
             auto config = codec::limits_config{};
             config.max_encoded_body_bytes = byte_count{body};
             const auto seen = observe_storage(
               fixture, fixture.wire, 512, codec::limits::make(config).value());
-            EXPECT_EQ(seen.error.has_value(), body == 479);
+            EXPECT_EQ(seen.error.has_value(), body < exact);
             if (seen.error) {
                 EXPECT_EQ(seen.error->code(), errc::resource_exhausted);
                 EXPECT_EQ(seen.consumed, byte_count{});
@@ -156,9 +164,12 @@ TEST(StorageQualificationTest, ExactAndOneShortRootPageAndWrapperLimits) {
 TEST(StorageQualificationTest, ThreeGroupsIncludeEachEarlierFooterExactlyOnce) {
     seastar::abort_source abort;
     codec::cooperative_work work{codec::limits::defaults(), abort};
+    // Each footer is packed after its block and pads to the next group's
+    // start, so the extent ends with the third block.
+    const auto end = 2560U + data_block(102, 2, 2560).size();
     auto verifier = extent_verifier::make(
                       history(),
-                      scope(100, 103, 0, 3, 512, 3072),
+                      scope(100, 103, 0, 3, 512, end),
                       work.policy(),
                       extent_layout_kind::initial_append,
                       {},
@@ -175,14 +186,16 @@ TEST(StorageQualificationTest, ThreeGroupsIncludeEachEarlierFooterExactlyOnce) {
             EXPECT_EQ(prefix.boundary().block_count, group + 1U);
             const auto footer = footer_wire(
               prefix.boundary(),
-              {history(), runtime::file_position{position + 512U}});
+              {history(), runtime::file_position{position + block.size()}});
+            ASSERT_EQ(
+              position + block.size() + footer.size(), position + 1024U);
             ASSERT_TRUE(feed_footer(verifier, footer, work, prefix));
             supplied += footer;
         }
     }
     const auto proof = verifier.finish(work).value();
     EXPECT_EQ(proof.boundary().block_count, 3U);
-    EXPECT_EQ(proof.boundary().last_block, scope(102, 103, 2, 3, 2560, 3072));
+    EXPECT_EQ(proof.boundary().last_block, scope(102, 103, 2, 3, 2560, end));
     EXPECT_EQ(proof.boundary().data_crc32c, crc(supplied));
     EXPECT_EQ(proof.digest()->bytes(), exact_digest(supplied));
 }
@@ -229,9 +242,14 @@ TEST(
             auto copy = std::move(*shared);
             bytes::fragmented_buffer wire;
             if (wal) {
+                const auto expected = wal_expected(4096, 512);
                 auto encoded = encode_wal_prepare(
                                  std::move(copy),
-                                 wal_expected(4096, 512),
+                                 expected,
+                                 {true,
+                                  runtime::wall_time{1},
+                                  expected.target_data_start,
+                                  expected.wal_data_start},
                                  work,
                                  remaining,
                                  capacity_bound)
@@ -242,9 +260,11 @@ TEST(
                   << " field=" << encoded.error().field();
                 wire = std::move(*encoded);
             } else {
+                const auto expected = block_expected();
                 auto block = encode_segment_block(
                                std::move(copy),
-                               block_expected(),
+                               expected,
+                               {runtime::wall_time{1}, expected.data_start},
                                work,
                                remaining,
                                capacity_bound)
@@ -300,7 +320,7 @@ TEST(
                     .value(),
                   8U);
                 auto body
-                  = wire.share(byte_count{152}, child.bytes().size()).value();
+                  = wire.share(byte_count{176}, child.bytes().size()).value();
                 EXPECT_TRUE(
                   codec::bench::buffers_equal(body, child.bytes(), work).get());
             }

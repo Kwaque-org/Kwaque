@@ -21,14 +21,9 @@ std::span<const page_ref> root_pages(const local_bundle_root& root) {
     return std::visit(
       [](const auto& value) -> std::span<const page_ref> {
           using T = std::remove_cvref_t<decltype(value)>;
-          if constexpr (std::same_as<T, local_metadata_record>) {
-              if (
-                const auto* checkpoint = std::get_if<local_checkpoint_root>(
-                  &value.payload()))
-                  return checkpoint->pages;
-              return std::get<local_completed_retry_root>(value.payload())
-                .pages;
-          } else
+          if constexpr (std::same_as<T, local_metadata_record>)
+              return std::get<local_checkpoint_root>(value.payload()).pages;
+          else
               return value.pages();
       },
       root);
@@ -112,11 +107,9 @@ seastar::future<runtime::result<local_bundle>> local_bundle::make(
         const auto& local = std::get<local_metadata_expectation>(context);
         const auto kind = reference.kind();
         if (
-          (kind != local_root_kind::checkpoint
-           && kind != local_root_kind::completed_retry_snapshot)
+          kind != local_root_kind::checkpoint
           || reference.position().value() != 0
-          || local.header.kind()
-               != (kind == local_root_kind::checkpoint ? local_metadata_kind::checkpoint_root : local_metadata_kind::completed_retry_root)
+          || local.header.kind() != local_metadata_kind::checkpoint_root
           || local.header.generation().value() != reference.sequence().value()
           || local.digest != reference.digest()
           || local.encoded_bytes != reference.bytes())
@@ -166,10 +159,8 @@ runtime::result<runtime::file_path> local_bundle_path(
     if (
       const auto* local = std::get_if<local_metadata_expectation>(&context);
       local
-      && ((reference.kind() != local_root_kind::checkpoint
-           && reference.kind() != local_root_kind::completed_retry_snapshot)
-          || local->header.kind()
-               != (reference.kind() == local_root_kind::checkpoint ? local_metadata_kind::checkpoint_root : local_metadata_kind::completed_retry_root)
+      && (reference.kind() != local_root_kind::checkpoint
+          || local->header.kind() != local_metadata_kind::checkpoint_root
           || local->header.generation().value() != reference.sequence().value()
           || local->digest != reference.digest()
           || local->encoded_bytes != reference.bytes()
@@ -290,33 +281,22 @@ seastar::future<runtime::result<void>> local_bundle_verifier::next(
             co_return runtime::failure(detail::path_error(page.error().code()));
     } else {
         auto expected = std::get<local_metadata_expectation>(bundle_.context_);
-        const bool checkpoint = bundle_.reference_.kind()
-                                == local_root_kind::checkpoint;
         expected.header = local_metadata_header::make(
-                            checkpoint
-                              ? local_metadata_kind::checkpoint_page
-                              : local_metadata_kind::completed_retry_page,
+                            local_metadata_kind::checkpoint_page,
                             expected.header.owner(),
                             expected.header.generation())
                             .value();
         expected.digest = reference.digest();
         expected.encoded_bytes = reference.encoded_bytes();
         expected.page = reference;
-        expected.previous_retry = previous_retry_;
         expected.previous_checkpoint = previous_checkpoint_;
         auto page = co_await decode_local_metadata(
           input, expected, *memory, work, {}, codec::input_boundary::complete);
         if (!page)
             co_return runtime::failure(detail::path_error(page.error().code()));
-        if (checkpoint)
-            previous_checkpoint_ = std::get<local_checkpoint_page>(
-                                     page->value.payload())
-                                     .entries.back();
-        else
-            previous_retry_ = std::get<local_completed_retry_page>(
-                                page->value.payload())
-                                .entries.back()
-                                .id();
+        previous_checkpoint_ = std::get<local_checkpoint_page>(
+                                 page->value.payload())
+                                 .entries.back();
     }
     if (!input.at_end())
         co_return runtime::failure(detail::path_error(errc::malformed_data));

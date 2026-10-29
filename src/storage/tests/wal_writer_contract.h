@@ -19,6 +19,24 @@ inline wal_writer_config configuration() {
     // These contracts run the writer with nothing that reclaims its files;
     // one that bounds them says so.
     config.retained_files = 0;
+    // The profile they were written for: files grow through ordinary
+    // writes, none is kept for reuse and none is made ahead. The defaults
+    // are run by cases of their own (with_defaults()).
+    config.preallocation_bytes = {};
+    config.spares = 0;
+    config.prepare_ahead = false;
+    return config;
+}
+// The same writer at the production defaults: whole files zero-written,
+// reclaimed ones kept as spares, each successor made ahead.
+inline wal_writer_config with_defaults() {
+    auto config = configuration();
+    const wal_writer_config defaults{config.alignment, config.capacity_bytes};
+    config.preallocation_bytes = defaults.preallocation_bytes;
+    config.preallocation_extension_bytes
+      = defaults.preallocation_extension_bytes;
+    config.spares = defaults.spares;
+    config.prepare_ahead = defaults.prepare_ahead;
     return config;
 }
 
@@ -46,9 +64,18 @@ inline wal_child_expectation child_context(model::cluster_id cluster) {
       expected.target_profile};
 }
 
+// The broker time every offered child was assigned at.
+inline constexpr runtime::wall_time offered_time{1};
+
+// The child arrives in fragments of `width` bytes. Small ones exercise
+// fragmented input; a child of several KiB takes larger ones, as one read
+// off the network does, or its parser's bookkeeping passes the child limits.
 inline seastar::future<admitted_wal_batch> offer(
-  workload_budget& budget, std::string wire, codec::cooperative_work& work) {
-    auto raw = co_await installation_contract::buffer_async(wire, 67);
+  workload_budget& budget,
+  std::string wire,
+  codec::cooperative_work& work,
+  std::size_t width = 67) {
+    auto raw = co_await installation_contract::buffer_async(wire, width);
     auto held = take(budget.try_reserve_buffer(raw));
     auto working = take(budget.try_reserve(byte_count{2_MiB + 64_KiB}));
     const auto cost = raw.allocation_cost(charge).value();
@@ -64,7 +91,8 @@ inline seastar::future<admitted_wal_batch> offer(
       std::move(raw), batch_expected(), memory, work);
     require(checked.has_value(), "independent assigned bytes rejected");
     co_return take(
-      admitted_wal_batch::make(std::move(*checked), std::move(held), charge));
+      admitted_wal_batch::make(
+        std::move(*checked), std::move(held), offered_time, charge));
 }
 
 // Independent offsets and CRCs; no metadata encoder chooses the expected file.
@@ -350,7 +378,10 @@ seastar::future<> exercise(
               short_reservation.bytes().value() >= required,
               "test must distinguish payload allowance from bookkeeping");
             auto rejected = admitted_wal_batch::make(
-              std::move(input.batch), std::move(short_reservation), charge);
+              std::move(input.batch),
+              std::move(short_reservation),
+              input.append_time,
+              charge);
             require(
               !rejected && rejected.error().code() == errc::resource_exhausted,
               "reservation bookkeeping was counted as payload admission");

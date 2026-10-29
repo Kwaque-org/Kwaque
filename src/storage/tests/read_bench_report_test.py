@@ -91,17 +91,18 @@ def tail_row(case: str, side: str, **changed) -> dict:
         "scan_ns": 700 if case == "read_tail_scanned" else 0,
         "scanned_batches": 384 if case == "read_tail_scanned" else 0,
         "feed_dropped": 0,
+        "tail_device_reads": 0,
         "foreground_turns": 0,
         "longest_wait_ns": 0,
         **measured(),
         **cache(cache_capacity=1 << 20),
     }
-    fed = side != "unfed"
+    told = side in ("told", "told_copied")
     for lag in report.LAGS:
         reads = 48 - lag
         row[f"lag{lag}_reads"] = reads
-        row[f"lag{lag}_hits"] = reads if fed and side == "told" else 0
-        row[f"lag{lag}_device_reads"] = 0 if side == "told" else reads
+        row[f"lag{lag}_hits"] = reads if told else 0
+        row[f"lag{lag}_device_reads"] = 0 if told else reads
     row.update(changed)
     return row
 
@@ -121,6 +122,7 @@ class ReadBenchReportTest(unittest.TestCase):
             tail_row("read_tail", "unfed"),
             tail_row("read_tail", "untold"),
             tail_row("read_tail", "told"),
+            tail_row("read_tail", "told_copied"),
             tail_row("read_tail_scanned", "untold"),
             tail_row("read_tail_scanned", "told"),
         ]
@@ -129,7 +131,7 @@ class ReadBenchReportTest(unittest.TestCase):
         summaries = {
             (entry["case"], entry["side"]): entry for entry in report.summarize(rows)
         }
-        self.assertEqual(len(summaries), 14)
+        self.assertEqual(len(summaries), 15)
         cold = summaries[("read_seek", "cold")]
         self.assertEqual(cold["ns_per_seek"], 1000 / 256)
         self.assertEqual(cold["reads_per_seek"], 62 / 256)
@@ -147,6 +149,8 @@ class ReadBenchReportTest(unittest.TestCase):
         self.assertEqual(told["lag0_hit_rate"], 1.0)
         self.assertEqual(told["lag8_hit_rate"], 1.0)
         self.assertEqual(told["append_ns_per_block"], 1000.0)
+        self.assertEqual(told["tail_device_reads"], 0)
+        self.assertEqual(summaries[("read_tail", "told_copied")]["lag0_hit_rate"], 1.0)
         self.assertEqual(summaries[("read_tail", "unfed")]["lag0_hit_rate"], 0.0)
         self.assertEqual(
             summaries[("read_stride", "skipped")],
@@ -187,6 +191,7 @@ class ReadBenchReportTest(unittest.TestCase):
             for name in entry:
                 self.assertFalse(
                     not name.startswith("reactor_")
+                    and name != "tail_device_reads"
                     and (
                         name.endswith(("_reads", "_per_returned", "_hit_rate"))
                         or name in ("reads_per_seek", "read_bytes_per_seek")
@@ -261,6 +266,8 @@ class ReadBenchReportTest(unittest.TestCase):
             sealed_row("read_held", "held", cache_loads=65, cache_uncached=64),
             sealed_row("read_held", "kept", cache_uncached=1),
             tail_row("read_tail", "told", lag0_device_reads=1),
+            tail_row("read_tail", "told", tail_device_reads=1),
+            tail_row("read_tail", "told_copied", tail_device_reads=1),
             tail_row("read_tail", "unfed", lag0_hits=1),
             tail_row("read_tail", "told", lag2_hits=47),
             tail_row("read_tail", "told", lag8_reads=41),

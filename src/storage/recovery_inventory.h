@@ -8,9 +8,14 @@
 #include "src/storage/local_store_inspection.h"
 #include "src/storage/page_internal.h"
 #include "src/storage/recovery_decision.h"
+#include "src/storage/recovery_merge.h"
 #include "src/storage/recovery_pins.h"
+#include "src/storage/retained_wal.h"
 #include "src/storage/retention.h"
+#include "src/storage/segment_scan.h"
+#include "src/storage/table_view.h"
 
+#include <seastar/core/chunked_vector.hh>
 #include <seastar/core/coroutine.hh>
 
 #include <algorithm>
@@ -139,7 +144,7 @@ discover_recovery_decisions(
   const local_device_spec& control,
   std::uint32_t shard,
   const local_shard_control& fields,
-  std::span<const local_segment_descriptor> catalog,
+  table_view<local_segment_descriptor> catalog,
   workload_budget& budget,
   recovery_decision_limits limits,
   codec::cooperative_work& work,
@@ -347,6 +352,10 @@ discover_recovery_decisions(
 struct recovery_catalog_entry final {
     local_segment_descriptor descriptor;
     segment_header header;
+    // Where it starts in its range: its owner's activation record. None for
+    // a segment that was prepared and never activated: nothing was appended
+    // to it, and its origin is given when it is.
+    std::optional<model::range_logical_end> logical_origin;
     // For a segment its owner marks as expiring: the authorization its
     // removal was accepted with, supplied again at every start, so that a
     // removal a restart resumes is checked as the first request was.
@@ -368,6 +377,11 @@ enum class recovery_entry_state : std::uint8_t {
     // Its owner marks it expiring and no device holds it under either name:
     // a removal that finished. Reported again, and nothing is read.
     gone,
+    // Listed with no origin: prepared and never activated. Its first
+    // pointer, active and naming nothing, is all it published. It is taken
+    // in as prepared unless something says it was written (`conflict`), and
+    // the merge never reads it.
+    prepared,
 };
 // One catalog segment as restart found it, from its fixed publication and the
 // pins it carries. Only values are kept; nothing stays open.
@@ -393,14 +407,20 @@ struct recovery_entry final {
     // one changes nothing: the segment is kept and read as any other.
     std::optional<segment_immutable_expectation> sealed;
     std::optional<authorization_verdict> refused;
+    // A prepared entry that something says was written: a publication other
+    // than its first, an object of its own at its data start, an entry of
+    // the durable checkpoint or a PREPARE that names it. Its owner decides,
+    // and the start changes nothing.
+    bool conflict{false};
 };
 struct recovery_inventory final {
-    // Holds the charge for both vectors.
+    // Holds the charge for both tables.
     workload_reservation held;
-    // One per catalog segment, in catalog order.
-    std::vector<recovery_entry> entries;
+    // One per catalog segment, in catalog order, in fragments of at most
+    // 128 KiB.
+    seastar::chunked_vector<recovery_entry> entries;
     // What the merge reconciles: every target entry, in catalog order.
-    std::vector<recovery_target> targets;
+    seastar::chunked_vector<recovery_target> targets;
 };
 
 // Segments a restart step works on at once: the inventory's finds and the
@@ -474,6 +494,43 @@ pending_recovery_seal(
 } // namespace detail
 
 namespace detail {
+// Whether a prepared segment's data file holds anything of its own at its
+// data start: the first object its scan meets there, or anything that is
+// not the end of the file, zeros, or an intact object of another segment,
+// which a spare's earlier life left. Reads one object at most.
+template<runtime::file_system_backend Backend, local_directory_owner Owner>
+seastar::future<runtime::result<bool>> written_since_prepared(
+  Backend& files,
+  Owner& ownership,
+  const local_device_spec& spec,
+  std::uint32_t shard,
+  const segment_history_context& history,
+  workload_budget& budget,
+  local_store_io_limits limits,
+  codec::cooperative_work& work) {
+    bool met = false;
+    auto scanned = co_await scan_local_segment(
+      files,
+      ownership,
+      spec,
+      shard,
+      history,
+      std::nullopt,
+      budget,
+      segment_scan_limits{.metadata = limits},
+      work,
+      [&met](const segment_scanned_object&) {
+          met = true;
+          return seastar::make_ready_future<runtime::result<bool>>(false);
+      });
+    if (!scanned) co_return runtime::failure(scanned.error());
+    const auto& report = *scanned;
+    co_return met
+      || (report.stop != segment_scan_stop::end
+          && report.stop != segment_scan_stop::unwritten
+          && !(report.intact && report.stale));
+}
+
 // One catalog segment as the inventory finds it: its entry, and the merge's
 // target when it is one.
 struct recovery_found final {
@@ -501,7 +558,7 @@ seastar::future<runtime::result<recovery_found>> find_recovery_segment(
              item.descriptor.segment,
              item.descriptor.alignment,
              runtime::file_position{},
-             item.descriptor.logical_origin,
+             item.logical_origin.value_or(model::range_logical_end{}),
              item.descriptor.physical_origin,
              item.descriptor.profile},
            {},
@@ -584,7 +641,7 @@ seastar::future<runtime::result<recovery_found>> find_recovery_segment(
       item.descriptor.segment,
       item.descriptor.alignment,
       placement->data_start,
-      item.descriptor.logical_origin,
+      item.logical_origin.value_or(model::range_logical_end{}),
       item.descriptor.physical_origin,
       item.descriptor.profile};
     // The segment was located on one of these devices.
@@ -621,6 +678,22 @@ seastar::future<runtime::result<recovery_found>> find_recovery_segment(
     if (*pending) {
         entry.state = recovery_entry_state::sealing;
         entry.pending_seal = *pending;
+        co_return output;
+    }
+    if (!item.logical_origin) {
+        // Prepared and never activated, as its owner says: its first pointer
+        // and nothing of its own at its data start bear that out.
+        entry.state = recovery_entry_state::prepared;
+        if (
+          publication.state != local_object_state::active
+          || publication.boundary || !publication.roots.empty()) {
+            entry.conflict = true;
+            co_return output;
+        }
+        auto written = co_await written_since_prepared(
+          files, ownership, *spec, shard, history, budget, limits, work);
+        if (!written) co_return runtime::failure(written.error());
+        entry.conflict = *written;
         co_return output;
     }
     // The pins of the publication just selected, on the segment just
@@ -681,6 +754,7 @@ seastar::future<runtime::result<recovery_found>> find_recovery_segment(
     output.target = recovery_target{
       item.descriptor,
       item.header,
+      *item.logical_origin,
       publication.state,
       entry.generation,
       publication.state == local_object_state::sealed ? publication.boundary
@@ -698,12 +772,14 @@ recovery_admission_refused(const runtime::operation_error& error) noexcept {
 }
 } // namespace detail
 
-// The most segments one catalog may list: the inventory's working array is
-// one allocation, less what a charge profile adds to it. A shard that could
-// leave more than this unsealed or being removed could not be started again.
-inline constexpr std::size_t maximum_recovery_catalog
-  = (maximum_contiguous_allocation_bytes - 64)
-    / sizeof(std::optional<runtime::result<detail::recovery_found>>);
+// The most segments one catalog may list. Every table a restart keeps per
+// catalog segment, or per target, is chunked, so this bounds the work of one
+// start rather than an allocation. A shard that could leave more than this
+// writable, prepared or being removed could not be started again.
+inline constexpr std::size_t maximum_recovery_catalog = 8192;
+static_assert(
+  std::uint64_t{maximum_recovery_catalog} * maximum_retained_wal_files
+  == maximum_recovery_obligations);
 
 // Locates and opens every catalog segment as restart must see it before the
 // merge: on the one device that holds it, under its fixed publication and the
@@ -750,14 +826,16 @@ seastar::future<runtime::result<recovery_inventory>> open_recovery_inventory(
                 co_return runtime::failure(
                   detail::path_error(errc::invalid_argument));
     }
+    if (catalog.size() > maximum_recovery_catalog)
+        co_return runtime::failure(detail::path_error(errc::out_of_range));
     using found_type = std::optional<runtime::result<detail::recovery_found>>;
     byte_count total;
-    for (const auto bytes :
-         {catalog.size() * sizeof(recovery_entry),
-          catalog.size() * sizeof(recovery_target),
-          catalog.size() * sizeof(found_type)}) {
-        if (bytes == 0) continue;
-        auto charged = budget.allocation_charge(byte_count{bytes});
+    for (const auto element :
+         {sizeof(recovery_entry),
+          sizeof(recovery_target),
+          sizeof(found_type)}) {
+        auto charged = chunked_allocation_charge(
+          budget, catalog.size(), element);
         if (!charged) co_return runtime::failure(charged.error());
         auto next = total.checked_add(*charged);
         if (!next)
@@ -769,7 +847,10 @@ seastar::future<runtime::result<recovery_inventory>> open_recovery_inventory(
     recovery_inventory output{std::move(*held), {}, {}};
     output.entries.reserve(catalog.size());
     output.targets.reserve(catalog.size());
-    std::vector<found_type> found(catalog.size());
+    seastar::chunked_vector<found_type> found;
+    found.reserve(catalog.size());
+    for (std::size_t i = 0; i != catalog.size(); ++i)
+        found.emplace_back();
     const auto find = [&](std::size_t index, codec::cooperative_work& job) {
         return detail::find_recovery_segment(
           files,

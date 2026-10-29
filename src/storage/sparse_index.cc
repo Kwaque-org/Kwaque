@@ -175,7 +175,15 @@ std::uint32_t sparse_index_capacity(
     const auto most = std::min(maximum_blocks, maximum_object_entries);
     if (stride.records != 0 || stride.bytes.value() == 0) return most;
     const auto strides = maximum_data_bytes.value() / stride.bytes.value();
-    return strides < most ? static_cast<std::uint32_t>(strides) + 1 : most;
+    if (strides >= most) return most;
+    // Beside one per stride, one per maximum_anchor_blocks of the blocks the
+    // file holds, each at least its envelope around its child's.
+    constexpr std::uint64_t smallest = 2 * codec::envelope_prefix_bytes
+                                       + segment_block_fixed_bytes.value();
+    const auto blocks = std::min<std::uint64_t>(
+      maximum_blocks, maximum_data_bytes.value() / smallest);
+    const auto bound = strides + 1 + blocks / maximum_anchor_blocks;
+    return bound < most ? static_cast<std::uint32_t>(bound) : most;
 }
 
 std::uint32_t sparse_index_capacity(
@@ -190,28 +198,53 @@ std::uint32_t sparse_index_capacity(
 
 active_sparse_index::active_sparse_index(active_sparse_index&& other) noexcept
   : held_(std::move(other.held_))
+  , budget_(other.budget_)
   , chunks_(std::move(other.chunks_))
   , stride_(other.stride_)
   , capacity_(other.capacity_)
   , chosen_(std::exchange(other.chosen_, 0))
   , anchors_(std::exchange(other.anchors_, 0))
+  , admitted_(std::exchange(other.admitted_, 0))
+  , promised_(std::exchange(other.promised_, 0))
   , skipped_(other.skipped_)
   , frozen_(other.frozen_)
   , chosen_bytes_(other.chosen_bytes_)
   , offered_end_(other.offered_end_)
-  , chosen_records_(other.chosen_records_) {
+  , chosen_records_(other.chosen_records_)
+  , since_(other.since_) {
     // Its table went with it: it holds no anchor and takes none.
     other.capacity_ = 0;
     other.chunks_.clear();
 }
 
 segment_block_observer active_sparse_index::observer() noexcept {
-    return {
+    segment_block_observer output{
       [this](std::span<const segment_block_layout> blocks) noexcept {
           for (const auto& block : blocks)
               written(block.records);
       },
       [this](runtime::file_position end) noexcept { durable(end); }};
+    output.admit = [this](std::uint32_t blocks) { return admit(blocks); };
+    return output;
+}
+
+runtime::result<void> active_sparse_index::admit(std::uint32_t blocks) {
+    if (frozen_ || !budget_) return {};
+    const auto wanted = static_cast<std::uint32_t>(std::min<std::uint64_t>(
+      capacity_, std::uint64_t{chosen_} + promised_ + blocks));
+    while (admitted_ < wanted) {
+        const auto entries = std::min(chunk_entries, capacity_ - admitted_);
+        const auto charged = budget_->allocation_charge(
+          byte_count{entries * sizeof(sparse_index_entry)});
+        if (!charged) return runtime::failure(charged.error());
+        auto more = budget_->try_reserve(*charged);
+        if (!more) return runtime::failure(more.error());
+        if (auto merged = held_.adopt(std::move(*more)); !merged) return merged;
+        admitted_ += entries;
+    }
+    promised_ = static_cast<std::uint32_t>(
+      std::min<std::uint64_t>(capacity_, std::uint64_t{promised_} + blocks));
+    return {};
 }
 
 runtime::result<byte_count> active_sparse_index::admission(
@@ -222,22 +255,19 @@ runtime::result<byte_count> active_sparse_index::admission(
     if (capacity == 0 || capacity > maximum_object_entries)
         return runtime::failure(index_error(errc::invalid_argument));
     const auto chunks = (capacity + chunk_entries - 1) / chunk_entries;
-    // The list of chunks, then every chunk at its exact size.
+    // The list of chunks, then the first chunk at its exact size. A chunk is
+    // one page of the sealed form's own entries at most, so the pages stay
+    // contiguous and no chunk is smaller than the rest.
     const auto list = budget.allocation_charge(
       byte_count{chunks * sizeof(std::vector<sparse_index_entry>)});
     if (!list) return runtime::failure(list.error());
-    auto total = *list;
-    for (std::uint32_t left = capacity; left != 0;) {
-        const auto entries = std::min(left, chunk_entries);
-        const auto charged = budget.allocation_charge(
-          byte_count{entries * sizeof(sparse_index_entry)});
-        if (!charged) return runtime::failure(charged.error());
-        const auto next = total.checked_add(*charged);
-        if (!next) return runtime::failure(index_error(errc::out_of_range));
-        total = *next;
-        left -= entries;
-    }
-    return total;
+    const auto first = budget.allocation_charge(
+      byte_count{
+        std::min(capacity, chunk_entries) * sizeof(sparse_index_entry)});
+    if (!first) return runtime::failure(first.error());
+    const auto total = list->checked_add(*first);
+    if (!total) return runtime::failure(index_error(errc::out_of_range));
+    return *total;
 }
 
 runtime::result<active_sparse_index> active_sparse_index::make(
@@ -246,7 +276,7 @@ runtime::result<active_sparse_index> active_sparse_index::make(
     if (!total) return runtime::failure(total.error());
     auto held = budget.try_reserve(*total);
     if (!held) return runtime::failure(held.error());
-    active_sparse_index output{stride, capacity, std::move(*held)};
+    active_sparse_index output{stride, capacity, std::move(*held), budget};
     output.chunks_.reserve((capacity + chunk_entries - 1) / chunk_entries);
     // The first block is always an anchor, so its chunk is never waited for.
     output.chunks_.emplace_back().reserve(std::min(capacity, chunk_entries));
@@ -345,12 +375,15 @@ bool active_sparse_index::written(const coverage& block) noexcept {
       invariant_id{"KQ-INDEX-FROZEN"},
       !frozen_,
       "index offered a block after its segment was sealed");
+    // One block of a group admitted for it.
+    if (promised_ != 0) --promised_;
     const auto begin = block.bytes().begin();
     KWAQUE_INVARIANT(
       invariant_id{"KQ-INDEX-ORDER"},
       offered_end_ <= begin,
       "index offered a block out of file order");
     offered_end_ = block.bytes().end();
+    ++since_;
     // An anchor is the base of a record, so a block whose original span is
     // empty has none.
     const auto base = model::range_logical_offset::make(
@@ -365,13 +398,14 @@ bool active_sparse_index::written(const coverage& block) noexcept {
       chosen_ != 0
       && begin.value() - chosen_bytes_.value() < stride_.bytes.value()
       && (stride_.records == 0
-          || records.value() - chosen_records_.value() < stride_.records))
+          || records.value() - chosen_records_.value() < stride_.records)
+      && since_ < maximum_anchor_blocks)
         return false;
     KWAQUE_INVARIANT(
       invariant_id{"KQ-INDEX-ORDER"},
       chosen_ == 0 || chosen(chosen_ - 1).logical_anchor() < *base,
       "index offered a block out of logical order");
-    if (chosen_ == capacity_) {
+    if (chosen_ == capacity_ || chosen_ == admitted_) {
         ++skipped_;
         return false;
     }
@@ -391,6 +425,7 @@ bool active_sparse_index::written(const coverage& block) noexcept {
     ++chosen_;
     chosen_bytes_ = begin;
     chosen_records_ = records;
+    since_ = 0;
     return true;
 }
 

@@ -82,6 +82,25 @@ enum class metric_id : std::uint16_t {
     broker_shards = 59,
     broker_startup_duration_seconds = 60,
     broker_start_time_seconds = 61,
+    storage_wal_placed_portions_total = 62,
+    storage_segment_placed_portions_total = 63,
+    storage_wal_placed_bytes_total = 64,
+    storage_segment_placed_bytes_total = 65,
+    storage_held_portions_total = 66,
+    storage_held_portion_bytes_total = 67,
+    storage_runs_filled_total = 68,
+    storage_runs_wanted_total = 69,
+    storage_runs_limited_total = 70,
+    storage_runs_synced_total = 71,
+    storage_runs_pressed_total = 72,
+    storage_segment_barriers_total = 73,
+    storage_segment_syncs_total = 74,
+    storage_sync_rounds_total = 75,
+    storage_round_syncs_total = 76,
+    storage_held_bytes = 77,
+    storage_held_runs = 78,
+    storage_unsynced_bytes = 79,
+    storage_unsynced_wal_files = 80,
 };
 
 struct metric_descriptor final {
@@ -96,7 +115,7 @@ struct metric_descriptor final {
     bool operator==(const metric_descriptor&) const = default;
 };
 
-inline constexpr std::size_t metric_inventory_size{61};
+inline constexpr std::size_t metric_inventory_size{80};
 inline constexpr std::string_view metric_workload_label{"workload"};
 inline constexpr std::array<std::string_view, 8> metric_workload_label_values{
   "foreground_protocol",
@@ -110,7 +129,7 @@ inline constexpr std::array<std::string_view, 8> metric_workload_label_values{
 };
 inline constexpr std::size_t metric_workload_values
   = metric_workload_label_values.size();
-inline constexpr std::size_t metric_series_per_shard{89};
+inline constexpr std::size_t metric_series_per_shard{108};
 
 // Totals are plain unsigned 64-bit owner fields. Their overflow behavior is
 // the language-defined modulo-2^64 arithmetic, with no update-path branch.

@@ -303,16 +303,16 @@ seastar::future<> failed_generation_open(
       paths.segment_file(0, name, local_segment_file::published));
     co_await write_bytes(
       files, published, local_fixture::read("publication_all_roots"), drive);
-    const auto expected_contexts = contexts(spec);
+    const auto expected_contexts = contexts();
     const local_generation_expectation expected{
       publication_contract::generation(3),
       sealed_publication(),
       descriptor(),
+      origin(),
       expected_contexts};
     const std::array victims{
       take(paths.segment_file(0, name, local_segment_file::data)),
-      take(paths.object(0, name, sealed_ref().sequence())),
-      take(paths.object(0, name, snapshot_ref().sequence()))};
+      take(paths.object(0, name, sealed_ref().sequence()))};
     for (const auto& victim : victims) {
         const auto saved = take(
           runtime::file_path::make(victim.value() + ".saved"));
@@ -362,6 +362,7 @@ seastar::future<> failed_replacement_keeps_old_pin(
       publication_contract::generation(1),
       active_publication(),
       descriptor(),
+      origin(),
       {}};
     auto old = take(
       co_await drive.lifecycle(

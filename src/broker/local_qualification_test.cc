@@ -189,16 +189,16 @@ seastar::future<> local_metadata_native_reader_allocation_bound() {
             path,
             storage::testing::local_fixture::read("publication_all_roots"),
             drive);
-          const auto root_contexts = contexts(spec);
+          const auto root_contexts = contexts();
           const storage::local_generation_expectation expected{
             storage::testing::publication_contract::generation(3),
             sealed_publication(),
             descriptor(),
+            origin(),
             root_contexts};
           const std::array expected_pages{
             storage::testing::local_fixture::read("index_page"),
-            storage::testing::local_fixture::read("sealed_retry_page"),
-            storage::testing::local_fixture::read("snapshot_page")};
+            storage::testing::local_fixture::read("sealed_retry_page")};
           std::unique_ptr<storage::local_generation_owner> generation;
           runtime::first_failure failed;
           const auto before = seastar::memory::stats();
@@ -212,8 +212,7 @@ seastar::future<> local_metadata_native_reader_allocation_bound() {
               std::size_t i = 0;
               for (const auto kind :
                    {storage::local_root_kind::index,
-                    storage::local_root_kind::sealed_retry,
-                    storage::local_root_kind::completed_retry_snapshot}) {
+                    storage::local_root_kind::sealed_retry}) {
                   auto root = take(pin.root(kind));
                   auto page = take(
                     co_await root.read(

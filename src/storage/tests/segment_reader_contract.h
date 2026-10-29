@@ -19,9 +19,11 @@
 
 #include <seastar/core/abort_source.hh>
 #include <seastar/core/future.hh>
+#include <seastar/util/alloc_failure_injector.hh>
 #include <seastar/util/later.hh>
 #include <seastar/util/noncopyable_function.hh>
 
+#include <algorithm>
 #include <array>
 #include <cstdint>
 #include <memory>
@@ -64,16 +66,18 @@ inline bytes::fragmented_buffer buffer(const std::string& bytes) {
 // header length, and the block's length of its child.
 inline std::string batch_at(const std::string& data, std::uint64_t at) {
     const auto header = get(data, at + 10, 2);
-    const auto child = get(data, at + header + 112, 4);
-    return data.substr(at + header + 120, child);
+    const auto child = get(data, at + header + 136, 4);
+    return data.substr(at + header + 144, child);
 }
 // With one small block and its footer to a group, every `blocks`-th block is
-// an anchor: a block begins two units after the one before it.
+// an anchor: the footer pads the group to one unit, so a block begins one
+// unit after the one before it, and the stride lies halfway between.
 inline sparse_index_stride stride_of(std::uint32_t blocks) {
     return sparse_index_stride{byte_count{
-      (2ULL * blocks - 1) * segments::descriptor().alignment.bytes().value()}};
+      (2ULL * blocks - 1) * segments::descriptor().alignment.bytes().value()
+      / 2}};
 }
-// Three units to a stride: every second block is an anchor.
+// One and a half units to a stride: every second block is an anchor.
 inline sparse_index_stride paired_stride() { return stride_of(2); }
 
 // A batch of `records` records of `payload` bytes each, assigned at `logical`
@@ -94,7 +98,7 @@ inline seastar::future<encoded_assigned_batch> dense_child(
                           {},
                           work.policy())
                           .value();
-    const auto origin = segments::descriptor().logical_origin.value();
+    const auto origin = segments::logical_origin().value();
     const auto identity = model::batch_id::make(
                             id<model::producer_id>(0x40),
                             model::producer_epoch::make(1).value(),
@@ -168,7 +172,14 @@ seal_batches(
         resources)));
     output.writer = take(
       writer_type::make_new(
-        files, owner, spec, 0, described, resources, config));
+        files,
+        owner,
+        spec,
+        0,
+        described,
+        segments::logical_origin(),
+        resources,
+        config));
     runtime::first_failure failed;
     try {
         take(co_await drive.lifecycle(output.writer->create_new(work)));
@@ -188,7 +199,6 @@ seal_batches(
         output.sealed = co_await drive.lifecycle(output.writer->seal(
           segments::completed_source{{}, {}, &calls},
           0,
-          blocks,
           work,
           sparse_index_seal{
             output.index.get(), local_object_sequence::make(46).value()}));
@@ -342,7 +352,7 @@ seastar::future<> run_checks(
             auto flipped = extent;
             const auto second = blocks[1].coverage().bytes().begin().value()
                                 - begin;
-            flipped[second + 32 + 120 + 40] ^= 1;
+            flipped[second + 32 + 144 + 40] ^= 1;
             const auto damaged = co_await check(
               flipped, history, start_of(0), true);
             // The third block is zeroes.
@@ -474,8 +484,8 @@ seastar::future<> run_checks(
 
 // A sealed segment with its generation and its index open and a cache, and
 // what each of its blocks' batches is in the file. One small block and its
-// footer to a group and three units to a stride: every second block is an
-// anchor, so its runs hold two blocks each and the last may hold one.
+// footer to a group and one and a half units to a stride: every second block
+// is an anchor, so its runs hold two blocks each and the last may hold one.
 template<typename Backend, typename Owner, typename Writer>
 struct sealed_world final {
     indexes::sealed_segment<Writer> segment;
@@ -634,6 +644,7 @@ open_sealed(
            *sealed.boundary,
            {*sealed.index, *sealed.retry}},
           described,
+          history.logical_origin,
           contexts};
         made->generation = take(
           co_await drive.lifecycle(
@@ -950,7 +961,7 @@ seastar::future<> sealed_reads(
                     && w.matches(next, 2, 2)
                     && next.stop == segment_read_stop::limit
                     && holding.tasks == idle.tasks + 2
-                    && holding.bytes >= idle.bytes + 2 * (64_KiB + 4 * unit),
+                    && holding.bytes >= idle.bytes + 2 * (64_KiB + 2 * unit),
                   "a read kept more runs than its session may, or its "
                   "reader was not charged for what it keeps");
                 outliving = std::move(part.batches);
@@ -1333,7 +1344,8 @@ seastar::future<> prefetched_runs(
                       [&w](
                         model::range_logical_offset target,
                         seastar::abort_source& caller,
-                        sparse_index_place&) {
+                        sparse_index_place&,
+                        runtime::file_position) {
                           return w.index->locate(target, caller);
                       },
                       [&w](
@@ -1343,7 +1355,8 @@ seastar::future<> prefetched_runs(
                       },
                       [](
                         model::range_logical_offset,
-                        const sparse_index_place&) noexcept {
+                        const sparse_index_place&,
+                        runtime::file_position) noexcept {
                           return std::optional<sparse_index_answer>{};
                       }},
                     resources,
@@ -1363,11 +1376,11 @@ seastar::future<> prefetched_runs(
             unanswered.reset();
         }
         {
-            // A cache with no room for a run: each is read for its reader
-            // alone, and what the reader asks for ahead of itself is
-            // dropped.
+            // A cache with no room for a run, whose small share is less
+            // than one unit: each is read for its reader alone, and what the
+            // reader asks for ahead of itself is dropped.
             tight = take(
-              page_cache::make(resources, {.capacity = byte_count{128_KiB}}));
+              page_cache::make(resources, {.capacity = byte_count{64_KiB}}));
             crowded = take(
               segment_runs::make(
                 *tight,
@@ -1528,7 +1541,7 @@ seastar::future<> ahead_reads(
               *windowed,
               resources,
               last,
-              {.read_ahead_bytes = byte_count{2 * unit}});
+              {.read_ahead_bytes = byte_count{unit}});
             const auto a = co_await drive.lifecycle(
               reader.read(offset(w.base(0)), one, asking));
             const auto b = co_await drive.lifecycle(
@@ -1625,7 +1638,14 @@ seastar::future<> fed_tail(
       page_cache::make(resources, {.capacity = byte_count{2_MiB}}));
     auto writer = take(
       writer_type::make_new(
-        files, owner, spec, 0, described, resources, config));
+        files,
+        owner,
+        spec,
+        0,
+        described,
+        segments::logical_origin(),
+        resources,
+        config));
     std::unique_ptr<segment_runs> runs, device;
     runtime::first_failure failed;
     try {
@@ -1648,11 +1668,12 @@ seastar::future<> fed_tail(
         take(writer->observe_blocks(runs->observer(*index)));
         const auto first = history.logical_origin.value();
         const auto at = [&](std::uint64_t group) {
-            return start.value() + group * 2 * unit;
+            return start.value() + group * unit;
         };
         std::string stored;
-        codec::crc32c checksum;
-        // One block and its footer to a group, a record to a block.
+        segments::written_prefix prefix;
+        // One block and its footer to a group, a record to a block: the
+        // footer pads the group to one unit.
         const auto write =
           [&](
             std::uint64_t group) -> seastar::future<segment_captured_boundary> {
@@ -1663,9 +1684,9 @@ seastar::future<> fed_tail(
                 batches.push_back(
                   co_await segments::execution_child(first + group, work));
             auto [cut, bytes] = co_await segments::write_group(
-              *writer, std::move(batches), resources, work, drive, checksum);
+              *writer, std::move(batches), resources, work, drive, prefix);
             require(
-              bytes.size() == 2 * unit
+              bytes.size() == unit && cut.footer()
                 && cut.end().bytes.value() == at(group + 1),
               "a group is not one block and its footer");
             stored += bytes;
@@ -1687,7 +1708,7 @@ seastar::future<> fed_tail(
                 {.durable = view.durable,
                  .sealed = std::nullopt,
                  .visible = model::range_logical_end{first + 64}},
-                active_read_index(*index, view.durable),
+                active_read_index(*index),
                 resources,
                 one_ahead));
         };
@@ -1698,8 +1719,7 @@ seastar::future<> fed_tail(
                   const auto& batch = read.batches[i];
                   if (
                     batch.logical.begin().value() != first + from + i
-                    || flat(batch.bytes)
-                         != batch_at(stored, (from + i) * 2 * unit))
+                    || flat(batch.bytes) != batch_at(stored, (from + i) * unit))
                       return false;
               }
               return true;
@@ -1814,7 +1834,7 @@ seastar::future<> fed_tail(
                        && flat(take(kept->batch(i)))
                             == flat(take(read->batch(i)))
                        && flat(take(kept->batch(i)))
-                            == batch_at(stored, (2 + i) * 2 * unit);
+                            == batch_at(stored, (2 + i) * unit);
             }
             require(
               same && read->end() == kept->end(),
@@ -1857,15 +1877,16 @@ seastar::future<> fed_tail(
         }
         // One more block, which nobody feeds. A read that goes on from
         // where the last one said begins at that block, not at the anchor
-        // before it; a place that leads to no block is not believed, and
-        // the anchor is read from.
-        co_await sync(co_await write(5));
+        // before it; a place that leads to no block, its footer's, is not
+        // believed, and the anchor is read from.
+        const auto sixth = co_await write(5);
+        co_await sync(sixth);
         {
             auto reader = co_await session(*runs);
             const auto from_block = co_await drive.lifecycle(
               reader.read({resumed, all, true}, asking));
             auto misled = resumed;
-            misled.block = runtime::file_position{at(5) + unit};
+            misled.block = sixth.footer()->begin();
             const auto from_anchor = co_await drive.lifecycle(
               reader.read({misled, all, true}, asking));
             require(
@@ -1903,6 +1924,212 @@ seastar::future<> fed_tail(
     writer.reset();
     runs.reset();
     device.reset();
+    try {
+        co_await drive.lifecycle(cache->stop());
+    } catch (...) {
+        failed.observe(std::current_exception());
+    }
+    cache.reset();
+    index.reset();
+    take(failed.outcome());
+}
+
+// Packed blocks read from the device with nothing cached. Groups of blocks
+// of different lengths put each block at its own offset in its unit, some
+// across units. Every block is an anchor, so each run begins at a block and
+// ends where the next begins, at any offset on either side; a cold read of
+// each returns exactly that block's batch, from a run that holds it alone
+// and is charged at least for the bytes its batch retains. Read one unit at
+// a time, the segment comes back in parts that go on from unaligned blocks.
+template<
+  runtime::monotonic_clock Clock,
+  typename Backend,
+  typename Owner,
+  typename Driver>
+seastar::future<> packed_reads(
+  Backend& files,
+  Owner& owner,
+  const local_device_spec& spec,
+  workload_budget& resources,
+  Driver drive) {
+    using writer_type = segment_writer<Backend, Owner, Clock>;
+    seastar::abort_source abort;
+    codec::cooperative_work work{codec::limits::defaults(), abort};
+    co_await installation::bootstrap(
+      files, owner, spec, resources, work, drive);
+    // Each group's record values: blocks of about 401 + value bytes.
+    const std::array<std::vector<std::size_t>, 3> shapes{
+      {{100, 3000, 7000}, {5000, 64}, {1000, 2000, 300, 8000}}};
+    std::uint32_t blocks = 0;
+    for (const auto& shape : shapes)
+        blocks += static_cast<std::uint32_t>(shape.size());
+    auto config = segments::configuration();
+    config.maximum_groups = static_cast<std::uint32_t>(shapes.size());
+    config.admission.working_bytes = byte_count{1_MiB};
+    config.admission.maximum_blocks = 16;
+    const auto described = segments::descriptor();
+    const auto unit = described.alignment.bytes().value();
+    const sparse_index_stride stride{byte_count{0}};
+    auto index = std::make_unique<active_sparse_index>(take(
+      active_sparse_index::make(
+        stride,
+        sparse_index_capacity(
+          stride,
+          described.maximum_data_bytes,
+          config.admission.maximum_blocks),
+        resources)));
+    auto cache = take(
+      page_cache::make(resources, {.capacity = byte_count{2_MiB}}));
+    auto writer = take(
+      writer_type::make_new(
+        files,
+        owner,
+        spec,
+        0,
+        described,
+        segments::logical_origin(),
+        resources,
+        config));
+    std::unique_ptr<segment_runs> runs, cold, parted;
+    runtime::first_failure failed;
+    try {
+        take(co_await drive.lifecycle(writer->create_new(work)));
+        std::optional<segment_history_context> origin;
+        runtime::file_position start;
+        {
+            const auto view = take(
+              co_await drive.lifecycle(writer->pin_data(work)));
+            origin.emplace(view.history);
+            start = view.durable;
+        }
+        const auto history = *origin;
+        const auto first = history.logical_origin.value();
+        const auto make_runs = [&](segment_run_limits limits) {
+            return take(
+              segment_runs::make(
+                *cache, resources, history, {.limits = limits}));
+        };
+        runs = make_runs(run_limits());
+        take(writer->observe_blocks(runs->observer(*index)));
+        std::string stored;
+        segments::written_prefix prefix;
+        auto logical = first;
+        for (const auto& shape : shapes) {
+            std::vector<encoded_assigned_batch> batches;
+            for (const auto value : shape)
+                batches.push_back(
+                  co_await segments::valued_execution_child(
+                    logical++, value, work));
+            auto [cut, bytes] = co_await segments::write_group(
+              *writer, std::move(batches), resources, work, drive, prefix);
+            stored += bytes;
+            const auto synced = co_await drive.lifecycle(writer->barrier(cut));
+            take(synced.failure.outcome());
+            co_await drive.lifecycle(runs->settled());
+        }
+        bool unaligned = false;
+        for (std::uint32_t i = 0; i < index->size(); ++i)
+            unaligned = unaligned
+                        || (*index)[i].block_position().value() % unit != 0;
+        require(
+          index->size() == blocks && index->skipped() == 0 && unaligned,
+          "the packed blocks are not the anchors this case is about");
+        // The batch of the block anchor `i` names, as it was written.
+        const auto expected = [&](std::uint32_t i) {
+            return batch_at(
+              stored, (*index)[i].block_position().value() - start.value());
+        };
+        {
+            const auto view = take(
+              co_await drive.lifecycle(writer->pin_data(work)));
+            seastar::abort_source asking;
+            const auto session = [&](segment_runs& through) {
+                return take(
+                  segment_reader::open(
+                    through,
+                    segment_data_source{view.pin.share()},
+                    {.durable = view.durable,
+                     .sealed = std::nullopt,
+                     .visible = model::range_logical_end{logical}},
+                    active_read_index(*index),
+                    resources,
+                    one_ahead));
+            };
+            for (std::uint32_t i = 0; i < blocks; ++i) {
+                const auto at = (*index)[i].block_position();
+                const auto end = i + 1 < blocks
+                                   ? (*index)[i + 1].block_position()
+                                   : view.durable;
+                cold = make_runs(run_limits());
+                {
+                    auto reader = session(*cold);
+                    const auto before = cache->snapshot();
+                    const auto read = co_await drive.lifecycle(
+                      reader.read(offset(first + i), byte_count{1}, asking));
+                    const bool whole
+                      = read.batches.size() == 1
+                        && read.batches[0].logical.begin().value() == first + i
+                        && flat(read.batches[0].bytes) == expected(i)
+                        && static_cast<bool>(read.batches[0].held);
+                    const auto* run = whole ? read.batches[0].held.value()
+                                            : nullptr;
+                    require(
+                      run && run->begin() == at && run->end() == end
+                        && run->blocks().size() == 1
+                        && run->charge()
+                             >= read.batches[0].bytes.retained_bytes()
+                        && cache->snapshot().loads == before.loads + 1,
+                      "a cold read of a packed block did not return it from "
+                      "a run of its own, or charged less than it retains");
+                }
+                take(co_await drive.lifecycle(cold->close()));
+                cold.reset();
+            }
+            // One unit to a read: blocks longer than that are read again
+            // with their exact length, and every part goes on from the
+            // block after the last one it held.
+            auto limits = run_limits();
+            limits.run_bytes = byte_count{unit};
+            parted = make_runs(limits);
+            {
+                auto reader = session(*parted);
+                const auto read = co_await drive.lifecycle(
+                  reader.read(offset(first), byte_count{1_MiB}, asking));
+                bool same = read.batches.size() == blocks;
+                for (std::uint32_t i = 0; same && i < blocks; ++i)
+                    same = read.batches[i].logical.begin().value() == first + i
+                           && flat(read.batches[i].bytes) == expected(i);
+                require(
+                  same,
+                  "packed blocks read one unit at a time were not read "
+                  "back as written");
+            }
+            take(co_await drive.lifecycle(parted->close()));
+            parted.reset();
+        }
+        require(
+          !writer->failure().failed(), "reading packed blocks failed them");
+    } catch (...) {
+        failed.observe(std::current_exception());
+    }
+    for (auto* held : {&runs, &cold, &parted}) {
+        if (!*held) continue;
+        try {
+            failed.observe(co_await drive.lifecycle((*held)->close()));
+        } catch (...) {
+            failed.observe(std::current_exception());
+        }
+    }
+    try {
+        failed.observe(co_await drive.lifecycle(writer->close()));
+    } catch (...) {
+        failed.observe(std::current_exception());
+    }
+    // The writer's observer refers to the runs and the index until here.
+    writer.reset();
+    runs.reset();
+    cold.reset();
+    parted.reset();
     try {
         co_await drive.lifecycle(cache->stop());
     } catch (...) {
@@ -1981,7 +2208,14 @@ seastar::future<> sealed_tail(
       page_cache::make(resources, {.capacity = byte_count{2_MiB}}));
     auto writer = take(
       writer_type::make_new(
-        files, owner, spec, 0, described, resources, config));
+        files,
+        owner,
+        spec,
+        0,
+        described,
+        segments::logical_origin(),
+        resources,
+        config));
     std::unique_ptr<segment_runs> runs, fresh;
     // A reader's pin taken before the seal, for the sessions opened after.
     std::optional<segment_data_view> pinned;
@@ -1999,7 +2233,7 @@ seastar::future<> sealed_tail(
         const auto start = pinned->durable;
         const auto first = history.logical_origin.value();
         const auto at = [&](std::uint64_t group) {
-            return start.value() + group * 2 * unit;
+            return start.value() + group * unit;
         };
         const auto make_runs = [&] {
             return take(
@@ -2036,7 +2270,7 @@ seastar::future<> sealed_tail(
                 {.durable = view.durable,
                  .sealed = std::nullopt,
                  .visible = model::range_logical_end{first + 64}},
-                active_read_index(*index, view.durable),
+                active_read_index(*index),
                 resources,
                 one_ahead));
         };
@@ -2057,7 +2291,6 @@ seastar::future<> sealed_tail(
         const auto sealed = co_await drive.lifecycle(writer->seal(
           segments::completed_source{{}, {}, &calls},
           0,
-          groups,
           work,
           sparse_index_seal{
             index.get(), local_object_sequence::make(46).value()}));
@@ -2116,7 +2349,7 @@ seastar::future<> sealed_tail(
                 {.durable = extent.bytes().end(),
                  .sealed = extent.logical().end(),
                  .visible = extent.logical().end()},
-                active_read_index(*index, extent.bytes().end()),
+                active_read_index(*index),
                 resources,
                 one_ahead)));
             const auto before = cache->snapshot();
@@ -2139,7 +2372,7 @@ seastar::future<> sealed_tail(
               *fresh,
               segment_data_source{pinned->pin.share()},
               bypassing->bounds(),
-              active_read_index(*index, bypassing->bounds().durable),
+              active_read_index(*index),
               resources,
               one_ahead);
             const auto held = co_await drive.lifecycle(
@@ -2213,9 +2446,10 @@ seastar::future<> sealed_tail(
 // What a segment's owner does to its sessions. At the seal it moves them:
 // from then on no session holds the pin its writer gave it or refers to the
 // index its writer fed, so the writer closes with the sessions open and that
-// index is destroyed, and every session, one whose read was in flight at the
-// move included, reads on to the bound it took: from the cache, through the
-// generation's pin and by the sealed index. At the drain it revokes them: a
+// index is destroyed. Sessions opened when half the segment was durable read
+// on to its sealed end with no new session: from the cache, through the
+// generation's pin and by the sealed index. A read in flight at the move
+// keeps the bound it began with. At the drain it revokes them: a
 // read in flight ends with whole batches or with closed, every later read
 // fails with closed, the drains of the runs, of the index and of the
 // generation do not wait for a session that is still held, and what a
@@ -2256,7 +2490,14 @@ seastar::future<> moved_sessions(
       page_cache::make(resources, {.capacity = byte_count{2_MiB}}));
     auto writer = take(
       writer_type::make_new(
-        files, owner, spec, 0, described, resources, config));
+        files,
+        owner,
+        spec,
+        0,
+        described,
+        segments::logical_origin(),
+        resources,
+        config));
     sparse_index_residency residency{1};
     sparse_index_rebuild_limit rebuilds;
     std::unique_ptr<segment_runs> runs, fresh, apart;
@@ -2282,7 +2523,7 @@ seastar::future<> moved_sessions(
         origin.reset();
         const auto first = history.logical_origin.value();
         const auto at = [&](std::uint64_t group) {
-            return start.value() + group * 2 * unit;
+            return start.value() + group * unit;
         };
         const auto make_runs = [&] {
             return take(
@@ -2294,19 +2535,21 @@ seastar::future<> moved_sessions(
         apart = make_runs();
         take(writer->observe_blocks(runs->observer(*index)));
         runs->establish(1);
-        std::optional<segment_captured_boundary> cut;
-        for (std::uint32_t i = 0; i < groups; ++i)
-            cut.emplace(
-              co_await append_block(
-                *writer, first + i, i == 0, resources, work, drive));
-        {
+        // Groups `from` to `to`, durable.
+        const auto append_durable =
+          [&](std::uint32_t from, std::uint32_t to) -> seastar::future<> {
+            std::optional<segment_captured_boundary> cut;
+            for (auto i = from; i < to; ++i)
+                cut.emplace(
+                  co_await append_block(
+                    *writer, first + i, i == 0, resources, work, drive));
             const auto synced = co_await drive.lifecycle(writer->barrier(*cut));
             take(synced.failure.outcome());
-        }
-        co_await drive.lifecycle(runs->settled());
-        require(
-          cut->end().bytes.value() == at(groups) && index->size() == 2,
-          "the segment's tail is not the one this case is about");
+            co_await drive.lifecycle(runs->settled());
+        };
+        // Two groups are durable when the sessions open; two more by the
+        // seal.
+        co_await append_durable(0, 2);
         const auto session =
           [&](segment_runs& through_runs) -> seastar::future<segment_reader> {
             auto view = take(co_await drive.lifecycle(writer->pin_data(work)));
@@ -2317,7 +2560,7 @@ seastar::future<> moved_sessions(
                 {.durable = view.durable,
                  .sealed = std::nullopt,
                  .visible = model::range_logical_end{first + 64}},
-                active_read_index(*index, view.durable),
+                active_read_index(*index),
                 resources,
                 one_ahead,
                 &sessions));
@@ -2332,14 +2575,18 @@ seastar::future<> moved_sessions(
             tailing->read(offset(first), byte_count{1}, asking)));
         require(
           early->batches.size() == 1 && sessions.size() == 3
-            && tailing->bounds().durable.value() == at(groups),
+            && tailing->bounds().durable.value() == at(2),
           "a session was not listed, or was not given its first batch");
+        co_await append_durable(2, groups);
+        require(
+          writer->progress()->durable.bytes.value() == at(groups)
+            && index->size() == 2,
+          "the segment's tail is not the one this case is about");
 
         std::uint32_t calls = 0;
         const auto sealed = co_await drive.lifecycle(writer->seal(
           segments::completed_source{{}, {}, &calls},
           0,
-          groups,
           work,
           sparse_index_seal{
             index.get(), local_object_sequence::make(46).value()}));
@@ -2414,12 +2661,15 @@ seastar::future<> moved_sessions(
             cache.get()));
 
         // The move, with one read in flight: its runs hold nothing, so it
-        // reads the file.
+        // reads the file, and to the bound it began with.
         pending.emplace(bypassing->read(offset(first), all, asking));
         {
             const segment_data_source through_pin{take(pin->share())};
             sessions.move(
-              through_pin, [&] { return sealed_read_index(*sealed_index); });
+              through_pin,
+              [&] { return sealed_read_index(*sealed_index); },
+              sealed.extent->coverage.bytes().end(),
+              sealed.extent->coverage.logical().end());
         }
         // The writer closes under three open sessions, and the index it fed
         // goes with it.
@@ -2434,11 +2684,18 @@ seastar::future<> moved_sessions(
             const auto found = co_await drive.lifecycle(
               cold->read(offset(first), all, asking));
             require(
-              matches(*through, 0, 4) && matches(rest, 1, 3)
-                && rest.stop == segment_read_stop::short_of_visibility
+              matches(*through, 0, 2)
+                && through->stop == segment_read_stop::short_of_visibility
+                && matches(rest, 1, 3)
+                && rest.stop == segment_read_stop::end_of_segment
                 && matches(found, 0, 4)
-                && found.stop == segment_read_stop::short_of_visibility,
-              "a moved session did not read on to the bound it took");
+                && found.stop == segment_read_stop::end_of_segment
+                && tailing->bounds().durable
+                     == sealed.extent->coverage.bytes().end()
+                && tailing->bounds().sealed
+                     == sealed.extent->coverage.logical().end(),
+              "a moved session did not read on to its segment's sealed end, "
+              "or a read in flight did not keep the bounds it began with");
             require(
               sessions.size() == 3 && !tailing->revoked()
                 && !bypassing->revoked() && !cold->revoked(),
@@ -2478,7 +2735,7 @@ seastar::future<> moved_sessions(
         take(co_await drive.lifecycle(generation->close()));
         generation.reset();
         require(
-          matches(*early, 0, 1) && matches(*through, 0, 4),
+          matches(*early, 0, 1) && matches(*through, 0, 2),
           "what a session returned did not outlive its segment's drain");
     } catch (...) {
         failed.observe(std::current_exception());
@@ -2707,7 +2964,8 @@ seastar::future<> read_edges(
                   [&w, &asked](
                     model::range_logical_offset target,
                     seastar::abort_source& caller,
-                    sparse_index_place&) {
+                    sparse_index_place&,
+                    runtime::file_position) {
                       const bool misleads = asked++ == 0;
                       return w.index->locate(target, caller)
                         .then([&w, misleads](
@@ -2727,7 +2985,8 @@ seastar::future<> read_edges(
                   },
                   [&w](
                     model::range_logical_offset target,
-                    const sparse_index_place&) noexcept {
+                    const sparse_index_place&,
+                    runtime::file_position) noexcept {
                       return w.index->peek(target);
                   }},
                 resources,
@@ -2806,7 +3065,14 @@ seastar::future<> empty_reads(
       page_cache::make(resources, {.capacity = byte_count{2_MiB}}));
     auto writer = take(
       writer_type::make_new(
-        files, owner, spec, 0, described, resources, config));
+        files,
+        owner,
+        spec,
+        0,
+        described,
+        segments::logical_origin(),
+        resources,
+        config));
     std::unique_ptr<segment_runs> runs;
     runtime::first_failure failed;
     try {
@@ -2835,7 +3101,7 @@ seastar::future<> empty_reads(
                 {.durable = view.durable,
                  .sealed = std::nullopt,
                  .visible = model::range_logical_end{visible}},
-                active_read_index(*index, view.durable),
+                active_read_index(*index),
                 resources,
                 one_ahead));
         };
@@ -2865,11 +3131,11 @@ seastar::future<> empty_reads(
         }
         std::string stored;
         {
-            codec::crc32c checksum;
+            segments::written_prefix prefix;
             std::vector<encoded_assigned_batch> batches;
             batches.push_back(co_await segments::child(work));
             auto [cut, bytes] = co_await segments::write_group(
-              *writer, std::move(batches), resources, work, drive, checksum);
+              *writer, std::move(batches), resources, work, drive, prefix);
             stored = std::move(bytes);
             const auto synced = co_await drive.lifecycle(writer->barrier(cut));
             take(synced.failure.outcome());
@@ -2886,7 +3152,7 @@ seastar::future<> empty_reads(
             const auto unseen = co_await drive.lifecycle(
               unseeing.read(offset(first), all, asking));
             require(
-              reader.bounds().durable.value() == start.value() + 2 * unit
+              reader.bounds().durable.value() == start.value() + unit
                 && !runs->fed() && only.batches.size() == 1
                 && only.batches[0].logical.begin().value() == first
                 && flat(only.batches[0].bytes) == batch_at(stored, 0)
@@ -3007,13 +3273,13 @@ seastar::future<> damaged_runs(
             auto damaged = data;
             switch (what) {
             case damage::first_flipped:
-                damaged[w.position(3) + 32 + 120 + 40] ^= 1;
+                damaged[w.position(3) + 32 + 144 + 40] ^= 1;
                 break;
             case damage::middle_flipped:
-                damaged[w.position(4) + 32 + 120 + 40] ^= 1;
+                damaged[w.position(4) + 32 + 144 + 40] ^= 1;
                 break;
             case damage::last_flipped:
-                damaged[w.position(5) + 32 + 120 + 40] ^= 1;
+                damaged[w.position(5) + 32 + 144 + 40] ^= 1;
                 break;
             case damage::first_zeroed:
                 damaged.replace(w.position(3), unit, unit, '\0');
@@ -3026,7 +3292,7 @@ seastar::future<> damaged_runs(
                 damaged[w.position(3) + 15] ^= 0x40;
                 break;
             case damage::last_length_flipped:
-                // One byte more: not a whole unit.
+                // One byte more, which its header's checksum refuses.
                 damaged[w.position(5) + 12] ^= 1;
                 break;
             case damage::last_overlong: {
@@ -3120,10 +3386,9 @@ seastar::future<> damaged_runs(
             // A place to go on from that is wrong. A session that leaves
             // nothing behind reads from the place it is handed: one that
             // names the block after the one wanted leads to a whole block
-            // that is another, and one no block can begin at is not
-            // followed at all. Either way the place is forgotten and the
-            // anchor is read from: a wrong place costs a read, never the
-            // batches.
+            // that is another, and one inside a block leads to no block at
+            // all. Either way the place is forgotten and the anchor is read
+            // from: a wrong place costs a read, never the batches.
             runs = w.runs(resources);
             {
                 auto reader = w.session(
@@ -3132,7 +3397,7 @@ seastar::future<> damaged_runs(
                 const auto misplaced = co_await drive.lifecycle(reader.read(
                   {{wanted, runtime::file_position{w.position(5)}}, all, true},
                   asking));
-                const auto unaligned = co_await drive.lifecycle(reader.read(
+                const auto inside = co_await drive.lifecycle(reader.read(
                   {{wanted, runtime::file_position{w.position(4) + 1}},
                    all,
                    true},
@@ -3140,8 +3405,8 @@ seastar::future<> damaged_runs(
                 require(
                   w.matches(misplaced, 4, 5)
                     && misplaced.stop == segment_read_stop::end_of_segment
-                    && w.matches(unaligned, 4, 5)
-                    && unaligned.stop == segment_read_stop::end_of_segment
+                    && w.matches(inside, 4, 5)
+                    && inside.stop == segment_read_stop::end_of_segment
                     && !w.index->owed(),
                   "a wrong place to go on from failed its read, or was "
                   "believed");
@@ -3324,12 +3589,12 @@ seastar::future<> crowded_reads(
 // Batches of several records and of several sizes. Each is read back whole
 // and byte for byte wherever in it the offset asked for lies, and its span
 // says where it begins. A block longer than a stride is a run of its own.
-// With one alignment unit to a read every stretch is read in parts for its
-// reader alone: a part is one block, or the footer the part before it
-// stopped at, and a first block that one read does not hold is read again
-// with exactly its length. Every run ends with its group's footer, so with
-// that unit no run is the cache's. A read unit that is not whole alignment
-// units is refused.
+// With one alignment unit to a read a stretch longer than that is read in
+// parts for its reader alone: a part is a block and the footer that pads its
+// group, or the footer the part before it stopped at, and a first block that
+// one read does not hold is read again with exactly its length. A run of one
+// unit is the cache's. A read unit that is not whole alignment units is
+// refused.
 template<
   runtime::monotonic_clock Clock,
   typename Backend,
@@ -3347,7 +3612,7 @@ seastar::future<> mixed_batches(
       files, owner, spec, resources, work, drive);
     const auto unit = segments::descriptor().alignment.bytes().value();
     // Records to a batch, and what each record holds. The third batch's
-    // block is four units long, which is more than a stride.
+    // block is longer than a stride, and its group takes four units.
     struct shape final {
         std::uint32_t records;
         std::size_t payload;
@@ -3356,7 +3621,7 @@ seastar::future<> mixed_batches(
       {{3, 64}, {2, 64}, {1, 28000}, {5, 64}, {1, 64}, {4, 64}}};
     std::vector<encoded_assigned_batch> batches;
     batches.reserve(shapes.size());
-    auto next = segments::descriptor().logical_origin.value();
+    auto next = segments::logical_origin().value();
     for (const auto& made : shapes) {
         batches.push_back(
           co_await dense_child(next, made.records, made.payload, work));
@@ -3383,8 +3648,7 @@ seastar::future<> mixed_batches(
           last == next && last == first + 16 && w.base(1) == first + 3
             && w.base(2) == first + 5 && w.base(3) == first + 6
             && w.base(4) == first + 11 && w.base(5) == first + 12
-            && anchors.size() == 4
-            && w.segment.blocks[2].coverage().bytes().size().value() == 4 * unit
+            && anchors.size() == 4 && w.position(3) - w.position(2) == 4 * unit
             && anchors[1].block_position().value() == w.position(2)
             && anchors[2].block_position().value() == w.position(3)
             && anchors[3].block_position().value() == w.position(5),
@@ -3445,17 +3709,15 @@ seastar::future<> mixed_batches(
                 const auto read = co_await drive.lifecycle(
                   reader.read(offset(first), all, asking));
                 const auto after = cache.snapshot();
-                // Twelve reads, each for this reader alone: a block and a
-                // footer at a time, the long block's first read and its
-                // exact one, and the last block. Every run ends with its
-                // group's footer, the last one too, so none is one read
-                // long; the last footer is not read, since the read ends
-                // with the segment's last offset.
+                // Eight reads. Seven for this reader alone: a group at a
+                // time, and for the long block a first read, its exact one
+                // and its footer. The last run is one group of one unit,
+                // read for the cache.
                 require(
                   w.matches(read, 0, 6)
                     && read.stop == segment_read_stop::end_of_segment
-                    && after.loads == before.loads + 12
-                    && after.uncached == before.uncached + 12
+                    && after.loads == before.loads + 8
+                    && after.uncached == before.uncached + 7
                     && parted->prefetches() == 0,
                   "a stretch longer than one read was not read in parts, "
                   "each for its reader alone");
@@ -3495,16 +3757,17 @@ struct tail_world final {
     std::optional<segment_history_context> history;
     runtime::file_position start;
     std::uint64_t unit{0};
-    // The exact bytes written so far, and their running checksum.
+    // The exact bytes written so far, and what their footers cover.
     std::string stored;
-    codec::crc32c checksum;
+    segments::written_prefix prefix;
 
     [[nodiscard]] std::uint64_t first() const {
         return history->logical_origin.value();
     }
-    // Where group `group` begins: one block and its footer to a group.
+    // Where group `group` begins: one block and its footer to a group, which
+    // the footer pads to one unit.
     [[nodiscard]] std::uint64_t at(std::uint64_t group) const {
-        return start.value() + group * 2 * unit;
+        return start.value() + group * unit;
     }
     // Whether `read` returned `count` batches from the block of `from`.
     [[nodiscard]] bool matches(
@@ -3514,7 +3777,7 @@ struct tail_world final {
             if (
               read.batches[i].logical.begin().value() != first() + from + i
               || flat(read.batches[i].bytes)
-                   != batch_at(stored, (from + i) * 2 * unit))
+                   != batch_at(stored, (from + i) * unit))
                 return false;
         return true;
     }
@@ -3565,12 +3828,13 @@ open_tail(
   workload_budget& resources,
   codec::cooperative_work& work,
   Driver drive,
-  segment_runs_config runs_config) {
+  segment_runs_config runs_config,
+  std::uint32_t blocks = 16) {
     using writer_type = segment_writer<Backend, Owner, Clock>;
     auto config = segments::configuration();
     config.maximum_groups = 8;
     config.admission.working_bytes = byte_count{1_MiB};
-    config.admission.maximum_blocks = 16;
+    config.admission.maximum_blocks = blocks;
     const auto described = segments::descriptor();
     const auto stride = paired_stride();
     auto made = std::make_unique<tail_world<writer_type>>();
@@ -3587,7 +3851,14 @@ open_tail(
       page_cache::make(resources, {.capacity = byte_count{2_MiB}}));
     made->writer = take(
       writer_type::make_new(
-        files, owner, spec, 0, described, resources, config));
+        files,
+        owner,
+        spec,
+        0,
+        described,
+        segments::logical_origin(),
+        resources,
+        config));
     runtime::first_failure failed;
     try {
         take(co_await drive.lifecycle(made->writer->create_new(work)));
@@ -3625,14 +3896,9 @@ seastar::future<segment_captured_boundary> write_tail(
         batches.push_back(
           co_await segments::execution_child(world.first() + group, work));
     auto [cut, bytes] = co_await segments::write_group(
-      *world.writer,
-      std::move(batches),
-      resources,
-      work,
-      drive,
-      world.checksum);
+      *world.writer, std::move(batches), resources, work, drive, world.prefix);
     require(
-      bytes.size() == 2 * world.unit
+      bytes.size() == world.unit && cut.footer()
         && cut.end().bytes.value() == world.at(group + 1),
       "a group is not one block and its footer");
     world.stored += bytes;
@@ -3661,7 +3927,7 @@ seastar::future<segment_reader> read_tail(
         {.durable = view.durable,
          .sealed = std::nullopt,
          .visible = model::range_logical_end{world.first() + 64}},
-        active_read_index(*world.index, view.durable),
+        active_read_index(*world.index),
         resources,
         one_ahead));
 }
@@ -3839,7 +4105,7 @@ seastar::future<> fed_limit(
     codec::cooperative_work work{codec::limits::defaults(), abort};
     co_await installation::bootstrap(
       files, owner, spec, resources, work, drive);
-    // Room for half a group.
+    // Room for half a group, which takes one unit.
     auto world = co_await open_tail<Clock>(
       files,
       owner,
@@ -3848,7 +4114,8 @@ seastar::future<> fed_limit(
       work,
       drive,
       {.limits = run_limits(),
-       .feed_bytes = segments::descriptor().alignment.bytes()});
+       .feed_bytes = byte_count{
+         segments::descriptor().alignment.bytes().value() / 2}});
     auto& w = *world;
     auto& cache = *w.cache;
     auto& runs = *w.runs;
@@ -3881,6 +4148,1177 @@ seastar::future<> fed_limit(
         failed.observe(std::current_exception());
     }
     co_await close_tail(w, failed, drive);
+    take(failed.outcome());
+}
+
+// A segment its owner says is read before its first group is fed from that
+// group on: its first block is an anchor, so the first run begins with it,
+// and a tail read of what was written loads nothing. While a reader is
+// established the feed lasts however long nothing reads the segment; once
+// its owner says none is, the time since the last read decides again.
+template<
+  runtime::monotonic_clock Clock,
+  typename Backend,
+  typename Owner,
+  typename Driver>
+seastar::future<> established_tail(
+  Backend& files,
+  Owner& owner,
+  const local_device_spec& spec,
+  workload_budget& resources,
+  Driver drive) {
+    constexpr std::uint64_t linger = 1000;
+    seastar::abort_source abort;
+    codec::cooperative_work work{codec::limits::defaults(), abort};
+    co_await installation::bootstrap(
+      files, owner, spec, resources, work, drive);
+    // The time the runs are told, in the case's hands.
+    const auto ticks = std::make_unique<std::uint64_t>(0);
+    auto world = co_await open_tail<Clock>(
+      files,
+      owner,
+      spec,
+      resources,
+      work,
+      drive,
+      {.limits = run_limits(),
+       .feed_linger_nanoseconds = linger,
+       .now = [now = ticks.get()]() noexcept {
+           return runtime::monotonic_time{*now};
+       }});
+    auto& w = *world;
+    auto& cache = *w.cache;
+    auto& runs = *w.runs;
+    runtime::first_failure failed;
+    try {
+        const auto first = w.first();
+        seastar::abort_source asking;
+        const byte_count all{1_MiB};
+        // Whether group `group` is read from what was fed, with nothing
+        // loaded or read for a reader alone.
+        const auto from_memory =
+          [&](std::uint64_t group) -> seastar::future<bool> {
+            auto reader = co_await read_tail(w, resources, work, drive);
+            const auto before = cache.snapshot();
+            const auto read = co_await drive.lifecycle(
+              reader.read(offset(first + group), all, asking));
+            const auto after = cache.snapshot();
+            const bool fed = w.matches(read, group, 1)
+                             && after.loads == before.loads
+                             && after.uncached == before.uncached
+                             && runs.tail_device_reads() == 0;
+            co_return fed;
+        };
+        runs.establish(1);
+        require(
+          runs.fed() && runs.pending() == 0,
+          "a segment with an established reader is not fed");
+        co_await sync_tail(
+          w, co_await write_tail(w, 0, resources, work, drive), drive);
+        require(
+          runs.pending() == 1 && runs.dropped() == 0 && co_await from_memory(0),
+          "the first group of a segment established before it was not fed, "
+          "or was read from the device");
+        // Long past the time, with nothing read since: still fed.
+        *ticks = 10 * linger;
+        co_await sync_tail(
+          w, co_await write_tail(w, 1, resources, work, drive), drive);
+        require(
+          runs.fed() && runs.dropped() == 0 && co_await from_memory(1),
+          "an established segment stopped being fed for want of reads");
+        // Nobody is established: the time since the last read decides, and
+        // that read was the one just made.
+        runs.establish(0);
+        require(runs.fed(), "the feed stopped before its time was up");
+        *ticks = 11 * linger + 1;
+        co_await sync_tail(
+          w, co_await write_tail(w, 2, resources, work, drive), drive);
+        require(
+          !runs.fed() && runs.pending() == 0 && runs.dropped() == 1,
+          "a segment nobody was established on was fed past the time");
+        require(
+          !w.writer->failure().failed(),
+          "feeding or reading a segment failed it");
+    } catch (...) {
+        failed.observe(std::current_exception());
+    }
+    co_await close_tail(w, failed, drive);
+    take(failed.outcome());
+}
+
+// Whether two reads returned the same batches, bytes and all, and say the
+// same of where the next goes on and why they stopped.
+inline bool same_read(const segment_read& one, const segment_read& other) {
+    if (
+      one.batches.size() != other.batches.size() || one.next != other.next
+      || one.stop != other.stop || one.bytes != other.bytes)
+        return false;
+    for (std::size_t i = 0; i < one.batches.size(); ++i)
+        if (
+          one.batches[i].logical != other.batches[i].logical
+          || flat(one.batches[i].bytes) != flat(other.batches[i].bytes))
+            return false;
+    return true;
+}
+
+// One session that its owner extends reads what a new session at each bound
+// would: nothing past the bound it was last given, everything below it.
+// A read in flight keeps the bounds it began with. Bounds only widen: a
+// narrower one, a second seal, a seal before what was returned, a bound past
+// what the segment holds, and any change to a session whose bound was cut
+// to what its copy holds are refused and change nothing. The session keeps
+// its place: runs it reads in a row across an extension are asked for ahead
+// as they would be without one. Extending allocates nothing.
+template<
+  runtime::monotonic_clock Clock,
+  typename Backend,
+  typename Owner,
+  typename Driver>
+seastar::future<> extended_session(
+  Backend& files,
+  Owner& owner,
+  const local_device_spec& spec,
+  workload_budget& resources,
+  Driver drive) {
+    seastar::abort_source abort;
+    codec::cooperative_work work{codec::limits::defaults(), abort};
+    co_await installation::bootstrap(
+      files, owner, spec, resources, work, drive);
+    // Nothing is fed: every read is of the device or the cache.
+    auto world = co_await open_tail<Clock>(
+      files, owner, spec, resources, work, drive, {.limits = run_limits()});
+    auto& w = *world;
+    auto& runs = *w.runs;
+    runtime::first_failure failed;
+    try {
+        const auto first = w.first();
+        seastar::abort_source asking;
+        const byte_count all{1_MiB};
+        // Eight groups, durable: runs of two blocks from blocks 0, 2, 4, 6.
+        std::optional<segment_captured_boundary> cut;
+        for (std::uint64_t group = 0; group < 8; ++group)
+            cut.emplace(co_await write_tail(w, group, resources, work, drive));
+        co_await sync_tail(w, *cut, drive);
+        // What a session that sees `groups` groups is given.
+        const auto bound_at = [&](std::uint64_t groups) {
+            return segment_read_bounds{
+              .durable = runtime::file_position{w.at(groups)},
+              .sealed = std::nullopt,
+              .visible = model::range_logical_end{first + 64}};
+        };
+        const auto open =
+          [&](
+            segment_read_bounds bounds,
+            segment_reader_config config) -> seastar::future<segment_reader> {
+            auto view = take(
+              co_await drive.lifecycle(w.writer->pin_data(work)));
+            co_return take(
+              segment_reader::open(
+                runs,
+                segment_data_source{std::move(view.pin)},
+                bounds,
+                active_read_index(*w.index),
+                resources,
+                config));
+        };
+        // A scan's config: the cache keeps nothing these sessions read.
+        const segment_reader_config scan{.fill = false};
+        {
+            // Extended a group at a time, it returns what a new session
+            // with each bound returns, and nothing past the bound.
+            auto extended = co_await open(bound_at(1), scan);
+            segment_read_position at{
+              model::range_logical_end{first}, std::nullopt};
+            bool same = true;
+            for (std::uint64_t groups = 1; groups <= 6 && same; ++groups) {
+                if (groups != 1) take(extended.extend(bound_at(groups)));
+                auto fresh = co_await open(bound_at(groups), scan);
+                const auto mine = co_await drive.lifecycle(
+                  extended.read({at, all, true}, asking));
+                const auto theirs = co_await drive.lifecycle(
+                  fresh.read({at, all, true}, asking));
+                same = same_read(mine, theirs) && w.matches(mine, groups - 1, 1)
+                       && mine.stop == segment_read_stop::short_of_visibility;
+                at = mine.next;
+            }
+            require(
+              same,
+              "an extended session read other than new sessions with its "
+              "bounds, or past its bound");
+        }
+        {
+            // What its caller may see is a bound too.
+            auto seen = bound_at(8);
+            seen.visible = model::range_logical_end{first + 7};
+            auto session = co_await open(seen, scan);
+            const auto shown = co_await drive.lifecycle(
+              session.read(offset(first), all, asking));
+            require(
+              w.matches(shown, 0, 7)
+                && shown.stop == segment_read_stop::not_yet_visible,
+              "a session read past what its caller may see");
+
+            // Each refused, with nothing changed.
+            const auto kept = session.bounds();
+            const auto unchanged = [&] {
+                const auto& now = session.bounds();
+                return now.durable == kept.durable && now.sealed == kept.sealed
+                       && now.visible == kept.visible
+                       && now.short_of_visibility == kept.short_of_visibility;
+            };
+            const auto refused = [&](const segment_read_bounds& bounds) {
+                const auto given = session.extend(bounds);
+                return !given && given.error().code() == errc::invalid_argument
+                       && unchanged();
+            };
+            auto narrower = seen;
+            narrower.durable = runtime::file_position{w.at(7)};
+            auto unseen = seen;
+            unseen.visible = model::range_logical_end{first + 6};
+            auto beyond = seen;
+            beyond.durable = runtime::file_position{w.at(9)};
+            auto early = seen;
+            early.sealed = model::range_logical_end{first + 6};
+            auto cut_short = seen;
+            cut_short.short_of_visibility = true;
+            require(
+              refused(narrower) && refused(unseen) && refused(beyond)
+                && refused(early) && refused(cut_short),
+              "a bound that narrows, passes what the segment holds, ends "
+              "before what was returned or is cut was taken");
+            // Sealed once, and never again or elsewhere.
+            auto sealed = seen;
+            sealed.sealed = model::range_logical_end{first + 8};
+            take(session.extend(sealed));
+            auto resealed = sealed;
+            resealed.sealed = model::range_logical_end{first + 9};
+            auto moved = sealed;
+            moved.durable = runtime::file_position{w.at(9)};
+            const auto sealed_kept = session.bounds();
+            const auto refused_sealed = [&](const segment_read_bounds& bounds) {
+                const auto given = session.extend(bounds);
+                const auto& now = session.bounds();
+                return !given && given.error().code() == errc::invalid_argument
+                       && now.sealed == sealed_kept.sealed
+                       && now.durable == sealed_kept.durable;
+            };
+            require(
+              refused_sealed(resealed) && refused_sealed(moved),
+              "a sealed session's end or extent was moved");
+            auto wider = sealed;
+            wider.visible = model::range_logical_end{first + 64};
+            take(session.extend(wider));
+            const auto last = co_await drive.lifecycle(
+              session.read({shown.next, all, true}, asking));
+            require(
+              w.matches(last, 7, 1)
+                && last.stop == segment_read_stop::end_of_segment,
+              "a session extended to its segment's end did not read to it");
+        }
+        {
+            // A session whose bound was cut to what its copy holds.
+            auto bounds = bound_at(2);
+            bounds.short_of_visibility = true;
+            auto recovered = co_await open(bounds, scan);
+            const auto given = recovered.extend(bound_at(3));
+            require(
+              !given && given.error().code() == errc::invalid_argument
+                && recovered.bounds().durable == bounds.durable
+                && recovered.bounds().short_of_visibility,
+              "a session cut to what its copy holds was extended");
+        }
+        {
+            // A read in flight keeps the bounds it began with: an
+            // extension made while it waits for the device is the next
+            // read's.
+            auto reader = co_await open(bound_at(4), scan);
+            auto pending = reader.read(offset(first + 2), all, asking);
+            take(reader.extend(bound_at(6)));
+            const auto read = co_await drive.lifecycle(std::move(pending));
+            const auto next = co_await drive.lifecycle(
+              reader.read({read.next, all, true}, asking));
+            require(
+              w.matches(read, 2, 2)
+                && read.stop == segment_read_stop::short_of_visibility
+                && w.matches(next, 4, 2),
+              "an extension changed a read in flight, or was not the next "
+              "read's");
+        }
+        {
+            // Runs read in a row across an extension: the second asks for
+            // the one after it, as without one.
+            auto reader = co_await open(bound_at(5), one_ahead);
+            const auto one = co_await drive.lifecycle(
+              reader.read(offset(first), byte_count{1}, asking));
+            const auto two = co_await drive.lifecycle(
+              reader.read({one.next, byte_count{1}, true}, asking));
+            take(reader.extend(bound_at(7)));
+            const auto asked = runs.prefetches();
+            const auto three = co_await drive.lifecycle(
+              reader.read({two.next, byte_count{1}, true}, asking));
+            require(
+              w.matches(one, 0, 1) && w.matches(two, 1, 1)
+                && w.matches(three, 2, 1) && runs.prefetches() == asked + 1
+                && runs.holds(offset(first + 4)),
+              "an extension lost the session's place in what it reads in a "
+              "row");
+            // Extending allocates nothing.
+            auto& injector = seastar::memory::local_failure_injector();
+            injector.fail_after(0);
+            const auto given = reader.extend(bound_at(8));
+            const bool allocated = injector.failed();
+            injector.cancel();
+            require(
+              given && !allocated && reader.bounds().durable.value() == w.at(8),
+              "extending a session allocated");
+        }
+        require(!w.writer->failure().failed(), "reading a segment failed it");
+    } catch (...) {
+        failed.observe(std::current_exception());
+    }
+    co_await close_tail(w, failed, drive);
+    take(failed.outcome());
+}
+
+// A tail read as it is appended, a thousand times. Its segment's reader is
+// established before the first group, and one session, extended to each new
+// end, reads every group once its owner reports it, before any barrier, and
+// stops where what is reported ends: from what was fed, with nothing of the
+// tail read from the device. The
+// session uses each run once however many of its reads take from it, so no
+// run is used twice.
+template<
+  runtime::monotonic_clock Clock,
+  typename Backend,
+  typename Owner,
+  typename Driver>
+seastar::future<> steady_tail(
+  Backend& files,
+  Owner& owner,
+  const local_device_spec& spec,
+  workload_budget& resources,
+  Driver drive) {
+    constexpr std::uint64_t pushes = 1000;
+    seastar::abort_source abort;
+    codec::cooperative_work work{codec::limits::defaults(), abort};
+    co_await installation::bootstrap(
+      files, owner, spec, resources, work, drive);
+    auto world = co_await open_tail<Clock>(
+      files,
+      owner,
+      spec,
+      resources,
+      work,
+      drive,
+      {.limits = run_limits()},
+      1024);
+    auto& w = *world;
+    auto& cache = *w.cache;
+    auto& runs = *w.runs;
+    std::optional<segment_reader> reader;
+    runtime::first_failure failed;
+    try {
+        const auto first = w.first();
+        seastar::abort_source asking;
+        runs.establish(1);
+        {
+            auto view = take(
+              co_await drive.lifecycle(w.writer->pin_data(work)));
+            reader.emplace(take(
+              segment_reader::open(
+                runs,
+                segment_data_source{std::move(view.pin)},
+                {.durable = view.durable,
+                 .sealed = std::nullopt,
+                 .visible = model::range_logical_end{first + pushes}},
+                active_read_index(*w.index),
+                resources,
+                one_ahead)));
+        }
+        const auto before = cache.snapshot();
+        bool every = true;
+        for (std::uint64_t push = 0; push != pushes && every; ++push) {
+            const auto cut = co_await write_tail(
+              w, push, resources, work, drive);
+            take(w.writer->report(cut));
+            take(reader->extend(
+              {.durable = runs.durable_position(),
+               .sealed = std::nullopt,
+               .visible = model::range_logical_end{first + pushes}}));
+            const auto read = co_await drive.lifecycle(
+              reader->read(offset(first + push), byte_count{1_MiB}, asking));
+            every = w.matches(read, push, 1)
+                    && read.stop == segment_read_stop::short_of_visibility;
+            // The writer takes no group past a bounded digest backlog.
+            if (push % 64 == 63)
+                take(co_await drive.lifecycle(w.writer->digest_caught_up()));
+        }
+        const auto after = cache.snapshot();
+        require(every, "a reader at the tail missed or misread a group");
+        require(
+          runs.tail_device_reads() == 0 && runs.dropped() == 0
+            && after.uncached == before.uncached && after.waits == before.waits
+            && w.writer->progress()->durable.bytes == w.start,
+          "a reader at the tail read the device, or waited for a barrier");
+        require(
+          after.main_bytes == 0 && after.evicted != before.evicted,
+          "a session used one of the tail's runs twice");
+        require(!w.writer->failure().failed(), "a tail failed its segment");
+    } catch (...) {
+        failed.observe(std::current_exception());
+    }
+    reader.reset();
+    co_await close_tail(w, failed, drive);
+    take(failed.outcome());
+}
+
+// What may be read never passes the groups its writer has made. The owner
+// reports a group once its WAL barrier passed, and the writer makes it on
+// its own fiber; a report that comes first is told to readers only as far
+// as the groups made so far, and the rest once the group is made. Until
+// then a session extended to what may be read stops at the last group made,
+// and the writer gives none of the new group's bytes.
+template<
+  runtime::monotonic_clock Clock,
+  typename Backend,
+  typename Owner,
+  typename Driver>
+seastar::future<> reported_before_made(
+  Backend& files,
+  Owner& owner,
+  const local_device_spec& spec,
+  workload_budget& resources,
+  Driver drive) {
+    seastar::abort_source abort;
+    codec::cooperative_work work{codec::limits::defaults(), abort};
+    co_await installation::bootstrap(
+      files, owner, spec, resources, work, drive);
+    auto world = co_await open_tail<Clock>(
+      files, owner, spec, resources, work, drive, {.limits = run_limits()});
+    auto& w = *world;
+    auto& runs = *w.runs;
+    std::optional<segment_reader> reader;
+    runtime::first_failure failed;
+    try {
+        seastar::abort_source asking;
+        const segment_read_bounds unread{
+          .durable = w.start,
+          .sealed = std::nullopt,
+          .visible = model::range_logical_end{w.first() + 64}};
+        runs.establish(1);
+        {
+            auto view = take(
+              co_await drive.lifecycle(w.writer->pin_data(work)));
+            reader.emplace(take(
+              segment_reader::open(
+                runs,
+                segment_data_source{std::move(view.pin)},
+                unread,
+                active_read_index(*w.index),
+                resources,
+                one_ahead)));
+        }
+        const auto made = co_await write_tail(w, 0, resources, work, drive);
+        take(w.writer->report(made));
+        require(
+          runs.durable_position() == made.end().bytes,
+          "a group made and reported was not told to its readers");
+
+        std::vector<encoded_assigned_batch> batches;
+        batches.push_back(
+          co_await segments::execution_child(w.first() + 1, work));
+        auto [group, bytes] = co_await segments::encoded_group(
+          *w.writer, std::move(batches), resources, work, w.prefix);
+        w.stored += bytes;
+        // Nothing suspends from here until the read: the writer's fiber
+        // cannot make the group in between.
+        const auto cut = group.layout().boundary();
+        auto submitted = take(w.writer->submit(std::move(group), work));
+        take(w.writer->report(cut));
+        const auto unmade = w.writer->held_bytes(
+          made.end().bytes, cut.end().bytes);
+        require(
+          w.writer->progress()->reported.bytes == cut.end().bytes
+            && runs.durable_position() == made.end().bytes && !unmade
+            && unmade.error().code() == errc::out_of_range,
+          "a report past the groups made was told to readers, or the "
+          "writer gave bytes it has not made");
+        auto bounds = unread;
+        bounds.durable = runs.durable_position();
+        take(reader->extend(bounds));
+        const auto before = co_await drive.lifecycle(
+          reader->read(offset(w.first()), byte_count{1_MiB}, asking));
+        require(
+          w.matches(before, 0, 1)
+            && before.stop == segment_read_stop::short_of_visibility,
+          "a session read past the last group made");
+
+        take((co_await drive.lifecycle(std::move(submitted.written)))
+               .failure.outcome());
+        co_await drive.lifecycle(runs.settled());
+        bounds.durable = runs.durable_position();
+        take(reader->extend(bounds));
+        const auto after = co_await drive.lifecycle(
+          reader->read(offset(w.first()), byte_count{1_MiB}, asking));
+        require(
+          bounds.durable == cut.end().bytes && w.matches(after, 0, 2)
+            && after.stop == segment_read_stop::short_of_visibility,
+          "a reported group once made was not told to its readers");
+        require(
+          !w.writer->failure().failed(), "reading the tail failed a segment");
+    } catch (...) {
+        failed.observe(std::current_exception());
+    }
+    reader.reset();
+    co_await close_tail(w, failed, drive);
+    take(failed.outcome());
+}
+
+// `bytes` in an allocation of their own, or presented from one `backing`
+// times their length, as a small batch is in a large frame.
+inline bytes::fragmented_buffer
+backed(const std::string& bytes, std::uint64_t backing) {
+    if (backing == 1) return buffer(bytes);
+    std::string whole(bytes.size() * backing, '\0');
+    std::ranges::copy(bytes, whole.begin());
+    return buffer(whole).share(byte_count{0}, byte_count{bytes.size()}).value();
+}
+// Where a buffer's first fragment presents its bytes, as a number.
+inline std::uintptr_t presented_at(const bytes::fragmented_buffer& bytes) {
+    return reinterpret_cast<std::uintptr_t>(bytes.fragment_at(0)->data());
+}
+
+// A reader that comes before the feed's own work took what it wants takes
+// it itself, in order and as that work would: a group handed over and made
+// readable is read from memory at once, with nothing read from the device.
+// It takes no further than the group that holds its offset, stops at a
+// group after one that was not kept and at a lapse that work has not
+// handled, copies at most one run's worth a call, and takes nothing when no
+// group waiting holds its offset; the rest is the feed's own, which still
+// settles. Groups of several blocks are fed and taken alike. A fed fragment
+// that fills its allocation is shared, and the run is charged for that
+// allocation; one that keeps an allocation four times its length alive is
+// copied, unless the runs copy everything. Either stays whole and charged
+// once whoever handed it over lets go of its own.
+//
+// The writer's groups are recorded as it tells them and handed over to runs
+// of the case's own, so that nothing runs between handing over and reading.
+template<
+  runtime::monotonic_clock Clock,
+  typename Backend,
+  typename Owner,
+  typename Driver>
+seastar::future<> woken_tail(
+  Backend& files,
+  Owner& owner,
+  const local_device_spec& spec,
+  workload_budget& resources,
+  Driver drive) {
+    using writer_type = segment_writer<Backend, Owner, Clock>;
+    seastar::abort_source abort;
+    codec::cooperative_work work{codec::limits::defaults(), abort};
+    co_await installation::bootstrap(
+      files, owner, spec, resources, work, drive);
+    auto config = segments::configuration();
+    config.maximum_groups = 8;
+    config.admission.working_bytes = byte_count{1_MiB};
+    config.admission.maximum_blocks = 32;
+    const auto described = segments::descriptor();
+    const auto unit = described.alignment.bytes().value();
+    const auto stride = paired_stride();
+    auto cache = take(
+      page_cache::make(resources, {.capacity = byte_count{2_MiB}}));
+    auto writer = take(
+      writer_type::make_new(
+        files,
+        owner,
+        spec,
+        0,
+        described,
+        segments::logical_origin(),
+        resources,
+        config));
+    // What the writer made of each group, as it told it.
+    struct made_group final {
+        std::vector<segment_block_layout> blocks;
+        runtime::file_position begin;
+        std::string bytes;
+    };
+    std::vector<made_group> made;
+    made.reserve(16);
+    std::vector<segment_block_layout> told;
+    told.reserve(8);
+    bool wanted = true;
+    // Runs of the case's own, the index each chooses anchors in, and what
+    // the writer would have reported to.
+    struct replay final {
+        std::unique_ptr<active_sparse_index> index;
+        std::unique_ptr<segment_runs> runs;
+        std::optional<segment_block_observer> observer;
+    };
+    std::vector<replay> replays;
+    replays.reserve(8);
+    runtime::first_failure failed;
+    try {
+        take(co_await drive.lifecycle(writer->create_new(work)));
+        take(writer->observe_blocks(
+          segment_block_observer{
+            [&told](std::span<const segment_block_layout> blocks) noexcept {
+                told.assign(blocks.begin(), blocks.end());
+            },
+            [](runtime::file_position) noexcept {},
+            [&made, &told](
+              runtime::file_position at,
+              bytes::fragmented_buffer& bytes,
+              const workload_reservation&) noexcept {
+                try {
+                    made.push_back(made_group{told, at, flat(bytes)});
+                } catch (...) {
+                    made.clear();
+                }
+            },
+            &wanted}));
+        const auto history
+          = take(co_await drive.lifecycle(writer->pin_data(work))).history;
+        const auto first = history.logical_origin.value();
+        // Eight groups of one block, then one of three.
+        segments::written_prefix prefix;
+        std::optional<segment_captured_boundary> cut;
+        for (std::uint64_t group = 0; group < 9; ++group) {
+            std::vector<encoded_assigned_batch> batches;
+            if (group == 0)
+                batches.push_back(co_await segments::child(work));
+            else if (group < 8)
+                batches.push_back(
+                  co_await segments::execution_child(first + group, work));
+            else
+                for (std::uint64_t at = 8; at < 11; ++at)
+                    batches.push_back(
+                      co_await segments::execution_child(first + at, work));
+            cut.emplace(
+              (co_await segments::write_group(
+                 *writer, std::move(batches), resources, work, drive, prefix))
+                .first);
+        }
+        take(
+          (co_await drive.lifecycle(writer->barrier(*cut))).failure.outcome());
+        require(
+          made.size() == 9 && made[0].bytes.size() == unit
+            && made[8].blocks.size() == 3,
+          "the writer's groups were not recorded as they were made");
+        const auto end = cut->end().bytes;
+        const auto stored = co_await store_contract::read_all_bytes(
+          files, indexes::data_path(spec), drive);
+        std::vector<segment_block_layout> blocks;
+        for (const auto& group : made)
+            blocks.insert(
+              blocks.end(), group.blocks.begin(), group.blocks.end());
+        // Whether `read` returned `count` batches from block `from`.
+        const auto matches =
+          [&](const segment_read& read, std::size_t from, std::size_t count) {
+              if (read.batches.size() != count) return false;
+              for (std::size_t i = 0; i < count; ++i) {
+                  const auto& block = blocks[from + i].records;
+                  if (
+                    read.batches[i].logical != block.logical()
+                    || flat(read.batches[i].bytes)
+                         != batch_at(stored, block.bytes().begin().value()))
+                      return false;
+              }
+              return true;
+          };
+
+        const auto replay_with =
+          [&](segment_runs_config runs_config) -> replay& {
+            replay made_runs;
+            made_runs.index = std::make_unique<active_sparse_index>(take(
+              active_sparse_index::make(
+                stride,
+                sparse_index_capacity(
+                  stride,
+                  described.maximum_data_bytes,
+                  config.admission.maximum_blocks),
+                resources)));
+            made_runs.runs = take(
+              segment_runs::make(
+                *cache, resources, history, std::move(runs_config)));
+            made_runs.observer.emplace(
+              made_runs.runs->observer(*made_runs.index));
+            // Everything it is handed is in the file already.
+            made_runs.observer->written(end);
+            made_runs.runs->establish(1);
+            replays.push_back(std::move(made_runs));
+            return replays.back();
+        };
+        // Hands group `g` over as its writer did, in a backing `backing`
+        // times its length, which the case lets go of at once. Where the
+        // bytes it handed over lay.
+        const auto hand =
+          [&](replay& to, std::size_t g, std::uint64_t backing = 1) {
+              const auto& group = made[g];
+              to.observer->blocks(group.blocks);
+              auto bytes = backed(group.bytes, backing);
+              auto paid = take(
+                resources.try_reserve(byte_count{group.bytes.size()}));
+              to.observer->fed(group.begin, bytes, paid);
+              return presented_at(bytes);
+          };
+        // Everything up to group `g`'s end may be read.
+        const auto readable = [&](replay& to, std::size_t g) {
+            to.observer->durable(
+              runtime::file_position{
+                made[g].begin.value() + made[g].bytes.size()});
+        };
+        const auto session =
+          [&](replay& on) -> seastar::future<segment_reader> {
+            auto view = take(co_await drive.lifecycle(writer->pin_data(work)));
+            co_return take(
+              segment_reader::open(
+                *on.runs,
+                segment_data_source{std::move(view.pin)},
+                {.durable = history.data_start,
+                 .sealed = std::nullopt,
+                 .visible = model::range_logical_end{first + 64}},
+                active_read_index(*on.index),
+                resources,
+                one_ahead));
+        };
+        const auto widen = [&](segment_reader& reader, replay& on) {
+            take(reader.extend(
+              {.durable = on.runs->durable_position(),
+               .sealed = std::nullopt,
+               .visible = model::range_logical_end{first + 64}}));
+        };
+        seastar::abort_source asking;
+        const byte_count all{1_MiB};
+        {
+            // Three groups, readable and read before the feed's own work
+            // runs: each is taken in its turn, from memory. The first
+            // fills its allocation and is shared; the second is a quarter
+            // of its own and is copied.
+            auto& on = replay_with({.limits = run_limits()});
+            auto reader = co_await session(on);
+            const auto dense = hand(on, 0);
+            const auto sparse = hand(on, 1, 4);
+            static_cast<void>(hand(on, 2));
+            readable(on, 2);
+            widen(reader, on);
+            const auto queued = on.runs->waiting();
+            const auto before = cache->snapshot();
+            auto pending = reader.read(offset(first), all, asking);
+            const auto left = on.runs->waiting();
+            const auto read = co_await drive.lifecycle(std::move(pending));
+            const auto after = cache->snapshot();
+            require(
+              queued == 3 && left == 0 && matches(read, 0, 3)
+                && after.uncached == before.uncached
+                && after.loads == before.loads + 2
+                && on.runs->tail_device_reads() == 0,
+              "groups waiting to be taken were not taken in order by the "
+              "reader that wanted them, or were read from the device");
+            const auto kept = on.runs->floor(offset(first));
+            require(
+              kept && kept->blocks().size() == 2,
+              "a run caught up and readable is not the cache's");
+            const auto shared = presented_at(take(kept->batch(0)));
+            const auto copied = presented_at(take(kept->batch(1)));
+            require(
+              shared >= dense && shared < dense + unit
+                && (copied < sparse || copied >= sparse + 4 * unit)
+                && kept->charge().value() >= 2 * unit
+                && kept->charge().value() < 5 * unit,
+              "a dense fragment was not shared, a sparse one was not copied, "
+              "or the run was not charged what it keeps alive");
+            // The feed's own work settles with nothing left to it.
+            co_await drive.lifecycle(on.runs->settled());
+        }
+        {
+            // Runs that copy everything copy even a dense fragment.
+            auto& on = replay_with({.limits = run_limits(), .copy_fed = true});
+            auto reader = co_await session(on);
+            const auto dense = hand(on, 0);
+            readable(on, 0);
+            widen(reader, on);
+            const auto read = co_await drive.lifecycle(
+              reader.read(offset(first), all, asking));
+            const auto copied = presented_at(read.batches.at(0).bytes);
+            require(
+              matches(read, 0, 1) && (copied < dense || copied >= dense + unit),
+              "runs that copy what is fed shared it");
+        }
+        {
+            // A group that was not kept between two waiting groups: the
+            // reader takes the first and leaves the one after the gap, and
+            // reads the stretch it wants from the device.
+            auto& on = replay_with({.limits = run_limits()});
+            auto reader = co_await session(on);
+            static_cast<void>(hand(on, 0));
+            on.observer->blocks(made[1].blocks);
+            {
+                // Longer than any run: not kept.
+                auto oversized = buffer(std::string(2_MiB, 'x'));
+                auto paid = take(resources.try_reserve(byte_count{unit}));
+                on.observer->fed(made[1].begin, oversized, paid);
+            }
+            static_cast<void>(hand(on, 2));
+            readable(on, 2);
+            widen(reader, on);
+            const auto before = cache->snapshot();
+            auto pending = reader.read(offset(first + 2), all, asking);
+            const auto left = on.runs->waiting();
+            const auto read = co_await drive.lifecycle(std::move(pending));
+            require(
+              on.runs->dropped() == 1 && left == 1 && matches(read, 2, 1)
+                && cache->snapshot().uncached == before.uncached + 1
+                && on.runs->tail_device_reads() == 1,
+              "a reader took a group past one that was not kept, or did not "
+              "read that stretch from the device");
+        }
+        {
+            // A lapse the feed's own work has not handled: nothing is
+            // taken past it.
+            auto& on = replay_with({.limits = run_limits()});
+            auto reader = co_await session(on);
+            static_cast<void>(hand(on, 0));
+            on.runs->establish(0);
+            readable(on, 0);
+            widen(reader, on);
+            const auto before = cache->snapshot();
+            auto pending = reader.read(offset(first), all, asking);
+            const auto left = on.runs->waiting();
+            const auto read = co_await drive.lifecycle(std::move(pending));
+            require(
+              left == 1 && matches(read, 0, 1)
+                && cache->snapshot().uncached == before.uncached + 1,
+              "a reader took what was handed over past a lapse");
+        }
+        {
+            // At most one run's worth of copies a call. Copied, four
+            // groups take two calls; shared, one.
+            auto limits = run_limits();
+            limits.run_bytes = byte_count{2 * unit};
+            auto& copying = replay_with({.limits = limits});
+            for (std::size_t g = 0; g < 4; ++g)
+                static_cast<void>(hand(copying, g, 4));
+            readable(copying, 3);
+            const bool none = copying.runs->catch_up(offset(first + 100));
+            const bool once = copying.runs->catch_up(offset(first + 3));
+            const auto after_once = copying.runs->waiting();
+            const bool twice = copying.runs->catch_up(offset(first + 3));
+            auto& sharing = replay_with({.limits = limits});
+            for (std::size_t g = 0; g < 4; ++g)
+                static_cast<void>(hand(sharing, g));
+            readable(sharing, 3);
+            const bool whole = sharing.runs->catch_up(offset(first + 3));
+            require(
+              !none && once && after_once == 2 && twice
+                && copying.runs->waiting() == 0 && whole
+                && sharing.runs->waiting() == 0,
+              "a call took more than one run's worth of copies, or took "
+              "what no reader wanted");
+        }
+        {
+            // A group of three blocks, the first runs of their own: fed and
+            // caught up whole.
+            auto& on = replay_with({.limits = run_limits()});
+            auto reader = co_await session(on);
+            static_cast<void>(hand(on, 8));
+            readable(on, 8);
+            widen(reader, on);
+            const auto before = cache->snapshot();
+            const auto read = co_await drive.lifecycle(
+              reader.read(offset(first + 8), all, asking));
+            require(
+              matches(read, 8, 3)
+                && cache->snapshot().uncached == before.uncached,
+              "a group of several blocks was not fed and caught up whole");
+        }
+    } catch (...) {
+        failed.observe(std::current_exception());
+    }
+    for (auto& made_runs : replays) {
+        try {
+            failed.observe(co_await drive.lifecycle(made_runs.runs->close()));
+        } catch (...) {
+            failed.observe(std::current_exception());
+        }
+    }
+    try {
+        failed.observe(co_await drive.lifecycle(writer->close()));
+    } catch (...) {
+        failed.observe(std::current_exception());
+    }
+    writer.reset();
+    replays.clear();
+    try {
+        co_await drive.lifecycle(cache->stop());
+    } catch (...) {
+        failed.observe(std::current_exception());
+    }
+    cache.reset();
+    take(failed.outcome());
+}
+
+// Readers of what is durable in at least one place and not in the file
+// yet: groups held in a run that the owner reported and the writer keeps in
+// memory. A fed run answers from the cache once what may be read reaches
+// its end, and not before. Runs that hold nothing of the held groups, as
+// after an eviction, read them from the writer's memory, with nothing read
+// from the device, which holds none of them; the same bytes come from the
+// device once the run is written. Runs that were fed read the tail with no
+// read of the device.
+template<
+  runtime::monotonic_clock Clock,
+  typename Backend,
+  typename Owner,
+  typename Driver>
+seastar::future<> held_reads(
+  Backend& files,
+  Owner& owner,
+  const local_device_spec& spec,
+  workload_budget& resources,
+  Driver drive) {
+    using writer_type = segment_writer<Backend, Owner, Clock>;
+    seastar::abort_source abort;
+    codec::cooperative_work work{codec::limits::defaults(), abort};
+    co_await installation::bootstrap(
+      files, owner, spec, resources, work, drive);
+    auto config = segments::configuration();
+    config.admission.working_bytes = byte_count{1_MiB};
+    config.admission.maximum_blocks = 16;
+    const auto described = segments::descriptor();
+    const auto unit = described.alignment.bytes().value();
+    // Every second block of 3000 bytes is an anchor.
+    const sparse_index_stride stride{byte_count{6000}};
+    const auto make_index = [&] {
+        return std::make_unique<active_sparse_index>(take(
+          active_sparse_index::make(
+            stride,
+            sparse_index_capacity(
+              stride,
+              described.maximum_data_bytes,
+              config.admission.maximum_blocks),
+            resources)));
+    };
+    auto fed_index = make_index();
+    auto plain_index = make_index();
+    auto cache = take(
+      page_cache::make(resources, {.capacity = byte_count{2_MiB}}));
+    auto writer = take(
+      writer_type::make_new(
+        files,
+        owner,
+        spec,
+        0,
+        described,
+        segments::logical_origin(),
+        resources,
+        config));
+    std::unique_ptr<segment_runs> fed, plain;
+    // What each of the two runs is told; the writer's observer refers to
+    // them until its close.
+    std::optional<segment_block_observer> to_fed, to_plain;
+    runtime::first_failure failed;
+    try {
+        take(co_await drive.lifecycle(writer->create_new(work)));
+        const auto history
+          = take(co_await drive.lifecycle(writer->pin_data(work))).history;
+        const auto first = history.logical_origin.value();
+        const auto make_runs = [&] {
+            return take(
+              segment_runs::make(
+                *cache, resources, history, {.limits = run_limits()}));
+        };
+        fed = make_runs();
+        plain = make_runs();
+        fed->establish(1);
+        // Both are told everything the writer tells; only one is handed
+        // the bytes.
+        to_fed.emplace(fed->observer(*fed_index));
+        to_plain.emplace(plain->observer(*plain_index));
+        segment_block_observer both{
+          [&to_fed,
+           &to_plain](std::span<const segment_block_layout> blocks) noexcept {
+              to_fed->blocks(blocks);
+              to_plain->blocks(blocks);
+          },
+          [&to_fed, &to_plain](runtime::file_position end) noexcept {
+              to_fed->durable(end);
+              to_plain->durable(end);
+          },
+          [&to_fed](
+            runtime::file_position at,
+            bytes::fragmented_buffer& bytes,
+            const workload_reservation& paid) noexcept {
+              to_fed->fed(at, bytes, paid);
+          },
+          to_fed->wanted};
+        both.written = [&to_fed,
+                        &to_plain](runtime::file_position end) noexcept {
+            to_fed->written(end);
+            to_plain->written(end);
+        };
+        both.reported = [&to_fed,
+                         &to_plain](runtime::file_position end) noexcept {
+            to_fed->reported(end);
+            to_plain->reported(end);
+        };
+        take(writer->observe_blocks(std::move(both)));
+
+        constexpr std::uint64_t block = 3000;
+        const byte_count hold{2 * unit};
+        const auto start = writer->progress()->reserved.bytes;
+        segments::written_prefix prefix;
+        std::string expected;
+        std::vector<segment_captured_boundary> cuts;
+        for (std::uint64_t i = 0; i != 3; ++i) {
+            auto [cut, submitted, bytes, records]
+              = co_await segments::submit_held(
+                *writer,
+                co_await segments::block_child(first + i, block, work),
+                hold,
+                resources,
+                work,
+                prefix);
+            take((co_await drive.lifecycle(std::move(submitted.written)))
+                   .failure.outcome());
+            require(
+              !cut.footer() && bytes.size() == block,
+              "a block below its run's hold was not held");
+            expected += bytes;
+            cuts.push_back(cut);
+        }
+        const auto matches =
+          [&](const segment_read& read, std::uint64_t from, std::size_t count) {
+              if (read.batches.size() != count) return false;
+              for (std::size_t i = 0; i < count; ++i)
+                  if (
+                    read.batches[i].logical.begin().value() != first + from + i
+                    || flat(read.batches[i].bytes)
+                         != batch_at(expected, (from + i) * block))
+                      return false;
+              return true;
+          };
+        co_await drive.lifecycle(fed->settled());
+        require(
+          fed->pending() == 2 && writer->progress()->written.bytes == start
+            && !fed->floor(offset(first)),
+          "held groups were not fed, or answered from the cache before "
+          "anything was reported");
+        // Reported up to one block short of the first run's end: it is not
+        // the cache's yet. Reported to its end: it is.
+        take(writer->report(cuts[0]));
+        co_await drive.lifecycle(fed->settled());
+        require(
+          fed->durable_position() == cuts[0].end().bytes && fed->pending() == 2
+            && !fed->floor(offset(first)),
+          "a fed run that ends past what may be read answered from the "
+          "cache");
+        take(writer->report(cuts[1]));
+        co_await drive.lifecycle(fed->settled());
+        {
+            const auto kept = fed->floor(offset(first));
+            require(
+              kept && kept->end() == cuts[1].end().bytes && fed->pending() == 1,
+              "a fed run that what may be read reached did not answer from "
+              "the cache");
+        }
+
+        seastar::abort_source asking;
+        const byte_count all{1_MiB};
+        const auto session = [&](segment_runs& on, active_sparse_index& index)
+          -> seastar::future<segment_reader> {
+            auto view = take(co_await drive.lifecycle(writer->pin_data(work)));
+            co_return take(
+              segment_reader::open(
+                on,
+                segment_data_source{std::move(view.pin)},
+                {.durable = std::max(view.durable, view.reported),
+                 .sealed = std::nullopt,
+                 .visible = model::range_logical_end{first + 64}},
+                active_read_index(index),
+                resources,
+                one_ahead,
+                nullptr,
+                [&writer](
+                  runtime::file_position position, runtime::file_position end) {
+                    return writer->held_bytes(position, end);
+                }));
+        };
+        {
+            // Runs that hold nothing of the held groups read them from the
+            // writer's memory: the file holds none of them.
+            auto reader = co_await session(*plain, *plain_index);
+            const auto from_memory = co_await drive.lifecycle(
+              reader.read(offset(first), all, asking));
+            const auto size = take(
+                                co_await drive.lifecycle(
+                                  files.stat(indexes::data_path(spec))))
+                                .size.value();
+            require(
+              reader.bounds().durable == cuts[1].end().bytes
+                && matches(from_memory, 0, 2)
+                && from_memory.stop == segment_read_stop::short_of_visibility
+                && size == start.value(),
+              "what was reported and held was not read from the writer's "
+              "memory");
+            // Once the run is written, the same bytes from the device.
+            take(co_await drive.lifecycle(writer->materialize()));
+            const auto from_device = co_await drive.lifecycle(
+              reader.read(offset(first), all, asking));
+            const auto written = writer->progress()->written.bytes;
+            require(
+              written.value() > start.value() + 3 * block
+                && same_read(from_memory, from_device)
+                && !writer->held_bytes(start, cuts[0].end().bytes)
+                && !writer->held_bytes(
+                  written, runtime::file_position{written.value() + 1}),
+              "the run once written read other than it did from memory, or "
+              "the writer gave bytes it does not hold");
+        }
+        {
+            // Runs that were fed read every held group with no read of the
+            // tail from the device.
+            take(writer->report(cuts[2]));
+            co_await drive.lifecycle(fed->settled());
+            auto reader = co_await session(*fed, *fed_index);
+            const auto before = cache->snapshot();
+            const auto tail = co_await drive.lifecycle(
+              reader.read(offset(first), all, asking));
+            require(
+              matches(tail, 0, 3)
+                && cache->snapshot().uncached == before.uncached
+                && fed->tail_device_reads() == 0,
+              "a fed tail of held groups was read from the device");
+        }
+        require(
+          !writer->failure().failed(), "reading held groups failed a segment");
+    } catch (...) {
+        failed.observe(std::current_exception());
+    }
+    for (auto* held : {&fed, &plain}) {
+        if (!*held) continue;
+        try {
+            failed.observe(co_await drive.lifecycle((*held)->close()));
+        } catch (...) {
+            failed.observe(std::current_exception());
+        }
+    }
+    try {
+        failed.observe(co_await drive.lifecycle(writer->close()));
+    } catch (...) {
+        failed.observe(std::current_exception());
+    }
+    // The writer's observer refers to the runs and the indexes until here.
+    writer.reset();
+    fed.reset();
+    plain.reset();
+    try {
+        co_await drive.lifecycle(cache->stop());
+    } catch (...) {
+        failed.observe(std::current_exception());
+    }
+    cache.reset();
     take(failed.outcome());
 }
 

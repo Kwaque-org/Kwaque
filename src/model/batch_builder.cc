@@ -7,6 +7,7 @@
 
 #include <seastar/core/coroutine.hh>
 
+#include <algorithm>
 #include <cstdint>
 #include <exception>
 #include <utility>
@@ -42,6 +43,7 @@ batch_builder::batch_builder(batch_builder&& other) noexcept
   , descriptor_charge_(other.descriptor_charge_)
   , output_(std::move(other.output_))
   , timestamp_base_(other.timestamp_base_)
+  , max_record_time_(other.max_record_time_)
   , count_(other.count_)
   , headers_(other.headers_)
   , closed_(other.closed_) {
@@ -132,6 +134,9 @@ seastar::future<codec::result<void>> batch_builder::append(
       output_->size() == *total,
       "complete record append differs from checked accounting");
     timestamp_base_ = base;
+    max_record_time_ = count_.value() == 0
+                         ? timestamp
+                         : std::max(max_record_time_, timestamp);
     count_ = item_count{count_.value() + 1U};
     headers_ = *next_headers;
     co_return codec::result<void>{};
@@ -252,7 +257,8 @@ seastar::future<codec::result<submitted_batch>> batch_builder::finalize(
         if (exception) std::rethrow_exception(exception);
         co_return codec::failure(*failed);
     }
-    co_return submitted_batch{*context, *digest, headers_, std::move(records)};
+    co_return submitted_batch{
+      *context, *digest, headers_, max_record_time_, std::move(records)};
 }
 
 seastar::future<> batch_builder::close(codec::cooperative_work& work) & {

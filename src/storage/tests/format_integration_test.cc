@@ -208,13 +208,24 @@ std::string make_block(
         alignment(1024),
         runtime::file_position{8192 + (sequence - 4) * 1024})
         .value(),
+      runtime::file_position{8192},
       expected.location,
       expected.data_start,
       original_binding().routing_epoch(),
       original_expected(sequence)};
+    // Append times follow the batches' order; nothing is certified yet.
+    const wal_prepare_stamps stamps{
+      true,
+      runtime::wall_time{static_cast<std::int64_t>(1000 + sequence)},
+      expected.data_start,
+      wal.wal_data_start};
+    // The latest record time over the retained records only.
+    const runtime::wall_time latest{sparse ? 99 : 110};
+    EXPECT_EQ(child.info().max_record_time, latest);
     auto wire = encode_wal_prepare(
                   std::move(child),
                   wal,
+                  stamps,
                   work,
                   operation_budget().operation_remaining,
                   charge,
@@ -236,10 +247,16 @@ std::string make_block(
         EXPECT_TRUE(decoded.value.batch().bytes().content_equals(child_wire));
         EXPECT_EQ(
           decoded.value.batch().info().fingerprint, original_digest(sequence));
+        EXPECT_EQ(decoded.value.stamps(), stamps);
+        EXPECT_EQ(decoded.value.batch().info().max_record_time, latest);
+        // The block made from the PREPARE carries its append time and target
+        // stamp.
+        const auto carried = decoded.value.stamps();
         auto extracted = std::move(decoded.value).release_batch();
         return encode_segment_block(
                  std::move(extracted),
                  expected,
+                 {carried.append_time, carried.target_certified_end},
                  work,
                  operation_budget().operation_remaining,
                  charge)
@@ -247,6 +264,8 @@ std::string make_block(
           .value();
     }();
     EXPECT_EQ(block.descriptor().context(), expected.location.segment());
+    EXPECT_EQ(block.descriptor().batch().max_record_time, latest);
+    EXPECT_EQ(block.descriptor().stamps().append_time, stamps.append_time);
     EXPECT_EQ(
       block.descriptor().batch().context.submitted().id(),
       batch_identity(sequence));
@@ -355,7 +374,9 @@ void verify_manifest(
                                h.segment.segment(),
                                h.segment.generation(),
                                evidence.boundary().coverage,
-                               *evidence.digest())
+                               *evidence.digest(),
+                               evidence.boundary().times.max_append,
+                               evidence.boundary().times.max_record)
                                .value()};
     const auto page_header = manifest::page_header(1, mc, 100, 110);
     auto page_wire = encode_range_manifest_page(
@@ -526,11 +547,8 @@ TEST(
                 const auto context = sc(
                   static_cast<std::uint8_t>(sparse ? 0x80 : 0x30),
                   sparse ? 11U : 9U);
-                const auto expected_header = segment_header::make(
-                                               context,
-                                               model::range_logical_end{100},
-                                               alignment())
-                                               .value();
+                const auto expected_header
+                  = segment_header::make(context, alignment()).value();
                 auto header_bytes = encode_segment_header(
                                       expected_header,
                                       work,
@@ -623,10 +641,11 @@ TEST(
                                 {},
                                 extent_integrity::crc32c_and_digest)
                                 .value();
-                const auto add_data = [&](std::size_t i) {
+                const auto add_data = [&](
+                                        extent_verifier& walk, std::size_t i) {
                     auto bytes = buffer(blocks[i], width);
                     const auto memory = reserve_current(bytes, work);
-                    extent
+                    walk
                       .add_block(
                         std::move(bytes),
                         original_expected(4U + i),
@@ -635,14 +654,14 @@ TEST(
                       .get()
                       .value();
                 };
-                add_data(0);
+                add_data(extent, 0);
                 const auto footer_memory = reserve_current(middle, work);
                 extent
                   .add_footer(
                     std::move(middle), footer_memory, work, prefix_proof)
                   .get()
                   .value();
-                add_data(1);
+                add_data(extent, 1);
                 const auto evidence = extent.finish(work).value();
                 EXPECT_EQ(evidence.boundary().coverage, coverage);
                 EXPECT_EQ(evidence.boundary().block_count, 2U);
@@ -662,9 +681,10 @@ TEST(
                                operation_budget().operation_remaining,
                                charge)
                                .get()
-                               .value();
-                fragmented_buffer_parser footer_input{
-                  std::move(final).release_bytes()};
+                               .value()
+                               .release_bytes();
+                const auto final_wire = flat(final);
+                fragmented_buffer_parser footer_input{std::move(final)};
                 const auto footer = decode_durable_footer(
                                       footer_input,
                                       footer_location,
@@ -674,10 +694,47 @@ TEST(
                                       .value();
                 EXPECT_TRUE(footer_input.at_end());
                 EXPECT_TRUE(validate_durable_footer(footer, evidence));
+                // The sealed extent ends with the footer that closes the last
+                // write, and the root sits at that footer's aligned end.
+                const auto add_footer = [&](
+                                          extent_verifier& walk,
+                                          const std::string& wire,
+                                          const verified_extent& reference) {
+                    auto bytes = buffer(wire, width);
+                    const auto memory = reserve_current(bytes, work);
+                    walk.add_footer(std::move(bytes), memory, work, reference)
+                      .get()
+                      .value();
+                };
+                auto whole = extent_verifier::make(
+                               h,
+                               scope(
+                                 100,
+                                 110,
+                                 physical,
+                                 physical + 2 * retained,
+                                 first_position,
+                                 footer.encoded_extent().end().value()),
+                               work.policy(),
+                               sparse ? extent_layout_kind::rewrite
+                                      : extent_layout_kind::initial_append,
+                               {},
+                               extent_integrity::crc32c_and_digest)
+                               .value();
+                add_data(whole, 0);
+                add_footer(whole, middle_wire, prefix_proof);
+                add_data(whole, 1);
+                add_footer(whole, final_wire, evidence);
+                const auto sealed_extent = whole.finish(work).value();
+                ASSERT_TRUE(sealed_extent.digest());
+                EXPECT_EQ(
+                  sealed_extent.digest()->bytes(),
+                  exact_digest(
+                    blocks[0] + middle_wire + blocks[1] + final_wire));
                 const footer_expectation sealed_location{
                   h, footer.encoded_extent().end()};
                 auto sealed_wire = encode_sealed_footer(
-                                     evidence,
+                                     sealed_extent,
                                      sealed_location,
                                      0,
                                      {},
@@ -700,10 +757,11 @@ TEST(
                                 .get()
                                 .value();
                 EXPECT_TRUE(sealed_input.at_end());
-                EXPECT_TRUE(validate_sealed_footer(sealed.value, evidence));
+                EXPECT_TRUE(
+                  validate_sealed_footer(sealed.value, sealed_extent));
                 EXPECT_EQ(sealed.value.block_count(), 2U);
                 const std::array locations{first_location, second_location};
-                verify_metadata(evidence, blocks, locations, work);
+                verify_metadata(sealed_extent, blocks, locations, work);
             }
         }
     }

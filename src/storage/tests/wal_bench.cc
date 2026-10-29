@@ -159,16 +159,25 @@ struct wal_bench {
                               alignment(8192),
                               runtime::file_position{8192})
                               .value(),
+                            runtime::file_position{8192},
                             e.target,
                             e.target_data_start,
                             e.routing_epoch,
                             e.batch,
                             e.profile,
                             e.target_profile};
+                          // As the writer stamps its one member: it ends its
+                          // own write and certifies nothing.
+                          const wal_prepare_stamps stamps{
+                            true,
+                            wal_bench_support::child_time,
+                            context.target_data_start,
+                            context.wal_data_start};
                           const auto layout
                             = preflight_wal_prepare(
                                 child,
                                 context,
+                                envelope_placement::ends_span,
                                 work.policy(),
                                 {runtime::maximum_file_io_bytes,
                                  runtime::maximum_file_io_bytes})
@@ -186,6 +195,7 @@ struct wal_bench {
                           auto expected = (co_await encode_wal_prepare(
                                              std::move(alias),
                                              context,
+                                             stamps,
                                              work,
                                              byte_count{32_MiB},
                                              charge))
@@ -234,13 +244,17 @@ struct wal_bench {
                           }
                           auto admitted = take(
                             admitted_wal_batch::make(
-                              std::move(child), std::move(backing), charge));
+                              std::move(child),
+                              std::move(backing),
+                              stamps.append_time,
+                              charge));
                           auto group = take(wal_group::make(budget, 1));
                           std::optional<admitted_wal_batch::contents> reference;
                           if constexpr (Reference)
                               reference.emplace(std::move(admitted).release());
                           else
-                              take(group.append(std::move(admitted), e));
+                              take(group.append(
+                                std::move(admitted), e, e.target_data_start));
                           std::optional<runtime::file> direct;
                           std::optional<runtime::file::metadata_reservation>
                             metadata;
@@ -382,6 +396,7 @@ struct wal_bench {
                                         = preflight_wal_prepare(
                                             reference->batch,
                                             context,
+                                            envelope_placement::ends_span,
                                             work.policy(),
                                             {runtime::maximum_file_io_bytes,
                                              runtime::maximum_file_io_bytes})
@@ -393,6 +408,7 @@ struct wal_bench {
                                       output = (co_await encode_wal_prepare(
                                                   std::move(reference->batch),
                                                   context,
+                                                  stamps,
                                                   work,
                                                   byte_count{32_MiB},
                                                   charge))

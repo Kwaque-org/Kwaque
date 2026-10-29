@@ -21,6 +21,10 @@ parse_storage_profile(std::uint16_t value) noexcept;
 [[nodiscard]] result<replay_profile>
 parse_replay_profile(std::uint16_t value) noexcept;
 
+// The smallest storage alignment. Every file's data start is at or after it,
+// so a position of an object in a file's content is too.
+inline constexpr std::uint64_t minimum_storage_alignment_bytes = 512;
+
 // Encoded storage alignment, independently supplied by the caller. A valid
 // value does not attest to the alignment requirements of any open file/device.
 class storage_alignment final {
@@ -104,7 +108,8 @@ private:
 
 // Expected location of a segment object. physical_begin is a retained-record
 // boundary, including a representable terminal boundary; a later nonempty
-// append must separately check its physical end. No write is performed here.
+// append must separately check its physical end. The position need not be
+// aligned: only a write's start is. No write is performed here.
 class segment_write_context final {
 public:
     [[nodiscard]] static result<segment_write_context> make(

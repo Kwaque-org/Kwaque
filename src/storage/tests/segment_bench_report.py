@@ -12,6 +12,10 @@ else:
     from wal_cohort_report import PROFILE_KEYS, percentile
 
 PREFIX = "segment_bench_v1 "
+# A block's envelope header and fixed body before its child, and a durable
+# footer before its padding, at the writer's 32-byte headers.
+BLOCK_PREFIX_BYTES = 176
+FOOTER_BYTES = 248
 SCOPES = {
     "layout",
     "encode_evidence",
@@ -447,6 +451,19 @@ def summarize(rows: list[dict]) -> dict:
         result["native_write_amplification_over_child_wire"] = (
             sum(row["native_bytes"] for row in rows) / total if total else None
         )
+        first = rows[0]
+        if first["blocks"] == 1 and first["groups"]:
+            # One batch to a group: each group writes its block and the
+            # footer that pads it, from the group's aligned start.
+            writes = first["groups"] * first["segments"]
+            child = first["child_bytes"] // writes
+            unit = first["alignment"]
+            span = child + BLOCK_PREFIX_BYTES + FOOTER_BYTES
+            result["packed_device_bytes"] = writes * -(-span // unit) * unit
+            result["native_bytes_over_packed"] = (
+                percentile([row["native_bytes"] for row in rows], 0.5)
+                / result["packed_device_bytes"]
+            )
     if rows[0]["memory_observed"]:
         result["new_native_peak_upper_bound"] = max(row["memory_peak"] for row in rows)
         result["critical_peak_upper_bound"] = max(

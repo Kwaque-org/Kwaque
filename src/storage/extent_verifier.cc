@@ -4,6 +4,7 @@
 #include "src/storage/format_internal.h"
 #include "src/storage/page_internal.h"
 
+#include <algorithm>
 #include <exception>
 #include <limits>
 
@@ -41,6 +42,7 @@ extent_verifier::extent_verifier(extent_verifier&& other) noexcept
   , physical_(other.physical_)
   , position_(other.position_)
   , last_(other.last_)
+  , times_(other.times_)
   , count_(other.count_)
   , crc_(other.crc_)
   , state_(other.state_)
@@ -66,7 +68,6 @@ codec::result<extent_verifier> extent_verifier::make(
         || (kind != extent_layout_kind::initial_append && kind != extent_layout_kind::rewrite)
         || expected.logical().begin() < history.logical_origin || expected.physical().begin() < history.physical_origin
         || expected.bytes().begin() < history.data_start || !history.alignment.aligned(expected.bytes().begin())
-        || !history.alignment.aligned(expected.bytes().end())
         || expected.physical().count().value() > expected.logical().count().value()
         || (!expected.physical().empty() && expected.bytes().empty())
         || (kind == extent_layout_kind::initial_append && expected.physical().empty() != expected.logical().empty()))
@@ -221,6 +222,7 @@ seastar::future<codec::result<resumed_extent>> extent_verifier::resume(
     verifier.physical_ = fields.coverage.physical().end();
     verifier.position_ = *end;
     verifier.last_ = fields.last_block;
+    verifier.times_ = fields.times;
     verifier.count_ = fields.block_count;
     verifier.crc_ = crc;
     co_return resumed_extent{std::move(verifier), **footer};
@@ -238,6 +240,7 @@ boundary_fields extent_verifier::prefix() const noexcept {
           .value()},
       count_,
       last_,
+      times_,
       crc_};
 }
 codec::result<void> extent_verifier::ready(
@@ -269,7 +272,6 @@ codec::result<void> extent_verifier::extend_expected(
         || next.logical().end() < logical_
         || next.physical().end() < physical_
         || next.bytes().end() < position_
-        || !history_.alignment.aligned(next.bytes().end())
         || next.logical().count().value() != next.physical().count().value()
         || (next.bytes().end() == position_
             && (next.logical().end() != logical_ || next.physical().end() != physical_))) {
@@ -316,7 +318,8 @@ codec::result<verified_extent> extent_verifier::finish(
         if (auto ready = work.poll(at(errc::success, context)); !ready)
             return codec::failure(ready.error());
     }
-    return verified_extent{history_, {expected_, count_, last_, crc_}, digest};
+    return verified_extent{
+      history_, {expected_, count_, last_, times_, crc_}, digest};
 }
 codec::result<verified_extent> extent_verifier::finish_prefix(
   codec::cooperative_work& work, codec::field_context context) {
@@ -375,7 +378,8 @@ codec::result<verified_extent> extent_verifier::finish(
     hasher.reset();
     if (auto ready = work.poll(at(errc::success, context)); !ready)
         return codec::failure(ready.error());
-    return verified_extent{history_, {expected_, count_, last_, crc_}, value};
+    return verified_extent{
+      history_, {expected_, count_, last_, times_, crc_}, value};
 }
 void extent_verifier::close() noexcept {
     KWAQUE_INVARIANT(
@@ -576,6 +580,7 @@ seastar::future<codec::result<void>> extent_verifier::add(
     auto physical = physical_;
     auto position = position_;
     auto last = last_;
+    auto times = times_;
     auto count = count_;
     auto crc = crc_;
     std::optional<codec::error> failed;
@@ -735,6 +740,19 @@ seastar::future<codec::result<void>> extent_verifier::add(
                     failed = at(errc::resource_exhausted, context);
                     break;
                 }
+                // Append times never decrease along a segment, as a time
+                // index never goes back; record times may.
+                const auto append = descriptor.stamps().append_time;
+                if (count != 0 && append < times.max_append) {
+                    failed = at(errc::malformed_data, context);
+                    break;
+                }
+                times = {
+                  count == 0 ? append : times.first_append,
+                  append,
+                  count == 0
+                    ? info.max_record_time
+                    : std::max(times.max_record, info.max_record_time)};
                 ++count;
                 logical = coverage.logical().end();
                 physical = coverage.physical().end();
@@ -822,6 +840,7 @@ seastar::future<codec::result<void>> extent_verifier::add(
     physical_ = physical;
     position_ = position;
     last_ = last;
+    times_ = times;
     count_ = count;
     crc_ = crc;
     state_ = state::open;

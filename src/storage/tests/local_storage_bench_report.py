@@ -7,6 +7,16 @@ group, footer and block counts.
 Requests that one WAL barrier made durable are not independent of each other:
 a tail quantile counts the barriers its requests took, and a p99.9 is given
 only over 3,000 of them.
+
+Placement mode compares today's composition with three that keep one barrier
+per group: segment_placed writes no WAL record; wal_placed acknowledges on the
+WAL and syncs its segments once after the last group; wal_held does the same
+but holds its segment writes until every group is acknowledged. All must
+store the same segment bytes before their times are compared.
+
+Writes mode compares each scope with itself on zero-written files, where
+small writes go through a synchronized handle and need no flush, against
+files that grow with every write. Both must store the same bytes.
 """
 
 from __future__ import annotations
@@ -22,7 +32,15 @@ else:
     from wal_cohort_report import PROFILE_KEYS, percentile
 
 PREFIX = "local_storage_bench_v1 "
-SCOPES = ("candidate", "baseline", "sequential")
+SCOPES = (
+    "candidate",
+    "baseline",
+    "sequential",
+    "segment_placed",
+    "wal_placed",
+    "wal_held",
+)
+PLACED = ("segment_placed", "wal_placed", "wal_held")
 ARRIVALS = ("held", "serial", "isolated", "burst", "paced")
 OBSERVED = ("isolated", "burst", "paced")
 KINDS = ("wal", "data", "other")
@@ -128,6 +146,11 @@ def validate_kind(row: dict, name: str) -> None:
     kind = row[name]
     for key in KIND_COUNTERS:
         integer(kind[key], f"{name} {key}")
+    if "synchronized_calls" in kind and (
+        integer(kind["synchronized_calls"], f"{name} synchronized_calls")
+        > kind["calls"]
+    ):
+        raise ValueError(f"{name} synchronized writes exceed its writes")
     flushes = kind["flush_times"]
     if kind["flush_times_complete"] is not True or len(flushes) != kind["flushes"]:
         raise ValueError(f"incomplete {name} flush timing")
@@ -181,14 +204,35 @@ def validate(row: dict) -> None:
     ):
         raise ValueError("stored blocks disagree with the offered requests")
     groups, footers, flushes = row["wal_groups"], row["footers"], row["wal_flushes"]
-    if arrival == "held":
-        fixed = groups == 1 and footers == segments
-    elif arrival in ("serial", "isolated"):
-        fixed = groups == requests and footers == requests
+    # On zero-written files a WAL barrier over synchronized writes alone
+    # issues no flush; each barrier then has one or the other.
+    synchronized = row.get("wal_barrier") == "synchronized"
+    wal_synchronized = row.get("wal_synchronized_writes", 0)
+    if synchronized:
+        integer(wal_synchronized, "wal_synchronized_writes")
+    if scope == "segment_placed":
+        # Nothing reaches the WAL; each group still ends with one footer a
+        # segment.
+        fixed = groups == 0 and flushes == 0
+        fixed = fixed and footers == (segments if arrival == "held" else requests)
     else:
-        fixed = 1 <= groups <= requests and segments <= footers <= requests
-    if not fixed or not 1 <= flushes <= groups:
+        if arrival == "held":
+            fixed = groups == 1 and footers == segments
+        elif arrival in ("serial", "isolated"):
+            fixed = groups == requests and footers == requests
+        else:
+            fixed = 1 <= groups <= requests and segments <= footers <= requests
+        if synchronized:
+            fixed = fixed and flushes <= groups and flushes + wal_synchronized >= 1
+        else:
+            fixed = fixed and 1 <= flushes <= groups
+    if not fixed:
         raise ValueError("group, footer or WAL barrier counts disagree with the cut")
+    # When the last request was acknowledged: never after the timed region.
+    if "ack_ns" in row and (
+        type(row["ack_ns"]) is not int or not 0 < row["ack_ns"] <= row["elapsed_ns"]
+    ):
+        raise ValueError("invalid acknowledgement time")
     if not digest(row["wal_digest"]) or (
         not isinstance(row["segment_digest"], list)
         or len(row["segment_digest"]) != segments
@@ -213,7 +257,10 @@ def validate(row: dict) -> None:
     else:
         for kind in KINDS:
             validate_kind(row, kind)
-        if row["wal"]["flushes"] != flushes or row["data"]["flushes"] < segments:
+        data = row["data"]["flushes"]
+        if synchronized:
+            data += row["data"].get("synchronized_calls", 0)
+        if row["wal"]["flushes"] != flushes or data < segments:
             raise ValueError("native flushes disagree with the barriers")
     if "reactor_flushes" in row:
         for key in REACTOR_KEYS:
@@ -221,7 +268,9 @@ def validate(row: dict) -> None:
         if row["wal_barrier"] not in BARRIERS or row["data_barrier"] not in BARRIERS:
             raise ValueError("unknown barrier")
         # Every barrier the WAL claims reached the device.
-        if row["reactor_flushes"] == 0 or row["reactor_flushes"] < flushes:
+        if row["reactor_flushes"] < flushes or (
+            row["reactor_flushes"] == 0 and not synchronized
+        ):
             raise ValueError("claimed barrier reached no device")
     if row["memory_observed"]:
         for key in ("memory_peak", "largest_allocation"):
@@ -277,6 +326,11 @@ def quantiles(values: list[int], groups: int) -> dict:
 
 
 def setup(row: dict) -> tuple:
+    return (*conditions(row), row.get("wal_barrier"), row.get("data_barrier"))
+
+
+def conditions(row: dict) -> tuple:
+    """Everything a row was measured under except the barriers its files took."""
     return (
         row["case"],
         row["arrival"],
@@ -414,14 +468,168 @@ def pairs(rows: list[dict]) -> list[dict]:
     return result
 
 
+def placement(rows: list[dict]) -> list[dict]:
+    """Each placed scope against the two-barrier baseline of its case."""
+
+    def stored(row: dict) -> tuple:
+        return (
+            row["requests"],
+            row["segments"],
+            row["payload_bytes"],
+            row["fragmented"],
+            row["child_bytes"],
+            row["footers"],
+            row["blocks"],
+            tuple(row["segment_digest"]),
+        )
+
+    def side(scope_rows: list[dict]) -> dict:
+        return {
+            "runs": len(scope_rows),
+            "ack_ns_per_request": median(scope_rows, "ack_ns", True),
+            "elapsed_ns_per_request": median(scope_rows, "elapsed_ns", True),
+            "reactor_cpu_ns_per_request": median(scope_rows, "reactor_cpu_ns", True),
+            "device_write_bytes": median(scope_rows, "reactor_write_bytes"),
+            "device_writes": median(scope_rows, "reactor_writes"),
+            "device_flushes": median(scope_rows, "reactor_flushes"),
+            "wal_flushes": median(scope_rows, "wal_flushes"),
+        }
+
+    groups: dict[tuple, dict[str, list[dict]]] = {}
+    for row in rows:
+        groups.setdefault(setup(row), {}).setdefault(row["scope"], []).append(row)
+    result = []
+    for scopes in groups.values():
+        if "baseline" not in scopes or not any(s in scopes for s in PLACED):
+            continue
+        baseline = scopes["baseline"]
+        for row in [r for s in ("baseline", *PLACED) for r in scopes.get(s, [])]:
+            if "ack_ns" not in row or "reactor_write_bytes" not in row:
+                raise ValueError(
+                    f"{row['case']}: placement needs ack and device counts"
+                )
+        first = baseline[0]
+        entry = {
+            "case": first["case"],
+            "arrival": first["arrival"],
+            "payload_bytes": first["payload_bytes"],
+            "child_bytes": first["child_bytes"],
+            "requests": first["requests"],
+            "segments": first["segments"],
+            "topology": first["topology"],
+            "fdatasync": first["fdatasync"],
+            "baseline": side(baseline),
+        }
+        for scope in PLACED:
+            if scope not in scopes:
+                continue
+            placed = scopes[scope]
+            if {stored(r) for r in baseline + placed} != {stored(first)}:
+                raise ValueError(
+                    f"{first['case']}: {scope} stored other segment bytes or cuts"
+                )
+            if scope != "segment_placed" and {
+                r["wal_digest"] for r in baseline + placed
+            } != {first["wal_digest"]}:
+                raise ValueError(f"{first['case']}: {scope} stored other PREPAREs")
+            measured = side(placed)
+            base = entry["baseline"]
+            for key in ("ack_ns_per_request", "elapsed_ns_per_request"):
+                measured[f"{key}_to_baseline"] = measured[key] / base[key]
+            if base["device_write_bytes"]:
+                measured["device_write_bytes_to_baseline"] = (
+                    measured["device_write_bytes"] / base["device_write_bytes"]
+                )
+            entry[scope] = measured
+        result.append(entry)
+    return result
+
+
+def writes(rows: list[dict]) -> list[dict]:
+    """Each scope on zero-written files against itself on growing files."""
+
+    def stored(row: dict) -> tuple:
+        return (
+            row["requests"],
+            row["segments"],
+            row["payload_bytes"],
+            row["child_bytes"],
+            row["wal_groups"],
+            row["footers"],
+            row["blocks"],
+            row["wal_digest"],
+            tuple(row["segment_digest"]),
+        )
+
+    def side(scope_rows: list[dict]) -> dict:
+        native = scope_rows[0]["timing_only"] is False
+        return {
+            "runs": len(scope_rows),
+            "ack_ns_per_request": median(scope_rows, "ack_ns", True),
+            "elapsed_ns_per_request": median(scope_rows, "elapsed_ns", True),
+            "device_write_bytes": median(scope_rows, "reactor_write_bytes"),
+            "device_flushes": median(scope_rows, "reactor_flushes"),
+            "wal_synchronized_writes": statistics.median(
+                r.get("wal_synchronized_writes", 0) for r in scope_rows
+            ),
+            "data_synchronized_writes": statistics.median(
+                r["data"].get("synchronized_calls", 0) for r in scope_rows
+            )
+            if native
+            else None,
+        }
+
+    groups: dict[tuple, dict[str, list[dict]]] = {}
+    for row in rows:
+        key = (row["scope"], *conditions(row))
+        groups.setdefault(key, {}).setdefault(row["wal_barrier"], []).append(row)
+    result = []
+    for kinds in groups.values():
+        if "extending" not in kinds or "synchronized" not in kinds:
+            continue
+        growing, zeroed = kinds["extending"], kinds["synchronized"]
+        first = growing[0]
+        for row in growing + zeroed:
+            if "ack_ns" not in row or "reactor_write_bytes" not in row:
+                raise ValueError(f"{row['case']}: writes needs ack and device counts")
+        if {stored(r) for r in growing + zeroed} != {stored(first)}:
+            raise ValueError(
+                f"{first['case']}: {first['scope']} stored other bytes on "
+                "zero-written files"
+            )
+        before, after = side(growing), side(zeroed)
+        for key in ("ack_ns_per_request", "elapsed_ns_per_request"):
+            after[f"{key}_to_growing"] = after[key] / before[key]
+        result.append(
+            {
+                "case": first["case"],
+                "scope": first["scope"],
+                "arrival": first["arrival"],
+                "payload_bytes": first["payload_bytes"],
+                "requests": first["requests"],
+                "segments": first["segments"],
+                "growing": before,
+                "zero_written": after,
+            }
+        )
+    return result
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("logs", nargs="+", type=Path)
-    parser.add_argument("--pairs", action="store_true")
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--pairs", action="store_true")
+    mode.add_argument("--placement", action="store_true")
+    mode.add_argument("--writes", action="store_true")
     args = parser.parse_args()
     try:
         rows = [row for path in args.logs for row in read_measurements(path)]
-        if args.pairs:
+        if args.writes:
+            result = writes(rows)
+        elif args.placement:
+            result = placement(rows)
+        elif args.pairs:
             result = pairs(rows)
         else:
             groups: dict[tuple, list[dict]] = {}

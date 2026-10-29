@@ -37,22 +37,30 @@ void extent_operation(std::string_view name) {
       "unknown extent memory scenario");
     // Two earlier durable boundaries contribute stored bytes, but not data
     // block counts. All fixtures and expected hashes precede observation.
+    // Three writes: a block and its footer to 1536, another to 2560, and a
+    // last block.
     std::array<std::string, 5> wires;
+    const boundary_times times{
+      runtime::wall_time{1}, runtime::wall_time{1}, runtime::wall_time{0}};
     wires[0] = data_block(100, 0, 512);
+    const auto first_end = 512U + wires[0].size();
     wires[1] = footer_wire(
-      {scope(100, 101, 0, 1, 512, 1024),
+      {scope(100, 101, 0, 1, 512, first_end),
        1,
-       scope(100, 101, 0, 1, 512, 1024),
+       scope(100, 101, 0, 1, 512, first_end),
+       times,
        crc(wires[0])},
-      {history(), runtime::file_position{1024}});
+      {history(), runtime::file_position{first_end}});
     wires[2] = data_block(101, 1, 1536);
+    const auto second_end = 1536U + wires[2].size();
     const auto prefix = wires[0] + wires[1] + wires[2];
     wires[3] = footer_wire(
-      {scope(100, 102, 0, 2, 512, 2048),
+      {scope(100, 102, 0, 2, 512, second_end),
        2,
-       scope(101, 102, 1, 2, 1536, 2048),
+       scope(101, 102, 1, 2, 1536, second_end),
+       times,
        crc(prefix)},
-      {history(), runtime::file_position{2048}});
+      {history(), runtime::file_position{second_end}});
     wires[4] = data_block(102, 2, 2560);
     const auto all = prefix + wires[3] + wires[4];
     const auto expected = exact_digest(all);
@@ -67,9 +75,10 @@ void extent_operation(std::string_view name) {
                  .checked_add(retained_cost(inputs[i]))
                  .value();
     }
+    const auto end = 2560U + wires[4].size();
     auto verifier = extent_verifier::make(
                       history(),
-                      scope(100, 103, 0, 3, 512, 3072),
+                      scope(100, 103, 0, 3, 512, end),
                       work.policy(),
                       extent_layout_kind::initial_append,
                       {},
@@ -120,7 +129,7 @@ void extent_operation(std::string_view name) {
           proof && proof->digest() && proof->digest()->bytes() == expected
             && proof->boundary().data_crc32c == expected_crc
             && proof->boundary().block_count == 3
-            && proof->boundary().last_block == scope(102, 103, 2, 3, 2560, 3072)
+            && proof->boundary().last_block == scope(102, 103, 2, 3, 2560, end)
             && verifier.closed(),
           "extent changed exact history evidence");
         return true;

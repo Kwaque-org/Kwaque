@@ -3,8 +3,11 @@
 #include "src/base/units.h"
 #include "src/storage/page_internal.h"
 #include "src/storage/recovery_cases.h"
+#include "src/storage/recovery_tail.h"
+#include "src/storage/retained_wal.h"
 #include "src/storage/segment_scan.h"
 #include "src/storage/segment_writer_state.h"
+#include "src/storage/table_view.h"
 #include "src/storage/wal_scan.h"
 
 #include <seastar/core/coroutine.hh>
@@ -27,6 +30,8 @@ namespace kwaque::storage {
 struct recovery_target final {
     local_segment_descriptor descriptor;
     segment_header header;
+    // From the catalog entry.
+    model::range_logical_end logical_origin;
     // Active, recovering or sealed. Deleting objects belong to their
     // reconciliation, not to this merge.
     local_object_state state;
@@ -74,19 +79,31 @@ struct recovery_segment_report final {
     local_object_state state;
     local_publication_generation generation;
     std::optional<local_footer_reference> pin;
-    // The last footer whose covered history verified before the first damage,
-    // or the pin itself. Absent when neither exists or the pin is damaged.
+    // The boundary restart publishes: the last footer whose covered history
+    // verified before the first damage, or the pin itself; past it, the
+    // last footer the WAL's PREPAREs let the walk verify, found intact or
+    // derived. Absent when none exists or the pin is damaged.
     std::optional<segment_scan_boundary> boundary;
     // False for a sealed target, whose extent is cold and not read here.
     bool scanned{false};
+    // Where the walk ended, and where it first met bytes it could not read.
     runtime::file_position content_end;
+    std::optional<runtime::file_position> first_damage;
     std::uint64_t file_bytes{0};
     segment_scan_stop stop{segment_scan_stop::end};
+    // Corrupt when the boundary does not reach what the segment proves
+    // certified.
     segment_scan_verdict verdict{segment_scan_verdict::clean};
-    std::uint32_t satisfied{0}, footer_only{0}, candidates{0}, suffix{0},
-      conflicts{0};
+    // The most of the pin's end and the certified end every intact block of
+    // the segment and every PREPARE naming it carries.
+    runtime::file_position proven_end;
+    std::uint32_t satisfied{0}, footer_only{0}, materialize{0}, candidates{0},
+      suffix{0}, conflicts{0};
     // Unresolved PREPAREs claiming this segment, misplaced ones among them.
     std::uint32_t unresolved{0}, misplaced{0};
+    // Slots filled below the proven end; and the blocks made from PREPAREs
+    // and the footers derived, which restart writes before it publishes.
+    std::uint32_t repaired{0}, blocks{0}, footers{0};
 };
 // The obligations one WAL file holds toward one segment, rebuilt for the
 // checkpoint owner: the append path's in-memory rows do not survive restart.
@@ -128,6 +145,11 @@ struct recovery_merge_result final {
 };
 
 inline constexpr std::uint32_t maximum_recovery_cursors = 8;
+// The most obligation rows one restart rebuilds: a row for each segment a
+// restart's catalog may list (`maximum_recovery_catalog`) in each WAL file a
+// shard may keep.
+inline constexpr std::uint32_t maximum_recovery_obligations
+  = 8192 * maximum_retained_wal_files;
 struct recovery_merge_limits final {
     wal_scan_limits wal{};
     segment_scan_limits segment{};
@@ -140,10 +162,9 @@ struct recovery_merge_limits final {
     // queue runs the walk at once, so this changes when walks run and the
     // delivery order, never what is classified.
     std::uint32_t pending{128};
-    // (WAL file, segment) obligation rows. Like the pending slots of one
-    // segment, the rows are a fixed table that must be one contiguous
-    // allocation.
-    std::uint32_t obligations{512};
+    // (WAL file, segment) obligation rows. The table grows as rows appear,
+    // charged a fragment at a time; this only bounds it.
+    std::uint32_t obligations{maximum_recovery_obligations};
 
     [[nodiscard]] runtime::result<void> validate() const noexcept;
 };
@@ -169,6 +190,12 @@ struct recovery_queued final {
     bool ordered{false};
     std::optional<recovery_copy_identity> copy;
 };
+// A segment's queue is kept in chunks of this many, each charged the first
+// time the queue needs it: a target no PREPARE names takes none.
+inline constexpr std::size_t recovery_queue_chunk = 16;
+// No obligation row.
+inline constexpr std::uint32_t recovery_no_row
+  = std::numeric_limits<std::uint32_t>::max();
 
 // Everything the merge keeps per target; it survives a walk's eviction.
 struct recovery_segment_state final {
@@ -183,8 +210,17 @@ struct recovery_segment_state final {
     const local_device_spec* device{nullptr};
     // The last target position in WAL order.
     std::optional<runtime::file_position> last_target;
-    std::vector<recovery_queued> queued;
-    std::vector<recovery_pending> pending;
+    recovery_list<recovery_queued, recovery_queue_chunk> queued;
+    // The first of its obligation rows, one for each WAL file its PREPAREs
+    // lie in; each names the next.
+    std::uint32_t rows{recovery_no_row};
+    // Slots after the newest verified footer, until a later one covers them
+    // or the walk ends; a held run's outnumber a group's.
+    recovery_list<recovery_pending, recovery_list_chunk> pending;
+    // The PREPAREs among them, and those after the walk ended: its tail.
+    recovery_list<recovery_tail_prepare, recovery_list_chunk> tail;
+    // The most certified end the WAL's PREPAREs naming it carry.
+    runtime::file_position proven;
     // Where a reopened walk resumes: the newest verified footer, else the pin.
     std::optional<local_footer_reference> resume;
     // The end of the last object the merge processed.
@@ -198,17 +234,19 @@ struct recovery_segment_state final {
 struct recovery_obligation_row final {
     recovery_obligation value;
     std::uint64_t first{std::numeric_limits<std::uint64_t>::max()};
+    // Its segment's next row.
+    std::uint32_t next{recovery_no_row};
 };
 
 [[nodiscard]] runtime::result<void>
-  validate_recovery_targets(std::span<const recovery_target>) noexcept;
+  validate_recovery_targets(table_view<recovery_target>) noexcept;
 // The resume binding: the WAL head and checkpoint the control pins, the
 // cutoff, every target's identity, state, generation and pin, and the queue
 // bound, which decides where a full queue's slots fall in the enumeration.
 [[nodiscard]] codec::content_digest recovery_binding(
   const local_shard_control&,
   std::optional<local_wal_cursor> cutoff,
-  std::span<const recovery_target>,
+  table_view<recovery_target>,
   std::uint32_t pending) noexcept;
 [[nodiscard]] runtime::file_position
 footer_end(const local_footer_reference&) noexcept;
@@ -231,13 +269,14 @@ public:
       std::span<const local_device_spec> devices,
       const local_device_spec& wal_device,
       std::uint32_t shard,
-      std::span<const recovery_target> targets,
+      table_view<recovery_target> targets,
       workload_budget& budget,
       recovery_merge_limits limits,
       codec::cooperative_work& work,
       Visitor& visit,
       std::uint64_t skip,
-      codec::content_digest binding) noexcept
+      codec::content_digest binding,
+      recovery_tails& tails) noexcept
       : files_(files)
       , ownership_(ownership)
       , devices_(devices)
@@ -249,7 +288,8 @@ public:
       , work_(work)
       , visit_(visit)
       , skip_(skip)
-      , binding_(binding) {}
+      , binding_(binding)
+      , tails_(tails) {}
 
     seastar::future<runtime::result<recovery_merge_result>> run(
       const local_shard_control& control,
@@ -294,6 +334,32 @@ private:
         std::uint64_t used{0};
         bool opened{false};
     };
+    using tail_walk = recovery_tail_walk<Backend, Owner>;
+    // Hands what a segment's tail walk settles to the visitor.
+    struct tail_sink final {
+        recovery_merge* merge;
+        std::size_t index;
+        seastar::future<runtime::result<bool>>
+        slot(const typename tail_walk::slot_event& value) {
+            return merge->slot(
+              index,
+              value.position,
+              value.begin,
+              value.end,
+              value.order,
+              value.evidence);
+        }
+        seastar::future<runtime::result<bool>>
+        region(const typename tail_walk::region_event& value) {
+            return merge->deliver(merge->segment_region(
+              index,
+              value.begin,
+              value.end,
+              true,
+              value.certified,
+              value.filled));
+        }
+    };
 
     runtime::result<void> prepare() {
         if (auto valid = limits_.validate(); !valid) return valid;
@@ -301,41 +367,46 @@ private:
             return valid;
         const auto count = targets_.size();
         byte_count total;
-        const auto add = [&](std::size_t bytes) -> runtime::result<void> {
-            if (bytes == 0) return {};
-            auto charged = budget_.allocation_charge(byte_count{bytes});
+        // The per-target tables are chunked: a restart reads up to a
+        // catalog's worth of targets. A target's queue and the obligation
+        // rows are charged as they grow, so that what no PREPARE names costs
+        // nothing.
+        for (const auto element :
+             {sizeof(typename catalog_type::entry),
+              sizeof(recovery_segment_state),
+              sizeof(cursor),
+              sizeof(std::uint32_t)}) {
+            auto charged = chunked_allocation_charge(budget_, count, element);
             if (!charged) return runtime::failure(charged.error());
             auto next = total.checked_add(*charged);
             if (!next)
                 return runtime::failure(detail::path_error(errc::out_of_range));
             total = *next;
-            return {};
-        };
-        for (const auto bytes :
-             {count * sizeof(typename catalog_type::entry),
-              count * sizeof(recovery_segment_state),
-              count * sizeof(cursor),
-              std::size_t{limits_.obligations}
-                * sizeof(recovery_obligation_row)})
-            if (auto added = add(bytes); !added) return added;
-        for (const auto& target : targets_)
-            for (const auto bytes :
-                 {std::size_t{limits_.pending} * sizeof(recovery_queued),
-                  waiting_rows(target) * sizeof(recovery_pending)})
-                if (auto added = add(bytes); !added) return added;
+        }
         auto held = budget_.try_reserve(total);
         if (!held) return runtime::failure(held.error());
         held_.emplace(std::move(*held));
         entries_.reserve(count);
         segments_.reserve(count);
-        cursors_.resize(count);
-        rows_.reserve(limits_.obligations);
+        cursors_.reserve(count);
+        order_index_.reserve(count);
         for (const auto& target : targets_) {
             entries_.push_back({target.descriptor, target.header});
-            auto& state = segments_.emplace_back(target);
-            state.queued.reserve(limits_.pending);
-            state.pending.reserve(waiting_rows(target));
+            segments_.emplace_back(target);
+            cursors_.emplace_back();
+            order_index_.push_back(
+              static_cast<std::uint32_t>(order_index_.size()));
         }
+        // Each target's place in its segment's canonical order, for lookup.
+        std::sort(
+          order_index_.begin(),
+          order_index_.end(),
+          [this](std::uint32_t a, std::uint32_t b) {
+              return targets_[a].descriptor.segment.canonical_less(
+                targets_[b].descriptor.segment);
+          });
+        tails_.wal = limits_.wal;
+        tails_.segment = limits_.segment;
         auto made = catalog_type::make(
           files_,
           ownership_,
@@ -358,6 +429,9 @@ private:
       const local_shard_control& control,
       std::optional<local_wal_cursor> cutoff,
       recovery_merge_result& output) {
+        // The head is read on after its content for what its stamps prove.
+        auto wal = limits_.wal;
+        wal.prove = true;
         auto scanned = co_await scan_local_wal(
           files_,
           ownership_,
@@ -366,7 +440,7 @@ private:
           control,
           cutoff,
           budget_,
-          limits_.wal,
+          wal,
           work_,
           *catalog_,
           [this](const wal_scanned_prepare& value) {
@@ -408,9 +482,18 @@ private:
     }
 
     std::optional<std::size_t> find(const segment_context& segment) const {
-        for (std::size_t i = 0; i < segments_.size(); ++i)
-            if (segments_[i].target->descriptor.segment == segment) return i;
-        return std::nullopt;
+        const auto at = std::lower_bound(
+          order_index_.begin(),
+          order_index_.end(),
+          segment,
+          [this](std::uint32_t index, const segment_context& wanted) {
+              return targets_[index].descriptor.segment.canonical_less(wanted);
+          });
+        if (
+          at == order_index_.end()
+          || targets_[*at].descriptor.segment != segment)
+            return std::nullopt;
+        return std::size_t{*at};
     }
 
     // Placement comes from the catalog's verified header and device, never
@@ -430,7 +513,7 @@ private:
           descriptor.segment,
           target.alignment,
           target.data_start,
-          descriptor.logical_origin,
+          state.target->logical_origin,
           descriptor.physical_origin,
           target.profile};
         state.processed = state.target->pin ? footer_end(*state.target->pin)
@@ -439,31 +522,93 @@ private:
         return {};
     }
 
-    // Records a PREPARE's slot against its WAL file's obligation row.
+    // Records a PREPARE's slot against its WAL file's obligation row. A
+    // target's rows are found through its own chain, one row for each WAL
+    // file its PREPAREs lie in; a claim on a segment no target is, among
+    // all rows.
     runtime::result<void> oblige(
       const local_wal_cursor& begin,
       const segment_context& segment,
+      std::optional<std::size_t> index,
       std::uint64_t order,
       bool satisfied) {
-        auto row = std::find_if(rows_.begin(), rows_.end(), [&](const auto& r) {
-            return r.value.wal == begin.incarnation()
-                   && r.value.segment == segment;
-        });
-        if (row == rows_.end()) {
+        const auto matches = [&](const recovery_obligation_row& row) {
+            return row.value.wal == begin.incarnation()
+                   && row.value.segment == segment;
+        };
+        std::optional<std::size_t> found, last;
+        if (index) {
+            for (auto at = segments_[*index].rows; at != recovery_no_row;
+                 at = rows_[at].next) {
+                if (matches(rows_[at])) {
+                    found = at;
+                    break;
+                }
+                last = at;
+            }
+        } else {
+            for (std::size_t at = 0; at != rows_.size(); ++at)
+                if (matches(rows_[at])) {
+                    found = at;
+                    break;
+                }
+        }
+        if (!found) {
             if (rows_.size() == limits_.obligations)
                 return runtime::failure(
                   detail::path_error(errc::resource_exhausted));
-            rows_.push_back({{begin.incarnation(), segment, 0, 0, {}}});
-            row = rows_.end() - 1;
-        }
-        if (satisfied) {
-            ++row->value.satisfied;
-        } else {
-            ++row->value.pinned;
-            if (order < row->first) {
-                row->first = order;
-                row->value.first_pinned = begin;
+            if (auto room = row_room(); !room) return room;
+            try {
+                rows_.push_back({{begin.incarnation(), segment, 0, 0, {}}});
+            } catch (const std::bad_alloc&) {
+                return runtime::failure(
+                  detail::path_error(errc::resource_exhausted));
             }
+            found = rows_.size() - 1;
+            const auto added = static_cast<std::uint32_t>(*found);
+            if (last)
+                rows_[*last].next = added;
+            else if (index)
+                segments_[*index].rows = added;
+        }
+        auto& row = rows_[*found];
+        if (satisfied) {
+            ++row.value.satisfied;
+        } else {
+            ++row.value.pinned;
+            if (order < row.first) {
+                row.first = order;
+                row.value.first_pinned = begin;
+            }
+        }
+        return {};
+    }
+
+    // Room for one more obligation row. The table grows a fragment at a
+    // time, each charged when the table first needs it; the first is made
+    // whole at once, so that no row moves.
+    runtime::result<void> row_room() {
+        if (rows_.size() < rows_.capacity()) return {};
+        const auto fragment = chunked_fragment_elements(
+          sizeof(recovery_obligation_row));
+        const auto before = chunked_allocation_charge(
+          budget_, rows_.capacity(), sizeof(recovery_obligation_row));
+        const auto after = chunked_allocation_charge(
+          budget_,
+          rows_.capacity() + fragment,
+          sizeof(recovery_obligation_row));
+        if (!before) return runtime::failure(before.error());
+        if (!after) return runtime::failure(after.error());
+        if (
+          auto taken = hold_more(
+            grown_, budget_, byte_count{after->value() - before->value()});
+          !taken)
+            return taken;
+        try {
+            if (rows_.empty()) rows_.reserve(fragment);
+        } catch (const std::bad_alloc&) {
+            return runtime::failure(
+              detail::path_error(errc::resource_exhausted));
         }
         return {};
     }
@@ -480,11 +625,19 @@ private:
         const auto& matched = classify_recovery(parameters);
         count_slot(state.report, matched.classification);
         if (begin) {
+            // A slot restart fills or adopts below what it publishes is met
+            // once that publication is durable.
             const bool satisfied = matched.classification
-                                   == recovery_classification::satisfied;
+                                     == recovery_classification::satisfied
+                                   || matched.classification
+                                        == recovery_classification::materialize;
             if (
               auto obliged = oblige(
-                *begin, state.target->descriptor.segment, order, satisfied);
+                *begin,
+                state.target->descriptor.segment,
+                index,
+                order,
+                satisfied);
               !obliged)
                 co_return runtime::failure(obliged.error());
         }
@@ -499,48 +652,48 @@ private:
             evidence.difference});
     }
 
-    // Classifies every waiting slot now that its coverage is known.
+    // Classifies every waiting slot now that its coverage is known: a footer
+    // covers them, or none will. Covered, they are no tail.
     seastar::future<runtime::result<bool>>
     settle(std::size_t index, bool covered) {
         auto& state = segments_[index];
         for (const auto& waiting : state.pending) {
+            recovery_slot_evidence evidence;
+            evidence.prepare = waiting.prepare;
+            evidence.block = waiting.block;
+            evidence.covered = covered;
+            evidence.ordered = true;
+            evidence.placed = waiting.placed;
+            evidence.difference = waiting.difference;
             auto proceed = co_await slot(
               index,
               waiting.position,
               waiting.begin,
               waiting.end,
               waiting.order,
-              {waiting.prepare,
-               waiting.block,
-               false,
-               covered,
-               true,
-               waiting.placed,
-               waiting.difference});
+              evidence);
             if (!proceed || !*proceed) co_return proceed;
         }
         state.pending.clear();
+        if (covered) state.tail.clear();
         co_return true;
-    }
-
-    // A walk holds the slots after its last verified footer until a later
-    // footer covers them: one group, of at most this many blocks. A sealed
-    // target is never walked.
-    static std::size_t waiting_rows(const recovery_target& target) noexcept {
-        return target.state == local_object_state::sealed
-                 ? 0
-                 : maximum_segment_group_blocks;
     }
 
     runtime::result<void>
     wait(std::size_t index, const recovery_pending& waiting) {
-        auto& state = segments_[index];
-        auto& pending = state.pending;
-        if (pending.size() == waiting_rows(*state.target))
+        return segments_[index].pending.push(waiting, budget_, grown_);
+    }
+    // Keeps a PREPARE whose slot lies after the newest verified footer for
+    // the segment's tail walk, unless a later footer covers it.
+    runtime::result<void>
+    defer(std::size_t index, const recovery_queued& queued) {
+        if (!queued.copy)
             return runtime::failure(
-              detail::path_error(errc::resource_exhausted));
-        pending.push_back(waiting);
-        return {};
+              detail::path_error(errc::invariant_violation));
+        return segments_[index].tail.push(
+          {queued.begin, queued.end, queued.order, *queued.copy},
+          budget_,
+          tails_.held);
     }
 
     seastar::future<runtime::result<void>> unload(std::size_t index) {
@@ -567,23 +720,29 @@ private:
         co_return failed.outcome();
     }
 
-    // Opens the walk at its resume point, closing the least recently advanced
-    // open walk first when the bound is reached.
-    seastar::future<runtime::result<void>> load(std::size_t index) {
-        auto& walk = cursors_[index];
-        walk.used = ++clock_;
-        if (walk.opened) co_return runtime::result<void>{};
-        if (open_ == limits_.cursors) {
+    // Closes the least recently advanced open walks until another may open.
+    seastar::future<runtime::result<void>> make_room() {
+        while (open_ >= limits_.cursors) {
             std::optional<std::size_t> oldest;
             for (std::size_t i = 0; i < cursors_.size(); ++i)
                 if (
                   cursors_[i].opened
                   && (!oldest || cursors_[i].used < cursors_[*oldest].used))
                     oldest = i;
-            if (oldest)
-                if (auto closed = co_await unload(*oldest); !closed)
-                    co_return closed;
+            if (!oldest) break;
+            if (auto closed = co_await unload(*oldest); !closed)
+                co_return closed;
         }
+        co_return runtime::result<void>{};
+    }
+
+    // Opens the walk at its resume point, closing the least recently advanced
+    // open walk first when the bound is reached.
+    seastar::future<runtime::result<void>> load(std::size_t index) {
+        auto& walk = cursors_[index];
+        walk.used = ++clock_;
+        if (walk.opened) co_return runtime::result<void>{};
+        if (auto room = co_await make_room(); !room) co_return room;
         auto& state = segments_[index];
         auto handle = budget_.try_reserve(
           limits_.segment.metadata.execution_bytes);
@@ -653,6 +812,10 @@ private:
             auto next = co_await walk.scanner->next(work_);
             if (!next) co_return runtime::failure(next.error());
             if (!*next) {
+                // What survives after the damage still proves how far the
+                // segment was certified.
+                if (auto proved = co_await walk.scanner->prove(work_); !proved)
+                    co_return runtime::failure(proved.error());
                 state.stopped = true;
                 state.ended = walk.scanner->report();
                 if (auto closed = co_await unload(index); !closed)
@@ -685,15 +848,15 @@ private:
     }
 
     // Moves the walk to the first object at or after `position`, processing
-    // everything before it. Once the walk ends, its waiting slots were never
-    // covered.
+    // everything before it. Once the walk ends, its waiting slots wait for
+    // the segment's tail walk, or for none.
     seastar::future<runtime::result<bool>>
     advance(std::size_t index, runtime::file_position position) {
         auto& walk = cursors_[index];
         for (;;) {
             auto more = co_await next_object(index);
             if (!more) co_return runtime::failure(more.error());
-            if (!*more) co_return co_await settle(index, false);
+            if (!*more) co_return true;
             if (object_begin(*walk.current) >= position) co_return true;
             auto proceed = co_await process(index);
             if (!proceed || !*proceed) co_return proceed;
@@ -702,17 +865,29 @@ private:
 
     seastar::future<runtime::result<bool>>
     on_prepare(const wal_scanned_prepare& value) {
+        const auto& stamps = value.claims.stamps;
+        // An intact PREPARE after the head's content: its target's stamp is
+        // evidence, nothing else of it.
+        if (value.survival) {
+            if (auto index = find(value.claims.target)) {
+                auto& proven = segments_[*index].proven;
+                proven = std::max(proven, stamps.target_certified_end);
+            }
+            co_return true;
+        }
         const auto order = order_++;
         if (value.resolution != wal_target_resolution::resolved) {
             const auto& claims = value.claims;
-            if (auto index = find(claims.target)) {
+            const auto index = find(claims.target);
+            if (index) {
                 auto& report = segments_[*index].report;
                 ++report.unresolved;
                 if (value.resolution == wal_target_resolution::misplaced)
                     ++report.misplaced;
             }
             if (
-              auto obliged = oblige(value.begin, claims.target, order, false);
+              auto obliged = oblige(
+                value.begin, claims.target, index, order, false);
               !obliged)
                 co_return runtime::failure(obliged.error());
             co_return co_await deliver(
@@ -732,6 +907,7 @@ private:
         if (auto started = start(*index, *value.target); !started)
             co_return runtime::failure(started.error());
         auto& state = segments_[*index];
+        state.proven = std::max(state.proven, stamps.target_certified_end);
         const auto at = placement.position();
         const bool ordered = !state.last_target || at > *state.last_target;
         if (ordered) state.last_target = at;
@@ -755,7 +931,10 @@ private:
             auto served = co_await serve(*index);
             if (!served || !*served) co_return served;
         }
-        state.queued.push_back(std::move(queued));
+        if (
+          auto pushed = state.queued.push(std::move(queued), budget_, grown_);
+          !pushed)
+            co_return runtime::failure(pushed.error());
         co_return true;
     }
 
@@ -769,30 +948,6 @@ private:
         }
         queued.clear();
         co_return true;
-    }
-
-    // compare_recovery_copies for a queued PREPARE: its claims and length,
-    // then the block's child by the identity of its exact bytes.
-    seastar::future<runtime::result<recovery_copy_difference>>
-    compare(const recovery_copy_identity& prepare, const segment_block& block) {
-        auto difference = compare_recovery_claims(prepare, block);
-        if (!difference)
-            co_return runtime::failure(
-              detail::path_error(to_errc(difference.error())
-                                   .value_or(errc::invariant_violation)));
-        if (*difference != recovery_copy_difference::none)
-            co_return *difference;
-        auto child = block.child();
-        if (!child)
-            co_return runtime::failure(
-              detail::path_error(
-                to_errc(child.error()).value_or(errc::invariant_violation)));
-        auto digest = co_await detail::hash_exact(*child, work_, {});
-        if (!digest)
-            co_return runtime::failure(
-              detail::path_error(digest.error().code()));
-        co_return *digest == prepare.child ? recovery_copy_difference::none
-                                           : recovery_copy_difference::child;
     }
 
     // One queued PREPARE's slot against its segment's walk.
@@ -822,14 +977,10 @@ private:
             // with what is still known: certified bytes have no unmatched slot
             // start, and a waiting block may start there.
             evidence.covered = at < certified_end(state);
-            evidence.block = !evidence.covered
-                             && std::any_of(
-                               state.pending.begin(),
-                               state.pending.end(),
-                               [at](const auto& waiting) {
-                                   return waiting.block
-                                          && waiting.position == at;
-                               });
+            if (!evidence.covered)
+                for (const auto& waiting : state.pending)
+                    if (waiting.block && waiting.position == at)
+                        evidence.block = true;
             evidence.placed = evidence.block;
             co_return co_await slot(
               index, at, queued.begin, queued.end, queued.order, evidence);
@@ -838,19 +989,24 @@ private:
         if (!moved || !*moved) co_return moved;
         auto& walk = cursors_[index];
         if (state.stopped) {
-            // Beyond the content the slot is a candidate; inside it, the slot
-            // starts within another object.
-            evidence.covered = at < certified_end(state);
-            evidence.placed = at >= state.ended.content_end;
-            co_return co_await slot(
-              index, at, queued.begin, queued.end, queued.order, evidence);
+            // Inside certified content the slot starts within another
+            // object. After it, the tail walk settles the slot.
+            if (at < certified_end(state)) {
+                evidence.covered = true;
+                co_return co_await slot(
+                  index, at, queued.begin, queued.end, queued.order, evidence);
+            }
+            if (auto deferred = defer(index, queued); !deferred)
+                co_return runtime::failure(deferred.error());
+            co_return true;
         }
         const auto& current = *walk.current;
         if (object_begin(current) == at && current.block) {
             if (!queued.copy)
                 co_return runtime::failure(
                   detail::path_error(errc::invariant_violation));
-            auto difference = co_await compare(*queued.copy, *current.block);
+            auto difference = co_await compare_recovery_identity(
+              *queued.copy, *current.block, work_);
             if (!difference) co_return runtime::failure(difference.error());
             recovery_pending matched;
             matched.position = at;
@@ -865,6 +1021,8 @@ private:
             walk.current.reset();
             if (auto waited = wait(index, matched); !waited)
                 co_return runtime::failure(waited.error());
+            if (auto deferred = defer(index, queued); !deferred)
+                co_return runtime::failure(deferred.error());
             co_return true;
         }
         if (object_begin(current) == at) {
@@ -889,10 +1047,23 @@ private:
         misplaced.prepare = true;
         if (auto waited = wait(index, misplaced); !waited)
             co_return runtime::failure(waited.error());
+        if (auto deferred = defer(index, queued); !deferred)
+            co_return runtime::failure(deferred.error());
         co_return true;
     }
 
     seastar::future<runtime::result<void>> on_file(const wal_file_scan& value) {
+        // Where a tail walk reads this file's PREPAREs again.
+        if (
+          auto kept = tails_.files.push(
+            {value.incarnation,
+             value.alignment,
+             value.profile,
+             value.data_start},
+            budget_,
+            tails_.held);
+          !kept)
+            co_return runtime::failure(kept.error());
         const bool rotated = value.sealed_end.has_value();
         const auto region = [&](
                               runtime::file_position begin,
@@ -914,12 +1085,18 @@ private:
             regions[0] = region(
               value.begin, value.content_end, false, false, rotated);
         if (value.stop != wal_scan_stop::end) {
-            // A rotated file's damage lies inside its sealed prefix.
+            // A rotated file's damage lies inside its sealed prefix; the
+            // head's is certified when a stamp proves it was.
             const runtime::file_position end{
               rotated
                 ? std::max(value.sealed_end->value(), value.content_end.value())
                 : std::max(value.file_bytes, value.content_end.value())};
-            regions[1] = region(value.content_end, end, false, true, rotated);
+            regions[1] = region(
+              value.content_end,
+              end,
+              false,
+              true,
+              rotated || value.content_end < value.proven_end);
         }
         if (rotated && value.slack.value() != 0)
             regions[2] = region(
@@ -937,8 +1114,27 @@ private:
         co_return runtime::result<void>{};
     }
 
+    recovery_region_report segment_region(
+      std::size_t index,
+      runtime::file_position begin,
+      runtime::file_position end,
+      bool damage,
+      bool certified,
+      bool filled = false) const {
+        const auto parameters = region_parameters(
+          false, damage, certified, filled);
+        return recovery_region_report{
+          std::nullopt,
+          segments_[index].report.segment,
+          begin,
+          end,
+          parameters,
+          &classify_recovery(parameters)};
+    }
+
     // Serves the segment's queue, walks the rest of it, then reports its
-    // regions and summary.
+    // slots, regions and summary. A segment with PREPAREs after its
+    // recovered boundary goes on with its tail walk.
     seastar::future<runtime::result<bool>> finish_segment(std::size_t index) {
         auto& state = segments_[index];
         auto& report = state.report;
@@ -961,41 +1157,124 @@ private:
         if (!moved || !*moved) co_return moved;
         const auto& ended = state.ended;
         report.scanned = true;
+        report.proven_end = std::max(state.proven, ended.proven_end);
+        if (!state.tail.empty()) {
+            if (ended.verdict != segment_scan_verdict::corrupt)
+                co_return co_await finish_tail(index);
+            // Its pinned footer is damaged: the segment stops, and its tail
+            // is never walked.
+            for (const auto& entry : state.tail) {
+                recovery_slot_evidence evidence;
+                evidence.prepare = true;
+                evidence.ordered = true;
+                evidence.placed = entry.position() >= ended.content_end;
+                auto proceed = co_await slot(
+                  index,
+                  entry.position(),
+                  entry.begin,
+                  entry.end,
+                  entry.order,
+                  evidence);
+                if (!proceed || !*proceed) co_return proceed;
+            }
+        }
+        // Blocks after the boundary with no PREPARE: suffix.
+        if (auto settled = co_await settle(index, false); !settled || !*settled)
+            co_return settled;
+        if (auto proceed = co_await content(index); !proceed || !*proceed)
+            co_return proceed;
         report.boundary = ended.boundary;
         report.content_end = ended.content_end;
         report.file_bytes = ended.file_bytes;
         report.stop = ended.stop;
         report.verdict = ended.verdict;
-        const auto region = [&](
-                              runtime::file_position begin,
-                              runtime::file_position end,
-                              bool damage,
-                              bool certified) {
-            const auto parameters = region_parameters(false, damage, certified);
-            return recovery_region_report{
-              std::nullopt,
-              report.segment,
-              begin,
-              end,
-              parameters,
-              &classify_recovery(parameters)};
-        };
-        const auto data_start = state.history->data_start;
-        if (data_start < ended.content_end) {
-            auto proceed = co_await deliver(
-              region(data_start, ended.content_end, false, true));
-            if (!proceed || !*proceed) co_return proceed;
-        }
+        if (ended.stop != segment_scan_stop::end)
+            report.first_damage = ended.content_end;
+        if (certified_end(state) < report.proven_end)
+            report.verdict = segment_scan_verdict::corrupt;
         if (ended.stop != segment_scan_stop::end) {
             const runtime::file_position end{
               std::max(ended.file_bytes, ended.content_end.value())};
-            auto proceed = co_await deliver(region(
+            auto proceed = co_await deliver(segment_region(
+              index,
               ended.content_end,
               end,
               true,
-              ended.verdict == segment_scan_verdict::corrupt));
+              ended.content_end < report.proven_end));
             if (!proceed || !*proceed) co_return proceed;
         }
+        co_return co_await deliver(report);
+    }
+
+    // The verified content before the segment's first damage.
+    seastar::future<runtime::result<bool>> content(std::size_t index) {
+        const auto& state = segments_[index];
+        const auto data_start = state.history->data_start;
+        const auto end = state.ended.content_end;
+        if (data_start >= end) co_return true;
+        co_return co_await deliver(
+          segment_region(index, data_start, end, false, true));
+    }
+
+    // Walks the segment from its recovered boundary through its tail
+    // PREPAREs, reading each again from the WAL only to fill its slot, and
+    // reports what the walk settles. The walk counts against the bound on
+    // open walks.
+    seastar::future<runtime::result<bool>> finish_tail(std::size_t index) {
+        auto& state = segments_[index];
+        auto& report = state.report;
+        // Its slots are settled again by the tail walk.
+        state.pending.clear();
+        if (auto proceed = co_await content(index); !proceed || !*proceed)
+            co_return proceed;
+        if (auto room = co_await make_room(); !room)
+            co_return runtime::failure(room.error());
+        const auto& descriptor = state.target->descriptor;
+        if (
+          auto kept = tails_.segments.push(
+            {index,
+             *state.history,
+             state.device->owner.device(),
+             state.resume,
+             runtime::file_position{descriptor.maximum_data_bytes.value()},
+             report.proven_end,
+             std::move(state.tail),
+             std::nullopt,
+             0,
+             0},
+            budget_,
+            tails_.held);
+          !kept)
+            co_return runtime::failure(kept.error());
+        auto& tail = tails_.segments.back();
+        tail_sink sink{this, index};
+        auto walked = co_await walk_recovery_tail(
+          files_,
+          ownership_,
+          *state.device,
+          wal_device_,
+          shard_,
+          tails_,
+          tail,
+          false,
+          budget_,
+          work_,
+          sink);
+        if (!walked) co_return runtime::failure(walked.error());
+        if (!*walked) co_return false;
+        const auto& outcome = **walked;
+        tail.boundary = outcome.boundary;
+        tail.blocks = outcome.blocks;
+        tail.footers = outcome.footers;
+        report.boundary = outcome.boundary;
+        report.content_end = outcome.content_end;
+        report.first_damage = outcome.first_damage;
+        report.file_bytes = outcome.file_bytes;
+        report.stop = outcome.stop;
+        report.verdict = outcome.verdict;
+        report.repaired = outcome.repaired;
+        report.blocks = outcome.blocks;
+        report.footers = outcome.footers;
         co_return co_await deliver(report);
     }
 
@@ -1004,19 +1283,23 @@ private:
     std::span<const local_device_spec> devices_;
     const local_device_spec& wal_device_;
     std::uint32_t shard_;
-    std::span<const recovery_target> targets_;
+    table_view<recovery_target> targets_;
     workload_budget& budget_;
     recovery_merge_limits limits_;
     codec::cooperative_work& work_;
     Visitor& visit_;
     std::uint64_t skip_;
     codec::content_digest binding_;
-    std::optional<workload_reservation> held_;
-    std::vector<typename catalog_type::entry> entries_;
+    recovery_tails& tails_;
+    // The fixed tables, and what the waiting lists grew to.
+    std::optional<workload_reservation> held_, grown_;
+    seastar::chunked_vector<typename catalog_type::entry> entries_;
     std::unique_ptr<catalog_type> catalog_;
-    std::vector<recovery_segment_state> segments_;
-    std::vector<cursor> cursors_;
-    std::vector<recovery_obligation_row> rows_;
+    seastar::chunked_vector<recovery_segment_state> segments_;
+    seastar::chunked_vector<cursor> cursors_;
+    // Targets in their segments' canonical order: see find().
+    seastar::chunked_vector<std::uint32_t> order_index_;
+    seastar::chunked_vector<recovery_obligation_row> rows_;
     std::uint64_t ordinal_{0}, delivered_{0}, order_{0}, clock_{0};
     std::uint32_t open_{0}, reloads_{0};
     bool stopped_{false};
@@ -1036,6 +1319,21 @@ private:
 // check only. Sealed targets are not read. At most `limits.cursors` walks are
 // open at once; the least recently advanced one closes and later reopens at
 // its last verified footer.
+//
+// Stamps are evidence wherever an intact, self-identified object holds them:
+// each segment's proven end is the most of its pin's end, the certified end
+// of every intact block of it, read on after its first damage, and that of
+// every PREPARE naming it, the head's intact PREPAREs after its content
+// among them. The boundary restart publishes must reach it, or the segment
+// is proven corrupt; damage to the head below its own proven end is too.
+//
+// A segment with PREPAREs after its recovered boundary, the last verified
+// footer before its first damage, is walked again from there through those
+// PREPAREs, each read again from the WAL where the scan found it, only to
+// fill its slot: recovery_tail_walk, which writes nothing here. What it can
+// fill and publish is its tail, kept in `tails` for the restart that writes
+// it before publishing; a slot it settles below that boundary is
+// materialized, and the rest are candidates and suffix.
 //
 // visit(const recovery_item&) returns future<result<bool>> and receives, in
 // one deterministic order that no walk bound changes: unresolved PREPAREs and
@@ -1060,17 +1358,20 @@ reconcile_local_recovery(
   std::uint32_t shard,
   const local_shard_control& control,
   std::optional<local_wal_cursor> cutoff,
-  std::span<const recovery_target> targets,
+  table_view<recovery_target> targets,
   workload_budget& budget,
   recovery_merge_limits limits,
   codec::cooperative_work& work,
   Visitor visit,
-  std::optional<recovery_resume> resume = std::nullopt) {
+  std::optional<recovery_resume> resume = std::nullopt,
+  recovery_tails* tails = nullptr) {
     static_assert(sizeof(Visitor) <= 8_KiB);
     const auto binding = detail::recovery_binding(
       control, cutoff, targets, limits.pending);
     if (resume && resume->binding != binding)
         co_return runtime::failure(detail::path_error(errc::wrong_context));
+    std::optional<recovery_tails> own;
+    if (!tails) tails = &own.emplace();
     detail::recovery_merge<Backend, Owner, Visitor> merge{
       files,
       ownership,
@@ -1083,7 +1384,8 @@ reconcile_local_recovery(
       work,
       visit,
       resume ? resume->items : 0,
-      binding};
+      binding,
+      *tails};
     co_return co_await merge.run(control, cutoff);
 }
 

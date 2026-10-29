@@ -1,6 +1,7 @@
 #ifndef KWAQUE_SRC_STORAGE_WORKLOAD_BUDGET_H_
 #define KWAQUE_SRC_STORAGE_WORKLOAD_BUDGET_H_
 
+#include "src/base/allocation.h"
 #include "src/base/units.h"
 #include "src/bytes/fragmented_buffer.h"
 #include "src/resource/resource_manager.h"
@@ -9,6 +10,8 @@
 
 #include <seastar/core/shared_ptr.hh>
 
+#include <bit>
+#include <cstddef>
 #include <cstdint>
 #include <utility>
 
@@ -105,6 +108,21 @@ public:
 private:
     seastar::lw_shared_ptr<detail::workload_budget_state> state_;
 };
+
+// The elements one fragment of a seastar::chunked_vector of `element`-byte
+// elements holds, and what a table of `count` of them is charged: its
+// fragments, each allocated whole but the first, and its list of them. A
+// fragment of a power-of-two element size fills exactly 128 KiB, which the
+// debug and sanitizer charge model prices above the ceiling and refuses; a
+// table of such elements is refused here too, never later at an append.
+[[nodiscard]] constexpr std::size_t
+chunked_fragment_elements(std::size_t element) noexcept {
+    return std::bit_floor(maximum_contiguous_allocation_bytes / element);
+}
+[[nodiscard]] runtime::result<byte_count> chunked_allocation_charge(
+  const workload_budget& budget,
+  std::size_t count,
+  std::size_t element) noexcept;
 
 } // namespace kwaque::storage
 

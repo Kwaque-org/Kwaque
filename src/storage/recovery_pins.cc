@@ -15,7 +15,7 @@ validate_recovery_publication(const local_object_publication& publication) {
     const auto wrong = [] {
         return runtime::failure(path_error(errc::wrong_context));
     };
-    std::array<std::uint32_t, 6> seen{};
+    std::array<std::uint32_t, 5> seen{};
     for (const auto& root : publication.roots) {
         const auto kind = static_cast<std::size_t>(root.kind());
         if (kind >= seen.size() || seen[kind]++ != 0) return wrong();
@@ -36,8 +36,7 @@ validate_recovery_publication(const local_object_publication& publication) {
         if (
           (family && *family != durable_footer_family)
           || count(local_root_kind::index) != 0
-          || count(local_root_kind::sealed_retry) != 0
-          || (count(local_root_kind::completed_retry_snapshot) != 0 && !family))
+          || count(local_root_kind::sealed_retry) != 0)
             return wrong();
         return {};
     case local_object_state::sealed:
@@ -84,24 +83,6 @@ runtime::result<std::vector<local_bundle_context>> recovery_root_contexts(
             output.emplace_back(
               footer_expectation{history, publication.boundary->position()});
             break;
-        case local_root_kind::completed_retry_snapshot: {
-            auto generation = local_publication_generation::make(
-              root.sequence().value());
-            if (!generation)
-                return runtime::failure(path_error(errc::wrong_context));
-            auto header = local_metadata_header::make(
-              local_metadata_kind::completed_retry_root, *owner, *generation);
-            if (!header)
-                return runtime::failure(path_error(errc::wrong_context));
-            local_metadata_expectation expected{
-              *header, spec.identity.metadata_alignment};
-            expected.segment = history.segment;
-            expected.segment_alignment = history.alignment;
-            expected.digest = root.digest();
-            expected.encoded_bytes = root.bytes();
-            output.emplace_back(expected);
-            break;
-        }
         case local_root_kind::checkpoint:
         case local_root_kind::manifest:
             return runtime::failure(path_error(errc::wrong_context));

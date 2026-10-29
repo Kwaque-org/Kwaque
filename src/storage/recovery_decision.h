@@ -63,6 +63,10 @@ struct recovery_suffix_source final {
     std::optional<local_wal_cursor> cutoff;
     recovery_target target;
     wal_scan_limits limits{};
+    // For a WAL still written: where it is read to, above every PREPARE of
+    // the segment, which left the append owner when it ended there. Nothing
+    // after it is read. None for a WAL a restart reads whole.
+    std::optional<local_wal_cursor> end{};
 };
 
 // One resolved PREPARE of the segment, in WAL order, borrowed through a
@@ -208,6 +212,7 @@ seastar::future<runtime::result<recovery_suffix_scan>> scan_recovery_suffix(
         co_return runtime::failure(path_error(errc::invariant_violation));
     auto limits = source.limits;
     limits.digests = true;
+    limits.live_end = source.end;
     std::optional<runtime::file_position> last;
     auto prepares = [&](const wal_scanned_prepare& value)
       -> seastar::future<runtime::result<bool>> {

@@ -39,14 +39,12 @@ public:
       codec::cooperative_work& work,
       codec::field_context context,
       codec::decode_budget memory,
-      std::uint64_t end,
-      std::optional<model::batch_id> previous)
+      std::uint64_t end)
       : input_(input)
       , work_(work)
       , context_(context)
       , memory_(memory)
-      , end_(end)
-      , previous_retry_(previous) {}
+      , end_(end) {}
     [[nodiscard]] codec::field_context here() const noexcept {
         auto c = context_;
         c.origin += input_.bytes_consumed().value();
@@ -243,20 +241,27 @@ public:
               c,
               88);
             if (!alignment) co_return codec::failure(alignment.error());
-            if (!std::all_of(raw->begin() + 97, raw->begin() + 104, [](char b) {
+            if (load<72, std::uint64_t>(*raw) != 0)
+                co_return codec::failure(
+                  page_error(errc::malformed_data, c, 72));
+            const auto depth = load<97, std::uint8_t>(*raw);
+            if (depth == 0 || depth > maximum_retry_depth)
+                co_return codec::failure(
+                  page_error(errc::malformed_data, c, 97));
+            if (!std::all_of(raw->begin() + 98, raw->begin() + 104, [](char b) {
                     return b == 0;
                 }))
                 co_return codec::failure(
-                  page_error(errc::malformed_data, c, 97));
+                  page_error(errc::malformed_data, c, 98));
             value_.emplace(
               local_segment_descriptor{
                 *sc,
-                model::range_logical_end{load<72, std::uint64_t>(*raw)},
                 model::segment_relative_end{load<80, std::uint64_t>(*raw)},
                 *alignment,
                 static_cast<storage_profile>(load<92, std::uint16_t>(*raw)),
                 load<94, std::uint16_t>(*raw),
                 static_cast<local_layout_kind>(load<96, std::uint8_t>(*raw)),
+                depth,
                 byte_count{load<104, std::uint64_t>(*raw)},
                 runtime::monotonic_duration{load<112, std::uint64_t>(*raw)}});
             break;
@@ -442,83 +447,6 @@ public:
               local_boundary_evidence{*sc, *device, *footer, *coverage, retry});
             break;
         }
-        case local_metadata_kind::completed_retry_root: {
-            auto raw = co_await read<128>();
-            if (!raw) co_return codec::failure(raw.error());
-            auto sc = detail::read_local_segment<0>(*raw, c);
-            if (!sc) co_return codec::failure(sc.error());
-            if (auto valid = matches_segment(*sc); !valid) co_return valid;
-            auto footer = detail::read_local_footer<72>(*raw, c);
-            if (!footer) co_return codec::failure(footer.error());
-            if (
-              auto valid = detail::check_local_root_counts(
-                load<120, std::uint32_t>(*raw),
-                load<124, std::uint32_t>(*raw),
-                work_.policy(),
-                c);
-              !valid)
-                co_return valid;
-            value_.emplace(
-              local_completed_retry_root{
-                *sc, *footer, load<120, std::uint32_t>(*raw), {}});
-            co_return co_await entries<48>(
-              std::get<local_completed_retry_root>(*value_).pages,
-              load<124, std::uint32_t>(*raw),
-              static_cast<std::uint32_t>(std::min<std::uint64_t>(
-                maximum_object_pages,
-                work_.policy().config().max_object_pages.value())),
-              detail::read_page_ref);
-        }
-        case local_metadata_kind::completed_retry_page: {
-            auto raw = co_await read<92>();
-            if (!raw) co_return codec::failure(raw.error());
-            auto sc = detail::read_local_segment<0>(*raw, c);
-            if (!sc) co_return codec::failure(sc.error());
-            if (auto valid = matches_segment(*sc); !valid) co_return valid;
-            auto sequence = page_wire(
-              local_object_sequence::make(load<72, std::uint64_t>(*raw)),
-              c,
-              72);
-            auto ordinal = page_wire(
-              page_ordinal::make(load<80, std::uint32_t>(*raw)), c, 80);
-            if (!sequence) co_return codec::failure(sequence.error());
-            if (!ordinal) co_return codec::failure(ordinal.error());
-            if (
-              auto valid = detail::check_local_page_fields(
-                header.generation(),
-                *sequence,
-                *ordinal,
-                load<84, std::uint32_t>(*raw),
-                load<88, std::uint32_t>(*raw),
-                work_.policy(),
-                c);
-              !valid)
-                co_return valid;
-            if (
-              auto valid = matches_page(
-                *ordinal,
-                load<84, std::uint32_t>(*raw),
-                load<88, std::uint32_t>(*raw));
-              !valid)
-                co_return valid;
-            value_.emplace(
-              local_completed_retry_page{
-                *sc, *sequence, *ordinal, load<84, std::uint32_t>(*raw), {}});
-            co_return co_await entries<160>(
-              std::get<local_completed_retry_page>(*value_).entries,
-              load<88, std::uint32_t>(*raw),
-              static_cast<std::uint32_t>(std::min<std::uint64_t>(
-                maximum_object_entries,
-                work_.policy().config().max_object_entries.value())),
-              [segment = *sc, previous = previous_retry_](
-                const std::array<char, 160>& entry,
-                codec::field_context field) mutable {
-                  auto decoded = detail::read_retry_entry(
-                    entry, segment, field, previous);
-                  if (decoded) previous = decoded->id();
-                  return decoded;
-              });
-        }
         }
         co_return codec::result<void>{};
     }
@@ -533,7 +461,6 @@ private:
     codec::field_context context_;
     codec::decode_budget memory_;
     std::uint64_t end_;
-    std::optional<model::batch_id> previous_retry_;
 };
 struct wal_descriptor_expectation final {
     local_metadata_header header;
@@ -637,8 +564,7 @@ struct body_reader final {
           work,
           c,
           memory,
-          local_metadata_prefix_bytes.value() + payload_bytes,
-          expected ? expected->previous_retry : std::nullopt};
+          local_metadata_prefix_bytes.value() + payload_bytes};
         std::optional<codec::error> failed;
         std::exception_ptr exception;
         try {
@@ -675,7 +601,6 @@ struct body_reader final {
                     *reader.value_,
                     *layout,
                     expected ? expected->segment_alignment : std::nullopt,
-                    expected ? expected->data_metadata_alignment : std::nullopt,
                     work,
                     c);
                   !valid) {

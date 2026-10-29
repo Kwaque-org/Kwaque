@@ -59,6 +59,33 @@ seastar::future<> on_the_image(bool sealed) {
             files, owner, devices, budget, reserve, drive, timer, sealed);
       });
 }
+// The same image after a crash lost segment A's blocks, and the engine
+// started on it twice.
+seastar::future<> materialized_on_the_image() {
+    namespace image = storage::testing::engine_fixture_contract;
+    co_await with_reserved_store(
+      [](
+        auto& files,
+        auto&,
+        auto&,
+        auto& budget,
+        auto& reserve,
+        auto drive,
+        auto& timer) -> seastar::future<> {
+          const std::array roots{
+            take(runtime::file_path::make("/kwaque/w")),
+            take(runtime::file_path::make("/kwaque/a")),
+            take(runtime::file_path::make("/kwaque/b"))};
+          for (const auto& root : roots)
+              take(co_await drive.lifecycle(files.create_directories(root)));
+          const auto devices = image::devices(
+            roots, {{{1, 2}, {1, 3}, {1, 4}}});
+          ownership_input owner{devices};
+          co_await image::materialized_on_the_image<
+            simulation::monotonic_clock>(
+            files, owner, devices, budget, reserve, drive, timer);
+      });
+}
 } // namespace
 
 // The store that history leaves is the same store on every build: every
@@ -94,7 +121,7 @@ SEASTAR_TEST_CASE(engine_history_fake_the_store_is_the_same_on_every_build) {
     }
     BOOST_TEST_MESSAGE("the store's files:" << listing.str());
     BOOST_CHECK_MESSAGE(
-      left == UINT64_C(0x37ef20a93a7b9b28),
+      left == UINT64_C(0x388d5782d14418a5),
       "the store's digest is 0x" << std::hex << left << std::dec
                                  << "; its files:" << listing.str());
 }
@@ -109,4 +136,10 @@ SEASTAR_TEST_CASE(engine_fixture_fake_started_on_the_image) {
 // requests the image holds, byte for byte.
 SEASTAR_TEST_CASE(engine_fixture_fake_sealed_segment_read_from_the_image) {
     co_await on_the_image(true);
+}
+
+// The same image after a crash lost segment A's blocks while the WAL kept
+// their PREPAREs: the start writes them back before it publishes A.
+SEASTAR_TEST_CASE(engine_fixture_fake_lost_blocks_written_from_the_wal) {
+    co_await materialized_on_the_image();
 }

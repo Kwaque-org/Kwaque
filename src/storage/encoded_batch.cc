@@ -187,7 +187,8 @@ seastar::future<codec::result<assigned_batch_info>> read_info(
               value.value.context(),
               value.value.fingerprint(),
               value.value.header_count(),
-              value.fingerprint_verification);
+              value.fingerprint_verification,
+              value.value.max_record_time());
         } while (false);
     } catch (...) {
         exception = std::current_exception();
@@ -352,7 +353,8 @@ make_encoded_assigned_batch(
       input->context().retained_count().value()
           == input->context().submitted().original_count().value()
         ? model::batch_fingerprint_verification::recomputed
-        : model::batch_fingerprint_verification::carried};
+        : model::batch_fingerprint_verification::carried,
+      input->max_record_time()};
     std::optional<codec::result<kwaque::bytes::fragmented_buffer>> encoded;
     std::optional<encoded_assigned_batch> result;
     std::optional<codec::error> failed;

@@ -1,12 +1,17 @@
 #pragma once
 
 #include "src/base/units.h"
+#include "src/storage/local_metadata_layout.h"
 #include "src/storage/storage_scan.h"
 #include "src/storage/tests/local_reader_contract.h"
+#include "src/storage/tests/wal_test_support.h"
 #include "src/storage/wal_scan.h"
 
+#include <algorithm>
 #include <array>
+#include <bit>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace kwaque::storage::testing::scan_contract {
@@ -31,16 +36,17 @@ inline segment_context segment_b() {
              model::segment_generation::make(2).value())
       .value();
 }
+// Where the segment `descriptor_b()` describes starts in its range.
+inline model::range_logical_end origin_b() {
+    return model::range_logical_end{1000};
+}
 inline local_segment_descriptor descriptor_b() {
     auto value = descriptor();
     value.segment = segment_b();
-    value.logical_origin = model::range_logical_end{1000};
     return value;
 }
 inline segment_header segment_head_b() {
-    return segment_header::make(
-             segment_b(), model::range_logical_end{1000}, alignment(4096))
-      .value();
+    return segment_header::make(segment_b(), alignment(4096)).value();
 }
 // The head alone, pinned by its exact header digest.
 inline local_shard_control head_control() {
@@ -74,6 +80,7 @@ struct seen_prepare final {
     wal_target_resolution resolution;
     segment_context target;
     std::string child;
+    bool survival{false};
 };
 struct observed final {
     std::vector<seen_prepare> prepares;
@@ -88,7 +95,8 @@ struct observe_prepares final {
            value.end.position().value(),
            value.resolution,
            value.claims.target,
-           value.prepare ? flat(value.prepare->batch().bytes()) : ""});
+           value.prepare ? flat(value.prepare->batch().bytes()) : "",
+           value.survival});
         return seastar::make_ready_future<runtime::result<bool>>(true);
     }
 };
@@ -312,13 +320,18 @@ seastar::future<> reader_slots(
 
 // The head's content in WAL order, resolved against independent targets, and
 // every head tail ending the content without changing a byte.
-template<typename Backend, typename Owner, typename Driver>
+template<
+  typename Backend,
+  typename Owner,
+  typename Driver,
+  typename Reads = store_contract::uncounted_reads>
 seastar::future<> head_tails(
   Backend& files,
   Owner& owner,
   const local_device_spec& spec,
   workload_budget& budget,
-  Driver drive) {
+  Driver drive,
+  Reads reads = {}) {
     co_await seed_targets(files, owner, spec, budget, drive);
     seastar::abort_source abort;
     codec::cooperative_work work{codec::limits::defaults(), abort};
@@ -333,9 +346,28 @@ seastar::future<> head_tails(
     runtime::first_failure failed;
     try {
         co_await put_wal(files, spec, wal(1), interleaved(), drive);
+        const auto head_path = take(
+          take(local_paths::make(spec.root)).wal(0, wal(1)));
+        const auto read_before = reads(head_path);
         auto result = take(
           co_await scan(
             files, owner, spec, budget, head_control(), *catalog, out, drive));
+        // A scan reads the head's first envelope in one bounded read, then
+        // what follows its header at most twice: a first pass finds the
+        // last whole write and the visiting pass reads up to it. Here both
+        // read all of it.
+        const auto data_start = local_fixture::read("wal_header").size();
+        const auto first_read = [](std::uint64_t file) {
+            return std::min(
+              {file,
+               local_metadata_first_read_bytes.value(),
+               limits().operation_bytes.value()});
+        };
+        if (const auto read_after = reads(head_path); read_after && read_before)
+            require(
+              *read_after - *read_before
+                == first_read(16384) + 2 * (16384 - data_start),
+              "the head was read more than its header and two passes");
         require(
           result.complete && result.verdict == wal_scan_verdict::intact
             && result.files == 1 && result.prepares == 3
@@ -410,6 +442,7 @@ seastar::future<> head_tails(
             1}};
         for (const auto& tail : tails) {
             co_await put_wal(files, spec, wal(1), tail.bytes, drive);
+            const auto tail_before = reads(head_path);
             auto damaged = take(
               co_await scan(
                 files,
@@ -427,11 +460,88 @@ seastar::future<> head_tails(
                 && out.prepares.size() == tail.prepares && out.files.size() == 1
                 && out.files[0].stop == tail.stop,
               "head tail misclassified");
+            if (
+              const auto tail_after = reads(head_path);
+              tail_after && tail_before) {
+                const auto read = *tail_after - *tail_before;
+                const auto size = tail.bytes.size();
+                require(
+                  read <= first_read(size) + 2 * (size - data_start)
+                    && read >= first_read(size) + tail.content_end - data_start,
+                  "a head tail was read more than its header and two "
+                  "passes, or its content not read");
+            }
             const auto path = take(
               take(local_paths::make(spec.root)).wal(0, wal(1)));
             require(
               (co_await read_bytes(files, path, drive)) == tail.bytes,
               "head scan changed tail bytes");
+        }
+        // Read on after its content, as restart reads it, the head's intact
+        // PREPAREs at their own positions are survivals: never content, and
+        // their WAL stamps raise what the file proves certified. Without the
+        // probe nothing after the content is visited.
+        {
+            wal_prepare_expectation later{
+              wal_write_context::make(
+                wal(1), alignment(4096), runtime::file_position{12288})
+                .value(),
+              runtime::file_position{4096},
+              segment_write_context::make(
+                segment(),
+                alignment(4096),
+                model::segment_relative_end{1},
+                runtime::file_position{4495})
+                .value(),
+              runtime::file_position{4096},
+              model::range_routing_epoch::make(1).value(),
+              batch_expected()};
+            auto stamps = wal_stamps(later);
+            stamps.wal_certified_end = runtime::file_position{12288};
+            const auto bytes
+              = head + body_damage
+                + wal_wire(local_fixture::read("child_a2"), later, 32, stamps);
+            co_await put_wal(files, spec, wal(1), bytes, drive);
+            auto proving = scan_limits();
+            proving.prove = true;
+            auto proved = take(
+              co_await scan(
+                files,
+                owner,
+                spec,
+                budget,
+                head_control(),
+                *catalog,
+                out,
+                drive,
+                std::nullopt,
+                proving));
+            require(
+              proved.complete && proved.content_end
+                && proved.content_end->position().value() == 8192
+                && out.prepares.size() == 2 && !out.prepares[0].survival
+                && out.prepares[1].survival && out.prepares[1].position == 12288
+                && out.prepares[1].target == segment()
+                && out.prepares[1].child.empty() && out.files.size() == 1
+                && out.files[0].stop == wal_scan_stop::corrupt
+                && out.files[0].proven_end.value() == 12288,
+              "a later intact PREPARE did not prove the head's damage");
+            auto unproved = take(
+              co_await scan(
+                files,
+                owner,
+                spec,
+                budget,
+                head_control(),
+                *catalog,
+                out,
+                drive));
+            require(
+              unproved.content_end
+                && unproved.content_end->position().value() == 8192
+                && out.prepares.size() == 1 && out.files.size() == 1
+                && out.files[0].proven_end.value() == 4096,
+              "a scan without the probe read past the head's content");
         }
         co_await put_wal(files, spec, wal(1), head + unsupported, drive);
         auto rejected = co_await scan(
@@ -444,6 +554,490 @@ seastar::future<> head_tails(
     }
     catalog.reset();
     take(failed.outcome());
+}
+
+// A PREPARE of A1's child at `position` in the head, one member of its write
+// unless it ends it, whose WAL stamp says the bytes before `certified` were
+// durable when its group was formed. Of wal(1) unless `of` names another
+// incarnation, whose file a recycled head could hold.
+inline std::string stamped_member(
+  std::uint64_t position,
+  std::uint64_t certified,
+  bool ends_write = true,
+  model::wal_incarnation_id of = wal(1)) {
+    const wal_prepare_expectation context{
+      wal_write_context::make(
+        of, alignment(4096), runtime::file_position{position})
+        .value(),
+      runtime::file_position{4096},
+      segment_write_context::make(
+        segment(),
+        alignment(4096),
+        model::segment_relative_end{0},
+        runtime::file_position{4096})
+        .value(),
+      runtime::file_position{4096},
+      model::range_routing_epoch::make(1).value(),
+      batch_expected()};
+    auto stamps = wal_stamps(context);
+    stamps.ends_write = ends_write;
+    stamps.wal_certified_end = runtime::file_position{certified};
+    return wal_wire(local_fixture::read("child_a1"), context, 32, stamps);
+}
+// An object with one byte of its child flipped: its header still verifies
+// its length. With `header`, a byte of its header, so nothing verifies it.
+inline std::string flipped(std::string object, bool header = false) {
+    object[header ? 13 : 32 + 168 + 8] ^= 1;
+    return object;
+}
+
+// What a head's scan makes of damage, read on past it as restart reads it:
+// the cases of a reader that confirms damage by the sync offsets later
+// chunks carry, on a head of 4 KiB units. Damage below the end the head's
+// intact PREPAREs prove certified is corruption; at or past it the tail is
+// uncertified. A damaged object's stamp proves nothing, nor does a PREPARE
+// of another incarnation. An object whose header holds is passed over by
+// its verified length and anything else at the next unit, so an intact
+// PREPARE after damage in its own unit still counts. Stamps lie on unit
+// boundaries at or before their own object, so no object proves damage in
+// its own unit: only a later unit's can. Nothing is changed.
+template<typename Backend, typename Owner, typename Driver>
+seastar::future<> proven_heads(
+  Backend& files,
+  Owner& owner,
+  const local_device_spec& spec,
+  workload_budget& budget,
+  Driver drive) {
+    co_await seed_targets(files, owner, spec, budget, drive);
+    seastar::abort_source abort;
+    codec::cooperative_work work{codec::limits::defaults(), abort};
+    const std::array specs{spec};
+    using catalog_type = local_wal_target_catalog<Backend, Owner>;
+    const std::array<typename catalog_type::entry, 2> entries{
+      {{descriptor(), segment_head()}, {descriptor_b(), segment_head_b()}}};
+    auto catalog = take(
+      catalog_type::make(
+        files, owner, specs, 0, entries, budget, limits(), work));
+    observed out;
+    runtime::first_failure failed;
+    try {
+        const auto at = [](
+                          std::uint64_t position,
+                          std::uint64_t certified,
+                          bool ends_write = true) {
+            return stamped_member(position, certified, ends_write);
+        };
+        const auto stale = [](std::uint64_t position, std::uint64_t certified) {
+            return stamped_member(position, certified, true, wal(2));
+        };
+        // A member that does not end its write takes 423 bytes, so the next
+        // member of its write begins there.
+        const std::uint64_t next = 4096 + 423;
+        const std::uint64_t later = 8192 + 423;
+        struct proof_case final {
+            const char* name;
+            std::string tail;
+            wal_scan_stop stop;
+            std::uint64_t content_end, proven_end;
+            // Content PREPAREs, then intact ones visited after the content.
+            std::size_t content, survivals;
+        };
+        const std::array cases{
+          proof_case{
+            "one damaged object, nothing after it",
+            flipped(at(4096, 4096)),
+            wal_scan_stop::corrupt,
+            4096,
+            4096,
+            0,
+            0},
+          proof_case{
+            "damage that hides its own length",
+            flipped(at(4096, 4096), true),
+            wal_scan_stop::corrupt,
+            4096,
+            4096,
+            0,
+            0},
+          proof_case{
+            "two damaged objects",
+            flipped(at(4096, 4096)) + flipped(at(8192, 4096)),
+            wal_scan_stop::corrupt,
+            4096,
+            4096,
+            0,
+            0},
+          proof_case{
+            "the stamp that would prove it is damaged too",
+            flipped(at(4096, 4096)) + flipped(at(8192, 8192)),
+            wal_scan_stop::corrupt,
+            4096,
+            4096,
+            0,
+            0},
+          proof_case{
+            "a later unit proves it",
+            flipped(at(4096, 4096)) + at(8192, 8192),
+            wal_scan_stop::corrupt,
+            4096,
+            8192,
+            0,
+            1},
+          proof_case{
+            "its write's members, then a later unit that proves it",
+            flipped(at(4096, 4096, false)) + at(next, 4096) + at(8192, 8192),
+            wal_scan_stop::corrupt,
+            4096,
+            8192,
+            0,
+            2},
+          proof_case{
+            "its write's members cannot prove it, and the next unit is "
+            "damaged",
+            flipped(at(4096, 4096, false)) + at(next, 4096)
+              + flipped(at(8192, 8192)),
+            wal_scan_stop::corrupt,
+            4096,
+            4096,
+            0,
+            1},
+          proof_case{
+            "proof after damage in its own unit",
+            flipped(at(4096, 4096)) + flipped(at(8192, 8192, false))
+              + at(later, 8192),
+            wal_scan_stop::corrupt,
+            4096,
+            8192,
+            0,
+            1},
+          proof_case{
+            "proof two units on",
+            flipped(at(4096, 4096)) + flipped(at(8192, 8192, false))
+              + flipped(at(later, 8192)) + at(12288, 12288),
+            wal_scan_stop::corrupt,
+            4096,
+            12288,
+            0,
+            1},
+          proof_case{
+            "a stamp that reaches only where the damage begins",
+            at(4096, 4096) + flipped(at(8192, 8192)) + at(12288, 8192),
+            wal_scan_stop::corrupt,
+            8192,
+            8192,
+            1,
+            1},
+          proof_case{
+            "another incarnation's PREPARE in its place",
+            stale(4096, 4096),
+            wal_scan_stop::foreign,
+            4096,
+            4096,
+            0,
+            0},
+          proof_case{
+            "another incarnation's PREPARE, then proof",
+            stale(4096, 4096) + at(8192, 8192),
+            wal_scan_stop::foreign,
+            4096,
+            8192,
+            0,
+            1},
+          proof_case{
+            "another incarnation's stamp proves nothing",
+            stale(4096, 4096) + stale(8192, 8192),
+            wal_scan_stop::foreign,
+            4096,
+            4096,
+            0,
+            0}};
+        auto proving = scan_limits();
+        proving.prove = true;
+        const auto path = take(
+          take(local_paths::make(spec.root)).wal(0, wal(1)));
+        for (const auto& one : cases) {
+            const auto bytes = local_fixture::read("wal_header") + one.tail;
+            co_await put_wal(files, spec, wal(1), bytes, drive);
+            auto scanned = take(
+              co_await scan(
+                files,
+                owner,
+                spec,
+                budget,
+                head_control(),
+                *catalog,
+                out,
+                drive,
+                std::nullopt,
+                proving));
+            const auto survivals = static_cast<std::size_t>(
+              std::ranges::count_if(out.prepares, [](const seen_prepare& seen) {
+                  return seen.survival;
+              }));
+            require(
+              scanned.complete && scanned.content_end
+                && scanned.content_end->position().value() == one.content_end
+                && out.files.size() == 1 && out.files[0].stop == one.stop
+                && out.files[0].proven_end.value() == one.proven_end
+                && out.prepares.size() == one.content + one.survivals
+                && survivals == one.survivals,
+              one.name);
+            require(
+              (co_await read_bytes(files, path, drive)) == bytes,
+              "a head's scan changed its bytes");
+        }
+    } catch (...) {
+        failed.observe(std::current_exception());
+    }
+    catalog.reset();
+    take(failed.outcome());
+}
+
+// A PREPARE of the head wal(1) that ends its write or continues it, framed
+// independently as the fixtures are.
+inline std::string member_at(
+  std::string child,
+  std::uint64_t wal_position,
+  segment_context target,
+  std::uint64_t physical,
+  std::uint64_t position,
+  bool ends_write) {
+    const wal_prepare_expectation context{
+      wal_write_context::make(
+        wal(1), alignment(4096), runtime::file_position{wal_position})
+        .value(),
+      runtime::file_position{4096},
+      segment_write_context::make(
+        target,
+        alignment(4096),
+        model::segment_relative_end{physical},
+        runtime::file_position{position})
+        .value(),
+      runtime::file_position{4096},
+      model::range_routing_epoch::make(1).value(),
+      batch_expected()};
+    auto stamps = wal_stamps(context);
+    stamps.ends_write = ends_write;
+    return wal_wire(std::move(child), context, 32, stamps);
+}
+
+// Packed writes in the head. A write is content only whole: its members
+// before the one that sets ends_write are visited only once that member is
+// intact, so a write that lost its last member, to zeros, damage or the
+// file's end, ends the content where it began. Zeros where a write would
+// begin are unwritten space. A cutoff at a PREPARE boundary inside a write
+// scans from there. Nothing is changed.
+template<typename Backend, typename Owner, typename Driver>
+seastar::future<> packed_writes(
+  Backend& files,
+  Owner& owner,
+  const local_device_spec& spec,
+  workload_budget& budget,
+  Driver drive) {
+    co_await seed_targets(files, owner, spec, budget, drive);
+    seastar::abort_source abort;
+    codec::cooperative_work work{codec::limits::defaults(), abort};
+    const std::array specs{spec};
+    using catalog_type = local_wal_target_catalog<Backend, Owner>;
+    const std::array<typename catalog_type::entry, 2> entries{
+      {{descriptor(), segment_head()}, {descriptor_b(), segment_head_b()}}};
+    auto catalog = take(
+      catalog_type::make(
+        files, owner, specs, 0, entries, budget, limits(), work));
+    observed out;
+    runtime::first_failure failed;
+    try {
+        // One write of A1 then B1, which ends it; then A2's write alone.
+        const auto a1 = member_at(
+          local_fixture::read("child_a1"), 4096, segment(), 0, 4096, false);
+        const std::uint64_t b1_at = 4096 + a1.size();
+        const auto b1 = member_at(
+          local_fixture::read("child_b1"), b1_at, segment_b(), 0, 4096, true);
+        const std::uint64_t a2_at = b1_at + b1.size();
+        const auto a2 = member_at(
+          local_fixture::read("child_a2"), a2_at, segment(), 1, 8192, true);
+        const auto a2_open = member_at(
+          local_fixture::read("child_a2"), a2_at, segment(), 1, 8192, false);
+        const std::uint64_t whole_end = a2_at + a2.size();
+        const auto header = local_fixture::read("wal_header");
+        require(
+          a1.size() % 4096 != 0 && a2_at % 4096 == 0 && whole_end % 4096 == 0,
+          "the packed writes do not have the shape the cases need");
+        const auto path = take(
+          take(local_paths::make(spec.root)).wal(0, wal(1)));
+
+        co_await put_wal(files, spec, wal(1), header + a1 + b1 + a2, drive);
+        auto whole = take(
+          co_await scan(
+            files, owner, spec, budget, head_control(), *catalog, out, drive));
+        require(
+          whole.complete && whole.verdict == wal_scan_verdict::intact
+            && whole.content_end
+            && whole.content_end->position().value() == whole_end
+            && out.prepares.size() == 3 && out.prepares[0].position == 4096
+            && out.prepares[1].position == b1_at
+            && out.prepares[1].target == segment_b()
+            && out.prepares[2].position == a2_at && out.files.size() == 1
+            && out.files[0].stop == wal_scan_stop::end
+            && out.files[0].content_end.value() == whole_end,
+          "packed writes were not scanned whole and in order");
+
+        auto damaged_b1 = b1;
+        damaged_b1[400] ^= 1;
+        struct tail_case final {
+            std::string bytes;
+            wal_scan_stop stop;
+            std::uint64_t content_end;
+            std::size_t prepares;
+        };
+        const std::array tails{
+          tail_case{
+            header + a1 + std::string(8192, '\0'),
+            wal_scan_stop::torn,
+            4096,
+            0},
+          tail_case{header + a1, wal_scan_stop::torn, 4096, 0},
+          tail_case{header + a1 + damaged_b1, wal_scan_stop::corrupt, 4096, 0},
+          tail_case{
+            header + a1 + b1 + std::string(4096, '\0'),
+            wal_scan_stop::unwritten,
+            a2_at,
+            2},
+          tail_case{
+            header + a1 + b1 + a2_open + std::string(4096, '\0'),
+            wal_scan_stop::torn,
+            a2_at,
+            2}};
+        for (const auto& tail : tails) {
+            co_await put_wal(files, spec, wal(1), tail.bytes, drive);
+            auto damaged = take(
+              co_await scan(
+                files,
+                owner,
+                spec,
+                budget,
+                head_control(),
+                *catalog,
+                out,
+                drive));
+            require(
+              damaged.complete && damaged.verdict == wal_scan_verdict::intact
+                && damaged.content_end
+                && damaged.content_end->position().value() == tail.content_end
+                && out.prepares.size() == tail.prepares && out.files.size() == 1
+                && out.files[0].stop == tail.stop,
+              "a packed head's tail was misclassified, or a member of an "
+              "unfinished write was visited");
+            require(
+              (co_await read_bytes(files, path, drive)) == tail.bytes,
+              "the head scan changed bytes");
+        }
+
+        // From a cutoff inside the first write.
+        const auto inside = take(
+          local_wal_cursor::make(wal(1), runtime::file_position{b1_at}));
+        co_await put_wal(files, spec, wal(1), header + a1 + b1 + a2, drive);
+        auto resumed = take(
+          co_await scan(
+            files,
+            owner,
+            spec,
+            budget,
+            head_control(),
+            *catalog,
+            out,
+            drive,
+            inside));
+        require(
+          resumed.complete && resumed.content_end
+            && resumed.content_end->position().value() == whole_end
+            && out.prepares.size() == 2 && out.prepares[0].position == b1_at
+            && out.prepares[1].position == a2_at && out.files.size() == 1
+            && out.files[0].begin.value() == b1_at,
+          "a scan from a cutoff inside a write did not start there");
+        co_await put_wal(
+          files,
+          spec,
+          wal(1),
+          header + a1 + std::string(b1.size(), '\0'),
+          drive);
+        auto cut = take(
+          co_await scan(
+            files,
+            owner,
+            spec,
+            budget,
+            head_control(),
+            *catalog,
+            out,
+            drive,
+            inside));
+        require(
+          cut.complete && cut.content_end
+            && cut.content_end->position().value() == b1_at
+            && out.prepares.empty() && out.files.size() == 1
+            && out.files[0].stop == wal_scan_stop::torn,
+          "zeros inside a write after a cutoff were not a tear");
+    } catch (...) {
+        failed.observe(std::current_exception());
+    }
+    catalog.reset();
+    take(failed.outcome());
+}
+
+// The PREPARE a recycled file's earlier incarnation left at 8192: A1's,
+// placed there under another incarnation, so only the scan's identity
+// refuses it, and its child differs from B1's, which belongs there now.
+inline std::string earlier_prepare() {
+    auto stale = local_fixture::read("prepare_a1");
+    const auto earlier = wal(2);
+    const auto raw = earlier.bytes();
+    for (std::size_t i = 0; i < raw.size(); ++i)
+        stale[32 + i] = std::bit_cast<char>(raw[i]);
+    put(stale, 32 + 16, 8192, 8);
+    repair(stale);
+    return stale;
+}
+
+// A recycled head's own PREPAREs, then its earlier incarnation's: the
+// content ends at its own last PREPARE, the earlier bytes are foreign and
+// never damage. A new PREPARE torn over the earlier bytes never completes:
+// its checksum fails and it ends the content too. Nothing is changed.
+template<typename Backend, typename Owner, typename Driver>
+seastar::future<> recycled_head(
+  Backend& files,
+  Owner& owner,
+  const local_device_spec& spec,
+  workload_budget& budget,
+  Driver drive) {
+    co_await seed_targets(files, owner, spec, budget, drive);
+    fixed_targets targets{{target(segment()), target(segment_b())}};
+    observed out;
+    const auto head = local_fixture::read("wal_header")
+                      + local_fixture::read("prepare_a1");
+    const auto stale = earlier_prepare();
+    // B1's first sectors, inside its child, then the earlier bytes.
+    const auto torn = local_fixture::read("prepare_b1").substr(0, 256)
+                      + stale.substr(256);
+    const auto path = take(take(local_paths::make(spec.root)).wal(0, wal(1)));
+    for (const auto& [bytes, stop] :
+         {std::pair{head + stale, wal_scan_stop::foreign},
+          std::pair{head + torn, wal_scan_stop::corrupt}}) {
+        co_await put_wal(files, spec, wal(1), bytes, drive);
+        auto result = take(
+          co_await scan(
+            files, owner, spec, budget, head_control(), targets, out, drive));
+        require(
+          result.complete && result.verdict == wal_scan_verdict::intact
+            && result.files == 1 && result.prepares == 1 && result.content_end
+            && result.content_end->incarnation() == wal(1)
+            && result.content_end->position().value() == 8192
+            && out.files.size() == 1 && out.files[0].stop == stop,
+          "a recycled head's earlier bytes became content or damage");
+        require(
+          (co_await read_bytes(files, path, drive)) == bytes,
+          "the scan changed a recycled head");
+    }
 }
 
 // Rotated files are certified to their sealed end; slack after it is not
@@ -499,6 +1093,17 @@ seastar::future<> rotated_chain(
       result.verdict == wal_scan_verdict::intact && out.prepares.size() == 3
         && out.files[0].nonzero_slack,
       "nonzero slack hidden or parsed");
+    // A recycled file's earlier PREPARE past the sealed end is slack too.
+    co_await put_wal(
+      files, spec, wal(1), interleaved() + earlier_prepare(), drive);
+    result = take(
+      co_await scan(
+        files, owner, spec, budget, chain_control(), targets, out, drive));
+    require(
+      result.verdict == wal_scan_verdict::intact && out.prepares.size() == 3
+        && out.files[0].nonzero_slack
+        && out.files[0].slack.value() == earlier_prepare().size(),
+      "an earlier incarnation's PREPARE past the sealed end was parsed");
 
     const auto cutoff = take(
       local_wal_cursor::make(wal(1), runtime::file_position{8192}));
@@ -578,15 +1183,17 @@ seastar::future<> target_resolution(
       "unknown target gained authority or ended the content");
     require(only_a.lookups == 3, "target resolved more than once per PREPARE");
 
-    // A known target whose data starts after the claimed position.
+    // A known target whose data starts after the claimed positions: A1 at
+    // 4096 and A2, packed after it, at 4495. B's own target resolves.
     fixed_targets late{{target(segment(), 8192), target(segment_b())}};
     result = take(
       co_await scan(
         files, owner, spec, budget, head_control(), late, out, drive));
     require(
-      result.unresolved == 1
+      result.unresolved == 2
         && out.prepares[0].resolution == wal_target_resolution::misplaced
-        && out.prepares[2].resolution == wal_target_resolution::resolved,
+        && out.prepares[1].resolution == wal_target_resolution::resolved
+        && out.prepares[2].resolution == wal_target_resolution::misplaced,
       "misplaced target accepted");
 
     // Identity is checked before any lookup.
@@ -628,11 +1235,8 @@ seastar::future<> target_resolution(
                         segment_b().segment(),
                         model::segment_generation::make(3).value())
                         .value();
-    auto missing_head = segment_header::make(
-                          missing.segment,
-                          model::range_logical_end{1000},
-                          alignment(4096))
-                          .value();
+    auto missing_head
+      = segment_header::make(missing.segment, alignment(4096)).value();
     const std::array<typename catalog_type::entry, 2> entries{
       {{descriptor(), segment_head()}, {missing, missing_head}}};
     auto catalog = take(

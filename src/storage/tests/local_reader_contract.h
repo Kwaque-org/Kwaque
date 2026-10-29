@@ -11,6 +11,7 @@ using installation_contract::buffer_async;
 using installation_contract::descriptor;
 using installation_contract::limits;
 using installation_contract::literal_digest;
+using installation_contract::origin;
 using installation_contract::require;
 using installation_contract::segment;
 using installation_contract::segment_head;
@@ -37,36 +38,23 @@ record_expectation(const local_device_spec& spec, std::string_view name) {
         expected.segment = segment();
         expected.segment_alignment = alignment(4096);
     }
-    if (
-      test.kind == 6 || test.kind == 9 || test.kind == 10 || test.kind == 11) {
+    if (test.kind == 6 || test.kind == 9 || test.kind == 10) {
         expected.digest = literal_digest(test.digest);
         expected.encoded_bytes = byte_count{test.bytes};
     }
-    if (test.data_device) {
+    if (test.data_device)
         expected.data_device = id<device_store_id>(test.data_device);
-        expected.data_metadata_alignment = alignment(4096);
-    }
     return expected;
-}
-inline local_root_reference snapshot_ref() {
-    return take(
-      local_root_reference::make(
-        local_root_kind::completed_retry_snapshot,
-        local_object_sequence::make(40).value(),
-        runtime::file_position{},
-        byte_count{4_KiB},
-        page_count::make(1).value(),
-        literal_digest("58032fdff862aa9a3dc5869021e05dfc")));
 }
 inline local_root_reference sealed_ref() {
     return take(
       local_root_reference::make(
         local_root_kind::sealed_retry,
         local_object_sequence::make(41).value(),
-        runtime::file_position{16384},
+        runtime::file_position{8192},
         byte_count{4_KiB},
         page_count::make(1).value(),
-        literal_digest("23f26dfc1ea13edbe500c410124c229c")));
+        literal_digest("ce3d48e2534348af6d0252a246162909")));
 }
 inline local_root_reference index_ref() {
     return take(
@@ -76,7 +64,7 @@ inline local_root_reference index_ref() {
         runtime::file_position{},
         byte_count{4_KiB},
         page_count::make(1).value(),
-        literal_digest("8e20d4aa0f5e9fea105fab317cf06154")));
+        literal_digest("d27d642484957b030146bd059794b528")));
 }
 inline segment_history_context history() {
     return {
@@ -89,10 +77,10 @@ inline segment_history_context history() {
 inline local_footer_reference active_boundary() {
     return take(
       local_footer_reference::make(
-        runtime::file_position{12288},
-        byte_count{4_KiB},
+        runtime::file_position{4894},
+        byte_count{3298},
         6,
-        literal_digest("c156c15a2d7d3870d7d6d8d16d52ba64")));
+        literal_digest("182055564a478e85e6d294ce87a6526e")));
 }
 inline local_footer_reference sealed_boundary() {
     return take(
@@ -110,22 +98,18 @@ inline local_object_publication sealed_publication() {
       segment(),
       local_object_state::sealed,
       sealed_boundary(),
-      {index_ref(), sealed_ref(), snapshot_ref()}};
+      {index_ref(), sealed_ref()}};
 }
-inline std::array<local_bundle_context, 3>
-contexts(const local_device_spec& spec) {
+inline std::array<local_bundle_context, 2> contexts() {
     auto index
       = sparse_index_context::make(
           segment(),
-          scope(100, 102, 0, 2, 4096, 16384),
+          scope(100, 102, 0, 2, 4096, 8192),
           codec::extent_digest{
-            literal_digest("eca717818b53c4ae00458133840519cc").bytes()},
+            literal_digest("7a4e89e84ab06576682af14e02ae43bd").bytes()},
           alignment(4096))
           .value();
-    return {
-      index,
-      footer_expectation{history(), sealed_ref().position()},
-      record_expectation(spec, "snapshot_root")};
+    return {index, footer_expectation{history(), sealed_ref().position()}};
 }
 template<typename Backend, typename Owner, typename Driver>
 seastar::future<> seed_segment(
@@ -158,12 +142,6 @@ seastar::future<> seed_segment(
       local_fixture::read("data_header_a") + local_fixture::read("block_a1")
         + local_fixture::read("block_a2") + local_fixture::read("footer_a")
         + local_fixture::read("sealed_a"),
-      drive);
-    co_await write_bytes(
-      files,
-      take(paths.object(0, name, snapshot_ref().sequence())),
-      local_fixture::read("snapshot_root")
-        + local_fixture::read("snapshot_page"),
       drive);
     co_await write_bytes(
       files,
@@ -357,6 +335,7 @@ seastar::future<> generation_lifetime(
       local_publication_generation::make(1).value(),
       active_publication(),
       descriptor(),
+      origin(),
       {}};
     auto old = take(
       co_await drive.lifecycle(
@@ -401,11 +380,12 @@ seastar::future<> generation_lifetime(
     }
     try {
         if (!failed.failed()) {
-            const auto expected_contexts = contexts(spec);
+            const auto expected_contexts = contexts();
             local_generation_expectation after{
               local_publication_generation::make(3).value(),
               sealed_publication(),
               descriptor(),
+              origin(),
               expected_contexts};
             current = take(
               co_await drive.lifecycle(
@@ -438,9 +418,7 @@ seastar::future<> generation_lifetime(
                 && !pin.index_rebuild_reason(),
               "new generation root state");
             for (auto kind :
-                 {local_root_kind::index,
-                  local_root_kind::sealed_retry,
-                  local_root_kind::completed_retry_snapshot}) {
+                 {local_root_kind::index, local_root_kind::sealed_retry}) {
                 auto root = take(pin.root(kind));
                 auto page = take(
                   co_await drive.lifecycle(
@@ -475,11 +453,12 @@ seastar::future<> generation_errors(
       take(paths.segment_file(0, name, local_segment_file::published)),
       local_fixture::read("publication_all_roots"),
       drive);
-    const auto expected_contexts = contexts(spec);
+    const auto expected_contexts = contexts();
     local_generation_expectation expected{
       local_publication_generation::make(3).value(),
       sealed_publication(),
       descriptor(),
+      origin(),
       expected_contexts};
     auto index = take(paths.object(0, name, index_ref().sequence()));
     take(co_await drive.lifecycle(files.remove_file(index)));
@@ -510,7 +489,7 @@ seastar::future<> generation_errors(
       drive);
     take(
       co_await drive.lifecycle(files.remove_file(
-        take(paths.object(0, name, snapshot_ref().sequence())))));
+        take(paths.object(0, name, sealed_ref().sequence())))));
     auto rejected = co_await drive.lifecycle(
       local_generation_owner::open(
         files, owner, spec, 0, expected, budget, limits(), work));
@@ -520,7 +499,7 @@ seastar::future<> generation_errors(
     }
     require(
       !rejected && rejected.error().code() == errc::not_found,
-      "missing required snapshot treated as derived-index debt");
+      "missing required retry summary treated as derived-index debt");
 }
 
 inline model::wal_incarnation_id wal(std::uint64_t n) {
@@ -981,7 +960,7 @@ seastar::future<> discovery_cleanup(
         local_cleanup_references facts;
         if (
           record.entry.kind == local_entry_kind::object
-          && record.entry.sequence >= 40 && record.entry.sequence <= 42)
+          && record.entry.sequence >= 41 && record.entry.sequence <= 42)
             facts.persisted = local_reference_status::referenced;
         // Test-supplied complete absence proof for exactly the known marker
         // attempt; an arbitrary .tmp spelling receives no such assertion.
@@ -1004,7 +983,7 @@ seastar::future<> discovery_cleanup(
               std::get<local_object_publication>(
                 record.decoded->value.payload())
                   .roots.size()
-                == 3,
+                == 2,
               "object references not inventoried");
             ++publications;
         }
@@ -1100,7 +1079,7 @@ seastar::future<> empty_retry(
         runtime::file_position{4096},
         byte_count{4_KiB},
         page_count::make(0).value(),
-        literal_digest("6d93f4087752ba9c90cdc90796a30851")));
+        literal_digest("bf81e622ce0d845072560600fbe6014c")));
     footer_expectation expected{
       {sc,
        alignment(4096),

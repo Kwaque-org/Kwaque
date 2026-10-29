@@ -37,6 +37,21 @@ seastar::future<runtime::result<void>> zero_fill(
     const auto size = chunk.size().value();
     if (size == 0)
         co_return runtime::failure(path_error(errc::invalid_argument));
+    auto geometry = file.geometry();
+    if (!geometry) co_return runtime::failure(geometry.error());
+    const auto unit = geometry->write_alignment().value();
+    if (begin < end && begin % unit == 0 && end % unit == 0) {
+        if (auto ready = work.poll(); !ready)
+            co_return runtime::failure(path_error(ready.error().code()));
+        // A range starting before the end is refused before dispatch, and
+        // is written instead.
+        auto zeroed = co_await file.write_zeroes(
+          runtime::file_position{begin}, byte_count{end - begin});
+        if (zeroed && *zeroed == runtime::write_zeroes_outcome::written)
+            co_return runtime::result<void>{};
+        if (!zeroed && zeroed.error().code() != errc::invalid_argument)
+            co_return runtime::failure(zeroed.error());
+    }
     const auto per_write = zero_write_chunks * size;
     for (auto position = begin; position < end;) {
         if (auto ready = work.poll(); !ready)

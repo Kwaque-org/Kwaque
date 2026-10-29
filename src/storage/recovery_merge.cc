@@ -15,19 +15,13 @@ constexpr auto sealed_root_family = static_cast<std::uint16_t>(
 
 } // namespace
 
-static_assert(
-  std::size_t{maximum_segment_group_blocks} * sizeof(detail::recovery_pending)
-  <= maximum_contiguous_allocation_bytes);
-
 runtime::result<void> recovery_merge_limits::validate() const noexcept {
     if (auto valid = wal.validate(); !valid) return valid;
     if (auto valid = segment.validate(); !valid) return valid;
     if (
       cursors == 0 || cursors > maximum_recovery_cursors || pending == 0
-      || obligations == 0
+      || obligations == 0 || obligations > maximum_recovery_obligations
       || std::size_t{pending} * sizeof(detail::recovery_queued)
-           > maximum_contiguous_allocation_bytes
-      || std::size_t{obligations} * sizeof(detail::recovery_obligation_row)
            > maximum_contiguous_allocation_bytes)
         return runtime::failure(path_error(errc::invalid_argument));
     return {};
@@ -35,7 +29,7 @@ runtime::result<void> recovery_merge_limits::validate() const noexcept {
 
 namespace detail {
 runtime::result<void>
-validate_recovery_targets(std::span<const recovery_target> targets) noexcept {
+validate_recovery_targets(table_view<recovery_target> targets) noexcept {
     for (std::size_t i = 0; i < targets.size(); ++i) {
         const auto& target = targets[i];
         const auto& segment = target.descriptor.segment;
@@ -69,7 +63,7 @@ validate_recovery_targets(std::span<const recovery_target> targets) noexcept {
 codec::content_digest recovery_binding(
   const local_shard_control& control,
   std::optional<local_wal_cursor> cutoff,
-  std::span<const recovery_target> targets,
+  table_view<recovery_target> targets,
   std::uint32_t pending) noexcept {
     static constexpr std::string_view domain{"KQ/RECOVERY-MERGE/1"};
     codec::xxh3_128_hasher hash;
@@ -122,6 +116,9 @@ void count_slot(
     case recovery_classification::footer_only:
         ++report.footer_only;
         break;
+    case recovery_classification::materialize:
+        ++report.materialize;
+        break;
     case recovery_classification::candidate:
         ++report.candidates;
         break;
@@ -132,6 +129,8 @@ void count_slot(
         ++report.conflicts;
         break;
     case recovery_classification::content:
+    case recovery_classification::materialized:
+    case recovery_classification::repaired:
     case recovery_classification::uncertified_tail:
     case recovery_classification::corruption:
     case recovery_classification::slack:
