@@ -17,6 +17,12 @@ filegroup(
 )
 
 filegroup(
+    name = "ci_save_objects",
+    srcs = [".github/actions/save-objects/action.yml"],
+    visibility = ["//tools:__pkg__"],
+)
+
+filegroup(
     name = "ci_retention",
     srcs = [
         ".github/actions/retain-logs/action.yml",

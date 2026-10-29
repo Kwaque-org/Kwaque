@@ -72,6 +72,7 @@ SETUP_BUILD = (
     else WORKFLOW.parents[1] / "actions/setup-build/action.yml"
 )
 RETAIN_LOGS = SETUP_BUILD.parents[1] / "retain-logs/action.yml"
+SAVE_OBJECTS = SETUP_BUILD.parents[1] / "save-objects/action.yml"
 REACTOR_WORKFLOW = WORKFLOW.with_name("reactor-backends.yml")
 NIGHTLY_WORKFLOW = WORKFLOW.with_name("nightly.yml")
 RELEASE_WORKFLOW = WORKFLOW.with_name("release.yml")
@@ -542,8 +543,14 @@ class CiCoverageTest(unittest.TestCase):
             "python3 -m unittest tools.ci_changes_test tools.check_ci_coverage_test",
             run_commands(gate),
         )
-        # No job waits for another job's build; all start from the change check.
-        for name in set(jobs_section(self.workflow)) - {"workflow-lint", "ci-ok"}:
+        # No check waits for another job's build; all start from the change
+        # check. Dropping superseded objects on main follows the saves and
+        # holds up no check.
+        for name in set(jobs_section(self.workflow)) - {
+            "workflow-lint",
+            "ci-ok",
+            "drop-superseded-objects",
+        }:
             with self.subTest(job=name):
                 self.assertIn(
                     "    if: needs.workflow-lint.outputs.run_checks != 'false'\n",
@@ -674,24 +681,134 @@ class CiCoverageTest(unittest.TestCase):
                     report.write_text(xml)
                     self.assertTrue(failed_report(report))
 
-    def test_analysis_is_independent_and_parallel_without_reducing_scope(self) -> None:
+    def test_analysis_is_independent_parallel_and_complete_outside_pull_requests(
+        self,
+    ) -> None:
         jobs = job_blocks(self.workflow)
         for name in ("clang-tidy", "clang-tidy-fuzz"):
             job = jobs[name]
             self.assertIn("needs: workflow-lint", job)
             self.assertNotIn("needs: [workflow-lint, build]", job)
-            for command in run_commands(job):
-                if "//tools:clang_tidy" in command:
-                    self.assertIn("-- --jobs=2", command)
+            checks = [
+                command
+                for command in run_commands(job)
+                if "//tools:clang_tidy" in command
+            ]
+            self.assertEqual(len(checks), 1)
+            self.assertIn("-- --jobs=4", checks[0])
+            # A pull request is compared with the base its merge commit
+            # merges onto; every other run checks the whole tree.
+            self.assertIn('--scope="${SCOPE}" --base=HEAD~1', checks[0])
+            self.assertIn(
+                "          SCOPE: ${{ github.event_name == 'pull_request'"
+                " && 'changed' || 'all' }}\n",
+                job,
+            )
+            self.assertIn(
+                "          persist-credentials: false\n"
+                "          # A pull request's merge commit and the base it merges onto.\n"
+                "          fetch-depth: 2\n",
+                job,
+            )
+        # The ordinary sources are split between runners, and together the
+        # shards check every one of them.
+        ordinary = jobs["clang-tidy"]
+        listed = re.search(r"^        shard: \[([0-9, ]+)\]$", ordinary, re.MULTILINE)
+        self.assertIsNotNone(listed)
+        shards = [int(value) for value in listed.group(1).split(",")]
+        checks = [
+            command
+            for command in run_commands(ordinary)
+            if "//tools:clang_tidy" in command
+        ]
+        self.assertEqual(len(checks), 1)
+        count = re.search(r'--shard="\$\{SHARD\}/([0-9]+)"', checks[0])
+        self.assertIsNotNone(count)
+        self.assertEqual(shards, list(range(int(count.group(1)))))
+        self.assertIn("SHARD: ${{ matrix.shard }}", ordinary)
+        self.assertIn("fail-fast: false", ordinary)
 
-    def test_caches_hold_downloads_written_only_from_main(self) -> None:
+    def test_caches_hold_downloads_and_objects_written_only_from_main(self) -> None:
         setup = SETUP_BUILD.read_text()
         self.assertIn("disk-cache: false", setup)
         self.assertIn("repository-cache: true", setup)
         self.assertIn("bazelisk-cache: true", setup)
         self.assertIn("cache-save: ${{ github.ref == 'refs/heads/main' }}", setup)
-        self.assertNotIn("--disk_cache", setup)
-        self.assertNotIn("inputs:", setup)
+        # One configuration's compiled objects are restored here and never
+        # saved. Links and test results stay out of the cache, so every binary
+        # is linked and every test runs on every run.
+        self.assertIn("uses: actions/cache/restore@", setup)
+        self.assertNotIn("actions/cache/save@", setup)
+        self.assertIn('echo "build --disk_cache=${HOME}/.cache/bazel-objects"', setup)
+        self.assertIn(
+            'echo "build --modify_execution_info='
+            'CppLink=+no-cache,TestRunner=+no-cache"',
+            setup,
+        )
+        marked = setup.find('touch "${RUNNER_TEMP}/bazel-objects.started"')
+        self.assertGreater(marked, setup.find("uses: actions/cache/restore@"))
+        # What is saved is exactly what the run stored or read.
+        saving = SAVE_OBJECTS.read_text()
+        pruned = saving.find('! -newer "${RUNNER_TEMP}/bazel-objects.started" -delete')
+        saved = saving.find("uses: actions/cache/save@")
+        self.assertTrue(0 <= pruned < saved)
+        # Only main writes, each configuration from one job, which restored it.
+        writers = {}
+        for name, job in jobs_section(self.workflow).items():
+            for scope in re.findall(
+                r"        uses: \./\.github/actions/save-objects\n"
+                r"        with:\n          objects: ([a-z0-9_-]+)\n",
+                job,
+            ):
+                self.assertIn(
+                    "        if: github.ref == 'refs/heads/main' && !cancelled()\n"
+                    "        uses: ./.github/actions/save-objects\n",
+                    job,
+                )
+                self.assertIn(
+                    "      - uses: ./.github/actions/setup-build\n"
+                    f"        with:\n          objects: {scope}\n",
+                    job,
+                )
+                self.assertNotIn(scope, writers)
+                writers[scope] = name
+        self.assertEqual(
+            set(writers), {"debug", "sanitizer", "release-x86_64", "release-aarch64"}
+        )
+        for name, job in jobs_section(self.workflow).items():
+            for scope in re.findall(
+                r"setup-build\n        with:\n          objects: ([a-z0-9_-]+)\n", job
+            ):
+                self.assertIn(scope, writers, name)
+        # After the saves on main, each configuration keeps only its newest
+        # entry, so superseded objects never evict other caches. Only that
+        # job may write, and it runs nothing from the repository.
+        dropping = jobs_section(self.workflow)["drop-superseded-objects"]
+        needed = re.search(r"^    needs: \[([a-z0-9, -]+)\]$", dropping, re.MULTILINE)
+        self.assertIsNotNone(needed)
+        self.assertEqual(
+            {job.strip() for job in needed.group(1).split(",")},
+            {"workflow-lint", *writers.values()},
+        )
+        self.assertIn(
+            "    if: github.ref == 'refs/heads/main' && !cancelled()\n", dropping
+        )
+        self.assertIn("    permissions:\n      actions: write #", dropping)
+        self.assertNotIn("uses:", dropping)
+        dropped = re.search(r"for scope in ([a-z0-9_ -]+); do", dropping)
+        self.assertIsNotNone(dropped)
+        self.assertEqual(set(dropped.group(1).split()), set(writers))
+        self.assertIn(
+            'gh cache list --ref refs/heads/main --key "bazel-objects-${scope}-"',
+            dropping,
+        )
+        self.assertIn(
+            "--sort created_at --order desc --limit 100 --json id --jq '.[1:][].id'",
+            dropping,
+        )
+        for name, job in jobs_section(self.workflow).items():
+            if name != "drop-superseded-objects":
+                self.assertNotIn("permissions:", job, name)
         for workflow in (
             self.workflow,
             FUZZ_WORKFLOW.read_text(),
@@ -700,6 +817,13 @@ class CiCoverageTest(unittest.TestCase):
         ):
             for value in ("cache-scope:", "cache-write:", "--disk_cache"):
                 self.assertNotIn(value, workflow)
+        for workflow in (
+            FUZZ_WORKFLOW.read_text(),
+            REACTOR_WORKFLOW.read_text(),
+            NIGHTLY_WORKFLOW.read_text(),
+        ):
+            self.assertNotIn("save-objects", workflow)
+            self.assertNotIn("objects:", workflow)
         # The only other cache is each scheduled fuzz target's corpus.
         for workflow in (
             self.workflow,
