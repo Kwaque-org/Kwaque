@@ -102,6 +102,32 @@ struct local_publication_limits final {
     byte_count execution_bytes{64_KiB};
 };
 
+// What a publisher's prepare() reserves for `working_bytes` under `limits`.
+[[nodiscard]] inline runtime::result<byte_count> local_publication_charge(
+  const workload_budget& budget,
+  byte_count working_bytes,
+  local_publication_limits limits = {}) {
+    if (
+      limits.maximum_bytes.value() == 0
+      || limits.maximum_bytes > byte_count{64_KiB}
+      || limits.execution_bytes.value() == 0
+      || limits.execution_bytes
+           > byte_count{maximum_contiguous_allocation_bytes}
+      || working_bytes < byte_count{64_KiB}
+      || working_bytes > byte_count{4_MiB})
+        return runtime::failure(detail::path_error(errc::invalid_argument));
+    auto path = budget.allocation_charge(
+      byte_count{runtime::maximum_file_path_bytes + 1});
+    if (!path) return runtime::failure(path.error());
+    // The cold publication path installs a single physical write slot.
+    // Its staging plus short-write recovery can each use one maximum
+    // served allocation, independently of a temporary's native geometry.
+    const byte_count write_credit{2 * maximum_contiguous_allocation_bytes};
+    return byte_count{
+      working_bytes.value() + limits.execution_bytes.value()
+      + write_credit.value() + 8U * path->value()};
+}
+
 // One externally owned namespace target. The caller supplies already validated
 // encoded bytes and dependencies, and holds its mutable-state serialization
 // from snapshot selection through publish completion/in-memory installation.
@@ -132,6 +158,15 @@ public:
           "publisher destroyed before joined close");
     }
 
+    // What prepare() reserves for `working_bytes` under `limits`, for whoever
+    // holds it ready to fund one: see prepare(workload_reservation, ...).
+    [[nodiscard]] static runtime::result<byte_count> prepared_charge(
+      const workload_budget& budget,
+      byte_count working_bytes,
+      local_publication_limits limits = {}) {
+        return local_publication_charge(budget, working_bytes, limits);
+    }
+
     // Reserve before accepting work that must later publish. The namespace
     // owner keeps this parent stable until joined close. In addition to memory
     // and handle credits, keep the parent directory open, so its sync after
@@ -145,55 +180,51 @@ public:
             co_return runtime::failure(detail::path_error(errc::closed));
         if (busy_ || prepared_)
             co_return runtime::failure(detail::path_error(errc::queue_full));
-        if (
-          limits_.maximum_bytes.value() == 0
-          || limits_.maximum_bytes > byte_count{64_KiB}
-          || limits_.execution_bytes.value() == 0
-          || limits_.execution_bytes
-               > byte_count{maximum_contiguous_allocation_bytes}
-          || working_bytes < byte_count{64_KiB}
-          || working_bytes > byte_count{4_MiB})
-            co_return runtime::failure(
-              detail::path_error(errc::invalid_argument));
-        auto paths = path_charge();
-        if (!paths) co_return runtime::failure(paths.error());
-        auto allocation = byte_count{maximum_contiguous_allocation_bytes};
-        while (!budget_.allocation_charge(allocation) && allocation.value() > 1)
-            allocation = byte_count{allocation.value() / 2};
-        if (!budget_.allocation_charge(allocation))
-            co_return runtime::failure(
-              detail::path_error(errc::resource_exhausted));
-        // The cold publication path installs a single physical write slot.
-        // Its staging plus short-write recovery can each use one maximum
-        // served allocation, independently of a temporary's native geometry.
-        const byte_count write_credit{2 * maximum_contiguous_allocation_bytes};
-        auto held = budget_.try_reserve(
-          byte_count{
-            working_bytes.value() + limits_.execution_bytes.value()
-            + write_credit.value() + paths->value()});
+        auto charge = prepared_charge(budget_, working_bytes, limits_);
+        if (!charge) co_return runtime::failure(charge.error());
+        auto held = budget_.try_reserve(*charge);
         if (!held) co_return runtime::failure(held.error());
         if (
           auto handles = held->try_acquire_handles(publication_handles);
           !handles)
             co_return runtime::failure(handles.error());
-        auto holder = operations_.hold();
-        busy_ = true;
-        auto idle = seastar::defer([this] noexcept { busy_ = false; });
-        auto inspected = co_await inspect_local_path(
-          files_,
-          target_.root,
-          target_.parent,
-          runtime::file_kind::directory,
-          admission);
-        if (!inspected) co_return inspected;
-        auto parent = co_await files_.open_directory(target_.parent);
-        if (!parent) co_return runtime::failure(parent.error());
-        prepared_parent_.emplace(std::move(*parent));
-        prepared_.emplace(std::move(*held));
-        prepared_working_ = working_bytes;
-        prepared_write_credit_ = write_credit;
-        prepared_write_allocation_ = allocation;
-        co_return runtime::result<void>{};
+        co_return co_await prepare_funded(
+          std::move(*held), working_bytes, admission, false);
+    }
+    // The same, funded by `held`: an exclusive grant of this budget of at
+    // least prepared_charge(), holding publication_handles credits, which
+    // whoever funds it reserved before it was needed. The grant stays here
+    // through close, and release_prepared() then gives it back unchanged.
+    [[nodiscard]] seastar::future<runtime::result<void>> prepare(
+      workload_reservation held,
+      byte_count working_bytes,
+      codec::cooperative_work& admission) {
+        assert_current();
+        if (closing_ || closed_ || fenced_)
+            co_return runtime::failure(detail::path_error(errc::closed));
+        if (busy_ || prepared_)
+            co_return runtime::failure(detail::path_error(errc::queue_full));
+        auto charge = prepared_charge(budget_, working_bytes, limits_);
+        if (!charge) co_return runtime::failure(charge.error());
+        if (
+          !budget_.owns(held) || !held.exclusive()
+          || held.retained_bytes() < *charge)
+            co_return runtime::failure(
+              detail::path_error(errc::invalid_argument));
+        co_return co_await prepare_funded(
+          std::move(held), working_bytes, admission, true);
+    }
+    // Once closed, the grant a funded prepare() was given, for its funder
+    // to keep; none for one this publisher reserved itself, or while an
+    // outcome still holds a share of it.
+    [[nodiscard]] std::optional<workload_reservation>
+    release_prepared() noexcept {
+        assert_current();
+        if (!closed_ || !funded_ || !prepared_ || !prepared_->exclusive())
+            return std::nullopt;
+        auto grant = std::move(prepared_);
+        prepared_.reset();
+        return grant;
     }
 
     [[nodiscard]] seastar::future<local_publication_outcome> publish(
@@ -330,7 +361,8 @@ public:
             }
             prepared_parent_.reset();
         }
-        prepared_.reset();
+        // A funded grant goes back to its funder: see release_prepared().
+        if (!funded_) prepared_.reset();
         closed_ = true;
         co_return close_failure_.outcome();
     }
@@ -358,6 +390,38 @@ public:
     }
 
 private:
+    seastar::future<runtime::result<void>> prepare_funded(
+      workload_reservation held,
+      byte_count working_bytes,
+      codec::cooperative_work& admission,
+      bool funded) {
+        auto allocation = byte_count{maximum_contiguous_allocation_bytes};
+        while (!budget_.allocation_charge(allocation) && allocation.value() > 1)
+            allocation = byte_count{allocation.value() / 2};
+        if (!budget_.allocation_charge(allocation))
+            co_return runtime::failure(
+              detail::path_error(errc::resource_exhausted));
+        auto holder = operations_.hold();
+        busy_ = true;
+        auto idle = seastar::defer([this] noexcept { busy_ = false; });
+        auto inspected = co_await inspect_local_path(
+          files_,
+          target_.root,
+          target_.parent,
+          runtime::file_kind::directory,
+          admission);
+        if (!inspected) co_return inspected;
+        auto parent = co_await files_.open_directory(target_.parent);
+        if (!parent) co_return runtime::failure(parent.error());
+        prepared_parent_.emplace(std::move(*parent));
+        prepared_.emplace(std::move(held));
+        funded_ = funded;
+        prepared_working_ = working_bytes;
+        prepared_write_credit_ = byte_count{
+          2 * maximum_contiguous_allocation_bytes};
+        prepared_write_allocation_ = allocation;
+        co_return runtime::result<void>{};
+    }
     runtime::result<workload_reservation>
     prepared_reservation(byte_count working) {
         if (working > prepared_working_)
@@ -732,5 +796,7 @@ private:
     runtime::first_failure close_failure_;
     seastar::gate operations_;
     bool busy_{false}, closing_{false}, closed_{false}, fenced_{false};
+    // The prepared grant was given, not reserved here.
+    bool funded_{false};
 };
 } // namespace kwaque::storage

@@ -52,10 +52,9 @@ result<aligned_envelope_layout> local_metadata_layout(
             shape = bytes == descriptor->minimum_payload_bytes;
         else {
             const auto tail = bytes - descriptor->minimum_payload_bytes;
-            const bool nonempty
-              = kind == local_metadata_kind::checkpoint_page
-                || kind == local_metadata_kind::completed_retry_page
-                || kind == local_metadata_kind::deletion_intent;
+            const bool nonempty = kind == local_metadata_kind::checkpoint_page
+                                  || kind
+                                       == local_metadata_kind::deletion_intent;
             shape = tail % descriptor->entry_bytes == 0
                     && (!nonempty || tail != 0);
         }
@@ -75,9 +74,7 @@ result<std::uint32_t> local_metadata_page_capacity(
   byte_count header,
   storage_alignment alignment,
   const codec::limits& policy) noexcept {
-    if (
-      kind != local_metadata_kind::checkpoint_page
-      && kind != local_metadata_kind::completed_retry_page)
+    if (kind != local_metadata_kind::checkpoint_page)
         return failure(errc::invalid_argument);
     const auto descriptor
       = local_metadata_descriptor_for(static_cast<std::uint16_t>(kind)).value();

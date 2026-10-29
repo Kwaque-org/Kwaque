@@ -46,8 +46,9 @@ void write_scope(
     store<60>(fixed, logical.begin().value());
     store<68>(fixed, logical.end().value());
 }
+using entry_wire = std::array<char, range_manifest_entry_wire_bytes.value()>;
 void write_entry(
-  std::array<char, 104>& fixed, const range_manifest_entry& entry) noexcept {
+  entry_wire& fixed, const range_manifest_entry& entry) noexcept {
     const auto coverage = entry.coverage();
     store<0>(fixed, coverage.logical().begin().value());
     store<8>(fixed, coverage.logical().end().value());
@@ -58,6 +59,17 @@ void write_entry(
     store<56>(fixed, coverage.bytes().begin().value());
     store<64>(fixed, coverage.bytes().end().value());
     detail::write_digest<72>(fixed, entry.digest());
+    store<104>(fixed, entry.max_append_time().unix_nanoseconds());
+    store<112>(fixed, entry.max_record_time().unix_nanoseconds());
+}
+// Entries that hold records never go back in append time; empty ones carry
+// no time and are skipped.
+bool append_ordered(
+  const range_manifest_entry& entry, runtime::wall_time& latest) noexcept {
+    if (entry.coverage().physical().empty()) return true;
+    if (entry.max_append_time() < latest) return false;
+    latest = entry.max_append_time();
+    return true;
 }
 codec::result<void> check_counts(
   range_manifest_root_header header,
@@ -106,7 +118,7 @@ codec::result<model::range_logical_span> read_scope(
       60);
 }
 codec::result<range_manifest_entry> read_entry(
-  const std::array<char, 104>& raw,
+  const entry_wire& raw,
   model::range_logical_end next,
   model::range_logical_end end,
   codec::field_context c) {
@@ -146,7 +158,9 @@ codec::result<range_manifest_entry> read_entry(
         *segment,
         *generation,
         storage::coverage{*logical, *physical, *bytes},
-        codec::extent_digest{*digest}),
+        codec::extent_digest{*digest},
+        runtime::wall_time{load<104, std::int64_t>(raw)},
+        runtime::wall_time{load<112, std::int64_t>(raw)}),
       c);
 }
 
@@ -285,6 +299,7 @@ struct page_reader final {
     page_ref reference;
     std::uint64_t start;
     std::optional<model::range_logical_end> previous;
+    runtime::wall_time latest;
     codec::decode_budget original;
     std::vector<range_manifest_entry> entries;
 
@@ -342,7 +357,9 @@ struct page_reader final {
           aligned_envelope_layout::make(
             {header,
              range_manifest_page_fixed_bytes,
-             byte_count{static_cast<std::uint64_t>(count) * 104U}},
+             byte_count{
+               static_cast<std::uint64_t>(count)
+               * range_manifest_entry_wire_bytes.value()}},
             alignment,
             work.policy(),
             {work.policy().config().max_page_bytes,
@@ -363,7 +380,7 @@ struct page_reader final {
           - remaining->metadata_remaining.value()};
         auto next = scope->begin();
         for (std::uint32_t index = 0; index < count; ++index) {
-            std::array<char, 104> raw{};
+            entry_wire raw{};
             auto entry_context = c;
             entry_context.origin += input.bytes_consumed().value();
             if (
@@ -380,6 +397,9 @@ struct page_reader final {
             const auto entry = read_entry(
               raw, next, scope->end(), entry_context);
             if (!entry) co_return codec::failure(entry.error());
+            if (!append_ordered(*entry, latest))
+                co_return codec::failure(
+                  page_error(errc::malformed_data, entry_context, 104));
             next = entry->coverage().logical().end();
             entries.push_back(*entry);
         }
@@ -413,7 +433,8 @@ seastar::future<codec::result<decoded_range_manifest_page>> decode_page(
   codec::cooperative_work& work,
   codec::field_context c,
   codec::input_boundary boundary,
-  std::optional<model::range_logical_end> previous) {
+  std::optional<model::range_logical_end> previous,
+  runtime::wall_time latest) {
     c.family = static_cast<std::uint16_t>(manifest_family);
     const auto fail = [](codec::error error) {
         return seastar::make_ready_future<
@@ -451,6 +472,7 @@ seastar::future<codec::result<decoded_range_manifest_page>> decode_page(
         ref,
         *start,
         previous,
+        latest,
         memory,
         {}},
       c,
@@ -480,15 +502,22 @@ result<range_manifest_entry> range_manifest_entry::make(
   model::segment_id segment,
   model::segment_generation generation,
   storage::coverage coverage,
-  codec::extent_digest digest) noexcept {
+  codec::extent_digest digest,
+  runtime::wall_time max_append_time,
+  runtime::wall_time max_record_time) noexcept {
     if (
       segment.is_nil() || !generation.is_valid() || coverage.logical().empty()
       || coverage.physical().count().value()
            > coverage.logical().count().value()
       || (!coverage.physical().empty() && coverage.bytes().empty())
-      || (coverage.bytes().empty() && digest.bytes() != empty_digest))
+      || (coverage.bytes().empty() && digest.bytes() != empty_digest)
+      || (coverage.physical().empty()
+            ? max_append_time != runtime::wall_time{}
+                || max_record_time != runtime::wall_time{}
+            : max_append_time.unix_nanoseconds() < 1))
         return failure(errc::invalid_argument);
-    return range_manifest_entry{segment, generation, coverage, digest};
+    return range_manifest_entry{
+      segment, generation, coverage, digest, max_append_time, max_record_time};
 }
 result<range_manifest_root_header> range_manifest_root_header::make(
   manifest_context context,
@@ -567,6 +596,7 @@ encode_range_manifest_page(
     if (entries.size() != header.entry_count())
         co_return codec::failure(page_error(errc::invalid_argument, c));
     auto next = header.logical_span().begin();
+    runtime::wall_time latest;
     for (const auto& entry : entries) {
         if (
           auto ready = co_await work.admit(
@@ -579,8 +609,8 @@ encode_range_manifest_page(
         // Positive entry lengths plus exact adjacency imply strict ascending
         // keys. Reject the edge before allocating any encoded tail.
         if (
-          logical.begin() != next
-          || logical.end() > header.logical_span().end())
+          logical.begin() != next || logical.end() > header.logical_span().end()
+          || !append_ordered(entry, latest))
             co_return codec::failure(page_error(errc::invalid_argument, c));
         next = logical.end();
     }
@@ -589,7 +619,9 @@ encode_range_manifest_page(
     const auto layout = aligned_envelope_layout::make(
                           {byte_count{32},
                            range_manifest_page_fixed_bytes,
-                           byte_count{entries.size() * 104U}},
+                           byte_count{
+                             entries.size()
+                             * range_manifest_entry_wire_bytes.value()}},
                           alignment,
                           work.policy(),
                           {work.policy().config().max_page_bytes,
@@ -606,7 +638,8 @@ encode_range_manifest_page(
     store<84>(fixed, header.entry_count());
     store<88>(
       fixed, static_cast<std::uint32_t>(layout.padding_bytes().value()));
-    auto output = co_await detail::encode_page_object<104>(
+    auto output = co_await detail::encode_page_object<
+      range_manifest_entry_wire_bytes.value()>(
       fixed,
       entries,
       write_entry,
@@ -743,7 +776,11 @@ codec::result<void> validate_range_manifest_extent(
         return codec::failure(page_error(errc::wrong_context, c));
     if (!evidence.digest())
         return codec::failure(page_error(errc::invalid_argument, c));
-    if (entry.coverage() != evidence.boundary().coverage)
+    const auto times = evidence.boundary().times;
+    if (
+      entry.coverage() != evidence.boundary().coverage
+      || entry.max_append_time() != times.max_append
+      || entry.max_record_time() != times.max_record)
         return codec::failure(page_error(errc::malformed_data, c));
     if (entry.digest() != *evidence.digest())
         return codec::failure(page_error(errc::corrupt_data, c));
@@ -787,7 +824,7 @@ decode_range_manifest_page(
   codec::field_context c,
   codec::input_boundary boundary) {
     return decode_page(
-      input, root, ordinal, memory, work, c, boundary, std::nullopt);
+      input, root, ordinal, memory, work, c, boundary, std::nullopt, {});
 }
 codec::result<void> range_manifest_verifier::ready(
   codec::cooperative_work& work, codec::field_context c) {
@@ -844,7 +881,8 @@ range_manifest_verifier::next(
             work,
             c,
             boundary,
-            end_));
+            end_,
+            latest_));
         if (!output->has_value()) failed = output->error();
         if (!failed) {
             if (auto valid = work.poll(page_error(errc::success, c)); !valid)
@@ -861,6 +899,9 @@ range_manifest_verifier::next(
         co_return codec::failure(*failed);
     }
     end_ = (*output)->value.header().logical_span().end();
+    for (const auto& entry : (*output)->value.entries())
+        if (!entry.coverage().physical().empty())
+            latest_ = entry.max_append_time();
     ++next_;
     state_ = state::open;
     transaction.commit();

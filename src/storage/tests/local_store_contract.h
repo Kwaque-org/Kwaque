@@ -51,6 +51,36 @@ struct ownership_input final {
           runtime::result<void>{});
     }
 };
+// How many bytes a backend has read from a file so far, as asked, where it
+// can tell: a fake counts them, a native backend cannot.
+struct uncounted_reads final {
+    std::optional<std::uint64_t>
+    operator()(const runtime::file_path&) const noexcept {
+        return std::nullopt;
+    }
+};
+// How many writes a backend has been asked for so far, where it can tell.
+struct uncounted_writes final {
+    std::optional<std::uint64_t> operator()() const noexcept {
+        return std::nullopt;
+    }
+};
+// How many operations that may change what a device holds a backend has
+// applied so far, where it can tell: writes, flushes, truncations,
+// creations, removals, renames and directory syncs, never opens or closes.
+struct uncounted_mutations final {
+    std::optional<std::uint64_t> operator()() const noexcept {
+        return std::nullopt;
+    }
+};
+// The writes to one file that reached past a size, from when watch() was
+// asked, where a backend can tell.
+struct unwatched_writes final {
+    void watch(const runtime::file_path&, std::uint64_t) const noexcept {}
+    std::optional<std::uint64_t> beyond() const noexcept {
+        return std::nullopt;
+    }
+};
 template<runtime::file_system_backend Backend, typename Driver>
 seastar::future<std::string>
 read_bytes(Backend& files, const runtime::file_path& path, Driver drive) {

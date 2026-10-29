@@ -1,17 +1,33 @@
 """Validate and summarize append measurements through the engine.
 
-Each row is one open-loop stream of small requests through the engine, the
-product's composition of one shard's storage, to two segments: alone, beside
+Each row is one open-loop stream of requests through the engine, the
+product's composition of one shard's storage, to its segments (two unless a
+run sets more, small fixture children unless it sets a record size, and the
+append owner's placement threshold and hold as the run sets them): alone, beside
 the seal or the removal of a third segment, beside a creation that the
-shard's exhausted share of its filesystem refuses, over two data devices, or
-at a fixed rate until enough WAL barriers are durable. Request i is planned
+shard's exhausted share of its filesystem refuses, over two data devices, at
+a fixed rate until enough WAL barriers are durable, or rolling: the bench
+owns its segments, offers what a full segment refused to a successor made as
+a new file, and seals the full one beside the stream. Request i is planned
 at a fixed spacing from the stream's first planned instant. Its latency runs
 from that instant to its result and its delay from it to its offer; each is
 kept in a histogram of one-second intervals, and so is the latency of the
 requests that overlapped what ran beside the stream. The driver makes each
 request inside the timed region, so its allocations and tasks are not the
 owners' alone. Every row carries the shard's own counts of what it issued in
-that region, flushes, writes and reads, every file together, in both builds.
+that region, flushes, writes and reads, every file together, in both builds,
+and what the append owner placed, held and synced there. A synchronized run
+has the WAL file and every data file zero-written before the region, so a
+small write goes through a synchronized handle and needs no flush; the
+observing build counts those writes. A run may set the alignment of its
+files and the largest write through a synchronized handle, rest between
+its setup and its stream, make its segments as new files rather than
+recycled ones, and name a block device whose own counters, which also see
+what the filesystem writes for itself, the row then gives for the
+interval. Rows of different streams,
+thresholds, holds, alignments or write profiles are summarized apart, so a
+sweep over them reads as one summary each, with device bytes per byte of
+records, writes per second and flushes and synchronized writes per barrier.
 
 Requests that one WAL barrier made durable are not independent of each
 other: a row counts the distinct barriers its requests took, a quantile is
@@ -44,6 +60,7 @@ CASES = {
     "exhausted_share": "creation",
     "two_data_devices": "none",
     "fixed_rate": "none",
+    "rolling": "none",
 }
 # Fewer independent barriers than this leave p99.9 unqualified.
 TAIL_GROUPS = 3000
@@ -64,12 +81,38 @@ HISTOGRAM_KEYS = {
     "total",
     "buckets",
 }
+# What the append owner placed, held and synced in the timed region, and
+# what stood at its end.
+PLACEMENT_COUNTERS = (
+    "wal_placed_portions",
+    "segment_placed_portions",
+    "wal_placed_bytes",
+    "segment_placed_bytes",
+    "held_portions",
+    "held_portion_bytes",
+    "runs_filled",
+    "runs_wanted",
+    "runs_limited",
+    "runs_synced",
+    "runs_pressed",
+    "segment_barriers",
+    "segment_syncs",
+    "sync_rounds",
+    "round_syncs",
+    "held_bytes",
+    "held_runs",
+    "unsynced_bytes",
+    "unsynced_wal_files",
+)
 COUNTERS = (
     "requests",
     "completed",
     "request_bound",
     "spacing_ns",
     "targets",
+    "payload_bytes",
+    "placement_bytes",
+    "hold_bytes",
     "groups",
     "wal_capacity_bytes",
     "share_bytes",
@@ -83,9 +126,18 @@ COUNTERS = (
     "reactor_write_bytes",
     "reactor_reads",
     "reactor_read_bytes",
+    "alignment_bytes",
+    "segment_bytes",
+    "synchronous_write_bytes",
+    "settle_ms",
+    "rolls",
+    "roll_creation_ns",
+    "roll_creation_longest_ns",
+    *PLACEMENT_COUNTERS,
 )
 FLAGS = (
     "same_filesystem",
+    "fresh_segments",
     "timing_only",
     "ndebug",
     "libcxx_hardening_none",
@@ -103,10 +155,13 @@ BASE_KEYS = {
     "latency",
     "delay",
     "affinity_cpus",
+    "block",
     *COUNTERS,
     *FLAGS,
 }
 KINDS = ("wal", "data", "other")
+# What a block device's counters give for the interval.
+BLOCK_COUNTERS = ("reads", "read_bytes", "writes", "write_bytes", "flushes")
 KIND_COUNTERS = (
     "writes",
     "write_bytes",
@@ -120,6 +175,7 @@ KIND_COUNTERS = (
     "unlinks",
     "unlink_ns",
     "unlink_longest_ns",
+    "synchronized_calls",
 )
 NAMESPACE_COUNTERS = (
     "directory_opens",
@@ -356,14 +412,72 @@ def validate_observed(row: dict) -> None:
         raise ValueError("invalid namespace counts")
     for key in NAMESPACE_COUNTERS:
         integer(names[key], key)
-    # Every WAL barrier the requests took flushed a WAL file.
-    if row["wal"]["flushes"] < row["groups"]:
-        raise ValueError("native WAL flushes are fewer than the barriers")
+    # The shard issued every flush its owners made. One flush covers every
+    # write completed before it began, so the barriers do not bound the
+    # flushes from below; a synchronized run's barriers reached the device
+    # through a flush or a synchronized write.
+    if sum(row[name]["flushes"] for name in KINDS) > row["reactor_flushes"]:
+        raise ValueError("native flushes exceed the shard's")
+    if row["wal_barrier"] == "synchronized" and (
+        row["reactor_flushes"] == 0
+        and sum(row[name]["synchronized_calls"] for name in KINDS) == 0
+    ):
+        raise ValueError("claimed barrier reached no device")
     # A removal renames the segment's directory and unlinks its data file.
     if row["beside"] == "removal" and (
         row["data"]["unlinks"] == 0 or names["renames"] == 0
     ):
         raise ValueError("a removal unlinked no data file")
+
+
+def validate_block(row: dict) -> None:
+    block = row["block"]
+    if block is None:
+        return
+    if not isinstance(block, dict) or set(block) != {"device", *BLOCK_COUNTERS}:
+        raise ValueError("invalid block device counters")
+    if not isinstance(block["device"], str) or not block["device"]:
+        raise ValueError("block counters name no device")
+    for key in BLOCK_COUNTERS:
+        integer(block[key], f"block {key}")
+    # The device saw at least the shard's own writes.
+    if block["writes"] == 0 or block["write_bytes"] < block["writes"] * 512:
+        raise ValueError("the block device saw no writes")
+
+
+def validate_placement(row: dict) -> None:
+    """What the owner counted follows its threshold and hold: nothing is
+    placed in the WAL at a threshold of zero, nothing is held with no hold,
+    only WAL-placed portions are held, and a run is written only once
+    something was held."""
+    wal = row["wal_placed_portions"]
+    portions = wal + row["segment_placed_portions"]
+    if portions == 0:
+        raise ValueError("the stream placed no portion")
+    if row["placement_bytes"] == 0 and wal != 0:
+        raise ValueError("a portion reached the WAL at a threshold of zero")
+    if row["held_portions"] > wal or (
+        row["hold_bytes"] == 0 and row["held_portions"] != 0
+    ):
+        raise ValueError("a portion was held that could not be")
+    runs = sum(
+        row[key]
+        for key in (
+            "runs_filled",
+            "runs_wanted",
+            "runs_limited",
+            "runs_synced",
+            "runs_pressed",
+        )
+    )
+    if row["hold_bytes"] == 0 and (runs != 0 or row["held_runs"] != 0):
+        raise ValueError("a run was held with no hold")
+    if row["held_runs"] > row["targets"] + 1 or (
+        (row["held_runs"] == 0) != (row["held_bytes"] == 0)
+    ):
+        raise ValueError("held runs disagree with their bytes")
+    if row["round_syncs"] < row["sync_rounds"]:
+        raise ValueError("a sync round asked for no sync")
 
 
 def validate(row: dict) -> None:
@@ -406,13 +520,41 @@ def validate(row: dict) -> None:
         raise ValueError("a stream ended short of its plan")
     if row["wal_barrier"] not in BARRIERS or row["data_barrier"] not in BARRIERS:
         raise ValueError("unknown barrier")
-    # Every barrier the WAL claims reached the device.
-    if row["reactor_flushes"] < groups:
+    # Both files zero-written, or neither; only the observing build counts
+    # synchronized writes.
+    synchronized = row["wal_barrier"] == "synchronized"
+    if synchronized != (row["data_barrier"] == "synchronized") or (
+        synchronized and row["timing_only"]
+    ):
+        raise ValueError("invalid barrier profile")
+    # Every barrier claimed reached the device.
+    if not synchronized and row["reactor_flushes"] == 0:
         raise ValueError("claimed barrier reached no device")
+    # A fresh segment is made zero-written; an alignment is a whole number
+    # of 4 KiB that is a power of two.
+    if row["fresh_segments"] and not synchronized:
+        raise ValueError("fresh segments without zero-written files")
+    alignment = row["alignment_bytes"]
+    if alignment < 4096 or alignment & (alignment - 1):
+        raise ValueError("invalid alignment")
+    if row["segment_bytes"] == 0 or row["segment_bytes"] % alignment:
+        raise ValueError("invalid segment size")
+    if row["synchronous_write_bytes"] < 4096:
+        raise ValueError("invalid synchronized write limit")
+    # Only a rolling stream rolls, and its segments are new files.
+    rolling = row["case"] == "rolling"
+    if (row["rolls"] and not rolling) or (rolling and not row["fresh_segments"]):
+        raise ValueError("rolls disagree with the case")
+    if (row["roll_creation_ns"] == 0) != (row["rolls"] == 0) or (
+        row["roll_creation_longest_ns"] > row["roll_creation_ns"]
+    ):
+        raise ValueError("invalid roll creation time")
+    validate_block(row)
     if row["reactor_writes"] == 0 or row["reactor_write_bytes"] < row["reactor_writes"]:
         raise ValueError("a durable stream wrote nothing")
     if (row["share_bytes"] == 0) != (row["case"] == "exhausted_share"):
         raise ValueError("the share disagrees with the case")
+    validate_placement(row)
     validate_devices(row)
     validate_histogram(row, "latency", row["completed"])
     validate_histogram(row, "delay", row["completed"])
@@ -476,6 +618,14 @@ def stream(row: dict) -> tuple:
         row["request_bound"],
         row["group_target"],
         row["targets"],
+        row["payload_bytes"],
+        row["placement_bytes"],
+        row["hold_bytes"],
+        row["alignment_bytes"],
+        row["segment_bytes"],
+        row["synchronous_write_bytes"],
+        row["settle_ms"],
+        row["fresh_segments"],
         row["timing_only"],
         tuple(sorted(row["build_profile"].items())),
     )
@@ -486,6 +636,7 @@ def setup(row: dict) -> tuple:
         row["case"],
         row["same_filesystem"],
         row["fdatasync"],
+        row["wal_barrier"],
         *stream(row),
     )
 
@@ -496,6 +647,29 @@ def median(rows: list[dict], key: str, per_request: bool = False) -> float:
     )
 
 
+def block_summary(rows: list[dict]) -> dict | None:
+    if any(row["block"] is None for row in rows):
+        return None
+    payload = rows[0]["payload_bytes"]
+    return {
+        "device": sorted({row["block"]["device"] for row in rows}),
+        "write_bytes_per_payload_byte": (
+            statistics.median(
+                row["block"]["write_bytes"] / (row["requests"] * payload)
+                for row in rows
+            )
+            if payload
+            else None
+        ),
+        "writes_per_request": statistics.median(
+            row["block"]["writes"] / row["requests"] for row in rows
+        ),
+        "flushes_per_request": statistics.median(
+            row["block"]["flushes"] / row["requests"] for row in rows
+        ),
+    }
+
+
 def summarize(rows: list[dict]) -> dict:
     first = rows[0]
     groups = sum(row["groups"] for row in rows)
@@ -504,11 +678,18 @@ def summarize(rows: list[dict]) -> dict:
         "case": first["case"],
         "beside": first["beside"],
         "spacing_ns": first["spacing_ns"],
+        "targets": first["targets"],
+        "payload_bytes": first["payload_bytes"],
+        "placement_bytes": first["placement_bytes"],
+        "hold_bytes": first["hold_bytes"],
         "request_bound": first["request_bound"],
         "group_target": first["group_target"],
         "data_devices": len(first["devices"]) - 1,
         "same_filesystem": first["same_filesystem"],
         "fdatasync": first["fdatasync"],
+        "barrier": first["wal_barrier"],
+        "alignment_bytes": first["alignment_bytes"],
+        "fresh_segments": first["fresh_segments"],
         "timing_only": first["timing_only"],
         "build_profile": first["build_profile"],
         "runs": len(rows),
@@ -520,6 +701,46 @@ def summarize(rows: list[dict]) -> dict:
         "allocations_per_request": median(rows, "allocations", True),
         "tasks_per_request": median(rows, "tasks", True),
         "reactor_flushes_per_request": median(rows, "reactor_flushes", True),
+        "reactor_flushes_per_group": sum(row["reactor_flushes"] for row in rows)
+        / groups,
+        "reactor_write_bytes_per_request": median(rows, "reactor_write_bytes", True),
+        # Device bytes for each byte of the requests' records.
+        "device_bytes_per_payload_byte": (
+            statistics.median(
+                row["reactor_write_bytes"] / (row["requests"] * row["payload_bytes"])
+                for row in rows
+            )
+            if first["payload_bytes"]
+            else None
+        ),
+        "writes_per_second": statistics.median(
+            row["reactor_writes"] * PERIOD_NS / row["elapsed_ns"] for row in rows
+        ),
+        # What the block device did, filesystem included, when every row
+        # names one.
+        "block": block_summary(rows),
+        "synchronized_writes_per_group": (
+            sum(row[name]["synchronized_calls"] for row in rows for name in KINDS)
+            / groups
+            if not first["timing_only"]
+            else None
+        ),
+        "wal_placed_share": sum(row["wal_placed_portions"] for row in rows)
+        / sum(
+            row["wal_placed_portions"] + row["segment_placed_portions"] for row in rows
+        ),
+        "held_portions": sum(row["held_portions"] for row in rows),
+        "run_closes": {
+            why: sum(row[f"runs_{why}"] for row in rows)
+            for why in ("filled", "wanted", "limited", "synced", "pressed")
+        },
+        "segment_syncs_per_round": (
+            sum(row["round_syncs"] for row in rows)
+            / sum(row["sync_rounds"] for row in rows)
+            if any(row["sync_rounds"] for row in rows)
+            else None
+        ),
+        "held_bytes_at_end": statistics.median(row["held_bytes"] for row in rows),
         "latency_ns": quantiles(rows, "latency", groups),
         "delay_ns": quantiles(rows, "delay", groups),
     }

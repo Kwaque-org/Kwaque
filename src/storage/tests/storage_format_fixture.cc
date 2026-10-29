@@ -16,17 +16,17 @@ storage_fixture::storage_fixture(
   std::size_t inner_header,
   std::uint64_t a,
   std::uint64_t wal_a,
-  std::uint32_t retry_count)
+  std::uint32_t retry_count,
+  bool ends_write)
   : kind(selected)
-  , header(
-      segment_header::make(sc(), model::range_logical_end{100}, alignment(a))
-        .value())
+  , header(segment_header::make(sc(), alignment(a)).value())
   , block_context(block_expected(0x30, 1, a, 0, a))
   , wal_context(wal_expected(wal_a, a))
   , history(testing::history(0x30, 1, a))
   , durable_context{history, runtime::file_position{a}}
   , sealed_context{history, runtime::file_position{a}}
-  , coverage(scope(100, sparse ? 105U : 101U, 0, sparse ? 2U : 1U, a, a)) {
+  , coverage(scope(100, sparse ? 105U : 101U, 0, sparse ? 2U : 1U, a, a))
+  , extent(coverage) {
     if (
       retry_count == 0 || retry_count > 408
       || (outer_header != 32 && outer_header != 40 && outer_header != 4096))
@@ -36,8 +36,16 @@ storage_fixture::storage_fixture(
     coverage = scope(
       100, sparse ? 105U : 101U, 0, sparse ? 2U : 1U, a, a + block.size());
     durable_context.position = runtime::file_position{a + block.size()};
-    const boundary_fields fields{coverage, 1, coverage, crc(block)};
-    const auto durable = footer_wire(fields, durable_context, outer_header);
+    // The block carries the builder's 1 ns append time.
+    const boundary_fields fields{
+      coverage,
+      1,
+      coverage,
+      {runtime::wall_time{1},
+       runtime::wall_time{1},
+       runtime::wall_time{max_record_time(child)}},
+      crc(block)};
+    durable = footer_wire(fields, durable_context, outer_header);
     sealed_context.position = runtime::file_position{
       a + block.size() + durable.size()};
     entries.reserve(retry_count);
@@ -58,8 +66,21 @@ storage_fixture::storage_fixture(
     }
     page = retry_page_wire(entries, sealed_context, 0, 0, outer_header);
     const std::array refs{reference(page, 0, 0, retry_count)};
+    extent = scope(
+      100,
+      sparse ? 105U : 101U,
+      0,
+      sparse ? 2U : 1U,
+      a,
+      sealed_context.position.value());
+    auto sealed = fields;
+    sealed.coverage = extent;
     root = sealed_wire(
-      fields, exact_digest(block), refs, sealed_context, outer_header);
+      sealed,
+      exact_digest(block + durable),
+      refs,
+      sealed_context,
+      outer_header);
     switch (kind) {
     case storage_case::header:
         wire = header_wire(header, outer_header);
@@ -67,9 +88,13 @@ storage_fixture::storage_fixture(
     case storage_case::block:
         wire = block;
         break;
-    case storage_case::wal:
-        wire = wal_wire(child, wal_context, outer_header);
+    case storage_case::wal: {
+        // A PREPARE before the last of its write's carries no padding.
+        auto stamps = wal_stamps(wal_context);
+        stamps.ends_write = ends_write;
+        wire = wal_wire(child, wal_context, outer_header, stamps);
         break;
+    }
     case storage_case::durable:
         wire = durable;
         break;
@@ -163,11 +188,12 @@ storage_observation observe_storage(
         if (record(result)) {
             const auto header = static_cast<std::size_t>(get(candidate, 10, 2));
             const auto size = result->value.batch().bytes().size().value();
+            const auto fixed = wal_prepare_fixed_bytes.value();
             require(
-              header + 136 <= candidate.size()
-              && size <= candidate.size() - header - 136);
+              header + fixed <= candidate.size()
+              && size <= candidate.size() - header - fixed);
             require(result->value.batch().bytes().content_equals(
-              candidate.substr(header + 136, size)));
+              candidate.substr(header + fixed, size)));
             seen.digest = result->value.batch().info().fingerprint.bytes();
             seen.facts[0] = result->value.wal_extent().end().value();
             seen.facts[1] = result->value.target().position().value();

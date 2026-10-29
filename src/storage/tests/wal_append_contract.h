@@ -89,35 +89,69 @@ inline seastar::future<wal_group> offer(
   workload_budget& budget,
   model::cluster_id cluster,
   codec::cooperative_work& work,
-  std::span<const std::string> records) {
+  std::span<const std::string> records,
+  std::size_t width = 67) {
     auto group = take(
       wal_group::make(
         budget,
         static_cast<std::uint32_t>(std::max<std::size_t>(1, records.size()))));
     for (const auto& record : records) {
-        auto child = co_await wal_writer_contract::offer(budget, record, work);
-        take(group.append(
-          std::move(child), wal_writer_contract::child_context(cluster)));
+        auto child = co_await wal_writer_contract::offer(
+          budget, record, work, width);
+        const auto expected = wal_writer_contract::child_context(cluster);
+        take(
+          group.append(std::move(child), expected, expected.target_data_start));
     }
     co_return std::move(group);
 }
+// One PREPARE at `position`. It states `certified`, where the file's last
+// completed barrier ended when the writer encoded it (the data start, 8192,
+// before one has), and pads to the next boundary when it ends its write.
 inline std::string prepare_bytes(
   std::string child,
   local_wal_head head,
   model::cluster_id cluster,
-  std::uint64_t position) {
+  std::uint64_t position,
+  std::uint64_t certified = 8192,
+  bool ends = true) {
     const auto e = wal_writer_contract::child_context(cluster);
     return wal_wire(
       std::move(child),
       {wal_write_context::make(
          head.incarnation, alignment(8192), runtime::file_position{position})
          .value(),
+       runtime::file_position{8192},
        e.target,
        e.target_data_start,
        e.routing_epoch,
        e.batch,
        e.profile,
-       e.target_profile});
+       e.target_profile},
+      32,
+      wal_prepare_stamps{
+        ends,
+        wal_writer_contract::offered_time,
+        e.target_data_start,
+        runtime::file_position{certified}});
+}
+// One group's PREPAREs back to back from `position`; the last ends the write
+// and pads it to the next boundary. Each states `certified`.
+inline std::string group_bytes(
+  std::span<const std::string> children,
+  local_wal_head head,
+  model::cluster_id cluster,
+  std::uint64_t position,
+  std::uint64_t certified = 8192) {
+    std::string output;
+    for (std::size_t i = 0; i < children.size(); ++i)
+        output += prepare_bytes(
+          children[i],
+          head,
+          cluster,
+          position + output.size(),
+          certified,
+          i + 1 == children.size());
+    return output;
 }
 
 template<typename Backend, typename Owner, typename Driver>
@@ -163,7 +197,8 @@ seastar::future<> exercise(
                   if (i != 0)
                       expected.routing_epoch
                         = model::range_routing_epoch::make(9).value();
-                  take(group.append(std::move(child), expected));
+                  take(group.append(
+                    std::move(child), expected, expected.target_data_start));
               }
               auto rejected = co_await writer.submit(std::move(group), work);
               require(
@@ -208,9 +243,11 @@ seastar::future<> exercise(
           // An entered group is transferred to the writer.
           // NOLINTNEXTLINE(bugprone-use-after-move)
           require(group.size() == 0, "entered group did not transfer");
+          // Both members lie back to back from 8192; the second pads the
+          // write to the next boundary.
           const auto cut = accepted.boundary;
           require(
-            cut.cursor().position().value() == 24576,
+            cut.cursor().position().value() == 16384,
             "whole-group extent is wrong");
           require(
             writer.progress()->durable == before,
@@ -218,7 +255,7 @@ seastar::future<> exercise(
           auto written = co_await drive.lifecycle(std::move(accepted.written));
           take(written.failure.outcome());
           require(
-            written.written == byte_count{16_KiB},
+            written.written == byte_count{8_KiB},
             "group completion byte count changed");
           require(
             writer.progress()->write_complete == cut.cursor()
@@ -229,10 +266,7 @@ seastar::future<> exercise(
             take(local_paths::make(spec.root)).wal(0, head.incarnation));
           auto expected = wal_writer_contract::header_bytes(
             spec, 0, head.incarnation);
-          expected += prepare_bytes(
-            records[0], head, spec.owner.cluster(), 8192);
-          expected += prepare_bytes(
-            records[1], head, spec.owner.cluster(), 16384);
+          expected += group_bytes(records, head, spec.owner.cluster(), 8192);
           require(
             (co_await store_contract::read_bytes(files, path, drive))
               == expected,
@@ -258,7 +292,7 @@ seastar::future<> exercise(
               auto detached = take(
                 co_await writer.submit(std::move(tail), work));
               require(
-                detached.boundary.cursor().position().value() == 32768,
+                detached.boundary.cursor().position().value() == 24576,
                 "tail was not reserved");
           }
           take(co_await drive.lifecycle(writer.close()));
@@ -267,7 +301,10 @@ seastar::future<> exercise(
               && writer.progress()->reserved == writer.progress()->durable
               && writer.statistics().flush_calls == 2,
             "close did not join and cover detached accepted work");
-          expected += prepare_bytes(last[0], head, spec.owner.cluster(), 24576);
+          // Encoded after the barrier over the first group: it states that
+          // barrier's end.
+          expected += prepare_bytes(
+            last[0], head, spec.owner.cluster(), 16384, 16384);
           require(
             (co_await store_contract::read_bytes(files, path, drive))
               == expected,
@@ -357,6 +394,202 @@ seastar::future<> zero_written(
       "zero-written WAL frames are not exact or its tail is not zeros");
 }
 
+// At the production defaults a file is zero-written to its end when it is
+// made, and its successor is made beside it: every group of up to 1 MiB is
+// a synchronized write, durable at completion, so neither a barrier nor
+// close flushes, and the file ends in zeros at its capacity.
+template<typename Backend, typename Owner, typename Driver>
+seastar::future<> zero_written_by_default(
+  Backend& files,
+  Owner& ownership,
+  const local_device_spec& spec,
+  workload_budget& budget,
+  Driver drive) {
+    constexpr unsigned groups = 6;
+    const auto config = wal_writer_contract::with_defaults();
+    const auto capacity = config.capacity_bytes.value();
+    std::optional<runtime::file_path> path;
+    std::string expected;
+    co_await with_writer(
+      files,
+      ownership,
+      spec,
+      budget,
+      drive,
+      config,
+      [&](auto& writer, auto& work) -> seastar::future<> {
+          const auto head = *writer.prepared_head();
+          path = take(
+            take(local_paths::make(spec.root)).wal(0, head.incarnation));
+          expected = wal_writer_contract::header_bytes(
+            spec, 0, head.incarnation);
+          const auto start = writer.progress()->reserved.position().value();
+          const auto zeroed = co_await store_contract::read_all_bytes(
+            files, *path, drive);
+          require(
+            zeroed.size() == capacity
+              && zeroed.find_first_not_of('\0', start) == std::string::npos,
+            "the default preparation did not zero-write the whole file");
+          std::optional<wal_captured_boundary> last;
+          for (unsigned i = 0; i != groups; ++i) {
+              const std::array records{assigned_wire()};
+              const auto position = writer.progress()->reserved.position();
+              auto group = co_await offer(
+                budget, spec.owner.cluster(), work, records);
+              auto accepted = take(
+                co_await writer.submit(std::move(group), work));
+              auto written = co_await drive.lifecycle(
+                std::move(accepted.written));
+              take(written.failure.outcome());
+              expected += prepare_bytes(
+                records[0], head, spec.owner.cluster(), position.value());
+              last = accepted.boundary;
+          }
+          const auto stats = writer.statistics();
+          require(
+            stats.write_calls == groups && stats.synchronized_writes == groups
+              && stats.extensions == 0 && stats.flush_calls == 0,
+            "a group inside the zero-written file took an ordinary write");
+          auto durable = co_await drive.lifecycle(writer.barrier(*last));
+          take(durable.failure.outcome());
+          require(
+            durable.receipt && writer.progress()->durable == last->cursor()
+              && writer.statistics().flush_calls == 0,
+            "a barrier over synchronized writes flushed");
+          require(
+            co_await drive.lifecycle(writer.successor_made()),
+            "no successor was made ahead");
+      });
+    const auto stored = co_await store_contract::read_all_bytes(
+      files, *path, drive);
+    require(
+      stored.size() == capacity && stored.substr(0, expected.size()) == expected
+        && stored.find_first_not_of('\0', expected.size()) == std::string::npos,
+      "zero-written WAL frames are not exact or its tail is not zeros");
+}
+
+// Groups of 1, 2, 3 and 64 PREPAREs whose unpadded end lands one byte
+// short of a boundary, on it, and one byte past it. Each group's PREPAREs
+// lie back to back from its aligned start, only the last sets ends_write
+// and pads, and the next group begins on the boundary that pad reached. The
+// file holds exactly the independent PREPAREs.
+template<typename Backend, typename Owner, typename Driver>
+seastar::future<> packed_groups(
+  Backend& files,
+  Owner& ownership,
+  const local_device_spec& spec,
+  workload_budget& budget,
+  Driver drive) {
+    co_await with_writer(
+      files,
+      ownership,
+      spec,
+      budget,
+      drive,
+      wal_writer_contract::configuration(),
+      [&](auto& writer, auto& work) -> seastar::future<> {
+          constexpr std::uint64_t unit = 8192;
+          const auto head = *writer.prepared_head();
+          auto expected = wal_writer_contract::header_bytes(
+            spec, 0, head.incarnation);
+          for (const std::uint64_t members : {1U, 2U, 3U, 64U}) {
+              // PREPAREs of 425 + value bytes for values of 121 to 8,191;
+              // the fewest units their values can reach.
+              const auto units = (members * 546 + unit - 1) / unit;
+              for (const std::uint64_t end :
+                   {units * unit - 1, units * unit, units * unit + 1}) {
+                  const auto values = end - 425 * members;
+                  std::vector<std::string> children;
+                  for (std::uint64_t i = 0; i < members; ++i)
+                      children.push_back(valued_child(
+                        100,
+                        values / members
+                          + (i + 1 == members ? values % members : 0)));
+                  const auto start = writer.progress()->reserved.position();
+                  auto group = co_await offer(
+                    budget, spec.owner.cluster(), work, children, 4096);
+                  auto accepted = take(
+                    co_await writer.submit(std::move(group), work));
+                  const auto padded = (end + unit - 1) / unit * unit;
+                  require(
+                    accepted.boundary.cursor().position().value()
+                      == start.value() + padded,
+                    "a packed group did not end on the next boundary");
+                  auto written = co_await drive.lifecycle(
+                    std::move(accepted.written));
+                  take(written.failure.outcome());
+                  require(
+                    written.written == byte_count{padded},
+                    "a packed group's write was not its padded extent");
+                  expected += group_bytes(
+                    children, head, spec.owner.cluster(), start.value());
+              }
+          }
+          const auto path = take(
+            take(local_paths::make(spec.root)).wal(0, head.incarnation));
+          require(
+            (co_await store_contract::read_all_bytes(files, path, drive))
+              == expected,
+            "packed groups differ from independent PREPAREs");
+      });
+}
+
+// Each PREPARE states where the last barrier of its file that had completed
+// when its group's encoding began ended: the data start before any, never a
+// cut still being made durable, never decreasing.
+template<typename Backend, typename Owner, typename Driver>
+seastar::future<> certified_stamps(
+  Backend& files,
+  Owner& ownership,
+  const local_device_spec& spec,
+  workload_budget& budget,
+  Driver drive) {
+    co_await with_writer(
+      files,
+      ownership,
+      spec,
+      budget,
+      drive,
+      wal_writer_contract::configuration(),
+      [&](auto& writer, auto& work) -> seastar::future<> {
+          const auto head = *writer.prepared_head();
+          auto expected = wal_writer_contract::header_bytes(
+            spec, 0, head.incarnation);
+          const std::array records{assigned_wire(), assigned_wire(true, 48)};
+          // Submits one group and awaits its write; it states `certified`.
+          const auto group = [&](std::uint64_t certified)
+            -> seastar::future<wal_captured_boundary> {
+              const auto start = writer.progress()->reserved.position();
+              auto offered = co_await offer(
+                budget, spec.owner.cluster(), work, records);
+              auto accepted = take(
+                co_await writer.submit(std::move(offered), work));
+              take((co_await drive.lifecycle(std::move(accepted.written)))
+                     .failure.outcome());
+              expected += group_bytes(
+                records, head, spec.owner.cluster(), start.value(), certified);
+              co_return accepted.boundary;
+          };
+          const auto first = co_await group(8192);
+          take((co_await drive.lifecycle(writer.barrier(first)))
+                 .failure.outcome());
+          const auto after = first.cursor().position().value();
+          static_cast<void>(co_await group(after));
+          // Nothing covers the second group yet: the third states the first.
+          const auto third = co_await group(after);
+          take((co_await drive.lifecycle(writer.barrier(third)))
+                 .failure.outcome());
+          static_cast<void>(co_await group(third.cursor().position().value()));
+          const auto path = take(
+            take(local_paths::make(spec.root)).wal(0, head.incarnation));
+          require(
+            (co_await store_contract::read_bytes(files, path, drive))
+              == expected,
+            "a PREPARE did not state the newest barrier completed before "
+            "its group was encoded");
+      });
+}
+
 template<typename Backend, typename Owner, typename Driver>
 seastar::future<> capacity(
   Backend& files,
@@ -374,15 +607,18 @@ seastar::future<> capacity(
       drive,
       config,
       [&](auto& writer, auto& work) -> seastar::future<> {
-          const std::array too_many{
-            assigned_wire(), assigned_wire(), assigned_wire()};
+          // Members of 4,487 bytes (a 4,287-byte child): three pack into
+          // 13,461 bytes and pad to exactly the 16 KiB left; four pad to
+          // 24 KiB, past the capacity.
+          const auto large = assigned_wire(false, 4096);
+          const std::array too_many{large, large, large, large};
           auto group = co_await offer(
             budget, spec.owner.cluster(), work, too_many);
           auto rejected = co_await writer.submit(std::move(group), work);
           require(
             !rejected && writer.progress()->reserved.position().value() == 8192,
             "group straddled capacity or partially reserved");
-          const std::array exact{assigned_wire(), assigned_wire()};
+          const std::array exact{large, large, large};
           auto exact_group = co_await offer(
             budget, spec.owner.cluster(), work, exact);
           auto accepted = take(

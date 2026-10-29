@@ -518,6 +518,27 @@ ALLOWANCES += (
         "src/simulation/fake_file_test_support.h",
         "unordered-iteration",
         """for (const auto& [id, object] : filesystem.objects_) {
+                  static_cast<void>(id);
+                  total += object->occurrences[static_cast<std::size_t>(point)];
+              }""",
+        1,
+        "Commutative operation-count summation, with no ordered output.",
+    ),
+    Allowance(
+        "src/simulation/fake_file_test_support.h",
+        "unordered-iteration",
+        """for (const auto& [id, object] : filesystem.objects_) {
+                  static_cast<void>(id);
+                  if (object->kind == fake_file_kind::regular)
+                      most = std::max(most, object->visible_links);
+              }""",
+        1,
+        "Commutative maximum of link counts, with no ordered output.",
+    ),
+    Allowance(
+        "src/simulation/fake_file_test_support.h",
+        "unordered-iteration",
+        """for (const auto& [id, object] : filesystem.objects_) {
                   fake_inode_snapshot copy{
                     .id = id, .kind = object->kind,
                     .open_references = object->open_references,

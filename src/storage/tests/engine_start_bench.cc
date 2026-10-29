@@ -71,10 +71,9 @@ constexpr std::uint32_t writable_bound = 4;
 // Tiny requests appended to each segment, one at a time, before it is sealed
 // or left writable.
 constexpr std::uint32_t requests_per_segment = 4;
-// The most sealed segments one restart's catalog lists beside every segment
-// the shard may leave writable or being removed: the catalog's 122 entries
-// less the 4 writable and the table's 16 deleting.
-constexpr std::uint32_t top = 102;
+// The most sealed segments one case lists beside every segment the shard
+// may leave writable or being removed: well inside what one catalog holds.
+constexpr std::uint32_t top = 103;
 
 // One store and the catalog its start is given. Segments are written in
 // generation order: the sealed ones the catalog lists, then the sealed ones
@@ -267,6 +266,12 @@ void verify(
         && began.owed == 0 && began.refused == 0 && began.sealing == 0
         && began.unresolved == 0 && began.wal_files != 0,
       "the start found another store than the one written");
+    // A clean stop synced every run its segments held: nothing is left for
+    // the start to write back from the WAL.
+    require(
+      began.materialized == 0 && began.repaired == 0 && began.candidates == 0
+        && began.uncertified_tails == 0,
+      "a start after a clean stop had something to write back");
     for (std::uint32_t generation = shape.sealed + shape.unlisted + 1;
          generation <= shape.written();
          ++generation)
@@ -347,6 +352,10 @@ void print_measurement(
     number("refused", began.refused);
     number("sealing", began.sealing);
     number("unresolved", began.unresolved);
+    number("materialized", began.materialized);
+    number("repaired", began.repaired);
+    number("candidates", began.candidates);
+    number("uncertified_tails", began.uncertified_tails);
     number("wal_files", began.wal_files);
     std::printf("},\"store\":{");
     constexpr std::array<const char*, measured::file_kinds> kinds{
@@ -480,9 +489,9 @@ struct engine_start_bench {
         const auto config = bench::configuration(writable_bound);
         require(
           top + config.table.maximum_writable + config.table.maximum_deleting
-            == maximum_recovery_catalog,
-          "the largest case no longer lists what one catalog holds beside "
-          "the writable and deleting bounds");
+            <= maximum_recovery_catalog,
+          "the largest case lists more than one catalog holds beside the "
+          "writable and deleting bounds");
         require(
           selected.listed() <= top && selected.unlisted <= top
             && selected.unsealed <= writable_bound,
@@ -517,13 +526,13 @@ ENGINE_START_CASE(no_segments)
 ENGINE_START_CASE(sealed_8, .sealed = 8)
 ENGINE_START_CASE(sealed_32, .sealed = 32)
 // The most sealed segments one catalog lists.
-ENGINE_START_CASE(sealed_102, .sealed = 102)
+ENGINE_START_CASE(sealed_103, .sealed = 103)
 // As many listed, four of them left writable at the stop.
-ENGINE_START_CASE(sealed_98_unsealed_4, .sealed = 98, .unsealed = 4)
-// The stores of sealed_8 and sealed_102, started with nothing listed: what a
+ENGINE_START_CASE(sealed_99_unsealed_4, .sealed = 99, .unsealed = 4)
+// The stores of sealed_8 and sealed_103, started with nothing listed: what a
 // store retains and its catalog does not list is read by no start.
 ENGINE_START_CASE(unlisted_8, .unlisted = 8)
-ENGINE_START_CASE(unlisted_102, .unlisted = 102)
+ENGINE_START_CASE(unlisted_103, .unlisted = 103)
 #undef ENGINE_START_CASE
 } // namespace
 } // namespace kwaque::storage::testing::engine_start_bench_support

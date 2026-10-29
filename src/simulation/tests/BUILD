@@ -1011,6 +1011,8 @@ kwaque_cc_seastar_test(
         "//src/simulation:fake_file",
         "//src/simulation:fake_file_test_support",
         "//src/simulation:virtual_time",
+        "//src/storage:local_paths",
+        "//src/storage:local_store_config",
         "//src/storage/tests:engine_history",
         "//src/storage/tests:engine_history_contract",
         "//src/storage/tests:engine_ledger",

@@ -122,11 +122,13 @@ public:
       bool compressed,
       std::size_t width,
       std::uint32_t entries,
-      bool large = false)
+      bool large = false,
+      std::uint64_t alignment = 512)
       : compressed_(compressed)
       , large_(large)
       , width_(width)
-      , entries_(entries) {}
+      , entries_(entries)
+      , alignment_(alignment) {}
 
     template<operation Op>
     seastar::future<std::size_t> measure() {
@@ -329,6 +331,7 @@ private:
             return encode_segment_block(
               std::move(*child),
               source_->block_context,
+              {runtime::wall_time{1}, source_->block_context.data_start},
               work,
               remaining_,
               capacity_bound);
@@ -336,6 +339,10 @@ private:
             return encode_wal_prepare(
               std::move(*child),
               source_->wal_context,
+              {true,
+               runtime::wall_time{1},
+               source_->wal_context.target_data_start,
+               source_->wal_context.wal_data_start},
               work,
               remaining_,
               capacity_bound);
@@ -387,7 +394,14 @@ private:
         if (source_) co_return;
         codec::bench::qualify_allocator();
         source_.emplace(
-          family(Op), compressed_, false, 32, 32, 512, 512, entries_);
+          family(Op),
+          compressed_,
+          false,
+          32,
+          32,
+          alignment_,
+          alignment_,
+          entries_);
         seastar::abort_source abort;
         codec::cooperative_work work{codec::limits::defaults(), abort};
         if (large_)
@@ -416,6 +430,8 @@ private:
             auto encoded = (co_await encode_segment_block(
                               std::move(copy),
                               source_->block_context,
+                              {runtime::wall_time{1},
+                               source_->block_context.data_start},
                               work,
                               remaining_,
                               capacity_bound))
@@ -429,6 +445,10 @@ private:
                 auto encoded_wal = (co_await encode_wal_prepare(
                                       std::move(wal_child),
                                       source_->wal_context,
+                                      {true,
+                                       runtime::wall_time{1},
+                                       source_->wal_context.target_data_start,
+                                       source_->wal_context.wal_data_start},
                                       work,
                                       remaining_,
                                       capacity_bound))
@@ -454,9 +474,13 @@ private:
               {},
               0)
               .value();
+        // A sealed root covers the footer that ends the block's write; every
+        // other operation checks the block alone.
+        constexpr bool sealed = Op == operation::sealed_decode
+                                || Op == operation::sealed_encode;
         auto verifier = extent_verifier::make(
                           source_->history,
-                          source_->coverage,
+                          sealed ? source_->extent : source_->coverage,
                           work.policy(),
                           extent_layout_kind::initial_append,
                           {},
@@ -465,6 +489,25 @@ private:
         (co_await verifier.add_block(
            std::move(input), testing::batch_expected(), memory, work))
           .value();
+        if constexpr (sealed) {
+            auto footer = co_await layout(source_->durable, work);
+            const auto footer_cost
+              = footer.allocation_cost(capacity_bound).value();
+            const auto footer_memory = codec::detail::consume_decode_budget(
+                                         work.policy(),
+                                         budget(),
+                                         footer_cost.backing,
+                                         footer_cost.descriptors
+                                           .checked_add(
+                                             footer_cost.share_controls)
+                                           .value(),
+                                         {},
+                                         0)
+                                         .value();
+            (co_await verifier.add_footer(
+               std::move(footer), footer_memory, work))
+              .value();
+        }
         proof_ = verifier.finish(work).value();
         if constexpr (Op == operation::summary_verify) {
             std::vector<page_ref> refs;
@@ -544,10 +587,12 @@ private:
               .value();
         remaining_ = codec::testing::residual.checked_sub(retained).value();
         fmt::print(
-          "kwaque-storage-fixture-v1 scope={} codec={} bytes={} fragments={} "
-          "retries={} pages={} cached_upper={} normalization=operations\n",
+          "kwaque-storage-fixture-v1 scope={} codec={} alignment={} bytes={} "
+          "fragments={} retries={} pages={} cached_upper={} "
+          "normalization=operations\n",
           scope_name(Op),
           compressed_ ? "lz4" : "none",
+          alignment_,
           wire_.size().value(),
           wire_.fragment_count(),
           entries_,
@@ -557,6 +602,7 @@ private:
     bool compressed_, large_;
     std::size_t width_;
     std::uint32_t entries_;
+    std::uint64_t alignment_;
     std::optional<testing::storage_fixture> source_;
     fragmented_buffer wire_, block_;
     std::vector<fragmented_buffer> pages_;
@@ -572,12 +618,15 @@ template<
   bool Compressed,
   std::size_t Width,
   std::uint32_t Entries,
-  bool Large = false>
+  bool Large = false,
+  std::uint64_t Alignment = 512>
 struct fixture : measurements {
     fixture()
-      : measurements(Compressed, Width, Entries, Large) {}
+      : measurements(Compressed, Width, Entries, Large, Alignment) {}
 };
 using storage_tiny = fixture<false, 512, 1>;
+// The same objects packed and padded at a 4 KiB alignment.
+using storage_tiny_a4096 = fixture<false, 512, 1, false, 4096>;
 using storage_fragmented = fixture<true, 7, 1>;
 using storage_page_max = fixture<false, 4096, 408>;
 using storage_batch_max = fixture<false, 65536, 1, true>;
@@ -630,6 +679,7 @@ using storage_batch_max_lz4 = fixture<true, 65536, 1, true>;
     }                                                                          \
     PERF_TEST_F(group, exact_hash) { return measure<operation::exact_hash>(); }
 STORAGE_CASES(storage_tiny)
+STORAGE_CASES(storage_tiny_a4096)
 STORAGE_CASES(storage_fragmented)
 STORAGE_CASE(storage_page_max, sealed_decode)
 STORAGE_CASE(storage_page_max, sealed_encode)

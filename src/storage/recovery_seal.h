@@ -1,6 +1,8 @@
 #pragma once
 
 #include "src/storage/recovery_decision.h"
+#include "src/storage/recovery_tail.h"
+#include "src/storage/retry_summary.h"
 #include "src/storage/segment_scan.h"
 #include "src/storage/segment_writer.h"
 
@@ -23,6 +25,9 @@ enum class recovered_seal_gap : std::uint8_t {
     // Bytes that no surviving object or authorized candidate fills and that
     // are not a proved footer-sized gap between groups.
     unproved,
+    // The extent holds more streams than its retry depth lets one segment
+    // keep the facts of: no live owner appended it so.
+    streams,
 };
 
 struct recovered_seal_outcome final {
@@ -38,6 +43,12 @@ struct recovered_seal_outcome final {
     std::optional<runtime::file_position> at;
     // Candidate blocks and footers reconstructed below the end.
     std::uint32_t blocks{0}, footers{0};
+    // Once sealed now: the sealed publication, its generation and each
+    // root's context in its order, what the sealed segment is opened
+    // against from here on.
+    std::optional<local_publication_generation> generation;
+    std::optional<local_object_publication> publication;
+    std::vector<local_bundle_context> roots;
 };
 
 namespace detail {
@@ -65,10 +76,6 @@ struct recovered_seal_pin final {
     }
 };
 
-// Failures that say the candidate cannot continue the verified layout, not
-// that the walk could not run.
-[[nodiscard]] bool recovered_layout_failure(errc) noexcept;
-
 struct recovered_reconstruction_result final {
     codec::immutable_object_digest identity;
     recovered_seal_gap gap{recovered_seal_gap::none};
@@ -88,10 +95,17 @@ struct recovered_reconstruction_result final {
 // previous object is a block and the candidate continues the prefix with no
 // record missing: the end of a group. A surviving later footer must name the
 // prefix with the reconstruction in it. Nothing below the certified end is
-// replaced, and an intact object is never overwritten. Without a writer the
+// replaced, and an intact object is never overwritten. The extent ends with a
+// footer: when its content stops after a block, the footer the prefix
+// encodes there must end exactly at the decided end. Without a writer the
 // pass only proves the layout (Writer is void); with one, each reconstructed
-// object is written in place once the walk has verified it. Every PREPARE of
-// the segment feeds the plan identity whether or not it is kept.
+// object is written in place once the walk has verified it, in writes of
+// whole units: blocks pack, so an object's unit holds bytes around it, which
+// are copied from the file as they survive. A unit never holds two of the
+// segment's writes, and every write past the certified end is uncertified,
+// so those bytes are rewritten unchanged and come again from their own
+// copies if the rewrite tears. Every PREPARE of the segment feeds the plan
+// identity whether or not it is kept.
 template<
   runtime::file_system_backend Backend,
   local_directory_owner Owner,
@@ -169,7 +183,7 @@ public:
                 if (rejected(report))
                     co_return unresolve(recovered_seal_gap::conflict, x);
                 if (x < at) {
-                    auto filled = co_await fill_footer(x, at, prepare);
+                    auto filled = co_await fill_footer(x, at, &prepare);
                     if (!filled || gap_ != recovered_seal_gap::none)
                         co_return filled;
                     continue;
@@ -180,6 +194,8 @@ public:
             if (!next) co_return runtime::failure(next.error());
             if (!*next) {
                 stopped_ = true;
+                if (auto classified = co_await classify_stop(); !classified)
+                    co_return classified;
                 continue;
             }
             const auto& object = **next;
@@ -214,30 +230,48 @@ public:
         for (;;) {
             const auto& report = scanner_->report();
             const auto x = report.content_end;
-            if (x == end_) co_return runtime::result<void>{};
+            if (x == end_) {
+                // A sealed root follows a footer, never a block.
+                if (last_block_)
+                    co_return unresolve(recovered_seal_gap::unproved, x);
+                co_return co_await flush();
+            }
             // The last object placed runs across the end.
             if (x > end_)
                 co_return unresolve(recovered_seal_gap::conflict, end_);
-            if (stopped_)
-                co_return unresolve(
-                  rejected(report) ? recovered_seal_gap::conflict
-                                   : recovered_seal_gap::unproved,
-                  x);
+            if (stopped_) {
+                if (rejected(report))
+                    co_return unresolve(recovered_seal_gap::conflict, x);
+                // Blocks with no footer after them, a held run among them:
+                // the footer that closes them must end at the decided end.
+                if (last_block_) {
+                    auto filled = co_await fill_footer(x, end_, nullptr);
+                    if (!filled || gap_ != recovered_seal_gap::none)
+                        co_return filled;
+                    continue;
+                }
+                co_return unresolve(recovered_seal_gap::unproved, x);
+            }
             auto next = co_await scanner_->next(work_);
             if (!next) co_return runtime::failure(next.error());
             if (!*next) {
                 stopped_ = true;
+                if (auto classified = co_await classify_stop(); !classified)
+                    co_return classified;
                 continue;
             }
             const auto& object = **next;
             if (object_end(object) > end_)
                 co_return unresolve(
                   recovered_seal_gap::conflict, object_begin(object));
+            last_block_ = object.block != nullptr;
         }
     }
 
     seastar::future<runtime::result<void>> close() {
         runtime::first_failure failed;
+        // A write not flushed belongs to a pass that did not finish.
+        pending_.reset();
         if (scanner_) {
             co_await scanner_->close();
             scanner_.reset();
@@ -283,13 +317,51 @@ private:
         return runtime::file_position{
           footer.position().value() + footer.bytes().value()};
     }
-    // The walk stopped at bytes someone wrote, not at damage: an intact
-    // object the prefix rejects, or one whose verified header runs past the
-    // decided end while the file goes on.
+    // The walk stopped at bytes this segment wrote, not at damage: an intact
+    // object of this segment the prefix rejects, or one whose verified
+    // header runs past the decided end while the file goes on, unless
+    // classify_stop() found it another segment's. Another segment's intact
+    // object is a recycled file's earlier bytes: unwritten space, filled
+    // like zeros.
     bool rejected(const segment_scan_report& report) const noexcept {
-        return report.intact
+        return (report.intact && !report.stale)
                || (report.stop == segment_scan_stop::torn
-                   && report.file_bytes > end_.value());
+                   && report.file_bytes > end_.value() && !stale_past_end_);
+    }
+    // Once the bounded walk stopped at an object whose verified header runs
+    // past the decided end while the file goes on: whose object it is lies
+    // in a body the bounded walk does not read. One walk without the bound,
+    // from the same pin, reads on to it, and places nothing: an object of
+    // another segment there is a recycled file's earlier bytes. Read only
+    // past an end a recycled file can put such an object across.
+    seastar::future<runtime::result<void>> classify_stop() {
+        const auto& report = scanner_->report();
+        if (
+          report.stop != segment_scan_stop::torn
+          || report.file_bytes <= end_.value())
+            co_return runtime::result<void>{};
+        auto made = co_await segment_scanner::make(
+          *file_, budget_, history_, pin_, limits_, work_);
+        if (!made) co_return runtime::failure(made.error());
+        auto probe = std::move(*made);
+        runtime::result<void> output{};
+        try {
+            for (;;) {
+                auto next = co_await probe->next(work_);
+                if (!next) {
+                    output = runtime::failure(next.error());
+                    break;
+                }
+                if (!*next) break;
+            }
+            const auto& found = probe->report();
+            stale_past_end_ = output && found.content_end == report.content_end
+                              && found.intact && found.stale;
+        } catch (...) {
+            output = runtime::failure(recognized_or_rethrown());
+        }
+        co_await probe->close();
+        co_return output;
     }
     runtime::result<void>
     unresolve(recovered_seal_gap gap, runtime::file_position at) noexcept {
@@ -301,6 +373,8 @@ private:
     seastar::future<runtime::result<void>>
     fill_block(const recovery_suffix_prepare& prepare) {
         const auto location = prepare.prepare->target();
+        // The block the writer made from this PREPARE's group carried these.
+        const auto stamps = prepare.prepare->stamps();
         auto child = std::move(*prepare.prepare).release_batch();
         const auto info = child.info();
         const auto original = info.context.submitted();
@@ -317,6 +391,7 @@ private:
             original.binding(),
             info.fingerprint},
            history_.profile},
+          {stamps.append_time, stamps.target_certified_end},
           work_,
           byte_count{
             cost->backing.value() + cost->descriptors.value()
@@ -339,31 +414,29 @@ private:
                   recovered_seal_gap::unproved, location.position());
             co_return runtime::failure(placed.error());
         }
-        if constexpr (!std::is_void_v<Writer>) {
-            if (writer_) {
-                auto written = co_await writer_->write_recovered(
-                  location.position(),
-                  std::move(*placed).release_bytes(),
-                  work_);
-                if (!written) co_return written;
-            }
-        }
+        auto written = co_await place(
+          location.position(), std::move(*placed).release_bytes());
+        if (!written) co_return written;
         ++blocks_;
         last_block_ = true;
         stopped_ = false;
         co_return runtime::result<void>{};
     }
 
+    // The footer the verified prefix encodes at `at`, which must end exactly
+    // at `next`: before the candidate `prepare`, which must continue the
+    // prefix with no record missing, or at the decided end without one.
     seastar::future<runtime::result<void>> fill_footer(
       runtime::file_position at,
       runtime::file_position next,
-      const recovery_suffix_prepare& prepare) {
+      const recovery_suffix_prepare* prepare) {
         if (!last_block_) co_return unresolve(recovered_seal_gap::unproved, at);
         auto prefix = scanner_->prefix(work_);
         if (!prefix) co_return runtime::failure(prefix.error());
         if (
-          prepare.prepare->target().physical_begin()
-          != prefix->boundary().coverage.physical().end())
+          prepare
+          && prepare->prepare->target().physical_begin()
+               != prefix->boundary().coverage.physical().end())
             co_return unresolve(recovered_seal_gap::unproved, at);
         auto encoded = co_await encode_durable_footer(
           *prefix,
@@ -380,18 +453,113 @@ private:
             co_return unresolve(recovered_seal_gap::unproved, at);
         auto placed = co_await scanner_->substitute(std::move(*encoded), work_);
         if (!placed) co_return runtime::failure(placed.error());
-        if constexpr (!std::is_void_v<Writer>) {
-            if (writer_) {
-                auto written = co_await writer_->write_recovered(
-                  at, std::move(*placed).release_bytes(), work_);
-                if (!written) co_return written;
-            }
-        }
+        auto written = co_await place(at, std::move(*placed).release_bytes());
+        if (!written) co_return written;
         ++footers_;
         last_block_ = false;
         stopped_ = false;
         co_return runtime::result<void>{};
     }
+
+    // Adds a reconstructed object at `at` to the write being assembled, after
+    // the surviving bytes between it and the last object placed. A write ends
+    // once an object ends on a boundary or the next lies past its last unit.
+    seastar::future<runtime::result<void>>
+    place(runtime::file_position at, bytes::fragmented_buffer object) {
+        if constexpr (std::is_void_v<Writer>) {
+            co_return runtime::result<void>{};
+        } else {
+            if (!writer_) co_return runtime::result<void>{};
+            const auto unit = history_.alignment.bytes().value();
+            if (pending_ && round_up(pending_->end) <= at.value()) {
+                auto flushed = co_await flush();
+                if (!flushed) co_return flushed;
+            }
+            if (!pending_)
+                pending_.emplace(
+                  runtime::file_position{at.value() - at.value() % unit});
+            auto copied = co_await copy(at);
+            if (!copied) co_return copied;
+            auto held = budget_.try_reserve(object.retained_bytes());
+            if (!held) co_return runtime::failure(held.error());
+            if (auto adopted = pending_->hold(std::move(*held)); !adopted)
+                co_return runtime::failure(adopted.error());
+            const auto size = object.size().value();
+            if (
+              auto appended = pending_->bytes.append_buffer(std::move(object));
+              !appended)
+                co_return runtime::failure(
+                  path_error(errc::resource_exhausted));
+            pending_->end = runtime::file_position{at.value() + size};
+            if (pending_->end.value() % unit == 0) co_return co_await flush();
+            co_return runtime::result<void>{};
+        }
+    }
+    // Writes the assembled write, through the boundary after its last object.
+    seastar::future<runtime::result<void>> flush() {
+        if constexpr (std::is_void_v<Writer>) {
+            co_return runtime::result<void>{};
+        } else {
+            if (!pending_) co_return runtime::result<void>{};
+            auto copied = co_await copy(
+              runtime::file_position{round_up(pending_->end)});
+            if (!copied) co_return copied;
+            auto write = std::move(*pending_);
+            pending_.reset();
+            auto bytes = write.bytes.finish();
+            if (!bytes)
+                co_return runtime::failure(
+                  path_error(errc::resource_exhausted));
+            co_return co_await writer_->write_recovered(
+              write.begin, std::move(*bytes), work_);
+        }
+    }
+    // Appends the file's bytes from the end of the write being assembled to
+    // `to`: what survives of the objects there.
+    seastar::future<runtime::result<void>> copy(runtime::file_position to) {
+        const auto from = pending_->end;
+        if (from >= to) co_return runtime::result<void>{};
+        auto read = co_await file_->read(
+          from, byte_count{to.value() - from.value()});
+        if (!read) co_return runtime::failure(read.error());
+        auto data = std::move(*read).take_data();
+        if (data.size().value() != to.value() - from.value())
+            co_return runtime::failure(path_error(errc::truncated_data));
+        auto held = budget_.try_reserve(data.retained_bytes());
+        if (!held) co_return runtime::failure(held.error());
+        if (auto adopted = pending_->hold(std::move(*held)); !adopted)
+            co_return runtime::failure(adopted.error());
+        if (
+          auto appended = pending_->bytes.append_buffer(std::move(data));
+          !appended)
+            co_return runtime::failure(path_error(errc::resource_exhausted));
+        pending_->end = to;
+        co_return runtime::result<void>{};
+    }
+    [[nodiscard]] std::uint64_t
+    round_up(runtime::file_position at) const noexcept {
+        const auto unit = history_.alignment.bytes().value();
+        return (at.value() + unit - 1) / unit * unit;
+    }
+
+    // A write being assembled from `begin`, a boundary, to `end`, and what
+    // it holds of the budget.
+    struct pending_write final {
+        explicit pending_write(runtime::file_position at) noexcept
+          : begin(at)
+          , end(at) {}
+        runtime::file_position begin, end;
+        bytes::fragmented_buffer_builder bytes{
+          {.max_total_bytes = runtime::maximum_file_io_bytes}};
+        std::optional<workload_reservation> held;
+        runtime::result<void> hold(workload_reservation more) {
+            if (!held) {
+                held.emplace(std::move(more));
+                return {};
+            }
+            return held->adopt(std::move(more));
+        }
+    };
 
     Backend& files_;
     Owner& ownership_;
@@ -409,10 +577,14 @@ private:
     std::optional<workload_reservation> handle_;
     std::optional<runtime::file> file_;
     std::unique_ptr<segment_scanner> scanner_;
+    std::optional<pending_write> pending_;
     std::optional<runtime::file_position> at_;
     std::uint32_t blocks_{0}, footers_{0};
     recovered_seal_gap gap_{recovered_seal_gap::none};
     bool active_{false}, stopped_{false}, last_block_{false};
+    // The object the bounded walk stopped at past the decided end is
+    // another segment's: see classify_stop().
+    bool stale_past_end_{false};
 };
 
 // What a recovered seal starts from, as the segment's descriptor, header and
@@ -627,7 +799,7 @@ resolve_recovered_seal(
       descriptor.segment,
       descriptor.alignment,
       state->data_start,
-      descriptor.logical_origin,
+      wal.target.logical_origin,
       descriptor.physical_origin,
       descriptor.profile};
     auto proved
@@ -673,8 +845,14 @@ resolve_recovered_seal(
 // written, and a publication already sealed at the end is reported as done.
 // config.retry_object is reserved afresh for every attempt; an earlier
 // attempt's bundle is left for reconciliation. `wal.target` is the segment's
-// verified descriptor and header, `wal.devices` include `data`. Source and
-// the counts are as for segment_writer::seal().
+// verified descriptor and header, `wal.devices` include `data`.
+//
+// The walk also derives the seal's completed facts: each verified block's
+// batch feeds a builder at the descriptor's retry depth, admitted from
+// `budget`, so the summary holds the last R batches of every stream the
+// extent keeps, acknowledged or not, as a live seal of the same blocks would.
+// Nothing beyond the decided end is walked, so nothing beyond it has a fact.
+// An extent with more streams than that depth allows is left unresolved.
 //
 // An index source is given every block of the verifying walk and then the
 // seal. An attempt uses it up whatever its outcome: its walk has offered
@@ -685,7 +863,6 @@ template<
   runtime::monotonic_clock Clock,
   runtime::file_system_backend Backend,
   local_directory_owner Owner,
-  typename Source,
   typename Index = segment_no_index>
 seastar::future<runtime::result<recovered_seal_outcome>> execute_recovered_seal(
   Backend& files,
@@ -698,11 +875,9 @@ seastar::future<runtime::result<recovered_seal_outcome>> execute_recovered_seal(
   workload_budget& budget,
   segment_writer_config config,
   segment_scan_limits limits,
-  Source source,
-  std::uint32_t completed,
-  std::uint32_t unresolved,
   codec::cooperative_work& work,
-  Index index = {}) {
+  Index index = {},
+  segment_seal_grants* grants = nullptr) {
     using writer_type = segment_writer<Backend, Owner, Clock>;
     const auto& descriptor = wal.target.descriptor;
     const auto& header = wal.target.header;
@@ -757,7 +932,6 @@ seastar::future<runtime::result<recovered_seal_outcome>> execute_recovered_seal(
                 if (root.kind() == local_root_kind::index)
                     done.seal.index = root;
             }
-            done.seal.unresolved = unresolved;
             co_return done;
         }
         co_return runtime::failure(detail::path_error(errc::wrong_context));
@@ -771,7 +945,7 @@ seastar::future<runtime::result<recovered_seal_outcome>> execute_recovered_seal(
       descriptor.segment,
       descriptor.alignment,
       data_start,
-      descriptor.logical_origin,
+      wal.target.logical_origin,
       descriptor.physical_origin,
       descriptor.profile};
     // Bytes the publication's pin certifies are never reconstructed; a pin
@@ -804,9 +978,11 @@ seastar::future<runtime::result<recovered_seal_outcome>> execute_recovered_seal(
         recovered_seal_outcome output;
         output.unresolved = proved->gap;
         output.at = proved->at;
-        output.seal.unresolved = unresolved;
         co_return output;
     }
+    auto facts = retry_summary_builder::make(
+      descriptor.segment, descriptor.retry_depth, budget);
+    if (!facts) co_return runtime::failure(facts.error());
 
     std::unique_ptr<writer_type> writer;
     runtime::first_failure failed;
@@ -816,7 +992,15 @@ seastar::future<runtime::result<recovered_seal_outcome>> execute_recovered_seal(
     try {
         do {
             auto opened = co_await writer_type::open_recovered_seal(
-              files, ownership, data, shard, descriptor, budget, config, work);
+              files,
+              ownership,
+              data,
+              shard,
+              descriptor,
+              wal.target.logical_origin,
+              budget,
+              config,
+              work);
             if (!opened) {
                 failed.observe(opened);
                 break;
@@ -867,6 +1051,8 @@ seastar::future<runtime::result<recovered_seal_outcome>> execute_recovered_seal(
                     described) { fed.block(described); },
               "an index source's block() takes one verified block descriptor");
             bool seen = false;
+            // Where the walk met a stream the depth has no room for.
+            std::optional<runtime::file_position> crowded;
             auto extent = co_await verify_local_segment_extent(
               files,
               ownership,
@@ -877,16 +1063,33 @@ seastar::future<runtime::result<recovered_seal_outcome>> execute_recovered_seal(
               budget,
               limits,
               work,
-              [&index, pinned = detail::recovered_seal_pin{pin, &seen}](
+              [&index,
+               &facts,
+               &crowded,
+               pinned = detail::recovered_seal_pin{pin, &seen}](
                 const segment_scanned_object& object) {
-                  if constexpr (requires {
-                                    index.block(object.block->descriptor());
-                                }) {
-                      if (object.block) index.block(object.block->descriptor());
-                  } else
-                      static_cast<void>(index);
+                  using output = runtime::result<bool>;
+                  if (object.block) {
+                      const auto described = object.block->descriptor();
+                      if constexpr (requires { index.block(described); })
+                          index.block(described);
+                      auto derived = facts->derive(described.batch());
+                      if (!derived)
+                          return seastar::make_ready_future<output>(
+                            runtime::failure(derived.error()));
+                      if (!*derived) {
+                          crowded = described.coverage().bytes().begin();
+                          return seastar::make_ready_future<output>(false);
+                      }
+                  }
+                  static_cast<void>(index);
                   return pinned(object);
               });
+            if (crowded) {
+                output.unresolved = recovered_seal_gap::streams;
+                output.at = crowded;
+                break;
+            }
             if (!extent) {
                 failed.observe(extent);
                 break;
@@ -895,14 +1098,28 @@ seastar::future<runtime::result<recovered_seal_outcome>> execute_recovered_seal(
                 failed.observe(detail::path_error(errc::corrupt_data));
                 break;
             }
+            auto summary = co_await retry_summary_builder::seal(
+              std::move(*facts), work);
+            if (!summary) {
+                failed.observe(summary);
+                break;
+            }
+            const auto completed = summary->completed();
             output.seal = co_await writer->seal_recovered(
               std::move(*extent),
-              std::move(source),
+              std::move(*summary),
               completed,
-              unresolved,
               work,
-              std::move(index));
+              std::move(index),
+              grants);
             failed = output.seal.failure;
+            if (!failed.failed() && output.seal.extent)
+                if (const auto published = writer->published()) {
+                    output.generation = published->generation;
+                    output.publication = published->publication;
+                    output.roots.assign(
+                      published->roots.begin(), published->roots.end());
+                }
         } while (false);
     } catch (...) {
         failed.observe(std::current_exception());

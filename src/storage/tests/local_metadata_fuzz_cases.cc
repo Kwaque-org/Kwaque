@@ -58,16 +58,14 @@ seen observe(
         result.error = decoded.error().code();
         return result;
     }
-    auto encoded = encode_local_metadata(
-                     {expected.header,
-                      expected.alignment,
-                      expected.segment_alignment,
-                      expected.data_metadata_alignment},
-                     decoded->value.payload(),
-                     work,
-                     decoded->remaining.operation_remaining,
-                     charge)
-                     .get();
+    auto encoded
+      = encode_local_metadata(
+          {expected.header, expected.alignment, expected.segment_alignment},
+          decoded->value.payload(),
+          work,
+          decoded->remaining.operation_remaining,
+          charge)
+          .get();
     if (encoded) {
         result.canonical = flat(encoded->bytes);
     } else {
@@ -111,7 +109,7 @@ void pin(
   const std::string& wire) {
     expected.digest = codec::immutable_object_digest{exact_digest(wire)};
     expected.encoded_bytes = byte_count{wire.size()};
-    if (test.kind != 7 && test.kind != 12) return;
+    if (test.kind != 7) return;
     const auto page = page_ref::make(
       page_ordinal::make(test.ordinal).value(),
       test.first,

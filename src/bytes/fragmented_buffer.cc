@@ -203,6 +203,14 @@ result<fragment_view> fragmented_buffer::fragment_at(std::size_t index) const {
     return fragment_view{fragment.storage.get(), fragment.storage.size()};
 }
 
+result<byte_count>
+fragmented_buffer::fragment_retained_bytes(std::size_t index) const {
+    if (index >= fragments_.size()) {
+        return failure(errc::out_of_range);
+    }
+    return fragments_[index].retained_bytes;
+}
+
 result<buffer_allocation_cost>
 fragmented_buffer::allocation_cost(allocation_charge_fn charge) const noexcept {
     return allocation_cost(0, fragments_.size(), charge);

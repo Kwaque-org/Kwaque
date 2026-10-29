@@ -63,6 +63,21 @@ SEASTAR_TEST_CASE(production_file_system_runs_shared_capability_contract) {
       });
 }
 
+// The host's file system and device decide the answer; the contract holds
+// for either.
+SEASTAR_TEST_CASE(production_file_system_runs_shared_write_zeroes_contract) {
+    return seastar::tmp_dir::do_with(
+      kwaque::runtime::testing::test_directory_template(),
+      [](seastar::tmp_dir& directory) -> seastar::future<> {
+          kwaque::runtime::production::file_system files;
+          static_cast<void>(
+            co_await kwaque::runtime::testing::run_write_zeroes_contract(
+              files,
+              path_of(directory.get_path() / "zeroes"),
+              native_file_driver{}));
+      });
+}
+
 SEASTAR_TEST_CASE(production_file_system_creates_opens_stats_and_reopens) {
     return seastar::tmp_dir::do_with(
       kwaque::runtime::testing::test_directory_template(),

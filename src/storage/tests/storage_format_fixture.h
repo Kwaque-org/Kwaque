@@ -18,7 +18,8 @@ struct storage_fixture final {
       std::size_t inner_header = 32,
       std::uint64_t segment_alignment = 512,
       std::uint64_t wal_alignment = 512,
-      std::uint32_t retry_count = 1);
+      std::uint32_t retry_count = 1,
+      bool ends_write = true);
     storage_case kind;
     segment_header header;
     segment_block_expectation block_context;
@@ -26,9 +27,11 @@ struct storage_fixture final {
     segment_history_context history;
     footer_expectation durable_context;
     footer_expectation sealed_context;
-    storage::coverage coverage;
+    // The block's own coverage, and the sealed extent: the block and the
+    // durable footer that ends its write.
+    storage::coverage coverage, extent;
     std::vector<completed_retry> entries;
-    std::string child, block, page, root, wire;
+    std::string child, block, durable, page, root, wire;
 };
 
 struct storage_observation final {

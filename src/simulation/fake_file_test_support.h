@@ -583,6 +583,26 @@ public:
     }
     // Operations at point already counted for one object; a fault rule for
     // its next one names this count plus one.
+    // Tells `observer` of every native write submitted from now on, before
+    // it is applied: the object, where the write begins and its length. It
+    // replaces an earlier one, and an empty one tells nothing.
+    static void observe_writes(
+      fake_file_system& filesystem,
+      seastar::noncopyable_function<
+        void(fake_object_id, std::uint64_t, std::size_t) noexcept> observer) {
+        filesystem.assert_current();
+        filesystem.write_observer_ = std::move(observer);
+    }
+    // Tells `observer` of every native read submitted from now on, as
+    // asked: the object, where the read begins and its length. It replaces
+    // an earlier one, and an empty one tells nothing.
+    static void observe_reads(
+      fake_file_system& filesystem,
+      seastar::noncopyable_function<
+        void(fake_object_id, std::uint64_t, std::size_t) noexcept> observer) {
+        filesystem.assert_current();
+        filesystem.read_observer_ = std::move(observer);
+    }
     [[nodiscard]] static runtime::result<std::uint64_t> occurrences(
       const fake_file_system& filesystem,
       fake_object_id id,
@@ -594,6 +614,35 @@ public:
               runtime::operation_error{
                 errc::not_found, runtime::operation_kind::file});
         return inode->occurrences[static_cast<std::size_t>(point)];
+    }
+    // Operations at `point` counted so far over every object the fake holds,
+    // and how many objects it holds and has made: nothing is copied.
+    [[nodiscard]] static std::uint64_t total_occurrences(
+      const fake_file_system& filesystem, runtime::builtin_fault_point point) {
+        filesystem.assert_current();
+        std::uint64_t total = 0;
+        for (const auto& [id, object] : filesystem.objects_) {
+            static_cast<void>(id);
+            total += object->occurrences[static_cast<std::size_t>(point)];
+        }
+        return total;
+    }
+    // The most names any regular file has now.
+    [[nodiscard]] static std::uint32_t
+    most_file_links(const fake_file_system& filesystem) {
+        filesystem.assert_current();
+        std::uint32_t most = 0;
+        for (const auto& [id, object] : filesystem.objects_) {
+            static_cast<void>(id);
+            if (object->kind == fake_file_kind::regular)
+                most = std::max(most, object->visible_links);
+        }
+        return most;
+    }
+    [[nodiscard]] static std::pair<std::uint64_t, std::uint64_t>
+    object_counts(const fake_file_system& filesystem) {
+        filesystem.assert_current();
+        return {filesystem.objects_.size(), filesystem.next_object_id_};
     }
     // Namespace groups a crash would decide now, oldest first: the bits of
     // fake_crash_policy::namespace_survivors. None without a crash policy.

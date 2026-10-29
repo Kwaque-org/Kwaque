@@ -32,6 +32,7 @@ codec::envelope_extent_limits limits(const codec::limits& policy) {
         config.max_encoded_body_bytes.value()
         + config.max_header_bytes.value()}};
 }
+using prepare_fixed = std::array<char, wal_prepare_fixed_bytes.value()>;
 template<typename T>
 codec::result<T> from_wire(
   result<T> value,
@@ -50,10 +51,8 @@ codec::result<T> from_wire(
 }
 template<std::size_t Offset, typename Id>
 codec::result<Id> read_id(
-  const std::array<char, 136>& fixed,
-  codec::field_context context,
-  wal_field field) {
-    static_assert(Offset + Id::width <= 136);
+  const prepare_fixed& fixed, codec::field_context context, wal_field field) {
+    static_assert(Offset + Id::width <= wal_prepare_fixed_bytes.value());
     std::array<std::uint8_t, Id::width> raw{};
     for (std::size_t i = 0; i < raw.size(); ++i)
         raw[i] = static_cast<std::uint8_t>(fixed[Offset + i]);
@@ -61,7 +60,7 @@ codec::result<Id> read_id(
 }
 template<std::size_t Offset, typename Id>
 codec::result<void> check_id(
-  const std::array<char, 136>& fixed,
+  const prepare_fixed& fixed,
   Id expected,
   codec::field_context context,
   wal_field field) {
@@ -71,9 +70,59 @@ codec::result<void> check_id(
         return codec::failure(at(errc::wrong_context, context, field, Offset));
     return {};
 }
+// The flag and append time are valid on their own; a stamp is valid only
+// relative to positions, so its checks are the caller's.
+codec::result<wal_prepare_stamps>
+read_stamp_fields(const prepare_fixed& fixed, codec::field_context context) {
+    const auto flags = load<126, std::uint16_t>(fixed);
+    if (flags > 1)
+        return codec::failure(
+          at(errc::malformed_data, context, wal_field::write_flags, 126));
+    const runtime::wall_time append{load<128, std::int64_t>(fixed)};
+    if (append.unix_nanoseconds() < 1)
+        return codec::failure(
+          at(errc::malformed_data, context, wal_field::append_time, 128));
+    return wal_prepare_stamps{
+      flags == 1,
+      append,
+      runtime::file_position{load<144, std::uint64_t>(fixed)},
+      runtime::file_position{load<152, std::uint64_t>(fixed)}};
+}
+// A certified end a writer can stamp: an alignment boundary from the file's
+// data start, which claims nothing, to the stamped object's position.
+bool certified_in_domain(
+  runtime::file_position value,
+  runtime::file_position data_start,
+  runtime::file_position position,
+  storage_alignment alignment) noexcept {
+    return data_start <= value && value <= position && alignment.aligned(value);
+}
+// The stamps against the expectation's positions and data starts.
+codec::result<wal_prepare_stamps> read_stamps(
+  const prepare_fixed& fixed,
+  const wal_prepare_expectation& expected,
+  codec::field_context context) {
+    const auto stamps = read_stamp_fields(fixed, context);
+    if (!stamps) return stamps;
+    if (!certified_in_domain(
+          stamps->target_certified_end,
+          expected.target_data_start,
+          expected.target.position(),
+          expected.target.alignment()))
+        return codec::failure(at(
+          errc::malformed_data, context, wal_field::target_certified_end, 144));
+    if (!certified_in_domain(
+          stamps->wal_certified_end,
+          expected.wal_data_start,
+          expected.wal.position(),
+          expected.wal.alignment()))
+        return codec::failure(
+          at(errc::malformed_data, context, wal_field::wal_certified_end, 152));
+    return stamps;
+}
 // Scalar syntax only, in field order; nothing is compared with context.
 codec::result<wal_prepare_claims>
-read_claims(const std::array<char, 136>& fixed, codec::field_context context) {
+read_claims(const prepare_fixed& fixed, codec::field_context context) {
     const auto incarnation = read_id<0, model::wal_incarnation_id>(
       fixed, context, wal_field::incarnation);
     if (!incarnation) return codec::failure(incarnation.error());
@@ -113,9 +162,19 @@ read_claims(const std::array<char, 136>& fixed, codec::field_context context) {
       wal_field::replay_profile,
       124);
     if (!profile) return codec::failure(profile.error());
-    if (load<126, std::uint16_t>(fixed) != 0)
+    const auto stamps = read_stamp_fields(fixed, context);
+    if (!stamps) return codec::failure(stamps.error());
+    const runtime::file_position wal_position{load<16, std::uint64_t>(fixed)};
+    const runtime::file_position target_position{
+      load<112, std::uint64_t>(fixed)};
+    if (stamps->target_certified_end > target_position)
+        return codec::failure(at(
+          errc::malformed_data, context, wal_field::target_certified_end, 144));
+    if (
+      stamps->wal_certified_end > wal_position
+      || !alignment->aligned(stamps->wal_certified_end))
         return codec::failure(
-          at(errc::malformed_data, context, wal_field::reserved, 126));
+          at(errc::malformed_data, context, wal_field::wal_certified_end, 152));
     const auto target = from_wire(
       segment_context::make(*cluster, *topic, *range, *segment, *generation),
       context,
@@ -124,13 +183,15 @@ read_claims(const std::array<char, 136>& fixed, codec::field_context context) {
     if (!target) return codec::failure(target.error());
     return wal_prepare_claims{
       *incarnation,
-      runtime::file_position{load<16, std::uint64_t>(fixed)},
+      wal_position,
       *alignment,
       *profile,
       *target,
       *routing,
       model::segment_relative_end{load<104, std::uint64_t>(fixed)},
-      runtime::file_position{load<112, std::uint64_t>(fixed)}};
+      target_position,
+      *stamps,
+      runtime::wall_time{load<136, std::int64_t>(fixed)}};
 }
 wal_child_expectation child_expectation(const wal_prepare_expectation& e) {
     return {
@@ -175,11 +236,17 @@ codec::result<void> check_expectation(
 }
 codec::result<void> check_expectation(
   const wal_prepare_expectation& expected, codec::field_context context) {
+    if (
+      expected.wal_data_start.value() == 0
+      || !expected.wal.alignment().aligned(expected.wal_data_start)
+      || expected.wal.position() < expected.wal_data_start)
+        return codec::failure(at(errc::invalid_argument, context));
     return check_expectation(child_expectation(expected), context);
 }
 codec::result<aligned_envelope_layout> checked_layout(
   byte_count child_bytes,
   const wal_prepare_expectation& expected,
+  envelope_placement placement,
   const codec::limits& policy,
   codec::envelope_extent_limits owner_limits,
   codec::field_context context) {
@@ -189,6 +256,8 @@ codec::result<aligned_envelope_layout> checked_layout(
       {byte_count{codec::envelope_prefix_bytes},
        wal_prepare_fixed_bytes,
        child_bytes},
+      expected.wal.position(),
+      placement,
       expected.wal.alignment(),
       policy,
       owner_limits);
@@ -207,7 +276,7 @@ codec::result<aligned_envelope_layout> checked_layout(
     return *layout;
 }
 codec::result<void> check_fixed(
-  const std::array<char, 136>& fixed,
+  const prepare_fixed& fixed,
   const wal_prepare_expectation& expected,
   codec::field_context context) {
     if (
@@ -281,9 +350,6 @@ codec::result<void> check_fixed(
     if (*profile != expected.profile)
         return codec::failure(
           at(errc::wrong_context, context, wal_field::replay_profile, 124));
-    if (load<126, std::uint16_t>(fixed) != 0)
-        return codec::failure(
-          at(errc::malformed_data, context, wal_field::reserved, 126));
     return {};
 }
 
@@ -331,6 +397,7 @@ codec::result<void> validate_wal_child_context(
 codec::result<aligned_envelope_layout> preflight_wal_prepare(
   const encoded_assigned_batch& child,
   const wal_prepare_expectation& expected,
+  envelope_placement placement,
   const codec::limits& policy,
   codec::envelope_extent_limits owner_limits,
   codec::field_context context) {
@@ -339,7 +406,7 @@ codec::result<aligned_envelope_layout> preflight_wal_prepare(
     if (child.bytes().empty())
         return codec::failure(at(errc::invalid_argument, context));
     auto layout = checked_layout(
-      child.bytes().size(), expected, policy, owner_limits, context);
+      child.bytes().size(), expected, placement, policy, owner_limits, context);
     if (!layout) return layout;
     if (auto valid = check_child(child.info(), expected, context, true); !valid)
         return codec::failure(valid.error());
@@ -352,8 +419,9 @@ public:
     static wal_prepare make(
       const wal_prepare_expectation& expected,
       model::file_byte_span extent,
+      wal_prepare_stamps stamps,
       encoded_assigned_batch child) noexcept {
-        return wal_prepare{expected, extent, std::move(child)};
+        return wal_prepare{expected, extent, stamps, std::move(child)};
     }
 };
 } // namespace detail
@@ -361,6 +429,7 @@ public:
 seastar::future<codec::result<fragmented_buffer>> encode_wal_prepare(
   encoded_assigned_batch&& source,
   wal_prepare_expectation expected,
+  wal_prepare_stamps stamps,
   codec::cooperative_work& work,
   byte_count remaining,
   bytes::allocation_charge_fn charge,
@@ -386,11 +455,28 @@ seastar::future<codec::result<fragmented_buffer>> encode_wal_prepare(
             const auto layout = checked_layout(
               child->bytes().size(),
               expected,
+              stamps.ends_write ? envelope_placement::ends_span
+                                : envelope_placement::continues,
               work.policy(),
               limits(work.policy()),
               context);
             if (!layout) {
                 failed = layout.error();
+                break;
+            }
+            if (
+              stamps.append_time.unix_nanoseconds() < 1
+              || !certified_in_domain(
+                stamps.target_certified_end,
+                expected.target_data_start,
+                expected.target.position(),
+                expected.target.alignment())
+              || !certified_in_domain(
+                stamps.wal_certified_end,
+                expected.wal_data_start,
+                expected.wal.position(),
+                expected.wal.alignment())) {
+                failed = at(errc::invalid_argument, context);
                 break;
             }
             const auto cost = child->bytes().allocation_cost(charge);
@@ -439,7 +525,7 @@ seastar::future<codec::result<fragmented_buffer>> encode_wal_prepare(
                 failed = valid.error();
                 break;
             }
-            std::array<char, 136> fixed{};
+            prepare_fixed fixed{};
             const auto put = [&](auto id, std::size_t offset) {
                 std::copy(
                   id.bytes().begin(),
@@ -462,9 +548,15 @@ seastar::future<codec::result<fragmented_buffer>> encode_wal_prepare(
               static_cast<std::uint32_t>(
                 expected.wal.alignment().bytes().value()));
             store<124>(fixed, static_cast<std::uint16_t>(expected.profile));
-            store<128>(
+            store<126>(
+              fixed, static_cast<std::uint16_t>(stamps.ends_write ? 1 : 0));
+            store<128>(fixed, stamps.append_time.unix_nanoseconds());
+            store<136>(fixed, child->info().max_record_time.unix_nanoseconds());
+            store<144>(fixed, stamps.target_certified_end.value());
+            store<152>(fixed, stamps.wal_certified_end.value());
+            store<160>(
               fixed, static_cast<std::uint32_t>(child->bytes().size().value()));
-            store<132>(
+            store<164>(
               fixed,
               static_cast<std::uint32_t>(layout->padding_bytes().value()));
             output.emplace(
@@ -511,34 +603,40 @@ struct wal_reader final {
     // The declared child size and padding against the envelope, and the file
     // extent the PREPARE occupies at `wal_position`: nothing here depends on
     // the segment it names.
+    // The flag decides the padding: the end of a write pads to the next
+    // boundary, any other PREPARE not at all, so one value is accepted.
     codec::result<model::file_byte_span> occupied(
-      const std::array<char, 136>& fixed,
+      const prepare_fixed& fixed,
       const fragmented_buffer_parser& input,
       codec::field_context context,
       storage_alignment alignment,
       runtime::file_position wal_position,
       const codec::limits& policy) const {
-        const byte_count child_bytes{load<128, std::uint32_t>(fixed)};
+        const byte_count child_bytes{load<160, std::uint32_t>(fixed)};
         if (child_bytes.value() == 0)
             return codec::failure(at(
-              errc::malformed_data, context, wal_field::assigned_bytes, 128));
+              errc::malformed_data, context, wal_field::assigned_bytes, 160));
         const auto layout = from_wire(
           aligned_envelope_layout::make(
             {byte_count{context.origin - start},
              wal_prepare_fixed_bytes,
              child_bytes},
+            wal_position,
+            (load<126, std::uint16_t>(fixed) & 1U) != 0
+              ? envelope_placement::ends_span
+              : envelope_placement::continues,
             alignment,
             policy,
             limits(policy)),
           context,
           wal_field::assigned_bytes,
-          128);
+          160);
         if (!layout) return codec::failure(layout.error());
         if (
           input.total_bytes() != layout->body_bytes()
-          || load<132, std::uint32_t>(fixed) != layout->padding_bytes().value())
+          || load<164, std::uint32_t>(fixed) != layout->padding_bytes().value())
             return codec::failure(
-              at(errc::malformed_data, context, wal_field::padding, 132));
+              at(errc::malformed_data, context, wal_field::padding, 164));
         return from_wire(
           layout->at(wal_position), context, wal_field::wal_position, 16);
     }
@@ -552,12 +650,13 @@ struct wal_reader final {
         fragmented_buffer child_bytes_owner;
         std::optional<codec::result<encoded_assigned_batch>> child;
         std::optional<model::file_byte_span> extent;
+        std::optional<wal_prepare_stamps> stamps;
         std::optional<codec::error> failed;
         std::exception_ptr exception;
         const auto anchor = at(errc::success, context);
         try {
             do {
-                std::array<char, 136> fixed{};
+                prepare_fixed fixed{};
                 if (
                   auto read = co_await detail::read_fixed(
                     input, fixed, work, context);
@@ -619,7 +718,13 @@ struct wal_reader final {
                     failed = valid.error();
                     break;
                 }
-                const byte_count child_bytes{load<128, std::uint32_t>(fixed)};
+                auto stamped = read_stamps(fixed, expected, context);
+                if (!stamped) {
+                    failed = stamped.error();
+                    break;
+                }
+                stamps = *stamped;
+                const byte_count child_bytes{load<160, std::uint32_t>(fixed)};
                 const auto position = occupied(
                   fixed,
                   input,
@@ -657,12 +762,14 @@ struct wal_reader final {
                 auto shared = input.read_buffer(child_bytes);
                 if (!shared) {
                     failed = codec::detail::allocation_cost_error(
-                      shared.error(), context, context.origin + 136U);
+                      shared.error(),
+                      context,
+                      context.origin + wal_prepare_fixed_bytes.value());
                     break;
                 }
                 child_bytes_owner = std::move(*shared);
                 const codec::field_context child_context{
-                  context.origin + 136U,
+                  context.origin + wal_prepare_fixed_bytes.value(),
                   static_cast<std::uint16_t>(
                     codec::format_family::assigned_batch),
                   static_cast<std::uint16_t>(wal_field::assigned_batch)};
@@ -688,6 +795,16 @@ struct wal_reader final {
                     failed = valid.error();
                     break;
                 }
+                if (
+                  load<136, std::int64_t>(fixed)
+                  != (*child)->info().max_record_time.unix_nanoseconds()) {
+                    failed = at(
+                      errc::malformed_data,
+                      context,
+                      wal_field::max_record_time,
+                      136);
+                    break;
+                }
                 auto padding_context = context;
                 padding_context.field = static_cast<std::uint16_t>(
                   wal_field::padding);
@@ -695,7 +812,7 @@ struct wal_reader final {
                 if (
                   auto padding = co_await detail::read_padding(
                     input,
-                    byte_count{load<132, std::uint32_t>(fixed)},
+                    byte_count{load<164, std::uint32_t>(fixed)},
                     work,
                     padding_context);
                   !padding) {
@@ -720,7 +837,7 @@ struct wal_reader final {
         }
         KWAQUE_INVARIANT(
           invariant_id{"KQ-WAL-DECODE-OUTCOME"},
-          child && child->has_value() && extent,
+          child && child->has_value() && extent && stamps,
           "WAL decoding completed without its child or extent");
         // Prospective until the envelope decoder releases its body alias and
         // commits. Only the returned child's descriptors remain additional.
@@ -747,7 +864,8 @@ struct wal_reader final {
             co_return codec::failure(ready.error());
         }
         co_return decoded_wal_prepare{
-          detail::wal_codec::make(*selected, *extent, std::move(**child)),
+          detail::wal_codec::make(
+            *selected, *extent, *stamps, std::move(**child)),
           *remaining};
     }
 };

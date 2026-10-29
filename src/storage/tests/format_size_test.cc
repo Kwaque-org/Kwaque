@@ -51,6 +51,71 @@ void expect_error(const auto& result, errc error) {
     ASSERT_FALSE(result.has_value());
     EXPECT_EQ(result.error(), error);
 }
+auto placed(
+  std::uint64_t position,
+  storage::envelope_placement placement,
+  std::uint64_t header,
+  std::uint64_t fixed,
+  std::uint64_t tail,
+  std::uint64_t align = 512,
+  codec::envelope_extent_limits owner = ordinary) {
+    return aligned_envelope_layout::make(
+      {byte_count{header}, byte_count{fixed}, byte_count{tail}},
+      file_position{position},
+      placement,
+      alignment(align),
+      codec::limits::defaults(),
+      owner);
+}
+// Checks one envelope inside a write against arithmetic written out here:
+// an ending envelope pads its end to the next boundary, a continuing one not
+// at all, and either is found only at its own position.
+void expect_placed(
+  std::uint64_t position, std::uint64_t unpadded, std::uint64_t align) {
+    using storage::envelope_placement;
+    const auto fixed = unpadded - 32U;
+    const auto ending = placed(
+                          position,
+                          envelope_placement::ends_span,
+                          32,
+                          fixed,
+                          0,
+                          align,
+                          {byte_count{maximum}, byte_count{maximum}})
+                          .value();
+    const auto end = position + unpadded;
+    const auto padding = end % align == 0 ? 0U : align - end % align;
+    ASSERT_EQ(ending.padding_bytes(), byte_count{padding});
+    EXPECT_LT(padding, align);
+    EXPECT_EQ(ending.encoded_bytes(), byte_count{unpadded + padding});
+    EXPECT_EQ(
+      ending.at(file_position{position}).value().end().value() % align, 0U);
+    EXPECT_EQ(
+      storage::end_padding(
+        file_position{position}, byte_count{unpadded}, alignment(align))
+        .value(),
+      byte_count{padding});
+    const auto continuing = placed(
+                              position,
+                              envelope_placement::continues,
+                              32,
+                              fixed,
+                              0,
+                              align,
+                              {byte_count{maximum}, byte_count{maximum}})
+                              .value();
+    EXPECT_EQ(continuing.padding_bytes(), byte_count{});
+    EXPECT_EQ(continuing.encoded_bytes(), byte_count{unpadded});
+    EXPECT_EQ(
+      continuing.at(file_position{position}).value().end(), file_position{end});
+    for (const auto other : {position + 1U, position + align, position ^ 1U})
+        if (other != position) {
+            expect_error(
+              ending.at(file_position{other}), errc::invalid_argument);
+            expect_error(
+              continuing.at(file_position{other}), errc::invalid_argument);
+        }
+}
 
 TEST(StorageSizeTest, IndependentSmallObjectGeometryIncludesEveryHeader) {
     struct example {
@@ -267,6 +332,133 @@ TEST(StorageSizeTest, CheckedSumsAndPlacementRejectOverflowBeforeWrapping) {
     expect_error(result.at(file_position{highest_aligned}), errc::out_of_range);
     expect_error(result.at(file_position{1}), errc::invalid_argument);
     EXPECT_EQ(result.at(file_position{}).value().end(), file_position{512});
+}
+
+TEST(StorageSizeTest, PlacedEnvelopesPadOnlyToEndTheirWrite) {
+    // Every position and size residue at 512.
+    for (std::uint64_t position = 0; position < 512; ++position)
+        for (std::uint64_t unpadded = 32; unpadded < 544; ++unpadded)
+            expect_placed(position, unpadded, 512);
+    // Sampled residues at 4096 and 65536, both sides of each boundary.
+    for (const std::uint64_t align : {4096U, 65536U})
+        for (const std::uint64_t residue :
+             {0U, 1U, 7U, 511U, 512U, 1000U, 2047U, 4095U, 4096U, 40000U})
+            for (const std::uint64_t unpadded :
+                 {32U, 33U, 399U, 512U, 4095U, 4096U, 4097U, 65535U, 65536U})
+                expect_placed(3U * align + residue % align, unpadded, align);
+}
+
+TEST(StorageSizeTest, PlacedAtABoundaryEndsLikeAStartAlignedObject) {
+    for (const std::uint64_t align : {512U, 4096U, 65536U})
+        for (const std::uint64_t tail :
+             std::array<std::uint64_t, 5>{0, 1, 223, align - 1U, align}) {
+            const auto start = layout(32, 144, tail, align).value();
+            const auto ending = placed(
+                                  2U * align,
+                                  storage::envelope_placement::ends_span,
+                                  32,
+                                  144,
+                                  tail,
+                                  align)
+                                  .value();
+            EXPECT_EQ(ending.padding_bytes(), start.padding_bytes());
+            EXPECT_EQ(ending.encoded_bytes(), start.encoded_bytes());
+            EXPECT_EQ(ending.body_bytes(), start.body_bytes());
+            EXPECT_EQ(
+              ending.at(file_position{2U * align}).value(),
+              start.at(file_position{2U * align}).value());
+        }
+}
+
+TEST(StorageSizeTest, PlacedAllowancesAreExactAtEveryPosition) {
+    using storage::envelope_placement;
+    struct example {
+        envelope_placement placement;
+        std::uint64_t fixed, align, child;
+    };
+    // A block never pads; a PREPARE may end its write anywhere, so its
+    // padding can reach one unit less a byte.
+    constexpr std::array cases{
+      example{envelope_placement::continues, 144, 512, 16777072},
+      example{envelope_placement::continues, 144, 65536, 16777072},
+      example{envelope_placement::ends_span, 168, 4096, 16772953},
+      example{envelope_placement::ends_span, 168, 65536, 16711513}};
+    for (const auto& input : cases) {
+        const auto allowance = storage::max_child_bytes(
+          byte_count{32},
+          byte_count{input.fixed},
+          input.placement,
+          alignment(input.align),
+          codec::limits::defaults(),
+          ordinary);
+        ASSERT_TRUE(allowance.has_value());
+        EXPECT_EQ(*allowance, byte_count{input.child});
+        const auto unpadded = 32U + input.fixed + input.child;
+        for (std::uint64_t residue = 0; residue < input.align;
+             residue += input.align / 64U) {
+            EXPECT_TRUE(placed(
+              input.align + residue,
+              input.placement,
+              32,
+              input.fixed,
+              input.child,
+              input.align));
+        }
+        // Where an envelope of this size ends one byte past a boundary, so
+        // an ending one pads one unit less a byte.
+        const auto worst = [&input](std::uint64_t size) {
+            return input.align
+                   + (input.align + 1U - size % input.align) % input.align;
+        };
+        EXPECT_TRUE(placed(
+          worst(unpadded),
+          input.placement,
+          32,
+          input.fixed,
+          input.child,
+          input.align));
+        expect_error(
+          placed(
+            worst(unpadded + 1U),
+            input.placement,
+            32,
+            input.fixed,
+            input.child + 1U,
+            input.align),
+          errc::resource_exhausted);
+    }
+}
+
+TEST(StorageSizeTest, PlacedLayoutsRefuseUnrepresentablePositions) {
+    using storage::envelope_placement;
+    expect_error(
+      placed(maximum - 100U, envelope_placement::ends_span, 32, 144, 0),
+      errc::out_of_range);
+    expect_error(
+      storage::end_padding(
+        file_position{maximum - 100U}, byte_count{200}, alignment(512)),
+      errc::out_of_range);
+    // The end fits but its padding to the next boundary does not.
+    expect_error(
+      storage::end_padding(
+        file_position{maximum - 300U}, byte_count{200}, alignment(512)),
+      errc::out_of_range);
+    expect_error(
+      placed(maximum - 100U, envelope_placement::continues, 32, 144, 0),
+      errc::out_of_range);
+    // A continuing envelope needs no room for padding past its end.
+    const auto last = placed(
+                        maximum - 176U,
+                        envelope_placement::continues,
+                        32,
+                        144,
+                        0,
+                        512,
+                        {byte_count{maximum}, byte_count{maximum}})
+                        .value();
+    EXPECT_EQ(
+      last.at(file_position{maximum - 176U}).value().end(),
+      file_position{maximum});
 }
 
 TEST(StorageSizeTest, HeaderBoundsApplyToBothSizingOperations) {

@@ -278,8 +278,24 @@ private:
         seastar::abort_source abort;
         codec::cooperative_work work{codec::limits::defaults(), abort};
         if constexpr (supplied) {
-            auto bytes = co_await layout(testing::data_block(), work);
-            const auto scope = testing::scope(100, 101, 0, 1, 512, 1024);
+            // A sealed extent: the block and the footer that ends its write.
+            const auto data = testing::data_block();
+            const auto block_end = 512U + data.size();
+            const auto block_scope = testing::scope(
+              100, 101, 0, 1, 512, block_end);
+            const auto footer = testing::footer_wire(
+              {block_scope,
+               1,
+               block_scope,
+               {runtime::wall_time{1},
+                runtime::wall_time{1},
+                runtime::wall_time{
+                  testing::max_record_time(testing::data_child())}},
+               testing::crc(data)},
+              {testing::history(), runtime::file_position{block_end}});
+            const auto scope = testing::scope(
+              100, 101, 0, 1, 512, block_end + footer.size());
+            auto bytes = co_await layout(data, work);
             {
                 fragmented_buffer_parser input{bytes.share()};
                 const auto memory = codec::reserve_decode_input(
@@ -312,6 +328,23 @@ private:
             (co_await verifier.add_block(
                std::move(bytes), testing::batch_expected(), memory, work))
               .value();
+            auto footer_bytes = co_await layout(footer, work);
+            const auto footer_cost
+              = footer_bytes.allocation_cost(capacity_bound).value();
+            const auto footer_memory = codec::detail::consume_decode_budget(
+                                         work.policy(),
+                                         memory_,
+                                         footer_cost.backing,
+                                         footer_cost.descriptors
+                                           .checked_add(
+                                             footer_cost.share_controls)
+                                           .value(),
+                                         {},
+                                         0)
+                                         .value();
+            (co_await verifier.add_footer(
+               std::move(footer_bytes), footer_memory, work))
+              .value();
             evidence_ = verifier.finish(work).value();
             source_->index_context = sparse_index_context::make(
                                        testing::sc(),
@@ -329,7 +362,9 @@ private:
                             testing::sc().segment(),
                             testing::sc().generation(),
                             evidence_->boundary().coverage,
-                            *evidence_->digest())
+                            *evidence_->digest(),
+                            evidence_->boundary().times.max_append,
+                            evidence_->boundary().times.max_record)
                             .value();
         std::vector<page_ref> refs;
         refs.reserve(source_->pages);
@@ -463,9 +498,9 @@ using storage_index_extended = metadata_fixture<false, 4096, 3829, 4096, 65536>;
 using storage_index_walk = metadata_fixture<false, 4096, 64>;
 using storage_manifest_tiny = metadata_fixture<true, 512, 1>;
 using storage_manifest_frag7 = metadata_fixture<true, 7, 32>;
-using storage_manifest_page_max = metadata_fixture<true, 4096, 628>;
+using storage_manifest_page_max = metadata_fixture<true, 4096, 545>;
 using storage_manifest_extended
-  = metadata_fixture<true, 4096, 589, 4096, 65536>;
+  = metadata_fixture<true, 4096, 511, 4096, 65536>;
 using storage_manifest_walk = metadata_fixture<true, 4096, 64>;
 #define METADATA_CASE(group, op)                                               \
     PERF_TEST_F(group, op) { return measure<metadata_operation::op>(); }

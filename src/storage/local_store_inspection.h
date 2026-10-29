@@ -55,7 +55,9 @@ class local_namespace_scan final {
         checkpoints,
         evidence,
         decisions,
-        deletions
+        deletions,
+        wal_spares,
+        segment_spares
     };
     struct frame final {
         std::optional<runtime::file_path> path;
@@ -435,6 +437,8 @@ private:
                     frame.seen |= 32U;
                     co_return co_await descend(node::deletions);
                 }
+                if (name == "wal-spares")
+                    co_return co_await descend(node::wal_spares);
                 if (
                   auto temp = parse_local_temporary_name(
                     name, runtime::file_name::make("control").value());
@@ -465,6 +469,8 @@ private:
                 frame.seen |= 4U;
                 co_return co_await descend(node::segments);
             }
+            if (spec_.stores_data() && name == "segment-spares")
+                co_return co_await descend(node::segment_spares);
             co_return unsupported();
         case node::wal:
         case node::segments: {
@@ -593,6 +599,17 @@ private:
                   && parse_local_sequence_name(target->value(), metadata))
                     co_return runtime::result<void>{};
             }
+            co_return unsupported();
+        }
+        case node::wal_spares:
+        case node::segment_spares: {
+            // A spare is never read: its name says what it is.
+            if (auto valid = regular(); !valid) co_return valid;
+            report_.has_payload = true;
+            const bool spare = frame.kind == node::wal_spares
+                                 ? parse_local_wal_spare(name).has_value()
+                                 : parse_local_segment_spare(name).has_value();
+            if (spare) co_return runtime::result<void>{};
             co_return unsupported();
         }
         }

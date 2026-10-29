@@ -76,6 +76,10 @@ def measurement(sealed=8, unsealed=0, unlisted=0, timing=False, elapsed=7000):
             "refused": 0,
             "sealing": 0,
             "unresolved": 0,
+            "materialized": 0,
+            "repaired": 0,
+            "candidates": 0,
+            "uncertified_tails": 0,
             "wal_files": 1,
         },
         "store": {

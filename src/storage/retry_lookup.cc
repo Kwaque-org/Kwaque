@@ -1,5 +1,7 @@
 #include "src/storage/retry_lookup.h"
 
+#include <limits>
+
 namespace kwaque::storage {
 
 runtime::result<retry_page_directory>
@@ -49,6 +51,19 @@ retry_page_directory::find(const model::batch_id& id) const noexcept {
     return static_cast<std::uint32_t>(page - spans_.begin());
 }
 
+std::optional<std::uint32_t>
+retry_page_directory::floor(const model::batch_id& id) const noexcept {
+    const auto after = std::upper_bound(
+      spans_.begin(),
+      spans_.end(),
+      id,
+      [](const model::batch_id& wanted, const retry_page_span& page) {
+          return wanted.canonical_less(page.first);
+      });
+    if (after == spans_.begin()) return std::nullopt;
+    return static_cast<std::uint32_t>(after - 1 - spans_.begin());
+}
+
 const completed_retry* find_completed_retry(
   std::span<const completed_retry> entries,
   const model::batch_id& id) noexcept {
@@ -63,21 +78,26 @@ const completed_retry* find_completed_retry(
     return &*at;
 }
 
+const completed_retry* find_completed_retry_floor(
+  std::span<const completed_retry> entries,
+  const model::batch_id& id) noexcept {
+    const auto after = std::upper_bound(
+      entries.begin(),
+      entries.end(),
+      id,
+      [](const model::batch_id& wanted, const completed_retry& stored) {
+          return wanted.canonical_less(stored.id());
+      });
+    if (after == entries.begin()) return nullptr;
+    return &*(after - 1);
+}
+
 seastar::future<runtime::result<retry_root_reader>> retry_root_reader::open(
   local_root_pin pin, workload_budget& budget, codec::cooperative_work& work) {
-    std::uint32_t facts = 0;
-    const auto& root = pin.metadata();
-    if (const auto* summary = std::get_if<sealed_footer>(&root)) {
-        facts = summary->retry_count();
-    } else if (const auto* local = std::get_if<local_metadata_record>(&root)) {
-        const auto* snapshot = std::get_if<local_completed_retry_root>(
-          &local->payload());
-        if (!snapshot)
-            co_return runtime::failure(detail::path_error(errc::wrong_context));
-        facts = snapshot->retry_count;
-    } else {
+    const auto* summary = std::get_if<sealed_footer>(&pin.metadata());
+    if (!summary)
         co_return runtime::failure(detail::path_error(errc::wrong_context));
-    }
+    const auto facts = summary->retry_count();
     const auto pages = pin.reference().pages().value();
     auto directory = retry_page_directory::make(budget, pages);
     if (!directory) co_return runtime::failure(directory.error());
@@ -110,6 +130,28 @@ retry_root_reader::find(model::batch_id id, codec::cooperative_work& work) {
     co_return output{*found};
 }
 
+seastar::future<runtime::result<std::optional<completed_retry>>>
+retry_root_reader::find_stream_last(
+  retry_prefix prefix, codec::cooperative_work& work) {
+    using output = std::optional<completed_retry>;
+    // The stream's largest identity: no entry of it lies above.
+    const auto probe = model::batch_id::make(
+      prefix.producer,
+      prefix.epoch,
+      prefix.stream,
+      model::batch_sequence{std::numeric_limits<std::uint64_t>::max()});
+    if (!probe)
+        co_return runtime::failure(detail::path_error(errc::invalid_argument));
+    const auto ordinal = directory_.floor(*probe);
+    if (!ordinal) co_return output{};
+    auto page = co_await this->page(*ordinal, work);
+    if (!page) co_return runtime::failure(page.error());
+    const auto* found = find_completed_retry_floor(page->entries(), *probe);
+    // A neighbour's entry is never the answer.
+    if (!found || retry_prefix::of(found->id()) != prefix) co_return output{};
+    co_return output{*found};
+}
+
 seastar::future<runtime::result<local_retry_page>>
 retry_root_reader::page(std::uint32_t ordinal, codec::cooperative_work& work) {
     const auto place = page_ordinal::make(ordinal);
@@ -125,40 +167,31 @@ completed_retry_lookup::open(
   const local_generation_pin& generation,
   workload_budget& budget,
   codec::cooperative_work& work) {
-    std::optional<retry_root_reader> snapshot, summary;
+    std::optional<retry_root_reader> summary;
     for (const auto& root : generation.publication().roots) {
-        const bool local = root.kind()
-                           == local_root_kind::completed_retry_snapshot;
-        if (!local && root.kind() != local_root_kind::sealed_retry) continue;
+        if (root.kind() != local_root_kind::sealed_retry) continue;
         auto pin = generation.root(root.kind());
         if (!pin) co_return runtime::failure(pin.error());
         auto reader = co_await retry_root_reader::open(
           std::move(*pin), budget, work);
         if (!reader) co_return runtime::failure(reader.error());
-        (local ? snapshot : summary).emplace(std::move(*reader));
+        summary.emplace(std::move(*reader));
     }
-    co_return completed_retry_lookup{std::move(snapshot), std::move(summary)};
+    co_return completed_retry_lookup{std::move(summary)};
 }
 
-seastar::future<runtime::result<std::optional<retry_lookup_result>>>
+seastar::future<runtime::result<std::optional<completed_retry>>>
 completed_retry_lookup::find(
   model::batch_id id, codec::cooperative_work& work) {
-    using output = std::optional<retry_lookup_result>;
-    if (snapshot_) {
-        auto found = co_await snapshot_->find(id, work);
-        if (!found) co_return runtime::failure(found.error());
-        if (*found)
-            co_return output{
-              retry_lookup_result{**found, retry_source::snapshot}};
-    }
-    if (summary_) {
-        auto found = co_await summary_->find(id, work);
-        if (!found) co_return runtime::failure(found.error());
-        if (*found)
-            co_return output{
-              retry_lookup_result{**found, retry_source::summary}};
-    }
-    co_return output{};
+    if (!summary_) co_return std::optional<completed_retry>{};
+    co_return co_await summary_->find(id, work);
+}
+
+seastar::future<runtime::result<std::optional<completed_retry>>>
+completed_retry_lookup::find_stream_last(
+  retry_prefix prefix, codec::cooperative_work& work) {
+    if (!summary_) co_return std::optional<completed_retry>{};
+    co_return co_await summary_->find_stream_last(prefix, work);
 }
 
 } // namespace kwaque::storage

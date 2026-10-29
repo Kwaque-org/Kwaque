@@ -240,6 +240,7 @@ kwaque_cc_library(
         "//src/base:error",
         "//src/bytes:fragmented_buffer",
         "//src/codec:digest",
+        "//src/runtime:time",
     ],
 )
 

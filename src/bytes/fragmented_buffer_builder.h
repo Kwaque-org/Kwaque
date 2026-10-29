@@ -117,6 +117,12 @@ public:
     // of existing descriptors; an empty builder has no migration work.
     [[nodiscard]] result<void> reserve_fragments(item_count count);
 
+    // Zero-copy, of bytes already appended: an append writes only past them,
+    // so they never change, and the share outlives the builder and whatever
+    // it publishes.
+    [[nodiscard]] result<fragmented_buffer>
+    share(byte_count offset, byte_count length);
+
     // Publishes the accumulated bytes. One-way: the builder holds nothing
     // afterwards and every later append, reserve, or finish reports closed. The
     // descriptor storage transfers directly, without allocating at publication.

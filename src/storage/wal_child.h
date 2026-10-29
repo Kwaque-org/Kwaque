@@ -28,10 +28,13 @@ public:
         workload_reservation backing;
         std::optional<workload_reservation> aliases;
         encoded_assigned_batch batch;
+        // Supplied with the batch: the broker time it was assigned at.
+        runtime::wall_time append_time;
     };
     [[nodiscard]] static runtime::result<admitted_wal_batch> make(
       encoded_assigned_batch,
       workload_reservation,
+      runtime::wall_time append_time,
       bytes::allocation_charge_fn);
     admitted_wal_batch(admitted_wal_batch&&) noexcept = default;
     admitted_wal_batch& operator=(admitted_wal_batch&&) = delete;

@@ -14,6 +14,8 @@ struct assigned_batch_info final {
     codec::semantic_batch_digest fingerprint;
     item_count header_count;
     model::batch_fingerprint_verification verification;
+    // Derived from the retained records by the walk that validated them.
+    runtime::wall_time max_record_time;
     bool operator==(const assigned_batch_info&) const noexcept = default;
 };
 

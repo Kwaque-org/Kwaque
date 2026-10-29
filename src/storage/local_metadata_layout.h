@@ -29,8 +29,6 @@ enum class local_metadata_kind : std::uint16_t {
     deletion_intent = 8,
     recovery_decision = 9,
     boundary_evidence = 10,
-    completed_retry_root = 11,
-    completed_retry_page = 12,
 };
 struct local_metadata_descriptor final {
     local_metadata_kind kind;
@@ -59,10 +57,6 @@ inline constexpr std::array local_metadata_descriptors{
     local_metadata_kind::recovery_decision, 148, 148, 0, 0},
   local_metadata_descriptor{
     local_metadata_kind::boundary_evidence, 188, 248, 0, 0},
-  local_metadata_descriptor{
-    local_metadata_kind::completed_retry_root, 128, 128, 48, 256},
-  local_metadata_descriptor{
-    local_metadata_kind::completed_retry_page, 92, 92, 160, 65536},
 };
 [[nodiscard]] result<local_metadata_descriptor>
 local_metadata_descriptor_for(std::uint16_t) noexcept;

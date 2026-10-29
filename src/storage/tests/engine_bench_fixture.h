@@ -230,15 +230,19 @@ seastar::future<> with_bench_store(
     }
     owner_type owner{devices};
     measured::file_system files{observe, 0};
-    // Each writable segment's owner holds its data handle, write staging and
-    // metadata workspace, about 8 MiB, for its lifetime, and 16 handles; the
-    // WAL's owners take 32.
+    // Appends take the shard's whole foreground lease, as a shard gives
+    // them: requests a slow device holds back stay admitted until they are
+    // durable. Each writable segment takes 16 handles; the WAL's owners take
+    // 32. The engine keeps a writable segment for every six tasks of half
+    // the budget's, so each takes twelve beside the requests'.
     const std::uint64_t writable = config.table.maximum_writable;
+    auto appends = manager.acquire_workload(
+      resource::workload_class::foreground_protocol);
+    const auto foreground = appends.hard_budget();
     workload_budget budget{
-      manager.acquire_workload(resource::workload_class::foreground_protocol),
-      {.tasks = 1024,
-       .bytes
-       = byte_count{std::max<std::uint64_t>(96, 32 + 8 * writable) << 20U},
+      std::move(appends),
+      {.tasks = static_cast<std::uint32_t>(1024 + 12 * writable),
+       .bytes = foreground,
        .handles = static_cast<std::uint32_t>(32 + 16 * writable)},
       bytes::testing::charge};
     auto lease = manager.acquire_workload(resource::workload_class::metadata);

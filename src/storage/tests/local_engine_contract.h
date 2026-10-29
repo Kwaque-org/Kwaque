@@ -17,6 +17,7 @@
 #include "src/storage/tests/local_store_contract.h"
 #include "src/storage/tests/recovery_successor_contract.h"
 #include "src/storage/tests/segment_lifecycle_contract.h"
+#include "src/storage/tests/segment_test_support.h"
 #include "src/storage/tests/segment_writer_contract.h"
 #include "src/storage/tests/wal_writer_contract.h"
 #include "src/storage/workload_budget.h"
@@ -26,9 +27,12 @@
 
 #include <array>
 #include <cstdint>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <span>
+#include <string>
+#include <vector>
 
 namespace kwaque::storage::testing::local_engine_contract {
 using store_contract::require;
@@ -46,6 +50,11 @@ inline local_engine_config configuration() {
     config.checkpoint = {.pins = {}, .metadata = store_contract::limits()};
     config.table = lifecycle::configuration();
     config.table.maximum_writable = 2;
+    // The bounds these contracts were written for, every portion placed in
+    // its segment among them.
+    config.append.maximum_segments = 64;
+    config.append.maximum_requests = 64;
+    config.append.segment_placement_bytes = byte_count{0};
     config.table.maximum_creations = 1;
     config.cache = {.capacity = byte_count{2_MiB}};
     config.writer = segments::configuration();
@@ -65,11 +74,10 @@ inline recovery_catalog_entry listed(
     described.segment = appends::context(generation);
     const auto header = segment_header::make(
                           described.segment,
-                          described.logical_origin,
                           described.alignment,
                           described.profile)
                           .value();
-    return {described, header, expiring};
+    return {described, header, appends::segment_origin(), expiring};
 }
 
 // One shard's storage through three lives of its process. A store that was
@@ -143,8 +151,8 @@ seastar::future<> started_and_restarted(
             const auto target = take(
               co_await drive.lifecycle(
                 engine->table()->create(lifecycle::creation(spec, 1), work)));
-            co_await lifecycle::append_one(
-              *engine->append(), target, 100, 1, budget, work, drive);
+            co_await lifecycle::append_one<Clock>(
+              *engine->append(), target, 100, 1, budget, work, drive, timer);
         } catch (...) {
             failed.observe(std::current_exception());
         }
@@ -184,8 +192,8 @@ seastar::future<> started_and_restarted(
             const auto next = take(
               co_await drive.lifecycle(
                 engine->table()->create(lifecycle::creation(spec, 2), work)));
-            co_await lifecycle::append_one(
-              *engine->append(), next, 100, 2, budget, work, drive);
+            co_await lifecycle::append_one<Clock>(
+              *engine->append(), next, 100, 2, budget, work, drive, timer);
             // The recovered one goes as what it is. The durable checkpoint
             // pins its last footer: the removal has it let go first.
             const auto gone = co_await drive.lifecycle(
@@ -206,8 +214,8 @@ seastar::future<> started_and_restarted(
             const auto third = take(
               co_await drive.lifecycle(
                 engine->table()->create(lifecycle::creation(spec, 3), work)));
-            co_await lifecycle::append_one(
-              *engine->append(), third, 100, 3, budget, work, drive);
+            co_await lifecycle::append_one<Clock>(
+              *engine->append(), third, 100, 3, budget, work, drive, timer);
             const auto cut = co_await drive.lifecycle(
               engine->checkpoint()->request());
             const auto sealed = co_await drive.lifecycle(
@@ -334,6 +342,868 @@ seastar::future<> stale_control_record_refused(
       "the store a refused start was given did not restart");
 }
 
+// A spare is no WAL file a control record hands out: the check that refuses
+// a record older than its store passes it over. The record a store was made
+// with, put back once the first WAL file the start made lies among the
+// WAL's spares under its incarnation, which the record never handed out,
+// starts the store as never used, and the spare is left as it was. Restart's
+// inspection takes the store with its spares.
+template<
+  runtime::monotonic_clock Clock,
+  typename Backend,
+  typename Owner,
+  typename Driver,
+  typename Timer>
+seastar::future<> stale_control_check_passes_spares(
+  Backend& files,
+  Owner& owner,
+  const local_device_spec& spec,
+  workload_budget& budget,
+  workload_budget& reserve,
+  Driver drive,
+  Timer& timer) {
+    using engine_type = local_engine<Backend, Owner, Clock>;
+    using control_type = local_control_owner<Backend, Owner>;
+    seastar::abort_source abort;
+    codec::cooperative_work work{codec::limits::defaults(), abort};
+    co_await installation_contract::bootstrap(
+      files, owner, spec, budget, work, drive);
+    const std::array devices{spec};
+    const auto paths = take(local_paths::make(spec.root));
+    const auto control = take(paths.control(0));
+    const auto made = co_await store_contract::read_all_bytes(
+      files, control, drive);
+    const auto life = [&]() -> seastar::future<engine_start> {
+        lifecycle::told heard;
+        auto engine = take(
+          engine_type::make(
+            {files, owner, devices, spec, 0, budget, budget, reserve, budget},
+            configuration()));
+        runtime::first_failure failed;
+        engine_start began;
+        try {
+            began = co_await drive.lifecycle(
+              engine->start(timer, {}, {heard.sink(), {}, {}}));
+        } catch (...) {
+            failed.observe(std::current_exception());
+        }
+        failed.observe(co_await drive.lifecycle(engine->stop()));
+        take(failed.outcome());
+        co_return began;
+    };
+
+    take((co_await life()).failure.outcome());
+    std::optional<model::wal_incarnation_id> head;
+    {
+        auto opened = take(
+          co_await drive.lifecycle(
+            control_type::open(
+              files,
+              owner,
+              spec,
+              0,
+              false,
+              budget,
+              store_contract::limits(),
+              work)));
+        const auto fields = take(opened->snapshot()).fields;
+        if (fields.wal_head) head = fields.wal_head->incarnation;
+        take(co_await drive.lifecycle(opened->close()));
+    }
+    require(head.has_value(), "a store's first start made no WAL file");
+    const auto spare = take(paths.spare(0, *head));
+    const auto kept = co_await store_contract::read_all_bytes(
+      files, take(paths.wal(0, *head)), drive);
+    take(
+      co_await drive.lifecycle(files.create_directories(
+        take(paths.spares(0, local_spare_kind::wal)))));
+    take(
+      co_await drive.lifecycle(files.rename(
+        take(paths.wal(0, *head)),
+        spare,
+        runtime::file_rename_policy::no_replace)));
+    co_await store_contract::write_bytes(files, control, made, drive);
+
+    const auto began = co_await life();
+    take(began.failure.outcome());
+    require(
+      began.state == engine_state::ready && !began.restarted,
+      "a store whose only WAL file is a spare was refused or restarted");
+    require(
+      co_await store_contract::read_all_bytes(files, spare, drive) == kept,
+      "a start changed a spare");
+    // Restart's inspection takes a store that keeps spares as it is.
+    const auto inspected = take(
+      co_await drive.lifecycle(inspect_local_recovery(
+        files, owner, devices, budget, store_contract::limits(), work)));
+    require(
+      inspected.inspected == 1
+        && inspected.verdict == recovery_store_verdict::ready,
+      "a store that keeps spares did not pass restart's inspection");
+}
+
+// A segment prepared and never activated is listed with no origin. A
+// restart takes it in as prepared, and it is activated at the origin its
+// owner then gives and takes appends. Listed so again once it was written,
+// as though its activation record was lost, it is a conflict: the shard
+// stays recovering and nothing is changed.
+template<
+  runtime::monotonic_clock Clock,
+  typename Backend,
+  typename Owner,
+  typename Driver,
+  typename Timer>
+seastar::future<> prepared_restarted(
+  Backend& files,
+  Owner& owner,
+  const local_device_spec& spec,
+  workload_budget& budget,
+  workload_budget& reserve,
+  Driver drive,
+  Timer& timer) {
+    using engine_type = local_engine<Backend, Owner, Clock>;
+    seastar::abort_source abort;
+    codec::cooperative_work work{codec::limits::defaults(), abort};
+    co_await installation_contract::bootstrap(
+      files, owner, spec, budget, work, drive);
+    const std::array devices{spec};
+    const auto a = appends::context(1);
+    const auto share = [](engine_type& engine) {
+        const std::array pools{
+          device_pool_share{true, false, byte_count{1_GiB}}};
+        engine.placement()->sampled(pools, Clock::now());
+    };
+    auto prepared = listed(1);
+    prepared.logical_origin.reset();
+    const std::array catalog{prepared};
+    // One life of the shard: started on `catalogued`, then `body`, then
+    // stopped.
+    const auto life = [&](
+                        std::span<const recovery_catalog_entry> catalogued,
+                        auto body) -> seastar::future<> {
+        lifecycle::told heard;
+        auto engine = take(
+          engine_type::make(
+            {files, owner, devices, spec, 0, budget, budget, reserve, budget},
+            configuration()));
+        runtime::first_failure failed;
+        try {
+            const auto began = co_await drive.lifecycle(
+              engine->start(timer, catalogued, {heard.sink(), {}, {}}));
+            take(began.failure.outcome());
+            co_await body(*engine, began);
+        } catch (...) {
+            failed.observe(std::current_exception());
+        }
+        failed.observe(co_await drive.lifecycle(engine->stop()));
+        take(failed.outcome());
+    };
+
+    co_await life(
+      {}, [&](engine_type& engine, const engine_start&) -> seastar::future<> {
+          share(engine);
+          take(
+            co_await drive.lifecycle(
+              engine.table()->prepare(lifecycle::creation(spec, 1), work)));
+          require(
+            engine.table()->life(a) == segment_life::prepared,
+            "a prepared segment was not held as prepared");
+      });
+    co_await life(
+      catalog,
+      [&](engine_type& engine, const engine_start& began) -> seastar::future<> {
+          require(
+            began.state == engine_state::ready && began.prepared == 1
+              && began.conflicts == 0
+              && engine.table()->life(a) == segment_life::prepared,
+            "a restart did not take in a segment prepared and never "
+            "activated");
+          share(engine);
+          const auto target = take(
+            co_await drive.lifecycle(engine.table()->activate(
+              a, {.logical_origin = appends::segment_origin()}, work)));
+          co_await lifecycle::append_one<Clock>(
+            *engine.append(), target, 100, 1, budget, work, drive, timer);
+      });
+    co_await life(
+      catalog,
+      [&](engine_type&, const engine_start& began) -> seastar::future<> {
+          require(
+            began.state == engine_state::recovering && began.prepared == 1
+              && began.conflicts == 1,
+            "a segment listed as never activated that was written was taken "
+            "in as prepared");
+          co_return;
+      });
+}
+
+// A shard whose appends' budget holds fewer writable segments than it is
+// configured for takes as many as the budget holds, and reports that many:
+// each of them can be made, and one more is refused as over the bound.
+template<
+  runtime::monotonic_clock Clock,
+  typename Backend,
+  typename Owner,
+  typename Driver,
+  typename Timer>
+seastar::future<> derived_segments(
+  Backend& files,
+  Owner& owner,
+  const local_device_spec& spec,
+  workload_budget& budget,
+  workload_budget& reserve,
+  Driver drive,
+  Timer& timer) {
+    using engine_type = local_engine<Backend, Owner, Clock>;
+    seastar::abort_source abort;
+    codec::cooperative_work work{codec::limits::defaults(), abort};
+    co_await installation_contract::bootstrap(
+      files, owner, spec, budget, work, drive);
+    const std::array devices{spec};
+    auto config = configuration();
+    config.table.maximum_writable = 64;
+    // The handle credits left after the WAL's, every seal slot's and each
+    // creation's, at an idle segment's for each.
+    const auto credits
+      = (budget.limits().handles - config.reserved_append_handles
+         - config.table.maximum_seals * segment_seal_handles
+         - config.table.maximum_creations * segment_creation_handles)
+        / segment_writer_handles(config.writer);
+    lifecycle::told heard;
+    auto engine = take(
+      engine_type::make(
+        {files, owner, devices, spec, 0, budget, budget, reserve, budget},
+        config));
+    runtime::first_failure failed;
+    try {
+        const auto began = co_await drive.lifecycle(
+          engine->start(timer, {}, {heard.sink(), {}, {}}));
+        take(began.failure.outcome());
+        require(
+          began.state == engine_state::ready && began.segments != 0
+            && began.segments <= credits && began.segments < 64,
+          "a shard did not take the writable segments its budget holds");
+        const std::array pools{
+          device_pool_share{true, false, byte_count{1_GiB}}};
+        engine->placement()->sampled(pools, Clock::now());
+        for (std::uint32_t generation = 1; generation <= began.segments;
+             ++generation)
+            static_cast<void>(take(
+              co_await drive.lifecycle(engine->table()->create(
+                lifecycle::creation(spec, generation), work))));
+        const auto over = co_await drive.lifecycle(engine->table()->create(
+          lifecycle::creation(spec, began.segments + 1), work));
+        require(
+          !over && over.error().code() == errc::queue_full,
+          "a shard made more writable segments than it reported");
+    } catch (...) {
+        failed.observe(std::current_exception());
+    }
+    failed.observe(co_await drive.lifecycle(engine->stop()));
+    take(failed.outcome());
+}
+
+// A shard at its default width. It takes the 1,024 writable segments it is
+// configured for, makes them and 1,024 more prepared, appends to each and
+// stops cleanly, its checkpoint pinning every one. Started again on a
+// catalog that lists them all, it takes each in as recovered or prepared.
+// A catalog one longer than a restart reads is refused before anything is
+// read.
+template<
+  runtime::monotonic_clock Clock,
+  typename Backend,
+  typename Owner,
+  typename Driver,
+  typename Timer>
+seastar::future<> wide_shard(
+  Backend& files,
+  Owner& owner,
+  const local_device_spec& spec,
+  workload_budget& budget,
+  workload_budget& reserve,
+  Driver drive,
+  Timer& timer) {
+    using engine_type = local_engine<Backend, Owner, Clock>;
+    constexpr std::uint32_t width = 1024;
+    seastar::abort_source abort;
+    codec::cooperative_work work{codec::limits::defaults(), abort};
+    co_await installation_contract::bootstrap(
+      files, owner, spec, budget, work, drive);
+    const std::array devices{spec};
+    auto config = configuration();
+    config.table.maximum_writable = width;
+    config.table.maximum_prepared = width;
+    config.append.maximum_segments = width;
+    // Room on the device for every segment's whole bound. A share is
+    // trusted for a few seconds, and making 2,048 segments takes longer:
+    // it is handed before each creation, as the process's sampler keeps it
+    // fresh.
+    const auto share = [](engine_type& engine) {
+        const std::array pools{
+          device_pool_share{true, false, byte_count{std::uint64_t{1} << 50U}}};
+        engine.placement()->sampled(pools, Clock::now());
+    };
+    // One life of the shard: started on `catalogued`, then `body`, which
+    // judges the start, then stopped.
+    const auto life = [&](
+                        std::span<const recovery_catalog_entry> catalogued,
+                        auto body) -> seastar::future<> {
+        lifecycle::told heard;
+        auto engine = take(
+          engine_type::make(
+            {files, owner, devices, spec, 0, budget, budget, reserve, budget},
+            config));
+        runtime::first_failure failed;
+        try {
+            const auto began = co_await drive.lifecycle(
+              engine->start(timer, catalogued, {heard.sink(), {}, {}}));
+            co_await body(*engine, began);
+        } catch (...) {
+            failed.observe(std::current_exception());
+        }
+        failed.observe(co_await drive.lifecycle(engine->stop()));
+        take(failed.outcome());
+    };
+
+    co_await life(
+      {},
+      [&](engine_type& engine, const engine_start& began) -> seastar::future<> {
+          take(began.failure.outcome());
+          require(
+            began.state == engine_state::ready && began.segments == width,
+            "a shard did not take the writable segments it is configured "
+            "for");
+          for (std::uint32_t generation = 1; generation <= width;
+               ++generation) {
+              share(engine);
+              const auto target = take(
+                co_await drive.lifecycle(engine.table()->create(
+                  lifecycle::creation(spec, generation), work)));
+              co_await lifecycle::append_one<Clock>(
+                *engine.append(),
+                target,
+                100,
+                generation,
+                budget,
+                work,
+                drive,
+                timer);
+          }
+          for (std::uint32_t generation = width + 1; generation <= 2 * width;
+               ++generation) {
+              share(engine);
+              take(
+                co_await drive.lifecycle(engine.table()->prepare(
+                  lifecycle::creation(spec, generation), work)));
+          }
+      });
+
+    std::vector<recovery_catalog_entry> catalog;
+    catalog.reserve(maximum_recovery_catalog + 1);
+    for (std::uint32_t generation = 1; generation <= width; ++generation)
+        catalog.push_back(listed(generation));
+    for (std::uint32_t generation = width + 1; generation <= 2 * width;
+         ++generation) {
+        auto prepared = listed(generation);
+        prepared.logical_origin.reset();
+        catalog.push_back(std::move(prepared));
+    }
+    co_await life(
+      catalog,
+      [&](engine_type&, const engine_start& began) -> seastar::future<> {
+          take(began.failure.outcome());
+          require(
+            began.state == engine_state::ready && began.restarted
+              && began.recovered == width && began.unadopted == 0
+              && began.prepared == width && began.conflicts == 0,
+            "a restart did not take in every segment its catalog lists");
+          co_return;
+      });
+
+    while (catalog.size() <= maximum_recovery_catalog)
+        catalog.push_back(listed(catalog.size() + 1));
+    co_await life(
+      catalog,
+      [&](engine_type&, const engine_start& began) -> seastar::future<> {
+          const auto refused = began.failure.outcome();
+          require(
+            began.state != engine_state::ready && !refused
+              && refused.error().code() == errc::out_of_range,
+            "a catalog longer than one restart reads was not refused");
+          co_return;
+      });
+}
+
+// The append owner's own placement, as a shard runs it. A small request's
+// portion is placed in the WAL and held in its segment's run: its WAL
+// barrier publishes it while the segment holds nothing of it, and a session
+// is given it all the same. A clean stop syncs the run, so the next start
+// finds every reported block where its receipt said, and writes nothing.
+template<
+  runtime::monotonic_clock Clock,
+  typename Backend,
+  typename Owner,
+  typename Driver,
+  typename Timer>
+seastar::future<> placed_by_default(
+  Backend& files,
+  Owner& owner,
+  const local_device_spec& spec,
+  workload_budget& budget,
+  workload_budget& reserve,
+  Driver drive,
+  Timer& timer) {
+    using engine_type = local_engine<Backend, Owner, Clock>;
+    seastar::abort_source abort;
+    codec::cooperative_work work{codec::limits::defaults(), abort};
+    co_await installation_contract::bootstrap(
+      files, owner, spec, budget, work, drive);
+    const std::array devices{spec};
+    const auto a = appends::context(1);
+    auto config = configuration();
+    const local_append_config product;
+    config.append.segment_placement_bytes = product.segment_placement_bytes;
+    config.append.held_run_bytes = product.held_run_bytes;
+    const auto make = [&] {
+        return take(
+          engine_type::make(
+            {files, owner, devices, spec, 0, budget, budget, reserve, budget},
+            config));
+    };
+    std::vector<std::string> wires;
+    std::vector<local_append_receipt> receipts;
+    {
+        lifecycle::told heard;
+        auto engine = make();
+        runtime::first_failure failed;
+        try {
+            const auto began = co_await drive.lifecycle(
+              engine->start(timer, {}, {heard.sink(), {}, {}}));
+            take(began.failure.outcome());
+            const std::array pools{
+              device_pool_share{true, false, byte_count{1_GiB}}};
+            engine->placement()->sampled(pools, Clock::now());
+            auto& table = *engine->table();
+            auto& append = *engine->append();
+            const auto target = take(
+              co_await drive.lifecycle(
+                table.create(lifecycle::creation(spec, 1), work)));
+            for (std::uint64_t logical = 100; logical != 104; ++logical) {
+                wires.push_back(appends::child_wire(logical, 1));
+                const auto outcome = co_await appends::settle(
+                  append.append(
+                    target,
+                    co_await appends::request(wires.back(), budget, work),
+                    work),
+                  drive);
+                const auto& receipt = appends::durable(outcome);
+                require(
+                  receipt.placement == local_append_placement::wal
+                    && receipt.wal && !receipt.segment
+                    && !receipt.boundary.footer(),
+                  "a small request was not placed in the WAL and held");
+                receipts.push_back(receipt);
+            }
+            const auto counted = append.statistics();
+            require(
+              counted.held_portions == 4 && counted.held_runs == 1
+                && counted.held_bytes != 0 && counted.barriers == 0
+                && counted.unsynced_bytes != 0,
+              "the requests' run was not held unwritten");
+            auto session = take(
+              co_await drive.lifecycle(table.open_session(
+                a, lifecycle::sight(1U << 20U), budget, work)));
+            const auto read = co_await lifecycle::read_from(
+              session,
+              {model::range_logical_end{100}, std::nullopt},
+              byte_count{1_MiB},
+              drive);
+            require(
+              read.batches.size() == wires.size(),
+              "a session was not given the held requests");
+            for (std::size_t i = 0; i != wires.size(); ++i)
+                require(
+                  read.batches[i].logical.begin().value() == 100 + i
+                    && flat(read.batches[i].bytes) == wires[i],
+                  "a session was given a held request other than its own");
+        } catch (...) {
+            failed.observe(std::current_exception());
+        }
+        failed.observe(co_await drive.lifecycle(engine->stop()));
+        take(failed.outcome());
+    }
+    lifecycle::told heard;
+    auto engine = make();
+    runtime::first_failure failed;
+    try {
+        const std::array catalog{listed(1)};
+        const auto began = co_await drive.lifecycle(
+          engine->start(timer, catalog, {heard.sink(), {}, {}}));
+        take(began.failure.outcome());
+        require(
+          began.state == engine_state::ready && began.recovered == 1
+            && began.materialized == 0 && began.candidates == 0,
+          "a clean stop left its held run for the start to write");
+        const auto data = co_await appends::read_segment(files, spec, 1, drive);
+        for (std::size_t i = 0; i != receipts.size(); ++i) {
+            const auto& block = receipts[i].block;
+            const auto placed = appends::block_at(
+              wires[i], 1, block, 8192, receipts[i].stamps);
+            require(
+              data.size()
+                  >= block.records.bytes().begin().value() + placed.size()
+                && data.substr(
+                     block.records.bytes().begin().value(), placed.size())
+                     == placed,
+              "a reported request's block is not where its receipt said");
+        }
+    } catch (...) {
+        failed.observe(std::current_exception());
+    }
+    failed.observe(co_await drive.lifecycle(engine->stop()));
+    take(failed.outcome());
+}
+
+// How a WAL head is damaged before the start that follows a crash.
+enum class head_damage : std::uint8_t {
+    // Four bytes of the oldest request's PREPARE zeroed.
+    zeroed,
+    // One bit of it flipped.
+    flipped,
+    // A unit of bytes that begin no PREPARE, after the newest one.
+    junk,
+    // A PREPARE's first bytes after the newest one, its header cut short:
+    // a write the crash tore.
+    torn_header,
+    // A PREPARE cut inside its body after the newest one.
+    torn_body,
+};
+
+// Small requests are placed in the WAL and held in their segment's run,
+// each reported durable by its WAL barrier, so each later group's PREPARE
+// stamps the WAL as certified past the earlier ones. `crash` crashes the
+// device and stops the shard as the crash leaves it: the WAL keeps the
+// PREPAREs and the run is lost. Damage the later stamps prove certified is
+// corruption: the start reads everything, changes nothing and stays
+// recovering. Damage after the newest PREPARE is a tail no stamp certifies:
+// the start writes every reported request into its segment from the WAL
+// and flushes it before it serves, is ready and takes appends, and the
+// start after that finds nothing more to write.
+template<
+  runtime::monotonic_clock Clock,
+  typename Backend,
+  typename Owner,
+  typename Driver,
+  typename Timer,
+  typename Crash>
+seastar::future<> damaged_head(
+  Backend& files,
+  Owner& owner,
+  const local_device_spec& spec,
+  workload_budget& budget,
+  workload_budget& reserve,
+  Driver drive,
+  Timer& timer,
+  head_damage damage,
+  Crash crash) {
+    using engine_type = local_engine<Backend, Owner, Clock>;
+    seastar::abort_source abort;
+    codec::cooperative_work work{codec::limits::defaults(), abort};
+    co_await installation_contract::bootstrap(
+      files, owner, spec, budget, work, drive);
+    const std::array devices{spec};
+    auto config = configuration();
+    config.append.segment_placement_bytes = byte_count{
+      std::numeric_limits<std::uint64_t>::max()};
+    config.append.held_run_bytes = byte_count{128_KiB};
+    const auto make = [&] {
+        return take(
+          engine_type::make(
+            {files, owner, devices, spec, 0, budget, budget, reserve, budget},
+            config));
+    };
+    const auto share = [](engine_type& engine) {
+        const std::array pools{
+          device_pool_share{true, false, byte_count{1_GiB}}};
+        engine.placement()->sampled(pools, Clock::now());
+    };
+    std::vector<std::string> wires;
+    std::vector<local_append_receipt> receipts;
+    std::optional<runtime::file_path> head;
+    {
+        lifecycle::told heard;
+        auto engine = make();
+        const auto began = co_await drive.lifecycle(
+          engine->start(timer, {}, {heard.sink(), {}, {}}));
+        take(began.failure.outcome());
+        share(*engine);
+        const auto target = take(
+          co_await drive.lifecycle(
+            engine->table()->create(lifecycle::creation(spec, 1), work)));
+        for (std::uint64_t logical = 100; logical != 104; ++logical) {
+            wires.push_back(appends::child_wire(logical, 1));
+            const auto outcome = co_await appends::settle(
+              engine->append()->append(
+                target,
+                co_await appends::request(wires.back(), budget, work),
+                work),
+              drive);
+            receipts.push_back(appends::durable(outcome));
+            require(
+              receipts.back().wal && !receipts.back().segment,
+              "a request was not reported by its WAL barrier alone");
+        }
+        head = take(take(local_paths::make(spec.root))
+                      .wal(0, take(engine->append()->wal_end()).incarnation()));
+        co_await crash(*engine);
+    }
+    // The oldest request's PREPARE begins where the head's content does,
+    // one unit in; past its envelope's prefix lies its body.
+    constexpr std::size_t oldest = 8192 + 100;
+    auto stored = co_await store_contract::read_all_bytes(files, *head, drive);
+    const auto unit = [](std::string bytes) {
+        bytes.resize((bytes.size() + 8191) / 8192 * 8192, '\0');
+        return bytes;
+    };
+    const auto prepare = stored.substr(8192, 8192);
+    switch (damage) {
+    case head_damage::zeroed:
+        stored.replace(oldest, 4, 4, '\0');
+        break;
+    case head_damage::flipped:
+        stored[oldest] = static_cast<char>(stored[oldest] ^ 1);
+        break;
+    case head_damage::junk:
+        stored += std::string(8192, 'J');
+        break;
+    case head_damage::torn_header:
+        stored += unit(prepare.substr(0, 16));
+        break;
+    case head_damage::torn_body:
+        stored += unit(prepare.substr(0, 300));
+        break;
+    }
+    co_await store_contract::write_bytes(files, *head, stored, drive);
+    const bool certified = damage == head_damage::zeroed
+                           || damage == head_damage::flipped;
+    const auto data = appends::segment_path(spec, 1);
+    const auto before = co_await store_contract::read_all_bytes(
+      files, data, drive);
+    // One life on what the last left: started with the segments listed,
+    // then `body`, then stopped.
+    const auto life = [&](
+                        std::span<const recovery_catalog_entry> catalog,
+                        auto body) -> seastar::future<> {
+        lifecycle::told heard;
+        auto engine = make();
+        runtime::first_failure failed;
+        try {
+            const auto began = co_await drive.lifecycle(
+              engine->start(timer, catalog, {heard.sink(), {}, {}}));
+            co_await body(*engine, began);
+        } catch (...) {
+            failed.observe(std::current_exception());
+        }
+        failed.observe(co_await drive.lifecycle(engine->stop()));
+        take(failed.outcome());
+    };
+    const std::array first{listed(1)};
+    co_await life(
+      first,
+      [&](engine_type& engine, const engine_start& began) -> seastar::future<> {
+          if (certified) {
+              require(
+                began.state == engine_state::recovering
+                  && (co_await store_contract::read_all_bytes(
+                       files, *head, drive))
+                       == stored
+                  && (co_await store_contract::read_all_bytes(
+                       files, data, drive))
+                       == before,
+                "a start went past damage the WAL proves certified, or "
+                "changed the store");
+              co_return;
+          }
+          take(began.failure.outcome());
+          require(
+            began.state == engine_state::ready && began.recovered == 1
+              && began.materialized == receipts.size() && began.candidates == 0,
+            "a start did not write the reported requests the WAL held");
+          const auto written = co_await store_contract::read_all_bytes(
+            files, data, drive);
+          for (std::size_t i = 0; i != receipts.size(); ++i) {
+              const auto& block = receipts[i].block;
+              const auto placed = appends::block_at(
+                wires[i], 1, block, 8192, receipts[i].stamps);
+              const auto at = block.records.bytes().begin().value();
+              require(
+                written.size() >= at + placed.size()
+                  && written.substr(at, placed.size()) == placed,
+                "a reported request was not written where its receipt said");
+          }
+          share(engine);
+          const auto target = take(
+            co_await drive.lifecycle(
+              engine.table()->create(lifecycle::creation(spec, 2), work)));
+          co_await lifecycle::append_one<Clock>(
+            *engine.append(), target, 100, 2, budget, work, drive, timer);
+      });
+    if (certified) co_return;
+    const std::array both{listed(1), listed(2)};
+    co_await life(
+      both, [&](engine_type&, const engine_start& began) -> seastar::future<> {
+          take(began.failure.outcome());
+          require(
+            began.state == engine_state::ready && began.recovered == 2
+              && began.materialized == 0,
+            "a start wrote again what the start before it had written");
+          co_return;
+      });
+}
+
+// Which block of a segment is damaged before the start after a crash.
+enum class block_damage : std::uint8_t {
+    // None: the start writes what only the WAL held.
+    none,
+    // The first block, placed in the WAL: its PREPARE writes it again.
+    wal_placed,
+    // The second, placed in its segment alone: nothing else holds it.
+    segment_placed,
+};
+
+// One segment takes a small request, a large one and a small one, each
+// reported before the next is offered: S1 is placed in the WAL and held,
+// L2 in the segment alone, which writes S1's run before it and makes both
+// durable there, and S3 in the WAL again, its PREPARE stamping the segment
+// certified past L2. `crash` crashes the device and stops the shard as the
+// crash leaves it, so S3's run is lost. Undamaged, the start writes S3 from
+// its PREPARE. With S1 damaged, it writes S1 again from its PREPARE: a
+// repair. With L2 damaged, S3's stamp proves the damage certified and no
+// copy is left to write: the start reads everything, changes nothing and
+// stays recovering.
+template<
+  runtime::monotonic_clock Clock,
+  typename Backend,
+  typename Owner,
+  typename Driver,
+  typename Timer,
+  typename Crash>
+seastar::future<> damaged_certified_block(
+  Backend& files,
+  Owner& owner,
+  const local_device_spec& spec,
+  workload_budget& budget,
+  workload_budget& reserve,
+  Driver drive,
+  Timer& timer,
+  block_damage damage,
+  Crash crash) {
+    using engine_type = local_engine<Backend, Owner, Clock>;
+    seastar::abort_source abort;
+    codec::cooperative_work work{codec::limits::defaults(), abort};
+    co_await installation_contract::bootstrap(
+      files, owner, spec, budget, work, drive);
+    const std::array devices{spec};
+    auto config = configuration();
+    config.append.segment_placement_bytes = appends::middle_placement;
+    config.append.held_run_bytes = byte_count{128_KiB};
+    const auto make = [&] {
+        return take(
+          engine_type::make(
+            {files, owner, devices, spec, 0, budget, budget, reserve, budget},
+            config));
+    };
+    const std::array wires{
+      appends::child_wire(100, 1),
+      appends::valued_wire(101, appends::large_value, 1),
+      appends::child_wire(102, 1)};
+    std::vector<local_append_receipt> receipts;
+    {
+        lifecycle::told heard;
+        auto engine = make();
+        const auto began = co_await drive.lifecycle(
+          engine->start(timer, {}, {heard.sink(), {}, {}}));
+        take(began.failure.outcome());
+        const std::array pools{
+          device_pool_share{true, false, byte_count{1_GiB}}};
+        engine->placement()->sampled(pools, Clock::now());
+        const auto target = take(
+          co_await drive.lifecycle(
+            engine->table()->create(lifecycle::creation(spec, 1), work)));
+        for (const auto& wire : wires) {
+            const auto outcome = co_await appends::settle(
+              engine->append()->append(
+                target,
+                co_await appends::request(
+                  wire, budget, work, appends::large_width),
+                work),
+              drive);
+            receipts.push_back(appends::durable(outcome));
+        }
+        require(
+          receipts[0].placement == local_append_placement::wal
+            && receipts[1].placement == local_append_placement::segment
+            && receipts[2].placement == local_append_placement::wal
+            && receipts[2].stamps.certified_end
+                 >= receipts[1].boundary.end().bytes,
+          "the requests were not placed by size, or the last group's stamp "
+          "does not certify the large one");
+        co_await crash(*engine);
+    }
+    const auto data = appends::segment_path(spec, 1);
+    auto stored = co_await store_contract::read_all_bytes(files, data, drive);
+    if (damage != block_damage::none) {
+        const auto& block
+          = receipts[damage == block_damage::wal_placed ? 0 : 1].block;
+        // A byte of the child, inside the block's checksummed body.
+        const auto at = block.records.bytes().begin().value() + 32 + 144 + 8;
+        require(at < stored.size(), "the damaged block was never written");
+        stored[at] = static_cast<char>(stored[at] ^ 1);
+        co_await store_contract::write_bytes(files, data, stored, drive);
+    }
+    lifecycle::told heard;
+    auto engine = make();
+    runtime::first_failure failed;
+    try {
+        const std::array catalog{listed(1)};
+        const auto began = co_await drive.lifecycle(
+          engine->start(timer, catalog, {heard.sink(), {}, {}}));
+        if (damage == block_damage::segment_placed) {
+            require(
+              began.state == engine_state::recovering
+                && (co_await store_contract::read_all_bytes(files, data, drive))
+                     == stored,
+              "a start went past certified damage nothing could repair, or "
+              "changed the segment");
+        } else {
+            take(began.failure.outcome());
+            require(
+              began.state == engine_state::ready && began.recovered == 1
+                && began.materialized != 0
+                && began.repaired
+                     == (damage == block_damage::wal_placed ? 1U : 0U),
+              "a start did not write what the WAL held, or repaired what "
+              "was intact");
+            const auto written = co_await store_contract::read_all_bytes(
+              files, data, drive);
+            for (std::size_t i = 0; i != receipts.size(); ++i) {
+                const auto& block = receipts[i].block;
+                const auto placed = appends::block_at(
+                  wires[i], 1, block, 8192, receipts[i].stamps);
+                const auto at = block.records.bytes().begin().value();
+                require(
+                  written.size() >= at + placed.size()
+                    && written.substr(at, placed.size()) == placed,
+                  "a reported request is not where its receipt said");
+            }
+        }
+    } catch (...) {
+        failed.observe(std::current_exception());
+    }
+    failed.observe(co_await drive.lifecycle(engine->stop()));
+    take(failed.outcome());
+}
+
 // One crash history of a removal. A store takes a segment, seals it and lets
 // its owner go; the segment's removal is then cut after `cut` scheduler
 // events and the device crashes with the removal wherever it stood: before,
@@ -411,8 +1281,15 @@ seastar::future<bool> removal_crash(
               co_await drive.lifecycle(
                 engine->table()->create(lifecycle::creation(spec, 1), work)));
             for (const std::uint64_t logical : {100U, 101U})
-                co_await lifecycle::append_one(
-                  *engine->append(), target, logical, 1, budget, work, drive);
+                co_await lifecycle::append_one<Clock>(
+                  *engine->append(),
+                  target,
+                  logical,
+                  1,
+                  budget,
+                  work,
+                  drive,
+                  timer);
             const auto sealed = co_await drive.lifecycle(
               engine->table()->seal(a));
             take(sealed.failure.outcome());

@@ -176,7 +176,7 @@ writer_config(const shape& selected, byte_count preallocation = {}) {
     result.preallocation_bytes = preallocation;
     result.policy = policy(selected);
     result.maximum_groups = selected.window;
-    result.admission.working_bytes = selected.payload_bytes >= 4_MiB
+    result.admission.working_bytes = selected.payload_bytes >= 1_MiB
                                        ? working_bytes
                                        : byte_count{1_MiB};
     return result;
@@ -197,6 +197,7 @@ seastar::future<std::unique_ptr<writer_type>> create_writer(
         spec,
         0,
         input.descriptor,
+        input.history.logical_origin,
         resources,
         writer_config(selected, preallocation)));
     runtime::first_failure failed;
@@ -250,7 +251,8 @@ seastar::future<segment_frozen_group> freeze_children(
     for (auto& batch : batches) {
         auto held = take(resources.try_reserve_buffer(batch.bytes()));
         children.push_back(take(
-          admitted_wal_batch::make(std::move(batch), std::move(held), charge)));
+          admitted_wal_batch::make(
+            std::move(batch), std::move(held), runtime::wall_time{1}, charge)));
     }
     co_return take(
       co_await writer.freeze_group(
@@ -369,14 +371,17 @@ seastar::future<> seal_writer(
   const workload_reservation& fixture,
   codec::cooperative_work& work,
   measurement& observed) {
+    segment_seal_grants grants;
+    take(grants.fill(resources, writer.config().metadata));
     const auto before = resources.snapshot();
     if (selected.pressure) resources.close_admission();
     std::uint32_t calls = 0;
     const auto sealed = co_await writer.seal(
       completed_snapshot{fixture.share(), std::move(input.completed), &calls},
       selected.batches(),
-      0,
-      work);
+      work,
+      segment_no_index{},
+      &grants);
     take(sealed.failure.outcome());
     require(
       sealed.extent && sealed.boundary && sealed.retry
@@ -1258,6 +1263,15 @@ SEGMENT_CASE(singleton, .payload_bytes = 128_KiB, .groups = 8, .blocks = 1)
 SEGMENT_CASE(final_flush, .groups = 1, .blocks = 8)
 SEGMENT_CASE(footers32, .groups = 32, .blocks = 1, .window = 4)
 SEGMENT_CASE(footers128, .groups = 128, .blocks = 1, .window = 4)
+// One batch to a write: each group is its block and the footer that pads it,
+// so the device bytes per payload byte are the packed layout's at 1 KiB,
+// 16 KiB and 1 MiB.
+SEGMENT_CASE(
+  p1k, .payload_bytes = 1_KiB, .exact = true, .groups = 8, .blocks = 1)
+SEGMENT_CASE(
+  p16k, .payload_bytes = 16_KiB, .exact = true, .groups = 8, .blocks = 1)
+SEGMENT_CASE(
+  p1m, .payload_bytes = 1_MiB, .exact = true, .groups = 2, .blocks = 1)
 #undef SEGMENT_CASE
 
 #define SEGMENT_LIFECYCLE(Name, ...)                                           \

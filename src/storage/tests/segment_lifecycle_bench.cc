@@ -90,8 +90,8 @@ struct settings final {
     // than one index page of 1,024. About two pages is what a full 64-MiB
     // segment holds at the table's default stride of 32 KiB.
     std::uint32_t seal_blocks{2048};
-    // Data bytes the segment a roll leaves may hold: room for about a dozen
-    // one-request groups of 8-KiB blocks.
+    // Data bytes the segment a roll leaves may hold: room for a few dozen
+    // requests of 8-KiB blocks.
     std::uint64_t roll_bytes{256_KiB};
     // Requests of the segment a removal takes away. Each is an 8-KiB block,
     // so its data region holds two 4-KiB file system blocks for each of
@@ -346,8 +346,30 @@ struct offered final {
     local_append_acceptance decided;
     local_append_outcome outcome;
 };
-// One request of `generation` at `logical`, offered and joined, with a work
-// account of its own: the shared fixture's append, keeping the acceptance.
+// The block of each request the roll and removal cases make, in bytes: their
+// settings count blocks of this size, which no group or held run it shares
+// changes.
+constexpr std::size_t request_block = 8_KiB;
+// One request of `generation` at `logical` whose block is `block` bytes
+// long, or the smallest request when `block` is zero.
+seastar::future<local_append_request> request_of(
+  support::bench_store& store,
+  std::uint64_t logical,
+  std::uint64_t generation,
+  std::size_t block,
+  codec::cooperative_work& work) {
+    if (block == 0)
+        co_return co_await appends::request(
+          appends::child_wire(logical, generation), store.appends, work);
+    co_return co_await appends::request(
+      lifecycle::sized_wire(logical, block, generation),
+      store.appends,
+      work,
+      appends::large_width);
+}
+// One request of `generation` at `logical` with a block of request_block
+// bytes, offered and joined, with a work account of its own: the shared
+// fixture's append, keeping the acceptance.
 seastar::future<offered> offer(
   support::bench_store& store,
   local_append_target target,
@@ -358,8 +380,7 @@ seastar::future<offered> offer(
     codec::cooperative_work work{store.config.policy, store.abort};
     auto stages = owner->append(
       target,
-      co_await appends::request(
-        appends::child_wire(logical, generation), store.appends, work),
+      co_await request_of(store, logical, generation, request_block, work),
       work);
     offered out;
     out.decided = co_await std::move(stages.accepted);
@@ -393,7 +414,8 @@ settled(local_append_stages& stages, runtime::first_failure& failed) {
 constexpr std::uint32_t fill_window = 32;
 
 // Appends `count` one-record requests of `generation` to `target` from the
-// segment's logical origin, before any timed region. Each window's requests
+// segment's logical origin, before any timed region, each with a block of
+// `block` bytes, or the smallest when it is zero. Each window's requests
 // are made first and offered in one step, so they take that order, then
 // joined; each has a work account of its own, kept until its result. Every
 // one must be durable.
@@ -401,10 +423,11 @@ seastar::future<> fill(
   support::bench_store& store,
   local_append_target target,
   std::uint64_t generation,
-  std::uint32_t count) {
+  std::uint32_t count,
+  std::size_t block = 0) {
     auto* owner = store.engine->append();
     require(owner != nullptr, "the shard is not ready");
-    const auto origin = segments::descriptor().logical_origin.value();
+    const auto origin = segments::logical_origin().value();
     runtime::first_failure failed;
     std::uint32_t done = 0, made_durable = 0;
     while (done != count && !failed.failed()) {
@@ -415,10 +438,8 @@ seastar::future<> fill(
         for (std::uint32_t i = 0; i != n; ++i) {
             auto& work = works.emplace_back(store.config.policy, store.abort);
             inputs.push_back(
-              co_await appends::request(
-                appends::child_wire(origin + done + i, generation),
-                store.appends,
-                work));
+              co_await request_of(
+                store, origin + done + i, generation, block, work));
         }
         std::vector<local_append_stages> stages;
         stages.reserve(n);
@@ -517,6 +538,7 @@ seastar::future<> write_blocks(
         store.devices.front(),
         0,
         descriptor,
+        segments::logical_origin(),
         store.appends,
         config));
     auto& writer = *out.writer;
@@ -530,7 +552,7 @@ seastar::future<> write_blocks(
             [&writer, &work] { return writer.create_new(work); }));
         take(writer.observe_blocks(out.index->observer()));
         const fixture::shape shape{.name = "seal"};
-        auto logical = descriptor.logical_origin;
+        auto logical = segments::logical_origin();
         std::uint64_t sequence = 0;
         std::uint32_t done = 0;
         while (done != blocks) {
@@ -571,7 +593,10 @@ seastar::future<> write_blocks(
                       store.appends.try_reserve_buffer(batch.bytes()));
                     children.push_back(take(
                       admitted_wal_batch::make(
-                        std::move(batch), std::move(backing), charge)));
+                        std::move(batch),
+                        std::move(backing),
+                        segments::child_append_time,
+                        charge)));
                 }
                 auto group = take(
                   co_await writer.freeze_group(
@@ -640,14 +665,12 @@ seastar::future<> writer_seal(
             outcome = co_await writer.seal(
               segments::completed_source{{}, {}, &calls},
               0,
-              chosen.seal_blocks,
               work,
               sparse_index_seal{out.index.get(), object});
         else
             outcome = co_await writer.seal(
               segments::completed_source{{}, {}, &calls},
               0,
-              chosen.seal_blocks,
               work,
               segment_no_index{});
         const auto took = timed.finish();
@@ -698,11 +721,9 @@ seastar::future<> table_seal(
     const auto context = appends::context(1);
     const auto target = take(co_await support::create(store, 1));
     co_await fill(store, target, 1, chosen.seal_blocks);
-    // What the WAL's rotations asked of the checkpoint owner, and a cut of
-    // the segment's completed retries that fell due, are done before the
-    // timed region, not inside it: a seal waits for a cut in flight.
+    // What the WAL's rotations asked of the checkpoint owner is done before
+    // the timed region, not inside it.
     static_cast<void>(take(co_await store.engine->checkpoint()->request()));
-    static_cast<void>(co_await table.cut_retries(context, false));
     timed_region timed{store.files};
     timed.begin();
     const auto sealed = co_await table.seal(context);
@@ -738,7 +759,7 @@ seastar::future<> roll(
     co_await started(store);
     auto& table = table_of(store);
     const auto first_context = appends::context(1);
-    const auto origin = segments::descriptor().logical_origin.value();
+    const auto origin = segments::logical_origin().value();
     const auto first = take(
       co_await create_bounded(store, 1, chosen.roll_bytes));
     std::optional<local_append_target> second;
@@ -749,7 +770,7 @@ seastar::future<> roll(
     bool refused = false;
     for (;;) {
         require(
-          taken <= chosen.roll_bytes / 4_KiB,
+          taken <= chosen.roll_bytes / request_block,
           "the first segment took more requests than its bound holds");
         if (ahead && taken != 0) {
             const auto room = take(table.left(first_context));
@@ -922,7 +943,7 @@ seastar::future<> removal(
     auto& table = table_of(store);
     const auto context = appends::context(1);
     const auto made = take(co_await support::create(store, 1));
-    co_await fill(store, made, 1, chosen.removal_requests);
+    co_await fill(store, made, 1, chosen.removal_requests, request_block);
     const auto sealed = co_await table.seal(context);
     take(sealed.failure.outcome());
     require(

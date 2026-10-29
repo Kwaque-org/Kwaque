@@ -27,8 +27,12 @@ struct native_driver final {
         return operation;
     }
 };
+// `handles` and `tasks` are the appends' handle credits and tasks: a case
+// that holds more segments, or more seal slots, than the others asks for
+// more.
 template<typename Func>
-seastar::future<> with_local_store(Func function) {
+seastar::future<> with_local_store(
+  Func function, std::uint32_t handles = 32, std::uint32_t tasks = 128) {
     auto config = resource::resource_config::from_total_memory(
                     byte_count{seastar::memory::stats().total_memory()})
                     .value();
@@ -41,8 +45,8 @@ seastar::future<> with_local_store(Func function) {
         co_await seastar::tmp_dir::do_with(
           runtime::testing::test_directory_template(),
           seastar::coroutine::lambda(
-            [&manager,
-             &function](seastar::tmp_dir& directory) -> seastar::future<> {
+            [&manager, &function, handles, tasks](
+              seastar::tmp_dir& directory) -> seastar::future<> {
                 const auto root = directory.get_path() / "store";
                 co_await seastar::recursive_touch_directory(root.string());
                 const auto status = co_await seastar::file_stat(
@@ -59,7 +63,9 @@ seastar::future<> with_local_store(Func function) {
                 storage::workload_budget budget{
                   manager.acquire_workload(
                     resource::workload_class::foreground_protocol),
-                  {.tasks = 128, .bytes = byte_count{48_MiB}, .handles = 32},
+                  {.tasks = tasks,
+                   .bytes = byte_count{48_MiB},
+                   .handles = handles},
                   bytes::testing::charge};
                 runtime::production::timer timer;
                 std::exception_ptr failure;
@@ -96,9 +102,42 @@ SEASTAR_TEST_CASE(local_append_native_independent_alignments) {
     });
 }
 
+SEASTAR_TEST_CASE(local_append_native_placement_by_size) {
+    co_await with_local_store([](auto&&... shared) {
+        return contract::placement_by_size<clock_type>(shared..., false);
+    });
+}
+
+// The same requests at three thresholds, each in a store of its own, with
+// nothing held and with a hold.
+SEASTAR_TEST_CASE(local_append_native_placement_ends) {
+    for (const auto hold : {byte_count{}, byte_count{64_KiB}})
+        co_await contract::placement_ends(
+          [hold](byte_count placement)
+            -> seastar::future<contract::placement_trace> {
+              contract::placement_trace trace;
+              co_await with_local_store(
+                [&trace, placement, hold](auto&&... shared) {
+                    return contract::placement_run<clock_type>(
+                             shared..., placement, hold)
+                      .then([&trace](contract::placement_trace run) {
+                          trace = std::move(run);
+                      });
+                });
+              co_return trace;
+          },
+          hold.value() != 0);
+}
+
 SEASTAR_TEST_CASE(local_append_native_occupancy_batching) {
     co_await with_local_store([](auto&&... shared) {
         return contract::occupancy_batching<clock_type>(shared..., false);
+    });
+}
+
+SEASTAR_TEST_CASE(local_append_native_full_group_starts_next) {
+    co_await with_local_store([](auto&&... shared) {
+        return contract::full_group_starts_next<clock_type>(shared...);
     });
 }
 
@@ -120,6 +159,26 @@ struct no_flush_count final {
         return std::nullopt;
     }
 };
+SEASTAR_TEST_CASE(local_append_native_held_until_synced) {
+    co_await with_local_store([](auto&&... shared) {
+        return contract::held_until_synced<clock_type>(
+          shared..., no_flush_count{});
+    });
+}
+
+SEASTAR_TEST_CASE(local_append_native_rotation_syncs) {
+    co_await with_local_store([](auto&&... shared) {
+        return contract::rotation_syncs<clock_type>(
+          shared..., no_flush_count{});
+    });
+}
+
+SEASTAR_TEST_CASE(local_append_native_pressure_releases_holds) {
+    co_await with_local_store([](auto&&... shared) {
+        return contract::pressure_releases_holds<clock_type>(shared...);
+    });
+}
+
 SEASTAR_TEST_CASE(local_recovered_successor_native) {
     co_await with_local_store([](auto&&... shared) {
         return storage::testing::recovery_successor_contract::
@@ -134,10 +193,13 @@ SEASTAR_TEST_CASE(local_recovery_repeated_restarts_native) {
     });
 }
 
+// At every placement and hold.
 SEASTAR_TEST_CASE(local_append_native_close_drains_accepted) {
-    co_await with_local_store([](auto&&... shared) {
-        return contract::close_drains_accepted<clock_type>(shared...);
-    });
+    for (const auto profile : contract::placement_profiles)
+        co_await with_local_store([profile](auto&&... shared) {
+            return contract::close_drains_accepted<clock_type>(
+              shared..., profile);
+        });
 }
 
 SEASTAR_TEST_CASE(segment_lifecycle_native_sealed_under_readers) {
@@ -178,6 +240,78 @@ SEASTAR_TEST_CASE(segment_lifecycle_native_age_reported) {
 SEASTAR_TEST_CASE(segment_lifecycle_native_created_ahead) {
     co_await with_local_store([](auto&&... shared) {
         return storage::testing::segment_lifecycle_contract::created_ahead<
+          clock_type>(shared...);
+    });
+}
+
+SEASTAR_TEST_CASE(segment_lifecycle_native_prepared_ahead) {
+    co_await with_local_store([](auto&&... shared) {
+        return storage::testing::segment_lifecycle_contract::prepared_ahead<
+          clock_type>(shared...);
+    });
+}
+
+SEASTAR_TEST_CASE(segment_lifecycle_native_recycled_on_removal) {
+    co_await with_local_store([](auto&&... shared) {
+        return storage::testing::segment_lifecycle_contract::
+          recycled_on_removal<clock_type>(shared...);
+    });
+}
+
+SEASTAR_TEST_CASE(segment_lifecycle_native_failure_kinds) {
+    co_await with_local_store([](auto&&... shared) {
+        return storage::testing::segment_lifecycle_contract::failure_kinds<
+          clock_type>(shared...);
+    });
+}
+
+SEASTAR_TEST_CASE(segment_lifecycle_native_sealed_in_slots) {
+    co_await with_local_store(
+      [](auto&&... shared) {
+          return storage::testing::segment_lifecycle_contract::sealed_in_slots<
+            clock_type>(shared...);
+      },
+      48);
+}
+
+SEASTAR_TEST_CASE(segment_lifecycle_native_running_seal_of_held) {
+    co_await with_local_store([](auto&&... shared) {
+        return storage::testing::segment_lifecycle_contract::
+          running_seal_of_held<clock_type>(
+            shared..., [](const runtime::file_path&) { return false; });
+    });
+}
+
+SEASTAR_TEST_CASE(segment_lifecycle_native_running_seal_without_room) {
+    co_await with_local_store([](auto&&... shared) {
+        return storage::testing::segment_lifecycle_contract::
+          running_seal_without_room<clock_type>(
+            shared..., [](const runtime::file_path&) { return false; });
+    });
+}
+
+// Sixty-four writable segments, each with the tasks and handle credits a
+// writable segment takes.
+SEASTAR_TEST_CASE(segment_lifecycle_native_writable_footprint) {
+    co_await with_local_store(
+      [](auto&&... shared) {
+          return storage::testing::segment_lifecycle_contract::
+            writable_footprint<clock_type>(shared...);
+      },
+      32 + 4 * 64,
+      128 + 12 * 64);
+}
+
+SEASTAR_TEST_CASE(segment_lifecycle_native_running_seal) {
+    co_await with_local_store([](auto&&... shared) {
+        return storage::testing::segment_lifecycle_contract::running_seal<
+          clock_type>(shared...);
+    });
+}
+
+SEASTAR_TEST_CASE(segment_lifecycle_native_idle_cost) {
+    co_await with_local_store([](auto&&... shared) {
+        return storage::testing::segment_lifecycle_contract::idle_cost<
           clock_type>(shared...);
     });
 }
@@ -238,10 +372,13 @@ SEASTAR_TEST_CASE(segment_lifecycle_native_revoked_in_flight) {
     });
 }
 
+// At every placement and hold.
 SEASTAR_TEST_CASE(local_append_native_quiesce_drains_one_attachment) {
-    co_await with_local_store([](auto&&... shared) {
-        return contract::quiesce_drains_one_attachment<clock_type>(shared...);
-    });
+    for (const auto profile : contract::placement_profiles)
+        co_await with_local_store([profile](auto&&... shared) {
+            return contract::quiesce_drains_one_attachment<clock_type>(
+              shared..., profile);
+        });
 }
 
 SEASTAR_TEST_CASE(local_append_native_interest_ends_without_cancelling) {
@@ -263,10 +400,13 @@ SEASTAR_TEST_CASE(local_append_native_shutdown_stops_admission) {
     });
 }
 
+// At every placement and hold.
 SEASTAR_TEST_CASE(local_append_native_concurrent_pipeline) {
-    co_await with_local_store([](auto&&... shared) {
-        return contract::concurrent_pipeline<clock_type>(shared...);
-    });
+    for (const auto profile : contract::placement_profiles)
+        co_await with_local_store([profile](auto&&... shared) {
+            return contract::concurrent_pipeline<clock_type>(
+              shared..., profile);
+        });
 }
 
 #if defined(SEASTAR_ENABLE_ALLOC_FAILURE_INJECTION) && !defined(SEASTAR_DEBUG)

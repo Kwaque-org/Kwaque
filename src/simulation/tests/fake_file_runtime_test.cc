@@ -3061,6 +3061,69 @@ SEASTAR_TEST_CASE(
     BOOST_CHECK_EQUAL(constrained.files->pending_operations(), 0U);
 }
 
+// Off, write_zeroes answers unsupported and changes nothing; on, it zeroes
+// past the end and grows the file. Neither answer fences the handle.
+SEASTAR_TEST_CASE(fake_file_system_runs_shared_write_zeroes_contract) {
+    for (const bool supported : {false, true}) {
+        fake_file_system_config config;
+        config.write_zeroes = supported;
+        fixture test{{}, config};
+        const auto outcome
+          = co_await kwaque::runtime::testing::run_write_zeroes_contract(
+            *test.files,
+            path("/kwaque/zeroes"),
+            fake_file_driver{&test.events});
+        BOOST_CHECK(
+          outcome
+          == (supported ? kwaque::runtime::write_zeroes_outcome::written : kwaque::runtime::write_zeroes_outcome::unsupported));
+        const auto snapshot = fake_file_test_access::snapshot(*test.files);
+        BOOST_REQUIRE(snapshot.has_value());
+        BOOST_CHECK_EQUAL(snapshot->open_handles, 0U);
+        BOOST_CHECK_EQUAL(snapshot->pending_operations, 0U);
+    }
+}
+
+// A write_zeroes that fails is a mutation failure, as a failed truncate is:
+// later mutations are refused and close answers it.
+SEASTAR_TEST_CASE(fake_failed_write_zeroes_fences_later_mutations) {
+    seastar::chunked_vector<fault_rule> rules;
+    rules.push_back(rule(
+      121,
+      builtin_fault_point::file_truncate,
+      1,
+      1,
+      fault_decision::make_error()));
+    fake_file_system_config config;
+    config.write_zeroes = true;
+    fixture test{std::move(rules), config};
+    auto creating = test.files->create_directories(path("/kwaque/data"));
+    co_await pump_until(test.events, creating);
+    co_await require_ready_success(creating);
+    auto opening = test.files->open(
+      path("/kwaque/data/file"),
+      {.access = kwaque::runtime::file_access::read_write, .create = true});
+    co_await pump_until(test.events, opening);
+    auto opened = co_await std::move(opening);
+    BOOST_REQUIRE(opened.has_value());
+    auto file = std::move(*opened);
+    auto zeroing = file.write_zeroes(
+      kwaque::runtime::file_position{0}, kwaque::byte_count{4'096});
+    co_await pump_until(test.events, zeroing);
+    const auto zeroed = co_await std::move(zeroing);
+    BOOST_REQUIRE(!zeroed.has_value());
+    BOOST_CHECK(zeroed.error().code() != kwaque::errc::invalid_argument);
+    auto writing = file.write(
+      kwaque::runtime::file_position{0}, payload(std::string(4'096, 'x')));
+    co_await pump_until(test.events, writing);
+    const auto written = co_await std::move(writing);
+    BOOST_REQUIRE(!written.has_value());
+    auto closing = file.close();
+    co_await pump_until(test.events, closing);
+    const auto closed = co_await std::move(closing);
+    BOOST_REQUIRE(!closed.has_value());
+    BOOST_CHECK(closed.error().code() == zeroed.error().code());
+}
+
 SEASTAR_TEST_CASE(fake_file_system_runs_shared_capability_contract) {
     fixture test;
     co_await kwaque::runtime::testing::run_file_system_contract(

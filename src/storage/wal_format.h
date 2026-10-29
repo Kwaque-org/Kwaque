@@ -11,7 +11,7 @@ namespace detail {
 class wal_codec;
 }
 
-inline constexpr byte_count wal_prepare_fixed_bytes{136};
+inline constexpr byte_count wal_prepare_fixed_bytes{168};
 
 enum class wal_field : std::uint16_t {
     fixed_body = 192,
@@ -27,10 +27,33 @@ enum class wal_field : std::uint16_t {
     segment_position,
     alignment,
     replay_profile,
-    reserved,
+    write_flags,
     assigned_bytes,
     padding,
     assigned_batch,
+    append_time,
+    max_record_time,
+    target_certified_end,
+    wal_certified_end,
+};
+
+// What the writer stamps on a PREPARE, beside what its child and context
+// determine.
+struct wal_prepare_stamps final {
+    // The PREPARE is the last of its write: it alone pads, to the next
+    // boundary. Every write ends with one that sets it.
+    bool ends_write{false};
+    // Broker time at assignment, at least 1 ns; the block made from this
+    // PREPARE carries it.
+    runtime::wall_time append_time;
+    // The target segment's certified end when the group formed, between its
+    // data start and the target position on its alignment; the block made
+    // from this PREPARE carries it.
+    runtime::file_position target_certified_end;
+    // This WAL file's certified end when the PREPARE was encoded, between its
+    // data start and the PREPARE's position on its alignment.
+    runtime::file_position wal_certified_end;
+    bool operator==(const wal_prepare_stamps&) const noexcept = default;
 };
 
 // Independently pinned file lifetimes and positions. WAL alignment governs its
@@ -40,6 +63,8 @@ enum class wal_field : std::uint16_t {
 // route.
 struct wal_prepare_expectation final {
     wal_write_context wal;
+    // The end of the WAL file's header, on its alignment.
+    runtime::file_position wal_data_start;
     segment_write_context target;
     runtime::file_position target_data_start;
     model::range_routing_epoch routing_epoch;
@@ -68,10 +93,12 @@ struct wal_child_expectation final {
 // Borrowed scalar/layout preflight, used before reserving a complete group.
 // It does not encode or attest to semantic validation under a narrower policy;
 // validate the exact child separately with encoded_assigned_batch::validate.
-// The consuming encoder repeats these same context/layout leaves.
+// The consuming encoder repeats these same context/layout leaves. Placement
+// says whether the PREPARE ends its write.
 [[nodiscard]] codec::result<aligned_envelope_layout> preflight_wal_prepare(
   const encoded_assigned_batch&,
   const wal_prepare_expectation&,
+  envelope_placement,
   const codec::limits&,
   codec::envelope_extent_limits owner_limits,
   codec::field_context context = {});
@@ -101,6 +128,7 @@ public:
     [[nodiscard]] model::file_byte_span wal_extent() const noexcept {
         return extent_;
     }
+    [[nodiscard]] wal_prepare_stamps stamps() const noexcept { return stamps_; }
     [[nodiscard]] const encoded_assigned_batch& batch() const& noexcept {
         return batch_;
     }
@@ -114,6 +142,7 @@ private:
     wal_prepare(
       const wal_prepare_expectation& expected,
       model::file_byte_span extent,
+      wal_prepare_stamps stamps,
       encoded_assigned_batch batch) noexcept
       : wal_(expected.wal)
       , target_(expected.target)
@@ -121,6 +150,7 @@ private:
       , profile_(expected.profile)
       , target_profile_(expected.target_profile)
       , extent_(extent)
+      , stamps_(stamps)
       , batch_(std::move(batch)) {}
     wal_write_context wal_;
     segment_write_context target_;
@@ -128,6 +158,7 @@ private:
     replay_profile profile_;
     storage_profile target_profile_;
     model::file_byte_span extent_;
+    wal_prepare_stamps stamps_;
     encoded_assigned_batch batch_;
 };
 
@@ -147,6 +178,7 @@ struct decoded_wal_prepare final {
 encode_wal_prepare(
   encoded_assigned_batch&& child,
   wal_prepare_expectation expected,
+  wal_prepare_stamps stamps,
   codec::cooperative_work& work,
   byte_count parent_remaining,
   bytes::allocation_charge_fn charge,
@@ -164,6 +196,10 @@ struct wal_prepare_claims final {
     model::range_routing_epoch routing_epoch;
     model::segment_relative_end physical_begin;
     runtime::file_position target_position;
+    // Each stamp no later than the position it was stamped at, and the WAL
+    // stamp on the WAL alignment; data starts are checked on resolution.
+    wal_prepare_stamps stamps;
+    runtime::wall_time max_record_time;
 };
 
 // Returns the expectation for one PREPARE's claims, or a failure that the

@@ -47,11 +47,12 @@ bool valid_entry(
   const sparse_index_context& context,
   const sparse_index_entry& entry,
   const std::optional<sparse_index_entry>& previous) noexcept {
+    // Any block may be an anchor: packed writes place blocks anywhere after
+    // the data start.
     const auto coverage = context.coverage();
     return coverage.logical().contains(entry.logical_anchor())
       && coverage.bytes().begin() <= entry.block_position()
       && entry.block_position() < coverage.bytes().end()
-      && context.alignment().aligned(entry.block_position())
       && (!previous || (previous->logical_anchor() < entry.logical_anchor()
                         && previous->block_position() < entry.block_position()));
 }
@@ -484,7 +485,6 @@ codec::result<void> validate_sparse_index_anchor(
       !valid_entry(context, entry, std::nullopt)
       || entry.logical_anchor().as_end() != inner.logical().begin()
       || entry.block_position() != inner.bytes().begin()
-      || !context.alignment().aligned(inner.bytes().end())
       || !contains_span(outer.logical(), inner.logical())
       || !contains_span(outer.physical(), inner.physical())
       || !contains_span(outer.bytes(), inner.bytes()))

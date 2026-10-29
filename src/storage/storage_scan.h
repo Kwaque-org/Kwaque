@@ -86,6 +86,11 @@ public:
     // next() returned an object and before advance() or close().
     [[nodiscard]] runtime::result<bytes::fragmented_buffer> object();
     [[nodiscard]] runtime::result<void> advance();
+    // Moves the cursor forward to `at`, at or before the scan end, without
+    // examining what lies between: for a probe after damage, which goes on
+    // where a write can begin. The bytes between are still read, once, in
+    // order.
+    [[nodiscard]] runtime::result<void> skip_to(runtime::file_position at);
     [[nodiscard]] runtime::file_position position() const noexcept {
         return cursor_;
     }

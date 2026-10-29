@@ -3,7 +3,9 @@
 #include "src/base/units.h"
 #include "src/storage/recovery_inventory.h"
 #include "src/storage/recovery_plan.h"
+#include "src/storage/recovery_tail.h"
 #include "src/storage/segment_writer.h"
+#include "src/storage/table_view.h"
 
 #include <seastar/core/abort_source.hh>
 #include <seastar/core/coroutine.hh>
@@ -53,7 +55,7 @@ struct recovered_segment_outcome final {
 struct recovered_publications final {
     workload_reservation held;
     // One per active or recovering target, in target order.
-    std::vector<recovered_segment_outcome> segments;
+    seastar::chunked_vector<recovered_segment_outcome> segments;
     // Every planned recovering publication is durable. Only then, and once
     // the planned WAL successor is active, may the shard become ready.
     bool complete{false};
@@ -68,9 +70,12 @@ struct recovered_publication_limits final {
 
 // Establishes fresh durability for every recovered segment whose classified
 // prefix will seed evidence, then publishes it as recovering. A ready plan
-// only: each `publish_recovering` segment is opened as the inventory found it,
-// gets one new flush of its data file, and only after that succeeded a
-// recovering publication pinning its recovered boundary, never below its pin.
+// only: each `publish_recovering` segment first gets what its tail walk
+// filled below the boundary written, verified again as it is written against
+// the PREPAREs on `wal` (the same boundary, or an error), then is opened as
+// the inventory found it, gets one new flush of its data file, which covers
+// those writes, and only after that succeeded a recovering publication
+// pinning its recovered boundary, never below its pin.
 // `retain` segments are not touched. Surviving bytes prove no earlier flush,
 // so nothing is published on them alone. A failed or uncertain flush or
 // publication leaves that segment as published before and the result
@@ -80,7 +85,8 @@ struct recovered_publication_limits final {
 // caller's work is polled before each, and an abort fails the call. A segment
 // refused admission beside other jobs is published again alone.
 // `visible` are the owner's supplied visible ends; each outcome's read bound
-// honours them. The plan and inventory must come from the same targets.
+// honours them. The plan, inventory and tails must come from the same
+// targets and merge.
 template<
   runtime::monotonic_clock Clock,
   runtime::file_system_backend Backend,
@@ -93,6 +99,8 @@ publish_recovered_segments(
   std::uint32_t shard,
   const recovery_planner& plan,
   const recovery_inventory& inventory,
+  const recovery_tails& tails,
+  const local_device_spec& wal,
   std::span<const recovery_visibility> visible,
   workload_budget& budget,
   segment_writer_config config,
@@ -127,10 +135,10 @@ publish_recovered_segments(
     for (const auto& segment : planned)
         if (segment.action == recovery_plan_action::publish_recovering) ++jobs;
     byte_count charge;
-    for (const auto bytes :
-         {scanned * sizeof(recovered_segment_outcome), jobs * sizeof(job)}) {
-        if (bytes == 0) continue;
-        auto charged = budget.allocation_charge(byte_count{bytes});
+    for (const auto [count, element] :
+         {std::pair{scanned, sizeof(recovered_segment_outcome)},
+          std::pair{jobs, sizeof(job)}}) {
+        auto charged = chunked_allocation_charge(budget, count, element);
         if (!charged) co_return runtime::failure(charged.error());
         auto next = charge.checked_add(*charged);
         if (!next)
@@ -141,7 +149,7 @@ publish_recovered_segments(
     if (!held) co_return runtime::failure(held.error());
     recovered_publications output{std::move(*held), {}, false};
     output.segments.reserve(scanned);
-    std::vector<job> queue;
+    seastar::chunked_vector<job> queue;
     queue.reserve(jobs);
     for (std::size_t i = 0, entry = 0; i < planned.size(); ++i, ++entry) {
         while (entry < inventory.entries.size()
@@ -164,9 +172,7 @@ publish_recovered_segments(
            segment_plan.action,
            false,
            bound_recovered_reads(
-             target.descriptor.logical_origin,
-             segment_plan.recovered_end,
-             supplied),
+             target.logical_origin, segment_plan.recovered_end, supplied),
            {}});
     }
     // One segment: open it as the inventory found it, publish, close.
@@ -179,6 +185,29 @@ publish_recovered_segments(
           });
         if (spec == devices.end())
             co_return runtime::failure(detail::path_error(errc::wrong_context));
+        const auto& boundary = planned[item.target].boundary;
+        if (const auto* tail = tails.find(item.target)) {
+            const auto found = tail->boundary
+                                 ? std::optional{tail->boundary->footer}
+                                 : std::nullopt;
+            if (found != boundary)
+                co_return runtime::failure(
+                  detail::path_error(errc::invalid_argument));
+            if (tail->blocks + tail->footers != 0)
+                if (
+                  auto written = co_await detail::materialize_recovery_tail(
+                    files,
+                    ownership,
+                    *spec,
+                    wal,
+                    shard,
+                    tails,
+                    *tail,
+                    budget,
+                    job_work);
+                  !written)
+                    co_return runtime::failure(written.error());
+        }
         auto contexts = detail::recovery_root_contexts(
           *spec, shard, found.history, found.publication, nullptr);
         if (!contexts) co_return runtime::failure(contexts.error());
@@ -190,6 +219,7 @@ publish_recovered_segments(
           {found.generation,
            found.publication,
            inventory.targets[item.target].descriptor,
+           inventory.targets[item.target].logical_origin,
            *contexts},
           budget,
           config,
@@ -199,8 +229,7 @@ publish_recovered_segments(
         runtime::first_failure failed;
         try {
             failed.observe(
-              co_await writer->publish_recovering(
-                planned[item.target].boundary, job_work));
+              co_await writer->publish_recovering(boundary, job_work));
         } catch (...) {
             failed.observe(std::current_exception());
         }

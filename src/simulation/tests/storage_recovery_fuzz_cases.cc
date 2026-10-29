@@ -26,8 +26,23 @@
 namespace kwaque::simulation::testing {
 namespace {
 namespace image = storage::testing::engine_fixture_contract;
-// A record of the image begins at each multiple of this in its file.
-constexpr std::size_t record_bytes = 4096;
+// Every write to a file of the image begins at a multiple of this.
+constexpr std::size_t unit_bytes = 4096;
+
+// Where the record that holds `at` begins. Records lie back to back from the
+// file's start, each as long as its header says: blocks pack, and a record
+// that ends a write holds the padding to the next unit.
+std::size_t record_holding(std::string_view bytes, std::size_t at) {
+    std::size_t record = 0;
+    while (record + 32 <= bytes.size()) {
+        const auto next = record
+                          + storage::testing::get(bytes.substr(record), 10, 2)
+                          + storage::testing::get(bytes.substr(record), 12, 4);
+        if (next <= record || next > at) break;
+        record = next;
+    }
+    return record;
+}
 } // namespace
 
 std::string damaged_bytes(
@@ -54,6 +69,7 @@ std::string damaged_bytes(
     case image_damage::foreign:
     case image_damage::stale:
     case image_damage::removed:
+    case image_damage::dropped:
         break;
     case image_damage::appended:
         for (std::size_t i = 0; i != std::size_t{control.length} * 16 + 1; ++i)
@@ -77,9 +93,9 @@ std::string damaged_bytes(
         bytes.resize(at);
         break;
     case image_damage::torn: {
-        const auto sector = at / record_bytes * record_bytes;
+        const auto sector = at / unit_bytes * unit_bytes;
         const auto from = sector + std::size_t{control.length % 8U} * 512;
-        const auto to = std::min(sector + record_bytes, bytes.size());
+        const auto to = std::min(sector + unit_bytes, bytes.size());
         if (from < to)
             std::fill(
               bytes.begin() + static_cast<std::ptrdiff_t>(from),
@@ -87,11 +103,13 @@ std::string damaged_bytes(
               '\0');
         break;
     }
-    case image_damage::overlong:
+    case image_damage::overlong: {
+        const auto record = record_holding(bytes, at);
         return image::overlong(
           std::move(bytes),
-          at / record_bytes * record_bytes,
+          record,
           512 * (std::size_t{control.length % 4U} + 1));
+    }
     }
     return bytes;
 }
@@ -104,6 +122,11 @@ std::string_view recovery_verdict(const recovery_seen& seen) noexcept {
         && seen.unresolved == 0 && seen.a_recovering && seen.b_recovering))
         return "baseline";
     if (!seen.ready && !seen.untouched) return "wrote";
+    if (seen.dropped)
+        return seen.ready && seen.recovered == 2 && seen.a_recovering
+                   && seen.b_recovering && seen.materialized == 2
+                 ? std::string_view{}
+                 : "lost";
     if (seen.changed && seen.ready) {
         if (seen.device == 1 && !seen.b_recovering) return "spared";
         if (seen.device == 2 && !seen.a_recovering) return "spared";
@@ -143,9 +166,9 @@ recovery_case_result exercise_recovery_case(
                 files, chosen.path, drive);
               const auto damaged = damaged_bytes(
                 original, control, script, chosen.foreign, chosen.stale);
-              const bool removed = static_cast<image_damage>(
-                                     control.damage % image_damage_count)
-                                   == image_damage::removed;
+              const auto kind = static_cast<image_damage>(
+                control.damage % image_damage_count);
+              const bool removed = kind == image_damage::removed;
               result.seen.device = chosen.device;
               result.seen.changed = removed || damaged != original;
               // At rest, with nothing of the store told.
@@ -166,6 +189,11 @@ recovery_case_result exercise_recovery_case(
                   }
                   take(fake_file_test_access::flush(files, held));
               }
+              if (kind == image_damage::dropped) {
+                  co_await image::drop_blocks_a(files, devices, drive);
+                  result.seen.device = 1;
+                  result.seen.changed = result.seen.dropped = true;
+              }
               const auto given = engine_history_fixture::image(files);
               const auto began = co_await image::start_on_the_image<
                 simulation::monotonic_clock>(
@@ -179,6 +207,7 @@ recovery_case_result exercise_recovery_case(
               result.seen.unresolved = began.unresolved;
               result.seen.a_recovering = began.a_recovering;
               result.seen.b_recovering = began.b_recovering;
+              result.seen.materialized = began.materialized;
               if (began.failed)
                   result.seen.failure
                     = began.failure

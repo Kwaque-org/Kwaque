@@ -19,7 +19,7 @@ result<replay_profile> parse_replay_profile(std::uint16_t value) noexcept {
 
 result<storage_alignment> storage_alignment::make(byte_count bytes) noexcept {
     if (
-      bytes.value() < 512 || bytes.value() > 65536
+      bytes.value() < minimum_storage_alignment_bytes || bytes.value() > 65536
       || !std::has_single_bit(bytes.value()))
         return failure(errc::invalid_argument);
     return storage_alignment{bytes};
@@ -48,7 +48,6 @@ result<segment_write_context> segment_write_context::make(
   storage_alignment alignment,
   model::segment_relative_end physical_begin,
   runtime::file_position position) noexcept {
-    if (!alignment.aligned(position)) return failure(errc::invalid_argument);
     return segment_write_context{segment, alignment, physical_begin, position};
 }
 result<void> segment_write_context::validate_expected(
@@ -61,8 +60,7 @@ result<wal_write_context> wal_write_context::make(
   model::wal_incarnation_id incarnation,
   storage_alignment alignment,
   runtime::file_position position) noexcept {
-    if (incarnation.is_nil() || !alignment.aligned(position))
-        return failure(errc::invalid_argument);
+    if (incarnation.is_nil()) return failure(errc::invalid_argument);
     return wal_write_context{incarnation, alignment, position};
 }
 result<void> wal_write_context::validate_expected(

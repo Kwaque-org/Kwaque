@@ -94,9 +94,18 @@ def measurement(case="quiet", timing=False):
         reactor_flushes=400,
         reactor_writes=400,
         reactor_write_bytes=400 * 8192,
+        segment_placed_portions=200,
+        segment_placed_bytes=200 * 8192,
+        segment_barriers=200,
         devices=[device(0x33, 10, None, "wal_control"), device(0x44, 10, 0, "data")],
         target_devices=[1, 1],
         same_filesystem=True,
+        alignment_bytes=8192,
+        segment_bytes=64 << 20,
+        synchronous_write_bytes=1 << 20,
+        settle_ms=0,
+        fresh_segments=False,
+        block=None,
         timing_only=timing,
         ndebug=True,
         libcxx_hardening_none=True,
@@ -158,6 +167,19 @@ def measurement(case="quiet", timing=False):
                 for key in report.NAMESPACE_COUNTERS
             },
         )
+    if case == "rolling":
+        row.update(
+            wal_barrier="synchronized",
+            data_barrier="synchronized",
+            reactor_flushes=0,
+            fresh_segments=True,
+            rolls=8,
+            roll_creation_ns=80_000_000,
+            roll_creation_longest_ns=15_000_000,
+        )
+        if not timing:
+            row["wal"].update(flushes=0, synchronized_calls=200)
+            row["data"].update(flushes=0, synchronized_calls=200)
     return row
 
 
@@ -193,6 +215,10 @@ class EngineAppendReportTest(unittest.TestCase):
     def test_every_case_validates_in_both_builds(self):
         for case in report.CASES:
             for timing in (False, True):
+                # A rolling stream's files are zero-written, which only the
+                # observing build counts.
+                if case == "rolling" and timing:
+                    continue
                 report.validate(measurement(case, timing))
         # Two data devices on two filesystems are two pools.
         row = measurement("two_data_devices")
@@ -222,7 +248,8 @@ class EngineAppendReportTest(unittest.TestCase):
         self.assertRefused(lambda r: r.update(groups=257))
         self.assertRefused(lambda r: r.update(reactor_flushes=199))
         self.assertRefused(lambda r: r.update(reactor_writes=0))
-        self.assertRefused(lambda r: r["wal"].update(flushes=199))
+        self.assertRefused(lambda r: r["wal"].update(flushes=201))
+        self.assertRefused(lambda r: r.update(reactor_flushes=0), timing=True)
         self.assertRefused(lambda r: r.update(wal_barrier="preallocated"))
         self.assertRefused(lambda r: r.update(request_bound=200))
         self.assertRefused(lambda r: r.update(request_bound=512))
@@ -239,6 +266,162 @@ class EngineAppendReportTest(unittest.TestCase):
         self.assertRefused(lambda r: r.update(elapsed_ns=0))
         self.assertRefused(lambda r: r["build_profile"].pop("asan"))
         self.assertRefused(lambda r: r.update(affinity_cpus=[]))
+
+    def test_barriers_follow_the_write_profile(self):
+        # Every portion in its segment: the WAL takes no write and no flush.
+        row = measurement()
+        row["wal"] = kind()
+        row["reactor_flushes"] = 200
+        report.validate(row)
+
+        def synchronized(row):
+            row.update(wal_barrier="synchronized", data_barrier="synchronized")
+            row["wal"].update(flushes=0, synchronized_calls=200)
+            row["data"].update(flushes=0, synchronized_calls=200)
+            row["reactor_flushes"] = 0
+            return row
+
+        def silent(row):
+            synchronized(row)
+            row["wal"]["synchronized_calls"] = row["data"]["synchronized_calls"] = 0
+
+        report.validate(synchronized(measurement()))
+        self.assertRefused(silent)
+        self.assertRefused(lambda r: r.update(wal_barrier="synchronized"))
+        self.assertRefused(
+            lambda r: r.update(wal_barrier="synchronized", data_barrier="synchronized"),
+            timing=True,
+        )
+        # A synchronized row and one that grew its files are two summaries.
+        summaries = report.summaries([measurement(), synchronized(measurement())])
+        self.assertEqual(
+            sorted(one["barrier"] for one in summaries), ["extending", "synchronized"]
+        )
+        held = next(one for one in summaries if one["barrier"] == "synchronized")
+        self.assertEqual(held["synchronized_writes_per_group"], 2)
+
+    def test_summary_reads_device_bytes_and_write_rate(self):
+        row = measurement()
+        row.update(payload_bytes=8192)
+        summary = report.summaries([row])[0]
+        # 400 writes of 8 KiB for 256 requests of 8 KiB, over 0.3 s.
+        self.assertEqual(summary["device_bytes_per_payload_byte"], 400 / 256)
+        self.assertAlmostEqual(summary["writes_per_second"], 400 / 0.3)
+        self.assertIsNone(
+            report.summaries([measurement()])[0]["device_bytes_per_payload_byte"]
+        )
+        self.assertIsNone(
+            report.summaries([measurement(timing=True)])[0][
+                "synchronized_writes_per_group"
+            ]
+        )
+
+    def test_rolling_stream(self):
+        report.validate(measurement("rolling"))
+        # Only the rolling case rolls, and its segments are new files.
+        self.assertRefused(lambda r: r.update(rolls=1, roll_creation_ns=1))
+        self.assertRefused(lambda r: r.update(fresh_segments=False), "rolling")
+        self.assertRefused(lambda r: None, "rolling", timing=True)
+        # Each roll's creation took time, the longest one of them.
+        self.assertRefused(lambda r: r.update(roll_creation_ns=0), "rolling")
+        self.assertRefused(
+            lambda r: r.update(roll_creation_longest_ns=90_000_000), "rolling"
+        )
+        # A segment holds a whole number of alignment units.
+        self.assertRefused(lambda r: r.update(segment_bytes=0))
+        self.assertRefused(lambda r: r.update(segment_bytes=(64 << 20) + 4096))
+
+    def test_alignment_fresh_segments_and_block_device(self):
+        def synchronized(row):
+            row.update(wal_barrier="synchronized", data_barrier="synchronized")
+            row["wal"].update(flushes=0, synchronized_calls=200)
+            row["data"].update(flushes=0, synchronized_calls=200)
+            row["reactor_flushes"] = 0
+            return row
+
+        fresh = synchronized(measurement())
+        fresh["fresh_segments"] = True
+        report.validate(fresh)
+        # Fresh segments are made zero-written.
+        self.assertRefused(lambda r: r.update(fresh_segments=True))
+        self.assertRefused(lambda r: r.update(alignment_bytes=0))
+        self.assertRefused(lambda r: r.update(alignment_bytes=2048))
+        self.assertRefused(lambda r: r.update(alignment_bytes=12288))
+        self.assertRefused(lambda r: r.update(synchronous_write_bytes=0))
+        aligned = measurement()
+        aligned["alignment_bytes"] = 4096
+        report.validate(aligned)
+        # Another alignment or fresh segments are summaries of their own.
+        summaries = report.summaries(
+            [measurement(), aligned, fresh, synchronized(measurement())]
+        )
+        self.assertEqual(len(summaries), 4)
+
+        block = {
+            "device": "nvme0n1",
+            "reads": 0,
+            "read_bytes": 0,
+            "writes": 512,
+            "write_bytes": 512 * 16384,
+            "flushes": 256,
+        }
+        counted = measurement()
+        counted.update(payload_bytes=8192, block=dict(block))
+        report.validate(counted)
+        summary = report.summaries([counted])[0]["block"]
+        self.assertEqual(summary["device"], ["nvme0n1"])
+        # 8 MiB on the device for 256 requests of 8 KiB.
+        self.assertEqual(summary["write_bytes_per_payload_byte"], 4)
+        self.assertEqual(summary["writes_per_request"], 2)
+        self.assertEqual(summary["flushes_per_request"], 1)
+        self.assertIsNone(report.summaries([measurement()])[0]["block"])
+        # A run that named no device leaves the pooled counts out.
+        self.assertIsNone(report.block_summary([counted, measurement()]))
+        self.assertRefused(lambda r: r.update(block={**block, "device": ""}))
+        self.assertRefused(lambda r: r.update(block={**block, "writes": 0}))
+        self.assertRefused(lambda r: r.update(block={**block, "flushes": -1}))
+        self.assertRefused(lambda r: r.update(block={**block, "extra": 1}))
+        self.assertRefused(lambda r: r.pop("block"))
+
+    def test_placement_follows_threshold_and_hold(self):
+        def placed(row):
+            row.update(
+                placement_bytes=32768,
+                hold_bytes=16384,
+                wal_placed_portions=150,
+                segment_placed_portions=50,
+                held_portions=120,
+                runs_filled=4,
+                runs_wanted=40,
+                runs_synced=2,
+                sync_rounds=1,
+                round_syncs=2,
+                held_runs=1,
+                held_bytes=4096,
+            )
+            return row
+
+        report.validate(placed(measurement()))
+        self.assertRefused(
+            lambda r: r.update(segment_placed_portions=0, segment_barriers=0)
+        )
+        self.assertRefused(lambda r: r.update(wal_placed_portions=1))
+        self.assertRefused(lambda r: placed(r).update(held_portions=151))
+        self.assertRefused(lambda r: placed(r).update(hold_bytes=0))
+        self.assertRefused(lambda r: placed(r).update(held_bytes=0))
+        self.assertRefused(lambda r: placed(r).update(held_runs=4))
+        self.assertRefused(lambda r: placed(r).update(round_syncs=0))
+        # Rows at two thresholds are two summaries.
+        rows = [measurement(), placed(measurement())]
+        summaries = report.summaries(rows)
+        self.assertEqual(len(summaries), 2)
+        self.assertEqual(
+            sorted(one["placement_bytes"] for one in summaries), [0, 32768]
+        )
+        held = next(one for one in summaries if one["placement_bytes"])
+        self.assertEqual(held["wal_placed_share"], 0.75)
+        self.assertEqual(held["run_closes"]["wanted"], 40)
+        self.assertEqual(held["segment_syncs_per_round"], 2)
 
     def test_histograms_hold_what_the_row_says(self):
         self.assertRefused(lambda r: r["latency"].update(total=255))

@@ -5,6 +5,7 @@
 #include "src/codec/transaction.h"
 #include "src/storage/completion_resources.h"
 #include "src/storage/local_id_allocator.h"
+#include "src/storage/local_spares.h"
 #include "src/storage/wal_child.h"
 #include "src/storage/wal_inventory.h"
 #include "src/storage/wal_writer_state.h"
@@ -17,6 +18,7 @@
 #include <algorithm>
 #include <array>
 #include <exception>
+#include <limits>
 #include <span>
 
 namespace kwaque::storage {
@@ -28,21 +30,26 @@ enum class wal_start_intent : std::uint8_t {
     // activate_recovered() closes it with a successor and never resumes it.
     recovered_head
 };
+// A zero-written range that reaches as far as a file does.
+inline constexpr byte_count wal_whole_file{
+  std::numeric_limits<std::uint64_t>::max()};
 struct wal_writer_config final {
     storage_alignment alignment;
-    // Logical bound. Without preallocation, files grow through writes; no
-    // file is reused.
+    // Logical bound of every file. A file the checkpoint reclaims is kept,
+    // while there are fewer than `spares`, and a later file is made of it.
     byte_count capacity_bytes;
-    // Preparing a file writes zeros this far past its header (capped by the
-    // capacity) and makes them durable once. Writes inside the zero-written
-    // range overwrite allocated blocks inside the file size, so their
-    // durability needs no allocation metadata. The file then ends in zeros
-    // past its last frame, which never decode as a frame. Zero disables it.
-    byte_count preallocation_bytes{};
+    // Making a file writes zeros this far past its header, capped by the
+    // capacity, and makes them durable once: by default to its end, so that
+    // it can be written with O_DSYNC from the start. Writes inside the
+    // zero-written range overwrite allocated blocks inside the file size, so
+    // their durability needs no allocation metadata. The file then ends in
+    // zeros past its last frame, which never decode as a frame.
+    // Zero disables it.
+    byte_count preallocation_bytes{wal_whole_file};
     // Keeps the zero-written range ahead of the reservations: whenever less
     // than this remains past the reserved end, zero-write this much more in
     // the background. Writes past its start wait for it. Nonzero requires
-    // preallocation.
+    // preallocation. Zero by default: the whole file is written already.
     byte_count preallocation_extension_bytes{};
     // A gathered write no larger than this, wholly inside the zero-written
     // range, uses a second handle opened for synchronized writes: its
@@ -60,12 +67,24 @@ struct wal_writer_config final {
     // has removed a file. Zero sets no limit below the most a shard can
     // hold, which bounds every writer; one could never rotate.
     std::uint32_t retained_files{default_retained_wal_files};
+    // Reclaimed files kept to be made into later ones, at most
+    // maximum_wal_spares; zero unlinks each. A file made of a spare needs no
+    // zeros written, its blocks being written already.
+    std::uint32_t spares{default_wal_spares};
+    // While a file is the head, its successor is made ready: a spare taken,
+    // or a fresh file zero-written, its incarnation allocated and its
+    // handles open. A rotation then only writes the successor's header,
+    // names it and syncs its directory. Without one ready, a rotation makes
+    // its successor itself.
+    bool prepare_ahead{true};
 };
 struct wal_writer_statistics final {
     std::uint64_t accepted_groups{0}, encoded_groups{0}, write_calls{0},
       gathered_groups{0}, flush_calls{0}, rotations{0};
     // Writes durable at completion, and background zero-written extensions.
     std::uint64_t synchronized_writes{0}, extensions{0};
+    // Rotations that took a successor made ahead, and files made of a spare.
+    std::uint64_t ahead_rotations{0}, spares_taken{0};
 };
 
 // A size observation is neither an allocation guarantee nor a complete end.
@@ -102,6 +121,18 @@ class wal_writer final : public runtime::shard_affine {
         std::optional<runtime::file> sync;
         std::uint64_t zero_begin{0}, zeroed_end{0}, issued_end{0};
         std::uint64_t plain_writes{0}, flushed_plain_writes{0};
+        // A file made ahead of its header: its incarnation, where its data
+        // will start, and the temporary name its body has beside its own
+        // until name_body() writes the header and names it. `body`: it is
+        // made, with both handles open; `ahead`: by the task that makes it
+        // before its rotation.
+        std::optional<model::wal_incarnation_id> incarnation;
+        runtime::file_position data_start{};
+        std::optional<runtime::file_path> temporary;
+        bool body{false}, ahead{false};
+        // Its header is durable under its own name, whichever way it was
+        // made.
+        bool named{false};
         bool ancestors_ready{false}, verified{false}, ready{false};
         bool retryable{false}, abandoned{false};
     };
@@ -135,13 +166,13 @@ public:
           || config.capacity_bytes <= config.alignment.bytes()
           || config.capacity_bytes.value() % config.alignment.bytes().value()
                != 0
-          || config.preallocation_bytes > config.capacity_bytes
           || config.preallocation_extension_bytes > config.capacity_bytes
           || (config.preallocation_extension_bytes.value() != 0
               && config.preallocation_bytes.value() == 0)
           || config.synchronous_write_bytes > runtime::maximum_file_io_bytes
           || config.retained_files == 1
-          || config.retained_files > maximum_retained_wal_files)
+          || config.retained_files > maximum_retained_wal_files
+          || config.spares > maximum_wal_spares)
             return runtime::failure(detail::path_error(errc::invalid_argument));
         if (
           auto profile = parse_replay_profile(
@@ -218,11 +249,11 @@ public:
             if (!lists) return runtime::failure(lists.error());
             zero = staging->value() + lists->value();
         }
+        // What a write stages is the group's that issues it, and what a zero
+        // write stages is the zeroing's: the owner holds neither.
         auto held = budget.try_reserve(
           byte_count{
-            instance->value() + 16 * path->value() + chunk->value() + 64_KiB
-            + handles * 2 * runtime::maximum_file_write_concurrency
-                * staging->value()
+            instance->value() + path->value() + chunk->value() + 64_KiB
             + gather->value() + zero});
         if (!held) return runtime::failure(held.error());
         auto token_held = budget.try_reserve(*token);
@@ -468,6 +499,50 @@ public:
         assert_current();
         retained_.drop_oldest();
     }
+    // The files kept to be made into later ones: whoever reclaims the WAL
+    // moves a file in through them (reclaim_wal_prefix), and a restart
+    // takes in what their directory holds (remove_wal_below).
+    [[nodiscard]] local_spares<Backend, model::wal_incarnation_id>&
+    spares() noexcept {
+        assert_current();
+        return spares_;
+    }
+    // Waits until the successor being made ahead, if one is, is made or
+    // given up: true when one is ready for the next rotation.
+    [[nodiscard]] seastar::future<bool> successor_made() {
+        assert_current();
+        co_await join_ahead();
+        co_return successor_file().body;
+    }
+    // Starts making the head's successor ahead, when the configuration asks
+    // for it and none is made or being made. A bootstrap starts it itself.
+    // After a restart it is started once the restart has taken in what the
+    // WAL's directories hold, so that nothing the restart moves or removes
+    // is a file being made here.
+    void prepare_successor() noexcept {
+        assert_current();
+        if (
+          !config_.prepare_ahead || ahead_ || rotation_ || !active_
+          || admission_stopped_ || closing_ || closed_ || first_.failed())
+            return;
+        const auto& next = successor_file();
+        if (next.body || next.ready || next.file || next.preparation) return;
+        try {
+            ahead_.emplace(
+              seastar::with_scheduling_group(
+                budget_.scheduling_group(),
+                [this]() noexcept -> seastar::future<> {
+                    try {
+                        return make_ahead();
+                    } catch (...) {
+                        // No frame for it: the next rotation makes its
+                        // successor itself.
+                        return seastar::make_ready_future<>();
+                    }
+                }));
+        } catch (...) {
+        }
+    }
     [[nodiscard]] std::optional<local_wal_head>
     successor_head() const noexcept {
         assert_current();
@@ -668,15 +743,19 @@ private:
         detail::wal_member_memory memory;
     };
     // One member at end: complete layout, owner context and live memory. The
-    // submission repeats this with final targets before accepting.
+    // submission repeats this with final targets before accepting. Members
+    // lie back to back from the group's aligned start, and only the last,
+    // which ends the group's write, pads to the next boundary.
     [[nodiscard]] runtime::result<member_cost> measure_member(
       const encoded_assigned_batch& child,
       const wal_prepare_expectation& reserved,
+      envelope_placement placement,
       const codec::limits& policy,
       const local_store_context& owner) const {
         auto layout = preflight_wal_prepare(
           child,
           reserved,
+          placement,
           policy,
           {config_.maximum_pending_bytes, config_.maximum_pending_bytes},
           {reserved.wal.position().value()});
@@ -687,7 +766,7 @@ private:
           || reserved.profile != config_.profile)
             return runtime::failure(detail::path_error(errc::wrong_context));
         auto memory = detail::wal_prepare_memory(
-          child, *layout, policy, config_.children.charge);
+          child, layout->padding_bytes(), policy, config_.children.charge);
         if (!memory) return runtime::failure(memory.error());
         return member_cost{*layout, *memory};
     }
@@ -695,9 +774,11 @@ private:
       const wal_child_expectation& e,
       local_wal_cursor cursor,
       storage_alignment alignment,
+      runtime::file_position data_start,
       runtime::file_position at) {
         return {
           wal_write_context::make(cursor.incarnation(), alignment, at).value(),
+          data_start,
           e.target,
           e.target_data_start,
           e.routing_epoch,
@@ -723,6 +804,28 @@ private:
             return runtime::failure(detail::path_error(errc::invalid_argument));
         group_measure output;
         if (members.size() > limits.members) return output;
+        // A submission may hold fewer of these members, when some of their
+        // segments do not freeze, and then another member ends its write.
+        // So each is checked as one that may end it, and the bounds keep
+        // room for the costliest padding any of them would add there. The
+        // extent of fewer members is never longer.
+        const auto ending = max_child_bytes(
+          byte_count{codec::envelope_prefix_bytes},
+          wal_prepare_fixed_bytes,
+          envelope_placement::ends_span,
+          config_.alignment,
+          policy,
+          {config_.maximum_pending_bytes, config_.maximum_pending_bytes});
+        if (!ending)
+            return runtime::failure(
+              detail::path_error(
+                codec::detail::allocation_cost_error(ending.error(), {}, 0)
+                  .code()));
+        const byte_count most_padding{config_.alignment.bytes().value() - 1U};
+        detail::wal_member_memory padding{};
+        const auto more = [](byte_count padded, byte_count bare) {
+            return padded.checked_sub(bare).value_or(byte_count{});
+        };
         const auto start = before->reserved.position();
         auto end = start;
         for (const auto& member : members) {
@@ -732,13 +835,39 @@ private:
             auto cost = measure_member(
               *member.child,
               reserve_member(
-                *member.expected, before->reserved, config_.alignment, end),
+                *member.expected,
+                before->reserved,
+                config_.alignment,
+                current_file().descriptor->data_start,
+                end),
+              envelope_placement::continues,
               policy,
               before->owner);
             if (!cost) return runtime::failure(cost.error());
+            if (member.child->bytes().size() > *ending)
+                return runtime::failure(
+                  detail::path_error(errc::resource_exhausted));
+            auto padded = detail::wal_prepare_memory(
+              *member.child, most_padding, policy, config_.children.charge);
+            if (!padded) return runtime::failure(padded.error());
+            padding.additional = std::max(
+              padding.additional,
+              more(padded->additional, cost->memory.additional));
+            padding.retained = std::max(
+              padding.retained, more(padded->retained, cost->memory.retained));
+            padding.fragments = std::max(
+              padding.fragments,
+              item_count{
+                padded->fragments.value() - cost->memory.fragments.value()});
             if (!output.bounds.add(cost->memory, policy)) return output;
             end = cost->layout.at(end)->end();
         }
+        // The last member pads the write to the next boundary.
+        const auto pad = end_padding(end, byte_count{}, config_.alignment);
+        if (!pad)
+            return runtime::failure(detail::path_error(errc::out_of_range));
+        end = runtime::file_position{end.value() + pad->value()};
+        if (!output.bounds.add(padding, policy)) return output;
         const auto extent = model::file_byte_span::make(start, end).value();
         output.measure.encoded_bytes = extent.size();
         if (
@@ -804,8 +933,10 @@ private:
             measured->bounds.fragments
             * bytes::fragmented_buffer::fragment_descriptor_size()});
         if (!descriptors) return runtime::failure(descriptors.error());
-        const auto assembly = measured->bounds.additional.checked_add(
-          *descriptors);
+        const auto staging = write_staging(extent.value());
+        if (!staging) return runtime::failure(staging.error());
+        auto assembly = measured->bounds.additional.checked_add(*descriptors);
+        if (assembly) assembly = assembly->checked_add(*staging);
         if (!assembly)
             return runtime::failure(detail::path_error(errc::out_of_range));
         auto encoded = budget_.try_reserve(*assembly);
@@ -896,6 +1027,11 @@ private:
         closing_ = true;
         active_ = false;
         request_stop();
+        // A successor being made ahead stops where it stands: what it made
+        // is closed below with the other slot, and a start takes in what it
+        // left on the device.
+        ahead_abort_.request_abort();
+        co_await join_ahead();
         if (!operations_closed_) {
             co_await operations_.close();
             operations_closed_ = true;
@@ -994,13 +1130,20 @@ private:
         const auto start = before->reserved.position();
         auto end = start;
         group_bounds bounds;
-        for (auto& member : group.members_) {
+        for (std::size_t i = 0; i < group.members_.size(); ++i) {
+            auto& member = group.members_[i];
             const auto& e = member.expected;
-            member.reserved.emplace(
-              reserve_member(e, before->reserved, config_.alignment, end));
+            member.reserved.emplace(reserve_member(
+              e,
+              before->reserved,
+              config_.alignment,
+              current_file().descriptor->data_start,
+              end));
             auto cost = measure_member(
               member.input.batch,
               *member.reserved,
+              i + 1 == group.members_.size() ? envelope_placement::ends_span
+                                             : envelope_placement::continues,
               admission.policy(),
               before->owner);
             if (!cost) co_return runtime::failure(cost.error());
@@ -1041,12 +1184,16 @@ private:
             group.fragment_bound_
             * bytes::fragmented_buffer::fragment_descriptor_size()});
         if (!descriptors) co_return runtime::failure(descriptors.error());
+        const auto staging = write_staging(extent.size().value());
+        if (!staging) co_return runtime::failure(staging.error());
         auto assembly = group.additional_bytes_.checked_add(*descriptors);
+        if (assembly) assembly = assembly->checked_add(*staging);
         if (!assembly)
             co_return runtime::failure(detail::path_error(errc::out_of_range));
         std::optional<detail::wal_write_descriptor::pointer> descriptor;
         if (admitted) {
-            // The final targets change no geometry or cost, so the admitted
+            // The final targets change no geometry or cost, and the admission
+            // kept room for whichever member ends the write, so its
             // allowances cover the (possibly smaller) submitted group.
             if (
               extent.size() > admitted->extent_
@@ -1153,15 +1300,32 @@ private:
                         break;
                     }
                 }
-                for (auto& member : group.members_) {
+                // What the last completed barrier of this file covered when
+                // the group's encoding began, or its data start before one
+                // has: never past the group, which is unwritten. Each member
+                // states it.
+                const auto& start = *group.members_.front().reserved;
+                const auto durable = positions_->durable;
+                const auto certified = durable.incarnation()
+                                           == start.wal.incarnation()
+                                         ? durable.position()
+                                         : start.wal_data_start;
+                for (std::size_t i = 0; i < group.members_.size(); ++i) {
+                    auto& member = group.members_[i];
                     if (first_.failed()) {
                         fail_node(*node);
                         break;
                     }
+                    const wal_prepare_stamps stamps{
+                      i + 1 == group.members_.size(),
+                      member.input.append_time,
+                      member.target_certified_end,
+                      certified};
                     record.emplace(
                       co_await encode_wal_prepare(
                         std::move(member.input.batch),
                         *member.reserved,
+                        stamps,
                         work,
                         member.memory->codec_bytes,
                         config_.children.charge,
@@ -1462,12 +1626,46 @@ private:
       , ids_(ids)
       , budget_(budget)
       , config_(std::move(config))
+      , spares_(control.files_, control.spec_, control.shard_, config_.spares)
       , write_allocation_(write_allocation)
       , lifetime_(std::move(lifetime))
       , inflight_(config_.maximum_descriptors, config_.maximum_pending_bytes) {}
     static seastar::future<runtime::result<void>> reject(errc code) {
         return seastar::make_ready_future<runtime::result<void>>(
           runtime::failure(detail::path_error(code)));
+    }
+    // What the runtime may stage to write `bytes` of groups to the head,
+    // through either of its handles, which share one geometry: the staging
+    // of a write of twice as many bytes, at a boundary or not, whichever
+    // stages more. A gathered write stages no more than its groups'
+    // charges together. `slot` is the file written, the head by default.
+    runtime::result<byte_count>
+    write_staging(std::uint64_t bytes, const file_slot* slot = nullptr) const {
+        const auto& file = slot ? *slot : current_file();
+        if (!file.file)
+            return runtime::failure(detail::path_error(errc::closed));
+        const auto geometry = file.file->geometry();
+        if (!geometry) return runtime::failure(geometry.error());
+        const byte_count length{2 * bytes};
+        std::uint64_t most = 0;
+        for (const auto position : {std::uint64_t{0}, std::uint64_t{1}}) {
+            const auto layout = geometry->write_buffers(
+              runtime::file_position{position}, length);
+            if (!layout.allocations) continue;
+            const auto charge = budget_.allocation_charge(
+              layout.allocation_bytes);
+            if (!charge) return runtime::failure(charge.error());
+            most = std::max(most, charge->value() * layout.allocations);
+        }
+        return byte_count{most};
+    }
+    // What a zero write of `slot` may stage: see detail::zero_fill.
+    runtime::result<workload_reservation>
+    reserve_zero_staging(const file_slot& slot) {
+        auto staging = write_staging(
+          detail::zero_write_chunks * write_allocation_.value() / 2, &slot);
+        if (!staging) return runtime::failure(staging.error());
+        return budget_.try_reserve(*staging);
     }
     static runtime::file_path parent_of(const runtime::file_path& path) {
         return runtime::file_path::make(
@@ -1496,7 +1694,11 @@ private:
         return slots_[1 - active_slot_];
     }
     seastar::future<> close_file() { return close_slot(current_file()); }
-    seastar::future<> close_slot(file_slot& slot) {
+    // What a slot's closes answer is the WAL's failure, unless the slot is
+    // `let_go`: a body no rotation will take is no file of the WAL's, and a
+    // close answers the first failed write of its making as well as its own.
+    // An unrecognized exception is the WAL's either way.
+    seastar::future<> close_slot(file_slot& slot, bool let_go = false) {
         if (slot.publisher) {
             try {
                 auto closed = co_await slot.publisher->close();
@@ -1509,7 +1711,8 @@ private:
         if (slot.completion) slot.completion->release_metadata();
         if (slot.sync) {
             try {
-                first_.observe(co_await slot.sync->close());
+                auto closed = co_await slot.sync->close();
+                if (!let_go) first_.observe(closed);
             } catch (...) {
                 first_.observe(std::current_exception());
             }
@@ -1518,7 +1721,8 @@ private:
         }
         if (slot.file) {
             try {
-                first_.observe(co_await slot.file->close());
+                auto closed = co_await slot.file->close();
+                if (!let_go) first_.observe(closed);
             } catch (...) {
                 first_.observe(std::current_exception());
             }
@@ -1693,6 +1897,7 @@ private:
             if (failed.failed()) co_return failed.outcome();
             checked = publication_result(slot.header_publication);
             if (!checked) co_return checked;
+            slot.named = true;
         }
         if (stop_preparation(slot))
             co_return runtime::failure(detail::path_error(errc::closed));
@@ -1761,6 +1966,10 @@ private:
         slot.head_publication = local_publication_outcome{};
         slot.zero_begin = slot.zeroed_end = slot.issued_end = 0;
         slot.plain_writes = slot.flushed_plain_writes = 0;
+        slot.incarnation.reset();
+        slot.data_start = {};
+        slot.temporary.reset();
+        slot.body = slot.ahead = slot.named = false;
         slot.ancestors_ready = slot.verified = slot.ready = slot.retryable
           = slot.abandoned = false;
     }
@@ -1780,8 +1989,32 @@ private:
         try {
             do {
                 auto& next = successor_file();
-                auto prepared = co_await prepare_file(
-                  next, rotation_->cut.cursor_, work);
+                // A successor being made ahead is finished first: one file
+                // is made at a time, and the one made ahead is taken.
+                co_await join_ahead();
+                // With none made ahead, a spare is made into it here before
+                // a fresh file is: what fails of that is let go, and a fresh
+                // file is made instead.
+                if (
+                  !next.body && !next.ready && !next.file && !next.preparation
+                  && !next.descriptor && spares_.size() != 0) {
+                    runtime::result<void> made{};
+                    try {
+                        made = co_await prepare_body(next, work);
+                    } catch (...) {
+                        made = runtime::failure(
+                          detail::recognized_or_rethrown());
+                    }
+                    if (!made) co_await abandon_body(next);
+                    // Only what letting it go could not recognize failed the
+                    // WAL.
+                    if (first_.failed()) break;
+                }
+                auto prepared = next.body
+                                  ? co_await name_body(
+                                      next, rotation_->cut.cursor_, work)
+                                  : co_await prepare_file(
+                                      next, rotation_->cut.cursor_, work);
                 if (!prepared) {
                     if ((next.retryable || next.abandoned) && !first_.failed())
                         co_return prepared;
@@ -1840,10 +2073,7 @@ private:
                       if (
                         !rotation_ || !rotation_->barrier
                         || !rotation_->old_closed || current_file().file
-                        || !next.ready || !next.completion
-                        || next.header_publication.failure.failed()
-                        || next.header_publication.disposition
-                             != local_publication_disposition::durable
+                        || !next.ready || !next.completion || !next.named
                         || before.fields.wal_head != rotation_->old_head
                         || after.wal_head != next.head
                         || rotation_->barrier->boundary().cursor_
@@ -1879,12 +2109,14 @@ private:
                 rotation_.reset();
                 clear_slot(successor_file());
                 ++statistics_.rotations;
+                if (next.ahead) ++statistics_.ahead_rotations;
                 // The limit left room for it, and its incarnation is newer.
                 if (
                   auto named = retained_.extend(cursor.incarnation()); !named) {
                     first_.observe(named.error());
                     co_return runtime::failure(named.error());
                 }
+                prepare_successor();
                 co_return runtime::result<void>{};
             } while (false);
         } catch (...) {
@@ -1950,10 +2182,7 @@ private:
                     -> seastar::future<runtime::result<void>> {
                       if (
                         before.fields.wal_head || before.fields.checkpoint
-                        || !current_file().completion
-                        || current_file().header_publication.failure.failed()
-                        || current_file().header_publication.disposition
-                             != local_publication_disposition::durable
+                        || !current_file().completion || !current_file().named
                         || after.wal_head != current_file().head)
                           co_return runtime::failure(
                             detail::path_error(errc::wrong_context));
@@ -2023,6 +2252,9 @@ private:
             co_return false;
         }
         active_ = true;
+        // A restart's successor waits for the restart to take in what the
+        // WAL's directories hold: see prepare_successor().
+        if (intent_ == wal_start_intent::known_unactivated) prepare_successor();
         co_return true;
     }
     // One new flush of the recovered head through a read-only handle: the
@@ -2192,10 +2424,7 @@ private:
                     -> seastar::future<runtime::result<void>> {
                       if (
                         !recovered_flushed_ || before.fields.wal_head != old
-                        || !current_file().completion
-                        || current_file().header_publication.failure.failed()
-                        || current_file().header_publication.disposition
-                             != local_publication_disposition::durable
+                        || !current_file().completion || !current_file().named
                         || after.wal_head != current_file().head)
                           co_return runtime::failure(
                             detail::path_error(errc::wrong_context));
@@ -2288,6 +2517,8 @@ private:
             if (window == 0) co_return runtime::result<void>{};
             if (zero_.empty())
                 zero_ = detail::make_zero_chunk(write_allocation_);
+            auto staged = reserve_zero_staging(slot);
+            if (!staged) co_return runtime::failure(staged.error());
             // Reserve the whole range first, then zero-write it: otherwise
             // the zero writes fragment the file into many small extents.
             auto reserved = co_await slot.file->allocate(
@@ -2311,6 +2542,323 @@ private:
           auto limited = slot.sync->limit_write_allocation(write_allocation_);
           !limited)
             co_return runtime::failure(limited.error());
+        co_return runtime::result<void>{};
+    }
+
+    // Joins the successor being made ahead, if one is. One caller joins
+    // it, a rotation's or close's; one that comes meanwhile waits for that
+    // one to have joined it.
+    seastar::future<> join_ahead() {
+        while (joining_ahead_)
+            co_await changed_.when();
+        if (!ahead_) co_return;
+        joining_ahead_ = true;
+        try {
+            co_await std::move(*ahead_);
+        } catch (...) {
+            first_.observe(std::current_exception());
+        }
+        ahead_.reset();
+        joining_ahead_ = false;
+        changed_.broadcast();
+    }
+    // The task that makes the successor ahead. What it fails with is no
+    // failure of the WAL: what it made is let go, and the rotation that
+    // comes makes its successor itself, where the same cause, if it stays,
+    // is the WAL's. Only an exception of no family an operation expects is
+    // kept, as itself.
+    seastar::future<> make_ahead() {
+        codec::cooperative_work work{codec::limits::defaults(), ahead_abort_};
+        auto& next = successor_file();
+        runtime::result<void> made{};
+        try {
+            made = co_await prepare_body(next, work);
+        } catch (...) {
+            const auto code = detail::recognized(std::current_exception());
+            if (!code) first_.observe(std::current_exception());
+            made = runtime::failure(
+              code.value_or(detail::path_error(errc::invariant_violation)));
+        }
+        if (made)
+            next.ahead = true;
+        else
+            co_await abandon_body(next);
+        co_await work.drain_inline(work.byte_quantum(), work.item_quantum());
+        changed_.broadcast();
+    }
+    // Makes a file's body ahead of its header: its incarnation, and a spare
+    // or a fresh file zero-written to its window, under a temporary name
+    // beside the name it will take, with both its handles. Nothing names it
+    // and no scan reads it until name_body() writes its header at the
+    // rotation that takes it. A fresh file is written zeros from its start,
+    // so that its header too is written over allocated blocks; a spare keeps
+    // what it holds, of its old life, and is zero-written only where it is
+    // shorter than the window. Allocated incarnations are burned if unused.
+    seastar::future<runtime::result<void>>
+    prepare_body(file_slot& slot, codec::cooperative_work& work) {
+        const auto& spec = control_.spec_;
+        const auto io = control_.limits_;
+        auto& files = control_.files_;
+        if (!slot.preparation) {
+            auto held = budget_.try_reserve(
+              byte_count{
+                io.operation_bytes.value() + io.execution_bytes.value()});
+            if (!held) co_return runtime::failure(held.error());
+            if (auto handles = held->try_acquire_handles(2U); !handles)
+                co_return runtime::failure(handles.error());
+            slot.preparation.emplace(std::move(*held));
+        }
+        auto checked = co_await control_.owner_.validate(spec);
+        if (!checked) co_return checked;
+        if (!slot.incarnation) {
+            // Its header names a predecessor, as every successor's does.
+            const auto layout = local_metadata_layout(
+              local_metadata_kind::wal_descriptor,
+              byte_count{68},
+              byte_count{codec::envelope_prefix_bytes},
+              config_.alignment,
+              work.policy());
+            if (!layout || layout->encoded_bytes() >= config_.capacity_bytes)
+                co_return runtime::failure(
+                  detail::path_error(errc::invalid_argument));
+            if (ids_.busy_ || (ids_.wal_.remaining == 0 && control_.busy_))
+                co_return runtime::failure(
+                  detail::path_error(errc::queue_full));
+            auto id = co_await ids_.allocate_wal(work);
+            if (!id) co_return runtime::failure(id.error());
+            auto path = local_paths::make(spec.root).value().wal(
+              control_.shard_, *id);
+            if (!path) co_return runtime::failure(path.error());
+            const auto name = local_temporary_name(
+              leaf_of(*path), local_publication_generation::make(1).value(), 0);
+            if (!name) co_return runtime::failure(name.error());
+            auto temporary = local_child_path(parent_of(*path), *name);
+            if (!temporary) co_return runtime::failure(temporary.error());
+            slot.incarnation = *id;
+            slot.data_start = runtime::file_position{
+              layout->encoded_bytes().value()};
+            slot.path = std::move(*path);
+            slot.temporary = std::move(*temporary);
+        }
+        if (admission_stopped_)
+            co_return runtime::failure(detail::path_error(errc::closed));
+        const auto parent = parent_of(*slot.path);
+        if (!slot.ancestors_ready) {
+            checked = co_await detail::ensure_local_directory(
+              files, spec, parent_of(parent), leaf_of(parent), work);
+            if (!checked) co_return checked;
+            slot.ancestors_ready = true;
+        }
+        if (admission_stopped_)
+            co_return runtime::failure(detail::path_error(errc::closed));
+        std::uint64_t existing = 0;
+        if (!slot.file) {
+            std::optional<byte_count> taken;
+            {
+                const auto turn = co_await spares_.turn();
+                auto moved = co_await spares_.take(*slot.temporary, work);
+                if (!moved) co_return runtime::failure(moved.error());
+                taken = *moved;
+                if (taken) ++statistics_.spares_taken;
+            }
+            auto opened = co_await files.open(
+              *slot.temporary,
+              {.access = runtime::file_access::read_write,
+               .create = !taken,
+               .exclusive = !taken});
+            if (!opened) co_return runtime::failure(opened.error());
+            slot.file.emplace(std::move(*opened));
+            if (
+              auto limited = slot.file->limit_write_allocation(
+                write_allocation_);
+              !limited)
+                co_return limited;
+            auto geometry = slot.file->geometry();
+            if (
+              !geometry
+              || !geometry->supports_disk_alignment(config_.alignment.bytes()))
+                co_return runtime::failure(
+                  detail::path_error(errc::invalid_argument));
+            // A spare is what its blocks are written to, never past the
+            // capacity: whatever a start took in was no larger.
+            if (taken)
+                existing = std::min(
+                             taken->value(), config_.capacity_bytes.value())
+                           / config_.alignment.bytes().value()
+                           * config_.alignment.bytes().value();
+            slot.zeroed_end = existing;
+        }
+        if (!slot.completion) {
+            auto completion = completion_resources::make(
+              budget_, *slot.file, config_.completion);
+            if (!completion) co_return runtime::failure(completion.error());
+            slot.completion.emplace(std::move(*completion));
+        }
+        if (admission_stopped_)
+            co_return runtime::failure(detail::path_error(errc::closed));
+        if (!slot.sync) {
+            const auto alignment = config_.alignment.bytes().value();
+            const auto limit = config_.capacity_bytes.value();
+            const auto start = slot.data_start.value();
+            const auto window = std::min(
+              config_.preallocation_bytes.value(), limit - start);
+            const auto end = config_.preallocation_bytes.value() == 0
+                               ? 0
+                               : (start + window) / alignment * alignment;
+            if (end > slot.zeroed_end) {
+                if (zero_.empty())
+                    zero_ = detail::make_zero_chunk(write_allocation_);
+                auto staged = reserve_zero_staging(slot);
+                if (!staged) co_return runtime::failure(staged.error());
+                // The whole range first, then its zeros: see preallocate().
+                auto reserved = co_await slot.file->allocate(
+                  runtime::file_position{slot.zeroed_end},
+                  byte_count{end - slot.zeroed_end});
+                if (!reserved) co_return reserved;
+                auto zeroed = co_await detail::zero_fill(
+                  *slot.file, zero_, slot.zeroed_end, end, work);
+                if (!zeroed) co_return zeroed;
+                auto synced = co_await slot.file->flush(
+                  slot.completion->metadata());
+                if (!synced) co_return synced;
+                slot.zeroed_end = end;
+            }
+            slot.zero_begin = start;
+            if (slot.zeroed_end > start) {
+                auto opened = co_await files.open(
+                  *slot.temporary,
+                  {.access = runtime::file_access::read_write,
+                   .synchronous = true});
+                if (!opened) co_return runtime::failure(opened.error());
+                slot.sync.emplace(std::move(*opened));
+                if (
+                  auto limited = slot.sync->limit_write_allocation(
+                    write_allocation_);
+                  !limited)
+                    co_return limited;
+            }
+        }
+        slot.preparation.reset();
+        slot.body = true;
+        co_return runtime::result<void>{};
+    }
+    // What a successor made ahead left once its making failed or stopped:
+    // its handles close and its body is unlinked, with no directory sync,
+    // and neither is the WAL's failure. A body that comes back after a crash
+    // is a temporary a start takes in as a spare or removes.
+    seastar::future<> abandon_body(file_slot& slot) {
+        co_await close_slot(slot, true);
+        if (slot.file || slot.sync) co_return;
+        if (slot.temporary) {
+            try {
+                static_cast<void>(
+                  co_await control_.files_.remove_file(*slot.temporary));
+            } catch (...) {
+                // Unlinked or not, nothing names it.
+                static_cast<void>(detail::recognized_or_rethrown());
+            }
+        }
+        clear_slot(slot);
+    }
+    // At the rotation that takes a body made ahead: its descriptor, naming
+    // `predecessor`, is encoded and written as its header at its start
+    // through the synchronized handle, so that the write is durable when it
+    // completes; then the body takes its own name and its directory is
+    // synced. Only then may the control record pin it. A failed step leaves
+    // it unnamed, or named and unpinned, as an inline preparation's failure
+    // does; nothing is retried here but a refusal for admission, which
+    // changed nothing.
+    seastar::future<runtime::result<void>> name_body(
+      file_slot& slot,
+      local_wal_cursor predecessor,
+      codec::cooperative_work& work) {
+        slot.retryable = false;
+        if (slot.ready) co_return runtime::result<void>{};
+        const auto& spec = control_.spec_;
+        const auto owner = spec.shard_owner(control_.shard_).value();
+        const auto io = control_.limits_;
+        auto& files = control_.files_;
+        if (!slot.named) {
+            auto held = budget_.try_reserve(
+              byte_count{
+                io.operation_bytes.value() + io.execution_bytes.value()});
+            if (!held) {
+                slot.retryable = admission_pressure(held.error());
+                co_return runtime::failure(held.error());
+            }
+            if (!slot.descriptor)
+                slot.descriptor.emplace(
+                  *slot.incarnation,
+                  predecessor,
+                  config_.alignment,
+                  config_.profile,
+                  slot.data_start,
+                  config_.capacity_bytes);
+            const auto header = local_metadata_header::make(
+                                  local_metadata_kind::wal_descriptor,
+                                  owner,
+                                  local_publication_generation::make(1).value())
+                                  .value();
+            const local_metadata_payload payload{*slot.descriptor};
+            auto encoded = co_await encode_local_metadata(
+              {header, config_.alignment},
+              payload,
+              work,
+              io.operation_bytes,
+              io.charge);
+            if (!encoded)
+                co_return runtime::failure(
+                  detail::path_error(encoded.error().code()));
+            if (encoded->bytes.size().value() != slot.data_start.value())
+                co_return runtime::failure(
+                  detail::path_error(errc::invariant_violation));
+            slot.head.emplace(*slot.incarnation, encoded->digest);
+            auto& through = slot.sync ? *slot.sync : *slot.file;
+            auto written = co_await through.write(
+              runtime::file_position{}, std::move(encoded->bytes));
+            if (!written) co_return runtime::failure(written.error());
+            if (written->value() != slot.data_start.value())
+                co_return runtime::failure(
+                  detail::path_error(errc::io_failure));
+            if (!slot.sync) {
+                auto synced = co_await slot.file->flush(
+                  slot.completion->metadata());
+                if (!synced) co_return synced;
+            }
+            if (slot.temporary) {
+                auto renamed = co_await files.rename(
+                  *slot.temporary,
+                  *slot.path,
+                  runtime::file_rename_policy::no_replace);
+                if (!renamed) co_return renamed;
+                slot.temporary.reset();
+            }
+            const auto parent = parent_of(*slot.path);
+            if (
+              auto inspected = co_await inspect_local_path(
+                files, spec.root, parent, runtime::file_kind::directory, work);
+              !inspected)
+                co_return inspected;
+            auto opened = co_await files.open_directory(parent);
+            if (!opened) co_return runtime::failure(opened.error());
+            auto directory = std::move(*opened);
+            runtime::first_failure failed;
+            try {
+                failed.observe(co_await directory.sync());
+            } catch (...) {
+                failed.observe(std::current_exception());
+            }
+            try {
+                failed.observe(co_await directory.close());
+            } catch (...) {
+                failed.observe(std::current_exception());
+            }
+            if (auto done = detail::settled(failed); !done) co_return done;
+            slot.named = true;
+        }
+        slot.verified = true;
+        slot.body = false;
+        slot.ready = true;
         co_return runtime::result<void>{};
     }
 
@@ -2354,6 +2902,14 @@ private:
         seastar::abort_source abort;
         codec::cooperative_work work{codec::limits::defaults(), abort};
         runtime::first_failure failed;
+        // Only speed depends on an extension: one the budget cannot stage
+        // now is tried again later.
+        auto staged = reserve_zero_staging(slot);
+        if (!staged) {
+            extending_ = false;
+            changed_.broadcast();
+            co_return;
+        }
         try {
             failed.observe(
               co_await detail::zero_fill(*slot.file, zero_, begin, end, work));
@@ -2389,6 +2945,7 @@ private:
     allocator_type& ids_;
     workload_budget& budget_;
     wal_writer_config config_;
+    local_spares<Backend, model::wal_incarnation_id> spares_;
     byte_count write_allocation_;
     seastar::lw_shared_ptr<wal_captured_boundary::lifetime> lifetime_;
     detail::wal_descriptor_queue inflight_;
@@ -2405,6 +2962,11 @@ private:
     seastar::condition_variable changed_;
     seastar::promise<> dispatcher_started_;
     std::optional<seastar::future<>> dispatcher_;
+    // The successor being made ahead, joined by the rotation that takes it
+    // and by close, which aborts its work.
+    std::optional<seastar::future<>> ahead_;
+    bool joining_ahead_{false};
+    seastar::abort_source ahead_abort_;
     // Background extension of the current file's zero-written range, joined
     // by the dispatcher; it holds the ordinary-write slot while running.
     std::optional<seastar::future<>> extension_;

@@ -1,9 +1,11 @@
 #pragma once
 
+#include "src/storage/local_metadata_layout.h"
 #include "src/storage/recovery_inventory.h"
 #include "src/storage/recovery_plan.h"
 #include "src/storage/recovery_publication.h"
 #include "src/storage/recovery_seal.h"
+#include "src/storage/retry_lookup.h"
 #include "src/storage/sparse_index.h"
 #include "src/storage/tests/retry_test_support.h"
 #include "src/storage/tests/segment_scan_contract.h"
@@ -12,8 +14,10 @@
 #include <seastar/util/alloc_failure_injector.hh>
 
 #include <algorithm>
+#include <array>
 #include <bit>
 #include <limits>
+#include <span>
 #include <string>
 #include <string_view>
 #include <type_traits>
@@ -21,6 +25,7 @@
 
 namespace kwaque::storage::testing::recovery_contract {
 using installation_contract::descriptor;
+using installation_contract::origin;
 using installation_contract::segment;
 using installation_contract::segment_head;
 using reader_contract::active_boundary;
@@ -31,6 +36,7 @@ using reader_contract::wal;
 using scan_contract::descriptor_b;
 using scan_contract::head_control;
 using scan_contract::interleaved;
+using scan_contract::origin_b;
 using scan_contract::seed_targets;
 using scan_contract::segment_b;
 using scan_contract::segment_head_b;
@@ -50,6 +56,7 @@ inline recovery_target target_a(
     return {
       descriptor(),
       segment_head(),
+      origin(),
       state,
       local_publication_generation::make(generation).value(),
       pin};
@@ -58,6 +65,7 @@ inline recovery_target target_b() {
     return {
       descriptor_b(),
       segment_head_b(),
+      origin_b(),
       local_object_state::active,
       local_publication_generation::make(1).value(),
       std::nullopt};
@@ -75,18 +83,25 @@ inline std::string segment_b_bytes() {
            + local_fixture::read("block_b1") + local_fixture::read("footer_b");
 }
 // A PREPARE of the head file wal(1), independently framed as the fixtures
-// are.
+// are: it ends its write, at `append_time`, and its stamps say how far a
+// barrier of its target and of the WAL had reached, by default their data
+// starts, which certify nothing. A segment's first request is appended at
+// 1 ns, every later one at 2 ns.
 inline std::string prepare_at(
   std::string child,
   std::uint64_t wal_position,
   segment_context target,
   std::uint64_t physical,
-  std::uint64_t position) {
+  std::uint64_t position,
+  std::int64_t append_time = 1,
+  std::uint64_t certified = 4096,
+  std::uint64_t wal_certified = 4096) {
     return wal_wire(
       std::move(child),
       {wal_write_context::make(
          wal(1), alignment(4096), runtime::file_position{wal_position})
          .value(),
+       runtime::file_position{4096},
        segment_write_context::make(
          target,
          alignment(4096),
@@ -95,7 +110,13 @@ inline std::string prepare_at(
          .value(),
        runtime::file_position{4096},
        model::range_routing_epoch::make(1).value(),
-       batch_expected()});
+       batch_expected()},
+      32,
+      wal_prepare_stamps{
+        true,
+        runtime::wall_time{append_time},
+        runtime::file_position{certified},
+        runtime::file_position{wal_certified}});
 }
 
 inline std::string name(const segment_context& value) {
@@ -163,6 +184,7 @@ inline std::string describe(const recovery_item& item) {
                      + " " + verdict_name(value.verdict)
                      + " sat=" + number(value.satisfied)
                      + " fo=" + number(value.footer_only)
+                     + " mat=" + number(value.materialize)
                      + " cand=" + number(value.candidates)
                      + " suf=" + number(value.suffix)
                      + " conf=" + number(value.conflicts)
@@ -206,14 +228,15 @@ seastar::future<runtime::result<recovery_merge_result>> merge(
   Owner& owner,
   const local_device_spec& spec,
   workload_budget& budget,
-  std::span<const recovery_target> targets,
+  table_view<recovery_target> targets,
   std::vector<std::string>& out,
   Driver drive,
   std::uint32_t cursors = 2,
   std::optional<recovery_resume> resume = std::nullopt,
   std::size_t stop_after = std::numeric_limits<std::size_t>::max(),
   const local_shard_control& control = head_control(),
-  recovery_planner* planner = nullptr) {
+  recovery_planner* planner = nullptr,
+  recovery_tails* tails = nullptr) {
     seastar::abort_source abort;
     codec::cooperative_work work{codec::limits::defaults(), abort};
     const std::array specs{spec};
@@ -231,7 +254,8 @@ seastar::future<runtime::result<recovery_merge_result>> merge(
       merge_limits(cursors),
       work,
       record{&out, planner, stop_after, &seen},
-      resume));
+      resume,
+      tails));
 }
 
 // A3's PREPARE, with the later fixtures.
@@ -294,7 +318,7 @@ seastar::future<> merge_pass(
       prepare_at(local_fixture::read("child_a1"), 4096, segment(), 0, 4096)
           == local_fixture::read("prepare_a1")
         && prepare_at(
-             local_fixture::read("child_a2"), 12288, segment(), 1, 8192)
+             local_fixture::read("child_a2"), 12288, segment(), 1, 4495, 2)
              == local_fixture::read("prepare_a2"),
       "PREPAREs are not framed as the fixtures");
     co_await write_bytes(files, data_path(spec, segment()), active_a(), drive);
@@ -305,14 +329,14 @@ seastar::future<> merge_pass(
     const std::vector<std::string> expected{
       "region wal1 4096-16384 @content",
       "slot A 4096 @satisfied w4096",
-      "slot A 8192 @satisfied w12288",
-      "region A 4096-16384 @content",
-      "segment A boundary=12288 end clean sat=2 fo=0 cand=0 suf=0 conf=0 "
-      "unres=0",
+      "slot A 4495 @satisfied w12288",
+      "region A 4096-8192 @content",
+      "segment A boundary=4894 end clean sat=2 fo=0 mat=0 cand=0 suf=0 "
+      "conf=0 unres=0",
       "slot B 4096 @satisfied w8192",
-      "region B 4096-12288 @content",
-      "segment B boundary=8192 end clean sat=1 fo=0 cand=0 suf=0 conf=0 "
-      "unres=0",
+      "region B 4096-8192 @content",
+      "segment B boundary=4535 end clean sat=1 fo=0 mat=0 cand=0 suf=0 "
+      "conf=0 unres=0",
       "obligation A sat=2 pinned=0",
       "obligation B sat=1 pinned=0"};
     std::vector<std::string> out;
@@ -383,7 +407,8 @@ seastar::future<> merge_pass(
 
     // A full queue runs its walk during the scan. With B first in target
     // order and one walk open, B's walk closes A's, and A's reopens at its
-    // last verified footer: only the reload count differs.
+    // last verified footer: only the reload count differs. Two walks and
+    // the most a merge keeps open both hold A and B without a reload.
     co_await write_bytes(
       files,
       data_path(spec, segment()),
@@ -393,42 +418,44 @@ seastar::future<> merge_pass(
     const std::array reordered{target_b(), target_a()};
     const auto control = head_control();
     const std::array specs{spec};
-    std::array<std::vector<std::string>, 2> served;
-    std::array<std::uint32_t, 2> reloads{};
-    for (const std::uint32_t cursors : {1U, 2U}) {
+    constexpr std::array widths{1U, 2U, maximum_recovery_cursors};
+    std::array<std::vector<std::string>, widths.size()> served;
+    std::array<std::uint32_t, widths.size()> reloads{};
+    for (std::size_t w = 0; w != widths.size(); ++w) {
+        const auto cursors = widths[w];
         seastar::abort_source abort;
         codec::cooperative_work work{codec::limits::defaults(), abort};
         auto limits = merge_limits(cursors);
         limits.pending = 2;
         std::size_t seen = 0;
-        auto& out = served[cursors - 1];
-        reloads[cursors - 1] = take(
-                                 co_await drive.lifecycle(
-                                   reconcile_local_recovery(
-                                     files,
-                                     owner,
-                                     std::span<const local_device_spec>{specs},
-                                     spec,
-                                     0,
-                                     control,
-                                     std::nullopt,
-                                     reordered,
-                                     budget,
-                                     limits,
-                                     work,
-                                     record{
-                                       &out,
-                                       nullptr,
-                                       std::numeric_limits<std::size_t>::max(),
-                                       &seen})))
-                                 .reloads;
+        auto& out = served[w];
+        reloads[w] = take(
+                       co_await drive.lifecycle(reconcile_local_recovery(
+                         files,
+                         owner,
+                         std::span<const local_device_spec>{specs},
+                         spec,
+                         0,
+                         control,
+                         std::nullopt,
+                         reordered,
+                         budget,
+                         limits,
+                         work,
+                         record{
+                           &out,
+                           nullptr,
+                           std::numeric_limits<std::size_t>::max(),
+                           &seen})))
+                       .reloads;
     }
     require(
-      served[0] == served[1] && reloads[0] == 1 && reloads[1] == 0
+      served[0] == served[1] && served[0] == served[2] && reloads[0] == 1
+        && reloads[1] == 0 && reloads[2] == 0
         && std::count_if(
              served[0].begin(),
              served[0].end(),
-             [](const auto& line) { return line.starts_with("slot A 16384 "); })
+             [](const auto& line) { return line.starts_with("slot A 8192 "); })
              == 1,
       "a walk closed by another changed the merge or was not reopened");
 }
@@ -461,17 +488,17 @@ seastar::future<> merge_cases(
         active_a(),
         header
           + prepare_at(
-            local_fixture::read("child_a2"), 4096, segment(), 1, 8192)
+            local_fixture::read("child_a2"), 4096, segment(), 1, 4495, 2)
           + prepare_at(
             local_fixture::read("child_a1"), 8192, segment(), 0, 4096),
         std::nullopt,
         local_object_state::active,
         {"slot A 4096 @block_out_of_order w8192",
          "slot A 4096 @footer_only",
-         "slot A 8192 @satisfied w4096",
-         "region A 4096-16384 @content",
-         "segment A boundary=12288 end clean sat=1 fo=1 cand=0 suf=0 conf=1 "
-         "unres=0"},
+         "slot A 4495 @satisfied w4096",
+         "region A 4096-8192 @content",
+         "segment A boundary=4894 end clean sat=1 fo=1 mat=0 cand=0 suf=0 "
+         "conf=1 unres=0"},
         "a non-increasing target was not a conflict"},
       // Slots inside the pinned footer's history get a layout check only.
       merge_case{
@@ -480,10 +507,10 @@ seastar::future<> merge_cases(
         active_boundary(),
         local_object_state::active,
         {"slot A 4096 @satisfied_pinned w4096",
-         "slot A 8192 @satisfied_pinned w12288",
-         "region A 4096-16384 @content",
-         "segment A boundary=12288 end clean sat=2 fo=0 cand=0 suf=0 conf=0 "
-         "unres=0"},
+         "slot A 4495 @satisfied_pinned w12288",
+         "region A 4096-8192 @content",
+         "segment A boundary=4894 end clean sat=2 fo=0 mat=0 cand=0 suf=0 "
+         "conf=0 unres=0"},
         "pinned evidence was scanned again"},
       // A sealed extent is cold: its root pins every slot below it.
       merge_case{
@@ -492,49 +519,110 @@ seastar::future<> merge_cases(
         sealed_boundary(),
         local_object_state::sealed,
         {"slot A 4096 @satisfied_pinned w4096",
-         "slot A 8192 @satisfied_pinned w12288",
-         "segment A boundary=- cold clean sat=2 fo=0 cand=0 suf=0 conf=0 "
-         "unres=0"},
+         "slot A 4495 @satisfied_pinned w12288",
+         "segment A boundary=- cold clean sat=2 fo=0 mat=0 cand=0 suf=0 "
+         "conf=0 unres=0"},
         "a sealed extent was read or its slots lost"},
-      // No surviving block: both PREPAREs are candidates.
+      // No block was ever written: each PREPARE fills its slot past the
+      // file's end, and the footer that closes their run is derived.
       merge_case{
         header_a,
         interleaved(),
         std::nullopt,
         local_object_state::active,
-        {"slot A 4096 @candidate w4096",
-         "slot A 8192 @candidate w12288",
-         "segment A boundary=- end clean sat=0 fo=0 cand=2 suf=0 conf=0 "
-         "unres=0"},
-        "PREPAREs without blocks were not candidates"},
-      // A1's block survives without a footer, then zeros: an unresolved
-      // suffix with its source, a candidate and an uncertified tail.
+        {"slot A 4096 @materialize w4096",
+         "slot A 4495 @materialize w12288",
+         "region A 4096-8192 @materialized",
+         "segment A boundary=4894 end clean sat=0 fo=0 mat=2 cand=0 suf=0 "
+         "conf=0 unres=0"},
+        "PREPAREs whose blocks were never written were not filled"},
+      // A1's block survives without a footer, then zeros to the end of its
+      // unit: A1 is taken, A2 filled from its PREPARE, and the footer that
+      // closes them derived where the zeros begin after A2.
       merge_case{
-        header_a + local_fixture::read("block_a1") + std::string(4096, '\0'),
+        header_a + local_fixture::read("block_a1")
+          + std::string(8192 - 4495, '\0'),
         interleaved(),
         std::nullopt,
         local_object_state::active,
-        {"slot A 4096 @suffix_sourced w4096",
+        {"region A 4096-4495 @content",
+         "slot A 4096 @adopt w4096",
+         "slot A 4495 @materialize w12288",
+         "region A 4495-8192 @materialized",
+         "segment A boundary=4894 end clean sat=0 fo=0 mat=2 cand=0 suf=0 "
+         "conf=0 unres=0"},
+        "a block before damage and a lost one were not published"},
+      // A1's PREPARE did not survive: its block, intact with no footer
+      // after it, is a suffix no footer may be derived over, so A2's slot
+      // after it is not filled and A2 stays a candidate.
+      merge_case{
+        header_a + local_fixture::read("block_a1")
+          + std::string(8192 - 4495, '\0'),
+        header
+          + prepare_at(
+            local_fixture::read("child_a2"), 4096, segment(), 1, 4495, 2)
+          + local_fixture::read("prepare_b1"),
+        std::nullopt,
+        local_object_state::active,
+        {"region A 4096-4495 @content",
+         "slot A 4495 @candidate w4096",
+         "slot A 4096 @suffix_unsourced",
+         "region A 4495-8192 @uncertified_tail",
+         "segment A boundary=- unwritten tail sat=0 fo=0 mat=0 cand=1 suf=1 "
+         "conf=0 unres=0"},
+        "a PREPARE after a block without its own was filled"},
+      // A WAL-placed A1, a segment-placed group lost with its footer and
+      // A1's run footer, then a WAL-placed request in the next unit: A1's
+      // run is closed by the footer derived after it, and the request after
+      // the lost group, which its slot cannot continue, stays a candidate.
+      merge_case{
+        header_a + local_fixture::read("block_a1")
+          + std::string(8192 - 4495, '\0'),
+        header + local_fixture::read("prepare_a1")
+          + local_fixture::read("prepare_b1")
+          + prepare_at(data_child(102), 12288, segment(), 2, 8192, 2),
+        std::nullopt,
+        local_object_state::active,
+        {"region A 4096-4495 @content",
+         "slot A 4096 @adopt w4096",
          "slot A 8192 @candidate w12288",
-         "region A 4096-8192 @content",
-         "region A 8192-12288 @uncertified_tail",
-         "segment A boundary=- unwritten tail sat=0 fo=0 cand=1 suf=1 conf=0 "
-         "unres=0"},
-        "a suffix before damage was not classified"},
+         "region A 4495-8192 @materialized",
+         "segment A boundary=4495 end clean sat=0 fo=0 mat=1 cand=1 suf=0 "
+         "conf=0 unres=0"},
+        "a run before a lost group was not closed, or a slot after it filled"},
+      // A segment-placed group, certified and then damaged: a later
+      // PREPARE's target stamp says a barrier had covered it, and nothing
+      // fills it, so the segment is proven corrupt.
+      merge_case{
+        segment_scan_contract::active_a().substr(0, 4495)
+          + std::string(4894 - 4495, '\0')
+          + segment_scan_contract::active_a().substr(4894)
+          + std::string(4096, '\0'),
+        header + prepare_at(data_child(102), 4096, segment(), 2, 8192, 2, 8192)
+          + local_fixture::read("prepare_b1"),
+        std::nullopt,
+        local_object_state::active,
+        {"region A 4096-4495 @content",
+         "slot A 8192 @candidate w4096",
+         "slot A 4096 @suffix_unsourced",
+         "region A 4495-12288 @corruption",
+         "segment A boundary=- unwritten corrupt sat=0 fo=0 mat=0 cand=1 "
+         "suf=1 conf=0 unres=0"},
+        "certified damage a later stamp proves was not corruption"},
       // A PREPARE naming the slot a verified footer occupies.
       merge_case{
         active_a(),
         header + local_fixture::read("prepare_a1")
           + prepare_at(
-            local_fixture::read("child_a2"), 8192, segment(), 1, 12288),
+            local_fixture::read("child_a2"), 8192, segment(), 1, 4894, 2),
         std::nullopt,
         local_object_state::active,
         {"slot A 4096 @satisfied w4096",
-         "slot A 8192 @footer_only",
-         "slot A 12288 @covered_misplaced w8192",
-         "region A 4096-16384 @content",
-         "segment A boundary=12288 end clean sat=1 fo=1 cand=0 suf=0 conf=1 "
-         "unres=0"},
+         "slot A 4495 @footer_only",
+         "slot A 4894 @covered_misplaced w8192",
+         "region A 4096-8192 @content",
+         "segment A boundary=4894 end clean sat=1 fo=1 mat=0 cand=0 suf=0 "
+         "conf=1 unres=0"},
         "a PREPARE naming a footer's slot was not a conflict"},
     };
     for (const auto& test : cases) {
@@ -554,33 +642,46 @@ seastar::future<> merge_cases(
           (co_await read_bytes(files, a, drive)) == test.segment_a,
           "merging changed segment bytes");
     }
-    // The same request encoded differently at A2's slot: the merge compares
-    // the two copies' exact children and reports them differing.
+    // The same request encoded differently at A2's slot, under the footer
+    // that names it there: the merge compares the two copies' exact children
+    // and reports them differing.
+    const auto block_a1 = local_fixture::read("block_a1");
+    const auto compressed = block_a(101, 1, 4495, true, 2);
+    const auto footer_at = 4495 + compressed.size();
     co_await write_bytes(
       files,
       a,
-      header_a + local_fixture::read("block_a1") + block_a(101, 1, 8192, true)
-        + local_fixture::read("footer_a"),
+      header_a + block_a1 + compressed
+        + footer_wire(
+          {scope(100, 102, 0, 2, 4096, footer_at),
+           2,
+           scope(101, 102, 1, 2, 4495, footer_at),
+           segment_scan_contract::times_a(),
+           crc(block_a1 + compressed)},
+          {segment_scan_contract::history_a(),
+           runtime::file_position{footer_at}}),
       drive);
     co_await put_wal(files, spec, wal(1), interleaved(), drive);
     const std::array targets{target_a(), target_b()};
     std::vector<std::string> out;
     take(co_await merge(files, owner, spec, budget, targets, out, drive));
     require(
-      std::ranges::find(out, "slot A 8192 @differing_copies w12288")
+      std::ranges::find(out, "slot A 4495 @differing_copies w12288")
         != out.end(),
       "differing copies of one slot were not compared");
 }
 
+// With `tails`, what the plan's publication writes first is kept there.
 template<typename Backend, typename Owner, typename Driver>
 seastar::future<recovery_planner> plan(
   Backend& files,
   Owner& owner,
   const local_device_spec& spec,
   workload_budget& budget,
-  std::span<const recovery_target> targets,
+  table_view<recovery_target> targets,
   Driver drive,
-  const local_shard_control& control = head_control()) {
+  const local_shard_control& control = head_control(),
+  recovery_tails* tails = nullptr) {
     auto planner = take(recovery_planner::make(targets, budget));
     std::vector<std::string> out;
     auto merged = take(
@@ -596,7 +697,8 @@ seastar::future<recovery_planner> plan(
         std::nullopt,
         std::numeric_limits<std::size_t>::max(),
         control,
-        &planner));
+        &planner,
+        tails));
     take(planner.finish(merged));
     co_return std::move(planner);
 }
@@ -606,17 +708,53 @@ seastar::future<recovery_planner> plan(
 // head's content ends at its first damage and a successor continues after it,
 // later intact PREPAREs stay uncertified survivals, and damage below
 // certification stops instead of becoming a shorter history.
-template<typename Backend, typename Owner, typename Driver>
+template<
+  typename Backend,
+  typename Owner,
+  typename Driver,
+  typename Reads = store_contract::uncounted_reads,
+  typename Writes = store_contract::uncounted_writes>
 seastar::future<> plan_cases(
   Backend& files,
   Owner& owner,
   const local_device_spec& spec,
   workload_budget& budget,
-  Driver drive) {
+  Driver drive,
+  Reads reads = {},
+  Writes writes = {}) {
     co_await seed_targets(files, owner, spec, budget, drive);
     const auto a = data_path(spec, segment());
     const auto wal_path = take(
       take(local_paths::make(spec.root)).wal(0, wal(1)));
+    // Planning writes nothing. Its WAL scan reads the head's first envelope
+    // in one bounded read and what follows the header twice (a first pass
+    // finds the last whole write), and its proving walk reads each PREPARE
+    // it substitutes once: no WAL byte is read more than once a pass.
+    const auto wal_header = local_fixture::read("wal_header").size();
+    const auto counted_plan =
+      [&](auto&&... args) -> seastar::future<recovery_planner> {
+        const auto size
+          = take(co_await drive.lifecycle(files.stat(wal_path))).size.value();
+        const auto read_before = reads(wal_path);
+        const auto written_before = writes();
+        auto planned = co_await plan(args...);
+        const auto read_after = reads(wal_path);
+        const auto written_after = writes();
+        require(
+          !written_before || *written_after == *written_before,
+          "planning wrote to the store");
+        if (read_before && read_after) {
+            const auto first = std::min(
+              {size,
+               local_metadata_first_read_bytes.value(),
+               store_contract::limits().operation_bytes.value()});
+            require(
+              *read_after - *read_before
+                <= first + 3 * (size > wal_header ? size - wal_header : 0),
+              "planning read a WAL byte more than once a pass");
+        }
+        co_return planned;
+    };
     co_await write_bytes(files, a, active_a(), drive);
     co_await write_bytes(
       files, data_path(spec, segment_b()), segment_b_bytes(), drive);
@@ -645,7 +783,8 @@ seastar::future<> plan_cases(
     auto truncated = interleaved();
     truncated.resize(truncated.size() - 4);
     co_await put_wal(files, spec, wal(1), truncated, drive);
-    auto planned = co_await plan(files, owner, spec, budget, targets, drive);
+    auto planned = co_await counted_plan(
+      files, owner, spec, budget, targets, drive);
     expect(
       planned,
       recovery_plan_action::activate_successor,
@@ -664,7 +803,7 @@ seastar::future<> plan_cases(
     // A PREPARE's checksummed bytes end where its child does; the rest of its
     // aligned slot is zero padding. A tear must land before that end.
     const auto payload = [](std::string_view prepare) {
-        return 32 + 136 + get(prepare, 32 + 128, 4);
+        return 32 + 168 + get(prepare, 32 + 160, 4);
     };
     const auto a2_payload = payload(local_fixture::read("prepare_a2"));
     const auto b1_payload = payload(local_fixture::read("prepare_b1"));
@@ -676,7 +815,7 @@ seastar::future<> plan_cases(
     auto torn = interleaved();
     std::fill(torn.begin() + 12288 + 256, torn.end(), '\0');
     co_await put_wal(files, spec, wal(1), torn, drive);
-    planned = co_await plan(files, owner, spec, budget, targets, drive);
+    planned = co_await counted_plan(files, owner, spec, budget, targets, drive);
     expect(
       planned,
       recovery_plan_action::activate_successor,
@@ -697,7 +836,7 @@ seastar::future<> plan_cases(
     require(
       merged.wal.content_end
         && merged.wal.content_end->position().value() == 8192
-        && std::find(out.begin(), out.end(), "slot A 8192 @footer_only")
+        && std::find(out.begin(), out.end(), "slot A 4495 @footer_only")
              != out.end()
         && std::find(out.begin(), out.end(), "slot B 4096 @footer_only")
              != out.end()
@@ -705,7 +844,7 @@ seastar::future<> plan_cases(
              out.begin(), out.end(), "region wal1 8192-16384 @uncertified_tail")
              != out.end(),
       "a PREPARE after the head's first damage became evidence");
-    planned = co_await plan(files, owner, spec, budget, targets, drive);
+    planned = co_await counted_plan(files, owner, spec, budget, targets, drive);
     expect(
       planned,
       recovery_plan_action::activate_successor,
@@ -717,11 +856,42 @@ seastar::future<> plan_cases(
       (co_await read_bytes(files, wal_path, drive)) == middle,
       "planning changed the damaged head");
 
+    // Damage below what a later intact PREPARE's WAL stamp proves the head
+    // had certified is proven corruption: nothing may change.
+    auto proven = interleaved();
+    proven[8192 + 24] ^= 1;
+    proven.replace(
+      12288,
+      4096,
+      prepare_at(
+        local_fixture::read("child_a2"),
+        12288,
+        segment(),
+        1,
+        4495,
+        2,
+        4096,
+        12288));
+    co_await put_wal(files, spec, wal(1), proven, drive);
+    out.clear();
+    take(co_await merge(files, owner, spec, budget, targets, out, drive));
+    require(
+      std::find(out.begin(), out.end(), "region wal1 8192-16384 @corruption")
+        != out.end(),
+      "head damage a later stamp proves certified was not corruption");
+    planned = co_await counted_plan(files, owner, spec, budget, targets, drive);
+    require(
+      planned.wal().action == recovery_plan_action::stop
+        && planned.wal().reason == recovery_plan_reason::corruption
+        && !planned.ready()
+        && (co_await read_bytes(files, wal_path, drive)) == proven,
+      "proven head corruption became a plan or changed the head");
+
     // The same damage inside a rotated file's sealed prefix is proven
     // corruption: nothing may change.
     co_await put_wal(
       files, spec, wal(9), local_fixture::read("wal_successor_gap"), drive);
-    planned = co_await plan(
+    planned = co_await counted_plan(
       files, owner, spec, budget, targets, drive, chain_control());
     require(
       planned.wal().action == recovery_plan_action::stop
@@ -732,10 +902,11 @@ seastar::future<> plan_cases(
 
     // Damage to the pinned footer is proven corruption of that segment.
     auto pinned = active_a();
-    pinned[12288 + 40] ^= 1;
+    pinned[4894 + 40] ^= 1;
     co_await write_bytes(files, a, pinned, drive);
     const std::array pinned_targets{target_a(active_boundary()), target_b()};
-    planned = co_await plan(files, owner, spec, budget, pinned_targets, drive);
+    planned = co_await counted_plan(
+      files, owner, spec, budget, pinned_targets, drive);
     require(
       planned.segments()[0].action == recovery_plan_action::stop
         && planned.segments()[0].reason == recovery_plan_reason::corruption
@@ -747,25 +918,55 @@ seastar::future<> plan_cases(
       (co_await read_bytes(files, a, drive)) == pinned,
       "planning changed a damaged segment");
 
-    // An uncertified segment tail keeps its candidates; the plan publishes the
-    // recovered boundary and never truncates the suffix.
+    // A segment tail the WAL fills: A1 is taken, A2 written from its
+    // PREPARE and the footer closing them derived, and the plan publishes
+    // that footer. The zeros after it stay an uncertified tail.
     const auto tail = local_fixture::read("data_header_a")
                       + local_fixture::read("block_a1")
                       + std::string(4096, '\0');
     co_await write_bytes(files, a, tail, drive);
-    planned = co_await plan(files, owner, spec, budget, targets, drive);
+    planned = co_await counted_plan(files, owner, spec, budget, targets, drive);
+    require(
+      planned.segments()[0].action == recovery_plan_action::publish_recovering
+        && planned.segments()[0].boundary == active_boundary()
+        && planned.segments()[0].recovered_end.value() == 102
+        && planned.segments()[0].materialized == 2
+        && planned.segments()[0].repaired == 0
+        && planned.segments()[0].candidates == 0
+        && planned.segments()[0].suffix == 0
+        && planned.segments()[0].uncertified_tail && planned.ready(),
+      "a tail the WAL fills was not planned for publication");
+    require(
+      (co_await read_bytes(files, a, drive)) == tail,
+      "planning wrote the tail it fills");
+    // Without A1's PREPARE nothing after its block is filled: the uncertified
+    // tail keeps its candidate and suffix, and the plan publishes no footer
+    // and never truncates them.
+    co_await put_wal(
+      files,
+      spec,
+      wal(1),
+      local_fixture::read("wal_header")
+        + prepare_at(
+          local_fixture::read("child_a2"), 4096, segment(), 1, 4495, 2)
+        + local_fixture::read("prepare_b1"),
+      drive);
+    planned = co_await counted_plan(files, owner, spec, budget, targets, drive);
     require(
       planned.segments()[0].action == recovery_plan_action::publish_recovering
         && !planned.segments()[0].boundary
+        && planned.segments()[0].materialized == 0
         && planned.segments()[0].candidates == 1
         && planned.segments()[0].suffix == 1 && planned.ready(),
       "an uncertified tail was not kept for resolution");
+    co_await put_wal(files, spec, wal(1), interleaved(), drive);
     // A recovering segment already pinned at its recovered boundary needs no
     // new publication.
     co_await write_bytes(files, a, active_a(), drive);
     const std::array recovering{
       target_a(active_boundary(), local_object_state::recovering), target_b()};
-    planned = co_await plan(files, owner, spec, budget, recovering, drive);
+    planned = co_await counted_plan(
+      files, owner, spec, budget, recovering, drive);
     require(
       planned.segments()[0].action == recovery_plan_action::retain
         && planned.segments()[0].boundary == active_boundary(),
@@ -802,7 +1003,7 @@ seastar::future<> plan_cases(
       "an unsupported PREPARE was planned over");
 }
 
-// A recovered seal of these tests seals no completion facts.
+// A seal these tests refuse before it reads a fact.
 struct no_facts final {
     seastar::future<runtime::result<std::vector<completed_retry>>>
     read(std::uint32_t, std::uint32_t, codec::cooperative_work&) {
@@ -829,27 +1030,130 @@ inline local_wal_cursor cursor(std::uint64_t position) {
 }
 // The sealed root an independent builder places at `end` over the blocks and
 // footers before it.
+// The completed fact a seal derives from an assigned child: its identity,
+// digest, binding and span as the child carries them, acknowledged in its
+// own generation.
+inline completed_retry fact_of(std::string_view child) {
+    const auto number = [child](std::size_t offset) {
+        std::uint64_t value = 0;
+        for (std::size_t i = 0; i != 8; ++i)
+            value |= std::uint64_t{static_cast<unsigned char>(
+                       child[32 + offset + i])}
+                     << (8U * i);
+        return value;
+    };
+    const auto bytes = [child](std::size_t offset) {
+        std::array<std::uint8_t, 16> value{};
+        for (std::size_t i = 0; i != value.size(); ++i)
+            value[i] = static_cast<std::uint8_t>(child[32 + offset + i]);
+        return value;
+    };
+    codec::content_digest digest{};
+    for (std::size_t i = 0; i != digest.size(); ++i)
+        digest[i] = static_cast<unsigned char>(child[32 + 104 + i]);
+    const auto generation = model::segment_generation::make(number(96)).value();
+    return completed_retry::make(
+             model::batch_id::make(
+               model::producer_id::make(bytes(0)).value(),
+               model::producer_epoch::make(number(16)).value(),
+               model::producer_stream_id::make(number(24)).value(),
+               model::batch_sequence{number(32)})
+               .value(),
+             codec::semantic_batch_digest{digest},
+             model::producer_stream_binding::make(
+               model::topic_id::make(bytes(40)).value(),
+               model::range_id::make(bytes(56)).value(),
+               model::range_routing_epoch::make(number(72)).value(),
+               model::segment_id::make(bytes(80)).value(),
+               generation)
+               .value(),
+             model::range_logical_span::from_count(
+               model::range_logical_end{number(168)},
+               model::range_logical_count{number(176) - number(168)})
+               .value(),
+             generation)
+      .value();
+}
+// The children of segment A's first `count` blocks, A1 to A4.
+inline std::vector<std::string> children_a(std::size_t count) {
+    std::vector<std::string> children{
+      local_fixture::read("child_a1"),
+      local_fixture::read("child_a2"),
+      data_child(102),
+      data_child(103)};
+    children.resize(count);
+    return children;
+}
+// The retry bundle of a seal of segment A at `end` whose blocks carry these
+// children: one page of their facts, one stream's in block order, and
+// nothing for no block.
+inline std::string
+retry_bundle_a(std::uint64_t end, std::span<const std::string> children) {
+    if (children.empty()) return {};
+    std::vector<completed_retry> facts;
+    facts.reserve(children.size());
+    for (const auto& child : children)
+        facts.push_back(fact_of(child));
+    return retry_page_wire(
+      facts, {segment_scan_contract::history_a(), runtime::file_position{end}});
+}
+// The sealed root of segment A at `end` over these blocks' children, which
+// names the page of their facts.
 inline std::string sealed_root(
   std::uint64_t end,
   std::string_view extent,
   storage::coverage covered,
-  std::uint32_t blocks,
-  storage::coverage last) {
+  storage::coverage last,
+  std::span<const std::string> children) {
+    const auto blocks = static_cast<std::uint32_t>(children.size());
+    // A1 is stamped at 1 ns and every later block at 2 ns, all carrying
+    // records of the same time.
+    const boundary_times times = blocks == 0 ? boundary_times{}
+                                             : segment_scan_contract::times_a();
+    const auto page = retry_bundle_a(end, children);
+    std::vector<page_ref> refs;
+    if (!page.empty()) refs.push_back(reference(page, 0, 0, blocks));
     return sealed_wire(
-      {covered, blocks, last, 0},
+      {covered, blocks, last, times, 0},
       exact_digest(extent),
-      {},
+      refs,
       {segment_scan_contract::history_a(), runtime::file_position{end}});
 }
 
-// A4 at 24576, after the footer naming A3; PREPAREs for A3 and A4 follow the
-// interleaved head at 16384 and 20480.
-inline std::string block_a4() { return block_a(103, 3, 24576); }
+// Segment A packs A1 at 4096, A2 at 4495 and footer_a at 4894, which ends at
+// 8192. A3 follows at 8192, the footer naming it at 8591, and A4 at 12288
+// after that footer's end. PREPAREs for A3 and A4 follow the interleaved head
+// at 16384 and 20480.
+inline std::string block_a4() { return block_a(103, 3, 12288, false, 2); }
+// A pin on the footer naming A3, the second group's.
+inline local_footer_reference pin_a3() {
+    return segment_scan_contract::footer_reference(
+      segment_scan_contract::footer_a3(),
+      segment_scan_contract::footer_a3_at());
+}
+// The footer naming the prefix through A4, right after it: the one that
+// closes an extent keeping A4, at 16384.
+inline std::uint64_t footer_a4_at() { return 12288 + block_a4().size(); }
+inline std::string footer_a4() {
+    const auto stored = local_fixture::read("block_a1")
+                        + local_fixture::read("block_a2")
+                        + local_fixture::read("footer_a")
+                        + segment_scan_contract::block_a3()
+                        + segment_scan_contract::footer_a3() + block_a4();
+    const auto at = footer_a4_at();
+    return footer_wire(
+      {scope(100, 104, 0, 4, 4096, at),
+       4,
+       scope(103, 104, 3, 4, 12288, at),
+       segment_scan_contract::times_a(),
+       crc(stored)},
+      {segment_scan_contract::history_a(), runtime::file_position{at}});
+}
 inline std::string prepare_a3() {
-    return prepare_at(data_child(102), 16384, segment(), 2, 16384);
+    return prepare_at(data_child(102), 16384, segment(), 2, 8192, 2);
 }
 inline std::string prepare_a4(std::uint64_t physical = 3) {
-    return prepare_at(data_child(103), 20480, segment(), physical, 24576);
+    return prepare_at(data_child(103), 20480, segment(), physical, 12288, 2);
 }
 
 // One PREPARE of a segment's suffix plan: its source in wal(1), its slot and
@@ -861,9 +1165,9 @@ struct planned_prepare final {
 inline std::vector<planned_prepare> planned_a(std::size_t count) {
     std::vector<planned_prepare> all{
       {4096, 8192, 4096, local_fixture::read("prepare_a1")},
-      {12288, 16384, 8192, local_fixture::read("prepare_a2")},
-      {16384, 20480, 16384, prepare_a3()},
-      {20480, 24576, 24576, prepare_a4()}};
+      {12288, 16384, 4495, local_fixture::read("prepare_a2")},
+      {16384, 20480, 8192, prepare_a3()},
+      {20480, 24576, 12288, prepare_a4()}};
     all.resize(count);
     return all;
 }
@@ -1035,9 +1339,6 @@ seastar::future<runtime::result<recovered_seal_outcome>> execute_seal(
         budget,
         seal_config(retry),
         segment_scan_contract::scan_limits(),
-        no_facts{},
-        0,
-        0,
         work,
         std::move(index)));
 }
@@ -1132,13 +1433,13 @@ seastar::future<> decisions(
         const recovery_candidate_resolution a3{
           cursor(16384),
           segment(),
-          runtime::file_position{16384},
+          runtime::file_position{8192},
           local_recovery_action::reconstruct,
           901};
         // A resolution must name a PREPARE the WAL classifies at that slot;
         // nothing is invented for one that does not.
         auto misplaced = a3;
-        misplaced.target = runtime::file_position{20480};
+        misplaced.target = runtime::file_position{8591};
         auto missing = co_await drive.lifecycle(
           log->resolve(misplaced, source_a, work));
         require(
@@ -1158,7 +1459,7 @@ seastar::future<> decisions(
           cursor(16384),
           codec::immutable_object_digest{exact_digest(prepare_a3())},
           segment(),
-          runtime::file_position{16384},
+          runtime::file_position{8192},
           local_recovery_action::reconstruct,
           901};
         require(
@@ -1203,8 +1504,9 @@ seastar::future<> decisions(
           "a replayed or refused decision wrote a record");
 
         // A seal whose layout cannot be proved is answered with where the
-        // proof stopped, and nothing is persisted: no PREPARE names the slot
-        // after A3, so the owner may still decide another end.
+        // proof stopped, and nothing is persisted: the footer that closes A3
+        // ends a unit before the end asked for, so the owner may still decide
+        // another end.
         auto unproved = take(
           co_await drive.lifecycle(resolve_recovered_seal(
             *log,
@@ -1215,27 +1517,27 @@ seastar::future<> decisions(
             0,
             source_a,
             recovery_seal_resolution{
-              segment(), runtime::file_position{24576}, 902},
+              segment(), runtime::file_position{16384}, 902},
             budget,
             segment_scan_contract::scan_limits(),
             work)));
         require(
           !unproved.decided && unproved.gap == recovered_seal_gap::unproved
-            && unproved.at == runtime::file_position{20480}
+            && unproved.at == runtime::file_position{8591}
             && !(co_await present(files, record_path(2), drive)),
           "a seal whose layout was not proved was persisted");
 
         // One segment decision pins the WAL content end and the canonical
         // suffix plan it proved, and agrees with the candidate decision held
-        // for it.
+        // for it: A3 and the footer that closes it.
         const recovery_seal_resolution seal{
-          segment(), runtime::file_position{20480}, 902};
+          segment(), runtime::file_position{12288}, 902};
         const auto sealed = co_await decide_seal(
           *log, files, owner, spec, budget, source_a, seal, drive);
         require(
           sealed.status == recovery_decision_status::created
             && sealed.record.value
-                 == local_recovery_decision{cursor(20480), codec::immutable_object_digest{suffix_identity(segment(), 20480, planned_a(3))}, segment(), runtime::file_position{20480}, local_recovery_action::seal_at, 902}
+                 == local_recovery_decision{cursor(20480), codec::immutable_object_digest{suffix_identity(segment(), 12288, planned_a(3))}, segment(), runtime::file_position{12288}, local_recovery_action::seal_at, 902}
             && sealed.record.pin.sequence.value() == 2,
           "a segment decision did not pin its suffix plan");
         auto again = co_await decide_seal(
@@ -1245,7 +1547,7 @@ seastar::future<> decisions(
             && again.record.pin == sealed.record.pin,
           "a repeated segment decision did not replay");
         auto lower = seal;
-        lower.end = runtime::file_position{16384};
+        lower.end = runtime::file_position{8192};
         again = co_await decide_seal(
           *log, files, owner, spec, budget, source_a, lower, drive);
         require(
@@ -1258,7 +1560,7 @@ seastar::future<> decisions(
         recovery_candidate_resolution a2{
           cursor(12288),
           segment(),
-          runtime::file_position{8192},
+          runtime::file_position{4495},
           local_recovery_action::reconstruct,
           903};
         auto resolved = take(
@@ -1365,7 +1667,6 @@ seastar::future<> recovered_seal(
       paths.segment_file(0, name, local_segment_file::published));
     const auto wal_path = take(paths.wal(0, wal(1)));
     co_await put_wal(files, spec, wal(1), interleaved(), drive);
-    const auto header = local_fixture::read("data_header_a");
     const auto a1 = local_fixture::read("block_a1");
     const auto a2 = local_fixture::read("block_a2");
     const auto footer_a = local_fixture::read("footer_a");
@@ -1405,8 +1706,8 @@ seastar::future<> recovered_seal(
       spec,
       64,
       local_recovery_action::seal_at,
-      16384,
-      plan(16384),
+      8192,
+      plan(8192),
       16384,
       drive);
     refused = co_await execute(decision_pin(64, at_footer_record), 50);
@@ -1418,8 +1719,8 @@ seastar::future<> recovered_seal(
       spec,
       66,
       local_recovery_action::discard,
-      16384,
-      plan(16384),
+      8192,
+      plan(8192),
       16384,
       drive);
     refused = co_await execute(discard, 50);
@@ -1431,7 +1732,7 @@ seastar::future<> recovered_seal(
       spec,
       68,
       local_recovery_action::seal_at,
-      16384,
+      8192,
       exact_digest("another plan"),
       16384,
       drive);
@@ -1439,32 +1740,32 @@ seastar::future<> recovered_seal(
     require(
       !refused && refused.error().code() == errc::wrong_context,
       "a decision naming another suffix plan authorized a seal");
-    // Past the surviving objects, with no candidate to fill the gap: the
-    // layout is not proved and nothing changes.
+    // Past the footer that would close the surviving A3, with no candidate
+    // to fill the gap: the layout is not proved and nothing changes.
     const auto beyond = co_await put_decision(
       files,
       spec,
       67,
       local_recovery_action::seal_at,
-      24576,
-      plan(24576),
+      16384,
+      plan(16384),
       16384,
       drive);
     auto gap = take(co_await execute(beyond, 50));
     require(
       gap.unresolved == recovered_seal_gap::unproved && gap.at
-        && gap.at->value() == 20480 && !gap.seal.boundary,
+        && gap.at->value() == 8591 && !gap.seal.boundary,
       "a seal past the surviving objects was not left unresolved");
     co_await unchanged(suffix, "an unresolved seal changed bytes");
 
     // Sealed at the decided end: the suffix after it is removed, the WAL is
     // not touched, and the sealed publication pins the new root.
     const auto root = sealed_root(
-      16384,
+      8192,
       a1 + a2 + footer_a,
-      scope(100, 102, 0, 2, 4096, 16384),
-      2,
-      scope(101, 102, 1, 2, 8192, 12288));
+      scope(100, 102, 0, 2, 4096, 8192),
+      scope(101, 102, 1, 2, 4495, 4894),
+      children_a(2));
     const auto sealed_bytes = active_a() + root;
     const auto expect_sealed = [&](const char* message) -> seastar::future<> {
         require(
@@ -1476,7 +1777,7 @@ seastar::future<> recovered_seal(
         require(
           generation.publication.state == local_object_state::sealed
             && generation.publication.boundary
-            && generation.publication.boundary->position().value() == 16384
+            && generation.publication.boundary->position().value() == 8192
             && generation.publication.boundary->digest().bytes()
                  == exact_digest(root),
           message);
@@ -1498,9 +1799,9 @@ seastar::future<> recovered_seal(
         sparse_index_seal{&index, local_object_sequence::make(90).value()}));
     require(
       !sealed.already_sealed && sealed.seal.boundary
-        && sealed.seal.boundary->position().value() == 16384
-        && sealed.seal.retry && sealed.seal.retry->sequence().value() == 50
-        && sealed.blocks == 0 && sealed.footers == 0,
+        && sealed.seal.boundary->position().value() == 8192 && sealed.seal.retry
+        && sealed.seal.retry->sequence().value() == 50 && sealed.blocks == 0
+        && sealed.footers == 0,
       "the recovered seal did not report its root");
     require(
       sealed.seal.index && sealed.seal.index->sequence().value() == 90
@@ -1508,7 +1809,7 @@ seastar::future<> recovered_seal(
         && index[0].logical_anchor().value() == 100
         && index[0].block_position().value() == 4096
         && index[1].logical_anchor().value() == 101
-        && index[1].block_position().value() == 8192,
+        && index[1].block_position().value() == 4495,
       "the recovered seal's walk did not index the extent it sealed");
     co_await expect_sealed("the recovered seal left a tail or wrong root");
     {
@@ -1520,15 +1821,42 @@ seastar::future<> recovered_seal(
             && generation.publication.roots.front() == *sealed.seal.index
             && !generation.index_rebuild,
           "the recovered seal's index is not named, or does not open");
+        // Each batch it kept is answerable from its summary, and the
+        // stream's newest is the last of them.
+        runtime::first_failure looked;
+        try {
+            seastar::abort_source abort;
+            codec::cooperative_work work{codec::limits::defaults(), abort};
+            const auto pin = take(generation.owner->pin());
+            auto lookup = take(
+              co_await drive.lifecycle(
+                completed_retry_lookup::open(pin, budget, work)));
+            const auto children = children_a(2);
+            const auto first = fact_of(children[0]);
+            const auto second = fact_of(children[1]);
+            const auto found = take(
+              co_await drive.lifecycle(lookup.find(first.id(), work)));
+            const auto newest = take(
+              co_await drive.lifecycle(
+                lookup.find_stream_last(retry_prefix::of(first.id()), work)));
+            require(
+              lookup.facts() == 2 && found == first && newest == second,
+              "a batch the recovered seal kept is not answerable");
+        } catch (...) {
+            looked.observe(std::current_exception());
+        }
         co_await segment_scan_contract::close_generation(generation, drive);
+        take(looked.outcome());
     }
+    // Its summary holds the facts its walk derived from A1 and A2: nothing
+    // supplied them.
     require(
       (co_await read_bytes(
-         files,
-         take(paths.object(0, name, sealed.seal.retry->sequence())),
-         drive))
-        .empty(),
-      "the retry bundle of an empty completion set is not empty");
+        files,
+        take(paths.object(0, name, sealed.seal.retry->sequence())),
+        drive))
+        == retry_bundle_a(8192, children_a(2)),
+      "the recovered seal's summary is not the facts of the blocks it kept");
     // Repeating the decision finds it done, with the index it named.
     sealed = take(co_await execute(at_footer, 51));
     require(
@@ -1550,36 +1878,36 @@ seastar::future<> recovered_seal(
         co_await expect_sealed("a resumed seal reached another state");
     }
 
-    // An owner's end below the recovered boundary: the root replaces the
-    // pinned footer, and a seal interrupted there still resumes without it.
+    // An owner's end below the recovered boundary. A root follows a footer,
+    // so the end is a group's: with A3's group pinned, the root at the end
+    // of footer_a replaces A3 and the pinned footer, and a seal interrupted
+    // there still resumes without them.
+    const auto pinned_a3 = co_await put_publication(
+      files, spec, local_object_state::active, pin_a3(), 1, drive);
     const auto lower = co_await put_decision(
       files,
       spec,
       65,
       local_recovery_action::seal_at,
-      12288,
-      plan(12288),
+      8192,
+      plan(8192),
       16384,
       drive);
-    const auto lower_root = sealed_root(
-      12288,
-      a1 + a2,
-      scope(100, 102, 0, 2, 4096, 12288),
-      2,
-      scope(101, 102, 1, 2, 8192, 12288));
+    // Its root names the page of A1's and A2's facts alone: nothing past the
+    // decided end is in its summary.
     for (const auto& [bytes, retry] :
          std::array<std::pair<std::string, std::uint64_t>, 2>{
-           {{active_a() + segment_scan_contract::block_a3(), 54},
-            {header + a1 + a2 + lower_root + segment_scan_contract::block_a3(),
-             55}}}) {
+           {{active_a() + segment_scan_contract::block_a3()
+               + segment_scan_contract::footer_a3(),
+             54},
+            {active_a() + root + block_a4(), 55}}}) {
         co_await write_bytes(files, data, bytes, drive);
-        co_await write_bytes(files, published, boundary, drive);
+        co_await write_bytes(files, published, pinned_a3, drive);
         sealed = take(co_await execute(lower, retry));
         require(
           sealed.seal.boundary
-            && sealed.seal.boundary->position().value() == 12288
-            && (co_await read_bytes(files, data, drive))
-                 == header + a1 + a2 + lower_root,
+            && sealed.seal.boundary->position().value() == 8192
+            && (co_await read_bytes(files, data, drive)) == sealed_bytes,
           "a seal below the recovered boundary did not end at its decision");
     }
 
@@ -1602,6 +1930,7 @@ seastar::future<> recovered_seal(
               {local_publication_generation::make(2).value(),
                recovering,
                descriptor(),
+               origin(),
                {}},
               budget,
               seal_config(56),
@@ -1614,12 +1943,12 @@ seastar::future<> recovered_seal(
                 && !writer->capture(),
               "a recovering publication reopened for append");
             auto ordinary = co_await drive.lifecycle(
-              writer->seal(no_facts{}, 0, 0, work));
+              writer->seal(no_facts{}, 0, work));
             require(
               ordinary.failure.failed() && !ordinary.boundary,
               "an ordinary seal ran on a recovered segment");
             auto written = co_await drive.lifecycle(writer->write_recovered(
-              runtime::file_position{16384},
+              runtime::file_position{8192},
               co_await installation_contract::buffer_async(
                 segment_scan_contract::block_a3()),
               work));
@@ -1635,7 +1964,7 @@ seastar::future<> recovered_seal(
                 spec,
                 0,
                 segment_scan_contract::history_a(),
-                runtime::file_position{16384},
+                runtime::file_position{8192},
                 budget,
                 segment_scan_contract::scan_limits(),
                 work,
@@ -1643,8 +1972,8 @@ seastar::future<> recovered_seal(
                     return seastar::make_ready_future<runtime::result<bool>>(
                       true);
                 })));
-            auto unauthorized = co_await drive.lifecycle(writer->seal_recovered(
-              std::move(extent), no_facts{}, 0, 0, work));
+            auto unauthorized = co_await drive.lifecycle(
+              writer->seal_recovered(std::move(extent), no_facts{}, 0, work));
             require(
               unauthorized.failure.failed() && !unauthorized.boundary,
               "a recovered segment was sealed without a decision");
@@ -1700,23 +2029,23 @@ seastar::future<> crash_after_seal(
       spec,
       64,
       local_recovery_action::seal_at,
-      16384,
-      suffix_identity(segment(), 16384, planned_a(2)),
+      8192,
+      suffix_identity(segment(), 8192, planned_a(2)),
       16384,
       drive);
     const auto root = sealed_root(
-      16384,
+      8192,
       local_fixture::read("block_a1") + local_fixture::read("block_a2")
         + local_fixture::read("footer_a"),
-      scope(100, 102, 0, 2, 4096, 16384),
-      2,
-      scope(101, 102, 1, 2, 8192, 12288));
+      scope(100, 102, 0, 2, 4096, 8192),
+      scope(101, 102, 1, 2, 4495, 4894),
+      children_a(2));
     const auto before = flushes(data);
     auto sealed = take(
       co_await execute_seal<Clock>(
         files, owner, spec, budget, decision, 50, drive));
     require(
-      sealed.seal.boundary && sealed.seal.boundary->position().value() == 16384,
+      sealed.seal.boundary && sealed.seal.boundary->position().value() == 8192,
       "the recovered seal did not seal at its decision");
     if (before)
         require(
@@ -1739,10 +2068,11 @@ seastar::future<> crash_after_seal(
 // Reconstruction happens only inside the recovered seal, slot by slot in
 // file order: each slot below the decided end holds its verified surviving
 // object or the block of the PREPARE that names it, and a footer is placed
-// only in a gap proved to be one between groups. A surviving later footer
-// must name the reconstructed prefix. Whatever cannot be proved leaves the
-// segment and the WAL untouched, and an interrupted reconstruction resumes
-// from the same decision.
+// only in a gap proved to be one between groups, or after the last block,
+// ending exactly at the decided end. A surviving later footer must name the
+// reconstructed prefix. Whatever cannot be proved leaves the segment and the
+// WAL untouched, and an interrupted reconstruction resumes from the same
+// decision.
 template<
   runtime::monotonic_clock Clock,
   typename Backend,
@@ -1810,74 +2140,92 @@ seastar::future<> reconstruction(
     };
 
     // Two groups of candidates after the pinned footer: A3, then the footer
-    // that ends its group in a gap proved by A4, then A4. Every byte placed
-    // is exactly what the writer would have written.
-    const auto sealed_extent = active_a() + a3 + footer_a3 + a4;
+    // that ends its group in a gap proved by A4, then A4 and the footer that
+    // closes the extent at the decided end. Every byte placed is exactly what
+    // the writer would have written.
+    const auto sealed_extent = active_a() + a3 + footer_a3 + a4 + footer_a4();
     const auto root = sealed_root(
-      28672,
-      a1 + a2 + footer_a + a3 + footer_a3 + a4,
-      scope(100, 104, 0, 4, 4096, 28672),
-      4,
-      scope(103, 104, 3, 4, 24576, 28672));
+      16384,
+      a1 + a2 + footer_a + a3 + footer_a3 + a4 + footer_a4(),
+      scope(100, 104, 0, 4, 4096, 16384),
+      scope(103, 104, 3, 4, 12288, footer_a4_at()),
+      children_a(4));
     auto done = take(
       co_await run(
-        active_a() + std::string(4096, '\0'), full_wal, 28672, 4, 24576));
+        active_a() + std::string(4096, '\0'), full_wal, 16384, 4, 24576));
     require(
-      sealed_at(done, 28672) && done.outcome.blocks == 2
-        && done.outcome.footers == 1 && done.bytes == sealed_extent + root,
-      "candidates and their group footer were not reconstructed exactly");
+      sealed_at(done, 16384) && done.outcome.blocks == 2
+        && done.outcome.footers == 2 && done.bytes == sealed_extent + root,
+      "candidates and their group footers were not reconstructed exactly");
 
-    // Interrupted after A3 was written, or after every object but before the
-    // root: the same decision reaches the same state.
+    // Interrupted after A3 reached its unit and its footer did not, or after
+    // every object but before the root: the same decision reaches the same
+    // state.
     for (const auto& [bytes, blocks, footers] :
          std::array<std::tuple<std::string, std::uint32_t, std::uint32_t>, 2>{
-           {{active_a() + a3 + std::string(4096, '\0'), 1, 1},
+           {{active_a() + a3 + std::string(12288 - 8192 - a3.size(), '\0'),
+             1,
+             2},
             {sealed_extent, 0, 0}}}) {
-        done = take(co_await run(bytes, full_wal, 28672, 4, 24576));
+        done = take(co_await run(bytes, full_wal, 16384, 4, 24576));
         require(
-          sealed_at(done, 28672) && done.outcome.blocks == blocks
+          sealed_at(done, 16384) && done.outcome.blocks == blocks
             && done.outcome.footers == footers
             && done.bytes == sealed_extent + root,
           "an interrupted reconstruction did not resume to the same state");
     }
 
     // A group whose later member's PREPARE did not survive: the owner seals
-    // after A3, and the root, not an invented footer, ends the extent.
-    const auto partial_root = sealed_root(
-      20480,
-      a1 + a2 + footer_a + a3,
-      scope(100, 103, 0, 3, 4096, 20480),
-      3,
-      scope(102, 103, 2, 3, 16384, 20480));
+    // after A3, and the footer its prefix encodes closes the extent before
+    // the root.
+    const auto a3_root = sealed_root(
+      12288,
+      a1 + a2 + footer_a + a3 + footer_a3,
+      scope(100, 103, 0, 3, 4096, 12288),
+      scope(102, 103, 2, 3, 8192, 8192 + a3.size()),
+      children_a(3));
     const auto partial_wal = interleaved() + prepare_a3();
     done = take(
       co_await run(
-        active_a() + std::string(8192, '\0'), partial_wal, 20480, 3, 20480));
+        active_a() + std::string(8192, '\0'), partial_wal, 12288, 3, 20480));
     require(
-      sealed_at(done, 20480) && done.outcome.blocks == 1
-        && done.outcome.footers == 0
-        && done.bytes == active_a() + a3 + partial_root,
-      "a partial group was not sealed after its surviving candidate");
+      sealed_at(done, 12288) && done.outcome.blocks == 1
+        && done.outcome.footers == 1
+        && done.bytes == active_a() + a3 + footer_a3 + a3_root,
+      "a partial group was not closed after its surviving candidate");
 
     // A surviving later footer must name the reconstructed prefix.
-    const auto later_root = sealed_root(
-      24576,
-      a1 + a2 + footer_a + a3 + footer_a3,
-      scope(100, 103, 0, 3, 4096, 24576),
-      3,
-      scope(102, 103, 2, 3, 16384, 20480));
     done = take(
       co_await run(
-        active_a() + std::string(4096, '\0') + footer_a3,
+        active_a() + std::string(a3.size(), '\0') + footer_a3,
         partial_wal,
-        24576,
+        12288,
         3,
         20480));
     require(
-      sealed_at(done, 24576) && done.outcome.blocks == 1
+      sealed_at(done, 12288) && done.outcome.blocks == 1
         && done.outcome.footers == 0
-        && done.bytes == active_a() + a3 + footer_a3 + later_root,
+        && done.bytes == active_a() + a3 + footer_a3 + a3_root,
       "a surviving footer did not verify the reconstruction");
+
+    // A held run lost at a crash, in a file recycled from another segment:
+    // its slot and everything after it hold that segment's groups, which are
+    // unwritten space for this one. A3 and its footer are reconstructed over
+    // them from the WAL as over zeros, never a conflict, and the root's
+    // truncation leaves none of them.
+    done = take(
+      co_await run(
+        active_a() + segment_scan_contract::stale_b(8192, 24576),
+        partial_wal,
+        12288,
+        3,
+        20480));
+    require(
+      sealed_at(done, 12288) && done.outcome.blocks == 1
+        && done.outcome.footers == 1
+        && done.bytes == active_a() + a3 + footer_a3 + a3_root,
+      "a lost held run in a recycled file was not reconstructed from the "
+      "WAL");
 
     // Nothing that cannot be proved changes a byte.
     struct unproved_case final {
@@ -1889,48 +2237,49 @@ seastar::future<> reconstruction(
         std::uint64_t at;
         const char* message;
     };
-    const auto foreign_a3 = block_a(102, 2, 16384, true);
+    const auto foreign_a3 = block_a(102, 2, 8192, true, 2);
     const std::array cases{
       // An intact block other than the candidate holds its slot.
       unproved_case{
         active_a() + foreign_a3,
         partial_wal,
-        20480,
+        12288,
         3,
         20480,
         recovered_seal_gap::conflict,
-        16384,
+        8192,
         "a different intact block was overwritten"},
       // A surviving footer that does not name the reconstructed prefix.
       unproved_case{
-        active_a() + std::string(4096, '\0')
+        active_a() + std::string(a3.size(), '\0')
           + segment_scan_contract::footer_a3(1),
         partial_wal,
-        24576,
+        12288,
         3,
         20480,
         recovered_seal_gap::conflict,
-        20480,
+        8591,
         "a footer contradicting the reconstruction was kept or replaced"},
-      // A gap after the last candidate is not a group boundary anyone proved.
+      // A gap after the footer that closes the last candidate is not a
+      // boundary anyone proved.
       unproved_case{
         active_a() + std::string(8192, '\0'),
         partial_wal,
-        24576,
+        16384,
         3,
         20480,
         recovered_seal_gap::unproved,
-        20480,
-        "a footer was invented at the end of a group"},
+        8591,
+        "a gap past the closing footer was filled"},
       // A4 skips a record, so the gap before it is not a footer's.
       unproved_case{
         active_a() + std::string(4096, '\0'),
         interleaved() + prepare_a3() + prepare_a4(4),
-        28672,
+        16384,
         0,
         24576,
         recovered_seal_gap::unproved,
-        20480,
+        8591,
         "a gap before a discontinuous candidate became a footer"},
     };
     for (const auto& test : cases) {
@@ -1939,7 +2288,7 @@ seastar::future<> reconstruction(
                                           planned_a(3)[0],
                                           planned_a(3)[1],
                                           planned_a(3)[2],
-                                          {20480, 24576, 24576, prepare_a4(4)}};
+                                          {20480, 24576, 12288, prepare_a4(4)}};
         co_await write_bytes(files, data, test.segment_bytes, drive);
         co_await put_wal(files, spec, wal(1), test.wal_bytes, drive);
         const auto boundary = co_await put_publication(
@@ -1979,8 +2328,8 @@ seastar::future<> reconstruction(
       spec,
       sequence++,
       local_recovery_action::seal_at,
-      20480,
-      suffix_identity(segment(), 20480, planned_a(3)),
+      12288,
+      suffix_identity(segment(), 12288, planned_a(3)),
       20480,
       drive);
     auto stale = co_await execute_seal<Clock>(
@@ -1991,12 +2340,106 @@ seastar::future<> reconstruction(
 
     // Damage to the pinned footer is proven corruption: nothing is rebuilt.
     auto damaged = active_a() + std::string(4096, '\0');
-    damaged[12288 + 40] ^= 1;
-    auto corrupt = co_await run(damaged, full_wal, 28672, 4, 24576);
+    damaged[4894 + 40] ^= 1;
+    auto corrupt = co_await run(damaged, full_wal, 16384, 4, 24576);
     require(
       !corrupt && corrupt.error().code() == errc::corrupt_data
         && (co_await read_bytes(files, data, drive)) == damaged,
       "damage below the pin was reconstructed over");
+}
+
+// A reconstructed block and the footer that closes it at every kind of
+// place in a unit. A3's PREPARE carries a value of each size of a sweep, so
+// the footer after A3 begins at another offset each time: on the boundary,
+// just before it, just after it, filling its unit exactly or one byte past
+// that; and the larger A3s cross into the next unit and the one after. The
+// recovered seal writes whole units around them, and the sealed extent is
+// what the writer would have written: A3, its footer and the root at that
+// footer's end.
+template<
+  runtime::monotonic_clock Clock,
+  typename Backend,
+  typename Owner,
+  typename Driver>
+seastar::future<> reconstruction_residues(
+  Backend& files,
+  Owner& owner,
+  const local_device_spec& spec,
+  workload_budget& budget,
+  Driver drive) {
+    co_await seed_targets(files, owner, spec, budget, drive);
+    const auto data = data_path(spec, segment());
+    const auto a1 = local_fixture::read("block_a1");
+    const auto a2 = local_fixture::read("block_a2");
+    const auto footer_a = local_fixture::read("footer_a");
+    const std::uint64_t unit = 4096;
+    std::uint64_t sequence = 70, retry = 70;
+    // A3 begins at 8192 and its footer 401 bytes and its value later.
+    constexpr std::array<std::size_t, 10> values{
+      121, 1000, 3446, 3447, 3448, 3694, 3695, 3696, 5000, 8000};
+    for (const auto value : values) {
+        const auto child = valued_child(102, value);
+        const auto a3 = block_wire(
+          child,
+          {segment_write_context::make(
+             segment(),
+             alignment(unit),
+             model::segment_relative_end{2},
+             runtime::file_position{8192})
+             .value(),
+           runtime::file_position{4096},
+           batch_expected()},
+          32,
+          segment_block_stamps{
+            runtime::wall_time{2}, runtime::file_position{4096}});
+        const auto at = 8192 + a3.size();
+        const auto footer = footer_wire(
+          {scope(100, 103, 0, 3, 4096, at),
+           3,
+           scope(102, 103, 2, 3, 8192, at),
+           segment_scan_contract::times_a(),
+           crc(a1 + a2 + footer_a + a3)},
+          {segment_scan_contract::history_a(), runtime::file_position{at}});
+        const auto end = at + footer.size();
+        auto children = children_a(2);
+        children.push_back(child);
+        const auto root = sealed_root(
+          end,
+          a1 + a2 + footer_a + a3 + footer,
+          scope(100, 103, 0, 3, 4096, end),
+          scope(102, 103, 2, 3, 8192, at),
+          children);
+        const auto prepare = prepare_at(child, 16384, segment(), 2, 8192, 2);
+        auto plan = planned_a(2);
+        plan.push_back({16384, 16384 + prepare.size(), 8192, prepare});
+        const auto wal_bytes = interleaved() + prepare;
+        co_await write_bytes(
+          files, data, active_a() + std::string(unit, '\0'), drive);
+        co_await put_wal(files, spec, wal(1), wal_bytes, drive);
+        co_await put_publication(
+          files, spec, local_object_state::active, active_boundary(), 1, drive);
+        const auto decision = co_await put_decision(
+          files,
+          spec,
+          sequence++,
+          local_recovery_action::seal_at,
+          end,
+          suffix_identity(segment(), end, plan),
+          16384 + prepare.size(),
+          drive);
+        const auto done = take(
+          co_await execute_seal<Clock>(
+            files, owner, spec, budget, decision, retry++, drive));
+        require(
+          end % unit == 0 && done.unresolved == recovered_seal_gap::none
+            && done.seal.boundary
+            && done.seal.boundary->position().value() == end && done.blocks == 1
+            && done.footers == 1
+            && (co_await read_bytes(files, data, drive))
+                 == active_a() + a3 + footer + root,
+          "a reconstructed block and its closing footer were not written "
+          "exactly at an offset of their unit");
+    }
 }
 
 // The directory a file's path names.
@@ -2084,6 +2527,7 @@ seastar::future<runtime::result<recovered_publications>> publish(
   workload_budget& budget,
   const recovery_planner& planned,
   const recovery_inventory& found,
+  const recovery_tails& tails,
   std::span<const recovery_visibility> visible,
   std::uint64_t retry,
   Driver drive) {
@@ -2098,6 +2542,8 @@ seastar::future<runtime::result<recovered_publications>> publish(
         0,
         planned,
         found,
+        tails,
+        spec,
         visible,
         budget,
         seal_config(retry),
@@ -2132,30 +2578,29 @@ seastar::future<> interruptions(
       paths.segment_file(0, name, local_segment_file::published));
     const auto wal_path = take(paths.wal(0, wal(1)));
     co_await put_wal(files, spec, wal(1), interleaved(), drive);
-    const auto header = local_fixture::read("data_header_a");
     const auto a1 = local_fixture::read("block_a1");
     const auto a2 = local_fixture::read("block_a2");
-    const auto a3 = segment_scan_contract::block_a3();
+    const auto footer_a = local_fixture::read("footer_a");
     co_await put_publication(
-      files, spec, local_object_state::active, active_boundary(), 1, drive);
+      files, spec, local_object_state::active, pin_a3(), 1, drive);
     const auto decision = co_await put_decision(
       files,
       spec,
       65,
       local_recovery_action::seal_at,
-      12288,
-      suffix_identity(segment(), 12288, planned_a(2)),
+      8192,
+      suffix_identity(segment(), 8192, planned_a(2)),
       16384,
       drive);
     const auto root = sealed_root(
-      12288,
-      a1 + a2,
-      scope(100, 102, 0, 2, 4096, 12288),
-      2,
-      scope(101, 102, 1, 2, 8192, 12288));
-    // The seal's root replaced the pinned footer; the process stopped before
-    // the truncation and the sealed publication.
-    co_await write_bytes(files, data, header + a1 + a2 + root + a3, drive);
+      8192,
+      a1 + a2 + footer_a,
+      scope(100, 102, 0, 2, 4096, 8192),
+      scope(101, 102, 1, 2, 4495, 4894),
+      children_a(2));
+    // The seal's root replaced A3's group and its pinned footer; the process
+    // stopped before the truncation and the sealed publication.
+    co_await write_bytes(files, data, active_a() + root + block_a4(), drive);
     // A decision's and a publication's temporaries, and a successor header
     // the head chain never reached.
     const auto pending = temporary_of(
@@ -2185,11 +2630,11 @@ seastar::future<> interruptions(
     fields.decision_high = local_decision_high{128};
     const std::array descriptors{descriptor(), descriptor_b()};
     const std::array catalog{
-      recovery_catalog_entry{descriptor(), segment_head()},
-      recovery_catalog_entry{descriptor_b(), segment_head_b()}};
+      recovery_catalog_entry{descriptor(), segment_head(), origin()},
+      recovery_catalog_entry{descriptor_b(), segment_head_b(), origin_b()}};
 
     {
-        const std::array targets{target_a(active_boundary())};
+        const std::array targets{target_a(pin_a3())};
         auto planned = co_await plan(
           files, owner, spec, budget, targets, drive, fields);
         require(
@@ -2234,7 +2679,7 @@ seastar::future<> interruptions(
         && discovered.temporaries == 1 && discovered.unmatched == 0
         && found.size() == 1 && found[0].pin == decision
         && found[0].value.action == local_recovery_action::seal_at
-        && found[0].value.target_position.value() == 12288,
+        && found[0].value.target_position.value() == 8192,
       "the durable seal decision was not discovered under its pin");
 
     // A restarted log holds what discovery found before it takes any
@@ -2272,9 +2717,9 @@ seastar::future<> interruptions(
               owner,
               spec,
               budget,
-              suffix_source(specs, target_a(active_boundary())),
+              suffix_source(specs, target_a(pin_a3())),
               recovery_seal_resolution{
-                segment(), runtime::file_position{16384}, 906},
+                segment(), runtime::file_position{12288}, 906},
               drive);
             require(
               held.value == found[0].value
@@ -2315,9 +2760,8 @@ seastar::future<> interruptions(
             drive));
         require(
           sealed.seal.boundary
-            && sealed.seal.boundary->position().value() == 12288
-            && (co_await read_bytes(files, data, drive))
-                 == header + a1 + a2 + root,
+            && sealed.seal.boundary->position().value() == 8192
+            && (co_await read_bytes(files, data, drive)) == active_a() + root,
           "the resumed seal did not end at its decision");
     }
     auto opened = take(
@@ -2328,7 +2772,7 @@ seastar::future<> interruptions(
         && !opened.entries[0].pending_seal && opened.targets.size() == 1
         && opened.targets[0].state == local_object_state::sealed
         && opened.targets[0].pin
-        && opened.targets[0].pin->position().value() == 12288
+        && opened.targets[0].pin->position().value() == 8192
         && opened.entries[1].state == recovery_entry_state::deleting,
       "the seal decision was not consumed by the sealed publication");
     auto planned = co_await plan(
@@ -2367,8 +2811,9 @@ seastar::future<> interruptions(
           recovery_catalog_entry{
             descriptor(),
             segment_head(),
+            origin(),
             deletion_authorization{segment(), sealed}},
-          recovery_catalog_entry{descriptor_b(), segment_head_b()}};
+          recovery_catalog_entry{descriptor_b(), segment_head_b(), origin_b()}};
     };
     std::optional<segment_immutable_expectation> identity;
     {
@@ -2608,14 +3053,16 @@ seastar::future<> recovering_publication(
     const auto published = take(
       paths.segment_file(0, name, local_segment_file::published));
     co_await put_wal(files, spec, wal(1), interleaved(), drive);
-    // A3 after footer_a is a suffix no PREPARE names.
-    const auto bytes = segment_scan_contract::active_a()
-                       + segment_scan_contract::block_a3();
+    // A3 after footer_a is a suffix no PREPARE names: its write tore after
+    // it, and the rest of its unit was never written.
+    const auto a3 = segment_scan_contract::block_a3();
+    const auto bytes = segment_scan_contract::active_a() + a3
+                       + std::string(12288 - 8192 - a3.size(), '\0');
     co_await write_bytes(files, data, bytes, drive);
     const auto initial = co_await put_publication(
       files, spec, local_object_state::active, std::nullopt, 1, drive);
     const std::array catalog{
-      recovery_catalog_entry{descriptor(), segment_head()}};
+      recovery_catalog_entry{descriptor(), segment_head(), origin()}};
     const std::array beyond{
       recovery_visibility{segment(), model::range_logical_end{103}}};
 
@@ -2637,15 +3084,32 @@ seastar::future<> recovering_publication(
         // A plan that has not finished authorizes nothing.
         auto unfinished = take(recovery_planner::make(found.targets, budget));
         auto refused = co_await publish<Clock>(
-          files, owner, spec, budget, unfinished, found, beyond, 70, drive);
+          files,
+          owner,
+          spec,
+          budget,
+          unfinished,
+          found,
+          recovery_tails{},
+          beyond,
+          70,
+          drive);
         require(
           !refused && refused.error().code() == errc::wrong_context
             && (co_await read_bytes(files, published, drive)) == initial,
           "a plan that had not finished published a segment");
     }
     {
+        recovery_tails tails;
         auto planned = co_await plan(
-          files, owner, spec, budget, found.targets, drive);
+          files,
+          owner,
+          spec,
+          budget,
+          found.targets,
+          drive,
+          head_control(),
+          &tails);
         require(
           planned.ready()
             && planned.segments()[0].action
@@ -2656,7 +3120,16 @@ seastar::future<> recovering_publication(
           "the restart did not plan a recovering publication");
         auto outcome = take(
           co_await publish<Clock>(
-            files, owner, spec, budget, planned, found, beyond, 71, drive));
+            files,
+            owner,
+            spec,
+            budget,
+            planned,
+            found,
+            tails,
+            beyond,
+            71,
+            drive));
         require(
           outcome.complete && outcome.segments.size() == 1
             && outcome.segments[0].published && !outcome.segments[0].failure
@@ -2697,16 +3170,18 @@ seastar::future<> recovering_publication(
               {local_publication_generation::make(2).value(),
                current,
                descriptor(),
+               origin(),
                {}},
               budget,
               seal_config(72),
               work)));
         runtime::first_failure failed;
         try {
+            // Another footer at the pin's own position.
             const auto other = take(
               local_footer_reference::make(
-                runtime::file_position{12288},
-                byte_count{4_KiB},
+                active_boundary().position(),
+                active_boundary().bytes(),
                 6,
                 codec::immutable_object_digest{exact_digest("other")}));
             for (const auto& [boundary, code] : std::array<
@@ -2749,13 +3224,14 @@ seastar::future<> recovering_publication(
         && again.targets[0].state == local_object_state::recovering
         && again.targets[0].pin == active_boundary(),
       "the recovering segment did not resume at its pin");
+    recovery_tails tails;
     auto replanned = co_await plan(
-      files, owner, spec, budget, again.targets, drive);
+      files, owner, spec, budget, again.targets, drive, head_control(), &tails);
     const std::array below{
       recovery_visibility{segment(), model::range_logical_end{101}}};
     auto kept = take(
       co_await publish<Clock>(
-        files, owner, spec, budget, replanned, again, below, 73, drive));
+        files, owner, spec, budget, replanned, again, tails, below, 73, drive));
     require(
       replanned.ready()
         && replanned.segments()[0].action == recovery_plan_action::retain
@@ -2899,7 +3375,7 @@ seastar::future<> source_cases(
         std::vector<std::string> out;
         take(co_await merge(files, owner, spec, budget, targets, out, drive));
         require(
-          contains(out, "slot A 8192 @footer_only")
+          contains(out, "slot A 4495 @footer_only")
             && contains(out, "slot B 4096 @footer_only"),
           "a PREPARE after the head's damage became evidence");
     }
@@ -3007,7 +3483,9 @@ seastar::future<> source_cases(
     co_await put_wal(files, spec, wal(1), interleaved(), drive);
 
     // Segments. The recovered boundary is the last footer before the first
-    // damage; the PREPAREs after it stay candidates or a sourced suffix.
+    // damage; after it each slot holds what survives intact, or what its
+    // PREPARE fills, and the footer closing them is found intact or derived.
+    // Planning writes none of it.
     const auto a1 = local_fixture::read("block_a1");
     const auto a3 = segment_scan_contract::block_a3();
     const auto segment_plan = [&](std::string bytes, const char* message)
@@ -3023,8 +3501,8 @@ seastar::future<> source_cases(
           message);
         co_return planned.segments()[0];
     };
-    // A single block, damaged: nothing is recovered and nothing truncated;
-    // both PREPAREs stay candidates.
+    // A single block, damaged: both PREPAREs fill their slots, and the
+    // footer after them is derived.
     {
         auto bad = a1;
         bad[24] ^= 1;
@@ -3032,22 +3510,27 @@ seastar::future<> source_cases(
           local_fixture::read("data_header_a") + bad,
           "a single damaged block was truncated away");
         require(
-          !planned.boundary && planned.candidates == 2,
-          "a single damaged block lost its candidates");
+          planned.boundary == active_boundary() && planned.materialized == 2
+            && planned.candidates == 0,
+          "a single damaged block was not filled from its PREPARE");
     }
-    // A damaged last block after an intact group: the boundary is before it.
+    // A damaged last block after an intact group, no PREPARE naming it: the
+    // boundary is before it.
     {
         auto bad = a3;
         bad[24] ^= 1;
         const auto planned = co_await segment_plan(
           active_a() + bad, "a damaged last block was not ended before");
         require(
-          planned.boundary == active_boundary() && planned.candidates == 0,
+          planned.boundary == active_boundary() && planned.materialized == 0
+            && planned.candidates == 0,
           "a damaged last block moved the boundary");
     }
-    // Nonsense from inside any object to the end of the file.
+    // Nonsense from inside any object to the end of the file: A1, A2,
+    // footer_a, then A3 after the first group. Whatever of the first group
+    // the nonsense covers is filled again, and nothing after it is read.
     const auto tail = active_a() + a3 + segment_scan_contract::footer_a3();
-    for (const std::uint64_t object : {4096U, 8192U, 12288U, 16384U})
+    for (const std::uint64_t object : {4096U, 4495U, 4894U, 8192U})
         for (const std::uint64_t inside : {0U, 7U, 14U}) {
             auto bytes = tail;
             std::fill(
@@ -3056,33 +3539,30 @@ seastar::future<> source_cases(
               'x');
             const auto planned = co_await segment_plan(
               bytes, "nonsense to the end changed the segment");
-            if (object >= 16384)
-                require(
-                  planned.boundary == active_boundary()
-                    && planned.candidates == 0 && planned.suffix == 0,
-                  "nonsense after a footer moved the boundary");
-            else {
-                // Each intact block before the damage stays a sourced
-                // suffix; each PREPARE whose block is gone a candidate.
-                const auto candidates = (12288 - object) / 4096;
-                require(
-                  !planned.boundary && planned.candidates == candidates
-                    && planned.suffix == 2 - candidates,
-                  "nonsense inside the first group dropped a PREPARE");
-            }
+            require(
+              planned.boundary == active_boundary()
+                && planned.materialized == (object >= 8192 ? 0 : 2)
+                && planned.candidates == 0 && planned.suffix == 0
+                && planned.uncertified_tail,
+              "nonsense in the first group was not filled before it");
         }
-    // Interior damage with later intact objects: no footer after the damage
-    // becomes the boundary, and nothing after it is read as an end.
-    for (const auto kind :
-         {slot_damage::zeros,
-          slot_damage::zeroed_header,
-          slot_damage::garbage}) {
+    // Interior damage to A2 with later intact objects, zeros over it or its
+    // header, or garbage: A2 is filled from its PREPARE, footer_a verifies
+    // the prefix holding it, and A3 under footer_a3 follows: the boundary is
+    // the last intact footer.
+    const auto a2_bytes = local_fixture::read("block_a2").size();
+    for (const auto& [fill, length] :
+         std::array<std::pair<char, std::size_t>, 3>{
+           {{'\0', a2_bytes}, {'\0', 32}, {'x', a2_bytes}}}) {
+        auto damaged = tail;
+        std::fill_n(damaged.begin() + 4495, length, fill);
         const auto planned = co_await segment_plan(
-          damage_slot(tail, 8192, kind),
-          "interior segment damage changed the segment");
+          damaged, "interior segment damage changed the segment");
         require(
-          !planned.boundary && planned.candidates == 1 && planned.suffix == 1,
-          "a footer after interior damage became the boundary");
+          planned.boundary == pin_a3() && planned.materialized == 1
+            && planned.candidates == 0 && planned.suffix == 0
+            && !planned.uncertified_tail,
+          "an intact footer after filled damage was not the boundary");
     }
     // Garbage after the header.
     {
@@ -3090,9 +3570,33 @@ seastar::future<> source_cases(
           local_fixture::read("data_header_a") + std::string(8192, 'x'),
           "a garbage segment was changed");
         require(
-          !planned.boundary && planned.candidates == 2,
-          "a garbage segment lost its candidates");
+          planned.boundary == active_boundary() && planned.materialized == 2
+            && planned.candidates == 0,
+          "a garbage segment was not filled from the WAL");
     }
+    // Without A1's PREPARE the first slot cannot be filled: nothing after it
+    // is, and A2 stays a candidate.
+    co_await put_wal(
+      files,
+      spec,
+      wal(1),
+      local_fixture::read("wal_header")
+        + prepare_at(
+          local_fixture::read("child_a2"), 4096, segment(), 1, 4495, 2)
+        + local_fixture::read("prepare_b1"),
+      drive);
+    {
+        auto bad = a1;
+        bad[24] ^= 1;
+        const auto planned = co_await segment_plan(
+          local_fixture::read("data_header_a") + bad,
+          "a slot without its PREPARE was changed");
+        require(
+          !planned.boundary && planned.materialized == 0
+            && planned.candidates == 1,
+          "a slot without its PREPARE was filled or its successor lost");
+    }
+    co_await put_wal(files, spec, wal(1), interleaved(), drive);
 }
 
 // A seeded stream of damage choices, so one seed replays one image exactly.
@@ -3201,7 +3705,6 @@ seastar::future<> torn_seals(
   Driver drive) {
     co_await seed_targets(files, owner, spec, budget, drive);
     const auto data = data_path(spec, segment());
-    const auto header = local_fixture::read("data_header_a");
     const auto a1 = local_fixture::read("block_a1");
     const auto a2 = local_fixture::read("block_a2");
     const auto footer_a = local_fixture::read("footer_a");
@@ -3249,10 +3752,12 @@ seastar::future<> torn_seals(
         recovered_seal_outcome outcome;
         std::string bytes;
     };
-    // As the reconstruction case: resets the segment, its publication and
-    // the WAL, then executes a seal at `end` of the plan that WAL classifies.
+    // As the reconstruction case: resets the segment, its publication at
+    // `pin` and the WAL, then executes a seal at `end` of the plan that WAL
+    // classifies.
     const auto run = [&](
                        std::string segment_bytes,
+                       local_footer_reference pin,
                        std::string wal_bytes,
                        std::uint64_t end,
                        std::size_t planned,
@@ -3261,7 +3766,7 @@ seastar::future<> torn_seals(
         co_await write_bytes(files, data, segment_bytes, drive);
         co_await put_wal(files, spec, wal(1), wal_bytes, drive);
         co_await put_publication(
-          files, spec, local_object_state::active, active_boundary(), 1, drive);
+          files, spec, local_object_state::active, pin, 1, drive);
         const auto decision = co_await put_decision(
           files,
           spec,
@@ -3281,46 +3786,52 @@ seastar::future<> torn_seals(
     // sealed extent.
     {
         const auto root = sealed_root(
-          28672,
-          a1 + a2 + footer_a + a3 + footer_a3 + a4,
-          scope(100, 104, 0, 4, 4096, 28672),
-          4,
-          scope(103, 104, 3, 4, 24576, 28672));
+          16384,
+          a1 + a2 + footer_a + a3 + footer_a3 + a4 + footer_a4(),
+          scope(100, 104, 0, 4, 4096, 16384),
+          scope(103, 104, 3, 4, 12288, footer_a4_at()),
+          children_a(4));
         const auto before = active_a() + std::string(4096, '\0');
-        const auto written = a3 + footer_a3 + a4 + root;
+        const auto written = a3 + footer_a3 + a4 + footer_a4() + root;
         const auto full_wal = interleaved() + prepare_a3() + prepare_a4();
         for (std::uint64_t seed = 1; seed <= 16; ++seed) {
             auto done = take(
               co_await run(
-                torn(before, written, 16384, seed), full_wal, 28672, 4, 24576));
+                torn(before, written, 8192, seed),
+                active_boundary(),
+                full_wal,
+                16384,
+                4,
+                24576));
             require(
               done.outcome.unresolved == recovered_seal_gap::none
                 && done.outcome.seal.boundary
-                && done.outcome.seal.boundary->position().value() == 28672
+                && done.outcome.seal.boundary->position().value() == 16384
                 && done.bytes == active_a() + written,
               "a torn reconstruction did not resume to the sealed extent");
         }
     }
-    // A seal below the pinned footer, torn after its root replaced that
-    // footer, with or without its truncation: the same decision ends there.
+    // A seal below the pinned footer, A3's, torn after its root replaced
+    // that footer's group, with or without its truncation: the same decision
+    // ends there.
     {
         const auto lower_root = sealed_root(
-          12288,
-          a1 + a2,
-          scope(100, 102, 0, 2, 4096, 12288),
-          2,
-          scope(101, 102, 1, 2, 8192, 12288));
-        const auto before = active_a() + a3;
+          8192,
+          a1 + a2 + footer_a,
+          scope(100, 102, 0, 2, 4096, 8192),
+          scope(101, 102, 1, 2, 4495, 4894),
+          children_a(2));
+        const auto before = active_a() + a3 + footer_a3 + a4;
         for (std::uint64_t seed = 1; seed <= 8; ++seed) {
-            auto image = torn(before, lower_root, 12288, seed);
+            auto image = torn(before, lower_root, 8192, seed);
             if (seed % 2 == 0)
-                image.resize(std::min(image.size(), 12288 + lower_root.size()));
+                image.resize(std::min(image.size(), 8192 + lower_root.size()));
             auto done = take(
-              co_await run(image, interleaved(), 12288, 2, 16384));
+              co_await run(image, pin_a3(), interleaved(), 8192, 2, 16384));
             require(
               done.outcome.seal.boundary
-                && done.outcome.seal.boundary->position().value() == 12288
-                && done.bytes == header + a1 + a2 + lower_root,
+                && done.outcome.seal.boundary->position().value() == 8192
+                && done.bytes == active_a() + lower_root,
               "a torn seal below the pin did not end at its decision");
         }
     }
@@ -3330,6 +3841,273 @@ seastar::future<> torn_seals(
 // flushed footer and never loses a PREPARE: each stays satisfied, a sourced
 // suffix or a candidate. A torn WAL tail never ends the head before its
 // certified prefix.
+// Restart writes what its WAL fills before it publishes it. The store it
+// leaves is byte for byte the one the writer leaves with no crash, whatever
+// a crash during that write kept of it, and the next restart finds the
+// written objects intact and publishes nothing new. Planning writes nothing,
+// and a scope that stops writes nothing either.
+template<
+  runtime::monotonic_clock Clock,
+  typename Backend,
+  typename Owner,
+  typename Driver>
+seastar::future<> materialization(
+  Backend& files,
+  Owner& owner,
+  const local_device_spec& spec,
+  workload_budget& budget,
+  Driver drive) {
+    co_await seed_targets(files, owner, spec, budget, drive);
+    const auto paths = take(local_paths::make(spec.root));
+    const auto data = data_path(spec, segment());
+    const auto wal_path = take(paths.wal(0, wal(1)));
+    const local_segment_name name{segment().segment(), segment().generation()};
+    const auto published = take(
+      paths.segment_file(0, name, local_segment_file::published));
+    co_await put_wal(files, spec, wal(1), interleaved(), drive);
+    co_await write_bytes(
+      files, data_path(spec, segment_b()), segment_b_bytes(), drive);
+    const auto header_a = local_fixture::read("data_header_a");
+    const std::array catalog{
+      recovery_catalog_entry{descriptor(), segment_head(), origin()}};
+    const auto found_now = [&]() -> seastar::future<recovery_inventory> {
+        co_return take(
+          co_await inventory(
+            files,
+            owner,
+            spec,
+            budget,
+            catalog,
+            std::span<const recovery_decision_record>{},
+            drive));
+    };
+
+    // A1 and A2 were reported by their WAL barrier and never reached the
+    // segment: the restart writes both and the footer after them, flushes,
+    // then publishes that footer.
+    co_await write_bytes(files, data, header_a, drive);
+    co_await put_publication(
+      files, spec, local_object_state::active, std::nullopt, 1, drive);
+    {
+        auto found = co_await found_now();
+        recovery_tails tails;
+        auto planned = co_await plan(
+          files,
+          owner,
+          spec,
+          budget,
+          found.targets,
+          drive,
+          head_control(),
+          &tails);
+        require(
+          planned.ready()
+            && planned.segments()[0].action
+                 == recovery_plan_action::publish_recovering
+            && planned.segments()[0].boundary == active_boundary()
+            && planned.segments()[0].materialized == 2
+            && (co_await read_bytes(files, data, drive)) == header_a,
+          "the restart did not plan the WAL's suffix, or planning wrote it");
+        auto outcome = take(
+          co_await publish<Clock>(
+            files,
+            owner,
+            spec,
+            budget,
+            planned,
+            found,
+            tails,
+            std::span<const recovery_visibility>{},
+            80,
+            drive));
+        require(
+          outcome.complete && outcome.segments.size() == 1
+            && outcome.segments[0].published,
+          "the materialized segment was not published");
+    }
+    require(
+      (co_await read_bytes(files, data, drive)) == active_a()
+        && (co_await read_bytes(files, wal_path, drive)) == interleaved(),
+      "the written suffix is not what the writer would have written, or the "
+      "WAL changed");
+    {
+        auto again = co_await found_now();
+        recovery_tails tails;
+        auto planned = co_await plan(
+          files,
+          owner,
+          spec,
+          budget,
+          again.targets,
+          drive,
+          head_control(),
+          &tails);
+        require(
+          again.targets[0].pin == active_boundary() && planned.ready()
+            && planned.segments()[0].action == recovery_plan_action::retain
+            && planned.segments()[0].materialized == 0
+            && tails.segments.empty(),
+          "the next restart did not find the written suffix published");
+    }
+
+    // A crash during that write keeps any part of it: every image converges
+    // on the same boundary and bytes. What survived whole is taken, and an
+    // image that kept everything has nothing to write.
+    for (std::uint64_t seed = 1; seed <= 16; ++seed) {
+        const auto image = torn(header_a, active_a().substr(4096), 4096, seed);
+        co_await write_bytes(files, data, image, drive);
+        const std::array targets{target_a(), target_b()};
+        recovery_tails tails;
+        auto planned = co_await plan(
+          files, owner, spec, budget, targets, drive, head_control(), &tails);
+        const auto* tail = tails.find(0);
+        require(
+          planned.ready() && planned.segments()[0].boundary == active_boundary()
+            && (tail || image == active_a())
+            && (!tail || (tail->boundary && tail->boundary->footer == active_boundary()))
+            && (co_await read_bytes(files, data, drive)) == image,
+          "a torn suffix did not plan the same boundary");
+        if (!tail) continue;
+        seastar::abort_source abort;
+        codec::cooperative_work work{codec::limits::defaults(), abort};
+        take(
+          co_await drive.lifecycle(
+            detail::materialize_recovery_tail(
+              files, owner, spec, spec, 0, tails, *tail, budget, work)));
+        require(
+          (co_await read_bytes(files, data, drive)) == active_a(),
+          "a torn suffix was not written back to the writer's bytes");
+        // Written again over its own bytes, it changes nothing.
+        take(
+          co_await drive.lifecycle(
+            detail::materialize_recovery_tail(
+              files, owner, spec, spec, 0, tails, *tail, budget, work)));
+        require(
+          (co_await read_bytes(files, data, drive)) == active_a(),
+          "a second write of the suffix changed it");
+    }
+
+    // An intact block that differs from its PREPARE stops the scope: nothing
+    // is written or published.
+    {
+        const auto differing = header_a + local_fixture::read("block_a1")
+                               + block_a(101, 1, 4495, true, 2)
+                               + std::string(4096, '\0');
+        co_await write_bytes(files, data, differing, drive);
+        const std::array targets{target_a(), target_b()};
+        const auto before = co_await read_bytes(files, published, drive);
+        auto planned = co_await plan(
+          files, owner, spec, budget, targets, drive);
+        require(
+          !planned.ready()
+            && planned.segments()[0].action == recovery_plan_action::stop
+            && planned.segments()[0].reason == recovery_plan_reason::conflict
+            && (co_await read_bytes(files, data, drive)) == differing
+            && (co_await read_bytes(files, published, drive)) == before,
+          "an intact differing block was written over or published");
+    }
+}
+
+// A write or flush of what restart writes back fails: the publication does
+// not complete, so the shard stays out of ready, and neither the WAL nor
+// the segment's publication changes. The next restart, with nothing
+// failing, writes the same suffix and publishes it. `ready` is told the
+// segment's data file once the first plan is made and answers whether its
+// caller's environment fails that file's next write or flush.
+template<
+  runtime::monotonic_clock Clock,
+  typename Backend,
+  typename Owner,
+  typename Driver,
+  typename Ready>
+seastar::future<> materialization_failure(
+  Backend& files,
+  Owner& owner,
+  const local_device_spec& spec,
+  workload_budget& budget,
+  Driver drive,
+  Ready ready) {
+    co_await seed_targets(files, owner, spec, budget, drive);
+    const auto paths = take(local_paths::make(spec.root));
+    const auto data = data_path(spec, segment());
+    const auto wal_path = take(paths.wal(0, wal(1)));
+    const local_segment_name name{segment().segment(), segment().generation()};
+    const auto published = take(
+      paths.segment_file(0, name, local_segment_file::published));
+    co_await put_wal(files, spec, wal(1), interleaved(), drive);
+    co_await write_bytes(
+      files, data_path(spec, segment_b()), segment_b_bytes(), drive);
+    // A1 and A2 were reported by their WAL barrier and never reached the
+    // segment: restart writes both and the footer after them.
+    co_await write_bytes(
+      files, data, local_fixture::read("data_header_a"), drive);
+    const auto initial = co_await put_publication(
+      files, spec, local_object_state::active, std::nullopt, 1, drive);
+    const std::array catalog{
+      recovery_catalog_entry{descriptor(), segment_head(), origin()}};
+    for (std::uint64_t attempt = 0;; ++attempt) {
+        require(attempt != 2, "a restart with nothing failing did not publish");
+        auto found = take(
+          co_await inventory(
+            files,
+            owner,
+            spec,
+            budget,
+            catalog,
+            std::span<const recovery_decision_record>{},
+            drive));
+        recovery_tails tails;
+        auto planned = co_await plan(
+          files,
+          owner,
+          spec,
+          budget,
+          found.targets,
+          drive,
+          head_control(),
+          &tails);
+        require(
+          planned.ready()
+            && planned.segments()[0].action
+                 == recovery_plan_action::publish_recovering
+            && planned.segments()[0].boundary == active_boundary()
+            && (attempt != 0 || planned.segments()[0].materialized == 2),
+          "the restart did not plan the WAL's suffix");
+        const bool armed = attempt == 0 && ready(data);
+        auto outcome = take(
+          co_await publish<Clock>(
+            files,
+            owner,
+            spec,
+            budget,
+            planned,
+            found,
+            tails,
+            std::span<const recovery_visibility>{},
+            80 + attempt,
+            drive));
+        const auto wal_now = co_await read_bytes(files, wal_path, drive);
+        if (armed) {
+            require(
+              !outcome.complete && outcome.segments.size() == 1
+                && !outcome.segments[0].published && outcome.segments[0].failure
+                && (co_await read_bytes(files, published, drive)) == initial
+                && wal_now == interleaved(),
+              "a failed write-back left the shard ready, or changed the WAL "
+              "or the publication");
+            continue;
+        }
+        require(
+          outcome.complete && outcome.segments.size() == 1
+            && outcome.segments[0].published
+            && (co_await read_bytes(files, data, drive)) == active_a()
+            && wal_now == interleaved(),
+          "the written suffix was not published as the writer wrote it, or "
+          "the WAL changed");
+        break;
+    }
+}
+
 template<typename Backend, typename Owner, typename Driver>
 seastar::future<> torn_tails(
   Backend& files,
@@ -3360,39 +4138,51 @@ seastar::future<> torn_tails(
             }
         return matches == 1 ? found : std::string{};
     };
-    const auto footer_a3_ref = take(
-      local_footer_reference::make(
-        runtime::file_position{20480},
-        byte_count{4096},
-        6,
-        codec::immutable_object_digest{exact_digest(footer_a3)}));
-    // Appends torn after the last flushed footer: the boundary is that footer
-    // or a later one that survived whole, and every PREPARE stays.
+    const auto footer_a3_ref = pin_a3();
+    const auto footer_a4_ref = segment_scan_contract::footer_reference(
+      footer_a4(), footer_a4_at());
+    // Two group writes torn after the last flushed footer, A3 with its
+    // footer and A4 with its own, each a whole unit: whatever survives of
+    // them is taken, the rest filled from the PREPAREs, and the boundary is
+    // the footer closing A4, found where it survived and derived where it
+    // did not.
     co_await put_wal(
       files, spec, wal(1), interleaved() + prepare_a3() + prepare_a4(), drive);
+    bool fourth_read = false;
     for (std::uint64_t seed = 1; seed <= 16; ++seed) {
-        const auto image = torn(active_a(), a3 + footer_a3 + a4, 16384, seed);
+        const auto image = torn(
+          active_a(), a3 + footer_a3 + a4 + footer_a4(), 8192, seed);
         co_await write_bytes(files, data, image, drive);
         std::vector<std::string> out;
         take(co_await merge(files, owner, spec, budget, targets, out, drive));
         auto planned = co_await plan(
           files, owner, spec, budget, targets, drive);
         const auto& a_plan = planned.segments()[0];
-        const auto third = label(out, "slot A 16384 ");
-        const auto fourth = label(out, "slot A 24576 ");
-        const bool later = a_plan.boundary == footer_a3_ref;
+        const auto third = label(out, "slot A 8192 ");
+        const auto fourth = label(out, "slot A 12288 ");
+        const auto taken = [](const std::string& found) {
+            return found == "@satisfied" || found == "@adopt"
+                   || found == "@materialize";
+        };
         require(
           planned.ready()
             && a_plan.action == recovery_plan_action::publish_recovering
-            && (later || a_plan.boundary == active_boundary())
-            && (later ? third == "@satisfied" : third == "@suffix_sourced" || third == "@candidate")
-            && (fourth == "@suffix_sourced" || fourth == "@candidate")
+            && a_plan.boundary == footer_a4_ref && a_plan.candidates == 0
+            && taken(third) && taken(fourth)
             && (co_await read_bytes(files, data, drive)) == image,
           "torn appends lowered the boundary or lost a PREPARE");
+        fourth_read = fourth_read || fourth != "@materialize";
     }
+    require(fourth_read, "A4 was never taken where it survived");
     // A WAL tail torn after its certified prefix: the head ends no earlier
     // than that prefix, and the segment's copies stay covered.
-    co_await write_bytes(files, data, active_a() + a3 + footer_a3 + a4, drive);
+    // A4's write tore after A4: the rest of its unit was never written.
+    co_await write_bytes(
+      files,
+      data,
+      active_a() + a3 + footer_a3 + a4
+        + std::string(16384 - 12288 - a4.size(), '\0'),
+      drive);
     for (std::uint64_t seed = 1; seed <= 16; ++seed) {
         const auto image = torn(
           interleaved(), prepare_a3() + prepare_a4(), 16384, seed);
@@ -3402,15 +4192,18 @@ seastar::future<> torn_tails(
         auto planned = co_await plan(
           files, owner, spec, budget, targets, drive);
         const auto end = planned.wal().predecessor;
-        const auto third = label(out, "slot A 16384 ");
-        const auto fourth = label(out, "slot A 24576 ");
+        const auto third = label(out, "slot A 8192 ");
+        const auto fourth = label(out, "slot A 12288 ");
+        // A4 with its PREPARE is taken under the footer derived after it;
+        // without it A4 is a suffix no footer is derived over.
+        const bool sourced = end && end->position().value() >= 24576;
         require(
           planned.ready() && end && end->position().value() >= 16384
-            && planned.segments()[0].boundary == footer_a3_ref
+            && planned.segments()[0].boundary
+                 == (sourced ? footer_a4_ref : footer_a3_ref)
             && third
                  == (end->position().value() >= 20480 ? "@satisfied" : "@footer_only")
-            && fourth
-                 == (end->position().value() >= 24576 ? "@suffix_sourced" : "@suffix_unsourced")
+            && fourth == (sourced ? "@adopt" : "@suffix_unsourced")
             && (co_await read_bytes(files, wal_path, drive)) == image,
           "a torn WAL tail ended the head before its certified prefix");
     }

@@ -10,6 +10,7 @@ using detail::load;
 using detail::store;
 constexpr codec::envelope_extent_limits footer_limits{
   byte_count{64_KiB}, byte_count{64_KiB}};
+using footer_fixed = std::array<char, durable_footer_fixed_bytes.value()>;
 codec::error at(
   errc code,
   codec::field_context context,
@@ -37,12 +38,12 @@ codec::result<T> from_wire(
 }
 template<std::size_t Offset, typename Id>
 codec::result<void> check_id(
-  const std::array<char, 192>& fixed,
+  const footer_fixed& fixed,
   Id expected,
   codec::field_context context,
   footer_field field) {
     std::array<std::uint8_t, Id::width> raw{};
-    static_assert(Offset + Id::width <= 192);
+    static_assert(Offset + Id::width <= durable_footer_fixed_bytes.value());
     for (std::size_t i = 0; i < raw.size(); ++i)
         raw[i] = static_cast<std::uint8_t>(fixed[Offset + i]);
     const auto value = from_wire(Id::make(raw), context, field, Offset);
@@ -53,9 +54,7 @@ codec::result<void> check_id(
 }
 template<std::size_t Offset>
 codec::result<storage::coverage> read_coverage(
-  const std::array<char, 192>& fixed,
-  codec::field_context context,
-  footer_field field) {
+  const footer_fixed& fixed, codec::field_context context, footer_field field) {
     const auto logical = from_wire(
       model::range_logical_span::make(
         model::range_logical_end{load<Offset, std::uint64_t>(fixed)},
@@ -83,8 +82,7 @@ codec::result<storage::coverage> read_coverage(
     return storage::coverage{*logical, *physical, *bytes};
 }
 template<std::size_t Offset>
-void write_coverage(
-  std::array<char, 192>& fixed, const storage::coverage& value) {
+void write_coverage(footer_fixed& fixed, const storage::coverage& value) {
     store<Offset>(fixed, value.logical().begin().value());
     store<Offset + 8>(fixed, value.logical().end().value());
     store<Offset + 16>(fixed, value.physical().begin().value());
@@ -107,18 +105,28 @@ codec::result<void> detail::check_boundary(
     const auto shift = sealed ? 4U : 0U;
     const auto& scope = value.coverage;
     const auto& history = expected.history;
+    // Blocks pack, so neither the covered bytes nor the last block need end
+    // on a boundary: only a write does, and the footer ends it.
     if (
       scope.logical().begin() < history.logical_origin
       || scope.physical().begin() < history.physical_origin
       || scope.bytes().begin() < history.data_start
-      || scope.bytes().end() > expected.position
-      || !history.alignment.aligned(scope.bytes().begin())
-      || !history.alignment.aligned(scope.bytes().end()))
+      || scope.bytes().end() > expected.position)
         return codec::failure(at(
           errc::malformed_data, context, footer_field::coverage, 80 + shift));
     if (!sealed && scope.bytes().empty() && value.data_crc32c != 0)
         return codec::failure(
-          at(errc::malformed_data, context, footer_field::data_crc32c, 184));
+          at(errc::malformed_data, context, footer_field::data_crc32c, 208));
+    const auto& times = value.times;
+    if (
+      value.block_count == 0 ? times != boundary_times{}
+                             : times.first_append.unix_nanoseconds() < 1
+                                 || times.first_append > times.max_append)
+        return codec::failure(at(
+          errc::malformed_data,
+          context,
+          footer_field::first_append_time,
+          184 + shift));
     if (value.block_count == 0) {
         if (
           value.last_block || !scope.physical().empty()
@@ -151,9 +159,7 @@ codec::result<void> detail::check_boundary(
       || last.physical().end() != scope.physical().end()
       || (!sealed && last.logical().end() != scope.logical().end())
       || last.logical().count().value() > codec::absolute_max_original_records
-      || last.physical().count().value() > last.logical().count().value()
-      || !history.alignment.aligned(last.bytes().begin())
-      || !history.alignment.aligned(last.bytes().end()))
+      || last.physical().count().value() > last.logical().count().value())
         return codec::failure(at(
           errc::malformed_data,
           context,
@@ -183,9 +189,7 @@ codec::result<void> validate_footer_location(
   const footer_expectation& expected, codec::field_context context) {
     if (auto valid = validate_history(expected.history, context); !valid)
         return valid;
-    if (
-      expected.position < expected.history.data_start
-      || !expected.history.alignment.aligned(expected.position))
+    if (expected.position < expected.history.data_start)
         return codec::failure(
           at(errc::invalid_argument, context, footer_field::position));
     return {};
@@ -225,6 +229,9 @@ codec::result<void> validate_durable_footer(
     if (actual.last_block != expected.last_block)
         return codec::failure(
           at(errc::malformed_data, context, footer_field::last_block));
+    if (actual.times != expected.times)
+        return codec::failure(
+          at(errc::malformed_data, context, footer_field::first_append_time));
     if (actual.data_crc32c != expected.data_crc32c)
         return codec::failure(
           at(errc::corrupt_data, context, footer_field::data_crc32c));
@@ -263,6 +270,8 @@ seastar::future<codec::result<encoded_durable_footer>> encode_durable_footer(
       {byte_count{codec::envelope_prefix_bytes},
        durable_footer_fixed_bytes,
        {}},
+      expected.position,
+      envelope_placement::ends_span,
       expected.history.alignment,
       work.policy(),
       footer_limits);
@@ -278,7 +287,7 @@ seastar::future<codec::result<encoded_durable_footer>> encode_durable_footer(
         co_return codec::failure(
           codec::detail::allocation_cost_error(
             extent.error(), context, context.origin));
-    std::array<char, 192> fixed{};
+    footer_fixed fixed{};
     const auto put = [&](auto id, std::size_t offset) {
         std::copy(
           id.bytes().begin(),
@@ -298,8 +307,11 @@ seastar::future<codec::result<encoded_durable_footer>> encode_durable_footer(
         store<132>(fixed, std::uint8_t{1});
         write_coverage<136>(fixed, *boundary.last_block);
     }
-    store<184>(fixed, boundary.data_crc32c);
-    store<188>(
+    store<184>(fixed, boundary.times.first_append.unix_nanoseconds());
+    store<192>(fixed, boundary.times.max_append.unix_nanoseconds());
+    store<200>(fixed, boundary.times.max_record.unix_nanoseconds());
+    store<208>(fixed, boundary.data_crc32c);
+    store<212>(
       fixed, static_cast<std::uint32_t>(layout->padding_bytes().value()));
     auto output = co_await detail::encode_padded(
       fixed,
@@ -333,7 +345,7 @@ struct footer_reader final {
       codec::input_boundary,
       codec::decode_budget,
       codec::cooperative_work& work) {
-        std::array<char, 192> fixed{};
+        footer_fixed fixed{};
         if (
           auto read = co_await detail::read_fixed(input, fixed, work, context);
           !read)
@@ -405,7 +417,10 @@ struct footer_reader final {
           *scope,
           load<128, std::uint32_t>(fixed),
           last,
-          load<184, std::uint32_t>(fixed)};
+          {runtime::wall_time{load<184, std::int64_t>(fixed)},
+           runtime::wall_time{load<192, std::int64_t>(fixed)},
+           runtime::wall_time{load<200, std::int64_t>(fixed)}},
+          load<208, std::uint32_t>(fixed)};
         if (
           auto valid = detail::check_boundary(boundary, expected, context);
           !valid)
@@ -415,18 +430,20 @@ struct footer_reader final {
             {byte_count{context.origin - start},
              durable_footer_fixed_bytes,
              {}},
+            expected.position,
+            envelope_placement::ends_span,
             expected.history.alignment,
             work.policy(),
             footer_limits),
           context,
           footer_field::padding,
-          188);
+          212);
         if (!layout) co_return codec::failure(layout.error());
         if (
           input.total_bytes() != layout->body_bytes()
-          || load<188, std::uint32_t>(fixed) != layout->padding_bytes().value())
+          || load<212, std::uint32_t>(fixed) != layout->padding_bytes().value())
             co_return codec::failure(
-              at(errc::malformed_data, context, footer_field::padding, 188));
+              at(errc::malformed_data, context, footer_field::padding, 212));
         const auto extent = from_wire(
           layout->at(expected.position), context, footer_field::position, 72);
         if (!extent) co_return codec::failure(extent.error());

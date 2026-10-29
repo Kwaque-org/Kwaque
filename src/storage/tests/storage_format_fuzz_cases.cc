@@ -21,21 +21,30 @@ void extent_case(const std::array<std::uint8_t, 8>& control) {
     for (const std::size_t width : {7U, 512U}) {
         seastar::abort_source abort;
         codec::cooperative_work work{codec::limits::defaults(), abort};
+        // A block, the footer that ends its write on the next boundary,
+        // then the next write's block.
+        const auto first = data_block(100, 0, 512, false, 0x30, 1, compressed);
+        const auto first_end = 512U + first.size();
+        const auto span = scope(100, 101, 0, 1, 512, first_end);
+        const boundary_times times{
+          runtime::wall_time{1},
+          runtime::wall_time{1},
+          runtime::wall_time{
+            max_record_time(data_child(100, false, compressed))}};
+        const auto middle = footer_wire(
+          {span, 1, span, times, crc(first)},
+          {history(), runtime::file_position{first_end}});
+        const auto next = first_end + middle.size();
+        const auto second = data_block(
+          101, 1, next, false, 0x30, 1, compressed);
         auto verifier = extent_verifier::make(
                           history(),
-                          scope(100, 102, 0, 2, 512, 2048),
+                          scope(100, 102, 0, 2, 512, next + second.size()),
                           work.policy(),
                           extent_layout_kind::initial_append,
                           {},
                           extent_integrity::crc32c_and_digest)
                           .value();
-        const auto first = data_block(100, 0, 512, false, 0x30, 1, compressed);
-        const auto second = data_block(
-          101, 1, 1536, false, 0x30, 1, compressed);
-        const auto span = scope(100, 101, 0, 1, 512, 1024);
-        const auto middle = footer_wire(
-          {span, 1, span, crc(first)},
-          {history(), runtime::file_position{1024}});
         require(feed_block(verifier, first, work, width).has_value());
         auto footer = middle;
         if (mode == 1) {
@@ -43,11 +52,11 @@ void extent_case(const std::array<std::uint8_t, 8>& control) {
             repair(footer);
         }
         if (mode == 2) {
-            put(footer, 32 + 184, crc(first) ^ 1U, 4);
+            put(footer, 32 + 208, crc(first) ^ 1U, 4);
             repair(footer);
         }
         if (mode == 3) {
-            put(footer, 32 + 72, 1536, 8);
+            put(footer, 32 + 72, next, 8);
             repair(footer);
         }
         if (mode == 4) footer.pop_back();
@@ -94,6 +103,7 @@ void exercise_storage_case(std::span<const std::uint8_t> script) {
     }
     const auto kind = static_cast<storage_case>(selected);
     const auto variant = control[7];
+    const auto flags = control[2];
     const std::size_t outer = (variant & 8U) != 0   ? 4096U
                               : (variant & 4U) != 0 ? 40U
                                                     : 32U;
@@ -107,8 +117,10 @@ void exercise_storage_case(std::span<const std::uint8_t> script) {
       outer,
       inner,
       (variant & 64U) != 0 ? 4096U : 512U,
-      (variant & 128U) != 0 ? 4096U : 512U};
-    const auto flags = control[2];
+      (variant & 128U) != 0 ? 4096U : 512U,
+      1,
+      // A PREPARE that is not the last of its write.
+      (flags & 64U) == 0};
     const auto restrictions = static_cast<std::uint8_t>((flags >> 1U) & 31U);
     const auto mutation = control[3] % 9U;
     const auto index = std::size_t{control[4]}
@@ -142,9 +154,11 @@ void exercise_storage_case(std::span<const std::uint8_t> script) {
             break;
         }
         case 5: {
-            const std::size_t position = kind == storage_case::wal ? 16U
-                                         : selected >= 4           ? 76U
-                                                                   : 72U;
+            // A header's generation; each other object's own position.
+            const std::size_t position = kind == storage_case::wal      ? 16U
+                                         : kind == storage_case::header ? 64U
+                                         : selected >= 4                ? 76U
+                                                                        : 72U;
             put(
               wire, outer + position, get(wire, outer + position, 8) + 512U, 8);
             repair(wire);

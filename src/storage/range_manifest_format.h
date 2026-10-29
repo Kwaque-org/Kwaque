@@ -18,7 +18,7 @@ class range_manifest_codec;
 }
 inline constexpr byte_count range_manifest_root_fixed_bytes{88};
 inline constexpr byte_count range_manifest_page_fixed_bytes{92};
-inline constexpr byte_count range_manifest_entry_wire_bytes{104};
+inline constexpr byte_count range_manifest_entry_wire_bytes{120};
 
 // One immutable manifest identity in a topic/range namespace. Its generation
 // is independent of every referenced segment generation. No allocation of IDs,
@@ -63,14 +63,18 @@ private:
 // logical mapping. The digest is a claimed value, not proof of supplied data.
 // Cluster/topic/range membership and each segment's own alignment are checked
 // against independent extent context by its owner, not the manifest's
-// alignment.
+// alignment. Its two times are its extent's, as the sealed root carries them,
+// so a time search picks an extent without reading it: both are zero exactly
+// when no record remains, and otherwise the append time is at least 1 ns.
 class range_manifest_entry final {
 public:
     [[nodiscard]] static result<range_manifest_entry> make(
       model::segment_id,
       model::segment_generation,
       storage::coverage,
-      codec::extent_digest) noexcept;
+      codec::extent_digest,
+      runtime::wall_time max_append_time,
+      runtime::wall_time max_record_time) noexcept;
     [[nodiscard]] model::segment_id segment() const noexcept {
         return segment_;
     }
@@ -83,6 +87,12 @@ public:
     [[nodiscard]] codec::extent_digest digest() const noexcept {
         return digest_;
     }
+    [[nodiscard]] runtime::wall_time max_append_time() const noexcept {
+        return max_append_time_;
+    }
+    [[nodiscard]] runtime::wall_time max_record_time() const noexcept {
+        return max_record_time_;
+    }
     bool operator==(const range_manifest_entry&) const noexcept = default;
 
 private:
@@ -90,15 +100,21 @@ private:
       model::segment_id segment,
       model::segment_generation generation,
       storage::coverage coverage,
-      codec::extent_digest digest) noexcept
+      codec::extent_digest digest,
+      runtime::wall_time max_append_time,
+      runtime::wall_time max_record_time) noexcept
       : segment_(segment)
       , generation_(generation)
       , coverage_(coverage)
-      , digest_(digest) {}
+      , digest_(digest)
+      , max_append_time_(max_append_time)
+      , max_record_time_(max_record_time) {}
     model::segment_id segment_;
     model::segment_generation generation_;
     storage::coverage coverage_;
     codec::extent_digest digest_;
+    runtime::wall_time max_append_time_;
+    runtime::wall_time max_record_time_;
 };
 
 // Immutable fixed-header claims, without an owning entry/ref array or a page
@@ -280,10 +296,11 @@ struct decoded_range_manifest_page final {
 
 // Bounded scalar comparison against digest-bearing evidence for independently
 // pinned extent bytes. expected_cluster is enclosing context, absent from MC.
-// Checks the full namespace, segment generation, all spans and exact digest;
-// the evidence carries the data file's own alignment, independent of metadata
-// alignment. No data fetch, persistence or publication is implied. A driver
-// iterating entries must admit this work and retain at most one supplied proof.
+// Checks the full namespace, segment generation, all spans, both times and
+// the exact digest; the evidence carries the data file's own alignment,
+// independent of metadata alignment. No data fetch, persistence or
+// publication is implied. A driver iterating entries must admit this work and
+// retain at most one supplied proof.
 [[nodiscard]] codec::result<void> validate_range_manifest_extent(
   manifest_context,
   model::cluster_id expected_cluster,
@@ -375,6 +392,9 @@ private:
     const range_manifest_root& root_;
     codec::limits policy_;
     model::range_logical_end end_;
+    // The latest append time of the pages so far: later entries holding
+    // records may not be earlier.
+    runtime::wall_time latest_;
     std::uint32_t next_{0};
     state state_{state::open};
 };
@@ -393,8 +413,9 @@ private:
 // Validation precedes tail allocation; joined cleanup and a final abort check
 // precede publication. Fixed work requires at least 1024 bytes / 64 items.
 //
-// Page entries must partition the declared logical span in ascending order;
-// there is no implicit sorting, duplicate overwrite or full-object collection.
+// Page entries must partition the declared logical span in ascending order,
+// and the append times of entries that hold records never decrease; there is
+// no implicit sorting, duplicate overwrite or full-object collection.
 // Root PageRefs must have contiguous ordinals/entry indices and the exact
 // total. Their pages and target data are not supplied to the root encoder, so
 // cross-page coverage, extent integrity and whole-manifest proof are separate

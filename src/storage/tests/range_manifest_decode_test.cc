@@ -68,11 +68,11 @@ TEST(
             const auto wire = expected_root(root_header(), refs, a, h);
             if (h == 4096) {
                 const auto page_digest = a == 512
-                                           ? "615a118372111e003ffe5380984fddd3"
-                                           : "619c4baddda1ca68188cba605d2db713";
+                                           ? "f69426cd14e84c909ec13452888ec541"
+                                           : "9997994318cd71579eeec2bce9ac233e";
                 const auto root_digest = a == 512
-                                           ? "a7faf9e989bef7e86a39d21bae8fa423"
-                                           : "d9bddc8c812ccfcca572986d807f067d";
+                                           ? "9299bf9ecbd9fb5acd7bc0dd82617963"
+                                           : "2a96fbceee1992659fc2b36246f81c0d";
                 EXPECT_TRUE(
                   std::ranges::equal(
                     std::bit_cast<std::array<char, 16>>(manifest_digest(page)),
@@ -171,7 +171,9 @@ TEST(
           UINT64_MAX,
           UINT64_MAX - 1024U,
           UINT64_MAX),
-        codec::extent_digest{manifest_digest("wide")})
+        codec::extent_digest{manifest_digest("wide")},
+        runtime::wall_time{INT64_MAX},
+        runtime::wall_time{INT64_MIN})
         .value()};
     const auto bytes = expected_page(header, entries);
     const std::array refs{manifest_page_reference(bytes, header)};
@@ -375,11 +377,16 @@ TEST(
       mutation{92 + 32, 8, 0},
       mutation{92 + 48, 8, 3},
       mutation{92 + 64, 8, 512},
-      mutation{92 + 104, 8, 101},
-      mutation{92 + 104, 8, 103},
-      mutation{92 + 104 + 8, 8, 106},
-      mutation{92 + 104 + 48, 8, 9},
-      mutation{92 + 104 + 72, 1, 0},
+      // The first entry holds records but says it has no append time.
+      mutation{92 + 104, 8, 0},
+      mutation{92 + 120, 8, 101},
+      mutation{92 + 120, 8, 103},
+      mutation{92 + 120 + 8, 8, 106},
+      mutation{92 + 120 + 48, 8, 9},
+      mutation{92 + 120 + 72, 1, 0},
+      // The second, empty entry says it has times.
+      mutation{92 + 120 + 104, 8, 5},
+      mutation{92 + 120 + 112, 8, 5},
       mutation{88, 4, 0}};
     for (const auto& change : bad_entries) {
         auto bytes = page;
@@ -468,15 +475,19 @@ TEST(
   SequentialPartitionChecksFirstMiddleAndFinalCoverage) {
     seastar::abort_source abort;
     codec::cooperative_work work{codec::limits::defaults(), abort};
-    for (const unsigned mode : {0U, 1U, 2U, 3U, 4U, 5U}) {
+    for (const unsigned mode : {0U, 1U, 2U, 3U, 4U, 5U, 6U}) {
         const auto first_begin = mode == 1 ? 101U : 100U;
         const auto second_begin = mode == 2 ? 101U : mode == 3 ? 103U : 102U;
         const auto end = mode == 4 ? 104U : 105U;
         const auto h0 = page_header(1, mc(), first_begin, 102, 0, 0);
         const auto h1 = page_header(
           1, mode == 5 ? mc(0x61, 4) : mc(), second_begin, end, 1, 1);
+        // Mode 6: a later page's extent is earlier in append time than the
+        // first page's.
         const std::array e0{item(first_begin, 102)},
-          e1{item(second_begin, end, true)};
+          e1{
+            mode == 6 ? item(second_begin, end, false, 0x31, 7, 999)
+                      : item(second_begin, end, true)};
         const std::array bytes{expected_page(h0, e0), expected_page(h1, e1)};
         const std::array refs{
           manifest_page_reference(bytes[0], h0),
@@ -492,7 +503,7 @@ TEST(
               = walk.next(input, page_memory(input, root, work), work).get();
             const bool fails
               = (mode == 1 && i == 0)
-                || ((mode == 2 || mode == 3 || mode == 5) && i == 1);
+                || ((mode == 2 || mode == 3 || mode == 5 || mode == 6) && i == 1);
             if (fails) {
                 error(
                   out, mode == 5 ? errc::wrong_context : errc::malformed_data);
@@ -777,18 +788,43 @@ TEST(
     EXPECT_EQ(input.checkpoint_depth(), 1U);
 }
 
+// The footer packed after one block, ending its write on the next boundary.
+std::string ending_footer(
+  const std::string& block,
+  storage::coverage covered,
+  segment_history_context history) {
+    return footer_wire(
+      {covered,
+       1,
+       covered,
+       {runtime::wall_time{1},
+        runtime::wall_time{1},
+        runtime::wall_time{max_record_time(block.substr(32 + 144))}},
+       crc(block)},
+      {history, covered.bytes().end()});
+}
+
 // Fixture construction supplies exact stored bytes through the public extent
 // verifier. Callers retain only the returned scalar proof, never a history.
+// A block's extent is the block and the footer that ends its write.
 verified_extent supplied_extent(unsigned kind, codec::cooperative_work& work) {
     if (kind == 0 || kind == 1) {
         const bool sparse = kind == 1;
         const std::uint8_t segment = sparse ? 0x80 : 0x30;
         const std::uint64_t generation = sparse ? 9U : 1U;
+        const std::uint64_t start = sparse ? 4096U : 512U;
         const auto bytes
-          = sparse ? data_block(101, 17, 4096, true, segment, generation)
-                   : data_block(100, 0, 512, false, segment, generation);
-        const auto coverage = sparse ? scope(101, 106, 17, 19, 4096, 4608)
-                                     : scope(100, 101, 0, 1, 512, 1024);
+          = sparse ? data_block(101, 17, start, true, segment, generation)
+                   : data_block(100, 0, start, false, segment, generation);
+        const auto block_end = start + bytes.size();
+        const auto footer = ending_footer(
+          bytes,
+          sparse ? scope(101, 106, 17, 19, start, block_end)
+                 : scope(100, 101, 0, 1, start, block_end),
+          history(segment, generation));
+        const auto end = block_end + footer.size();
+        const auto coverage = sparse ? scope(101, 106, 17, 19, start, end)
+                                     : scope(100, 101, 0, 1, start, end);
         auto verifier = extent_verifier::make(
                           history(segment, generation),
                           coverage,
@@ -799,6 +835,7 @@ verified_extent supplied_extent(unsigned kind, codec::cooperative_work& work) {
                           extent_integrity::crc32c_and_digest)
                           .value();
         feed_block(verifier, bytes, work).value();
+        feed_footer(verifier, footer, work).value();
         return verifier.finish(work).value();
     }
     if (kind == 2) {
@@ -831,7 +868,9 @@ range_manifest_entry extent_entry(const verified_extent& proof) {
              proof.context().segment.segment(),
              proof.context().segment.generation(),
              proof.boundary().coverage,
-             *proof.digest())
+             *proof.digest(),
+             proof.boundary().times.max_append,
+             proof.boundary().times.max_record)
       .value();
 }
 
@@ -977,7 +1016,9 @@ TEST(
                            value.segment(),
                            value.generation(),
                            value.coverage(),
-                           codec::extent_digest{digest})
+                           codec::extent_digest{digest},
+                           value.max_append_time(),
+                           value.max_record_time())
                            .value();
     const std::array entries{changed};
     const auto ph = page_header(1, mc(), 100, 101);
@@ -1023,7 +1064,9 @@ TEST(
               generation ? value.segment() : id<model::segment_id>(0x31),
               model::segment_generation::make(generation ? 8U : 1U).value(),
               value.coverage(),
-              value.digest())
+              value.digest(),
+              value.max_append_time(),
+              value.max_record_time())
               .value();
         error(
           validate_range_manifest_extent(
@@ -1031,25 +1074,36 @@ TEST(
           errc::wrong_context);
     }
     for (const auto& coverage :
-         {scope(99, 101, 0, 1, 512, 1024),
-          scope(100, 102, 0, 1, 512, 1024),
-          scope(100, 101, 1, 2, 512, 1024),
-          scope(100, 101, 0, 1, 0, 1024),
-          scope(100, 101, 0, 1, 512, 1536)}) {
-        const auto entry
-          = range_manifest_entry::make(
-              value.segment(), value.generation(), coverage, value.digest())
-              .value();
+         {scope(99, 101, 0, 1, 512, 1536),
+          scope(100, 102, 0, 1, 512, 1536),
+          scope(100, 101, 1, 2, 512, 1536),
+          scope(100, 101, 0, 1, 0, 1536),
+          scope(100, 101, 0, 1, 512, 2048)}) {
+        const auto entry = range_manifest_entry::make(
+                             value.segment(),
+                             value.generation(),
+                             coverage,
+                             value.digest(),
+                             value.max_append_time(),
+                             value.max_record_time())
+                             .value();
         error(
           validate_range_manifest_extent(
             mc(), id<model::cluster_id>(0x50), entry, evidence),
           errc::malformed_data);
     }
+    const auto block = data_block(100, 0, 512, false, 0x30, 1);
     auto crc_only = extent_verifier::make(
                       history(0x30, 1), value.coverage(), work.policy())
                       .value();
-    ASSERT_TRUE(
-      feed_block(crc_only, data_block(100, 0, 512, false, 0x30, 1), work));
+    ASSERT_TRUE(feed_block(crc_only, block, work));
+    ASSERT_TRUE(feed_footer(
+      crc_only,
+      ending_footer(
+        block,
+        scope(100, 101, 0, 1, 512, 512 + block.size()),
+        history(0x30, 1)),
+      work));
     error(
       validate_range_manifest_extent(
         mc(),
@@ -1059,6 +1113,8 @@ TEST(
       errc::invalid_argument);
     // A valid alternative encoding at identical coordinates has different
     // exact bytes. Metadata/coordinate equality cannot authenticate that swap.
+    // Its footer ends the write on the same boundary.
+    const auto compressed = data_block(100, 0, 512, false, 0x30, 1, true);
     auto replacement = extent_verifier::make(
                          history(0x30, 1),
                          value.coverage(),
@@ -1067,8 +1123,14 @@ TEST(
                          {},
                          extent_integrity::crc32c_and_digest)
                          .value();
-    ASSERT_TRUE(feed_block(
-      replacement, data_block(100, 0, 512, false, 0x30, 1, true), work));
+    ASSERT_TRUE(feed_block(replacement, compressed, work));
+    ASSERT_TRUE(feed_footer(
+      replacement,
+      ending_footer(
+        compressed,
+        scope(100, 101, 0, 1, 512, 512 + compressed.size()),
+        history(0x30, 1)),
+      work));
     error(
       validate_range_manifest_extent(
         mc(),

@@ -1,6 +1,9 @@
 #include "src/base/units.h"
+#include "src/bytes/test_allocation_profile.h"
+#include "src/compression/compression.h"
 #include "src/model/batch_builder.h"
 #include "src/model/batch_codec.h"
+#include "src/model/batch_rewrite.h"
 #include "src/model/fingerprint.h"
 #include "src/model/record_scan.h"
 
@@ -286,6 +289,114 @@ TEST(
             baseline = batch.fingerprint();
         else
             EXPECT_NE(batch.fingerprint(), *baseline);
+    }
+}
+
+// The latest record time is derived from the records a batch holds, never
+// read from its bytes: the builder, the decoder under either codec,
+// assignment and a sparse rewrite all give the maximum over their records.
+TEST(BatchBuilderTest, MaximumRecordTimeIsDerivedFromTheRecordsHeld) {
+    seastar::abort_source abort;
+    codec::cooperative_work work{codec::limits::defaults(), abort};
+    constexpr auto top = std::numeric_limits<std::int64_t>::max();
+    constexpr auto bottom = std::numeric_limits<std::int64_t>::min();
+    const std::vector<std::vector<std::int64_t>> cases{
+      {100, 101, 105},
+      {105, 101, 100},
+      {7, 7, 7},
+      {100, 50, -3},
+      {42},
+      {top - 2, top, top - 1},
+      {bottom + 1, bottom}};
+    const model::batch_decode_expectation expected{
+      object<model::topic_id>(33), object<model::range_id>(65)};
+    // LZ4 owners are admitted under the shared allocator profile.
+    const auto shared = kwaque::bytes::testing::charge;
+    const codec::decode_budget profile{
+      byte_count{32_MiB}, byte_count{1_MiB}, shared};
+    const auto value = null_value();
+    const auto make = [&](const std::vector<std::int64_t>& times) {
+        auto output = builder();
+        for (const auto time : times)
+            add(output, value, wall_time{time}, work);
+        return output.finalize(work, memory().operation_remaining)
+          .get()
+          .value();
+    };
+    const auto decoded_time = [&](fragmented_buffer wire, bool assigned) {
+        kwaque::bytes::fragmented_buffer_parser input{std::move(wire)};
+        const auto budget
+          = codec::reserve_decode_input(input, work.policy(), profile).value();
+        if (assigned)
+            return model::decode_assigned_batch(input, expected, budget, work)
+              .get()
+              .value()
+              .value.max_record_time();
+        return model::decode_submitted_batch(input, expected, budget, work)
+          .get()
+          .value()
+          .value.max_record_time();
+    };
+    for (const auto& times : cases) {
+        const wall_time latest{*std::max_element(times.begin(), times.end())};
+        EXPECT_EQ(make(times).max_record_time(), latest);
+        for (const auto encoding :
+             {kwaque::compression::codec_id::none,
+              kwaque::compression::codec_id::lz4}) {
+            EXPECT_EQ(
+              decoded_time(
+                model::encode_submitted_batch(
+                  make(times),
+                  encoding,
+                  work,
+                  profile.operation_remaining,
+                  shared)
+                  .get()
+                  .value(),
+                false),
+              latest);
+            auto assigned = model::assigned_batch::assign(
+                              make(times),
+                              model::range_logical_end{100},
+                              binding())
+                              .value();
+            EXPECT_EQ(assigned.max_record_time(), latest);
+            EXPECT_EQ(
+              decoded_time(
+                model::encode_assigned_batch(
+                  std::move(assigned),
+                  encoding,
+                  work,
+                  profile.operation_remaining,
+                  shared)
+                  .get()
+                  .value(),
+                true),
+              latest);
+        }
+        // Over the retained records only: keeping one record keeps its time.
+        for (std::size_t kept = 0; kept < times.size(); ++kept) {
+            const std::array selected{model::range_logical_count{kept}};
+            auto sparse
+              = model::rewrite_assigned_batch(
+                  model::assigned_batch::assign(
+                    make(times), model::range_logical_end{100}, binding())
+                    .value(),
+                  selected,
+                  memory(),
+                  work)
+                  .get()
+                  .value();
+            EXPECT_EQ(sparse.max_record_time(), wall_time{times[kept]});
+            EXPECT_EQ(
+              decoded_time(
+                model::encode_assigned_batch(
+                  std::move(sparse), work, memory().operation_remaining, charge)
+                  .get()
+                  .value(),
+                true),
+              wall_time{times[kept]});
+        }
     }
 }
 

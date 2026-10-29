@@ -10,7 +10,7 @@ namespace kwaque::storage {
 namespace detail {
 class sealed_codec;
 }
-inline constexpr byte_count sealed_footer_fixed_bytes{232};
+inline constexpr byte_count sealed_footer_fixed_bytes{256};
 
 // One structurally valid footer, verified against an externally supplied exact
 // root digest. It has not verified the named extent or supplied retry pages.
@@ -33,6 +33,10 @@ public:
     }
     [[nodiscard]] std::optional<storage::coverage> last_block() const noexcept {
         return boundary_.last_block;
+    }
+    // The segment's times, as its last durable footer would carry them.
+    [[nodiscard]] boundary_times times() const noexcept {
+        return boundary_.times;
     }
     [[nodiscard]] codec::extent_digest extent_digest() const noexcept {
         return extent_digest_;

@@ -18,11 +18,11 @@ namespace kwaque::storage {
 
 // Reads `length` bytes of a segment's data at `position`, through a read-only
 // handle its owner keeps open. `bound` is how far the caller may read: the
-// end of a sealed extent, or the durable position of a segment that is still
-// written, as its writer gave it. The bound is the caller's own, taken when
-// it began, and later appends do not move it. Nothing at or past it is read:
-// a range that does not lie wholly below it is refused with out_of_range
-// before any work.
+// end of a sealed extent, or, for a segment that is still written, a
+// position its writer's bytes in the file had reached. The bound is the
+// caller's own, and later appends do not move it. Nothing at or past it is
+// read: a range that does not lie wholly below it is refused with
+// out_of_range before any work.
 //
 // The bytes come back in the file's own buffers. Whoever asks has admitted
 // them already: a read reserves nothing here. A read that fails, falls short

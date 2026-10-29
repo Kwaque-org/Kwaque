@@ -66,17 +66,6 @@ local_payload_bytes(const local_metadata_payload& payload) noexcept {
               fixed = 148;
           else if constexpr (std::is_same_v<T, local_boundary_evidence>)
               fixed = 188U + (value.retry ? 60U : 0U);
-          else if constexpr (std::is_same_v<T, local_completed_retry_root>) {
-              fixed = 128;
-              width = 48;
-              count = value.pages.size();
-              cap = maximum_object_pages;
-          } else if constexpr (std::is_same_v<T, local_completed_retry_page>) {
-              fixed = 92;
-              width = 160;
-              count = value.entries.size();
-              cap = maximum_object_entries;
-          }
           if (count > cap) return failure(errc::resource_exhausted);
           return byte_count{fixed + width * count};
       },
@@ -166,10 +155,8 @@ seastar::future<codec::result<void>> validate_local_payload(
   const local_metadata_payload& payload,
   aligned_envelope_layout layout,
   std::optional<storage_alignment> segment_alignment,
-  std::optional<storage_alignment> data_metadata_alignment,
   codec::cooperative_work& work,
-  codec::field_context c,
-  bool writing) {
+  codec::field_context c) {
     const auto anchor = page_error(errc::success, c);
     if (
       auto ready = co_await work.admit(
@@ -263,7 +250,8 @@ seastar::future<codec::result<void>> validate_local_payload(
             co_return wrong();
         if (value->maximum_lifetime.nanoseconds() == 0 || value->maximum_data_bytes.value()
             < value->alignment.bytes().value() * (value->layout == local_layout_kind::initial ? 4U : 2U)
-            || (value->layout == local_layout_kind::initial && value->physical_origin.value() != 0))
+            || (value->layout == local_layout_kind::initial && value->physical_origin.value() != 0)
+            || value->retry_depth == 0 || value->retry_depth > maximum_retry_depth)
             co_return bad();
     } else if (
       const auto* value = std::get_if<local_object_publication>(&payload)) {
@@ -297,15 +285,12 @@ seastar::future<codec::result<void>> validate_local_payload(
             if (auto ready = work.poll(anchor); !ready)
                 co_return codec::failure(ready.error());
             const auto code = static_cast<std::uint16_t>(root.kind());
-            if (code != 1 && code != 2 && code != 5) co_return wrong();
+            if (code != 1 && code != 2) co_return wrong();
             if (code <= previous) co_return bad();
             previous = code;
-            const auto alignment
-              = root.kind() == local_root_kind::completed_retry_snapshot
-                  ? layout.alignment()
-                  : data_alignment;
             if (
-              auto valid = local_wire(root.validate_alignment(alignment), c);
+              auto valid = local_wire(
+                root.validate_alignment(data_alignment), c);
               !valid)
                 co_return valid;
             if (root.kind() == local_root_kind::sealed_retry) {
@@ -355,23 +340,17 @@ seastar::future<codec::result<void>> validate_local_payload(
             static_cast<std::uint16_t>(value->action), 4, c);
           !code)
             co_return code;
+        // A seal ends on a boundary; a candidate's target is a block, which
+        // packed writes place anywhere after the data start.
+        const bool sealed = value->action == local_recovery_action::seal_at;
         if (
           !value->owner_decision_id
-          || !data_alignment.aligned(value->target_position))
+          || (sealed ? !data_alignment.aligned(value->target_position)
+                     : value->target_position.value()
+                         < minimum_storage_alignment_bytes))
             co_return bad();
     } else if (
       const auto* value = std::get_if<local_boundary_evidence>(&payload)) {
-        const bool other_device = value->data_device != header.owner().device();
-        if ((writing && other_device && !data_metadata_alignment)
-            || (!other_device && data_metadata_alignment
-                && *data_metadata_alignment != layout.alignment()))
-            co_return codec::failure(page_error(errc::invalid_argument, c));
-        // A discovery probe has no independent device configuration yet.
-        // It verifies only the common minimum; contextual decode requires it.
-        const auto retry_metadata_alignment
-          = other_device ? data_metadata_alignment.value_or(
-                             storage_alignment::make(byte_count{512}).value())
-                         : layout.alignment();
         if (
           value->data_device.is_nil()
           || value->covered.bytes().end() != value->footer.position())
@@ -382,50 +361,32 @@ seastar::future<codec::result<void>> validate_local_payload(
           !valid)
             co_return valid;
         if (value->retry) {
-            if (
-              value->retry->kind() != local_root_kind::sealed_retry
-              && value->retry->kind()
-                   != local_root_kind::completed_retry_snapshot)
+            if (value->retry->kind() != local_root_kind::sealed_retry)
                 co_return wrong();
-            const auto alignment = value->retry->kind()
-                                       == local_root_kind::sealed_retry
-                                     ? data_alignment
-                                     : retry_metadata_alignment;
             if (
               auto valid = local_wire(
-                value->retry->validate_alignment(alignment), c);
+                value->retry->validate_alignment(data_alignment), c);
               !valid)
                 co_return valid;
-            if (
-              value->retry->kind() == local_root_kind::sealed_retry
-              && !footer_matches(*value->retry, value->footer))
+            if (!footer_matches(*value->retry, value->footer))
                 co_return wrong();
         }
     }
     const auto* checkpoint_root = std::get_if<local_checkpoint_root>(&payload);
-    const auto* retry_root = std::get_if<local_completed_retry_root>(&payload);
-    if (checkpoint_root || retry_root) {
-        const auto& pages = checkpoint_root ? checkpoint_root->pages
-                                            : retry_root->pages;
-        const auto total = checkpoint_root ? checkpoint_root->entry_count
-                                           : retry_root->retry_count;
+    if (checkpoint_root) {
+        const auto& pages = checkpoint_root->pages;
+        const auto total = checkpoint_root->entry_count;
         if (
           auto valid = check_local_root_counts(
             total, pages.size(), work.policy(), c);
           !valid)
             co_return valid;
-        if (checkpoint_root) {
-            auto order = checkpoint_root->begin.compare(
-              header.owner(), checkpoint_root->end, header.owner());
-            // The end never precedes the begin. Entries are pins, not WAL
-            // intervals, so a table can change while the cursors stand still
-            // and the cursors can move while the table is empty.
-            if (!order || *order > 0) co_return bad();
-        } else if (
-          auto valid = local_wire(
-            retry_root->footer.validate_alignment(data_alignment), c);
-          !valid)
-            co_return valid;
+        auto order = checkpoint_root->begin.compare(
+          header.owner(), checkpoint_root->end, header.owner());
+        // The end never precedes the begin. Entries are pins, not WAL
+        // intervals, so a table can change while the cursors stand still
+        // and the cursors can move while the table is empty.
+        if (!order || *order > 0) co_return bad();
         std::uint32_t first = 0, ordinal = 0;
         for (const auto& ref : pages) {
             if (
@@ -439,8 +400,8 @@ seastar::future<codec::result<void>> validate_local_payload(
               ref,
               ordinal++,
               first,
-              checkpoint_root ? 92 : 164,
-              checkpoint_root ? 140 : 160,
+              92,
+              140,
               layout.alignment(),
               work.policy(),
               c);
@@ -451,16 +412,11 @@ seastar::future<codec::result<void>> validate_local_payload(
         if (first != total) co_return bad();
     }
     const auto* checkpoint = std::get_if<local_checkpoint_page>(&payload);
-    const auto* retries = std::get_if<local_completed_retry_page>(&payload);
-    if (checkpoint || retries) {
-        const auto sequence = checkpoint ? checkpoint->sequence
-                                         : retries->sequence;
-        const auto ordinal = checkpoint ? checkpoint->ordinal
-                                        : retries->ordinal;
-        const auto first = checkpoint ? checkpoint->first_entry
-                                      : retries->first_entry;
-        const auto count = checkpoint ? checkpoint->entries.size()
-                                      : retries->entries.size();
+    if (checkpoint) {
+        const auto sequence = checkpoint->sequence;
+        const auto ordinal = checkpoint->ordinal;
+        const auto first = checkpoint->first_entry;
+        const auto count = checkpoint->entries.size();
         if (
           auto valid = check_local_page_fields(
             header.generation(),
@@ -473,7 +429,6 @@ seastar::future<codec::result<void>> validate_local_payload(
           !valid)
             co_return valid;
         const local_checkpoint_entry* previous = nullptr;
-        std::optional<model::batch_id> previous_id;
         for (std::size_t i = 0; i < count; ++i) {
             if (
               auto ready = co_await work.admit(
@@ -482,63 +437,45 @@ seastar::future<codec::result<void>> validate_local_payload(
                 co_return codec::failure(ready.error());
             if (auto ready = work.poll(anchor); !ready)
                 co_return codec::failure(ready.error());
-            if (checkpoint) {
-                const auto& entry = checkpoint->entries[i];
+            const auto& entry = checkpoint->entries[i];
+            if (
+              auto code = scalar_code(
+                static_cast<std::uint16_t>(entry.disposition), 3, c);
+              !code)
+                co_return code;
+            // A relocated candidate is a recognized code with no reader
+            // or writer yet.
+            if (
+              entry.disposition
+              == local_checkpoint_disposition::preserved_candidate)
+                co_return codec::failure(
+                  page_error(errc::unsupported_format, c));
+            if (entry.segment.cluster() != header.owner().cluster())
+                co_return bad();
+            if (
+              entry.disposition
+              == local_checkpoint_disposition::segment_boundary) {
+                // The inline reference of a durable footer on a named
+                // data device. A segment has one, first among its
+                // entries.
                 if (
-                  auto code = scalar_code(
-                    static_cast<std::uint16_t>(entry.disposition), 3, c);
-                  !code)
-                    co_return code;
-                // A relocated candidate is a recognized code with no reader
-                // or writer yet.
-                if (
-                  entry.disposition
-                  == local_checkpoint_disposition::preserved_candidate)
-                    co_return codec::failure(
-                      page_error(errc::unsupported_format, c));
-                if (entry.segment.cluster() != header.owner().cluster())
+                  entry.device.is_nil() || entry.family != durable_footer_family
+                  || !local_footer_reference::make(
+                    runtime::file_position{entry.locator},
+                    entry.bytes,
+                    entry.family,
+                    entry.digest)
+                  || (previous && previous->segment == entry.segment))
                     co_return bad();
-                if (
-                  entry.disposition
-                  == local_checkpoint_disposition::segment_boundary) {
-                    // The inline reference of a durable footer on a named
-                    // data device. A segment has one, first among its
-                    // entries.
-                    if (
-                      entry.device.is_nil()
-                      || entry.family != durable_footer_family
-                      || !local_footer_reference::make(
-                        runtime::file_position{entry.locator},
-                        entry.bytes,
-                        entry.family,
-                        entry.digest)
-                      || (previous && previous->segment == entry.segment))
-                        co_return bad();
-                } else if (
-                  // A decision record on this device, by its sequence.
-                  !entry.device.is_nil() || entry.family != 0
-                  || entry.locator == 0 || entry.bytes.value() < 32
-                  || entry.bytes > local_metadata_max_bytes
-                  || entry.bytes.value() % layout.alignment().bytes().value()
-                       != 0)
-                    co_return bad();
-                if (previous && !previous->canonical_less(entry))
-                    co_return bad();
-                previous = &entry;
-            } else {
-                const auto& entry = retries->entries[i];
-                if (
-                  entry.original_binding().topic() != retries->segment.topic()
-                  || entry.original_binding().range()
-                       != retries->segment.range())
-                    co_return wrong();
-                if (
-                  (previous_id && !previous_id->canonical_less(entry.id()))
-                  || entry.returned_span().count().value()
-                       > work.policy().config().max_original_records.value())
-                    co_return bad();
-                previous_id = entry.id();
-            }
+            } else if (
+              // A decision record on this device, by its sequence.
+              !entry.device.is_nil() || entry.family != 0 || entry.locator == 0
+              || entry.bytes.value() < 32
+              || entry.bytes > local_metadata_max_bytes
+              || entry.bytes.value() % layout.alignment().bytes().value() != 0)
+                co_return bad();
+            if (previous && !previous->canonical_less(entry)) co_return bad();
+            previous = &entry;
         }
     }
     co_return work.poll(anchor);
@@ -551,16 +488,12 @@ codec::result<void> validate_local_expectation(
                          || kind == local_metadata_kind::object_publication
                          || kind == local_metadata_kind::deletion_intent
                          || kind == local_metadata_kind::recovery_decision
-                         || kind == local_metadata_kind::boundary_evidence
-                         || kind == local_metadata_kind::completed_retry_root
-                         || kind == local_metadata_kind::completed_retry_page;
-    const bool page = kind == local_metadata_kind::checkpoint_page
-                      || kind == local_metadata_kind::completed_retry_page;
+                         || kind == local_metadata_kind::boundary_evidence;
+    const bool page = kind == local_metadata_kind::checkpoint_page;
     const bool pinned = page || kind == local_metadata_kind::wal_descriptor
                         || kind == local_metadata_kind::checkpoint_root
                         || kind == local_metadata_kind::recovery_decision
-                        || kind == local_metadata_kind::boundary_evidence
-                        || kind == local_metadata_kind::completed_retry_root;
+                        || kind == local_metadata_kind::boundary_evidence;
     if (
       segment != e.segment.has_value()
       || segment != e.segment_alignment.has_value()
@@ -570,12 +503,8 @@ codec::result<void> validate_local_expectation(
       || (kind == local_metadata_kind::boundary_evidence)
            != e.data_device.has_value()
       || (e.data_device && e.data_device->is_nil())
-      || (e.data_device && *e.data_device != e.header.owner().device() && !e.data_metadata_alignment)
-      || (e.data_metadata_alignment && !e.data_device)
-      || (e.data_device && *e.data_device == e.header.owner().device() && e.data_metadata_alignment && *e.data_metadata_alignment != e.alignment)
       || e.digest.has_value() != e.encoded_bytes.has_value()
       || (pinned && !e.digest) || page != e.page.has_value()
-      || (e.previous_retry && kind != local_metadata_kind::completed_retry_page)
       || (e.previous_checkpoint && kind != local_metadata_kind::checkpoint_page))
         return codec::failure(page_error(errc::invalid_argument, c));
     if (e.segment && e.segment->cluster() != e.header.owner().cluster())
@@ -584,7 +513,7 @@ codec::result<void> validate_local_expectation(
         || e.encoded_bytes->value() % e.alignment.bytes().value() != 0))
         return codec::failure(page_error(errc::invalid_argument, c));
     if (e.page && (e.page->digest() != *e.digest || e.page->encoded_bytes() != *e.encoded_bytes
-        || (e.page->ordinal().value() == 0 && (e.previous_retry || e.previous_checkpoint))))
+        || (e.page->ordinal().value() == 0 && e.previous_checkpoint)))
         return codec::failure(page_error(errc::invalid_argument, c));
     return {};
 }
@@ -613,34 +542,21 @@ codec::result<void> match_local_expectation(
            != *e.data_device)
         return wrong();
     if (e.page) {
-        if (header.kind() == local_metadata_kind::completed_retry_page) {
-            const auto& retry = std::get<local_completed_retry_page>(payload);
+        const auto& checkpoint = std::get<local_checkpoint_page>(payload);
+        if (
+          checkpoint.ordinal != e.page->ordinal()
+          || checkpoint.first_entry != e.page->first_entry()
+          || checkpoint.entries.size() != e.page->entry_count())
+            return wrong();
+        // Order and the one boundary per segment hold across pages.
+        if (e.previous_checkpoint) {
+            const auto& first = checkpoint.entries.front();
             if (
-              retry.ordinal != e.page->ordinal()
-              || retry.first_entry != e.page->first_entry()
-              || retry.entries.size() != e.page->entry_count())
-                return wrong();
-            if (
-              e.previous_retry
-              && !e.previous_retry->canonical_less(retry.entries.front().id()))
+              !e.previous_checkpoint->canonical_less(first)
+              || (first.disposition
+                    == local_checkpoint_disposition::segment_boundary
+                  && e.previous_checkpoint->segment == first.segment))
                 return codec::failure(page_error(errc::malformed_data, c));
-        } else {
-            const auto& checkpoint = std::get<local_checkpoint_page>(payload);
-            if (
-              checkpoint.ordinal != e.page->ordinal()
-              || checkpoint.first_entry != e.page->first_entry()
-              || checkpoint.entries.size() != e.page->entry_count())
-                return wrong();
-            // Order and the one boundary per segment hold across pages.
-            if (e.previous_checkpoint) {
-                const auto& first = checkpoint.entries.front();
-                if (
-                  !e.previous_checkpoint->canonical_less(first)
-                  || (first.disposition
-                        == local_checkpoint_disposition::segment_boundary
-                      && e.previous_checkpoint->segment == first.segment))
-                    return codec::failure(page_error(errc::malformed_data, c));
-            }
         }
     }
     return {};

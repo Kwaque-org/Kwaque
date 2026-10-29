@@ -50,16 +50,17 @@ seastar::future<runtime::result<void>> activate_recovered_wal(
 }
 
 // Everything a ready plan establishes before the shard is ready, at once:
-// each recovered segment's fresh flush and recovering publication, and the
-// WAL head's successor. They change disjoint state, each segment's own
-// publication and the control's WAL head, and a crash after any subset of
-// their effects leaves a store the next restart classifies the same way, so
-// neither waits for the other. Each runs under its own cooperative work on
-// `abort`. Both are joined before returning; a publication failure is
-// returned first, then the successor's. A plan that activates no successor,
-// a WAL never activated, is refused before anything starts: its segments
-// are published alone. The shard is ready only once this succeeds with
-// every publication complete.
+// each recovered segment's tail written, its fresh flush and recovering
+// publication, and the WAL head's successor. They change disjoint state,
+// each segment's own file and publication and the control's WAL head, and
+// the successor leaves every PREPARE a tail is read from where it was. A
+// crash after any subset of their effects leaves a store the next restart
+// recovers to the same boundaries, so neither waits for the other. Each runs
+// under its own cooperative work on `abort`. Both are joined before returning;
+// a publication failure is returned first, then the successor's. A plan that
+// activates no successor, a WAL never activated, is refused before anything
+// starts: its segments are published alone. The shard is ready only once this
+// succeeds with every publication complete.
 template<
   runtime::monotonic_clock Clock,
   runtime::file_system_backend Backend,
@@ -73,6 +74,8 @@ establish_recovered_state(
   std::uint32_t shard,
   const recovery_planner& plan,
   const recovery_inventory& inventory,
+  const recovery_tails& tails,
+  const local_device_spec& wal,
   std::span<const recovery_visibility> visible,
   workload_budget& budget,
   segment_writer_config config,
@@ -96,6 +99,8 @@ establish_recovered_state(
         shard,
         plan,
         inventory,
+        tails,
+        wal,
         visible,
         budget,
         config,

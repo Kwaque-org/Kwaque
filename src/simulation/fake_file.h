@@ -19,6 +19,7 @@
 #include <seastar/core/shared_ptr.hh>
 #include <seastar/core/stream.hh>
 #include <seastar/core/temporary_buffer.hh>
+#include <seastar/util/noncopyable_function.hh>
 
 #include <absl/container/btree_map.h>
 #include <ankerl/unordered_dense.h>
@@ -208,6 +209,10 @@ struct fake_file_system_config final {
     std::optional<errc> space_error;
     std::optional<fake_crash_policy> crash_policy;
     std::uint64_t device_scope{1};
+    // Whether write_zeroes zero-extends a file, as fallocate's
+    // FALLOC_FL_WRITE_ZEROES does where the file system and device take it.
+    // Off, it is refused as unsupported and changes nothing.
+    bool write_zeroes{false};
 };
 
 enum class fake_file_system_state : std::uint8_t {
@@ -954,6 +959,15 @@ private:
     // device.
     std::uint64_t device_changes_{0};
     pending_operation* effect_operation_{nullptr};
+    // A test's view of every native write as it is submitted: the object,
+    // where the write begins and its length. Unset, nothing is told.
+    seastar::noncopyable_function<void(
+      fake_object_id, std::uint64_t, std::size_t) noexcept>
+      write_observer_;
+    // The same for every native read, as asked.
+    seastar::noncopyable_function<void(
+      fake_object_id, std::uint64_t, std::size_t) noexcept>
+      read_observer_;
 };
 
 static_assert(!std::is_move_constructible_v<fake_file_system>);

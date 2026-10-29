@@ -1,15 +1,18 @@
 #pragma once
 
 #include "src/storage/recovery_merge.h"
+#include "src/storage/table_view.h"
 
 #include <span>
 #include <vector>
 
 namespace kwaque::storage {
 
-// What startup may change in one scope. No action truncates, rewrites or
-// deletes: a recovered WAL head is closed by its successor, and a segment's
-// suffix leaves only through a durable decision's recovered seal.
+// What startup may change in one scope. No action truncates or deletes, and
+// none replaces an intact object: a recovered WAL head is closed by its
+// successor, a segment's suffix leaves only through a durable decision's
+// recovered seal, and only slots the walk could not read are filled from the
+// WAL.
 enum class recovery_plan_action : std::uint8_t {
     // Proven corruption, a conflict or a misplaced claim: nothing in this
     // scope changes, and its evidence stays for a supplied decision.
@@ -17,8 +20,9 @@ enum class recovery_plan_action : std::uint8_t {
     // Nothing changes: a sealed segment, a recovering one already pinned at
     // its recovered boundary, or a WAL that was never activated.
     retain,
-    // One fresh flush, then a recovering publication pinning the recovered
-    // boundary, never below its pin. The segment stays roll-required.
+    // What the WAL fills below the boundary is written, then one fresh
+    // flush, then a recovering publication pinning that boundary, never
+    // below its pin. The segment stays roll-required.
     publish_recovering,
     // One fresh flush of the head, then a successor whose predecessor cursor
     // is the head's classified content end.
@@ -45,8 +49,15 @@ struct recovery_segment_plan final {
     // The logical end that boundary covers, or the segment's logical origin
     // without one. Nothing after it is certified here.
     model::range_logical_end recovered_end{};
+    // Slots below the boundary that the WAL fills or that were found intact
+    // after the recovered one: written, then flushed with it. Those among
+    // them filled below what the segment proves certified.
+    std::uint32_t materialized{0}, repaired{0};
     // Kept for a supplied resolution; never served or truncated here.
     std::uint32_t candidates{0}, suffix{0};
+    // Damage after the boundary that nothing proves certified and nothing
+    // fills: retained, never content.
+    bool uncertified_tail{false};
 };
 struct recovery_wal_plan final {
     recovery_plan_action action{recovery_plan_action::retain};
@@ -83,7 +94,7 @@ plan_recovery_wal(const wal_scan_result&, bool corrupt_region) noexcept;
 class recovery_planner final {
 public:
     [[nodiscard]] static runtime::result<recovery_planner>
-    make(std::span<const recovery_target> targets, workload_budget& budget);
+    make(table_view<recovery_target> targets, workload_budget& budget);
 
     [[nodiscard]] runtime::result<void> observe(const recovery_item& item);
     // After the merge returned: it must have run to completion and every
@@ -92,8 +103,7 @@ public:
     finish(const recovery_merge_result& merged);
 
     [[nodiscard]] const recovery_wal_plan& wal() const noexcept { return wal_; }
-    [[nodiscard]] std::span<const recovery_segment_plan>
-    segments() const noexcept {
+    [[nodiscard]] table_view<recovery_segment_plan> segments() const noexcept {
         return segments_;
     }
     // No scope stopped. Otherwise no mutation of the plan may run.
@@ -105,15 +115,19 @@ private:
     };
     recovery_planner(
       workload_reservation held,
-      std::vector<recovery_segment_plan> segments,
-      std::vector<observed> reports) noexcept
+      seastar::chunked_vector<recovery_segment_plan> segments,
+      seastar::chunked_vector<observed> reports,
+      seastar::chunked_vector<std::uint32_t> order) noexcept
       : held_(std::move(held))
       , segments_(std::move(segments))
-      , reports_(std::move(reports)) {}
+      , reports_(std::move(reports))
+      , order_(std::move(order)) {}
 
     workload_reservation held_;
-    std::vector<recovery_segment_plan> segments_;
-    std::vector<observed> reports_;
+    seastar::chunked_vector<recovery_segment_plan> segments_;
+    seastar::chunked_vector<observed> reports_;
+    // Plans in their segments' canonical order, for lookup.
+    seastar::chunked_vector<std::uint32_t> order_;
     recovery_wal_plan wal_;
     bool wal_corrupt_{false}, finished_{false}, ready_{false};
 };

@@ -40,6 +40,9 @@ seastar::future<runtime::result<verified_extent>> verify_segment_immutable(
         co_return runtime::failure(detail::path_error(made.error().code()));
     auto verifier = std::move(*made);
     auto at = expected.coverage.bytes().begin();
+    // A root follows a footer's padding, never a block: a non-empty extent
+    // ends with the footer that closes it.
+    bool closed = expected.coverage.bytes().empty();
     while (at < expected.coverage.bytes().end()) {
         if (auto ready = co_await detail::path_checkpoint(work); !ready)
             co_return runtime::failure(ready.error());
@@ -118,8 +121,13 @@ seastar::future<runtime::result<verified_extent>> verify_segment_immutable(
         if (!verified)
             co_return runtime::failure(
               detail::path_error(verified.error().code()));
+        closed = prefix->family
+                 == static_cast<std::uint16_t>(
+                   codec::format_family::durable_boundary_footer);
         at = at.checked_add(length).value();
     }
+    if (!closed)
+        co_return runtime::failure(detail::path_error(errc::malformed_data));
     auto verified = verifier.finish(work);
     if (!verified)
         co_return runtime::failure(detail::path_error(verified.error().code()));

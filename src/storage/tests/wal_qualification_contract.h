@@ -126,15 +126,13 @@ seastar::future<> bounded_admission(
       [&](auto& writer, auto& work) -> seastar::future<> {
           const auto head = *writer.prepared_head();
           const std::array records{assigned_wire()};
-          const std::array oversize{
-            assigned_wire(),
-            assigned_wire(),
-            assigned_wire(),
-            assigned_wire(),
-            assigned_wire()};
+          // Five PREPAREs of 7,425 bytes pack into 37,125 and pad to 40 KiB,
+          // past the 32 KiB queue.
+          const auto large = valued_child(100, 7000);
+          const std::array oversize{large, large, large, large, large};
           const auto initial = take(writer.capture());
           auto too_large = co_await wal_append_contract::offer(
-            budget, spec.owner.cluster(), work, oversize);
+            budget, spec.owner.cluster(), work, oversize, 4096);
           auto rejected = co_await writer.submit(std::move(too_large), work);
           require(
             !rejected && rejected.error().code() == errc::resource_exhausted

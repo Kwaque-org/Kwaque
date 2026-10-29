@@ -12,7 +12,7 @@ namespace detail {
 class footer_codec;
 }
 
-inline constexpr byte_count durable_footer_fixed_bytes{192};
+inline constexpr byte_count durable_footer_fixed_bytes{216};
 
 // Independently supplied file namespace, layout and original empty boundary.
 // data_start is the checked end of the segment header, not a diagnostic origin.
@@ -30,10 +30,24 @@ struct footer_expectation final {
     runtime::file_position position;
 };
 
+// Over the blocks a boundary covers, from the segment's origin; all zero
+// when it covers none. A restart that resumes after a pinned footer takes
+// them from it instead of reading the prefix again.
+struct boundary_times final {
+    // The first block's append time.
+    runtime::wall_time first_append;
+    // The latest append time: the last block's, since it never decreases.
+    runtime::wall_time max_append;
+    // The latest record time over the blocks.
+    runtime::wall_time max_record;
+    bool operator==(const boundary_times&) const noexcept = default;
+};
+
 struct boundary_fields final {
     storage::coverage coverage;
     std::uint32_t block_count;
     std::optional<storage::coverage> last_block;
+    boundary_times times;
     std::uint32_t data_crc32c;
     bool operator==(const boundary_fields&) const noexcept = default;
 };
@@ -151,6 +165,9 @@ enum class footer_field : std::uint16_t {
     last_block,
     data_crc32c,
     padding,
+    first_append_time,
+    max_append_time,
+    max_record_time,
 };
 
 // No bytes are read here: evidence already binds exact context, coverage,
@@ -162,10 +179,12 @@ enum class footer_field : std::uint16_t {
 
 // Encode from accumulated evidence rather than an unchecked count/last/CRC
 // tuple. A footer may follow the named byte end; bytes outside that span are
-// outside its claim. parent_remaining excludes all other live/native/frame
-// reservations and includes new fixed/padding/envelope staging. Work/abort and
-// the verified allocator profile stay alive and exclusive until joined return.
-// Fixed scalar validation requires a 1024-byte / 64-item work quantum.
+// outside its claim. It ends its write: its padding takes its end to the next
+// alignment boundary, wherever it starts. parent_remaining excludes all other
+// live/native/frame reservations and includes new fixed/padding/envelope
+// staging. Work/abort and the verified allocator profile stay alive and
+// exclusive until joined return. Fixed scalar validation requires a 1024-byte /
+// 64-item work quantum.
 [[nodiscard]] seastar::future<codec::result<encoded_durable_footer>>
 encode_durable_footer(
   verified_extent evidence,

@@ -125,13 +125,9 @@ local_metadata_expectation expected(
           }
           if constexpr (std::is_same_v<T, local_wal_descriptor>)
               value.wal_incarnation = wal_id();
-          if constexpr (std::is_same_v<T, local_boundary_evidence>) {
+          if constexpr (std::is_same_v<T, local_boundary_evidence>)
               value.data_device = id<device_store_id>(0x44);
-              value.data_metadata_alignment = alignment(4096);
-          }
-          if constexpr (
-            std::is_same_v<T, local_checkpoint_page>
-            || std::is_same_v<T, local_completed_retry_page>)
+          if constexpr (std::is_same_v<T, local_checkpoint_page>)
               value.page = page_ref::make(
                              body.ordinal,
                              body.first_entry,
@@ -173,12 +169,12 @@ std::vector<record_case> cases() {
       {local_metadata_kind::segment_descriptor,
        local_segment_descriptor{
          sc(),
-         model::range_logical_end{100},
          model::segment_relative_end{0},
          alignment(4096),
          storage_profile::v1,
          1,
          local_layout_kind::initial,
+         default_retry_depth,
          byte_count{64_KiB},
          runtime::monotonic_duration{3600000000000ULL}}},
       {local_metadata_kind::object_publication,
@@ -224,22 +220,27 @@ std::vector<record_case> cases() {
        local_boundary_evidence{
          sc(),
          id<device_store_id>(0x44),
-         footer(),
+         footer(7),
          scope(100, 101, 0, 1, 4096, 8192),
-         root(local_root_kind::completed_retry_snapshot)},
+         root(local_root_kind::sealed_retry)},
        51},
-      {local_metadata_kind::completed_retry_root,
-       local_completed_retry_root{sc(), footer(), 0, {}},
-       40},
-      {local_metadata_kind::completed_retry_page,
-       local_completed_retry_page{
-         sc(),
-         local_object_sequence::make(40).value(),
-         page_ordinal::make(0).value(),
-         0,
-         {retry()}},
-       40},
     };
+}
+// The sample checkpoint page, encoded.
+std::string checkpoint_page_wire() {
+    seastar::abort_source abort;
+    codec::cooperative_work work{codec::limits::defaults(), abort};
+    auto encoded = encode_local_metadata(
+                     {record_header(local_metadata_kind::checkpoint_page, 70),
+                      alignment(4096),
+                      {}},
+                     cases()[6].payload,
+                     work,
+                     budget().operation_remaining,
+                     charge)
+                     .get();
+    EXPECT_TRUE(encoded);
+    return encoded ? flat(encoded->bytes) : std::string{};
 }
 TEST(LocalMetadataTest, EveryTypedBodyRoundTripsAndKeepsOwningResiduals) {
     for (const auto& test : cases()) {
@@ -251,11 +252,6 @@ TEST(LocalMetadataTest, EveryTypedBodyRoundTripsAndKeepsOwningResiduals) {
           [&](const auto& body) {
               if constexpr (requires { body.segment; })
                   encoding.segment_alignment = alignment(4096);
-              if constexpr (
-                std::is_same_v<
-                  std::remove_cvref_t<decltype(body)>,
-                  local_boundary_evidence>)
-                  encoding.data_metadata_alignment = alignment(4096);
           },
           test.payload);
         auto encoded = encode_local_metadata(
@@ -304,6 +300,54 @@ TEST(LocalMetadataTest, EveryTypedBodyRoundTripsAndKeepsOwningResiduals) {
         EXPECT_EQ(probe->header, header);
         EXPECT_TRUE(discovery.at_end());
     }
+}
+// A candidate's target is a block, which packed writes place anywhere after
+// the data start; a seal ends on a boundary.
+TEST(LocalMetadataTest, RecoveryDecisionTargetsFollowTheirAction) {
+    seastar::abort_source abort;
+    codec::cooperative_work work{codec::limits::defaults(), abort};
+    const auto header = record_header(local_metadata_kind::recovery_decision);
+    const auto round_trip = [&](
+                              local_recovery_action action,
+                              std::uint64_t target) {
+        const local_metadata_payload payload{local_recovery_decision{
+          cursor(8193),
+          digest(),
+          sc(),
+          runtime::file_position{target},
+          action,
+          7}};
+        auto encoding = local_metadata_encoding{header, alignment(4096), {}};
+        encoding.segment_alignment = alignment(4096);
+        auto encoded
+          = encode_local_metadata(
+              encoding, payload, work, budget().operation_remaining, charge)
+              .get();
+        if (!encoded) return false;
+        const auto wire = flat(encoded->bytes);
+        fragmented_buffer_parser input{buffer(wire, 67)};
+        const auto memory = reserve(input, work);
+        auto decoded
+          = decode_local_metadata(
+              input,
+              expected(header, payload, encoded->digest, encoded->bytes.size()),
+              memory,
+              work,
+              {},
+              codec::input_boundary::complete)
+              .get();
+        return decoded && decoded->value.payload() == payload;
+    };
+    for (const auto action :
+         {local_recovery_action::preserve,
+          local_recovery_action::reconstruct,
+          local_recovery_action::discard}) {
+        EXPECT_TRUE(round_trip(action, 4097));
+        EXPECT_TRUE(round_trip(action, 512));
+        EXPECT_FALSE(round_trip(action, 511));
+    }
+    EXPECT_TRUE(round_trip(local_recovery_action::seal_at, 8192));
+    EXPECT_FALSE(round_trip(local_recovery_action::seal_at, 8193));
 }
 TEST(LocalMetadataTest, WalDiscoveryUsesStoredGeometryWithIndependentPins) {
     for (const auto a : {512U, 8192U, 65536U}) {
@@ -621,20 +665,19 @@ TEST(LocalMetadataTest, RepairedCorruptionAndWrongContextRollbackParentMarks) {
 TEST(
   LocalMetadataTest,
   ExternalPinsAreRequiredAndCheckedBeforePublishingDecodedState) {
-    std::string payload(128, '\0');
-    put_sc(payload, sc());
-    put(payload, 72, 8192, 8);
-    put(payload, 80, 4096, 4);
-    put(payload, 84, 6, 2);
-    const auto wire = independent_record(
-      local_metadata_kind::completed_retry_root, payload, 40);
+    const auto header = record_header(local_metadata_kind::checkpoint_root, 70);
     seastar::abort_source abort;
     codec::cooperative_work work{codec::limits::defaults(), abort};
-    local_metadata_expectation e{
-      record_header(local_metadata_kind::completed_retry_root, 40),
-      alignment(4096),
-      sc(),
-      alignment(4096)};
+    auto encoded = encode_local_metadata(
+                     {header, alignment(4096), {}},
+                     local_checkpoint_root{cursor(4096), cursor(4096), 0, {}},
+                     work,
+                     budget().operation_remaining,
+                     charge)
+                     .get();
+    ASSERT_TRUE(encoded);
+    const auto wire = flat(encoded->bytes);
+    local_metadata_expectation e{header, alignment(4096)};
     fragmented_buffer_parser input{buffer(wire, 67)};
     auto result
       = decode_local_metadata(input, e, reserve(input, work), work).get();
@@ -651,59 +694,6 @@ TEST(
     result = decode_local_metadata(input, e, reserve(input, work), work).get();
     EXPECT_TRUE(result);
     EXPECT_TRUE(input.at_end());
-}
-TEST(LocalMetadataTest, RetryLeafBytesAndPreviousFullKeyAreSharedAcrossPages) {
-    for (const unsigned variant : {0U, 1U, 2U}) {
-        const bool duplicate = variant == 1;
-        std::string payload(92, '\0');
-        put_sc(payload, sc());
-        put(payload, 72, variant == 2 ? 41U : 40U, 8);
-        put(payload, 80, 1, 4);
-        put(payload, 84, 1, 4);
-        put(payload, 88, 1, 4);
-        payload += retry_wire(retry(duplicate ? 0 : 1));
-        const auto wire = independent_record(
-          local_metadata_kind::completed_retry_page, payload, 40);
-        seastar::abort_source abort;
-        codec::cooperative_work work{codec::limits::defaults(), abort};
-        auto hash = codec::immutable_object_digest{exact_digest(wire)};
-        local_metadata_expectation e{
-          record_header(local_metadata_kind::completed_retry_page, 40),
-          alignment(4096),
-          sc(),
-          alignment(4096)};
-        e.digest = hash;
-        e.encoded_bytes = byte_count{wire.size()};
-        e.page = page_ref::make(
-                   page_ordinal::make(1).value(), 1, 1, *e.encoded_bytes, hash)
-                   .value();
-        e.previous_retry = retry(0).id();
-        fragmented_buffer_parser input{buffer(wire, 67)};
-        auto result
-          = decode_local_metadata(input, e, reserve(input, work), work).get();
-        if (variant != 0) {
-            ASSERT_FALSE(result);
-            EXPECT_EQ(
-              result.error().code(),
-              duplicate ? errc::malformed_data : errc::wrong_context);
-            EXPECT_EQ(input.bytes_consumed().value(), 0U);
-        } else {
-            ASSERT_TRUE(result);
-            EXPECT_EQ(
-              std::get<local_completed_retry_page>(result->value.payload())
-                .entries[0],
-              retry(1));
-            auto encoded = encode_local_metadata(
-                             {e.header, e.alignment, e.segment_alignment},
-                             result->value.payload(),
-                             work,
-                             budget().operation_remaining,
-                             charge)
-                             .get();
-            ASSERT_TRUE(encoded);
-            EXPECT_TRUE(encoded->bytes.content_equals(wire));
-        }
-    }
 }
 TEST(
   LocalMetadataTest,
@@ -726,13 +716,7 @@ TEST(
         EXPECT_EQ(input.bytes_consumed().value(), 0U);
         EXPECT_EQ(input.checkpoint_depth(), 0U);
     }
-    std::string payload(92, '\0');
-    put_sc(payload, sc());
-    put(payload, 72, 40, 8);
-    put(payload, 88, 1, 4);
-    payload += retry_wire(retry());
-    const auto page = independent_record(
-      local_metadata_kind::completed_retry_page, payload, 40);
+    const auto page = checkpoint_page_wire();
     for (const bool cancel : {false, true}) {
         seastar::abort_source abort;
         codec::cooperative_work work{codec::limits::defaults(), abort};
@@ -755,26 +739,28 @@ TEST(
 TEST(LocalMetadataTest, BoundaryEvidenceMatchesIndependentFields) {
     for (const bool with_retry : {false, true}) {
         const auto covered = scope(100, 101, 0, 1, 4096, 8192);
+        // A sealed retry root names the sealed root the evidence pins.
+        const std::uint16_t family = with_retry ? 7 : 6;
         const local_metadata_payload payload{local_boundary_evidence{
           sc(),
           id<device_store_id>(0x44),
-          footer(),
+          footer(family),
           covered,
-          with_retry
-            ? std::optional{root(local_root_kind::completed_retry_snapshot)}
-            : std::nullopt}};
+          with_retry ? std::optional{root(local_root_kind::sealed_retry)}
+                     : std::nullopt}};
         std::string fields(with_retry ? 248U : 188U, '\0');
         put_sc(fields, sc());
         fields.replace(72, 16, 16, '\x44');
         put(fields, 88, 8192, 8);
         put(fields, 96, 4096, 4);
-        put(fields, 100, 6, 2);
+        put(fields, 100, family, 2);
         fields.replace(104, 16, 16, '\x61');
         put_coverage(fields, 136, covered);
         put(fields, 184, with_retry ? 1U : 0U, 1);
         if (with_retry) {
-            put(fields, 188, 5, 2);
+            put(fields, 188, 2, 2);
             put(fields, 192, 40, 8);
+            put(fields, 200, 8192, 8);
             put(fields, 208, 4096, 4);
             fields.replace(216, 16, 16, '\x61');
         }
@@ -784,14 +770,13 @@ TEST(LocalMetadataTest, BoundaryEvidenceMatchesIndependentFields) {
           local_metadata_kind::boundary_evidence, 51);
         seastar::abort_source abort;
         codec::cooperative_work work{codec::limits::defaults(), abort};
-        auto encoded
-          = encode_local_metadata(
-              {header, alignment(4096), alignment(4096), alignment(4096)},
-              payload,
-              work,
-              budget().operation_remaining,
-              charge)
-              .get();
+        auto encoded = encode_local_metadata(
+                         {header, alignment(4096), alignment(4096)},
+                         payload,
+                         work,
+                         budget().operation_remaining,
+                         charge)
+                         .get();
         ASSERT_TRUE(encoded);
         EXPECT_EQ(flat(encoded->bytes), wire);
         EXPECT_EQ(encoded->digest.bytes(), exact_digest(wire));
@@ -812,115 +797,6 @@ TEST(LocalMetadataTest, BoundaryEvidenceMatchesIndependentFields) {
     }
 }
 
-TEST(LocalMetadataTest, EvidenceUsesTheReferencedDevicesMetadataAlignment) {
-    const auto snapshot = local_root_reference::make(
-                            local_root_kind::completed_retry_snapshot,
-                            local_object_sequence::make(40).value(),
-                            runtime::file_position{},
-                            byte_count{512},
-                            page_count::make(0).value(),
-                            digest())
-                            .value();
-    const local_metadata_payload payload{local_boundary_evidence{
-      sc(),
-      id<device_store_id>(0x44),
-      footer(),
-      scope(100, 101, 0, 1, 4096, 8192),
-      snapshot}};
-    const auto header = record_header(
-      local_metadata_kind::boundary_evidence, 51);
-    seastar::abort_source abort;
-    codec::cooperative_work work{codec::limits::defaults(), abort};
-    auto encoded = encode_local_metadata(
-                     {header, alignment(4096), alignment(4096), alignment(512)},
-                     payload,
-                     work,
-                     budget().operation_remaining,
-                     charge)
-                     .get();
-    ASSERT_TRUE(encoded);
-    auto e = expected(header, payload, encoded->digest, encoded->bytes.size());
-    e.data_metadata_alignment = alignment(512);
-    const auto wire = flat(encoded->bytes);
-    fragmented_buffer_parser input{buffer(wire, 67)};
-    auto decoded
-      = decode_local_metadata(input, e, reserve(input, work), work).get();
-    ASSERT_TRUE(decoded);
-    EXPECT_EQ(decoded->value.payload(), payload);
-    e.data_metadata_alignment.reset();
-    fragmented_buffer_parser missing_context{buffer(wire, 67)};
-    auto missing = decode_local_metadata(
-                     missing_context, e, reserve(missing_context, work), work)
-                     .get();
-    ASSERT_FALSE(missing);
-    EXPECT_EQ(missing.error().code(), errc::invalid_argument);
-    EXPECT_EQ(missing_context.bytes_consumed().value(), 0U);
-    fragmented_buffer_parser probe_input{buffer(wire, 67)};
-    EXPECT_TRUE(
-      probe_local_metadata(
-        probe_input, alignment(4096), reserve(probe_input, work), work)
-        .get());
-}
-
-TEST(LocalMetadataTest, MaximumRetryPageIsBoundedAndImpossibleCountRejects) {
-    local_completed_retry_page page{
-      sc(),
-      local_object_sequence::make(40).value(),
-      page_ordinal::make(0).value(),
-      0,
-      {}};
-    page.entries.reserve(409);
-    for (std::uint32_t i = 0; i < 408; ++i)
-        page.entries.push_back(retry(i));
-    local_metadata_payload payload{std::move(page)};
-    seastar::abort_source abort;
-    codec::cooperative_work work{codec::limits::defaults(), abort};
-    const auto header = record_header(
-      local_metadata_kind::completed_retry_page, 40);
-    const local_metadata_encoding context{
-      header, alignment(4096), alignment(4096)};
-    auto encoded
-      = encode_local_metadata(
-          context, payload, work, budget().operation_remaining, charge)
-          .get();
-    ASSERT_TRUE(encoded);
-    EXPECT_EQ(encoded->bytes.size().value(), 65536U);
-    auto e = expected(header, payload, encoded->digest, encoded->bytes.size());
-    const auto wire = flat(encoded->bytes);
-    fragmented_buffer_parser input{buffer(wire, 4096)};
-    const auto memory = reserve(input, work);
-    auto decoded = decode_local_metadata(input, e, memory, work).get();
-    ASSERT_TRUE(decoded);
-    const auto& entries
-      = std::get<local_completed_retry_page>(decoded->value.payload()).entries;
-    EXPECT_EQ(entries.size(), 408U);
-    EXPECT_LE(
-      entries.capacity() * sizeof(completed_retry),
-      maximum_contiguous_allocation_bytes);
-    EXPECT_LT(decoded->remaining.metadata_remaining, memory.metadata_remaining);
-    auto bad = wire;
-    put(bad, 192, 409, 4);
-    repair(bad);
-    e.digest = codec::immutable_object_digest{exact_digest(bad)};
-    e.page
-      = page_ref::make(
-          page_ordinal::make(0).value(), 0, 409, *e.encoded_bytes, *e.digest)
-          .value();
-    fragmented_buffer_parser rejected_input{buffer(bad, 4096)};
-    auto rejected = decode_local_metadata(
-                      rejected_input, e, reserve(rejected_input, work), work)
-                      .get();
-    ASSERT_FALSE(rejected);
-    EXPECT_EQ(rejected.error().code(), errc::malformed_data);
-    EXPECT_EQ(rejected_input.bytes_consumed().value(), 0U);
-    std::get<local_completed_retry_page>(payload).entries.push_back(retry(408));
-    auto overflow
-      = encode_local_metadata(
-          context, payload, work, budget().operation_remaining, charge)
-          .get();
-    ASSERT_FALSE(overflow);
-    EXPECT_EQ(overflow.error().code(), errc::resource_exhausted);
-}
 TEST(
   LocalMetadataTest,
   WriterRejectsUnsupportedRelocationAndUnsafePublicationState) {
@@ -1113,13 +989,7 @@ TEST(
   LocalMetadataTest,
   AllocationFailureKeepsParserTransactionAndPermitsCleanRetry) {
 #if defined(SEASTAR_ENABLE_ALLOC_FAILURE_INJECTION)
-    std::string payload(92, '\0');
-    put_sc(payload, sc());
-    put(payload, 72, 40, 8);
-    put(payload, 88, 1, 4);
-    payload += retry_wire(retry());
-    const auto wire = independent_record(
-      local_metadata_kind::completed_retry_page, payload, 40);
+    const auto wire = checkpoint_page_wire();
     bool completed = false;
     unsigned failures = 0;
     for (unsigned allocation = 0; allocation < 128 && !completed;

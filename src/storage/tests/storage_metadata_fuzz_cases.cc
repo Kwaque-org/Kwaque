@@ -169,7 +169,7 @@ void object_case(
             // pin.
             if (!root) {
                 const std::size_t fixed = is_manifest ? 92U : 172U,
-                                  width = is_manifest ? 104U : 16U;
+                                  width = is_manifest ? 120U : 16U;
                 put(wire, h + fixed + width, get(wire, h + fixed, 8), 8);
             } else
                 put(wire, h + (is_manifest ? 80U : 160U), 257, 4);
@@ -181,7 +181,7 @@ void object_case(
         case 14: {
             if (!root) {
                 const std::size_t fixed = is_manifest ? 92U : 172U,
-                                  width = is_manifest ? 104U : 16U;
+                                  width = is_manifest ? 120U : 16U;
                 const auto at = h + fixed + width + (is_manifest ? 0U : 8U);
                 put(
                   wire,
@@ -320,7 +320,7 @@ void walk_case(const std::array<std::uint8_t, 8>& control, bool is_manifest) {
     }
     if (mode == 5 || mode == 6) {
         const auto fixed = is_manifest ? 92U : 172U;
-        const auto width = is_manifest ? 104U : 16U;
+        const auto width = is_manifest ? 120U : 16U;
         // Every page remains independently valid. Only the cross-page edge is
         // bad.
         if (is_manifest) {
@@ -329,8 +329,8 @@ void walk_case(const std::array<std::uint8_t, 8>& control, bool is_manifest) {
                   std::size_t{68},
                   std::size_t{92},
                   std::size_t{100},
-                  std::size_t{196},
-                  std::size_t{204}})
+                  std::size_t{212},
+                  std::size_t{220}})
                 put(
                   pages[1],
                   h + at,
@@ -443,7 +443,8 @@ void supplied_extent_case(const std::array<std::uint8_t, 8>& control) {
         seastar::abort_source abort;
         codec::cooperative_work work{codec::limits::defaults(), abort};
         const auto data = data_block();
-        const auto actual = scope(100, 101, 0, 1, 512, 1024);
+        const auto end = 512U + data.size();
+        const auto actual = scope(100, 101, 0, 1, 512, end);
         auto verifier = extent_verifier::make(
                           history(),
                           actual,
@@ -463,13 +464,15 @@ void supplied_extent_case(const std::array<std::uint8_t, 8>& control) {
           mode == 5 ? 1U : 0U,
           mode == 5 ? 2U : 1U,
           512,
-          mode == 6 ? 1536U : 1024U);
+          mode == 6 ? end + 512U : end);
         const std::array entries{
           range_manifest_entry::make(
             sc().segment(),
             model::segment_generation::make(mode == 2 ? 2U : 1U).value(),
             declared,
-            codec::extent_digest{digest})
+            codec::extent_digest{digest},
+            proof.boundary().times.max_append,
+            proof.boundary().times.max_record)
             .value()};
         const auto ph = manifest::page_header(
           1,

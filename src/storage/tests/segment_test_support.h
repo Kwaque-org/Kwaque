@@ -16,6 +16,7 @@
 #include <charconv>
 #include <limits>
 #include <lz4frame.h>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -45,9 +46,7 @@ inline storage_alignment alignment(std::uint64_t value = 512) {
     return storage_alignment::make(byte_count{value}).value();
 }
 inline segment_header header() {
-    return segment_header::make(
-             sc(), model::range_logical_end{100}, alignment())
-      .value();
+    return segment_header::make(sc(), alignment()).value();
 }
 inline model::batch_decode_expectation batch_expected() {
     return {id<model::topic_id>(0x10), id<model::range_id>(0x20)};
@@ -67,6 +66,11 @@ inline segment_block_expectation block_expected(
         .value(),
       runtime::file_position{multiple},
       batch_expected()};
+}
+// An append time of 1 ns and the data start, which certifies nothing.
+inline segment_block_stamps
+block_stamps(const segment_block_expectation& expected = block_expected()) {
+    return {runtime::wall_time{1}, expected.data_start};
 }
 inline std::string hex(std::string_view value) {
     std::string result;
@@ -139,7 +143,6 @@ inline std::string
 header_wire(segment_header value = header(), std::size_t h = 32) {
     std::string body(96, '\0');
     put_sc(body, value.context());
-    put(body, 72, value.logical_origin().value(), 8);
     put(body, 80, 1, 2);
     put(body, 82, 1, 2);
     const auto a = value.alignment().bytes().value();
@@ -192,11 +195,61 @@ inline std::string assigned_wire(
     body += records;
     return frame(std::move(body), 2, h);
 }
+// The latest record time of an assigned child, read from its records as the
+// record walk defines it: the base timestamp plus the largest delta.
+inline std::int64_t max_record_time(std::string_view child) {
+    const auto h = static_cast<std::size_t>(get(child, 10, 2));
+    const auto base = static_cast<std::int64_t>(get(child, h + 136, 8));
+    const auto retained = get(child, h + 148, 4);
+    std::string records{
+      child.substr(h + 184, static_cast<std::size_t>(get(child, h + 160, 4)))};
+    if (get(child, h + 156, 1) != 0) {
+        std::string expanded(
+          static_cast<std::size_t>(get(child, h + 164, 4)), '\0');
+        LZ4F_dctx* context = nullptr;
+        if (
+          LZ4F_isError(LZ4F_createDecompressionContext(&context, LZ4F_VERSION)))
+            throw std::runtime_error("lz4 context");
+        auto out = expanded.size();
+        auto in = records.size();
+        const auto done = LZ4F_decompress(
+          context, expanded.data(), &out, records.data(), &in, nullptr);
+        LZ4F_freeDecompressionContext(context);
+        if (LZ4F_isError(done) || out != expanded.size())
+            throw std::runtime_error("lz4 records");
+        records = std::move(expanded);
+    }
+    std::size_t at = 0;
+    const auto varuint = [&records, &at] {
+        std::uint64_t value = 0;
+        for (unsigned shift = 0;; shift += 7U) {
+            const auto byte = static_cast<unsigned char>(records.at(at++));
+            value |= std::uint64_t{byte & 0x7fU} << shift;
+            if ((byte & 0x80U) == 0) return value;
+        }
+    };
+    std::int64_t latest = std::numeric_limits<std::int64_t>::min();
+    for (std::uint64_t i = 0; i < retained; ++i) {
+        const auto length = varuint();
+        const auto body = at;
+        ++at; // attributes
+        const auto raw = varuint();
+        const auto delta = static_cast<std::int64_t>(raw >> 1U)
+                           ^ -static_cast<std::int64_t>(raw & 1U);
+        latest = std::max(latest, delta);
+        at = body + static_cast<std::size_t>(length);
+    }
+    return base + latest;
+}
+// Stamps unless given: an append time of 1 ns and the data start, which
+// certifies nothing.
 inline std::string block_wire(
   std::string child = assigned_wire(),
   segment_block_expectation expected = block_expected(),
-  std::size_t h = 32) {
-    std::string body(120, '\0');
+  std::size_t h = 32,
+  std::optional<segment_block_stamps> stamps = std::nullopt) {
+    const auto stamped = stamps.value_or(block_stamps(expected));
+    std::string body(144, '\0');
     put_sc(body, expected.location.segment());
     put(body, 72, expected.location.position().value(), 8);
     put(body, 80, expected.location.physical_begin().value(), 8);
@@ -208,12 +261,16 @@ inline std::string block_wire(
       8);
     put(body, 96, get(child, inner + 168, 8), 8);
     put(body, 104, get(child, inner + 176, 8), 8);
-    put(body, 112, child.size(), 4);
-    const auto a = expected.location.alignment().bytes().value();
-    const auto pad = (a - (h + body.size() + child.size()) % a) % a;
-    put(body, 116, pad, 4);
+    put(
+      body,
+      112,
+      static_cast<std::uint64_t>(stamped.append_time.unix_nanoseconds()),
+      8);
+    put(body, 120, static_cast<std::uint64_t>(max_record_time(child)), 8);
+    put(body, 128, stamped.certified_end.value(), 8);
+    put(body, 136, child.size(), 4);
+    // A block never pads: whatever follows it in its write starts here.
     body += child;
-    body.append(pad, '\0');
     return frame(std::move(body), 4, h);
 }
 inline bytes::fragmented_buffer

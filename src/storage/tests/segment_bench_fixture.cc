@@ -14,6 +14,8 @@
 #include <crc32c/crc32c.h>
 
 #include <algorithm>
+#include <array>
+#include <cstdint>
 #include <fstream>
 #include <span>
 
@@ -73,6 +75,49 @@ segment_block_expectation placement(
       {history.segment.topic(), history.segment.range()},
       history.profile};
 }
+// Every block is appended at one broker time, so a segment's append times
+// never decrease. It carries where the segment's durable bytes ended when its
+// group froze.
+segment_block_stamps stamps(runtime::file_position certified) {
+    return {runtime::wall_time{1}, certified};
+}
+// A durable footer at position ends its group's write: it pads to the
+// boundary after its end, so its size depends on where it begins.
+byte_count footer_bytes(
+  const segment_history_context& history,
+  runtime::file_position position,
+  const codec::limits& policy) {
+    return aligned_envelope_layout::make(
+             {byte_count{codec::envelope_prefix_bytes},
+              durable_footer_fixed_bytes,
+              {}},
+             position,
+             envelope_placement::ends_span,
+             history.alignment,
+             policy,
+             {byte_count{64_KiB}, byte_count{64_KiB}})
+      .value()
+      .encoded_bytes();
+}
+
+// The value of the one record whose encoding is exactly `bytes` long: its
+// attributes, time and offset deltas, null key and empty header count take a
+// byte each, and its value's length and its own length a varint each.
+std::size_t exact_value(std::size_t bytes) {
+    const auto varint = [](std::uint64_t number) {
+        std::size_t length = 1;
+        for (; number >= 0x80U; number >>= 7U)
+            ++length;
+        return length;
+    };
+    for (auto value = bytes - std::min<std::size_t>(bytes, 32); value < bytes;
+         ++value) {
+        const auto body = 5 + varint(2U * value) + value;
+        if (body + varint(body) == bytes) return value;
+    }
+    require(false, "no record is exactly the payload's length");
+    return 0;
+}
 
 seastar::future<encoded_assigned_batch> make_child(
   const shape& selected,
@@ -82,7 +127,8 @@ seastar::future<encoded_assigned_batch> make_child(
   codec::cooperative_work& work) {
     const auto records = std::max<std::size_t>(
       1, selected.payload_bytes / 1_MiB);
-    const auto size = selected.payload_bytes == 8_MiB ? 1048565U
+    const auto size = selected.exact ? exact_value(selected.payload_bytes)
+                      : selected.payload_bytes == 8_MiB ? 1048565U
                       : selected.payload_bytes == 0
                         ? 64U
                         : selected.payload_bytes / records - 1024U;
@@ -188,34 +234,47 @@ codec::limits policy(const shape& selected) {
 seastar::future<extent_input> make_extent(
   const shape& selected, std::uint32_t index, codec::cooperative_work& work) {
     require(
-      selected.batches() <= maximum_batches && index < maximum_extent_segments
+      selected.batches() <= maximum_batches
+        && index < maximum_wide_extent_segments
         && selected.blocks > 0 && selected.blocks <= maximum_group_blocks
         && selected.window > 0 && selected.window <= 8
-        && (selected.payload_bytes == 0 || (selected.payload_bytes >= 1_KiB && selected.payload_bytes <= 8_MiB)),
+        && (selected.payload_bytes == 0 || (selected.payload_bytes >= 1_KiB && selected.payload_bytes <= 8_MiB))
+        && (!selected.exact || selected.payload_bytes <= 1_MiB),
       "segment benchmark shape exceeds its bound");
     auto descriptor = installation_contract::descriptor();
-    descriptor.segment
-      = segment_context::make(
-          descriptor.segment.cluster(),
-          descriptor.segment.topic(),
-          selected.replace
-            ? descriptor.segment.range()
-            : id<model::range_id>(static_cast<std::uint8_t>(0x20U + index)),
-          id<model::segment_id>(static_cast<std::uint8_t>(0x30U + index)),
-          descriptor.segment.generation())
-          .value();
+    // An identity of the extent's own: one byte through the first extents,
+    // after them the byte with the extent's number in the last two.
+    const auto own = [index]<typename Id>(std::uint8_t byte) {
+        if (index < maximum_extent_segments)
+            return id<Id>(static_cast<std::uint8_t>(byte + index));
+        std::array<std::uint8_t, 16> bytes{};
+        bytes.fill(byte);
+        bytes[14] = static_cast<std::uint8_t>(index >> 8U);
+        bytes[15] = static_cast<std::uint8_t>(index);
+        return Id::make(bytes).value();
+    };
+    descriptor.segment = segment_context::make(
+                           descriptor.segment.cluster(),
+                           descriptor.segment.topic(),
+                           selected.replace
+                             ? descriptor.segment.range()
+                             : own.template operator()<model::range_id>(0x20U),
+                           own.template operator()<model::segment_id>(0x30U),
+                           descriptor.segment.generation())
+                           .value();
+    // The installation fixture's origin; a replacing extent starts after the
+    // ones before it.
+    model::range_logical_end origin{100};
     if (selected.replace)
-        descriptor.logical_origin = model::range_logical_end{
-          descriptor.logical_origin.value()
+        origin = model::range_logical_end{
+          origin.value()
           + std::uint64_t{index} * selected.batches()
               * std::max<std::size_t>(1, selected.payload_bytes / 1_MiB)};
     descriptor.alignment
       = storage_alignment::make(byte_count{selected.alignment}).value();
     auto header = (co_await encode_segment_header(
                      segment_header::make(
-                       descriptor.segment,
-                       descriptor.logical_origin,
-                       descriptor.alignment)
+                       descriptor.segment, descriptor.alignment)
                        .value(),
                      work,
                      working_bytes,
@@ -225,7 +284,7 @@ seastar::future<extent_input> make_extent(
       descriptor.segment,
       descriptor.alignment,
       runtime::file_position{header.size().value()},
-      descriptor.logical_origin,
+      origin,
       descriptor.physical_origin,
       descriptor.profile};
     extent_input result{descriptor, history, std::move(header), {}, {}, {}, {}};
@@ -241,18 +300,15 @@ seastar::future<extent_input> make_extent(
     auto logical = history.logical_origin;
     auto physical = history.physical_origin;
     auto position = history.data_start;
-    const auto footer_bytes = aligned_envelope_layout::make(
-                                {byte_count{codec::envelope_prefix_bytes},
-                                 durable_footer_fixed_bytes,
-                                 {}},
-                                descriptor.alignment,
-                                work.policy(),
-                                {byte_count{64_KiB}, byte_count{64_KiB}})
-                                .value()
-                                .encoded_bytes();
     std::uint32_t batch = 0;
     for (std::uint32_t g = 0; g < selected.groups; ++g) {
         const auto begin = position;
+        // Each window's barrier settles before the next window freezes: a
+        // group's blocks carry the end of the window before its own.
+        const auto certified
+          = g < selected.window
+              ? history.data_start
+              : result.groups[g - g % selected.window - 1].end;
         std::vector<encoded_assigned_batch> children;
         std::vector<segment_block> blocks;
         std::vector<bytes::fragmented_buffer> block_wires;
@@ -283,6 +339,7 @@ seastar::future<extent_input> make_extent(
             auto encoded = (co_await encode_segment_block(
                               std::move(shared),
                               placement(history, physical, position),
+                              stamps(certified),
                               work,
                               working_bytes,
                               charge))
@@ -304,7 +361,9 @@ seastar::future<extent_input> make_extent(
             position = covered.bytes().end();
         }
         const auto footer_begin = position;
-        const auto end = footer_begin.checked_add(footer_bytes).value();
+        const auto footer_size = footer_bytes(
+          history, footer_begin, work.policy());
+        const auto end = footer_begin.checked_add(footer_size).value();
         const auto whole = prefix(history, logical, physical, end);
         verifier.extend_expected(whole, work).value();
         for (const auto& block : blocks)
@@ -323,7 +382,7 @@ seastar::future<extent_input> make_extent(
                          charge))
                         .value();
         require(
-          footer.bytes().size() == footer_bytes, "footer projection changed");
+          footer.bytes().size() == footer_size, "footer projection changed");
         (co_await verifier.add_footer(footer, memory(), work, checkpoint))
           .value();
         auto footer_wire = std::move(footer).release_bytes();
@@ -347,6 +406,7 @@ seastar::future<extent_input> make_extent(
             whole,
             begin,
             end,
+            certified,
             wire_fragments});
         position = end;
     }
@@ -459,6 +519,7 @@ encode_extent(extent_input& input, codec::cooperative_work& work) {
                                   input.history,
                                   records.physical().begin(),
                                   records.bytes().begin()),
+                                stamps(group.certified),
                                 work,
                                 working_bytes,
                                 charge))
@@ -492,19 +553,14 @@ seastar::future<verified_extent> encode_cut_extent(
   const extent_input& input,
   std::span<encoded_assigned_batch> children,
   std::span<const std::uint32_t> cuts,
+  std::span<const runtime::file_position> certified,
   codec::cooperative_work& work) {
+    require(
+      certified.size() == children.size(),
+      "a block's certified end is missing");
     const auto& history = input.history;
     const model::batch_decode_expectation expected{
       history.segment.topic(), history.segment.range()};
-    const auto footer_bytes = aligned_envelope_layout::make(
-                                {byte_count{codec::envelope_prefix_bytes},
-                                 durable_footer_fixed_bytes,
-                                 {}},
-                                history.alignment,
-                                work.policy(),
-                                {byte_count{64_KiB}, byte_count{64_KiB}})
-                                .value()
-                                .encoded_bytes();
     auto verifier = empty_verifier(history, work.policy());
     auto logical = history.logical_origin;
     auto physical = history.physical_origin;
@@ -521,6 +577,7 @@ seastar::future<verified_extent> encode_cut_extent(
             auto block = (co_await encode_segment_block(
                             std::move(children[next]),
                             placement(history, physical, position),
+                            stamps(certified[next]),
                             work,
                             working_bytes,
                             charge))
@@ -531,7 +588,9 @@ seastar::future<verified_extent> encode_cut_extent(
             position = covered.bytes().end();
             blocks.push_back(std::move(block));
         }
-        const auto end = position.checked_add(footer_bytes).value();
+        const auto end
+          = position.checked_add(footer_bytes(history, position, work.policy()))
+              .value();
         verifier.extend_expected(prefix(history, logical, physical, end), work)
           .value();
         for (const auto& block : blocks)

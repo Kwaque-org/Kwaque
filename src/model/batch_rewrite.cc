@@ -35,11 +35,14 @@ public:
     std::optional<bytes::fragmented_buffer_builder> output;
     fragmented_buffer produced;
     item_count headers;
+    // Over the kept records only: removing a record can lower it.
+    runtime::wall_time max_record_time;
 
     [[nodiscard]] assigned_batch finish(
       assigned_batch_context context,
       codec::semantic_batch_digest digest) && noexcept {
-        return assigned_batch{context, digest, headers, std::move(produced)};
+        return assigned_batch{
+          context, digest, headers, max_record_time, std::move(produced)};
     }
 
     seastar::future<codec::result<void>> run(
@@ -210,6 +213,16 @@ public:
             }
             // Count the match only after any required copy has completed.
             headers = item_count{headers.value() + current->headers().size()};
+            // The walk checked this record's time representable.
+            const auto time = checked_timestamp_from_delta(
+              submitted.original_timestamp_base(),
+              current->fields.timestamp_delta);
+            KWAQUE_INVARIANT(
+              invariant_id{"KQ-BATCH-REWRITE-RECORD-TIME"},
+              time.has_value(),
+              "a walked record time is not representable");
+            if (selection == 0 || *time > max_record_time)
+                max_record_time = *time;
             ++selection;
         }
         if (!input.at_end() || header_count != expected_headers.value())

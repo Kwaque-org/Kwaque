@@ -2,11 +2,11 @@
 
 #include "src/base/units.h"
 #include "src/codec/digest.h"
+#include "src/storage/local_bundle.h"
 #include "src/storage/local_generation.h"
 #include "src/storage/local_paths.h"
 #include "src/storage/page_cache.h"
 #include "src/storage/recovery_pins.h"
-#include "src/storage/retry_snapshot.h"
 #include "src/storage/segment_format.h"
 #include "src/storage/sparse_index.h"
 #include "src/storage/sparse_index_owner.h"
@@ -79,7 +79,14 @@ seastar::future<> active_feed(
       "the index was not admitted when its segment was made");
     auto writer = take(
       writer_type::make_new(
-        files, owner, spec, 0, described, resources, config));
+        files,
+        owner,
+        spec,
+        0,
+        described,
+        segments::logical_origin(),
+        resources,
+        config));
     runtime::first_failure failed;
     try {
         take(co_await drive.lifecycle(writer->create_new(work)));
@@ -120,10 +127,18 @@ seastar::future<> active_feed(
         require(
           index.size() == blocks.size() && index.skipped() == 0,
           "a durable block is not an anchor");
+        // An index's context covers whole units: the extent through its
+        // last footer's padding, as a seal names it.
+        const auto covered = second_cut.covered();
         const auto context = take(
           sparse_index_context::make(
             described.segment,
-            second_cut.covered(),
+            storage::coverage{
+              covered.logical(),
+              covered.physical(),
+              model::file_byte_span::make(
+                covered.bytes().begin(), second_cut.end().bytes)
+                .value()},
             codec::extent_digest{codec::content_digest{}},
             described.alignment));
         for (std::uint32_t i = 0; i < index.size(); ++i)
@@ -182,6 +197,7 @@ seastar::future<> check_published_index(
        *sealed.boundary,
        {named, *sealed.retry}},
       described,
+      segments::logical_origin(),
       contexts};
     auto generation = take(
       co_await drive.lifecycle(
@@ -329,6 +345,7 @@ seastar::future<> damaged_page(
        *sealed.boundary,
        {named, *sealed.retry}},
       described,
+      segments::logical_origin(),
       contexts};
     // The top byte of an envelope's body length is its sixteenth.
     enum class damage : std::uint8_t { entry, page_length, root_length };
@@ -428,7 +445,14 @@ seastar::future<> sealed_index(
     const auto object = local_object_sequence::make(46).value();
     auto writer = take(
       writer_type::make_new(
-        files, owner, spec, 0, described, resources, config));
+        files,
+        owner,
+        spec,
+        0,
+        described,
+        segments::logical_origin(),
+        resources,
+        config));
     runtime::first_failure failed;
     try {
         take(co_await drive.lifecycle(writer->create_new(work)));
@@ -461,13 +485,11 @@ seastar::future<> sealed_index(
         const auto sealed = co_await drive.lifecycle(writer->seal(
           segments::completed_source{{}, {}, &calls},
           0,
-          2,
           work,
           sparse_index_seal{&index, late ? local_object_sequence{} : object}));
         take(sealed.failure.outcome());
         require(
           sealed.boundary && sealed.retry && sealed.extent
-            && sealed.unresolved == 2
             && writer->append_state() == model::append_state::sealed
             && writer->publication_generation()->value() == before + 1
             && index.frozen() && index.size() == 2 && index.skipped() == 0,
@@ -705,14 +727,20 @@ seastar::future<> empty_extent(
     const auto object = local_object_sequence::make(46).value();
     auto writer = take(
       writer_type::make_new(
-        files, owner, spec, 0, described, resources, config));
+        files,
+        owner,
+        spec,
+        0,
+        described,
+        segments::logical_origin(),
+        resources,
+        config));
     runtime::first_failure failed;
     try {
         take(co_await drive.lifecycle(writer->create_new(work)));
         std::uint32_t calls = 0;
         const auto sealed = co_await drive.lifecycle(writer->seal(
           segments::completed_source{{}, {}, &calls},
-          0,
           0,
           work,
           sparse_index_seal{&index, object}));
@@ -863,7 +891,14 @@ seal_segment(
         resources)));
     output.writer = take(
       writer_type::make_new(
-        files, owner, spec, 0, described, resources, config));
+        files,
+        owner,
+        spec,
+        0,
+        described,
+        segments::logical_origin(),
+        resources,
+        config));
     runtime::first_failure failed;
     try {
         take(co_await drive.lifecycle(output.writer->create_new(work)));
@@ -889,7 +924,6 @@ seal_segment(
         output.sealed = co_await drive.lifecycle(output.writer->seal(
           segments::completed_source{{}, {}, &calls},
           0,
-          blocks,
           work,
           sparse_index_seal{
             output.index.get(), object.value_or(local_object_sequence{})}));
@@ -1043,7 +1077,7 @@ seastar::future<> owed_index(
         const auto data = co_await store_contract::read_all_bytes(
           files, data_path(spec), drive);
         // The second block's base, at the footer that lies between the two
-        // blocks: inside the extent, aligned and in order, and no block.
+        // blocks: inside the extent and in order, and no block.
         const auto between = blocks[0].coverage().bytes().end();
         auto wrong = take(active_sparse_index::make(stride, 2, resources));
         wrong.written(blocks[0].coverage());
@@ -1250,6 +1284,7 @@ seastar::future<> owed_index(
                 spec,
                 0,
                 segments::descriptor(),
+                segments::logical_origin(),
                 resources,
                 store_contract::limits(),
                 work)));
@@ -2247,6 +2282,8 @@ seastar::future<> paged_lookups(
             described.alignment));
         auto frozen = take(
           active_sparse_index::make(stride, anchors, resources));
+        // As a writer admits each group's blocks before they are offered.
+        take(frozen.admit(static_cast<std::uint32_t>(anchors)));
         std::uint64_t ordinal = 0;
         for (auto entry = placed.begin(); entry != placed.end(); ++entry) {
             const auto next = std::next(entry);
@@ -2459,6 +2496,8 @@ seastar::future<> cached_lookups(
             described.alignment));
         auto frozen = take(
           active_sparse_index::make(stride, anchors, resources));
+        // As a writer admits each group's blocks before they are offered.
+        take(frozen.admit(static_cast<std::uint32_t>(anchors)));
         std::uint64_t ordinal = 0;
         for (auto entry = placed.begin(); entry != placed.end(); ++entry) {
             const auto next = std::next(entry);
@@ -3011,6 +3050,7 @@ seastar::future<> sealed_data(
            *segment.sealed.boundary,
            {*segment.sealed.index, *segment.sealed.retry}},
           described,
+          segments::logical_origin(),
           contexts};
         generation = take(
           co_await drive.lifecycle(

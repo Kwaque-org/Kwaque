@@ -84,6 +84,7 @@ private:
     byte_count descriptor_charge_;
     std::optional<bytes::fragmented_buffer_builder> output_;
     std::optional<runtime::wall_time> timestamp_base_;
+    runtime::wall_time max_record_time_;
     item_count count_;
     item_count headers_;
     bool closed_{false};

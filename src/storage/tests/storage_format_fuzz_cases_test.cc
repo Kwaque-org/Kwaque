@@ -18,6 +18,18 @@ TEST(StorageFuzzCasesTest, FamiliesMutationsAndCompatibleNestedProfiles) {
         }
     }
 }
+// A PREPARE before the last of its write carries no padding: whole, it is
+// accepted, and every mutation of the matrix is refused as for the last, at
+// each header length and alignment.
+TEST(StorageFuzzCasesTest, AWriteMemberBeforeItsLastIsUnpadded) {
+    for (std::uint8_t mutation = 0; mutation < 9; ++mutation)
+        for (const auto variant : std::array<std::uint8_t, 4>{0, 1, 2, 255}) {
+            const std::array<std::uint8_t, 8> script{
+              2, mutation, 64, mutation, 31, 0, 7, variant};
+            exercise_storage_case(script);
+            seastar::thread::maybe_yield();
+        }
+}
 TEST(StorageFuzzCasesTest, ResourceFailuresCancellationMarksAndTerminalOrigin) {
     for (std::uint8_t kind = 0; kind < 6; ++kind) {
         for (const auto flags :
@@ -112,7 +124,7 @@ TEST(StorageFuzzCasesTest, MalformedPaddingRejectsAcrossFragmentLayouts) {
             // An index root follows each reference with a first anchor.
             const std::size_t tail = is_root ? (is_manifest ? 48U : 56U)
                                              : fixture.entries
-                                                 * (is_manifest ? 104U : 16U);
+                                                 * (is_manifest ? 120U : 16U);
             const auto padding_begin = 32U + fixed + tail;
             ASSERT_LT(padding_begin, original.size());
             for (const auto bad :
@@ -194,17 +206,17 @@ TEST(StorageFuzzCasesTest, MetadataIndependentFixedBytesAndExactHashes) {
       golden{
         true,
         32,
-        "4b5142460900010001002000e001000000000000000000005e00278cadddb35d",
-        "4b5142460900010001002000e001000000000000000000001301aa1f1b36d28d",
-        "130ba44c2114cfea5f3fa1459a818ce9",
-        "e22d2348fb9d55e63531f5d0d758dd13"},
+        "4b5142460900010001002000e001000000000000000000007c355425cc601459",
+        "4b5142460900010001002000e00100000000000000000000f86e91cf2d6f1be4",
+        "89287057bf15d585c0e7db3e25c908b6",
+        "d75c790f9c85e70c31cc62280300b639"},
       golden{
         true,
         4096,
-        "4b51424609000200010000100002000000000000000000003f61df0ad8e29be0",
-        "4b5142460900020001000010000200000000000000000000ae1ed5a4847dc45f",
-        "72995518bf5b15ac5102b99330559db1",
-        "5beefb3d1fc4127bd68edeb030965fff"}};
+        "4b514246090002000100001000020000000000000000000054cfb2d0a118ec63",
+        "4b5142460900020001000010000200000000000000000000dd399e532f05bfec",
+        "d25ac7fed856b145c06b0efb35bb0e5c",
+        "f8e7ddc2d3bf8afd2fe76ae872968741"}};
     for (const auto& known : cases) {
         const metadata_fixture fixture{known.manifest, 2, 1, known.header};
         const auto page = fixture.page_wire(0);

@@ -10,8 +10,10 @@
 #include <exception>
 #include <optional>
 #include <set>
+#include <span>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <utility>
 
 namespace kwaque::runtime::testing {
@@ -27,6 +29,11 @@ T take(result<T> value) {
 }
 inline void take(result<void> value) {
     if (!value) throw std::runtime_error(value.error().render());
+}
+template<typename T>
+T take_bytes(kwaque::result<T> value) {
+    if (!value) throw std::runtime_error(value.error().message());
+    return std::move(*value);
 }
 template<typename T>
 concept has_preallocation = requires(T& owner) { owner.allocate(0, 4096); };
@@ -231,6 +238,79 @@ run_file_system_contract(Backend& files, file_path root, Driver drive) {
           co_await drive(files.remove_file(
             take(file_path::make(root.value() + "/" + name)))));
     take(co_await drive(files.remove_directory(root)));
+}
+
+// write_zeroes zeroes a range at or past the end and grows the file to its
+// end, or answers unsupported and changes nothing; a range starting before
+// the end is refused. Neither answer fences the handle. Returns the answer,
+// so each caller requires the one its backend's configuration gives.
+template<file_system_backend Backend, typename Driver>
+seastar::future<write_zeroes_outcome>
+run_write_zeroes_contract(Backend& files, file_path root, Driver drive) {
+    using namespace file_system_contract_detail;
+    std::optional<file> opened;
+    std::optional<write_zeroes_outcome> outcome;
+    std::exception_ptr first_failure;
+    const auto path = take(file_path::make(root.value() + "/zeroes"));
+    try {
+        take(co_await drive(files.create_directories(root)));
+        opened.emplace(take(
+          co_await drive(files.open(
+            path,
+            {.access = file_access::read_write,
+             .create = true,
+             .exclusive = true}))));
+        const auto unit = take(opened->geometry()).write_alignment().value();
+        const std::string content(unit, 'x');
+        const auto bytes = [](std::string_view value) {
+            return take_bytes(
+              bytes::fragmented_buffer::copy_of(
+                std::span{value.data(), value.size()}));
+        };
+        take(co_await drive(opened->write(file_position{0}, bytes(content))));
+        auto early = co_await drive(
+          opened->write_zeroes(file_position{unit - 1}, byte_count{2 * unit}));
+        require(
+          !early && early.error().code() == errc::invalid_argument,
+          "write_zeroes reached existing bytes");
+        outcome = take(
+          co_await drive(
+            opened->write_zeroes(file_position{unit}, byte_count{2 * unit})));
+        const auto zeroed = *outcome == write_zeroes_outcome::written;
+        const auto end = zeroed ? 3 * unit : unit;
+        require(
+          take(co_await drive(opened->size())) == end,
+          zeroed ? "write_zeroes did not grow the file"
+                 : "unsupported write_zeroes changed the size");
+        auto read = take(
+          co_await drive(opened->read(file_position{0}, byte_count{4 * unit})));
+        const auto stored = take_bytes(
+          read.data().linearize(byte_count{4 * unit}));
+        require(
+          std::string_view{stored.get(), stored.size()}
+            == content + std::string(end - unit, '\0'),
+          "write_zeroes changed bytes outside its zeros");
+        // The handle stays usable after either answer.
+        take(co_await drive(opened->write(file_position{end}, bytes(content))));
+        require(
+          take(co_await drive(opened->size())) == end + unit,
+          "a write after write_zeroes was refused");
+        take(co_await drive(opened->close()));
+        opened.reset();
+    } catch (...) {
+        first_failure = std::current_exception();
+    }
+    if (opened) {
+        try {
+            take(co_await drive(opened->close()));
+        } catch (...) {
+            retain_cleanup_failure(first_failure);
+        }
+    }
+    if (first_failure) std::rethrow_exception(first_failure);
+    take(co_await drive(files.remove_file(path)));
+    take(co_await drive(files.remove_directory(root)));
+    co_return *outcome;
 }
 
 } // namespace kwaque::runtime::testing

@@ -24,8 +24,9 @@ enum class recovery_predicate : std::uint8_t {
     block,
     // The slot lies inside pinned evidence, which is not scanned again.
     pinned,
-    // The slot lies at or below the recovered boundary, or inside pinned
-    // evidence.
+    // The slot lies under a footer the walk found intact, before the first
+    // damage or after what restart filled, or inside pinned evidence. A
+    // slot the walk filled is not covered.
     covered,
     // The PREPARE's target strictly increases within its segment in WAL
     // order, as formation submits groups.
@@ -34,19 +35,26 @@ enum class recovery_predicate : std::uint8_t {
     // and the child bytes, directly or by the XXH3-128 identity of each
     // copy's exact child.
     identical,
-    // The claimed slot fits the layout: aligned, at or after the data start,
-    // and never inside another object or a certified footer.
+    // The claimed slot fits the layout: at or after the data start, and
+    // never inside another object or a certified footer.
     placed,
+    // Meaningful only with a PREPARE after the recovered boundary: the slot
+    // lies below the boundary restart publishes, every slot before it filled
+    // by an intact object or from the WAL, and a footer, found intact or
+    // derived, after it.
+    contiguous,
     // The region lies beyond a rotated WAL file's sealed end.
     slack,
-    // The region starts at its file's first damage.
+    // The region starts at a damaged position of its file.
     damage,
-    // The region lies below pinned certification: a rotated WAL file's sealed
-    // prefix, a checkpoint, a published or recovering boundary, or a sealed
-    // root.
+    // The region lies below what its file proves certified: a rotated WAL
+    // file's sealed prefix, a checkpoint, a published or recovering
+    // boundary, a sealed root, or a stamp an intact object carries.
     certified,
+    // The damaged region was filled again from the WAL at restart.
+    filled,
 };
-inline constexpr std::size_t recovery_predicate_count = 11;
+inline constexpr std::size_t recovery_predicate_count = 13;
 using recovery_parameters = std::array<bool, recovery_predicate_count>;
 
 enum class recovery_matcher : std::uint8_t {
@@ -67,7 +75,11 @@ enum class recovery_classification : std::uint8_t {
     // A footer-covered block whose PREPARE did not survive in the WAL's
     // classified content. Overlapped barriers make this ordinary.
     footer_only,
-    // A PREPARE with no block at or below the recovered boundary: preserve
+    // A PREPARE whose slot lies below the boundary restart publishes, after
+    // the recovered one: its block is written from the PREPARE, or was found
+    // intact and identical, and is flushed before it is published.
+    materialize,
+    // A PREPARE behind a slot nothing fills: it was never reported. Preserve
     // it until a supplied resolution.
     candidate,
     // A complete block after the recovered boundary: unresolved, never
@@ -78,10 +90,16 @@ enum class recovery_classification : std::uint8_t {
     conflict,
     // Verified content before a file's first damage.
     content,
-    // The first damage and every later byte, beyond all pinned
-    // certification. Retained; later surviving envelopes are not evidence.
+    // Damage nothing proves certified, filled again from the WAL.
+    materialized,
+    // Damage below what its file proves certified, filled again from the
+    // WAL: counted, for the bytes it replaced were certified.
+    repaired,
+    // Damage beyond all proof of certification that nothing fills, and every
+    // later byte. Retained; later surviving objects are not content.
     uncertified_tail,
-    // Damage below pinned certification: stop affected recovery.
+    // Damage below what its file proves certified that nothing fills: stop
+    // affected recovery.
     corruption,
     // Bytes after a rotated WAL file's sealed end: never content.
     slack,
@@ -113,6 +131,9 @@ enum class recovery_copy_difference : std::uint8_t {
     target,
     batch_id,
     original_binding,
+    // Append time, record time or the target's certified end: the block
+    // made from the PREPARE would carry other bytes.
+    stamps,
     length,
     child,
 };
@@ -128,6 +149,9 @@ struct recovery_copy_identity final {
     segment_write_context target;
     model::batch_id id;
     model::producer_stream_binding binding;
+    // What the block made from it carries beside its child.
+    segment_block_stamps stamps;
+    runtime::wall_time max_record_time;
     byte_count child_bytes;
     codec::immutable_object_digest child;
 };
@@ -147,6 +171,7 @@ struct recovery_slot final {
     // Meaningful only with a PREPARE.
     bool ordered{false};
     bool placed{false};
+    bool contiguous{false};
     // Meaningful only with both copies.
     recovery_copy_difference difference{recovery_copy_difference::none};
 };
@@ -160,6 +185,7 @@ struct recovery_slot_evidence final {
     bool covered{false};
     bool ordered{false};
     bool placed{false};
+    bool contiguous{false};
     recovery_copy_difference difference{recovery_copy_difference::none};
 };
 
@@ -168,7 +194,7 @@ struct recovery_slot_evidence final {
 batch_parameters(const recovery_slot& slot) noexcept;
 [[nodiscard]] recovery_parameters
 batch_parameters(const recovery_slot_evidence& slot) noexcept;
-[[nodiscard]] recovery_parameters
-region_parameters(bool slack, bool damage, bool certified) noexcept;
+[[nodiscard]] recovery_parameters region_parameters(
+  bool slack, bool damage, bool certified, bool filled = false) noexcept;
 
 } // namespace kwaque::storage

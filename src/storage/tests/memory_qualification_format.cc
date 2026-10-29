@@ -37,9 +37,7 @@ void scalar_operation(std::string_view name) {
     const auto h = header_bytes(name);
     seastar::abort_source abort;
     codec::cooperative_work work{codec::limits::defaults(), abort};
-    const auto value = segment_header::make(
-                         sc(), model::range_logical_end{100}, alignment(a))
-                         .value();
+    const auto value = segment_header::make(sc(), alignment(a)).value();
     // Empty extent evidence permits measuring footer codecs without a hidden
     // pre-existing hash owner or a large fixture owner.
     const footer_expectation expected{
@@ -270,6 +268,10 @@ void wrapper_operation(std::string_view name) {
                 return encode_wal_prepare(
                          std::move(child),
                          wc,
+                         {true,
+                          runtime::wall_time{1},
+                          wc.target_data_start,
+                          wc.wal_data_start},
                          work,
                          observation::residual,
                          charge)
@@ -282,6 +284,7 @@ void wrapper_operation(std::string_view name) {
                 return encode_segment_block(
                          std::move(child),
                          bc,
+                         {runtime::wall_time{1}, bc.data_start},
                          work,
                          observation::residual,
                          charge)
@@ -293,17 +296,28 @@ void wrapper_operation(std::string_view name) {
             wire = std::move(*result).release_bytes();
         }
     } else {
-        wire
-          = wal ? encode_wal_prepare(
-                    std::move(child), wc, work, observation::residual, charge)
-                    .get()
-                    .value()
-                : std::move(
-                    encode_segment_block(
-                      std::move(child), bc, work, observation::residual, charge)
-                      .get()
-                      .value())
-                    .release_bytes();
+        wire = wal ? encode_wal_prepare(
+                       std::move(child),
+                       wc,
+                       {true,
+                        runtime::wall_time{1},
+                        wc.target_data_start,
+                        wc.wal_data_start},
+                       work,
+                       observation::residual,
+                       charge)
+                       .get()
+                       .value()
+                   : std::move(encode_segment_block(
+                                 std::move(child),
+                                 bc,
+                                 {runtime::wall_time{1}, bc.data_start},
+                                 work,
+                                 observation::residual,
+                                 charge)
+                                 .get()
+                                 .value())
+                       .release_bytes();
         // Large fragmented input reaches the public fragment admission path.
         wire = codec::bench::copy_layout(
                  std::move(wire), 16384, work, observation::residual, 1024)
@@ -344,11 +358,12 @@ void rejected_operation(std::string_view name) {
     const bool cancel = name == "block-abort";
     const bool pressure = name == "block-pressure";
     if (name == "block-padding") {
-        wire.back() = 1;
+        // A block never pads, so a padding count is malformed.
+        put(wire, 32 + 140, 1, 4);
         repair(wire);
     } else if (name == "block-nested") {
         // Repaired outer integrity must still reject the corrupt child.
-        wire[32 + 120 + 4096] ^= 1;
+        wire[32 + 144 + 4096] ^= 1;
         repair(wire);
     }
     auto source = buffer(wire, 7);

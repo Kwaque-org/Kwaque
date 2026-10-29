@@ -73,7 +73,12 @@ enum class engine_state : std::uint8_t {
 struct local_engine_config final {
     // The WAL's geometry is its store's: nothing here has a default for it.
     wal_writer_config wal;
-    wal_group_commit_config commit{};
+    // A group's WAL portions are written once the writer is free, with no
+    // deliberate wait: what arrives while a barrier is in flight joins the
+    // next cohort, so cohorts grow with load and an isolated request is not
+    // held back.
+    wal_group_commit_config commit{
+      .maximum_wait = runtime::monotonic_duration{0}};
     local_append_config append{};
     checkpoint_limits checkpoint{};
     segment_table_config table{};
@@ -93,7 +98,9 @@ struct local_engine_config final {
     // Identities taken from the control record at a time.
     std::uint32_t id_block{256};
     // Handle credits of the appends' budget that are not a segment's: the
-    // WAL writer's files and its publications.
+    // WAL writer's, three for its head (data, synchronized and completion
+    // handles) and three for the successor it keeps made ahead, and two for
+    // a header publication.
     std::uint32_t reserved_append_handles{8};
     codec::limits policy{codec::limits::defaults()};
 };
@@ -132,6 +139,27 @@ struct engine_start final {
     // PREPAREs with no segment the catalog explains; the WAL that holds
     // them stays until they are resolved. And the files its chain has.
     std::uint64_t unresolved{0}, wal_files{0};
+    // Segments the catalog lists with no origin, prepared and never
+    // activated: taken in as prepared, to be activated or discarded by their
+    // owner. Those of them something says were written: an entry of the
+    // durable checkpoint, a PREPARE, an object of their own at their data
+    // start or a publication past their first. Any of these leaves the
+    // shard recovering, with nothing changed, for their owner to decide.
+    std::uint32_t prepared{0}, conflicts{0};
+    // The writable segments the shard takes: its configured bound, or fewer
+    // when its budget holds fewer.
+    std::uint32_t segments{0};
+    // Files the shard keeps to make new ones of: WAL files its checkpoints
+    // reclaimed, and segments' data files its removals gave back.
+    std::uint32_t wal_spares{0}, segment_spares{0};
+    // Slots past a segment's recovered boundary that the restart fills from
+    // the WAL or finds intact, written and flushed before it publishes them;
+    // those among them that replace bytes their segment proves were
+    // certified. PREPAREs whose slot nothing fills, kept with the WAL that
+    // holds them until resolved. And segments whose damage after their
+    // published boundary nothing proves certified: retained, never read.
+    std::uint64_t materialized{0}, repaired{0}, candidates{0};
+    std::uint32_t uncertified_tails{0};
     // Why the shard is not ready, when it is not.
     runtime::first_failure failure;
 };
@@ -222,17 +250,36 @@ public:
               config.merge.validate(),
               config.publications.validate()})
             if (!valid) return runtime::failure(valid.error());
-        // What must agree: one policy for the table, its writers and the
-        // append owner; no more segments written than the append owner
-        // attaches; and no more left unsealed or being removed than one
-        // restart's catalog lists.
         if (
           config.table.policy != config.policy
           || config.writer.policy != config.policy
-          || config.append.policy != config.policy
-          || config.table.maximum_writable > config.append.maximum_segments
+          || config.append.policy != config.policy)
+            return runtime::failure(detail::path_error(errc::invalid_argument));
+        // As many writable segments as configured, or fewer when the
+        // appends' budget holds fewer: what each holds idle may take a
+        // quarter of its bytes and half of its reservations, beside handle
+        // credits for every seal slot, creation and the WAL.
+        // A seal of a failed segment reads the WAL as a restart does.
+        config.table.wal_scan = config.merge.wal;
+        const auto effective = effective_segments(given.appends, config);
+        if (!effective) return runtime::failure(effective.error());
+        config.table.maximum_writable = *effective;
+        config.table.maximum_creations = std::min(
+          config.table.maximum_creations, *effective);
+        config.table.maximum_prepared = std::min(
+          config.table.maximum_prepared, *effective);
+        // The checkpoint pins every writable segment, and each one detached
+        // until its own publication covers it.
+        config.checkpoint.pins.segments = std::max(
+          config.checkpoint.pins.segments,
+          std::min(maximum_checkpoint_segments, 2 * *effective));
+        // What must agree: no more segments written than the append owner
+        // attaches, and no more left unsealed, prepared or being removed
+        // than one restart's catalog lists.
+        if (
+          config.table.maximum_writable > config.append.maximum_segments
           || std::size_t{config.table.maximum_writable}
-                 + config.table.maximum_deleting
+                 + config.table.maximum_prepared + config.table.maximum_deleting
                > maximum_recovery_catalog)
             return runtime::failure(detail::path_error(errc::invalid_argument));
         if (
@@ -323,6 +370,7 @@ public:
         state_ = engine_state::starting;
         starting_ = true;
         failures_ = std::move(told.failures);
+        report.segments = config_.table.maximum_writable;
         try {
             report.failure.observe(
               co_await started(
@@ -418,20 +466,109 @@ private:
       , residency_(config_.resident_index_roots)
       , rebuilds_(config_.index_rebuilds) {}
 
-    // Feeds every merged item to the plan and keeps the obligation rows.
+    // Feeds every merged item to the plan and folds the obligation rows
+    // that pin anything into one pin per segment, charging the pins a
+    // fragment at a time as they grow.
     struct restart_view final {
         recovery_planner* planner;
-        std::vector<recovery_obligation>* rows;
+        seastar::chunked_vector<local_pinned_obligation>* pins;
+        std::optional<workload_reservation>* held;
+        workload_budget* budget;
+        const local_store_context* owner;
+        recovery_inventory* inventory;
         seastar::future<runtime::result<bool>>
         operator()(const recovery_item& item) const {
             if (auto observed = planner->observe(item); !observed)
                 return seastar::make_ready_future<runtime::result<bool>>(
                   runtime::failure(observed.error()));
             if (const auto* row = std::get_if<recovery_obligation>(&item))
-                rows->push_back(*row);
+                if (auto folded = fold(*row); !folded)
+                    return seastar::make_ready_future<runtime::result<bool>>(
+                      runtime::failure(folded.error()));
+            // A PREPARE that claims a prepared segment says it was written.
+            if (
+              const auto* claim = std::get_if<recovery_unresolved_report>(
+                &item))
+                for (auto& entry : inventory->entries)
+                    if (
+                      entry.state == recovery_entry_state::prepared
+                      && entry.history.segment == claim->claimed)
+                        entry.conflict = true;
             return seastar::make_ready_future<runtime::result<bool>>(true);
         }
+        runtime::result<void> fold(const recovery_obligation& row) const {
+            if (row.pinned != 0 && pins->size() == pins->capacity()) {
+                const auto fragment = chunked_fragment_elements(
+                  sizeof(local_pinned_obligation));
+                const auto before = chunked_allocation_charge(
+                  *budget, pins->capacity(), sizeof(local_pinned_obligation));
+                const auto after = chunked_allocation_charge(
+                  *budget,
+                  pins->capacity() + fragment,
+                  sizeof(local_pinned_obligation));
+                if (!before) return runtime::failure(before.error());
+                if (!after) return runtime::failure(after.error());
+                if (
+                  auto taken = detail::hold_more(
+                    *held,
+                    *budget,
+                    byte_count{after->value() - before->value()});
+                  !taken)
+                    return taken;
+                // The first fragment whole, so that no pin moves.
+                try {
+                    if (pins->empty()) pins->reserve(fragment);
+                } catch (const std::bad_alloc&) {
+                    return runtime::failure(
+                      detail::path_error(errc::resource_exhausted));
+                }
+            }
+            return fold_pinned_obligation(*pins, row, *owner);
+        }
     };
+    // The writable segments `appends` holds of what `config` asks for: see
+    // make(). Refused when it holds not one.
+    static runtime::result<std::uint32_t> effective_segments(
+      const workload_budget& appends, const local_engine_config& config) {
+        using writer_type = segment_writer<Backend, Owner, Clock>;
+        const auto writer = writer_type::idle_charge(appends, config.writer);
+        if (!writer) return runtime::failure(writer.error());
+        const auto slot = append_type::segment_charge(appends, config.append);
+        if (!slot) return runtime::failure(slot.error());
+        const auto owner = table_type::owner_charge(appends);
+        if (!owner) return runtime::failure(owner.error());
+        const auto table = active_sparse_index::admission(
+          maximum_object_entries, appends);
+        if (!table) return runtime::failure(table.error());
+        const auto index = appends.reservation_charge(*table);
+        if (!index) return runtime::failure(index.error());
+        const auto each = writer->bytes.value() + slot->value() + owner->value()
+                          + index->value();
+        const auto limits = appends.limits();
+        const std::uint64_t by_bytes = limits.bytes.value() / 4 / each;
+        // Its writer's reservations, its index's, and the one its retry
+        // summary holds once a producer stream has written to it.
+        const std::uint64_t by_tasks = limits.tasks / 2
+                                       / (writer->reservations + 2U);
+        const auto fixed = std::uint64_t{config.reserved_append_handles}
+                           + std::uint64_t{config.table.maximum_seals}
+                               * segment_seal_handles
+                           + std::uint64_t{config.table.maximum_creations}
+                               * segment_creation_handles;
+        const std::uint64_t by_handles
+          = limits.handles > fixed
+              ? (limits.handles - fixed) / segment_writer_handles(config.writer)
+              : 0;
+        const auto held = std::min(
+          {std::uint64_t{config.table.maximum_writable},
+           by_bytes,
+           by_tasks,
+           by_handles});
+        if (held == 0)
+            return runtime::failure(
+              detail::path_error(errc::resource_exhausted));
+        return static_cast<std::uint32_t>(held);
+    }
     // Arrays a restart keeps, each one allocation of the given bytes, charged
     // to maintenance under one reservation.
     runtime::result<workload_reservation>
@@ -451,10 +588,11 @@ private:
 
     // What a restart read and established before the append owner exists.
     struct restarted final {
-        // Declared first: released after the rows it pays for.
-        workload_reservation held;
+        // Declared first: released after the pins it pays for.
+        std::optional<workload_reservation> held;
         recovery_inventory inventory;
-        std::vector<recovery_obligation> rows;
+        // One for each segment the rebuilt obligation rows pin.
+        seastar::chunked_vector<local_pinned_obligation> pins;
         std::optional<loaded_checkpoint> durable;
         std::optional<recovered_publications> published;
     };
@@ -525,12 +663,21 @@ private:
             recovered.emplace(std::move(**read));
             state_ = engine_state::starting;
             // What a checkpoint reclaimed and a crash brought back, before
-            // any owner exists that could replace the head they are below.
-            if (
-              auto below = co_await remove_wal_below(
-                files_, ownership_, control_spec_, shard_, *control_, work);
-              !below)
-                co_return runtime::failure(below.error());
+            // any owner exists that could replace the head they are below;
+            // the spares the WAL keeps, and bodies no rotation took. Only
+            // then is the head's successor made ahead.
+            auto below = co_await remove_wal_below(
+              files_,
+              ownership_,
+              control_spec_,
+              shard_,
+              *control_,
+              work,
+              &writer_->spares(),
+              config_.wal.capacity_bytes);
+            if (!below) co_return runtime::failure(below.error());
+            report.wal_spares = writer_->spares().size();
+            writer_->prepare_successor();
             if (
               auto stale = co_await remove_stale_checkpoints(
                 files_, ownership_, control_spec_, shard_, *control_, work);
@@ -564,10 +711,10 @@ private:
         if (recovered) {
             // What the restart pinned holds its WAL file as a failed group
             // does, until a supplied resolution or a removal releases it.
-            const auto pinned = fold_pinned_obligations(
-              recovered->rows, wal->owner);
-            if (!pinned) co_return runtime::failure(pinned.error());
-            if (auto restored = append_->restore_pinned(*pinned); !restored)
+            if (
+              auto restored = append_->restore_pinned(
+                table_view<local_pinned_obligation>{recovered->pins});
+              !restored)
                 co_return restored;
         }
 
@@ -638,6 +785,17 @@ private:
           });
         if (!placement) co_return runtime::failure(placement.error());
         placement_ = std::move(*placement);
+        // The decisions that seal failed segments while the shard runs.
+        auto decisions = recovery_decision_log<Backend, Owner>::make(
+          files_,
+          ownership_,
+          control_spec_,
+          shard_,
+          *ids_,
+          metadata_,
+          config_.decisions);
+        if (!decisions) co_return runtime::failure(decisions.error());
+        decisions_ = std::move(*decisions);
         auto table = table_type::make(
           {files_,
            ownership_,
@@ -652,7 +810,9 @@ private:
            appends_,
            readers_,
            maintenance_,
-           placement_.get()},
+           placement_.get(),
+           control_.get(),
+           decisions_.get()},
           config_.table);
         if (!table) co_return runtime::failure(table.error());
         table_ = std::move(*table);
@@ -665,6 +825,10 @@ private:
               auto telling = table_->report_rolls(timer, std::move(rolls));
               !telling)
                 co_return telling;
+        // The data files removals kept, to make new segments' files of.
+        auto spares = co_await table_->adopt_spares(work);
+        if (!spares) co_return runtime::failure(spares.error());
+        report.segment_spares = spares->adopted;
 
         if (recovered) {
             // One checkpoint now that the head has its successor: when
@@ -676,7 +840,7 @@ private:
                 static_cast<void>(co_await checkpoint_->let_go());
             } catch (...) {
             }
-            co_await resume(recovered->inventory, report);
+            co_await resume(recovered->inventory, catalog, report);
         }
         state_ = engine_state::ready;
         co_return runtime::result<void>{};
@@ -693,28 +857,31 @@ private:
         using output = runtime::result<std::optional<restarted>>;
         // What a restart collects is reserved before anything is read, each
         // in one allocation charged to maintenance, so that none grows: the
-        // catalog's descriptors, every decision discovery may find and every
-        // obligation row the merge may deliver. A catalog longer than one
-        // restart reads is refused here.
+        // catalog's descriptors and every decision discovery may find. The
+        // pins the merge's obligation rows fold to are charged as they grow.
+        // A catalog longer than one restart reads is refused here.
         if (catalog.size() > maximum_recovery_catalog)
             co_return output{
               runtime::failure(detail::path_error(errc::out_of_range))};
         auto collected = reserve_restart(
-          {catalog.size() * sizeof(local_segment_descriptor),
-           std::size_t{config_.decisions.decisions}
-             * sizeof(recovery_decision_record)});
+          {std::size_t{config_.decisions.decisions}
+           * sizeof(recovery_decision_record)});
         if (!collected) co_return output{runtime::failure(collected.error())};
-        auto delivered = reserve_restart(
-          {std::size_t{config_.merge.obligations}
-           * sizeof(recovery_obligation)});
-        if (!delivered) co_return output{runtime::failure(delivered.error())};
-        std::vector<local_segment_descriptor> descriptors;
+        // The catalog's descriptors, in fragments.
+        auto listed = chunked_allocation_charge(
+          maintenance_, catalog.size(), sizeof(local_segment_descriptor));
+        if (!listed) co_return output{runtime::failure(listed.error())};
+        auto described = maintenance_.try_reserve(*listed);
+        if (!described) co_return output{runtime::failure(described.error())};
+        const auto owner = control_spec_.shard_owner(shard_);
+        if (!owner)
+            co_return output{
+              runtime::failure(detail::path_error(errc::invalid_argument))};
+        seastar::chunked_vector<local_segment_descriptor> descriptors;
         std::vector<recovery_decision_record> decided;
-        std::vector<recovery_obligation> rows;
         try {
             descriptors.reserve(catalog.size());
             decided.reserve(config_.decisions.decisions);
-            rows.reserve(config_.merge.obligations);
         } catch (const std::bad_alloc&) {
             co_return output{
               runtime::failure(detail::path_error(errc::resource_exhausted))};
@@ -727,7 +894,7 @@ private:
           control_spec_,
           shard_,
           fields,
-          std::span<const local_segment_descriptor>{descriptors},
+          table_view<local_segment_descriptor>{descriptors},
           maintenance_,
           config_.decisions,
           work,
@@ -749,8 +916,7 @@ private:
           config_.metadata,
           work);
         if (!found) co_return output{runtime::failure(found.error())};
-        restarted read{
-          std::move(*delivered), std::move(*found), std::move(rows), {}, {}};
+        restarted read{{}, std::move(*found), {}, {}, {}};
         for (const auto& entry : read.inventory.entries) {
             if (entry.state == recovery_entry_state::sealing) ++report.sealing;
             if (entry.refused) ++report.refused;
@@ -781,6 +947,8 @@ private:
         auto planner = recovery_planner::make(
           read.inventory.targets, maintenance_);
         if (!planner) co_return output{runtime::failure(planner.error())};
+        // What the merge's tail walks can fill, written before publication.
+        recovery_tails tails;
         const auto merged = co_await reconcile_local_recovery(
           files_,
           ownership_,
@@ -789,19 +957,39 @@ private:
           shard_,
           fields,
           cutoff,
-          std::span<const recovery_target>{read.inventory.targets},
+          table_view<recovery_target>{read.inventory.targets},
           maintenance_,
           config_.merge,
           work,
-          restart_view{&*planner, &read.rows});
+          restart_view{
+            &*planner,
+            &read.pins,
+            &read.held,
+            &maintenance_,
+            &*owner,
+            &read.inventory},
+          std::nullopt,
+          &tails);
         if (!merged) co_return output{runtime::failure(merged.error())};
         if (auto finished = planner->finish(*merged); !finished)
             co_return output{runtime::failure(finished.error())};
         report.unresolved = planner->wal().unresolved;
         report.wal_files = planner->wal().chain_files;
-        // A stopped scope, or a seal decision to carry out first: nothing
-        // is changed.
-        if (!planner->ready() || report.sealing != 0)
+        for (const auto& segment : planner->segments()) {
+            report.materialized += segment.materialized;
+            report.repaired += segment.repaired;
+            report.candidates += segment.candidates;
+            if (segment.uncertified_tail) ++report.uncertified_tails;
+        }
+        for (const auto& entry : read.inventory.entries)
+            if (entry.state == recovery_entry_state::prepared) {
+                ++report.prepared;
+                if (entry.conflict) ++report.conflicts;
+            }
+        // A stopped scope, a seal decision to carry out first, or a segment
+        // listed as never activated that something says was written:
+        // nothing is changed.
+        if (!planner->ready() || report.sealing != 0 || report.conflicts != 0)
             co_return output{std::optional<restarted>{}};
 
         auto writer = wal_type::make(
@@ -829,6 +1017,8 @@ private:
           shard_,
           *planner,
           read.inventory,
+          tails,
+          control_spec_,
           std::span<const recovery_visibility>{},
           maintenance_,
           recovering,
@@ -848,8 +1038,10 @@ private:
     // removal that finished is counted, and every unsealed segment is told
     // as recovered and taken in, so that its owner of segments can remove
     // it as what it is.
-    seastar::future<>
-    resume(const recovery_inventory& inventory, engine_start& report) {
+    seastar::future<> resume(
+      const recovery_inventory& inventory,
+      std::span<const recovery_catalog_entry> catalog,
+      engine_start& report) {
         for (const auto& entry : inventory.entries) {
             const auto& segment = entry.history.segment;
             switch (entry.state) {
@@ -885,6 +1077,21 @@ private:
                 break;
             case recovery_entry_state::sealing:
                 break;
+            case recovery_entry_state::prepared:
+                // Taken in as it was left: its origin is given when it is
+                // activated.
+                if (
+                  const auto listed = std::find_if(
+                    catalog.begin(),
+                    catalog.end(),
+                    [&segment](const auto& item) {
+                        return item.descriptor.segment == segment;
+                    });
+                  listed == catalog.end()
+                  || !table_->adopt_prepared(
+                    listed->descriptor, entry.device, config_.writer))
+                    ++report.unadopted;
+                break;
             }
         }
     }
@@ -906,8 +1113,14 @@ private:
             // The segment's own failure first: its device's then fails the
             // segments beside it, and finds this one failed with what it
             // said.
+            // One of no family an operation expects ends what the shard
+            // can do, as the append owner's own would.
             if (table_ && failure.segment)
-                table_->fail(*failure.segment, failure.failure);
+                if (
+                  table_->fail(*failure.segment, failure.failure)
+                    == segment_failure_kind::internal
+                  && !failed_.failed())
+                    failed_ = failure.failure;
             if (placement_ && failure.device)
                 placement_->failed(*failure.device, failure.detail);
             break;
@@ -960,6 +1173,8 @@ private:
         commit_.reset();
         if (writer_) co_await joined(kept, writer_->close());
         writer_.reset();
+        if (decisions_) co_await joined(kept, decisions_->close());
+        decisions_.reset();
         if (ids_) co_await joined(kept, ids_->close());
         ids_.reset();
         if (control_) co_await joined(kept, control_->close());
@@ -1013,6 +1228,7 @@ private:
     std::unique_ptr<checkpoint_type> checkpoint_;
     std::unique_ptr<page_cache> cache_;
     std::unique_ptr<device_table> placement_;
+    std::unique_ptr<recovery_decision_log<Backend, Owner>> decisions_;
     std::unique_ptr<table_type> table_;
     std::optional<seastar::shared_promise<runtime::result<void>>> stopping_;
 };

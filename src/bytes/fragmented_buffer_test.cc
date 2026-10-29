@@ -1458,6 +1458,55 @@ TEST(BufferBuilder, EnforcesTotalBytesFragmentCountAndReserveBounds) {
     EXPECT_EQ(retained_builder.retained_bytes().value(), 16U);
 }
 
+TEST(FragmentedBuffer, FragmentRetainedBytesNameWholeBackings) {
+    auto source = fragmented({"abcd", "efghijkl"});
+    EXPECT_EQ(source.fragment_retained_bytes(0)->value(), 4U);
+    EXPECT_EQ(source.fragment_retained_bytes(1)->value(), 8U);
+    EXPECT_FALSE(source.fragment_retained_bytes(2).has_value());
+
+    // A share of part of a fragment keeps all of it alive.
+    auto interior = source.share(byte_count{3}, byte_count{3});
+    ASSERT_TRUE(interior.has_value());
+    ASSERT_EQ(fragment_sizes(*interior), (std::vector<std::size_t>{1, 2}));
+    EXPECT_EQ(interior->fragment_retained_bytes(0)->value(), 4U);
+    EXPECT_EQ(interior->fragment_retained_bytes(1)->value(), 8U);
+}
+
+TEST(BufferBuilder, SharesOfAppendedBytesNeverChange) {
+    fragmented_buffer early, across;
+    {
+        fragmented_buffer_builder builder{
+          {.initial_fragment_bytes = byte_count{8},
+           .max_fragment_bytes = byte_count{8}}};
+        ASSERT_TRUE(builder.append(std::string_view{"abcdef"}).has_value());
+        auto shared = builder.share(byte_count{1}, byte_count{4});
+        ASSERT_TRUE(shared.has_value());
+        early = std::move(*shared);
+        // Past what was appended: the tail's unwritten room is not shared.
+        EXPECT_FALSE(builder.share(byte_count{2}, byte_count{5}).has_value());
+
+        // Later appends fill the same tail and go on in new fragments.
+        ASSERT_TRUE(builder.append(std::string_view{"ghijklmnop"}).has_value());
+        EXPECT_EQ(contents(early), "bcde");
+        auto spanning = builder.share(byte_count{5}, byte_count{6});
+        ASSERT_TRUE(spanning.has_value());
+        EXPECT_EQ(contents(*spanning), "fghijk");
+        EXPECT_EQ(spanning->fragment_count(), 2U);
+        EXPECT_EQ(spanning->retained_bytes().value(), 16U);
+        across = std::move(*spanning);
+        EXPECT_TRUE(builder.share(byte_count{16}, byte_count{0}).has_value());
+        EXPECT_FALSE(builder.share(byte_count{16}, byte_count{1}).has_value());
+
+        auto published = builder.finish();
+        ASSERT_TRUE(published.has_value());
+        EXPECT_EQ(contents(*published), "abcdefghijklmnop");
+        EXPECT_EQ(
+          builder.share(byte_count{0}, byte_count{1}).error(), errc::closed);
+    }
+    EXPECT_EQ(contents(early), "bcde");
+    EXPECT_EQ(contents(across), "fghijk");
+}
+
 TEST(BufferBuilder, PublishedSlicesSurviveTheBuilderAndOriginal) {
     fragmented_buffer slice;
     std::string expected;

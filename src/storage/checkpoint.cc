@@ -86,36 +86,38 @@ local_checkpoint_entry boundary_pin(
 }
 } // namespace
 
-runtime::result<std::vector<local_pinned_obligation>> fold_pinned_obligations(
-  std::span<const recovery_obligation> rows, const local_store_context& owner) {
-    std::vector<local_pinned_obligation> output;
-    output.reserve(rows.size());
-    for (const auto& row : rows) {
-        if (row.pinned == 0) continue;
-        if (!row.first_pinned || row.first_pinned->incarnation() != row.wal)
-            return runtime::failure(detail::path_error(errc::invalid_argument));
-        const auto found = std::find_if(
-          output.begin(), output.end(), [&row](const auto& pin) {
-              return pin.segment == row.segment;
-          });
-        if (found == output.end()) {
-            output.push_back(
+runtime::result<void> fold_pinned_obligation(
+  seastar::chunked_vector<local_pinned_obligation>& pins,
+  const recovery_obligation& row,
+  const local_store_context& owner) {
+    if (row.pinned == 0) return {};
+    if (!row.first_pinned || row.first_pinned->incarnation() != row.wal)
+        return runtime::failure(detail::path_error(errc::invalid_argument));
+    const auto found = std::find_if(
+      pins.begin(), pins.end(), [&row](const auto& pin) {
+          return pin.segment == row.segment;
+      });
+    if (found == pins.end()) {
+        try {
+            pins.push_back(
               {row.wal, row.segment, row.pinned, *row.first_pinned});
-            continue;
+        } catch (const std::bad_alloc&) {
+            return runtime::failure(
+              detail::path_error(errc::resource_exhausted));
         }
-        if (row.pinned > UINT32_MAX - found->pinned)
-            return runtime::failure(detail::path_error(errc::out_of_range));
-        found->pinned += row.pinned;
-        const auto order = row.first_pinned->compare(
-          owner, found->first, owner);
-        if (!order)
-            return runtime::failure(detail::path_error(errc::wrong_context));
-        if (*order == std::strong_ordering::less) {
-            found->wal = row.wal;
-            found->first = *row.first_pinned;
-        }
+        return {};
     }
-    return output;
+    if (row.pinned > UINT32_MAX - found->pinned)
+        return runtime::failure(detail::path_error(errc::out_of_range));
+    found->pinned += row.pinned;
+    const auto order = row.first_pinned->compare(owner, found->first, owner);
+    if (!order)
+        return runtime::failure(detail::path_error(errc::wrong_context));
+    if (*order == std::strong_ordering::less) {
+        found->wal = row.wal;
+        found->first = *row.first_pinned;
+    }
+    return {};
 }
 
 runtime::result<local_wal_cursor> checkpoint_cutoff(
@@ -589,7 +591,7 @@ runtime::result<checkpoint_resume> resume_from_checkpoint(
   std::span<const recovery_decision_record> decisions) {
     checkpoint_resume output;
     // A segment's entries are adjacent, so each segment is located once.
-    const recovery_entry* found = nullptr;
+    recovery_entry* found = nullptr;
     std::size_t target = 0;
     for (const auto& entry : table) {
         // A relocated candidate is recognized and unsupported: a restart
@@ -602,7 +604,7 @@ runtime::result<checkpoint_resume> resume_from_checkpoint(
         if (!found || found->history.segment != entry.segment) {
             found = nullptr;
             target = 0;
-            for (const auto& candidate : inventory.entries) {
+            for (auto& candidate : inventory.entries) {
                 if (candidate.history.segment == entry.segment) {
                     found = &candidate;
                     break;
@@ -614,6 +616,12 @@ runtime::result<checkpoint_resume> resume_from_checkpoint(
         // reclaimed WAL is gone, and nothing here explains it.
         if (!found)
             return runtime::failure(detail::path_error(errc::not_found));
+        // A prepared segment was never written: nothing durable names it.
+        if (found->state == recovery_entry_state::prepared) {
+            found->conflict = true;
+            ++output.conflicts;
+            continue;
+        }
         // Its own sealed or deleting publication, or a durable seal decision
         // still to be carried out, decides the segment whatever end it
         // chose; the entry leaves with the next checkpoint.
@@ -754,7 +762,7 @@ checkpoint_pages::next(codec::cooperative_work& work) {
     const local_metadata_payload payload{
       local_checkpoint_page{sequence, *place, first, std::move(slice)}};
     auto page = co_await encode_local_metadata(
-      {*header, alignment, {}, {}},
+      {*header, alignment, {}},
       payload,
       work,
       limits.operation_bytes.checked_sub(served).value(),
@@ -799,7 +807,7 @@ encode_checkpoint_root(
     const local_metadata_payload payload{
       local_checkpoint_root{begin, end, total, std::move(references)}};
     auto root = co_await encode_local_metadata(
-      {*header, pages.alignment, {}, {}},
+      {*header, pages.alignment, {}},
       payload,
       work,
       pages.limits.operation_bytes,

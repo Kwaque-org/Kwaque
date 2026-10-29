@@ -80,6 +80,11 @@ TEST(LocalTypesTest, CursorComparisonRequiresExactStoreAndAllowsBurnedGaps) {
     EXPECT_FALSE(local_wal_cursor::make({}, runtime::file_position{4096}));
     EXPECT_FALSE(local_wal_cursor::make(first_id, runtime::file_position{}));
     EXPECT_FALSE(local_wal_cursor::make(first_id, runtime::file_position{1}));
+    EXPECT_FALSE(local_wal_cursor::make(first_id, runtime::file_position{511}));
+    // A PREPARE boundary inside a packed write lies anywhere after the
+    // smallest data start.
+    EXPECT_TRUE(local_wal_cursor::make(first_id, runtime::file_position{512}));
+    EXPECT_TRUE(local_wal_cursor::make(first_id, runtime::file_position{8193}));
     EXPECT_FALSE(
       local_store_context::make(
         {}, identity<model::broker_id>(2), identity<device_store_id>(3), 0));
@@ -133,7 +138,7 @@ TEST(LocalTypesTest, RootAndFooterKindsKeepDifferentPlacementRules) {
         byte_count{4_KiB},
         pages,
         hash));
-    EXPECT_EQ(parse_local_root_kind(6).error(), errc::unsupported_format);
+    EXPECT_EQ(parse_local_root_kind(5).error(), errc::unsupported_format);
     EXPECT_FALSE(
       local_footer_reference::make(
         runtime::file_position{4096}, byte_count{4096}, 0, hash));
@@ -149,6 +154,23 @@ TEST(LocalTypesTest, RootAndFooterKindsKeepDifferentPlacementRules) {
       local_footer_reference::make(
         runtime::file_position{4096}, byte_count{4096}, 7, hash));
 }
+// A durable footer follows the blocks of its write wherever they end and
+// pads to the next boundary.
+TEST(LocalTypesTest, FooterReferencesEndOnABoundary) {
+    const auto alignment = storage_alignment::make(byte_count{512}).value();
+    const codec::immutable_object_digest hash{codec::content_digest{}};
+    const auto reference =
+      [&](std::uint64_t at, std::uint64_t bytes, std::uint16_t f) {
+          return local_footer_reference::make(
+                   runtime::file_position{at}, byte_count{bytes}, f, hash)
+            .value();
+      };
+    EXPECT_TRUE(reference(911, 625, 6).validate_alignment(alignment));
+    EXPECT_TRUE(reference(1024, 512, 6).validate_alignment(alignment));
+    EXPECT_FALSE(reference(1024, 400, 6).validate_alignment(alignment));
+    EXPECT_FALSE(reference(911, 624, 6).validate_alignment(alignment));
+    EXPECT_TRUE(reference(1536, 512, 7).validate_alignment(alignment));
+}
 TEST(LocalTypesTest, LayoutUsesActualHeaderAndIndependentPageEquations) {
     auto alignment = storage_alignment::make(byte_count{4096}).value();
     auto policy = codec::limits::defaults();
@@ -157,14 +179,12 @@ TEST(LocalTypesTest, LayoutUsesActualHeaderAndIndependentPageEquations) {
         local_metadata_kind::checkpoint_page, byte_count{32}, alignment, policy)
         .value(),
       467U);
+    // Only checkpoint pages are local metadata pages.
     EXPECT_EQ(
       local_metadata_page_capacity(
-        local_metadata_kind::completed_retry_page,
-        byte_count{32},
-        alignment,
-        policy)
-        .value(),
-      408U);
+        local_metadata_kind::deletion_intent, byte_count{32}, alignment, policy)
+        .error(),
+      errc::invalid_argument);
     EXPECT_EQ(
       local_metadata_layout(
         local_metadata_kind::checkpoint_page,
@@ -241,8 +261,8 @@ TEST(LocalTypesTest, LayoutUsesActualHeaderAndIndependentPageEquations) {
       alignment,
       policy));
     EXPECT_EQ(
-      local_metadata_descriptor_for(13).error(), errc::unsupported_format);
-    EXPECT_EQ(local_metadata_descriptors.size(), 12U);
+      local_metadata_descriptor_for(11).error(), errc::unsupported_format);
+    EXPECT_EQ(local_metadata_descriptors.size(), 10U);
 }
 } // namespace
 } // namespace kwaque::storage

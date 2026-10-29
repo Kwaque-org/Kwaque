@@ -117,11 +117,25 @@ struct history_hooks final {
     std::function<void(const history_step&)> asking;
     std::function<bool(const history_step&, bool)> ended;
 };
+// The engine's limits for a history: a small request's portion is placed
+// in the WAL and held in its segment's run, which a run of 16 KiB fills,
+// and a large one's is placed in its segment alone. So a history's requests
+// take both places, and its runs close every way a run can.
+inline local_engine_config history_configuration() {
+    auto config = engines::configuration();
+    config.append.segment_placement_bytes = appends::middle_placement;
+    config.append.held_run_bytes = byte_count{16_KiB};
+    return config;
+}
 // What a caller changes of a run: the engine's limits, and how many
 // segments its history may create in all.
 struct history_settings final {
-    local_engine_config engine{engines::configuration()};
+    local_engine_config engine{history_configuration()};
     std::size_t segments{maximum_history_segments};
+    // The sampler's part before each operation as well as at each start: the
+    // device stays healthy for as long as a run takes, as a sampler on its
+    // interval keeps it, and a removal keeps its data file as a spare.
+    bool sampled_each_operation{false};
 };
 struct history_report final {
     engine_ledger::verdict verdict{engine_ledger::verdict::holds};
@@ -472,11 +486,14 @@ private:
         require(
           began.state == engine_state::ready,
           "a start did not leave the shard ready");
-        // The sampler's part: the shard may promise this much of its pool.
+        sample();
+        co_return true;
+    }
+    // The sampler's part: the shard may promise this much of its pool.
+    void sample() {
         const std::array pools{
           device_pool_share{true, false, byte_count{1_GiB}}};
         engine_->placement()->sampled(pools, Clock::now());
-        co_return true;
     }
 
     // A stop with nothing left unanswered. False when the cut came first.
@@ -549,11 +566,17 @@ private:
         }
         ledger_.accepted(request.id);
         if (told.status == local_append_status::durable && told.receipt) {
+            // The block as its receipt says it was written, stamps
+            // included.
             ledger_.durable(
               request.id,
               told.receipt->block.records.bytes().begin().value(),
               appends::block_at(
-                request.wire, request.generation, told.receipt->block));
+                request.wire,
+                request.generation,
+                told.receipt->block,
+                8192,
+                told.receipt->stamps));
             return true;
         }
         ledger_.failed(request.id);
@@ -625,16 +648,23 @@ private:
     // One operation. False when the cut came first.
     seastar::future<bool> apply(history_operation operation) {
         auto* table = engine_->table();
+        if (settings_.sampled_each_operation) sample();
         switch (operation.op) {
         case history_op::append: {
             const bool stale = (operation.c & 0x80U) != 0;
+            const bool large = (operation.c & 0x40U) != 0;
             auto* segment = choose(operation.a, [stale](const held& one) {
                 return one.target && one.writable != stale;
             });
             if (!segment) co_return true;
             for (unsigned i = 0; i != operation.b % 4U + 1U; ++i) {
-                auto wire = appends::child_wire(
-                  segment->next_logical, segment->generation);
+                auto wire = large
+                              ? appends::valued_wire(
+                                  segment->next_logical,
+                                  appends::large_value,
+                                  segment->generation)
+                              : appends::child_wire(
+                                  segment->next_logical, segment->generation);
                 // Requests in flight together never share a work account:
                 // each has its own, borrowed until its acceptance is ready.
                 auto work = std::make_unique<codec::cooperative_work>(
@@ -643,7 +673,11 @@ private:
                   segment->generation, segment->next_logical++, wire);
                 auto stages = engine_->append()->append(
                   *segment->target,
-                  co_await appends::request(wire, budget_, *work),
+                  co_await appends::request(
+                    wire,
+                    budget_,
+                    *work,
+                    large ? appends::large_width : std::size_t{67}),
                   *work);
                 auto accepted = std::move(stages.accepted)
                                   .finally(
@@ -685,7 +719,7 @@ private:
             if (auto* segment = choose(operation.a, [](const held& one) {
                     return !one.gone;
                 }))
-                co_await read_back(*segment);
+                co_await read_back(*segment, false);
             co_return true;
         }
         case history_op::create: {
@@ -746,18 +780,6 @@ private:
         }
         case history_op::checkpoint: {
             auto cutting = engine_->checkpoint()->request();
-            if (!co_await reach(cutting)) {
-                abandon(std::move(cutting));
-                co_return false;
-            }
-            static_cast<void>(co_await std::move(cutting));
-            co_return true;
-        }
-        case history_op::cut: {
-            auto* segment = choose(
-              operation.a, [](const held& one) { return one.writable; });
-            if (!segment) co_return true;
-            auto cutting = table->cut_retries(segment->context, true);
             if (!co_await reach(cutting)) {
                 abandon(std::move(cutting));
                 co_return false;
@@ -842,17 +864,24 @@ private:
               : marked ? name::deleting
                        : name::absent));
             if (own) {
-                co_await read_back(segment);
+                co_await read_back(segment, true);
             } else {
                 static_cast<void>(ledger_.image_missing(segment.generation));
             }
         }
     }
-    seastar::future<> read_back(held& segment) {
+    // What a session is given of a segment, and every request reported
+    // durable where its receipt said in the data file as the device holds
+    // it, where that holds them all: after a start, which wrote what only
+    // the WAL held, and once the segment is sealed or recovered. Before
+    // that a run its segment holds may keep reported requests unwritten.
+    seastar::future<> read_back(held& segment, bool started) {
         // Everything a reader may be shown.
         constexpr std::uint64_t everything = 1U << 20U;
         auto* table = engine_->table();
         const auto life = table->life(segment.context);
+        const bool image = started || !life || *life == segment_life::sealed
+                           || *life == segment_life::recovering;
         if (
           life ? segment_admits_readers(*life)
                : static_cast<bool>(segment.expected)) {
@@ -891,6 +920,7 @@ private:
                     || stop == segment_read_stop::short_of_visibility));
             }
         }
+        if (!image) co_return;
         const auto data = take(
           paths_.segment_file(0, named(segment), local_segment_file::data));
         if (!take(co_await drive_.lifecycle(files_.exists(data)))) {

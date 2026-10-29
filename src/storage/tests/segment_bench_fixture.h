@@ -22,6 +22,10 @@ struct shape final {
     std::size_t payload_bytes{0};
     compression::codec_id encoding{compression::codec_id::none};
     bool fragmented{false};
+    // Each batch one record whose encoding is exactly `payload_bytes`, at
+    // most 1 MiB, the most a record may take: device bytes are then counted
+    // per byte of records.
+    bool exact{false};
     std::uint64_t alignment{4096};
     std::uint32_t groups{2}, blocks{4}, window{1}, segments{1};
     bool replace{false}, retain{false}, pressure{false}, reopen{false};
@@ -35,9 +39,12 @@ inline constexpr std::uint32_t maximum_batches = 128;
 // The writer's own per-group block bound.
 inline constexpr std::uint32_t maximum_group_blocks = 64;
 // Concurrent segment owners of this benchmark. The fixture can give up to
-// maximum_extent_segments segments distinct identities.
+// maximum_extent_segments segments distinct identities, each a range and a
+// segment of its own byte, and up to maximum_wide_extent_segments, those
+// past the first a range and a segment numbered in their last two bytes.
 inline constexpr std::uint32_t maximum_segments = 4;
 inline constexpr std::uint32_t maximum_extent_segments = 32;
+inline constexpr std::uint32_t maximum_wide_extent_segments = 1024;
 inline constexpr byte_count working_bytes{32_MiB};
 
 struct group_input final {
@@ -47,6 +54,8 @@ struct group_input final {
     bytes::fragmented_buffer footer, wire;
     storage::coverage whole_prefix;
     runtime::file_position begin, end;
+    // The certified end each of its blocks carries.
+    runtime::file_position certified;
     std::size_t wire_fragments{0};
 };
 struct extent_input final {
@@ -81,11 +90,13 @@ verify_extent(extent_input&, bool raw, codec::cooperative_work&);
 encode_extent(extent_input&, codec::cooperative_work&);
 // The exact extent of these children, the input's batches in order, stored
 // from its data start in groups of the given sizes, each sealed by one
-// footer. Consumes the children.
+// footer. Each block states the certified end given for it. Consumes the
+// children.
 [[nodiscard]] seastar::future<verified_extent> encode_cut_extent(
   const extent_input&,
   std::span<encoded_assigned_batch> children,
   std::span<const std::uint32_t> cuts,
+  std::span<const runtime::file_position> certified,
   codec::cooperative_work&);
 void export_extent(extent_input&, const shape&, std::string_view path);
 [[nodiscard]] seastar::future<> export_records(

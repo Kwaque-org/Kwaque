@@ -31,14 +31,16 @@
 
 namespace kwaque::storage {
 
-// One pin per segment from the obligation rows a restart rebuilt: every
-// PREPARE the segment has pinned across WAL files, at the oldest of them. Only
-// a segment's oldest unresolved PREPARE bounds a checkpoint, and the append
-// owner's table has room for one pinned row per segment. Rows that pin
-// nothing are skipped.
-[[nodiscard]] runtime::result<std::vector<local_pinned_obligation>>
-fold_pinned_obligations(
-  std::span<const recovery_obligation> rows, const local_store_context& owner);
+// Folds one obligation row a restart rebuilt into `pins`, one per segment:
+// every PREPARE the segment has pinned across WAL files, at the oldest of
+// them. Only a segment's oldest unresolved PREPARE bounds a checkpoint, and
+// the append owner's table has room for one pinned row per segment. A row
+// that pins nothing is skipped. A segment not pinned before is appended,
+// within the capacity the caller made and charged.
+[[nodiscard]] runtime::result<void> fold_pinned_obligation(
+  seastar::chunked_vector<local_pinned_obligation>& pins,
+  const recovery_obligation& row,
+  const local_store_context& owner);
 
 // Where the next checkpoint ends: the WAL below it is no longer needed. It is
 // the lowest of where the oldest open or pinned obligation begins, the
@@ -100,6 +102,9 @@ struct checkpoint_resume final {
     std::uint32_t superseded{0};
     // Discard entries matched to their durable decision.
     std::uint32_t discards{0};
+    // Entries of a segment the catalog lists as prepared, which nothing
+    // durable may name: each such entry is marked a conflict.
+    std::uint32_t conflicts{0};
 };
 
 // Hands a restart the pins of the durable checkpoint, before its merge reads
@@ -110,8 +115,10 @@ struct checkpoint_resume final {
 // pin. A segment's sealed or deleting publication, or a durable seal decision
 // it has not carried out, supersedes its entries whatever end it chose. A
 // boundary entry whose segment the catalog lacks, or names on another device,
-// fails, and so does a discard entry whose decision is absent or differs.
-// Nothing is read or changed but the inventory's pins.
+// fails, and so does a discard entry whose decision is absent or differs. An
+// entry of a segment the catalog lists as prepared makes that segment a
+// conflict. Nothing is read or changed but the inventory's pins and those
+// marks.
 [[nodiscard]] runtime::result<checkpoint_resume> resume_from_checkpoint(
   const seastar::chunked_vector<local_checkpoint_entry>& table,
   recovery_inventory& inventory,
@@ -180,8 +187,10 @@ private:
 // and an entry leaves only when the segment's own durable publication covers
 // it. A cut copies the table; adopting the cut, once the checkpoint that
 // carries it is durable, makes the cut's copy the table. Nothing here reads
-// or writes storage, and nothing is flushed for a pin: every reported append
-// already made its segment bytes durable.
+// or writes storage, and nothing is flushed for a pin: a reported WAL-placed
+// PREPARE stays above the cutoff until the append owner's sync covers its
+// segment group, so a pinned footer never stands in for bytes only the WAL
+// holds.
 //
 // No table is one large allocation. Each is held in fragments within the
 // contiguous allocation bound and charged fragment by fragment: the footers
@@ -721,10 +730,11 @@ struct checkpoint_outcome final {
     // Earlier bundles whose removal is still owed. One that survives is
     // referenced by nothing.
     std::uint32_t unretired{0};
-    // WAL files below the cutoff's file removed by this run, and those still
-    // there: debt the next run tries again. Removal is never reported as
-    // durable; space is counted again from the surviving names at start.
-    std::uint32_t wal_removed{0}, wal_owed{0};
+    // WAL files below the cutoff's file removed by this run, those of them
+    // kept as spares, and those still there: debt the next run tries again.
+    // Removal is never reported as durable; space is counted again from the
+    // surviving names at start.
+    std::uint32_t wal_removed{0}, wal_recycled{0}, wal_owed{0};
     // Why the oldest of the files still there could not be removed.
     std::optional<runtime::operation_error> wal_failed;
 };
@@ -769,9 +779,12 @@ private:
 // One shard's checkpoints. A run takes the cutoff from the append owner's
 // obligations, pins each unsealed segment's newest durable footer, publishes
 // the table as one immutable bundle and then replaces the control's
-// checkpoint head. Nothing is flushed for it: every reported append already
-// made its segment bytes durable, so a run costs one bundle and one control
-// replacement whatever the number of segments.
+// checkpoint head. Nothing is flushed for it: the cutoff stops at the oldest
+// WAL-placed PREPARE whose segment group no sync of the append owner has
+// covered yet, and the append owner syncs a segment before the file holding
+// such a PREPARE has to go, so the WAL below the cutoff holds nothing a
+// segment lacks. A run costs one bundle and one control replacement whatever
+// the number of segments.
 //
 // One run is in flight at a time, and requests made meanwhile are served
 // together by one run after it. Whatever the old checkpoint alone kept stays
@@ -785,9 +798,9 @@ private:
 //
 // Runs are asked for, never timed. request() is an explicit demand, let_go()
 // one that also writes for entries a publication has covered, and a
-// graceful stop is one made after the appends have drained: an ordinary
-// checkpoint that ends at the WAL-durable end, so the next start scans
-// nothing, and never a flag that skips recovery. Once bind_retention() is
+// graceful stop is one made after the appends have drained and synced: an
+// ordinary checkpoint that ends at the WAL-durable end, so the next start
+// scans nothing, and never a flag that skips recovery. Once bind_retention() is
 // called, the append owner asks too: when a closed WAL file may go, and when
 // a rotation meets the retained-WAL limit.
 //
@@ -1466,6 +1479,7 @@ private:
         const auto reclaimed = co_await reclaim_wal_prefix(
           files_, control_, shard_, *cutoff, append_);
         run.wal_removed = reclaimed.removed;
+        run.wal_recycled = reclaimed.recycled;
         run.wal_owed = reclaimed.owed;
         run.wal_failed = reclaimed.failed;
     }

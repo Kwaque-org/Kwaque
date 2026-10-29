@@ -1,6 +1,8 @@
 #include "src/storage/segment_writer_state.h"
 
 #include "src/base/units.h"
+#include "src/model/batch_codec.h"
+#include "src/model/record_codec.h"
 #include "src/storage/format_internal.h"
 #include "src/storage/local_paths.h"
 
@@ -345,12 +347,22 @@ runtime::result<byte_count> segment_disk_bound(
         return runtime::failure(detail::path_error(errc::invalid_argument));
     const auto config = policy.config();
     const auto unit = descriptor.alignment.bytes().value();
-    // Every block is at least one alignment unit: no more facts than units.
+    // Blocks pack, so the smallest a block can be bounds the facts: its child
+    // holds one record with no key, value or header, uncompressed (an LZ4
+    // frame of it is longer).
+    const auto record = model::record_encoded_size(
+      {}, std::nullopt, std::nullopt, {}, policy);
+    if (!record)
+        return runtime::failure(detail::path_error(errc::invalid_argument));
+    const auto block = 2 * codec::envelope_prefix_bytes
+                       + segment_block_fixed_bytes.value()
+                       + model::assigned_batch_fixed_bytes.value()
+                       + record->encoded_bytes.value();
     const auto facts = std::min<std::uint64_t>(
       {limits.maximum_retry_entries,
        limits.maximum_blocks,
        config.max_object_entries.value(),
-       descriptor.maximum_data_bytes.value() / unit});
+       descriptor.maximum_data_bytes.value() / block});
     const auto projected = project_retries(
       facts,
       descriptor.alignment,
@@ -413,6 +425,9 @@ detail::segment_capacity_constants::make(
           config.max_encoded_body_bytes.value()
           + config.max_header_bytes.value()}}};
     if (output.tiny) return output;
+    // A footer pads from wherever its group's blocks end, so every plan lays
+    // out its own and refuses the group whose footer would not fit there.
+    // Here only one that begins on a boundary must fit.
     auto footer = aligned_envelope_layout::make(
       {byte_count{codec::envelope_prefix_bytes},
        durable_footer_fixed_bytes,
@@ -420,13 +435,32 @@ detail::segment_capacity_constants::make(
       descriptor.alignment,
       policy,
       {config.max_page_bytes, config.max_page_bytes});
-    if (footer) {
-        auto memory = staging_cost(
-          0, durable_footer_fixed_bytes, *footer, policy, charge);
-        if (memory) {
-            output.footer_bytes = footer->encoded_bytes();
-            output.footer_staging = memory->additional;
-        }
+    if (
+      footer
+      && staging_cost(0, durable_footer_fixed_bytes, *footer, policy, charge))
+        output.footer_bytes = byte_count{
+          footer->encoded_bytes().value() - footer->padding_bytes().value()};
+    // The staging of one that pads the most: it ends one byte past a
+    // boundary.
+    if (output.footer_bytes) {
+        const auto unit = descriptor.alignment.bytes().value();
+        const runtime::file_position worst{
+          data_start.value()
+          + (unit + 1 - output.footer_bytes->value() % unit) % unit};
+        auto padded = aligned_envelope_layout::make(
+          {byte_count{codec::envelope_prefix_bytes},
+           durable_footer_fixed_bytes,
+           {}},
+          worst,
+          envelope_placement::ends_span,
+          descriptor.alignment,
+          policy,
+          {config.max_page_bytes, config.max_page_bytes});
+        if (padded)
+            if (
+              auto cost = staging_cost(
+                0, durable_footer_fixed_bytes, *padded, policy, charge))
+                output.closing_staging = cost->additional;
     }
     output.pointer_bytes = publication_pointer_bytes(
       metadata_alignment, limits, policy, charge, finalization_bytes);
@@ -442,15 +476,6 @@ detail::segment_capacity_constants::make(
       policy);
     if (descriptor_layout)
         output.descriptor_bytes = descriptor_layout->encoded_bytes();
-    // One retained grant node per accepted group, independent of its larger
-    // encoding workspace. The finalizer supplies actual completion facts.
-    const byte_count control_request{
-      sizeof(workload_reservation) + 2 * sizeof(void*) + 64};
-    const auto fact_control = charge(control_request);
-    if (
-      fact_control >= control_request
-      && policy.validate_allocation(fact_control))
-        output.fact_control = fact_control;
     output.retry_wire_capacity = wire_capacity_for(
       descriptor.alignment, policy);
     return output;
@@ -515,7 +540,8 @@ runtime::result<segment_capacity_plan> plan_segment_capacity(
   const codec::limits& policy,
   bytes::allocation_charge_fn charge,
   storage_alignment metadata_alignment,
-  byte_count finalization_bytes) {
+  byte_count finalization_bytes,
+  std::optional<std::uint32_t> retry_entries) {
     if (batches.size() > maximum_segment_group_blocks)
         return runtime::failure(detail::path_error(errc::invalid_argument));
     std::array<const encoded_assigned_batch*, maximum_segment_group_blocks>
@@ -532,26 +558,60 @@ runtime::result<segment_capacity_plan> plan_segment_capacity(
       finalization_bytes);
     if (!constants) return runtime::failure(constants.error());
     return detail::plan_segment_capacity(
-      *constants, current, std::span{input}.first(batches.size()));
+      *constants,
+      current,
+      std::span{input}.first(batches.size()),
+      false,
+      retry_entries);
 }
 
 runtime::result<segment_capacity_plan> detail::plan_segment_capacity(
   segment_capacity_constants& fixed,
   segment_writer_position current,
-  std::span<const encoded_assigned_batch* const> batches) {
+  std::span<const encoded_assigned_batch* const> batches,
+  bool open,
+  std::optional<std::uint32_t> retry_entries) {
     const auto& descriptor = fixed.descriptor;
     const auto& policy = fixed.policy;
     const auto& limits = fixed.limits;
+    const auto entries = retry_entries.value_or(
+      static_cast<std::uint32_t>(batches.size()));
     if (
       batches.empty() || batches.size() > maximum_segment_group_blocks
-      || current.bytes < fixed.data_start
-      || current.logical < descriptor.logical_origin
-      || !descriptor.alignment.aligned(current.bytes))
+      || entries > batches.size() || current.bytes < fixed.data_start
+      || (!open && !descriptor.alignment.aligned(current.bytes)))
         return runtime::failure(detail::path_error(errc::invalid_argument));
     const auto config = policy.config();
     segment_capacity_plan output;
     if (fixed.tiny) return output;
+    // A footer padded to the boundary after its end, from `at`.
+    const auto footer_at = [&](runtime::file_position at) {
+        return aligned_envelope_layout::make(
+          {byte_count{codec::envelope_prefix_bytes},
+           durable_footer_fixed_bytes,
+           {}},
+          at,
+          envelope_placement::ends_span,
+          descriptor.alignment,
+          policy,
+          {config.max_page_bytes, config.max_page_bytes});
+    };
     auto logical = current.logical;
+    // The span's blocks lie back to back from its aligned start; only the
+    // footer after them pads, to the next boundary. A run held open before
+    // the group is closed by its own footer first.
+    auto position = current.bytes;
+    if (open) {
+        if (!fixed.footer_bytes) return output;
+        const auto closing = footer_at(position);
+        if (!closing) return output;
+        const auto staging = staging_cost(
+          0, durable_footer_fixed_bytes, *closing, policy, fixed.charge);
+        if (!staging) return output;
+        output.staging_bytes = staging->additional;
+        output.closing = closing->encoded_bytes();
+        position = closing->at(position)->end();
+    }
     std::uint64_t records = 0;
     for (const auto* input : batches) {
         if (!input)
@@ -584,6 +644,8 @@ runtime::result<segment_capacity_plan> detail::plan_segment_capacity(
           {byte_count{codec::envelope_prefix_bytes},
            segment_block_fixed_bytes,
            batch.bytes().size()},
+          position,
+          envelope_placement::continues,
           descriptor.alignment,
           policy,
           fixed.block_limits);
@@ -599,29 +661,33 @@ runtime::result<segment_capacity_plan> detail::plan_segment_capacity(
           = output.staging_bytes.checked_add(staging->additional).value();
         output.blocks
           = output.blocks.checked_add(layout->encoded_bytes()).value();
+        // make() checked that the block's end is a position.
+        position = layout->at(position)->end();
         records += info.context.retained_count().value();
     }
     if (!fixed.footer_bytes) return output;
+    const auto footer = footer_at(position);
+    if (!footer) return output;
+    const auto footer_staging = staging_cost(
+      0, durable_footer_fixed_bytes, *footer, policy, fixed.charge);
+    if (!footer_staging) return output;
     output.staging_bytes
-      = output.staging_bytes.checked_add(*fixed.footer_staging).value();
-    output.footer = *fixed.footer_bytes;
-    const auto incoming = output.blocks.checked_add(output.footer);
+      = output.staging_bytes.checked_add(footer_staging->additional).value();
+    output.footer = footer->encoded_bytes();
+    const auto span = output.blocks.checked_add(output.footer);
+    const auto incoming = span ? span->checked_add(output.closing)
+                               : std::nullopt;
     if (
       !incoming || *incoming > runtime::maximum_file_io_bytes
       || batches.size() > limits.maximum_blocks)
         return output;
     if (!fixed.pointer_bytes || !fixed.descriptor_bytes) return output;
+    // In an empty segment every batch may open a stream of its own.
     auto fresh = fixed.fresh_root(batches.size());
     if (!fresh) return output;
-    auto new_facts = metadata_charge(
-      batches.size(),
-      sizeof(completed_retry),
-      std::min(limits.metadata_bytes, config.max_metadata_bytes),
-      policy,
-      fixed.charge);
-    if (!new_facts || !fixed.fact_control) return output;
-    output.retry_metadata = new_facts->checked_add(*fixed.fact_control).value();
-    auto empty_end = fixed.data_start.checked_add(*incoming);
+    // The span starts aligned, so it is as long in an empty segment, which
+    // has no run to close.
+    auto empty_end = fixed.data_start.checked_add(*span);
     if (
       !empty_end || !empty_end->checked_add(*fresh)
       || empty_end->checked_add(*fresh)->value()
@@ -629,7 +695,7 @@ runtime::result<segment_capacity_plan> detail::plan_segment_capacity(
         return output;
     output.decision = segment_capacity_decision::roll_required;
     auto retry = project_retries(
-      std::uint64_t{current.retry_entries} + batches.size(),
+      std::uint64_t{current.retry_entries} + entries,
       descriptor.alignment,
       limits,
       policy,
@@ -642,11 +708,12 @@ runtime::result<segment_capacity_plan> detail::plan_segment_capacity(
     // Every reason that holds is given: a segment out of room in two ways
     // says both.
     if (!retry) output.reasons.add(segment_roll_reason::retry_state);
+    const std::uint32_t footers = open ? 2 : 1;
     if (
       !physical
       || batches.size() > limits.maximum_blocks
                             - std::min(current.blocks, limits.maximum_blocks)
-      || current.footers == std::numeric_limits<std::uint32_t>::max())
+      || current.footers > std::numeric_limits<std::uint32_t>::max() - footers)
         output.reasons.add(segment_roll_reason::count);
     // With no root to add, the data alone says whether the extent is passed.
     const auto sealed_end = data_end ? data_end->checked_add(
@@ -663,8 +730,8 @@ runtime::result<segment_capacity_plan> detail::plan_segment_capacity(
       *physical,
       *data_end,
       current.blocks + static_cast<std::uint32_t>(batches.size()),
-      current.footers + 1,
-      current.retry_entries + static_cast<std::uint32_t>(batches.size())};
+      current.footers + footers,
+      current.retry_entries + entries};
     output.retry_pages = retry->pages;
     output.retry_page_entries = retry->entries_per_page;
     output.sealed_root = retry->root;

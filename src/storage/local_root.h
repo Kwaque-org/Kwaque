@@ -48,10 +48,10 @@ public:
     // read and verified.
     [[nodiscard]] seastar::future<runtime::result<local_index_page>>
     read_index(page_ordinal, codec::cooperative_work&) const;
-    // One page of a sealed retry summary or a completed-retry snapshot,
-    // decoded once from its exact bytes under the reference the root pins it
-    // with. Any other root is wrong_context. Order across pages is the
-    // caller's to check: a page is read on its own.
+    // One page of a sealed retry summary, decoded once from its exact bytes
+    // under the reference the root pins it with. Any other root is
+    // wrong_context. Order across pages is the caller's to check: a page is
+    // read on its own.
     [[nodiscard]] seastar::future<runtime::result<local_retry_page>>
     read_retries(page_ordinal, codec::cooperative_work&) const;
 
@@ -81,12 +81,13 @@ struct local_index_page final {
     sparse_index_page value;
 };
 
-// The completed-retry entries of one verified page, in batch identity order.
-// The page keeps its root pinned for as long as it lives.
+// The completed-retry entries of one verified page of a sealed summary, in
+// batch identity order. The page keeps its root pinned for as long as it
+// lives.
 struct local_retry_page final {
     workload_reservation reservation;
     local_root_pin pin;
-    std::variant<retry_page, local_metadata_record> value;
+    retry_page value;
     [[nodiscard]] std::span<const completed_retry> entries() const& noexcept;
     std::span<const completed_retry> entries() const&& = delete;
 };

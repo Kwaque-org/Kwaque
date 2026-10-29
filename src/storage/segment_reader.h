@@ -35,11 +35,15 @@ namespace kwaque::storage {
 // that place to each lookup: an index that keeps its anchors in pages
 // answers from the page the session holds when the offset falls there, and
 // moves the place when it does not. An index that is all in memory leaves
-// the place alone.
+// the place alone. Each lookup is also handed how far the read that asks
+// may read, which a sealed segment's index has no use for.
 struct segment_read_index final {
-    seastar::noncopyable_function<seastar::future<
-      runtime::result<sparse_index_answer>>(
-      model::range_logical_offset, seastar::abort_source&, sparse_index_place&)>
+    seastar::noncopyable_function<
+      seastar::future<runtime::result<sparse_index_answer>>(
+        model::range_logical_offset,
+        seastar::abort_source&,
+        sparse_index_place&,
+        runtime::file_position)>
       locate;
     // The block where the anchor of an answer points is whole and is not
     // the block the anchor names.
@@ -51,7 +55,9 @@ struct segment_read_index final {
     // and nothing is read. Nothing when it cannot. A reader asks this of a
     // run it does not read yet.
     seastar::noncopyable_function<std::optional<sparse_index_answer>(
-      model::range_logical_offset, const sparse_index_place&) noexcept>
+      model::range_logical_offset,
+      const sparse_index_place&,
+      runtime::file_position) noexcept>
       peek;
 };
 // The lookups of a sealed segment's index, through its owner.
@@ -61,28 +67,29 @@ template<typename Index>
       [&index](
         model::range_logical_offset target,
         seastar::abort_source& caller,
-        sparse_index_place& at) { return index.locate(target, caller, &at); },
+        sparse_index_place& at,
+        runtime::file_position) { return index.locate(target, caller, &at); },
       [&index](
         const sparse_index_answer& given,
         runtime::operation_error why) noexcept { index.report(given, why); },
       [&index](
         model::range_logical_offset target,
-        const sparse_index_place& at) noexcept {
-          return index.peek(target, &at);
-      }};
+        const sparse_index_place& at,
+        runtime::file_position) noexcept { return index.peek(target, &at); }};
 }
 // The lookups of a segment that is still appended to, in the index its
-// writer feeds: the anchors that are durable when the lookup is made. A run
-// that reaches past `bound`, which is the session's, is not one the session
-// reads whole.
-[[nodiscard]] segment_read_index active_read_index(
-  const active_sparse_index& index, runtime::file_position bound);
+// writer feeds: the anchors that may be read when the lookup is made. A run
+// that reaches past the bound a lookup is handed is not one its read reads
+// whole.
+[[nodiscard]] segment_read_index
+active_read_index(const active_sparse_index& index);
 
-// How far a session reads. Taken when it opens and never widened: a new
-// session takes new bounds.
+// How far a session reads. Each read takes them as they are when it begins
+// and keeps to them; extend() widens what the reads after it take.
 struct segment_read_bounds final {
-    // In the segment's file: the durable position its writer gave with the
-    // pin, or the end of a sealed extent.
+    // In the segment's file: where what is durable in at least one place
+    // ended when the bound was given (its own barriers, or its owner's
+    // reports, its WAL included), or the end of a sealed extent.
     runtime::file_position durable;
     // Where a sealed segment's records end. Nothing for a segment that is
     // still appended to. The run of a sealed segment's last anchor ends
@@ -244,22 +251,26 @@ public:
     // Sessions in the list.
     [[nodiscard]] std::size_t size() const noexcept { return open_.size(); }
 
-    // The segment was sealed. From here on every session in the list reads
-    // through its own share of `sealed`, the pin of the generation the
-    // segment was published as, and looks up in what `lookups` gives it, the
-    // sealed segment's index: in one step, with nothing waited for. No
-    // session then holds the pin its writer gave it or refers to the index
-    // its writer fed, so the writer and that index may go. A read in flight
-    // goes on with what it has in hand and takes the new source and lookups
-    // where it next needs them; what it has asked of the old source
-    // completes by itself. Bounds, budget and what was returned are
-    // unchanged: a session reads on to the bound it took.
+    // The segment was sealed at `end` in its file, where its records end at
+    // `records`. From here on every session in the list reads through its
+    // own share of `sealed`, the pin of the generation the segment was
+    // published as, and looks up in what `lookups` gives it, the sealed
+    // segment's index: in one step, with nothing waited for. No session
+    // then holds the pin its writer gave it, refers to the index its writer
+    // fed or reads its writer's memory, so the writer and that index may
+    // go. Each session's next read reads on to the sealed end, as far as
+    // its caller may see: its bounds are widened to it, and `visible` is
+    // its caller's. A read in flight goes on with the bounds and what it has
+    // in hand and takes the new source and lookups where it next needs
+    // them; what it has asked of the old source completes by itself. Budget
+    // and what was returned are unchanged.
     //
     // A session that cannot be given a share is revoked instead.
     void move(
       const segment_data_source& sealed,
-      const seastar::noncopyable_function<segment_read_index()>&
-        lookups) noexcept;
+      const seastar::noncopyable_function<segment_read_index()>& lookups,
+      runtime::file_position end,
+      model::range_logical_end records) noexcept;
 
     // The segment's readers are ended: for its close, and before it is
     // removed. Every session leaves the list. One that is not in a read lets
@@ -283,17 +294,19 @@ private:
 // One reader's session on one segment: it reads whole batches forward from
 // an offset.
 //
-// A session takes its bounds when it opens and keeps them; see
-// segment_read_bounds. A read looks for its offset in the runs the cache
-// keeps of the segment, then in what its writer fed and the cache does not
-// answer with yet, and then asks the index for an anchor and reads that
-// anchor's run: as the cache's own work when it is a run the cache keeps,
-// and otherwise under this session's budget, with whoever misses the same
-// run at the same time when it is a whole run. An index that is owed is
-// waited for. A block where an anchor points that is whole and is not the
-// block the anchor names is reported to the index, once, and looked for
-// again; a block there that does not read as one is the data's damage and
-// that read's failure.
+// Each read takes the session's bounds when it begins; see
+// segment_read_bounds and extend(). A read looks for its offset in the runs
+// the cache keeps of the segment, then in what its writer fed and the cache
+// does not answer with yet, then in what the writer handed over that the
+// feed has not taken yet, and then asks the index for an anchor and reads
+// that anchor's run: as the cache's own work when it is a run the cache
+// keeps, and otherwise under this session's budget, with whoever misses the
+// same run at the same time when it is a whole run. What is not in the
+// segment's file yet is read from its writer's memory, for this session
+// alone. An index that is owed is waited for. A block where an anchor points
+// that is whole and is not the block the anchor names is reported to the index,
+// once, and looked for again; a block there that does not read as one is the
+// data's damage and that read's failure.
 //
 // A batch is returned whole or not at all. An offset inside a batch returns
 // that batch; one that no batch of its run holds returns the next batch of
@@ -316,6 +329,9 @@ private:
 // session needs nothing it was opened with but its budget.
 class segment_reader final {
 public:
+    // `held`, for a segment still appended to, reads what is durable in at
+    // least one place and not in its file yet. Without it a session reads
+    // nothing its writer has not written.
     [[nodiscard]] static runtime::result<segment_reader> open(
       segment_runs& runs,
       segment_data_source source,
@@ -323,7 +339,8 @@ public:
       segment_read_index index,
       workload_budget& budget,
       segment_reader_config config = {},
-      segment_sessions* among = nullptr);
+      segment_sessions* among = nullptr,
+      segment_read_held held = {});
     segment_reader(segment_reader&&) noexcept;
     segment_reader& operator=(segment_reader&&) noexcept = delete;
     segment_reader(const segment_reader&) = delete;
@@ -335,6 +352,18 @@ public:
     // Its segment's owner ended it: every read from here on fails with
     // closed.
     [[nodiscard]] bool revoked() const noexcept;
+
+    // The bounds the reads after this take, which a read in flight does
+    // not: as a stream's reader stays open and is given a new upper bound
+    // for each read. `durable` and `visible` never move back. `sealed` is
+    // given once, at or past every batch the session returned, and fixes
+    // `durable` from then on. For a segment still appended to, `durable`
+    // is never past what its runs say is durable in at least one place.
+    // Refused with invalid_argument, and nothing changed, for bounds that
+    // break any of that, and for a session whose bound was cut to what its
+    // copy holds; with closed for one that was revoked.
+    [[nodiscard]] runtime::result<void>
+    extend(const segment_read_bounds& bounds) noexcept;
 
     // Batches from the one a reader that wants the request's offset is
     // given, in order, while they lie below the session's bounds and fit

@@ -40,6 +40,11 @@ void error(const codec::result<T>& value, errc code) {
     ASSERT_FALSE(value.has_value());
     EXPECT_EQ(value.error().code(), code);
 }
+// The next 512-byte boundary at or after `at`.
+std::uint64_t up(std::uint64_t at) { return (at + 511U) / 512U * 512U; }
+// Where a footer that starts at `at` ends: it pads to the next boundary.
+std::uint64_t footer_end(std::uint64_t at) { return up(at + 248U); }
+
 codec::result<decoded_sparse_index_root> read_root(
   fragmented_buffer_parser& input,
   std::string_view wire,
@@ -416,10 +421,11 @@ TEST(
       = decode_segment_block(input, location, reserve(input, work), work).get();
     ASSERT_TRUE(decoded.has_value());
     const auto descriptor = decoded->value.descriptor();
+    // Blocks pack: the extent ends on the boundary after the block's end.
+    const auto end = up(1024U + block.size());
     const auto context = sparse_index_context::make(
                            location.location.segment(),
-                           scope(
-                             90, 110, 5, 7, 512, 1024U + block.size() + 512U),
+                           scope(90, 110, 5, 7, 512, end + 512U),
                            codec::extent_digest{digest_of(block)},
                            alignment())
                            .value();
@@ -442,9 +448,9 @@ TEST(
       validate_sparse_index_anchor(wrong, entry(100, 1024), descriptor),
       errc::wrong_context);
     for (const auto& clipped :
-         {scope(100, 104, 5, 7, 512, 1024U + block.size()),
-          scope(100, 105, 5, 6, 512, 1024U + block.size()),
-          scope(100, 105, 5, 7, 1024, 1536)}) {
+         {scope(100, 104, 5, 7, 512, end),
+          scope(100, 105, 5, 6, 512, end),
+          scope(100, 105, 5, 7, 1536, end + 512U)}) {
         const auto short_context
           = sparse_index_context::make(
               context.segment(), clipped, context.digest(), alignment())
@@ -459,15 +465,23 @@ TEST(
 TEST(SparseIndexFormatTest, ExtentEvidenceChecksBytesSeparatelyFromMetadata) {
     seastar::abort_source abort;
     codec::cooperative_work work{codec::limits::defaults(), abort};
+    // A block and the footer that closes it: an extent ends on a boundary.
+    const auto block = data_block();
+    const auto at = 512U + block.size();
     auto verifier = extent_verifier::make(
                       history(),
-                      scope(100, 101, 0, 1, 512, 1024),
+                      scope(100, 101, 0, 1, 512, footer_end(at)),
                       work.policy(),
                       extent_layout_kind::initial_append,
                       {},
                       extent_integrity::crc32c_and_digest)
                       .value();
-    ASSERT_TRUE(feed_block(verifier, data_block(), work));
+    ASSERT_TRUE(feed_block(verifier, block, work));
+    const auto prefix = verifier.checkpoint(work).value();
+    const auto closing = footer_wire(
+      prefix.boundary(), {history(), runtime::file_position{at}});
+    ASSERT_EQ(at + closing.size(), footer_end(at));
+    ASSERT_TRUE(feed_footer(verifier, closing, work, prefix));
     const auto evidence = verifier.finish(work).value();
     const auto context
       = sparse_index_context::make(
@@ -500,9 +514,10 @@ TEST(SparseIndexFormatTest, ExtentEvidenceChecksBytesSeparatelyFromMetadata) {
 
 TEST(
   SparseIndexFormatTest,
-  SuppliedBlocksMustFitTheExpectedAlignmentAndBlockCount) {
+  SuppliedBlocksMayEndOffTheBoundaryButMustFitTheBlockCount) {
     seastar::abort_source abort;
     codec::cooperative_work work{codec::limits::defaults(), abort};
+    // A packed block ends anywhere; any block may be an anchor.
     const auto wire = data_block(100, 0, 1024);
     fragmented_buffer_parser input{buffer(wire)};
     const auto block
@@ -510,19 +525,39 @@ TEST(
           input, block_expected(0x30, 1, 1024), reserve(input, work), work)
           .get();
     ASSERT_TRUE(block.has_value());
+    ASSERT_NE((1024U + wire.size()) % 1024U, 0U);
     const auto context = sparse_index_context::make(
                            sc(),
                            scope(100, 101, 0, 1, 1024, 2048),
                            codec::extent_digest{digest_of(wire)},
                            alignment(1024))
                            .value();
-    error(
-      validate_sparse_index_anchor(
-        context, entry(100, 1024), block->value.descriptor()),
-      errc::malformed_data);
+    EXPECT_TRUE(validate_sparse_index_anchor(
+      context, entry(100, 1024), block->value.descriptor()));
 
+    // A rewritten extent ends with a footer too: its one sparse block, then
+    // the footer that closes it.
     const auto sparse = data_block(100, 0, 512, true);
-    const auto extent = scope(100, 105, 0, 2, 512, 1024);
+    fragmented_buffer_parser sparse_input{buffer(sparse)};
+    const auto decoded = decode_segment_block(
+                           sparse_input,
+                           block_expected(0x30, 1, 512),
+                           reserve(sparse_input, work),
+                           work)
+                           .get();
+    ASSERT_TRUE(decoded.has_value());
+    const auto descriptor = decoded->value.descriptor();
+    const auto covered = descriptor.coverage();
+    const auto appended = descriptor.stamps().append_time;
+    const auto at = 512U + sparse.size();
+    const auto closing = footer_wire(
+      {covered,
+       1,
+       covered,
+       {appended, appended, descriptor.batch().max_record_time},
+       crc(sparse)},
+      {history(), runtime::file_position{at}});
+    const auto extent = scope(100, 105, 0, 2, 512, footer_end(at));
     auto walk = extent_verifier::make(
                   history(),
                   extent,
@@ -532,6 +567,7 @@ TEST(
                   extent_integrity::crc32c_and_digest)
                   .value();
     ASSERT_TRUE(feed_block(walk, sparse, work));
+    ASSERT_TRUE(feed_footer(walk, closing, work));
     const auto evidence = walk.finish(work).value();
     EXPECT_EQ(evidence.boundary().block_count, 1U);
     const auto indexed = sparse_index_context::make(
@@ -601,8 +637,7 @@ TEST(
           std::array{entry(99, 512), entry(101, 1024)},
           std::array{entry(100, 512), entry(103, 1024)},
           std::array{entry(100, 0), entry(101, 1024)},
-          std::array{entry(100, 512), entry(101, 2048)},
-          std::array{entry(100, 512), entry(101, 1025)}}) {
+          std::array{entry(100, 512), entry(101, 2048)}}) {
         const auto wire = page_wire(entries);
         const std::array refs{page_reference(wire, 2)};
         const auto root = pin(root_wire(refs), target(), work);

@@ -16,8 +16,6 @@ seastar::future<runtime::result<void>> validate_discovered_file(
     std::optional<std::span<const page_ref>> pages;
     if (const auto* root = std::get_if<local_checkpoint_root>(&payload))
         pages = root->pages;
-    if (const auto* root = std::get_if<local_completed_retry_root>(&payload))
-        pages = root->pages;
     if (pages) {
         auto bytes = loaded.value.encoded_bytes();
         for (const auto& page : *pages) {
@@ -72,9 +70,6 @@ runtime::result<void> validate_discovery_expectation(
     case local_entry_kind::publication:
         matches = code == local_metadata_kind::object_publication;
         break;
-    case local_entry_kind::object:
-        matches = code == local_metadata_kind::completed_retry_root;
-        break;
     case local_entry_kind::checkpoint:
         matches = code == local_metadata_kind::checkpoint_root;
         break;
@@ -106,8 +101,7 @@ runtime::result<void> validate_discovery_expectation(
         return runtime::failure(detail::path_error(errc::invalid_argument));
     if (expected.select_current &&
         (record.digest || record.encoded_bytes || record.page || record.wal_incarnation
-         || record.data_device || record.data_metadata_alignment || record.previous_retry
-         || record.previous_checkpoint
+         || record.data_device || record.previous_checkpoint
          || (kind == local_entry_kind::control && (record.segment || record.segment_alignment))))
         return runtime::failure(detail::path_error(errc::invalid_argument));
     if (

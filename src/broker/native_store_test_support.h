@@ -137,13 +137,25 @@ std::array<storage::local_directory_identity, N> identities_of(
 }
 } // namespace detail
 
+// What the appends' budget and the reserve grant, each in bytes at most its
+// lease.
+struct native_budgets final {
+    storage::workload_budget_limits appends{
+      .tasks = 128, .bytes = byte_count{48_MiB}, .handles = 32};
+    storage::workload_budget_limits reserve{
+      .tasks = 64, .bytes = byte_count{8_MiB}, .handles = 16};
+};
+
 // Runs `function(files, owner, devices, budget, reserve, drive, timer)` over
 // the devices `specify(roots, directories)` says the directories are. Every
 // root is made if it is not there, and each device's directory is what the
 // host says of it now. A budget left charged is the body's failure.
 template<std::size_t N, typename Specify, typename Func>
 seastar::future<> with_native_devices(
-  std::array<std::filesystem::path, N> roots, Specify specify, Func function) {
+  std::array<std::filesystem::path, N> roots,
+  Specify specify,
+  Func function,
+  native_budgets limits = {}) {
     using storage::testing::store_contract::require;
     using storage::testing::store_contract::take;
     auto config = resource::resource_config::from_total_memory(
@@ -169,19 +181,18 @@ seastar::future<> with_native_devices(
         auto ownership = take(
           co_await broker::storage_directories::acquire(devices));
         runtime::production::file_system files;
+        auto appends = manager.acquire_workload(
+          resource::workload_class::foreground_protocol);
+        limits.appends.bytes = std::min(
+          limits.appends.bytes, appends.hard_budget());
         storage::workload_budget budget{
-          manager.acquire_workload(
-            resource::workload_class::foreground_protocol),
-          {.tasks = 128, .bytes = byte_count{48_MiB}, .handles = 32},
-          bytes::testing::charge};
+          std::move(appends), limits.appends, bytes::testing::charge};
         auto lease = manager.acquire_workload(
           resource::workload_class::metadata);
-        const auto share = std::min<std::uint64_t>(
-          lease.hard_budget().value(), 8_MiB);
+        limits.reserve.bytes = std::min(
+          limits.reserve.bytes, lease.hard_budget());
         storage::workload_budget reserve{
-          std::move(lease),
-          {.tasks = 64, .bytes = byte_count{share}, .handles = 16},
-          bytes::testing::charge};
+          std::move(lease), limits.reserve, bytes::testing::charge};
         runtime::production::timer timer;
         std::exception_ptr failure;
         try {
@@ -214,7 +225,8 @@ seastar::future<> with_native_devices(
 // One device that holds everything, in `root`:
 // `function(files, owner, spec, budget, reserve, drive, timer)`.
 template<typename Func>
-seastar::future<> with_native_store(std::filesystem::path root, Func function) {
+seastar::future<> with_native_store(
+  std::filesystem::path root, Func function, native_budgets limits = {}) {
     return with_native_devices(
       std::array{std::move(root)},
       [](
@@ -233,7 +245,8 @@ seastar::future<> with_native_store(std::filesystem::path root, Func function) {
         auto& timer) mutable {
           return function(
             files, owner, devices[0], budget, reserve, drive, timer);
-      });
+      },
+      limits);
 }
 
 } // namespace kwaque::broker::testing

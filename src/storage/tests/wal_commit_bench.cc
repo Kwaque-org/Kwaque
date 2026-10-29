@@ -296,7 +296,10 @@ struct wal_commit_bench {
                             budget.try_reserve_buffer(child.bytes()));
                           std::optional<admitted_wal_batch> seed{take(
                             admitted_wal_batch::make(
-                              std::move(child), std::move(backing), charge))};
+                              std::move(child),
+                              std::move(backing),
+                              wal_bench_support::child_time,
+                              charge))};
                           const auto expected
                             = wal_writer_contract::child_context(
                               spec.owner.cluster());
@@ -307,6 +310,7 @@ struct wal_commit_bench {
                               alignment(8192),
                               runtime::file_position{8192})
                               .value(),
+                            runtime::file_position{8192},
                             expected.target,
                             expected.target_data_start,
                             expected.routing_epoch,
@@ -317,6 +321,7 @@ struct wal_commit_bench {
                             = preflight_wal_prepare(
                                 seed->batch(),
                                 initial,
+                                envelope_placement::ends_span,
                                 work.policy(),
                                 {runtime::maximum_file_io_bytes,
                                  runtime::maximum_file_io_bytes})
@@ -348,7 +353,9 @@ struct wal_commit_bench {
                                 take(wal_group::make(budget, 1)));
                               take(
                                 offers[i]->append(
-                                  std::move(pair.wal), expected));
+                                  std::move(pair.wal),
+                                  expected,
+                                  expected.target_data_start));
                           }
                           auto verification_child = std::move(*seed).release();
                           seed.reset();
@@ -892,52 +899,94 @@ struct wal_commit_bench {
                           }
                           for (std::size_t i = 0; i != count; ++i) {
                               if (!requests[i].accepted) continue;
-                              auto alias
-                                = co_await verification_child.batch.share(
-                                  {byte_count{32_MiB},
-                                   byte_count{1_MiB},
-                                   charge},
-                                  work);
-                              auto bytes = co_await encode_wal_prepare(
-                                std::move(alias).value(),
-                                {wal_write_context::make(
-                                   heads[i]->incarnation,
-                                   alignment(8192),
-                                   runtime::file_position{requests[i].begin})
-                                   .value(),
-                                 expected.target,
-                                 expected.target_data_start,
-                                 expected.routing_epoch,
-                                 expected.batch,
-                                 expected.profile,
-                                 expected.target_profile},
-                                work,
-                                byte_count{32_MiB},
-                                charge);
-                              auto encoded = std::move(bytes).value();
-                              for (auto fragment : encoded) {
-                                  expected_hash.update(
-                                    fragment.data(), fragment.size());
-                                  if (fixture)
-                                      fixture->write(
-                                        fragment.data(),
-                                        static_cast<std::streamsize>(
-                                          fragment.size()));
-                              }
-                              if (layout) {
-                                  *layout << encoded.size().value() << ' '
-                                          << requests[i].covering_end << ' '
-                                          << encoded.fragment_count();
-                                  for (auto fragment : encoded)
-                                      *layout << ' ' << fragment.size();
-                                  *layout << '\n';
-                              }
                               const auto path = take(
                                 take(local_paths::make(root))
                                   .wal(0, heads[i]->incarnation));
                               auto file = take(co_await files.open(path, {}));
                               runtime::first_failure checked;
                               try {
+                                  // Each file's header ends at 8 KiB, and
+                                  // each member is its own group, so it
+                                  // ends its write. Where its file's
+                                  // certified prefix ended when the group's
+                                  // encoding began depends on which barriers
+                                  // had completed: it is read back and held
+                                  // to its rule (a boundary between the data
+                                  // start and the PREPARE), and every other
+                                  // byte is compared exactly.
+                                  auto stamp = take(
+                                    co_await file.read(
+                                      runtime::file_position{
+                                        requests[i].begin + 32 + 152},
+                                      byte_count{8}));
+                                  require(
+                                    stamp.data().size() == byte_count{8},
+                                    "benchmark readback was short");
+                                  std::uint64_t stored = 0, shift = 0;
+                                  for (auto fragment : stamp.data())
+                                      for (std::size_t at = 0;
+                                           at < fragment.size();
+                                           ++at, shift += 8) {
+                                          const auto octet
+                                            = static_cast<unsigned char>(
+                                              fragment.data()[at]);
+                                          stored |= std::uint64_t{octet}
+                                                    << shift;
+                                      }
+                                  require(
+                                    8192 <= stored
+                                      && stored <= requests[i].begin
+                                      && stored % 8192 == 0,
+                                    "a PREPARE's certified end is off its "
+                                    "boundary or past its PREPARE");
+                                  const runtime::file_position certified{
+                                    stored};
+                                  auto alias
+                                    = co_await verification_child.batch.share(
+                                      {byte_count{32_MiB},
+                                       byte_count{1_MiB},
+                                       charge},
+                                      work);
+                                  auto bytes = co_await encode_wal_prepare(
+                                    std::move(alias).value(),
+                                    {wal_write_context::make(
+                                       heads[i]->incarnation,
+                                       alignment(8192),
+                                       runtime::file_position{
+                                         requests[i].begin})
+                                       .value(),
+                                     runtime::file_position{8192},
+                                     expected.target,
+                                     expected.target_data_start,
+                                     expected.routing_epoch,
+                                     expected.batch,
+                                     expected.profile,
+                                     expected.target_profile},
+                                    {true,
+                                     verification_child.append_time,
+                                     expected.target_data_start,
+                                     certified},
+                                    work,
+                                    byte_count{32_MiB},
+                                    charge);
+                                  auto encoded = std::move(bytes).value();
+                                  for (auto fragment : encoded) {
+                                      expected_hash.update(
+                                        fragment.data(), fragment.size());
+                                      if (fixture)
+                                          fixture->write(
+                                            fragment.data(),
+                                            static_cast<std::streamsize>(
+                                              fragment.size()));
+                                  }
+                                  if (layout) {
+                                      *layout << encoded.size().value() << ' '
+                                              << requests[i].covering_end << ' '
+                                              << encoded.fragment_count();
+                                      for (auto fragment : encoded)
+                                          *layout << ' ' << fragment.size();
+                                      *layout << '\n';
+                                  }
                                   std::uint64_t offset = 0;
                                   while (offset != encoded.size().value()) {
                                       const auto length = byte_count{
@@ -1241,7 +1290,10 @@ struct wal_commit_bench {
                             budget.try_reserve_buffer(child.bytes()));
                           std::optional<admitted_wal_batch> seed{take(
                             admitted_wal_batch::make(
-                              std::move(child), std::move(backing), charge))};
+                              std::move(child),
+                              std::move(backing),
+                              wal_bench_support::child_time,
+                              charge))};
                           const auto expected
                             = wal_writer_contract::child_context(
                               spec.owner.cluster());
@@ -1252,6 +1304,7 @@ struct wal_commit_bench {
                               alignment(8192),
                               runtime::file_position{8192})
                               .value(),
+                            runtime::file_position{8192},
                             expected.target,
                             expected.target_data_start,
                             expected.routing_epoch,
@@ -1262,6 +1315,7 @@ struct wal_commit_bench {
                             = preflight_wal_prepare(
                                 seed->batch(),
                                 initial,
+                                envelope_placement::ends_span,
                                 work.policy(),
                                 {runtime::maximum_file_io_bytes,
                                  runtime::maximum_file_io_bytes})
@@ -1300,7 +1354,9 @@ struct wal_commit_bench {
                                 take(wal_group::make(budget, 1)));
                               take(
                                 offers[slot]->append(
-                                  std::move(pair.wal), expected));
+                                  std::move(pair.wal),
+                                  expected,
+                                  expected.target_data_start));
                           };
                           std::unique_ptr<wal_group_commit> groups;
                           // The coordinator's own defaults, which the

@@ -11,7 +11,6 @@ runtime::result<void> validate_local_segment(
       !spec.stores_data() || !spec.shard_owner(shard)
       || descriptor.segment.cluster() != spec.owner.cluster()
       || descriptor.segment != header.context()
-      || descriptor.logical_origin != header.logical_origin()
       || descriptor.alignment != header.alignment()
       || descriptor.profile != header.profile())
         return runtime::failure(detail::path_error(errc::wrong_context));
@@ -22,6 +21,8 @@ runtime::result<void> validate_local_segment(
     if ((descriptor.layout != local_layout_kind::initial
          && descriptor.layout != local_layout_kind::rewrite)
         || (descriptor.layout == local_layout_kind::initial && descriptor.physical_origin.value() != 0)
+        || descriptor.retry_depth == 0
+        || descriptor.retry_depth > maximum_retry_depth
         || descriptor.maximum_lifetime.nanoseconds() == 0
         || descriptor.maximum_data_bytes.value() < descriptor.alignment.bytes().value()
              * (descriptor.layout == local_layout_kind::initial ? 4U : 2U))

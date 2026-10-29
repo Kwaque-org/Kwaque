@@ -120,7 +120,7 @@ inline std::string sealed_wire(
   std::span<const page_ref> refs = {},
   footer_expectation root = root_location(),
   std::size_t h = 32) {
-    std::string body(232, '\0');
+    std::string body(256, '\0');
     put(body, 0, 1, 2);
     std::string context(72, '\0');
     put_sc(context, root.history.segment);
@@ -132,8 +132,14 @@ inline std::string sealed_wire(
         put(body, 136, 1, 1);
         put_coverage(body, 140, *fields.last_block);
     }
+    const auto time = [](runtime::wall_time value) {
+        return static_cast<std::uint64_t>(value.unix_nanoseconds());
+    };
+    put(body, 188, time(fields.times.first_append), 8);
+    put(body, 196, time(fields.times.max_append), 8);
+    put(body, 204, time(fields.times.max_record), 8);
     for (std::size_t i = 0; i < digest.size(); ++i)
-        body[188 + i] = std::bit_cast<char>(digest[i]);
+        body[212 + i] = std::bit_cast<char>(digest[i]);
     std::uint32_t total = 0;
     for (const auto& ref : refs) {
         std::string page(48, '\0');
@@ -147,11 +153,11 @@ inline std::string sealed_wire(
         body += page;
         total += ref.entry_count();
     }
-    put(body, 220, total, 4);
-    put(body, 224, refs.size(), 4);
+    put(body, 244, total, 4);
+    put(body, 248, refs.size(), 4);
     const auto a = root.history.alignment.bytes().value();
     const auto pad = (a - (h + body.size()) % a) % a;
-    put(body, 228, pad, 4);
+    put(body, 252, pad, 4);
     body.append(pad, '\0');
     return frame(std::move(body), 7, h);
 }
@@ -159,15 +165,25 @@ inline std::string one_root(
   std::span<const page_ref> refs = {},
   footer_expectation root = root_location(),
   std::size_t h = 32) {
+    // data_block() unpadded at the data start.
     const auto extent = scope(
       100,
       101,
       0,
       1,
       root.history.data_start.value(),
-      2U * root.history.data_start.value());
+      root.history.data_start.value() + data_block().size());
+    // data_block()'s times: a 1 ns append time and a record at time 0.
     return sealed_wire(
-      {extent, 1, extent, 0}, exact_digest(data_block()), refs, root, h);
+      {extent,
+       1,
+       extent,
+       {runtime::wall_time{1}, runtime::wall_time{1}, runtime::wall_time{0}},
+       0},
+      exact_digest(data_block()),
+      refs,
+      root,
+      h);
 }
 inline sealed_footer pin_root(
   const std::string& wire,
@@ -200,7 +216,7 @@ inline codec::decode_budget reserve_page(
 inline verified_extent hashed_evidence(codec::cooperative_work& work) {
     auto verifier = extent_verifier::make(
                       history(),
-                      scope(100, 101, 0, 1, 512, 1024),
+                      scope(100, 101, 0, 1, 512, 512 + data_block().size()),
                       work.policy(),
                       extent_layout_kind::initial_append,
                       {},

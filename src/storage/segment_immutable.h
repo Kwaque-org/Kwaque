@@ -19,7 +19,8 @@ struct segment_immutable_expectation final {
 // at a time; fixed-prefix fields only bound the read, never prove its contents.
 // Root and required retry pages must independently pass the pinned metadata
 // reader. This walk supplies the missing data-extent proof, not append
-// authority.
+// authority. A non-empty extent ends with the footer that closes it, whose
+// padding the root follows.
 [[nodiscard]] seastar::future<runtime::result<verified_extent>>
 verify_segment_immutable(
   runtime::file&,

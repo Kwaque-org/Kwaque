@@ -7,6 +7,7 @@
 #include "src/runtime/cross_shard.h"
 #include "src/storage/metrics.h"
 #include "src/storage/operation_scope.h"
+#include "src/storage/placement_statistics.h"
 #include "src/storage/workload_budget.h"
 
 #include <seastar/core/coroutine.hh>
@@ -20,6 +21,7 @@
 #include <boost/test/unit_test.hpp>
 
 #include <array>
+#include <cstdint>
 #include <exception>
 #include <limits>
 #include <optional>
@@ -447,6 +449,115 @@ SEASTAR_TEST_CASE(storage_metrics_register_bounded_families_and_rollback_oom) {
         BOOST_CHECK(map.find("storage_active") == map.end());
         co_return;
     });
+}
+
+// With a reader of the shard's placement, every placement family registers
+// beside the sources' and reads the append owner's statistics at each
+// scrape: what only grows as a counter, what stands now as a gauge.
+SEASTAR_TEST_CASE(storage_metrics_read_the_placement_at_each_scrape) {
+    co_await with_budget(
+      [](
+        auto& manager) -> seastar::
+                         future<> {
+                             workload_budget budget{
+                               manager.acquire_workload(workload),
+                               limits(),
+                               bytes::testing::charge};
+                             storage_statistics statistics;
+                             const std::array sources{
+                               metric_source{&statistics, &budget}};
+                             // Each field its own value, in the order of the
+                             // families' ids.
+                             local_append_statistics placed;
+                             placed.portions = {1, 2};
+                             placed.portion_bytes = {3, 4};
+                             placed.held_portions = 5;
+                             placed.held_portion_bytes = 6;
+                             placed.runs = {7, 8, 9, 10, 11};
+                             placed.barriers = 12;
+                             placed.syncs = 13;
+                             placed.sync_rounds = 14;
+                             placed.round_syncs = 15;
+                             placed.held_bytes = 16;
+                             placed.held_runs = 17;
+                             placed.unsynced_bytes = 18;
+                             placed.unsynced_files = 19;
+                             storage_metrics metrics{
+                               sources,
+                               [&placed]() noexcept { return placed; }};
+                             metrics.start();
+                             const auto& map
+                               = seastar::metrics::impl::get_value_map();
+                             const auto
+                               value = [&map](metric_id id) -> std::
+                                                              uint64_t {
+                                                                  const auto&
+                                                                    descriptor
+                                                                    = *descriptor_for(
+                                                                      id);
+                                                                  auto name = seastar::
+                                                                    sstring{
+                                                                      std::string{
+                                                                        descriptor
+                                                                          .group}};
+                                                                  name
+                                                                    += seastar::
+                                                                      sstring{
+                                                                        "_"};
+                                                                  name += seastar::
+                                                                    sstring{
+                                                                      std::string{
+                                                                        descriptor
+                                                                          .name}};
+                                                                  const auto
+                                                                    found
+                                                                    = map.find(
+                                                                      name);
+                                                                  BOOST_REQUIRE(
+                                                                    found
+                                                                    != map
+                                                                         .end());
+                                                                  BOOST_REQUIRE_EQUAL(
+                                                                    found
+                                                                      ->second
+                                                                      .size(),
+                                                                    1U);
+                                                                  BOOST_CHECK(
+              found->second.info().type
+              == (descriptor.kind == metric_value_kind::gauge
+                    ? seastar::metrics::impl::data_type::GAUGE
+                    : seastar::metrics::impl::data_type::COUNTER));
+                                                                  return found
+                                                                    ->second
+                                                                    .begin()
+                                                                    ->second
+                                                                    ->get_function()()
+                                                                    .ui();
+                                                              };
+                             constexpr auto first = static_cast<std::uint16_t>(
+                               metric_id::storage_wal_placed_portions_total);
+                             constexpr auto last = static_cast<std::uint16_t>(
+                               metric_id::storage_unsynced_wal_files);
+                             for (auto id = first; id <= last; ++id)
+                                 BOOST_CHECK_EQUAL(
+                                   value(static_cast<metric_id>(id)),
+                                   id - first + 1U);
+                             unsigned families = 0;
+                             for (const auto& [name, family] : map)
+                                 if (
+                                   std::string_view{name.data(), name.size()}
+                                     .starts_with("storage_"))
+                                     ++families;
+                             BOOST_CHECK_EQUAL(families, 30U);
+                             // A later scrape reads what stands then.
+                             placed.held_bytes = 4096;
+                             BOOST_CHECK_EQUAL(
+                               value(metric_id::storage_held_bytes), 4096U);
+                             metrics.stop();
+                             BOOST_CHECK(
+                               map.find("storage_held_bytes") == map.end());
+                             co_return;
+                         });
 }
 
 SEASTAR_TEST_CASE(

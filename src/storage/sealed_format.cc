@@ -63,7 +63,7 @@ struct sealed_reader final {
       codec::decode_budget memory,
       codec::cooperative_work& work) {
         const auto anchor = page_error(errc::success, c);
-        std::array<char, 232> fixed{};
+        std::array<char, sealed_footer_fixed_bytes.value()> fixed{};
         if (
           auto read = co_await detail::read_fixed(input, fixed, work, c); !read)
             co_return codec::failure(read.error());
@@ -104,20 +104,26 @@ struct sealed_reader final {
                      }))
             co_return codec::failure(page_error(errc::malformed_data, c, 140));
         const boundary_fields boundary{
-          *coverage, load<132, std::uint32_t>(fixed), last, 0};
+          *coverage,
+          load<132, std::uint32_t>(fixed),
+          last,
+          {runtime::wall_time{load<188, std::int64_t>(fixed)},
+           runtime::wall_time{load<196, std::int64_t>(fixed)},
+           runtime::wall_time{load<204, std::int64_t>(fixed)}},
+          0};
         if (
           auto valid = detail::check_boundary(boundary, expected, c, true);
           !valid)
             co_return codec::failure(valid.error());
-        const auto stored_digest = detail::read_digest<188>(fixed);
+        const auto stored_digest = detail::read_digest<212>(fixed);
         if (!stored_digest)
-            co_return codec::failure(page_error(errc::malformed_data, c, 204));
+            co_return codec::failure(page_error(errc::malformed_data, c, 228));
         const codec::extent_digest extent_digest{*stored_digest};
         if (coverage->bytes().empty() && extent_digest.bytes() != empty_digest)
-            co_return codec::failure(page_error(errc::malformed_data, c, 188));
-        const auto total = load<220, std::uint32_t>(fixed);
+            co_return codec::failure(page_error(errc::malformed_data, c, 212));
+        const auto total = load<244, std::uint32_t>(fixed);
         const auto count = detail::page_wire(
-          page_count::make(load<224, std::uint32_t>(fixed)), c, 224);
+          page_count::make(load<248, std::uint32_t>(fixed)), c, 248);
         if (!count) co_return codec::failure(count.error());
         if (
           auto valid = check_counts(total, count->value(), work.policy(), c);
@@ -133,12 +139,12 @@ struct sealed_reader final {
             {work.policy().config().max_page_bytes,
              work.policy().config().max_page_bytes}),
           c,
-          228);
+          252);
         if (!layout) co_return codec::failure(layout.error());
         if (
           input.total_bytes() != layout->body_bytes()
-          || load<228, std::uint32_t>(fixed) != layout->padding_bytes().value())
-            co_return codec::failure(page_error(errc::malformed_data, c, 228));
+          || load<252, std::uint32_t>(fixed) != layout->padding_bytes().value())
+            co_return codec::failure(page_error(errc::malformed_data, c, 252));
         const auto extent = detail::page_wire(
           layout->at(expected.position), c, 76);
         if (!extent) co_return codec::failure(extent.error());
@@ -185,7 +191,7 @@ struct sealed_reader final {
             pages.push_back(*ref);
         }
         if (first != total)
-            co_return codec::failure(page_error(errc::malformed_data, c, 220));
+            co_return codec::failure(page_error(errc::malformed_data, c, 244));
         if (
           auto read = co_await detail::read_padding(
             input, layout->padding_bytes(), work, c);
@@ -228,7 +234,8 @@ codec::result<void> validate_sealed_footer(
     if (
       footer.coverage() != fields.coverage
       || footer.block_count() != fields.block_count
-      || footer.last_block() != fields.last_block)
+      || footer.last_block() != fields.last_block
+      || footer.times() != fields.times)
         return codec::failure(page_error(errc::malformed_data, c));
     if (footer.extent_digest() != *evidence.digest())
         return codec::failure(page_error(errc::corrupt_data, c));
@@ -331,7 +338,7 @@ seastar::future<codec::result<encoded_sealed_footer>> encode_sealed_footer(
       || layout->encoded_bytes().value()
            > std::numeric_limits<std::uint64_t>::max() - c.origin)
         co_return codec::failure(page_error(errc::out_of_range, c));
-    std::array<char, 232> fixed{};
+    std::array<char, sealed_footer_fixed_bytes.value()> fixed{};
     store<0>(fixed, std::uint16_t{1});
     detail::write_sc<4>(fixed, expected.history.segment);
     store<76>(fixed, expected.position.value());
@@ -341,10 +348,14 @@ seastar::future<codec::result<encoded_sealed_footer>> encode_sealed_footer(
         store<136>(fixed, std::uint8_t{1});
         detail::write_coverage<140>(fixed, *evidence.boundary().last_block);
     }
-    detail::write_digest<188>(fixed, *evidence.digest());
-    store<220>(fixed, total);
-    store<224>(fixed, static_cast<std::uint32_t>(refs.size()));
-    store<228>(
+    const auto times = evidence.boundary().times;
+    store<188>(fixed, times.first_append.unix_nanoseconds());
+    store<196>(fixed, times.max_append.unix_nanoseconds());
+    store<204>(fixed, times.max_record.unix_nanoseconds());
+    detail::write_digest<212>(fixed, *evidence.digest());
+    store<244>(fixed, total);
+    store<248>(fixed, static_cast<std::uint32_t>(refs.size()));
+    store<252>(
       fixed, static_cast<std::uint32_t>(layout->padding_bytes().value()));
     auto output = co_await detail::encode_page_object<48>(
       fixed,

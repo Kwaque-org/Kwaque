@@ -247,6 +247,25 @@ public:
         share = byte_count{
           share.value() > bound.value() ? share.value() - bound.value() : 0};
     }
+    // A prepared segment's files took `bytes` of the device's share before
+    // the segment counts among its writable ones, which its activation
+    // places with the rest of its bound; and what a preparation that made
+    // nothing gives back.
+    void taken(device_store_id device, byte_count bytes) noexcept {
+        assert_current();
+        auto* found = find(device);
+        if (!found) return;
+        auto& share = shares_[found->pool].share;
+        share = byte_count{
+          share.value() > bytes.value() ? share.value() - bytes.value() : 0};
+    }
+    void given(device_store_id device, byte_count bytes) noexcept {
+        assert_current();
+        auto* found = find(device);
+        if (!found) return;
+        auto& share = shares_[found->pool].share;
+        if (const auto back = share.checked_add(bytes)) share = *back;
+    }
     // A segment is written no more: sealed, failed or closed. `unused` is
     // what a creation that made nothing gives back.
     void unplaced(device_store_id device, byte_count unused = {}) noexcept {

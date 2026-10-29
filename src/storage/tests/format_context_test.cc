@@ -216,13 +216,14 @@ TEST(
     for (const auto& different : mismatches)
         expect_error(
           different.validate_expected(expected), errc::wrong_context);
-    expect_error(
-      segment_write_context::make(
-        context(),
-        alignment(),
-        model::segment_relative_end{},
-        file_position{513}),
-      errc::invalid_argument);
+    // A block packed after another begins wherever that one ends.
+    const auto packed = segment_write_context::make(
+      context(),
+      alignment(),
+      model::segment_relative_end{},
+      file_position{513});
+    ASSERT_TRUE(packed.has_value());
+    EXPECT_EQ(packed->position(), file_position{513});
     const auto terminal = segment_write_context::make(
       context(),
       alignment(),
@@ -276,10 +277,11 @@ TEST(
     expect_error(
       wal_write_context::make({}, alignment(), file_position{}),
       errc::invalid_argument);
-    expect_error(
-      wal_write_context::make(
-        expected.incarnation(), alignment(), file_position{1}),
-      errc::invalid_argument);
+    // So does a PREPARE packed after another in the same write.
+    const auto packed = wal_write_context::make(
+      expected.incarnation(), alignment(), file_position{513});
+    ASSERT_TRUE(packed.has_value());
+    EXPECT_EQ(packed->position(), file_position{513});
     EXPECT_TRUE(
       wal_write_context::make(
         expected.incarnation(), alignment(), file_position{}));

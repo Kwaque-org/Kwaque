@@ -219,6 +219,7 @@ private:
     model::segment_relative_end physical_;
     runtime::file_position position_;
     std::optional<storage::coverage> last_;
+    boundary_times times_;
     std::uint32_t count_{0};
     std::uint32_t crc_{0};
     state state_{state::open};

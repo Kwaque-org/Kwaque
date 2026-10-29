@@ -1084,6 +1084,92 @@ seastar::future<> accepted_encoding_failure(
     co_return;
 }
 
+// A group admitted with three PREPAREs that end exactly on a boundary, and
+// submitted without the middle one, as when its segment did not freeze: the
+// last now pads 3,425 bytes, which its admission kept room for. The
+// submission is accepted at the admitted start, packs the two PREPAREs and
+// pads them to the same boundary.
+template<
+  runtime::monotonic_clock Clock,
+  typename Backend,
+  typename Owner,
+  typename Driver>
+seastar::future<> admitted_shrink(
+  Backend& files,
+  Owner& owner,
+  const local_device_spec& spec,
+  workload_budget& budget,
+  Driver drive) {
+    co_await wal_append_contract::with_writer(
+      files,
+      owner,
+      spec,
+      budget,
+      drive,
+      wal_writer_contract::configuration(),
+      [&](auto& writer, auto& work) -> seastar::future<> {
+          const auto head = *writer.prepared_head();
+          const auto start = writer.progress()->reserved.position().value();
+          // PREPAREs of 2,425, 3,425 and 2,342 bytes: 8,192 together.
+          const std::array wires{
+            valued_child(100, 2000),
+            valued_child(100, 3000),
+            valued_child(100, 1917)};
+          std::vector<admitted_wal_batch> children;
+          for (const auto& wire : wires)
+              children.push_back(
+                co_await wal_writer_contract::offer(budget, wire, work, 4096));
+          const auto expected = wal_writer_contract::child_context(
+            spec.owner.cluster());
+          std::array<wal_admission_member, 3> members{};
+          for (std::size_t i = 0; i < members.size(); ++i)
+              members[i] = {&children[i].batch(), &expected};
+          co_await with_groups(
+            writer,
+            budget,
+            drive,
+            slow_batch(),
+            [&](auto& groups) -> seastar::future<> {
+                auto admitted = take(
+                  groups.template admit<Clock>(writer, members, work.policy()));
+                require(
+                  admitted.admission
+                    && admitted.measure.encoded_bytes == byte_count{8_KiB},
+                  "three PREPAREs ending on a boundary were not admitted as "
+                  "one unit");
+                auto offer = take(wal_group::make(budget, 3));
+                take(offer.append(
+                  std::move(children[0]),
+                  expected,
+                  expected.target_data_start));
+                take(offer.append(
+                  std::move(children[2]),
+                  expected,
+                  expected.target_data_start));
+                auto ticket = take(
+                  co_await groups.template submit<Clock>(
+                    writer,
+                    std::move(offer),
+                    std::move(*admitted.admission),
+                    work));
+                require(
+                  ticket.boundary().cursor().position().value() == start + 8192
+                    && ticket.encoded_bytes() == byte_count{8_KiB},
+                  "a smaller admitted group was refused or misplaced");
+            });
+          const std::array kept{wires[0], wires[2]};
+          const auto path = take(
+            take(local_paths::make(spec.root)).wal(0, head.incarnation));
+          const auto stored = co_await store_contract::read_bytes(
+            files, path, drive);
+          require(
+            stored.substr(start)
+              == wal_append_contract::group_bytes(
+                kept, head, spec.owner.cluster(), start),
+            "the smaller group was not packed and padded to its boundary");
+      });
+}
+
 template<
   runtime::monotonic_clock Clock,
   typename Backend,
@@ -1129,10 +1215,12 @@ seastar::future<> maximum_members(
                 auto second = take(
                   co_await groups.template submit<Clock>(
                     writer, std::move(two), work));
+                // Each group packs its 64 PREPAREs of 423 bytes into 27,072
+                // bytes and pads them to four units.
                 auto capture = groups.capture(Clock::now());
                 require(
                   capture && capture->groups() == 2 && capture->members() == 128
-                    && capture->encoded_bytes() == byte_count{128U * 8_KiB},
+                    && capture->encoded_bytes() == byte_count{2U * 32_KiB},
                   "legal writer groups did not form the maximum cohort");
             });
       });

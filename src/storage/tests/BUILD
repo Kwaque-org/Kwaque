@@ -273,7 +273,8 @@ test_suite(
         ":page_cache_test",
         ":recovery_test",
         ":retention_test",
-        ":retry_snapshot_test",
+        ":retry_lookup_test",
+        ":retry_summary_test",
         ":segment_writer_state_test",
         ":space_sampler_test",
         ":sparse_index_test",
@@ -723,6 +724,7 @@ kwaque_cc_seastar_test(
         "//src/runtime:error",
         "//src/storage:metrics",
         "//src/storage:operation_scope",
+        "//src/storage:placement_statistics",
         "//src/storage:statistics",
         "//src/storage:workload_budget",
     ],
@@ -847,6 +849,12 @@ kwaque_cc_seastar_test(
         "//src/storage:completion_resources",
         "//src/storage:workload_budget",
     ],
+)
+
+kwaque_cc_test(
+    name = "local_append_verdict_test",
+    srcs = ["local_append_verdict_test.cc"],
+    deps = ["//src/storage:local_append_verdict"],
 )
 
 kwaque_cc_test(
@@ -1175,7 +1183,9 @@ kwaque_cc_library(
     ],
     deps = [
         ":local_reader_contract",
+        ":storage_test_support",
         "//src/base",
+        "//src/storage:local_metadata_layout",
         "//src/storage:storage_scan",
         "@seastar",
     ],
@@ -1210,7 +1220,10 @@ kwaque_cc_library(
     deps = [
         ":segment_scan_contract",
         ":storage_test_support",
+        "//src/storage:completed_retry",
+        "//src/storage:local_metadata_layout",
         "//src/storage:recovery",
+        "//src/storage:retry_lookup",
         "//src/storage:sparse_index",
         "@seastar",
     ],
@@ -1246,9 +1259,10 @@ kwaque_cc_library(
         "//src/base",
         "//src/bytes:allocation_test_profile",
         "//src/storage:checkpoint",
+        "//src/storage:local_bundle",
         "//src/storage:recovery",
         "//src/storage:retry_lookup",
-        "//src/storage:retry_snapshot",
+        "//src/storage:retry_summary",
         "//src/storage:wal_reclaimer",
         "@seastar",
     ],
@@ -1292,15 +1306,15 @@ kwaque_cc_seastar_test(
 )
 
 kwaque_cc_seastar_test(
-    name = "retry_snapshot_test",
-    srcs = ["retry_snapshot_test.cc"],
+    name = "retry_lookup_test",
+    srcs = ["retry_lookup_test.cc"],
     memory = "256MiB",
     deps = [
         "//src/base",
         "//src/base:error",
         "//src/bytes:allocation_test_profile",
-        "//src/codec:cooperative",
         "//src/codec:digest",
+        "//src/codec:envelope",
         "//src/codec:limits",
         "//src/model:batch_identity",
         "//src/model:epoch",
@@ -1310,18 +1324,42 @@ kwaque_cc_seastar_test(
         "//src/resource:resource_manager",
         "//src/resource:resource_registry",
         "//src/resource:workload_class",
-        "//src/runtime:error",
-        "//src/runtime:file_position",
         "//src/storage:completed_retry",
+        "//src/storage:footer_format",
         "//src/storage:format_context",
-        "//src/storage:local_bundle",
-        "//src/storage:local_metadata",
-        "//src/storage:local_metadata_layout",
-        "//src/storage:local_store_config",
-        "//src/storage:local_types",
         "//src/storage:page_ref",
         "//src/storage:retry_lookup",
-        "//src/storage:retry_snapshot",
+        "//src/storage:workload_budget",
+    ],
+)
+
+kwaque_cc_seastar_test(
+    name = "retry_summary_test",
+    srcs = ["retry_summary_test.cc"],
+    memory = "512MiB",
+    deps = [
+        "//src/base",
+        "//src/base:error",
+        "//src/bytes:allocation_test_profile",
+        "//src/codec:cooperative",
+        "//src/codec:digest",
+        "//src/codec:limits",
+        "//src/model:batch_context",
+        "//src/model:batch_identity",
+        "//src/model:epoch",
+        "//src/model:identity",
+        "//src/model:position",
+        "//src/resource:resource_config",
+        "//src/resource:resource_manager",
+        "//src/resource:resource_registry",
+        "//src/resource:workload_class",
+        "//src/runtime:error",
+        "//src/runtime:time",
+        "//src/storage:completed_retry",
+        "//src/storage:encoded_batch",
+        "//src/storage:format_context",
+        "//src/storage:page_ref",
+        "//src/storage:retry_summary",
         "//src/storage:workload_budget",
     ],
 )
@@ -1690,7 +1728,9 @@ kwaque_cc_library(
         "//src/storage:local_metadata",
         "//src/storage:local_paths",
         "//src/storage:local_types",
+        "//src/storage:retained_wal",
         "//src/storage:wal_group",
+        "//src/storage:wal_reclaimer",
         "//src/storage:wal_writer",
         "//src/storage:workload_budget",
         "@seastar",
@@ -1972,7 +2012,6 @@ kwaque_cc_library(
         "//src/storage:page_cache",
         "//src/storage:page_ref",
         "//src/storage:recovery",
-        "//src/storage:retry_snapshot",
         "//src/storage:segment_format",
         "//src/storage:segment_group",
         "//src/storage:segment_writer",
@@ -2002,6 +2041,18 @@ kwaque_cc_seastar_test(
 )
 
 kwaque_cc_library(
+    name = "local_append_test_access",
+    testonly = True,
+    hdrs = ["local_append_test_access.h"],
+    deps = [
+        "//src/runtime:file",
+        "//src/runtime:time",
+        "//src/storage:local_append",
+        "@seastar",
+    ],
+)
+
+kwaque_cc_library(
     name = "local_append_contract",
     testonly = True,
     hdrs = ["local_append_contract.h"],
@@ -2010,6 +2061,7 @@ kwaque_cc_library(
         "//src/simulation/tests:__pkg__",
     ],
     deps = [
+        ":local_append_test_access",
         ":local_installation_contract",
         ":local_store_contract",
         ":segment_writer_contract",
@@ -2017,6 +2069,7 @@ kwaque_cc_library(
         ":wal_writer_contract",
         "//src/base",
         "//src/base:error",
+        "//src/bytes:fragmented_buffer_builder",
         "//src/codec:cooperative",
         "//src/codec:digest",
         "//src/codec:xxh3",
@@ -2024,12 +2077,15 @@ kwaque_cc_library(
         "//src/runtime:file",
         "//src/runtime:first_failure",
         "//src/runtime:time",
+        "//src/storage:completed_retry",
         "//src/storage:encoded_batch",
         "//src/storage:format_context",
         "//src/storage:local_append",
         "//src/storage:local_control",
         "//src/storage:local_id_allocator",
         "//src/storage:local_paths",
+        "//src/storage:placement_statistics",
+        "//src/storage:retry_summary",
         "//src/storage:segment_writer",
         "//src/storage:segment_writer_state",
         "//src/storage:wal_group_commit",
@@ -2051,10 +2107,12 @@ kwaque_cc_library(
         ":local_append_contract",
         ":local_store_contract",
         ":segment_reader_contract",
+        ":segment_scan_contract",
         ":segment_writer_contract",
         ":sparse_index_contract",
         "//src/base",
         "//src/base:error",
+        "//src/bytes:allocation_test_profile",
         "//src/bytes:fragmented_buffer",
         "//src/codec:cooperative",
         "//src/codec:limits",
@@ -2071,6 +2129,7 @@ kwaque_cc_library(
         "//src/storage:local_paths",
         "//src/storage:local_store_config",
         "//src/storage:page_cache",
+        "//src/storage:recovery",
         "//src/storage:segment_lifecycle",
         "//src/storage:segment_reader",
         "//src/storage:segment_writer",
@@ -2209,6 +2268,7 @@ kwaque_cc_library(
         ":recovery_successor_contract",
         ":segment_lifecycle_contract",
         ":segment_writer_contract",
+        ":storage_test_support",
         ":wal_writer_contract",
         "//src/base",
         "//src/codec:cooperative",
@@ -2468,6 +2528,7 @@ _LOCAL_STORAGE_BENCH_DEPS = [
     ":engine_bench_fixture",
     ":latency_histogram",
     ":local_append_contract",
+    ":local_append_test_access",
     ":local_installation_contract",
     ":local_storage_bench_file",
     ":local_store_contract",
@@ -2499,6 +2560,7 @@ _LOCAL_STORAGE_BENCH_DEPS = [
     "//src/storage:local_paths",
     "//src/storage:local_store_config",
     "//src/storage:local_types",
+    "//src/storage:placement_statistics",
     "//src/storage:retention",
     "//src/storage:segment_lifecycle",
     "//src/storage:segment_writer",
@@ -2532,6 +2594,45 @@ kwaque_cc_benchmark(
     local_defines = ["KWAQUE_LOCAL_STORAGE_TIMING_ONLY"],
     memory = "1GiB",
     deps = _LOCAL_STORAGE_BENCH_DEPS,
+)
+
+kwaque_cc_benchmark(
+    name = "concurrent_dsync_bench",
+    srcs = ["concurrent_dsync_bench.cc"],
+    # Its widest case keeps 1,024 files open for synchronized writes.
+    memory = "512MiB",
+    deps = [
+        ":local_store_contract",
+        ":wal_bench_file",
+        "//src/base",
+        "//src/bytes:fragmented_buffer",
+        "//src/codec:cooperative",
+        "//src/codec:limits",
+        "//src/codec/tests:memory_qualification_support",
+        "//src/runtime:file",
+        "//src/runtime/production:file",
+        "//src/runtime/testing:test_directory",
+        "//src/storage:zero_fill",
+    ],
+)
+
+py_binary(
+    name = "concurrent_dsync_report",
+    srcs = [
+        "concurrent_dsync_report.py",
+        "wal_cohort_report.py",
+    ],
+    main = "concurrent_dsync_report.py",
+)
+
+py_test(
+    name = "concurrent_dsync_report_test",
+    srcs = [
+        "concurrent_dsync_report.py",
+        "concurrent_dsync_report_test.py",
+        "wal_cohort_report.py",
+    ],
+    main = "concurrent_dsync_report_test.py",
 )
 
 py_binary(

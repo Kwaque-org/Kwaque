@@ -480,6 +480,92 @@ SEASTAR_TEST_CASE(wal_writer_fake_zero_written_file) {
             files, owner, spec, budget, drive);
       });
 }
+SEASTAR_TEST_CASE(wal_writer_fake_zero_written_by_default) {
+    co_await with_wal_environment(
+      config(), [](auto& env, auto& budget, auto drive) -> seastar::future<> {
+          auto& files = env.file_system();
+          const auto spec = specification(
+            take(runtime::file_path::make("/kwaque/store")), {1, 1});
+          const std::array specs{spec};
+          ownership_input owner{specs};
+          take(co_await drive.lifecycle(files.create_directories(spec.root)));
+          co_await storage::testing::wal_append_contract::
+            zero_written_by_default(files, owner, spec, budget, drive);
+      });
+}
+// Every write to the WAL file, as the device sees it, starts and ends on its
+// alignment, and none touches bytes an earlier one wrote.
+SEASTAR_TEST_CASE(wal_writer_fake_packed_groups) {
+    co_await with_wal_environment(
+      config(),
+      [](auto& env, auto& budget, auto drive) -> seastar::future<> {
+          auto& files = env.file_system();
+          const auto spec = specification(
+            take(runtime::file_path::make("/kwaque/store")), {1, 1});
+          const std::array specs{spec};
+          ownership_input owner{specs};
+          take(co_await drive.lifecycle(files.create_directories(spec.root)));
+          struct write final {
+              std::uint64_t object, position, length;
+          };
+          std::vector<write> writes;
+          writes.reserve(4096);
+          fake_file_test_access::observe_writes(
+            files,
+            [&writes](
+              fake_object_id object,
+              std::uint64_t position,
+              std::size_t length) noexcept {
+                if (writes.size() < writes.capacity())
+                    writes.push_back({object.value(), position, length});
+            });
+          co_await storage::testing::wal_append_contract::packed_groups(
+            files, owner, spec, budget, drive);
+          fake_file_test_access::observe_writes(files, {});
+          const auto first
+            = local_wal_high{}.checked_advance(1)->incarnation().value();
+          const auto path = take(
+            take(local_paths::make(spec.root)).wal(0, first));
+          const auto wal = take(
+            fake_file_test_access::lookup(
+              files,
+              take(fake_file_test_access::resolve(files, path.value()))));
+          std::size_t seen = 0;
+          for (std::size_t i = 0; i < writes.size(); ++i) {
+              const auto& one = writes[i];
+              if (one.object != wal.value()) continue;
+              ++seen;
+              require(
+                one.position % 8192 == 0 && one.length % 8192 == 0,
+                "a WAL write did not start and end on its alignment");
+              for (std::size_t j = 0; j < i; ++j) {
+                  const auto& earlier = writes[j];
+                  require(
+                    earlier.object != wal.value()
+                      || one.position >= earlier.position + earlier.length
+                      || one.position + one.length <= earlier.position,
+                    "a WAL write touched bytes an earlier one wrote");
+              }
+          }
+          require(
+            seen > 1 && writes.size() < writes.capacity(),
+            "the WAL's writes were not all seen");
+      },
+      128);
+}
+SEASTAR_TEST_CASE(wal_writer_fake_certified_stamps) {
+    co_await with_wal_environment(
+      config(), [](auto& env, auto& budget, auto drive) -> seastar::future<> {
+          auto& files = env.file_system();
+          const auto spec = specification(
+            take(runtime::file_path::make("/kwaque/store")), {1, 1});
+          const std::array specs{spec};
+          ownership_input owner{specs};
+          take(co_await drive.lifecycle(files.create_directories(spec.root)));
+          co_await storage::testing::wal_append_contract::certified_stamps(
+            files, owner, spec, budget, drive);
+      });
+}
 SEASTAR_TEST_CASE(wal_writer_fake_whole_group_capacity) {
     co_await with_wal_environment(
       config(), [](auto& env, auto& budget, auto drive) -> seastar::future<> {
@@ -559,8 +645,10 @@ SEASTAR_TEST_CASE(
                       spec.owner.cluster()),
                     work));
                 auto first = take(wal_group::make(budget, 1));
-                take(
-                  first.append(std::move(preserved.wal), preserved.expected));
+                take(first.append(
+                  std::move(preserved.wal),
+                  preserved.expected,
+                  preserved.expected.target_data_start));
                 auto second = co_await append_contract::offer(
                   budget, spec.owner.cluster(), work, records);
                 auto third = co_await append_contract::offer(
@@ -864,6 +952,178 @@ SEASTAR_TEST_CASE(wal_writer_fake_rotation_retained_limit) {
           ownership_input owner{specs};
           take(co_await drive.lifecycle(files.create_directories(spec.root)));
           co_await storage::testing::wal_rotation_contract::retention(
+            files, owner, spec, budget, drive);
+      });
+}
+
+SEASTAR_TEST_CASE(wal_writer_fake_rotation_ready_successor) {
+    co_await with_wal_environment(
+      config(), [](auto& env, auto& budget, auto drive) -> seastar::future<> {
+          auto& files = env.file_system();
+          const auto spec = specification(
+            take(runtime::file_path::make("/kwaque/store")), {1, 1});
+          const std::array specs{spec};
+          ownership_input owner{specs};
+          take(co_await drive.lifecycle(files.create_directories(spec.root)));
+          co_await storage::testing::wal_rotation_contract::ready_successor(
+            files, owner, spec, budget, drive);
+      });
+}
+
+// A successor's making ahead fails at its body's first write, and the
+// rotation makes its successor itself. A run with nothing failing finds the
+// body first: the one file under a temporary name among the WAL's.
+SEASTAR_TEST_CASE(wal_writer_fake_rotation_failed_body_falls_back) {
+    struct {
+        std::uint64_t object{0}, writes{0};
+    } found;
+    const auto run = [&found](environment_config configuration) {
+        return with_wal_environment(
+          std::move(configuration),
+          [&found](auto& env, auto& budget, auto drive) -> seastar::future<> {
+              auto& files = env.file_system();
+              const auto spec = specification(
+                take(runtime::file_path::make("/kwaque/store")), {1, 1});
+              const std::array specs{spec};
+              ownership_input owner{specs};
+              take(
+                co_await drive.lifecycle(files.create_directories(spec.root)));
+              co_await storage::testing::wal_rotation_contract::
+                failed_body_falls_back(
+                  files,
+                  owner,
+                  spec,
+                  budget,
+                  drive,
+                  [&found, &files](const local_device_spec& at) {
+                      if (found.object != 0) return true;
+                      const auto root = take(
+                        take(local_paths::make(at.root))
+                          .buckets(0, local_bucket_kind::wal));
+                      const auto buckets = take(
+                        fake_file_test_access::resolve(files, root.value()));
+                      for (const auto& bucket :
+                           take(fake_file_test_access::list(files, buckets))) {
+                          const auto directory = root.value() + "/"
+                                                 + bucket.name;
+                          const auto held = take(
+                            fake_file_test_access::resolve(files, directory));
+                          for (const auto& entry :
+                               take(fake_file_test_access::list(files, held))) {
+                              if (!entry.name.contains(".tmp-")) continue;
+                              BOOST_REQUIRE_EQUAL(found.object, 0U);
+                              const auto object = take(
+                                fake_file_test_access::lookup(
+                                  files,
+                                  take(
+                                    fake_file_test_access::resolve(
+                                      files, directory + "/" + entry.name))));
+                              found.object = object.value();
+                              found.writes = take(
+                                fake_file_test_access::occurrences(
+                                  files,
+                                  object,
+                                  runtime::builtin_fault_point::file_write));
+                          }
+                      }
+                      return false;
+                  });
+          });
+    };
+    co_await run(config());
+    BOOST_REQUIRE_NE(found.object, 0U);
+    BOOST_REQUIRE_NE(found.writes, 0U);
+    co_await run(config(
+      runtime::builtin_fault_point::file_write,
+      runtime::fault_action::file_failure_before_effect,
+      1,
+      runtime::fault_object_key::from_u64(found.object)));
+}
+
+// A group inside the WAL's zero-written window is one synchronized write:
+// once it completes it is durable with no flush, and a crash then keeps it:
+// the file's durable bytes, which are what a crash restores, hold it. The
+// same group in a file with no window is an ordinary write, which its
+// completion does not make durable, and a crash then loses it.
+SEASTAR_TEST_CASE(wal_writer_fake_synchronized_write_survives_crash) {
+    for (const bool synchronized : {true, false}) {
+        co_await with_wal_environment(
+          config(),
+          [synchronized](
+            auto& env, auto& budget, auto drive) -> seastar::future<> {
+              auto& files = env.file_system();
+              const auto spec = specification(
+                take(runtime::file_path::make("/kwaque/store")), {1, 1});
+              const std::array specs{spec};
+              ownership_input owner{specs};
+              take(
+                co_await drive.lifecycle(files.create_directories(spec.root)));
+              co_await storage::testing::wal_append_contract::with_writer(
+                files,
+                owner,
+                spec,
+                budget,
+                drive,
+                synchronized
+                  ? storage::testing::wal_writer_contract::with_defaults()
+                  : storage::testing::wal_writer_contract::configuration(),
+                [&](auto& writer, auto& work) -> seastar::future<> {
+                    auto group = co_await storage::testing::
+                      wal_rotation_contract::submit_one(
+                        writer, budget, spec.owner.cluster(), work);
+                    take((co_await drive.lifecycle(std::move(group.written)))
+                           .failure.outcome());
+                    const auto stats = writer.statistics();
+                    const auto cursor = group.boundary.cursor();
+                    const auto path = take(take(local_paths::make(spec.root))
+                                             .wal(0, cursor.incarnation()));
+                    const auto end = cursor.position().value();
+                    const auto written = co_await read_all_bytes(
+                      files, path, drive);
+                    // What a crash now would leave of the file.
+                    const auto at = take(
+                      fake_file_test_access::resolve(files, path.value()));
+                    std::string kept(
+                      take(fake_file_test_access::durable_size(files, at)),
+                      '\0');
+                    for (std::uint64_t page = 0;
+                         page * fake_file_page_bytes < kept.size();
+                         ++page) {
+                        const auto* bytes = static_cast<const char*>(take(
+                          fake_file_test_access::durable_page(
+                            files, at, page)));
+                        if (!bytes) continue;
+                        const auto from = page * fake_file_page_bytes;
+                        std::copy_n(
+                          bytes,
+                          std::min<std::uint64_t>(
+                            fake_file_page_bytes, kept.size() - from),
+                          kept.begin() + static_cast<std::ptrdiff_t>(from));
+                    }
+                    require(
+                      stats.flush_calls == 0
+                        && stats.synchronized_writes == (synchronized ? 1U : 0U)
+                        && written.size() >= end
+                        && (kept.size() >= end
+                            && kept.substr(0, end) == written.substr(0, end))
+                             == synchronized,
+                      "a completed group was durable other than as its write "
+                      "was synchronized");
+                });
+          });
+    }
+}
+
+SEASTAR_TEST_CASE(wal_writer_fake_rotation_recycled_files) {
+    co_await with_wal_environment(
+      config(), [](auto& env, auto& budget, auto drive) -> seastar::future<> {
+          auto& files = env.file_system();
+          const auto spec = specification(
+            take(runtime::file_path::make("/kwaque/store")), {1, 1});
+          const std::array specs{spec};
+          ownership_input owner{specs};
+          take(co_await drive.lifecycle(files.create_directories(spec.root)));
+          co_await storage::testing::wal_rotation_contract::recycled_files(
             files, owner, spec, budget, drive);
       });
 }
@@ -1389,7 +1649,10 @@ seastar::future<> parked_close_history(
                 spec.owner.cluster()),
               work));
           auto first = take(wal_group::make(budget, 1));
-          take(first.append(std::move(aliases.wal), aliases.expected));
+          take(first.append(
+            std::move(aliases.wal),
+            aliases.expected,
+            aliases.expected.target_data_start));
           const std::array second_bytes{
             storage::testing::assigned_wire(false, 48)};
           const std::array third_bytes{
@@ -2013,24 +2276,26 @@ seastar::future<> wal_data_history(
             !rejected && oracle.possible() == possible
               && writer.progress()->reserved == first.boundary.cursor(),
             "preacceptance rejection raised possible survival");
-          const std::array two_records{record, record};
+          // PREPAREs of 6,425 bytes: two pack into 16384..29234 and pad to
+          // 32768, so the second spans the write's third native chunk.
+          const auto large = storage::testing::valued_child(100, 6000);
+          const std::array two_records{large, large};
+          const auto members = std::span<const std::string>{two_records}.first(
+            mode == survival_history::captured_sync ? 1 : 2);
           auto offered = co_await append_contract::offer(
-            budget,
-            spec.owner.cluster(),
-            work,
-            std::span<const std::string>{two_records}.first(
-              mode == survival_history::captured_sync ? 1 : 2));
+            budget, spec.owner.cluster(), work, members, 4096);
           auto second = take(co_await writer.submit(std::move(offered), work));
-          oracle.attempted(append_contract::prepare_bytes(record, head, spec.owner.cluster(), 16384)
-          + (mode == survival_history::captured_sync ? std::string{}
-             : append_contract::prepare_bytes(record, head, spec.owner.cluster(), 24576)));
+          // Encoded after the first barrier: they state its end.
+          oracle.attempted(
+            append_contract::group_bytes(
+              members, head, spec.owner.cluster(), 16384, 16384));
           std::optional<wal_submission> third;
           if (mode == survival_history::captured_sync) {
               auto more = co_await rotation_contract::submit_one(
                 writer, budget, spec.owner.cluster(), work);
               oracle.attempted(
                 append_contract::prepare_bytes(
-                  record, head, spec.owner.cluster(), 24576));
+                  record, head, spec.owner.cluster(), 24576, 16384));
               third.emplace(std::move(more));
           }
           std::optional<seastar::future<wal_barrier_outcome>> barrier;
@@ -2438,6 +2703,19 @@ SEASTAR_TEST_CASE(
             simulation::monotonic_clock>(files, owner, spec, budget, drive);
       },
       256);
+}
+
+SEASTAR_TEST_CASE(wal_group_commit_fake_admitted_shrink) {
+    co_await with_cohort_environment([](
+                                       auto& files,
+                                       auto& owner,
+                                       const auto& spec,
+                                       auto& budget,
+                                       auto drive,
+                                       auto&) {
+        return storage::testing::wal_group_commit_contract::admitted_shrink<
+          simulation::monotonic_clock>(files, owner, spec, budget, drive);
+    });
 }
 
 SEASTAR_TEST_CASE(wal_group_commit_failed_lower_write_joins_every_successor) {
@@ -3277,10 +3555,14 @@ SEASTAR_TEST_CASE(
                                   files,
                                   inode,
                                   runtime::builtin_fault_point::file_write);
-                                const auto record
-                                  = storage::testing::assigned_wire();
+                                // The first group packs three PREPAREs
+                                // of 5,425 bytes into two units: the
+                                // write's first four native chunks.
+                                const auto large
+                                  = storage::testing::valued_child(100, 5000);
+                                const std::array first{large, large, large};
                                 const std::array records{
-                                  record, record, record};
+                                  storage::testing::assigned_wire()};
                                 std::array<std::optional<wal_group>, 4> offers;
                                 for (unsigned i = 0; i != offers.size(); ++i)
                                     offers[i].emplace(
@@ -3288,8 +3570,11 @@ SEASTAR_TEST_CASE(
                                         budget,
                                         spec.owner.cluster(),
                                         work,
-                                        std::span<const std::string>{records}
-                                          .first(i == 0 ? 3 : 1)));
+                                        i == 0
+                                          ? std::span<const std::string>{first}
+                                          : std::span<
+                                              const std::string>{records},
+                                        4096));
                                 std::array<std::optional<wal_commit_ticket>, 4>
                                   tickets;
                                 std::array<

@@ -20,12 +20,12 @@ using namespace kwaque::storage::testing;
 local_segment_descriptor descriptor() {
     return {
       sc(),
-      model::range_logical_end{100},
       {},
       alignment(),
       storage_profile::v1,
       1,
       local_layout_kind::initial,
+      default_retry_depth,
       byte_count{1_MiB},
       runtime::monotonic_duration{1'000'000}};
 }
@@ -68,8 +68,10 @@ SEASTAR_TEST_CASE(
                   byte_count{256_KiB})
                   .value();
     BOOST_REQUIRE(plan.decision == segment_capacity_decision::fits);
-    BOOST_CHECK_EQUAL(plan.blocks.value(), 4608U);
-    BOOST_CHECK_EQUAL(plan.footer.value(), 512U);
+    // The block packs (32 + 144 + a 4,287-byte child); the footer after it
+    // (32 + 216) pads the span to the boundary.
+    BOOST_CHECK_EQUAL(plan.blocks.value(), 4463U);
+    BOOST_CHECK_EQUAL(plan.footer.value(), 657U);
     BOOST_CHECK_EQUAL(plan.sealed_root.value(), 512U);
     BOOST_CHECK_EQUAL(plan.disk.data.value(), 6144U);
     BOOST_CHECK_EQUAL(plan.disk.retry_bundle.value(), 512U);
@@ -126,6 +128,86 @@ SEASTAR_TEST_CASE(
     BOOST_CHECK(roll.decision == segment_capacity_decision::roll_required);
     BOOST_CHECK(
       roll.reasons == segment_roll_reasons{segment_roll_reason::size});
+}
+
+// k blocks of one group lie back to back from the span's aligned start and
+// one footer pads them to the next boundary: the span is
+// ceil((k * (c + 176) + 248) / A) units, at 512 and at 4,096.
+SEASTAR_TEST_CASE(segment_capacity_packs_blocks_under_one_padded_footer) {
+    seastar::abort_source abort;
+    codec::cooperative_work work{codec::limits::defaults(), abort};
+    std::array<encoded_assigned_batch, 3> input{
+      co_await child(work, false, 100),
+      co_await child(work, false, 101),
+      co_await child(work, false, 102)};
+    for (const std::uint64_t unit : {512U, 4096U}) {
+        auto description = descriptor();
+        description.alignment = alignment(unit);
+        const runtime::file_position start{unit};
+        const segment_writer_position empty{
+          model::range_logical_end{100}, {}, start};
+        for (std::size_t k = 1; k <= input.size(); ++k) {
+            const auto plan = plan_segment_capacity(
+                                description,
+                                start,
+                                empty,
+                                std::span{input}.first(k),
+                                {},
+                                work.policy(),
+                                charge,
+                                alignment(4096),
+                                byte_count{256_KiB})
+                                .value();
+            BOOST_REQUIRE(plan.decision == segment_capacity_decision::fits);
+            const auto blocks = k * 4463U;
+            const auto span = (blocks + 248U + unit - 1U) / unit * unit;
+            BOOST_CHECK_EQUAL(plan.blocks.value(), blocks);
+            BOOST_CHECK_EQUAL(plan.footer.value(), span - blocks);
+            BOOST_REQUIRE(plan.end.has_value());
+            BOOST_CHECK_EQUAL(plan.end->bytes.value(), unit + span);
+            BOOST_CHECK_EQUAL(plan.end->blocks, k);
+            BOOST_CHECK_EQUAL(plan.end->footers, 1U);
+        }
+    }
+}
+
+// A block is at least 399 bytes: 32 + 144 around a child of one record with
+// no key, value or header (32 + 184 + 7). Blocks pack, so a segment of D
+// bytes holds at most D / 399 facts, and its disk bound keeps room for the
+// retry bundle of that many, as the plan of the group that reaches that
+// count projects it.
+SEASTAR_TEST_CASE(segment_disk_bound_counts_minimal_packed_blocks) {
+    seastar::abort_source abort;
+    codec::cooperative_work work{codec::limits::defaults(), abort};
+    const auto description = descriptor();
+    segment_admission_limits limits;
+    limits.metadata_bytes = byte_count{1_MiB};
+    const auto bound
+      = segment_disk_bound(
+          description, limits, work.policy(), charge, byte_count{256_KiB})
+          .value();
+    const std::uint32_t facts = 1_MiB / 399;
+    const std::array input{co_await child(work, false, 100U + facts - 1U)};
+    const segment_writer_position current{
+      model::range_logical_end{100U + facts - 1U},
+      model::segment_relative_end{facts - 1U},
+      runtime::file_position{512},
+      facts - 1U,
+      facts - 1U,
+      facts - 1U};
+    const auto plan = plan_segment_capacity(
+                        description,
+                        runtime::file_position{512},
+                        current,
+                        input,
+                        limits,
+                        work.policy(),
+                        charge,
+                        alignment(4096),
+                        byte_count{256_KiB})
+                        .value();
+    BOOST_REQUIRE(plan.decision == segment_capacity_decision::fits);
+    BOOST_CHECK_EQUAL(bound.value(), 1_MiB + plan.disk.retry_bundle.value());
 }
 
 SEASTAR_TEST_CASE(
@@ -272,7 +354,7 @@ SEASTAR_TEST_CASE(segment_capacity_honors_page_count_and_terminal_logical_end) {
     seastar::abort_source abort;
     codec::cooperative_work work{codec::limits::defaults(), abort};
     const std::array next{co_await child(work, false, 508)};
-    auto description = descriptor();
+    const auto description = descriptor();
     segment_admission_limits limits;
     limits.maximum_retry_pages = 1;
     limits.metadata_bytes = byte_count{1_MiB};
@@ -313,9 +395,10 @@ SEASTAR_TEST_CASE(segment_capacity_honors_page_count_and_terminal_logical_end) {
     BOOST_CHECK(fits.reasons.empty());
     BOOST_CHECK_EQUAL(fits.retry_pages, 2U);
     const std::array terminal{co_await child(work, false, UINT64_MAX - 1)};
-    description.logical_origin = model::range_logical_end{UINT64_MAX - 1};
     const segment_writer_position empty{
-      description.logical_origin, {}, runtime::file_position{512}};
+      model::range_logical_end{UINT64_MAX - 1},
+      {},
+      runtime::file_position{512}};
     const auto end = plan_segment_capacity(
                        description,
                        runtime::file_position{512},
@@ -437,6 +520,22 @@ SEASTAR_TEST_CASE(segment_capacity_full_summary_and_ref_memory_intersections) {
     BOOST_CHECK(over->decision == segment_capacity_decision::roll_required);
     BOOST_CHECK(
       over->reasons == segment_roll_reasons{segment_roll_reason::retry_state});
+    // A batch whose stream already holds its depth of entries takes none, so
+    // the segment still takes it.
+    const auto held = plan_segment_capacity(
+      description,
+      runtime::file_position{512},
+      exhausted,
+      input,
+      limits,
+      work.policy(),
+      charge,
+      alignment(4096),
+      byte_count{256_KiB},
+      0);
+    BOOST_REQUIRE(held.has_value());
+    BOOST_REQUIRE(held->decision == segment_capacity_decision::fits);
+    BOOST_CHECK_EQUAL(held->end->retry_entries, maximum_object_entries);
     limits.metadata_bytes = byte_count{8_KiB};
     const auto refs = plan_segment_capacity(
       description,

@@ -75,10 +75,7 @@ TEST(LocalMetadataFixtureTest, IndependentFieldsPinsAndMalformedVerdicts) {
             EXPECT_EQ(input.checkpoint_depth(), 1U);
             const auto e = expectation(test);
             auto encoded = encode_local_metadata(
-                             {e.header,
-                              e.alignment,
-                              e.segment_alignment,
-                              e.data_metadata_alignment},
+                             {e.header, e.alignment, e.segment_alignment},
                              decoded->value.payload(),
                              work,
                              decoded->remaining.operation_remaining,
@@ -99,7 +96,7 @@ TEST(LocalMetadataFixtureTest, IndependentFieldsPinsAndMalformedVerdicts) {
 TEST(
   LocalMetadataFixtureTest,
   FollowingReferencesChecksActualFamilyAndPageDigest) {
-    for (const auto name : {"wrong_footer_family", "root_page_digest"}) {
+    for (const auto name : {"wrong_footer_family", "checkpoint_root"}) {
         const auto found = std::find_if(
           std::begin(local_fixture_cases),
           std::end(local_fixture_cases),
@@ -120,19 +117,29 @@ TEST(
             EXPECT_NE(proof.footer.family(), get(footer, 4, 2));
             EXPECT_EQ(proof.footer.digest().bytes(), exact_digest(footer));
         } else {
-            const auto& root = std::get<local_completed_retry_root>(
+            // A root that pinned another digest for its page: the page's
+            // own bytes refuse it.
+            const auto& root = std::get<local_checkpoint_root>(
               decoded->value.payload());
             ASSERT_EQ(root.pages.size(), 1U);
             const auto page_case = std::find_if(
               std::begin(local_fixture_cases),
               std::end(local_fixture_cases),
-              [](const auto& test) { return test.name == "snapshot_page"; });
+              [](const auto& test) { return test.name == "checkpoint_page"; });
             ASSERT_NE(page_case, std::end(local_fixture_cases));
+            const auto& pinned = root.pages[0];
+            const codec::immutable_object_digest other{codec::content_digest{}};
             auto expected = expectation(*page_case);
-            expected.digest = root.pages[0].digest();
-            expected.page = root.pages[0];
+            expected.digest = other;
+            expected.page = page_ref::make(
+                              pinned.ordinal(),
+                              pinned.first_entry(),
+                              pinned.entry_count(),
+                              pinned.encoded_bytes(),
+                              other)
+                              .value();
             bytes::fragmented_buffer_parser page{
-              buffer(local_fixture::read("snapshot_page"), 67)};
+              buffer(local_fixture::read("checkpoint_page"), 67)};
             auto rejected = decode_local_metadata(
                               page, expected, reserve(page, work), work)
                               .get();

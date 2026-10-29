@@ -18,17 +18,21 @@
 #include "src/runtime/timer.h"
 #include "src/storage/checkpoint.h"
 #include "src/storage/device_placement.h"
+#include "src/storage/footer_format.h"
 #include "src/storage/format_context.h"
+#include "src/storage/format_size.h"
 #include "src/storage/local_append.h"
 #include "src/storage/local_discovery.h"
 #include "src/storage/local_generation.h"
 #include "src/storage/local_id_allocator.h"
 #include "src/storage/local_metadata.h"
 #include "src/storage/local_paths.h"
+#include "src/storage/local_spares.h"
 #include "src/storage/local_store_config.h"
 #include "src/storage/page_cache.h"
+#include "src/storage/recovery_seal.h"
 #include "src/storage/retention.h"
-#include "src/storage/retry_snapshot.h"
+#include "src/storage/retry_summary.h"
 #include "src/storage/sealed_format.h"
 #include "src/storage/segment_data.h"
 #include "src/storage/segment_immutable.h"
@@ -43,6 +47,7 @@
 #include "src/storage/workload_budget.h"
 
 #include <seastar/core/abort_source.hh>
+#include <seastar/core/chunked_vector.hh>
 #include <seastar/core/condition-variable.hh>
 #include <seastar/core/coroutine.hh>
 #include <seastar/core/future.hh>
@@ -56,6 +61,7 @@
 
 #include <algorithm>
 #include <array>
+#include <bit>
 #include <cstddef>
 #include <cstdint>
 #include <exception>
@@ -75,7 +81,11 @@ namespace kwaque::storage {
 // which has no word for a segment found again after a restart, for one that
 // failed here or for one being removed, and is not widened for them.
 enum class segment_life : std::uint8_t {
-    // Its files are being made; nothing is appended yet.
+    // Its files are made and it takes no append: it waits to be activated,
+    // with its origin, holding no writer, handle or reservation.
+    prepared,
+    // Its files are being made, or it is being opened to be written;
+    // nothing is appended yet.
     creating,
     // Appended to and read.
     writable,
@@ -97,7 +107,6 @@ enum class segment_life : std::uint8_t {
 enum class segment_transition : std::uint8_t {
     seal,
     index_publication,
-    retry_cut,
     deletion,
     close,
 };
@@ -121,7 +130,6 @@ segment_admits_readers(segment_life life) noexcept {
 segment_admits(segment_life life, segment_transition change) noexcept {
     switch (change) {
     case segment_transition::seal:
-    case segment_transition::retry_cut:
         return life == segment_life::writable;
     case segment_transition::index_publication:
         return life == segment_life::sealed;
@@ -129,7 +137,8 @@ segment_admits(segment_life life, segment_transition change) noexcept {
         // A writable segment is detached first, and one whose seal runs is
         // sealed or failed when its turn comes.
         return life == segment_life::sealed || life == segment_life::recovering
-               || life == segment_life::failed;
+               || life == segment_life::failed
+               || life == segment_life::prepared;
     case segment_transition::close:
         return true;
     }
@@ -150,7 +159,7 @@ struct segment_table_config final {
     // restart and not yet removed. No more than the append owner attaches.
     // It is what a restart may find unsealed, so what its catalog must
     // list of them stays inside it.
-    std::uint32_t maximum_writable{64};
+    std::uint32_t maximum_writable{1024};
     // Sealed segments kept open for readers: each holds its cached runs,
     // and its generation and index once a reader came. One more makes the
     // one nothing uses and nothing has used for longest close first; with
@@ -158,12 +167,21 @@ struct segment_table_config final {
     std::uint32_t maximum_open_sealed{64};
     // Seals in progress. The rest wait in the order they were asked for.
     std::uint32_t maximum_seals{4};
-    // Segments in creation at once, which count among the writable. One
-    // more is refused, and whoever asked asks again.
+    // Segments prepared and not yet activated: their files are made and
+    // they hold nothing else. They do not count among the writable.
+    std::uint32_t maximum_prepared{1024};
+    // Segments whose files are being made at once, which count among the
+    // writable, or among the prepared for a prepare. One more is refused,
+    // and whoever asked asks again.
     std::uint32_t maximum_creations{2};
     // Removals that take files away at once. The rest wait their turn,
     // drained and under their deleting name.
     std::uint32_t maximum_deletions{1};
+    // Data files of removed segments each data device keeps to make new
+    // segments' files of, at most maximum_segment_spares: kept while the
+    // device is healthy and what they hold stays within the shard's share
+    // of it. Zero unlinks every one.
+    std::uint32_t maximum_spares{default_segment_spares};
     // Segments being removed that the table holds an owner for: one whose
     // removal is in flight, waiting its turn or taking its files away; and
     // one the table had open before, whose removal settles or is owed. A
@@ -177,9 +195,13 @@ struct segment_table_config final {
     segment_run_limits runs{};
     byte_count feed_bytes{8_MiB};
     std::uint64_t feed_linger_nanoseconds{default_feed_linger_nanoseconds};
-    // What a generation and an index are opened and read under.
+    // What a generation and an index are opened and read under, and a
+    // segment is walked under.
     local_store_io_limits metadata{};
     segment_scan_limits scan{};
+    // What a seal of a failed segment reads the WAL under: what a restart
+    // reads it under.
+    wal_scan_limits wal_scan{};
     local_reader_limits readers{};
     codec::limits policy{codec::limits::defaults()};
 
@@ -192,15 +214,18 @@ struct segment_table_config final {
           || maximum_seals == 0 || maximum_seals > maximum_concurrent_seals
           || maximum_creations == 0
           || maximum_creations > maximum_concurrent_creations
-          || maximum_creations > maximum_writable || maximum_deletions == 0
+          || maximum_creations > maximum_writable
+          || maximum_prepared > maximum_local_append_segments
+          || maximum_deletions == 0
           || maximum_deletions > maximum_concurrent_deletions
           || maximum_deleting < maximum_deletions
           || maximum_deleting > maximum_deleting_segments
-          || feed_bytes.value() == 0)
+          || maximum_spares > maximum_segment_spares || feed_bytes.value() == 0)
             return runtime::failure(detail::path_error(errc::invalid_argument));
         if (auto valid = runs.validate(); !valid) return valid;
         if (auto valid = metadata.validate(); !valid) return valid;
         if (auto valid = scan.validate(); !valid) return valid;
+        if (auto valid = wal_scan.validate(); !valid) return valid;
         return readers.validate();
     }
     // What the budget that funds the table's writers is asked for: every
@@ -209,7 +234,7 @@ struct segment_table_config final {
     // with validate_segment_handles() before it creates any owner.
     [[nodiscard]] constexpr segment_handle_demand
     handle_demand(std::uint32_t reserved = 0) const noexcept {
-        return {maximum_writable, maximum_creations, reserved};
+        return {maximum_writable, maximum_creations, reserved, maximum_seals};
     }
 };
 
@@ -217,12 +242,102 @@ struct segment_table_config final {
 // minted here.
 struct segment_creation final {
     local_segment_descriptor descriptor;
+    // Where it starts in its range, from its owner's record.
+    model::range_logical_end logical_origin;
     // The configured data device it is created on. With none, the shard's
     // device table chooses; a named one is taken only if that table finds
     // it eligible.
     std::optional<device_store_id> device;
     // Its retry object is reserved by the table and need not be given.
     segment_writer_config writer;
+    // No batch it takes may have an append time below this: the newest its
+    // range's earlier segments took. A range's first segment has none.
+    runtime::wall_time append_floor{1};
+    // The readers its owner of segments already counts on it, as on the
+    // segment before it: its first group is fed for them, and each run is
+    // kept for that many reads. See establish().
+    std::uint32_t readers{0};
+};
+
+// What a segment's failure was, which decides what may be done with it while
+// the broker runs (see segment_table::seal_failed()), from its file failure's
+// detail and code and never from rethrowing what it kept.
+enum class segment_failure_kind : std::uint8_t {
+    // Its device failed: an I/O error, a file system turned read-only, a
+    // device gone, permission refused. The device is set aside, and the
+    // segment is sealed at the next start.
+    device,
+    // Its device ran out of space or quota: sealed where it is, once a
+    // sample shows room.
+    space,
+    // Its own: descriptors exhausted, or its memory or work refused, ended
+    // or closed. Sealed where it is.
+    own,
+    // No failure an operation expects: the process ends.
+    internal,
+};
+[[nodiscard]] inline segment_failure_kind
+classify_segment_failure(const runtime::first_failure& failure) noexcept {
+    auto error = failure.error();
+    if (!error && failure.exception())
+        error = detail::recognized(failure.exception());
+    if (!error) return segment_failure_kind::internal;
+    if (const auto found = runtime::file_detail(*error)) {
+        switch (*found) {
+        case runtime::file_failure_detail::no_space:
+        case runtime::file_failure_detail::quota:
+            return segment_failure_kind::space;
+        case runtime::file_failure_detail::read_only:
+        case runtime::file_failure_detail::device_io:
+        case runtime::file_failure_detail::device_gone:
+        case runtime::file_failure_detail::permission:
+            return segment_failure_kind::device;
+        case runtime::file_failure_detail::descriptor_limit:
+        case runtime::file_failure_detail::admission_not_dispatched:
+            return segment_failure_kind::own;
+        case runtime::file_failure_detail::unknown:
+            break;
+        }
+    }
+    switch (error->code()) {
+    case errc::io_failure:
+        return segment_failure_kind::device;
+    case errc::resource_exhausted:
+    case errc::queue_full:
+    case errc::aborted:
+    case errc::closed:
+    case errc::timed_out:
+        return segment_failure_kind::own;
+    default:
+        return segment_failure_kind::internal;
+    }
+}
+// What a failed segment left, once the append owner let it go: everything
+// a seal of it may keep lies below `reported`.
+struct segment_failed_boundary final {
+    segment_failure_kind kind{segment_failure_kind::internal};
+    // Its reported prefix once what it had accepted settled, its newest
+    // durable footer, and where the WAL ended when it left the append
+    // owner: above every PREPARE of it. None of them before the release.
+    std::optional<local_reported_boundary> reported;
+    std::optional<local_durable_boundary> durable;
+    std::optional<local_wal_cursor> quiet;
+    // It left the append owner and its writer let go of its handles, staging
+    // and held runs.
+    bool released{false};
+    // Where a seal that keeps all of the reported prefix ends: the prefix's
+    // own end where a footer ends it; inside a run its writer held, where
+    // the footer that closes that run ends. Nothing without a header.
+    std::optional<runtime::file_position> sealable;
+};
+
+// What activating a prepared segment supplies: where it starts in its
+// range, from its owner's activation record, and what a creation supplies
+// of the same.
+struct segment_activation final {
+    model::range_logical_end logical_origin;
+    runtime::wall_time append_floor{1};
+    std::uint32_t readers{0};
 };
 
 // What a sealed segment's owner of segments holds it to be, for a segment
@@ -239,6 +354,26 @@ struct sealed_segment_expectation final {
     std::vector<local_bundle_context> roots;
     segment_history_context history;
     segment_immutable_expectation extent;
+};
+
+// What a seal of a failed segment while the shard runs answers.
+struct segment_failed_seal final {
+    // The durable decision to seal it at the end asked for, or the one
+    // already held for it; nothing when the layout below the end could not
+    // be proved, and then where and why.
+    std::optional<recovery_decision_outcome> decided;
+    recovered_seal_gap gap{recovered_seal_gap::none};
+    std::optional<runtime::file_position> at;
+    // For a failure of its space or its own: the seal carried out on its
+    // device, and what the sealed segment is opened against from here on,
+    // for its owner of segments to keep. For a device failure only the
+    // decision is made: the next start carries it out.
+    std::optional<recovered_seal_outcome> sealed;
+    seastar::lw_shared_ptr<const sealed_segment_expectation> expected;
+    // Its device had no space for the seal: asked again once a sample of it
+    // shows room, the same decision then seals it.
+    bool room_wanted{false};
+    runtime::first_failure failure;
 };
 
 // What a seal through the table answers: its writer's outcome and, once the
@@ -266,8 +401,9 @@ struct segment_removal final {
     // an entry for the segment or has not passed its PREPAREs. The same
     // request finishes it once a later checkpoint is durable.
     bool settling{false};
-    // Files of the segment that this attempt removed.
-    std::uint32_t removed{0};
+    // Files of the segment that this attempt removed, and of them those
+    // kept as spares of its device.
+    std::uint32_t removed{0}, recycled{0};
     // Names in its directory that are no file of a segment: left where
     // they are, and the directory with them.
     std::uint32_t foreign{0};
@@ -307,9 +443,9 @@ struct segment_session_request final {
 // An owner is one object for a segment's whole local life here: from when
 // it is created or first opened for a reader until it is closed. It holds
 // what exists for the segment in the state it is in (its writer, its
-// attachment to the append owner, the index its writer feeds, its
-// completed-retry cuts, its cached runs, its sessions and, once sealed, its
-// generation and index) and nothing else decides for it. Appends go to the
+// attachment to the append owner, the index its writer feeds, its cached
+// runs, its sessions and, once sealed, its generation and index) and nothing
+// else decides for it. Appends go to the
 // append owner through target(); everything else comes through here.
 //
 // The table is not a catalog. Which segments a store has is their owner's
@@ -336,7 +472,6 @@ public:
     using append_type = local_append<Backend, Owner, Clock>;
     using checkpoint_type = local_checkpoint<Backend, Owner, Clock>;
     using allocator_type = local_id_allocator<Backend, Owner>;
-    using retry_type = retry_snapshot<Backend, Owner, Clock>;
     using index_type = sealed_sparse_index<Backend, Owner>;
 
     struct providers final {
@@ -362,6 +497,12 @@ public:
         // of a new segment and keeps the shard inside its share of each
         // filesystem. It outlives joined close().
         device_table* placement{nullptr};
+        // The shard's control record, and the log a seal of a failed segment
+        // makes its decision durable through, when the table seals failed
+        // segments while the shard runs (seal_failed()). Both outlive joined
+        // close().
+        const local_control_owner<Backend, Owner>* control{nullptr};
+        recovery_decision_log<Backend, Owner>* decisions{nullptr};
     };
 
     [[nodiscard]] static runtime::result<std::unique_ptr<segment_table>>
@@ -375,8 +516,9 @@ public:
         const auto recent = std::size_t{config.maximum_writable}
                             + config.maximum_open_sealed;
         // Beside those: the segments a restart found unsealed, which were
-        // writable before it, and the removals.
+        // writable before it, the prepared ones and the removals.
         const auto capacity = recent + config.maximum_writable
+                              + config.maximum_prepared
                               + config.maximum_deleting;
         const auto instance = given.writing.allocation_charge(
           byte_count{sizeof(segment_table)});
@@ -384,29 +526,42 @@ public:
           byte_count{capacity * sizeof(std::unique_ptr<owner>)});
         const auto each = given.writing.allocation_charge(
           byte_count{sizeof(owner)});
-        const auto marks = given.writing.allocation_charge(
-          byte_count{recent * sizeof(quiet_mark)});
+        const auto marks = chunked_allocation_charge(
+          given.writing, recent, sizeof(std::optional<quiet_mark>));
+        const auto grants = given.writing.allocation_charge(
+          byte_count{config.maximum_seals * sizeof(segment_seal_grants)});
         if (!instance) return runtime::failure(instance.error());
         if (!slots) return runtime::failure(slots.error());
         if (!each) return runtime::failure(each.error());
         if (!marks) return runtime::failure(marks.error());
+        if (!grants) return runtime::failure(grants.error());
         auto held = given.writing.try_reserve(
           byte_count{
             instance->value() + slots->value() + capacity * each->value()
-            + marks->value()});
+            + marks->value() + grants->value()});
         if (!held) return runtime::failure(held.error());
         try {
             // Before the table exists: nothing unjoined is left behind.
             std::vector<std::unique_ptr<owner>> owners;
             owners.reserve(capacity);
-            std::vector<quiet_mark> quiet;
+            seastar::chunked_vector<std::optional<quiet_mark>> quiet;
             quiet.reserve(recent);
+            for (std::size_t i = 0; i != recent; ++i)
+                quiet.emplace_back();
+            // Every seal slot's grants, before any segment is written.
+            std::vector<segment_seal_grants> sealing(config.maximum_seals);
+            for (auto& slot : sealing)
+                if (
+                  auto filled = slot.fill(given.writing, config.metadata);
+                  !filled)
+                    return runtime::failure(filled.error());
             return std::unique_ptr<segment_table>{new segment_table(
               given,
               config,
               std::move(*held),
               std::move(owners),
-              std::move(quiet))};
+              std::move(quiet),
+              std::move(sealing))};
         } catch (const std::bad_alloc&) {
             return runtime::failure(
               detail::path_error(errc::resource_exhausted));
@@ -414,6 +569,13 @@ public:
     }
     segment_table(const segment_table&) = delete;
     segment_table& operator=(const segment_table&) = delete;
+    // What each segment the table may hold costs it, reserved when it is
+    // made: its owner and its place among the owners.
+    [[nodiscard]] static runtime::result<byte_count>
+    owner_charge(const workload_budget& budget) noexcept {
+        return budget.allocation_charge(
+          byte_count{sizeof(owner) + sizeof(std::unique_ptr<owner>)});
+    }
     ~segment_table() {
         assert_current();
         KWAQUE_INVARIANT(
@@ -451,6 +613,25 @@ public:
         assert_current();
         const auto* found = find(context);
         return found ? found->sessions.size() : 0;
+    }
+    // Its owner of segments says `readers` readers are established on a
+    // segment that is still appended to, at any time: what it writes is fed
+    // to the cache while that is not zero, and each run is kept for that
+    // many reads. Zero hands the question back to whether it was read
+    // lately. False when the table holds no owner for it with runs.
+    bool
+    establish(const segment_context& context, std::uint32_t readers) noexcept {
+        assert_current();
+        auto* found = find(context);
+        if (!found || !found->runs) return false;
+        found->runs->establish(readers);
+        return true;
+    }
+    // Whether what a segment's writer makes is fed to the cache now.
+    [[nodiscard]] bool fed(const segment_context& context) const noexcept {
+        assert_current();
+        const auto* found = find(context);
+        return found && found->runs && found->runs->fed();
     }
     // What a sealed segment's owner here holds it to be, which its seal
     // answered with: its owner of segments keeps that answer, and supplies
@@ -665,6 +846,9 @@ public:
         assert_current();
         if (report.state == device_state::healthy) return;
         if (report.state != device_state::failed) {
+            // With no room left, the spares beyond what creations at once
+            // can take give their space back first.
+            if (report.state == device_state::low) trim_spares(report.device);
             tell_device(report.device);
             return;
         }
@@ -689,12 +873,22 @@ public:
             noted = keep(*held, device) || noted;
             held->failure.observe(why);
             held->life = segment_life::failed;
+            held->kind = segment_failure_kind::device;
             if (held->aging.is_linked())
                 aging_.erase(aging_.iterator_to(*held));
             unplace(*held);
-            hush(*held);
+            release(*held);
         }
         if (noted) stir();
+    }
+    // The data files of removed segments kept on a data device, to make
+    // new segments' files of: see segment_table_config::maximum_spares.
+    [[nodiscard]] std::uint32_t spares(device_store_id device) const noexcept {
+        assert_current();
+        for (std::size_t i = 0; i != devices_.size(); ++i)
+            if (devices_[i].owner.device() == device && spares_[i])
+                return spares_[i]->size();
+        return 0;
     }
     // What this shard's segments may still come to write, for each pool of
     // its device table: a segment in creation its whole bound, a writable
@@ -748,17 +942,42 @@ public:
 
     // A writable segment failed: its writer's first failure, as the append
     // owner's failure sink reports it. The segment takes no append and no
-    // new session from here on. Nothing for a segment in any other state,
-    // whose own transition says what became of it.
-    void fail(
+    // new session from here on, and leaves the writable ones. In a task of
+    // the table's own, what it accepted settles in the append owner, WAL
+    // barriers included, and it detaches with its reported prefix, newest
+    // durable footer and completed facts; then its writer lets go of its
+    // handles, staging and held runs. Its sessions read on below their
+    // bounds. Answers the failure's kind, or nothing for a segment in any
+    // other state, whose own transition says what became of it.
+    std::optional<segment_failure_kind> fail(
       const segment_context& context,
       const runtime::first_failure& why) noexcept {
         assert_current();
         auto* found = find(context);
-        if (!found || found->life != segment_life::writable) return;
+        if (!found || found->life != segment_life::writable)
+            return std::nullopt;
         if (!found->failure.failed()) found->failure = why;
         found->life = segment_life::failed;
+        found->kind = classify_segment_failure(found->failure);
         retire(*found);
+        release(*found);
+        return found->kind;
+    }
+    // What a failed segment left: see segment_failed_boundary. Nothing for a
+    // segment the table holds no failed owner for.
+    [[nodiscard]] std::optional<segment_failed_boundary>
+    failed_boundary(const segment_context& context) const noexcept {
+        assert_current();
+        const auto* found = find(context);
+        if (!found || found->life != segment_life::failed || !found->kind)
+            return std::nullopt;
+        return segment_failed_boundary{
+          *found->kind,
+          found->reported,
+          found->durable,
+          found->quiet,
+          found->released,
+          sealable_end(*found)};
     }
 
     // Creates a segment and attaches it: its files, the index and the runs
@@ -790,7 +1009,7 @@ public:
             co_return output{failed(errc::invalid_argument)};
         if (
           unsealed() >= config_.maximum_writable
-          || count(segment_life::creating) >= config_.maximum_creations)
+          || making() >= config_.maximum_creations)
             co_return output{failed(errc::queue_full)};
         // Its device: the one its caller named, or the one the device
         // table chooses, where its whole bound fits the shard's share.
@@ -818,11 +1037,13 @@ public:
         }
         std::optional<stay> inside{std::in_place, *made};
         runtime::result<void> created = failed(errc::resource_exhausted);
+        made->making = true;
         try {
             created = co_await create_owned(*made, std::move(request), work);
         } catch (...) {
             created = runtime::failure(detail::answer_thrown(made->failure));
         }
+        made->making = false;
         // Its device may have failed while it was made: it fails with it,
         // as the segments that were written there did.
         if (
@@ -830,6 +1051,10 @@ public:
           && placement_->cause(made->device->owner.device())
                != device_failure::none)
             created = failed(errc::io_failure);
+        if (made->writer && placement_)
+            placement_->given(
+              made->device->owner.device(),
+              std::min(made->bound, made->writer->spare_bytes()));
         if (created) {
             made->life = segment_life::writable;
             co_return output{*made->target};
@@ -859,6 +1084,235 @@ public:
             }
         }
         co_return output{runtime::failure(created.error())};
+    }
+
+    // Prepares a segment ahead of the request that activates it: its files
+    // are made and closed again (see segment_writer::prepare_files()), and
+    // it holds nothing else: no writer, handle, index, runs or attachment,
+    // and of its device's share only what its files take. It takes no
+    // append and no session until activate() gives it its origin. The
+    // descriptor is supplied whole and its origin is not: nothing of the
+    // segment's range is bound. Its device is chosen as for a creation,
+    // where its whole bound fits. Refused with already_exists for a context
+    // the table has an owner for, and with queue_full when as many segments
+    // are prepared, or have their files made at once, as may be. One that
+    // made nothing leaves nothing; one that fails later leaves a failed
+    // owner, whose files go by an authorized removal, as a prepared segment
+    // never activated does.
+    [[nodiscard]] seastar::future<runtime::result<void>>
+    prepare(segment_creation request, codec::cooperative_work& work) {
+        assert_current();
+        if (closing_) co_return failed(errc::closed);
+        const auto context = request.descriptor.segment;
+        if (find(context)) co_return failed(errc::already_exists);
+        if (request.writer.policy != config_.policy)
+            co_return failed(errc::invalid_argument);
+        if (
+          count(segment_life::prepared) >= config_.maximum_prepared
+          || making() >= config_.maximum_creations)
+            co_return failed(errc::queue_full);
+        // Its files take their window and the unit its header begins.
+        const auto unit = request.descriptor.alignment.bytes().value();
+        const auto limit = request.descriptor.maximum_data_bytes.value() / unit
+                           * unit;
+        const auto window = std::min(
+                              request.writer.preallocation_bytes.value(), limit)
+                            / unit * unit;
+        const byte_count files{std::min(limit, unit + window)};
+        // A spare as large as the files, on a device with no room left,
+        // covers them: they need no new space.
+        byte_count taken = files;
+        if (placement_) {
+            const auto whole = writer_type::disk_bound(
+              request.descriptor, request.writer);
+            if (!whole) co_return runtime::failure(whole.error());
+            auto chosen = placement_->choose(
+              *whole, Clock::now(), request.device);
+            if (!chosen && chosen.error().code() == errc::resource_exhausted)
+                if (
+                  const auto covered = covering_spare(files, request.device)) {
+                    chosen = *covered;
+                    taken = {};
+                }
+            if (!chosen) co_return runtime::failure(chosen.error());
+            request.device = *chosen;
+        }
+        if (!request.device) co_return failed(errc::invalid_argument);
+        const auto* device = store(*request.device);
+        if (!device) co_return failed(errc::wrong_context);
+        auto* made = insert(context, *device, segment_life::prepared);
+        if (!made) co_return failed(errc::resource_exhausted);
+        if (placement_) placement_->taken(*request.device, taken);
+        made->making = true;
+        made->prepared_bytes = files;
+        std::optional<stay> inside{std::in_place, *made};
+        runtime::result<prepared_files> prepared = failed(
+          errc::resource_exhausted);
+        bool touched = false;
+        try {
+            prepared = co_await prepare_owned(
+              *made, std::move(request), work, touched);
+        } catch (...) {
+            prepared = runtime::failure(detail::answer_thrown(made->failure));
+            touched = true;
+        }
+        made->making = false;
+        inside.reset();
+        if (prepared) {
+            // What a spare held of it was space taken before.
+            if (placement_)
+                placement_->given(
+                  made->device->owner.device(),
+                  std::min(taken, prepared->spare));
+            made->prepared_bytes = prepared->bytes;
+            co_return runtime::result<void>{};
+        }
+        if (!touched || prepared.error().code() == errc::already_exists) {
+            // Nothing of it was made: no owner is left, its share is given
+            // back, and the same request may be made again.
+            if (placement_)
+                placement_->given(made->device->owner.device(), taken);
+            if (!made->closing) erase(*made);
+            co_return runtime::failure(prepared.error());
+        }
+        made->failure.observe(prepared.error());
+        made->life = segment_life::failed;
+        made->descriptor.reset();
+        told(*made, made->failure);
+        co_return runtime::failure(prepared.error());
+    }
+    // Activates a prepared segment: its device's share is checked for what
+    // its files did not take, its writer opens it at `activation`'s origin,
+    // reading its files and writing and syncing nothing (see
+    // segment_writer::activate_prepared()), and it is attached with the index
+    // and runs its writer feeds, as a creation's is. Its retry object was
+    // reserved when it was prepared; one taken in by a restart reserves it
+    // here. Refused with not_found for a context the table has no owner for,
+    // with closed for one that is not prepared, and with queue_full when the
+    // segments that are not sealed are as many as may be. A refusal, and a
+    // failure that is not its device's, leave it prepared: its files are as
+    // they were. A device that failed fails it.
+    [[nodiscard]] seastar::future<runtime::result<local_append_target>>
+    activate(
+      const segment_context& context,
+      segment_activation activation,
+      codec::cooperative_work& work) {
+        using output = runtime::result<local_append_target>;
+        assert_current();
+        if (closing_) co_return output{failed(errc::closed)};
+        auto* found = find(context);
+        if (!found) co_return output{failed(errc::not_found)};
+        if (
+          found->closing || found->life != segment_life::prepared
+          || found->making || !found->descriptor)
+            co_return output{failed(errc::closed)};
+        if (unsealed() >= config_.maximum_writable)
+            co_return output{failed(errc::queue_full)};
+        // What its files took is placed already: the rest of its bound must
+        // fit now.
+        byte_count rest;
+        if (placement_) {
+            const auto whole = writer_type::disk_bound(
+              *found->descriptor, found->config);
+            if (!whole) co_return output{runtime::failure(whole.error())};
+            rest = whole->checked_sub(found->prepared_bytes)
+                     .value_or(byte_count{});
+            const auto chosen = placement_->choose(
+              rest, Clock::now(), found->device->owner.device());
+            if (!chosen) co_return output{runtime::failure(chosen.error())};
+            placement_->placed(*chosen, rest);
+            found->bound = rest;
+            found->placed = true;
+        }
+        found->life = segment_life::creating;
+        std::optional<stay> inside{std::in_place, *found};
+        runtime::result<void> activated = failed(errc::resource_exhausted);
+        try {
+            activated = co_await activate_owned(*found, activation, work);
+        } catch (...) {
+            activated = runtime::failure(detail::answer_thrown(found->failure));
+        }
+        if (
+          activated && placement_
+          && placement_->cause(found->device->owner.device())
+               != device_failure::none)
+            activated = failed(errc::io_failure);
+        if (activated) {
+            found->life = segment_life::writable;
+            found->descriptor.reset();
+            co_return output{*found->target};
+        }
+        // Nothing was written: what it opened closes, and it is prepared
+        // again, unless its device failed.
+        if (found->target) {
+            if (co_await append_.quiesce(*found->target))
+                if (append_.detach(*found->target)) found->target.reset();
+        }
+        runtime::first_failure kept;
+        if (found->runs)
+            co_await joined(kept, [found] { return found->runs->close(); });
+        if (found->writer && !found->target) {
+            co_await joined(kept, [found] { return found->writer->close(); });
+            found->writer.reset();
+        }
+        if (!found->writer) {
+            found->runs.reset();
+            found->feeding.reset();
+        }
+        inside.reset();
+        const auto detail = runtime::file_detail(activated.error());
+        if (
+          found->writer
+          || (detail && device_verdict_of(*detail).state == device_state::failed)) {
+            found->failure.observe(activated.error());
+            found->life = segment_life::failed;
+            found->descriptor.reset();
+            retire(*found);
+            told(*found, found->failure);
+            co_return output{runtime::failure(activated.error())};
+        }
+        unplace(*found, true);
+        found->life = segment_life::prepared;
+        co_return output{runtime::failure(activated.error())};
+    }
+    // Takes in the spares each data device's directory holds, at a start:
+    // see local_spares::adopt(). Those of no use, beyond the bound or empty,
+    // are removed unread.
+    [[nodiscard]] seastar::future<runtime::result<local_spares_found>>
+    adopt_spares(codec::cooperative_work& work) {
+        assert_current();
+        local_spares_found found;
+        for (auto& pool : spares_) {
+            if (!pool) continue;
+            const auto turn = co_await pool->turn();
+            auto adopted = co_await pool->adopt(
+              [](byte_count bytes) { return bytes.value() != 0; }, work);
+            if (!adopted) co_return runtime::failure(adopted.error());
+            found.adopted += adopted->adopted;
+            found.removed += adopted->removed;
+            found.other += adopted->other;
+        }
+        co_return found;
+    }
+    // Takes in a segment a restart found prepared and never activated, as
+    // it was left: see prepare(). Refused as adopt_recovered() is.
+    [[nodiscard]] runtime::result<void> adopt_prepared(
+      const local_segment_descriptor& descriptor,
+      device_store_id device,
+      segment_writer_config writer) {
+        assert_current();
+        if (closing_ || closed_) return failed(errc::closed);
+        if (find(descriptor.segment)) return failed(errc::already_exists);
+        const auto* on = store(device);
+        if (!on) return failed(errc::wrong_context);
+        if (count(segment_life::prepared) >= config_.maximum_prepared)
+            return failed(errc::queue_full);
+        auto* made = insert(descriptor.segment, *on, segment_life::prepared);
+        if (!made) return failed(errc::resource_exhausted);
+        writer.retry_object.reset();
+        made->descriptor = descriptor;
+        made->config = writer;
+        return {};
     }
 
     // Seals a writable segment, as one attempt its owner runs to the end
@@ -914,30 +1368,219 @@ public:
         co_return co_await std::move(joined);
     }
 
-    // Cuts a completed-retry snapshot of a writable segment when one is
-    // due, or whenever a fact is unsaved when `forced`. It is one of the
-    // segment's transitions: it waits for one before it, and a seal waits
-    // for it.
-    [[nodiscard]] seastar::future<runtime::result<retry_snapshot_outcome>>
-    cut_retries(segment_context context, bool forced) {
-        using output = runtime::result<retry_snapshot_outcome>;
+    // Seals a failed segment while the shard runs, at `end`: a
+    // complete-object boundary no higher than its reported prefix, or than
+    // where the footer closing the held run that prefix ends in ends
+    // (failed_boundary().sealable), which it must have left already
+    // (failed_boundary().released). As a restart's
+    // recovered seal does, and through the same steps: the layout below
+    // `end` is proved against the WAL from the durable cutoff up to where
+    // the WAL ended when the segment left the append owner, and no further
+    // while the WAL goes on; then a seal_at decision naming `owner_decision_id`
+    // is made durable, and the PREPAREs above `end` are discarded with it.
+    // For a failure of its space or its own, the seal is carried out at once
+    // in a seal slot on handles of its own: what only the WAL holds below
+    // `end` is written from its PREPAREs, then the retry bundle, the sealed
+    // root, the removal of every later byte, one flush and the sealed
+    // publication, which takes over from the checkpoint's entries and the
+    // pinned PREPAREs. Its sessions are ended and its writer closes; the
+    // answer carries what the sealed segment is opened against. For a
+    // device failure only the decision is made: the device is set aside,
+    // and the next start carries it out. A seal that met no space on its
+    // device is asked again once a sample shows room. The requests above
+    // `end` were never reported, and its successor takes their offsets.
+    [[nodiscard]] seastar::future<segment_failed_seal> seal_failed(
+      segment_context context,
+      runtime::file_position end,
+      std::uint64_t owner_decision_id) {
         assert_current();
+        segment_failed_seal output;
         auto* found = find(context);
-        if (!found) co_return output{failed(errc::not_found)};
-        // Nobody enters an owner that takes no cut: whoever ends it need
-        // not wait for them.
+        if (closing_ || !found || found->closing) {
+            output.failure.observe(
+              detail::path_error(found ? errc::closed : errc::not_found));
+            co_return output;
+        }
+        const auto control = std::find_if(
+          devices_.begin(), devices_.end(), [](const auto& spec) {
+              return spec.controls();
+          });
         if (
-          closing_ || found->closing
-          || !segment_admits(found->life, segment_transition::retry_cut))
-            co_return output{failed(errc::closed)};
+          found->life != segment_life::failed || !found->kind
+          || *found->kind == segment_failure_kind::internal || !found->writer
+          || !control_ || !decisions_ || control == devices_.end()) {
+            output.failure.observe(detail::path_error(errc::wrong_context));
+            co_return output;
+        }
+        if (!found->released || !found->quiet) {
+            // Its release has not run yet: asked again after it.
+            output.failure.observe(detail::path_error(errc::queue_full));
+            co_return output;
+        }
+        const auto data_start = found->writer->header_end();
+        const auto sealable = sealable_end(*found);
+        if (!data_start || !sealable || end < *data_start || end > *sealable) {
+            output.failure.observe(detail::path_error(errc::invalid_argument));
+            co_return output;
+        }
         const stay inside{*found};
         const auto turn = co_await seastar::get_units(found->turn, 1);
+        if (found->closing || found->life != segment_life::failed) {
+            output.failure.observe(detail::path_error(errc::closed));
+            co_return output;
+        }
+        seastar::abort_source abort;
+        codec::cooperative_work work{config_.policy, abort};
+        const auto& writer = *found->writer;
+        const auto snapshot = control_->snapshot();
+        if (!snapshot) {
+            output.failure.observe(snapshot.error());
+            co_return output;
+        }
+        // Read under the table's scan limits, its metadata as the table
+        // reads it.
+        auto wal = config_.wal_scan;
+        wal.metadata = config_.metadata;
+        auto limits = config_.scan;
+        limits.metadata = config_.metadata;
+        const recovery_suffix_source source{
+          devices_,
+          snapshot->fields,
+          control_->checkpoint_end(),
+          recovery_target{
+            writer.descriptor(),
+            writer.header(),
+            writer.logical_origin(),
+            local_object_state::active,
+            local_publication_generation::make(1).value(),
+            std::nullopt,
+            std::nullopt},
+          wal,
+          found->quiet};
+        auto decided = co_await resolve_recovered_seal(
+          *decisions_,
+          files_,
+          ownership_,
+          *control,
+          *found->device,
+          shard_,
+          source,
+          {context, end, owner_decision_id},
+          writing_,
+          limits,
+          work);
+        if (!decided) {
+            output.failure.observe(decided.error());
+            co_return output;
+        }
+        output.decided = decided->decided;
+        output.gap = decided->gap;
+        output.at = decided->at;
+        if (!decided->decided) co_return output;
+        if (decided->decided->status == recovery_decision_status::conflict) {
+            output.failure.observe(detail::path_error(errc::wrong_context));
+            co_return output;
+        }
+        // A device set aside takes no write: the next start seals it.
+        if (*found->kind == segment_failure_kind::device) co_return output;
+        auto config = writer.config();
+        const auto reserved = co_await ids_.allocate_object(work);
+        if (!reserved) {
+            output.failure.observe(reserved.error());
+            co_return output;
+        }
+        config.retry_object = *reserved;
+        const auto bound = co_await seastar::get_units(seals_, 1);
+        const auto slot = static_cast<std::size_t>(
+          std::countr_zero(sealing_free_));
+        sealing_free_ &= ~(std::uint32_t{1} << slot);
+        const auto returned = seastar::defer([this, slot] noexcept {
+            try {
+                static_cast<void>(
+                  sealing_[slot].fill(writing_, config_.metadata));
+            } catch (const std::bad_alloc&) {
+            }
+            sealing_free_ |= std::uint32_t{1} << slot;
+        });
+        auto executed = co_await execute_recovered_seal<Clock>(
+          files_,
+          ownership_,
+          *control,
+          *found->device,
+          shard_,
+          source,
+          decided->decided->record.pin,
+          writing_,
+          config,
+          limits,
+          work,
+          segment_no_index{},
+          &sealing_[slot]);
+        const auto no_room = [](const runtime::operation_error& why) {
+            const auto found = runtime::file_detail(why);
+            return found
+                   && (*found == runtime::file_failure_detail::no_space || *found == runtime::file_failure_detail::quota);
+        };
+        if (!executed) {
+            output.room_wanted = no_room(executed.error());
+            output.failure.observe(executed.error());
+            co_return output;
+        }
+        output.sealed = *executed;
+        if (executed->unresolved != recovered_seal_gap::none) {
+            output.gap = executed->unresolved;
+            output.at = executed->at;
+            co_return output;
+        }
+        if (executed->seal.failure.failed()) {
+            if (const auto& why = executed->seal.failure.error())
+                output.room_wanted = no_room(*why);
+            output.failure = executed->seal.failure;
+            co_return output;
+        }
+        if (!executed->seal.extent || !executed->publication) co_return output;
+        // Sealed on its device: the publication takes over from the
+        // checkpoint's entries and the pinned PREPAREs, and the owner holds
+        // it as sealed from here on.
+        if (checkpoint_)
+            found->debt.observe(checkpoint_->cover(*executed->publication));
         if (
-          closing_ || found->closing
-          || !segment_admits(found->life, segment_transition::retry_cut)
-          || !found->retries)
-            co_return output{failed(errc::closed)};
-        co_return co_await found->retries->request(forced);
+          const auto released = append_.discharge_pinned(
+            *executed->publication);
+          !released && released.error().code() != errc::not_found)
+            found->debt.observe(released.error());
+        try {
+            found->extent = *executed->seal.extent;
+            found->expected.emplace(
+              sealed_segment_expectation{
+                found->device->owner.device(),
+                *executed->generation,
+                *executed->publication,
+                writer.descriptor(),
+                executed->roots,
+                segment_history_context{
+                  context,
+                  writer.descriptor().alignment,
+                  *data_start,
+                  writer.logical_origin(),
+                  writer.descriptor().physical_origin,
+                  writer.descriptor().profile},
+                *executed->seal.extent});
+            output.expected
+              = seastar::make_lw_shared<const sealed_segment_expectation>(
+                *found->expected);
+        } catch (const std::bad_alloc&) {
+            found->debt.observe(detail::path_error(errc::resource_exhausted));
+        }
+        found->sessions.revoke();
+        co_await joined(
+          found->debt, [found] { return found->writer->close(); });
+        found->writer.reset();
+        found->feeding.reset();
+        if (found->runs) found->runs->seal();
+        found->life = segment_life::sealed;
+        found->used = ++uses_;
+        co_return output;
     }
 
     // A session on a segment, whatever its state: through the pin of its
@@ -1087,7 +1730,12 @@ public:
           && refused.verdict != authorization_verdict::repeated)
             co_return refused;
         if (found->life != segment_life::deleting) {
-            if (count(segment_life::deleting) >= config_.maximum_deleting) {
+            // Failed segments are bounded with those being removed, and one
+            // that is removed stays among them.
+            if (
+              found->life != segment_life::failed
+              && count(segment_life::deleting) + count(segment_life::failed)
+                   >= config_.maximum_deleting) {
                 refused.failure.observe(detail::path_error(errc::queue_full));
                 co_return refused;
             }
@@ -1252,7 +1900,6 @@ private:
         bool keeps_fed{false};
         std::unique_ptr<writer_type> writer;
         std::optional<local_append_target> target;
-        std::unique_ptr<retry_type> retries;
         // Its own share of the handle its writer opened for readers, from
         // the first reader on: a session opened while the segment seals
         // reads through a share of it, up to `sealing_bound`.
@@ -1288,13 +1935,28 @@ private:
         runtime::monotonic_time deadline;
         boost::intrusive::list_member_hook<> aging;
         // While it counts among its device's writable segments in the
-        // device table: the whole bound it was admitted for.
+        // device table: the whole bound it was admitted for, or what of it
+        // its prepared files did not take.
         byte_count bound;
         bool placed{false};
+        // A prepared segment's descriptor and writer configuration, its
+        // retry object reserved, which activation opens it with; and what
+        // its files take on its device. `making`: its files are being made.
+        std::optional<local_segment_descriptor> descriptor;
+        segment_writer_config config;
+        byte_count prepared_bytes;
+        bool making{false};
 
         // Once it left the append owner: where the WAL ended then, which is
         // above every PREPARE of it.
         std::optional<local_wal_cursor> quiet;
+        // Once it failed: of what kind, and, once released, what it left:
+        // its reported prefix, newest durable footer and completed facts.
+        std::optional<segment_failure_kind> kind;
+        std::optional<local_reported_boundary> reported;
+        std::optional<local_durable_boundary> durable;
+        std::optional<retry_summary_builder> facts;
+        bool released{false};
         // While it is removed: the authorization it was accepted with, the
         // attempt in flight, and what this process did for its removal
         // that the device does not say. `brought`: it was made for a
@@ -1309,12 +1971,7 @@ private:
         segment_context segment;
         local_wal_cursor below;
     };
-    // One allocation holds them at the largest table.
-    static_assert(
-      (std::uint64_t{maximum_local_append_segments}
-       + maximum_open_sealed_segments)
-        * sizeof(quiet_mark)
-      <= maximum_contiguous_allocation_bytes);
+
     using told_list = boost::intrusive::list<
       owner,
       boost::intrusive::member_hook<
@@ -1364,7 +2021,8 @@ private:
       segment_table_config config,
       workload_reservation held,
       std::vector<std::unique_ptr<owner>> owners,
-      std::vector<quiet_mark> quiet)
+      seastar::chunked_vector<std::optional<quiet_mark>> quiet,
+      std::vector<segment_seal_grants> sealing)
       : held_(std::move(held))
       , files_(given.files)
       , ownership_(given.ownership)
@@ -1372,6 +2030,8 @@ private:
       , shard_(given.shard)
       , append_(given.append)
       , checkpoint_(given.checkpoint)
+      , control_(given.control)
+      , decisions_(given.decisions)
       , ids_(given.ids)
       , cache_(given.cache)
       , residency_(given.residency)
@@ -1384,13 +2044,19 @@ private:
       , owners_(std::move(owners))
       , seals_(config.maximum_seals)
       , removals_(config.maximum_deletions)
-      , quiet_(std::move(quiet)) {
+      , quiet_(std::move(quiet))
+      , sealing_(std::move(sealing)) {
+        sealing_free_ = (std::uint32_t{1} << config.maximum_seals) - 1U;
         // No segment of this shard is attached yet: every PREPARE there is
         // lies below where the WAL ends now.
         if (const auto end = append_.wal_end())
             quiet_floor_ = *end;
         else
             quiet_lost_ = true;
+        for (std::size_t i = 0; i != devices_.size(); ++i)
+            if (devices_[i].stores_data())
+                spares_[i].emplace(
+                  files_, devices_[i], shard_, config_.maximum_spares);
     }
 
     [[nodiscard]] static auto failed(errc code) noexcept {
@@ -1431,7 +2097,8 @@ private:
         return static_cast<std::size_t>(
           std::count_if(owners_.begin(), owners_.end(), [](const auto& held) {
               return held->life == segment_life::creating
-                     || held->life == segment_life::recovering || held->writer;
+                     || held->life == segment_life::recovering
+                     || (held->writer && held->life != segment_life::failed);
           }));
     }
     // Whether a segment that failed here may be sealed on its device: its
@@ -1667,6 +2334,148 @@ private:
         }
     }
 
+    // Owners whose files are being made.
+    [[nodiscard]] std::size_t making() const noexcept {
+        return static_cast<std::size_t>(
+          std::count_if(owners_.begin(), owners_.end(), [](const auto& held) {
+              return held->making;
+          }));
+    }
+    // Makes a prepared segment's files through a writer of its own, closed
+    // again whatever it answers. `touched`: something of it may be on its
+    // device.
+    // What a prepared segment's files take on its device, and how much of
+    // it a spare held.
+    struct prepared_files final {
+        byte_count bytes, spare;
+    };
+    seastar::future<runtime::result<prepared_files>> prepare_owned(
+      owner& made,
+      segment_creation request,
+      codec::cooperative_work& work,
+      bool& touched) {
+        const auto reserved = co_await ids_.allocate_object(work);
+        if (!reserved) co_return runtime::failure(reserved.error());
+        request.writer.retry_object = *reserved;
+        made.descriptor = request.descriptor;
+        made.config = request.writer;
+        auto writer = writer_type::make_new(
+          files_,
+          ownership_,
+          *made.device,
+          shard_,
+          request.descriptor,
+          model::range_logical_end{},
+          writing_,
+          request.writer);
+        if (!writer) co_return runtime::failure(writer.error());
+        touched = true;
+        auto files = co_await (*writer)->prepare_files(
+          work, spares_on(*made.device));
+        const auto spare = (*writer)->spare_bytes();
+        runtime::first_failure kept;
+        co_await joined(kept, [&writer] { return (*writer)->close(); });
+        if (!files) co_return runtime::failure(files.error());
+        if (auto closed = detail::settled(kept); !closed)
+            co_return runtime::failure(closed.error());
+        co_return prepared_files{*files, spare};
+    }
+    // A data device with no room left whose oldest spare is at least
+    // `bytes`, among those `named` allows.
+    [[nodiscard]] std::optional<device_store_id> covering_spare(
+      byte_count bytes, std::optional<device_store_id> named) noexcept {
+        for (std::size_t i = 0; i != devices_.size(); ++i) {
+            const auto id = devices_[i].owner.device();
+            if (!spares_[i] || (named && *named != id)) continue;
+            const auto oldest = spares_[i]->oldest();
+            if (
+              oldest && *oldest >= bytes
+              && placement_->state(id, Clock::now()) == device_state::low)
+                return id;
+        }
+        return std::nullopt;
+    }
+    // A prepared segment's writer, opened at its origin, then its index,
+    // runs and attachment, as create_owned() makes them.
+    seastar::future<runtime::result<void>> activate_owned(
+      owner& made,
+      const segment_activation& activation,
+      codec::cooperative_work& work) {
+        if (!made.config.retry_object) {
+            const auto reserved = co_await ids_.allocate_object(work);
+            if (!reserved) co_return runtime::failure(reserved.error());
+            made.config.retry_object = *reserved;
+        }
+        try {
+            auto fed = active_sparse_index::make(
+              config_.stride,
+              sparse_index_capacity(
+                config_.stride,
+                made.descriptor->maximum_data_bytes,
+                made.config.admission.maximum_blocks),
+              writing_);
+            if (!fed) co_return runtime::failure(fed.error());
+            made.feeding = std::make_unique<active_sparse_index>(
+              std::move(*fed));
+        } catch (const std::bad_alloc&) {
+            co_return failed(errc::resource_exhausted);
+        }
+        auto writer = writer_type::make_new(
+          files_,
+          ownership_,
+          *made.device,
+          shard_,
+          *made.descriptor,
+          activation.logical_origin,
+          writing_,
+          made.config,
+          activation.append_floor);
+        if (!writer) co_return runtime::failure(writer.error());
+        made.writer = std::move(*writer);
+        co_return co_await attach_owned(
+          made, activation.readers, [&made, &work] {
+              return made.writer->activate_prepared(work);
+          });
+    }
+    // What follows a writer's making for a creation and an activation: the
+    // roll observer before its first group, its opening by `open`, its runs
+    // and index observer, and its attachment.
+    template<typename Open>
+    seastar::future<runtime::result<void>>
+    attach_owned(owner& made, std::uint32_t readers, Open open) {
+        // Before the first group, so that the lifetime's beginning is not
+        // missed.
+        if (told_) {
+            auto watched = made.writer->observe_roll(
+              {[this, &made](runtime::monotonic_time deadline) noexcept {
+                   aged(made, deadline);
+               },
+               [this, &made](segment_roll_reasons why) noexcept {
+                   note(made, why);
+               }});
+            if (!watched) co_return watched;
+        }
+        if (auto opened = co_await open(); !opened) co_return opened;
+        const auto boundary = made.writer->capture();
+        if (!boundary) co_return runtime::failure(boundary.error());
+        auto runs = segment_runs::make(
+          cache_, reading_, boundary->history(), runs_config(made));
+        if (!runs) co_return runtime::failure(runs.error());
+        made.runs = std::move(*runs);
+        // Before the first group, which is then fed: a segment's first
+        // block is an anchor.
+        made.runs->establish(readers);
+        // Before the first group, so that no block is missed.
+        if (
+          auto observed = made.writer->observe_blocks(
+            made.runs->observer(*made.feeding));
+          !observed)
+            co_return observed;
+        const auto target = append_.attach(*made.writer);
+        if (!target) co_return runtime::failure(target.error());
+        made.target = *target;
+        co_return runtime::result<void>{};
+    }
     seastar::future<runtime::result<void>> create_owned(
       owner& made, segment_creation request, codec::cooperative_work& work) {
         const auto reserved = co_await ids_.allocate_object(work);
@@ -1692,54 +2501,17 @@ private:
           *made.device,
           shard_,
           request.descriptor,
+          request.logical_origin,
           writing_,
-          request.writer);
+          request.writer,
+          request.append_floor);
         if (!writer) co_return runtime::failure(writer.error());
         made.writer = std::move(*writer);
-        // Before the first group, so that the lifetime's beginning is not
-        // missed.
-        if (told_) {
-            auto watched = made.writer->observe_roll(
-              {[this, &made](runtime::monotonic_time deadline) noexcept {
-                   aged(made, deadline);
-               },
-               [this, &made](segment_roll_reasons why) noexcept {
-                   note(made, why);
-               }});
-            if (!watched) co_return watched;
-        }
-        if (auto created = co_await made.writer->create_new(work); !created)
-            co_return created;
-        const auto boundary = made.writer->capture();
-        if (!boundary) co_return runtime::failure(boundary.error());
-        auto runs = segment_runs::make(
-          cache_, reading_, boundary->history(), runs_config(made));
-        if (!runs) co_return runtime::failure(runs.error());
-        made.runs = std::move(*runs);
-        // Before the first group, so that no block is missed.
-        if (
-          auto observed = made.writer->observe_blocks(
-            made.runs->observer(*made.feeding));
-          !observed)
-            co_return observed;
-        const auto target = append_.attach(*made.writer);
-        if (!target) co_return runtime::failure(target.error());
-        made.target = *target;
-        auto retries = retry_type::make(
-          files_,
-          ownership_,
-          devices_,
-          shard_,
-          append_,
-          *made.target,
-          *made.writer,
-          ids_,
-          writing_,
-          config_.metadata,
-          config_.policy);
-        if (!retries) co_return runtime::failure(retries.error());
-        made.retries = std::move(*retries);
-        co_return runtime::result<void>{};
+        auto* spares = spares_on(*made.device);
+        co_return co_await attach_owned(
+          made, request.readers, [&made, &work, spares] {
+              return made.writer->create_new(work, spares);
+          });
     }
 
     // The attempt the segment's owner runs: bounded on the shard, then one
@@ -1750,6 +2522,20 @@ private:
         bool attempted = false;
         try {
             const auto bound = co_await seastar::get_units(seals_, 1);
+            // A unit of the bound is a slot no seal holds.
+            const auto slot = static_cast<std::size_t>(
+              std::countr_zero(sealing_free_));
+            sealing_free_ &= ~(std::uint32_t{1} << slot);
+            const auto returned = seastar::defer([this, slot] noexcept {
+                // What its bundle used went with it: reserved again, or by
+                // the next seal that runs in this slot.
+                try {
+                    static_cast<void>(
+                      sealing_[slot].fill(writing_, config_.metadata));
+                } catch (const std::bad_alloc&) {
+                }
+                sealing_free_ |= std::uint32_t{1} << slot;
+            });
             {
                 const auto turn = co_await seastar::get_units(sealed.turn, 1);
                 // What it waited for may have closed or failed the segment.
@@ -1761,7 +2547,7 @@ private:
                 } else {
                     attempted = true;
                     static_cast<segment_seal_outcome&>(
-                      outcome) = co_await seal_owned(sealed);
+                      outcome) = co_await seal_owned(sealed, sealing_[slot]);
                 }
             }
             // The writer goes once the segment is sealed and its sessions
@@ -1807,7 +2593,8 @@ private:
         }
     }
 
-    seastar::future<segment_seal_outcome> seal_owned(owner& sealed) {
+    seastar::future<segment_seal_outcome>
+    seal_owned(owner& sealed, segment_seal_grants& grants) {
         segment_seal_outcome outcome;
         const auto fail = [&](const runtime::operation_error& why) {
             outcome.failure.observe(why);
@@ -1818,9 +2605,6 @@ private:
         retire(sealed);
         seastar::abort_source abort;
         codec::cooperative_work work{config_.policy, abort};
-        // Its cuts end: one of them holds the attachment.
-        if (sealed.retries)
-            sealed.debt.observe(co_await sealed.retries->close());
         // The sequence its index bundle is published under. Without one the
         // segment is sealed all the same, and its index is owed.
         std::optional<local_object_sequence> object;
@@ -1838,27 +2622,38 @@ private:
         }
         sealed.target.reset();
         sealed.quiet = quieted(sealed.context);
-        sealed.retries.reset();
         const auto& progress = sealed.writer->progress();
-        const auto completed = detached->retry.completed();
-        if (!progress || completed > progress->reserved.retry_entries) {
+        if (
+          !progress
+          || detached->retry.facts() > progress->reserved.retry_entries) {
             fail(detail::path_error(errc::wrong_context));
             co_return outcome;
         }
         // Everything accepted is durable: a session opened while the
         // writer seals reads up to here.
         sealed.sealing_bound = progress->durable.bytes;
-        const auto unresolved = progress->reserved.retry_entries - completed;
+        // The facts of every batch it published, in batch identity order.
+        auto summary = co_await retry_summary_builder::seal(
+          std::move(detached->retry), work);
+        if (!summary) {
+            fail(summary.error());
+            co_return outcome;
+        }
+        const auto completed = summary->completed();
         if (object)
             outcome = co_await sealed.writer->seal(
-              std::move(detached->retry),
+              std::move(*summary),
               completed,
-              unresolved,
               work,
-              sparse_index_seal{sealed.feeding.get(), *object});
+              sparse_index_seal{sealed.feeding.get(), *object},
+              &grants);
         else
             outcome = co_await sealed.writer->seal(
-              std::move(detached->retry), completed, unresolved, work);
+              std::move(*summary),
+              completed,
+              work,
+              segment_no_index{},
+              &grants);
         if (outcome.failure.failed() || !outcome.extent) {
             // Failed here whatever its device holds: a seal that failed
             // after it began to publish its sealed pointer may have left
@@ -1937,9 +2732,11 @@ private:
                     through.emplace(std::move(*shared));
             }
             if (through)
-                sealed.sessions.move(*through, [&sealed] {
-                    return sealed_read_index(*sealed.index);
-                });
+                sealed.sessions.move(
+                  *through,
+                  [&sealed] { return sealed_read_index(*sealed.index); },
+                  outcome.extent->coverage.bytes().end(),
+                  outcome.extent->coverage.logical().end());
             else
                 sealed.sessions.revoke();
         } else {
@@ -2009,6 +2806,7 @@ private:
           expected.generation,
           expected.publication,
           expected.descriptor,
+          expected.history.logical_origin,
           expected.roots};
         runtime::result<std::unique_ptr<local_generation_owner>> generation
           = failed(errc::io_failure);
@@ -2126,17 +2924,26 @@ private:
                 // the sealed form, and the writer's close is not held.
                 if (view && read.life != segment_life::sealed) {
                     if (!read.reading) read.reading.emplace(view->pin.share());
+                    // What is durable in at least one place: what its
+                    // writer holds of it and has not written is read from
+                    // its memory. The writer's close waits for the
+                    // session's pin, and a seal's move lets go of both.
                     co_return segment_reader::open(
                       *read.runs,
                       segment_data_source{std::move(view->pin)},
-                      {.durable = view->durable,
+                      {.durable = std::max(view->durable, view->reported),
                        .sealed = std::nullopt,
                        .visible = request.visible,
                        .short_of_visibility = request.short_of_visibility},
-                      active_read_index(*read.feeding, view->durable),
+                      active_read_index(*read.feeding),
                       reader,
                       request.config,
-                      &read.sessions);
+                      &read.sessions,
+                      [writer = read.writer.get()](
+                        runtime::file_position position,
+                        runtime::file_position end) {
+                          return writer->held_bytes(position, end);
+                      });
                 }
             }
             if (read.life == segment_life::sealing) {
@@ -2152,7 +2959,7 @@ private:
                        .sealed = std::nullopt,
                        .visible = request.visible,
                        .short_of_visibility = request.short_of_visibility},
-                      active_read_index(*read.feeding, *read.sealing_bound),
+                      active_read_index(*read.feeding),
                       reader,
                       request.config,
                       &read.sessions);
@@ -2203,11 +3010,15 @@ private:
             quiet_lost_ = true;
             return std::nullopt;
         }
-        if (quiet_.size() == quiet_.capacity()) {
-            quiet_floor_ = quiet_.front().below;
-            quiet_.erase(quiet_.begin());
+        // A ring of them: the oldest gives way to the newest.
+        if (quiet_size_ == quiet_.size()) {
+            quiet_floor_ = quiet_[quiet_first_]->below;
+            quiet_first_ = (quiet_first_ + 1) % quiet_.size();
+            --quiet_size_;
         }
-        quiet_.push_back({context, *end});
+        quiet_[(quiet_first_ + quiet_size_) % quiet_.size()].emplace(
+          quiet_mark{context, *end});
+        ++quiet_size_;
         return *end;
     }
     // Under which WAL position every PREPARE of a segment lies that is
@@ -2215,8 +3026,10 @@ private:
     [[nodiscard]] std::optional<local_wal_cursor>
     quiet_below(const segment_context& context) const noexcept {
         if (quiet_lost_) return std::nullopt;
-        for (auto at = quiet_.size(); at-- != 0;)
-            if (quiet_[at].segment == context) return quiet_[at].below;
+        for (auto at = quiet_size_; at-- != 0;) {
+            const auto& mark = quiet_[(quiet_first_ + at) % quiet_.size()];
+            if (mark->segment == context) return mark->below;
+        }
         return quiet_floor_;
     }
 
@@ -2245,9 +3058,6 @@ private:
         std::optional<runtime::operation_error> held;
         try {
             closed.sessions.revoke();
-            if (closed.retries)
-                co_await joined(
-                  kept, [&closed] { return closed.retries->close(); });
             if (closed.target) {
                 // Nothing accepted is abandoned: the attachment drains,
                 // then lets go. An append owner that closed first has
@@ -2270,7 +3080,6 @@ private:
             kept.observe(std::current_exception());
         }
         if (held) co_return runtime::failure(*held);
-        closed.retries.reset();
         if (closed.index)
             co_await joined(kept, [&closed] { return closed.index->close(); });
         closed.pin.reset();
@@ -2314,6 +3123,104 @@ private:
         if (!deleting) return runtime::failure(deleting.error());
         return removal_paths{
           std::move(*above), std::move(*live), std::move(*deleting)};
+    }
+    // Removes the spares of `device` beyond what creations at once can
+    // take, in a task of the table's own. One that cannot be started is
+    // left for the next report.
+    void trim_spares(device_store_id device) noexcept {
+        for (std::size_t i = 0; i != devices_.size(); ++i) {
+            if (devices_[i].owner.device() != device || !spares_[i]) continue;
+            if (spares_[i]->size() <= config_.maximum_creations) return;
+            try {
+                static_cast<void>(
+                  tasks_.spawn([this, i] { return trimmed(*spares_[i]); }));
+            } catch (...) {
+            }
+            return;
+        }
+    }
+    seastar::future<> trimmed(local_spares<Backend, local_segment_name>& pool) {
+        seastar::abort_source abort;
+        codec::cooperative_work work{config_.policy, abort};
+        try {
+            const auto turn = co_await pool.turn();
+            static_cast<void>(
+              co_await pool.trim(config_.maximum_creations, work));
+        } catch (...) {
+            // Only room depends on it; the next report tries again.
+            static_cast<void>(detail::recognized_or_rethrown());
+        }
+    }
+    // The spares kept on `on`'s device.
+    [[nodiscard]] local_spares<Backend, local_segment_name>*
+    spares_on(const local_device_spec& on) noexcept {
+        auto& pool = spares_[static_cast<std::size_t>(&on - devices_.data())];
+        return pool ? &*pool : nullptr;
+    }
+    // Where a seal that keeps all of a failed segment's reported prefix
+    // ends: its own end where a footer ends it. A prefix that ends inside a
+    // run its writer held, which only the WAL holds, has no footer yet: a
+    // seal closes the run with the footer its writer would have, as a
+    // restart closes it, and ends where that footer pads to.
+    [[nodiscard]] std::optional<runtime::file_position>
+    sealable_end(const owner& found) const noexcept {
+        if (!found.writer) return std::nullopt;
+        const auto start = found.writer->header_end();
+        if (!start) return std::nullopt;
+        const auto end = found.reported ? found.reported->covered.bytes().end()
+                                        : *start;
+        const auto alignment = found.writer->descriptor().alignment;
+        if (alignment.aligned(end)) return end;
+        const auto policy = config_.policy.config();
+        const auto footer = aligned_envelope_layout::make(
+          {byte_count{codec::envelope_prefix_bytes},
+           durable_footer_fixed_bytes,
+           {}},
+          end,
+          envelope_placement::ends_span,
+          alignment,
+          config_.policy,
+          {policy.max_page_bytes, policy.max_page_bytes});
+        if (!footer) return std::nullopt;
+        return runtime::file_position{
+          end.value() + footer->encoded_bytes().value()};
+    }
+    // Keeps a removed segment's data file as a spare, before the rest of
+    // its directory goes: while its device is healthy, the spares there
+    // have room and what they hold, with it, stays within the shard's share
+    // of the device. It is moved in, its directory and then the spare
+    // directory synced, under one turn of the spares. Otherwise, for a file
+    // already gone and for a move that failed, the sweep removes it
+    // with the rest; a spare directory that cannot be synced ends the
+    // attempt as any directory sync of a removal does.
+    seastar::future<runtime::result<void>> recycle(
+      const owner& removed,
+      const removal_paths& at,
+      segment_removal& outcome,
+      codec::cooperative_work& work) {
+        auto* pool = spares_on(*removed.device);
+        if (!pool || !placement_) co_return runtime::result<void>{};
+        const auto device = removed.device->owner.device();
+        if (placement_->state(device, Clock::now()) != device_state::healthy)
+            co_return runtime::result<void>{};
+        const auto data = local_child_path(
+          at.deleting, runtime::file_name::make("data").value());
+        if (!data) co_return runtime::failure(data.error());
+        const auto turn = co_await pool->turn();
+        // A move that failed keeps nothing: the sweep removes what is left.
+        const auto kept = co_await pool->move_in(
+          *data,
+          {removed.context.segment(), removed.context.generation()},
+          work,
+          placement_->share(device));
+        if (!kept || !*kept) co_return runtime::result<void>{};
+        ++outcome.removed;
+        ++outcome.recycled;
+        if (auto settled = co_await pool->settle(work); !settled) {
+            unsynced(removed) = settled.error();
+            co_return settled;
+        }
+        co_return runtime::result<void>{};
     }
     // Whether its close, or the table's, asks a removal to stop where it
     // stands. What it did is on the device, and a restart goes on from it.
@@ -2364,6 +3271,42 @@ private:
         } catch (...) {
         }
     }
+    // Starts the release of a failed owner: see fail(). One whose close or
+    // removal has begun is left to it, as a closed gate lets no one in: the
+    // close may already be past waiting for those inside, and it detaches
+    // the segment and closes its writer itself. One that cannot be started
+    // leaves it as it is, attached until its close.
+    void release(owner& failed) noexcept {
+        if (failed.closing || failed.removing) return;
+        try {
+            static_cast<void>(
+              tasks_.spawn([this, &failed] { return released(failed); }));
+        } catch (...) {
+        }
+    }
+    seastar::future<> released(owner& failed) {
+        const stay inside{failed};
+        try {
+            if (failed.target && co_await append_.quiesce(*failed.target)) {
+                // Everything it accepted settled: its prefix is final.
+                if (auto at = append_.reported(*failed.target); at)
+                    failed.reported = *at;
+                if (auto gone = append_.detach(*failed.target); gone) {
+                    failed.facts.emplace(std::move(gone->retry));
+                    failed.durable = gone->boundary;
+                    failed.target.reset();
+                    failed.quiet = quieted(failed.context);
+                }
+            }
+            if (!failed.target && failed.writer) {
+                co_await failed.writer->release_writing(failed.failure);
+                failed.released = true;
+            }
+        } catch (...) {
+            // What could not be let go stays until its close.
+            static_cast<void>(detail::recognized_or_rethrown());
+        }
+    }
     // Whether the sealed root a generation pinned is the extent, and the
     // history, its owner of segments holds the segment to be: what the
     // root says of itself, never a walk of the extent.
@@ -2391,6 +3334,7 @@ private:
           expected.generation,
           expected.publication,
           expected.descriptor,
+          expected.history.logical_origin,
           expected.roots};
         runtime::result<std::unique_ptr<local_generation_owner>> generation
           = failed(errc::io_failure);
@@ -2858,6 +3802,12 @@ private:
                 co_return outcome;
             }
             if (
+              const auto kept = co_await recycle(removed, *at, outcome, work);
+              !kept) {
+                owed(kept.error());
+                co_return outcome;
+            }
+            if (
               const auto emptied = co_await empty_directory(
                 removed, *at, outcome, work);
               !emptied) {
@@ -3005,6 +3955,8 @@ private:
     std::uint32_t shard_;
     append_type& append_;
     checkpoint_type* checkpoint_;
+    const local_control_owner<Backend, Owner>* control_;
+    recovery_decision_log<Backend, Owner>* decisions_;
     allocator_type& ids_;
     page_cache& cache_;
     sparse_index_residency& residency_;
@@ -3036,13 +3988,24 @@ private:
     // nothing, the floor, which is where it ended when the oldest of them
     // gave way, or when the table was made. Lost when the WAL could not
     // say where it ends.
-    std::vector<quiet_mark> quiet_;
+    seastar::chunked_vector<std::optional<quiet_mark>> quiet_;
+    std::size_t quiet_first_{0}, quiet_size_{0};
     std::optional<local_wal_cursor> quiet_floor_;
     bool quiet_lost_{false};
+    // One set of grants for each seal that may run at once, and which of
+    // them no seal holds: a seal that holds a unit of `seals_` finds one.
+    std::vector<segment_seal_grants> sealing_;
+    std::uint32_t sealing_free_{0};
     // For each device, by its place among `devices_`: what a directory
     // sync of a removal there failed with in this process.
     std::array<std::optional<runtime::operation_error>, maximum_local_devices>
       unsynced_{};
+    // For each data device, by its place among `devices_`: the spares kept
+    // there.
+    std::array<
+      std::optional<local_spares<Backend, local_segment_name>>,
+      maximum_local_devices>
+      spares_;
     std::uint64_t uses_{0};
     local_failure_sink failures_;
     // Owners about to be among the sealed: each has its place already.

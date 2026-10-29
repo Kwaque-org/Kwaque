@@ -59,13 +59,13 @@ public:
     }
     auto operator()(const local_segment_descriptor& value) {
         detail::write_sc<72>(fixed_, value.segment);
-        store<144>(fixed_, value.logical_origin.value());
         store<152>(fixed_, value.physical_origin.value());
         store<160>(
           fixed_, static_cast<std::uint32_t>(value.alignment.bytes().value()));
         store<164>(fixed_, static_cast<std::uint16_t>(value.profile));
         store<166>(fixed_, value.record_profile);
         store<168>(fixed_, static_cast<std::uint8_t>(value.layout));
+        store<169>(fixed_, value.retry_depth);
         store<176>(fixed_, value.maximum_data_bytes.value());
         store<184>(fixed_, value.maximum_lifetime.nanoseconds());
         return scalar<192>();
@@ -125,24 +125,6 @@ public:
             return scalar<320>();
         }
         return scalar<260>();
-    }
-    auto operator()(const local_completed_retry_root& value) {
-        detail::write_sc<72>(fixed_, value.segment);
-        detail::write_local_footer<144>(fixed_, value.footer);
-        store<192>(fixed_, value.retry_count);
-        store<196>(fixed_, static_cast<std::uint32_t>(value.pages.size()));
-        return finish<200, 48>(
-          std::span<const page_ref>{value.pages}, detail::write_page_ref);
-    }
-    auto operator()(const local_completed_retry_page& value) {
-        detail::write_sc<72>(fixed_, value.segment);
-        store<144>(fixed_, value.sequence.value());
-        store<152>(fixed_, value.ordinal.value());
-        store<156>(fixed_, value.first_entry);
-        store<160>(fixed_, static_cast<std::uint32_t>(value.entries.size()));
-        return finish<164, 160>(
-          std::span<const completed_retry>{value.entries},
-          detail::write_retry_entry);
     }
 
 private:
@@ -237,8 +219,7 @@ seastar::future<codec::result<encoded_local_metadata>> encode_local_metadata(
     if (!size)
         co_return codec::failure(
           codec::detail::allocation_cost_error(size.error(), c, c.origin));
-    if (!charge || (detail::local_payload_segment(payload).has_value() != context.segment_alignment.has_value())
-        || (context.data_metadata_alignment && context.header.kind() != local_metadata_kind::boundary_evidence))
+    if (!charge || (detail::local_payload_segment(payload).has_value() != context.segment_alignment.has_value()))
         co_return codec::failure(detail::page_error(errc::invalid_argument, c));
     const auto layout = local_metadata_layout(
       context.header.kind(),
@@ -253,14 +234,7 @@ seastar::future<codec::result<encoded_local_metadata>> encode_local_metadata(
         co_return codec::failure(detail::page_error(errc::out_of_range, c));
     if (
       auto valid = co_await detail::validate_local_payload(
-        context.header,
-        payload,
-        *layout,
-        context.segment_alignment,
-        context.data_metadata_alignment,
-        work,
-        c,
-        true);
+        context.header, payload, *layout, context.segment_alignment, work, c);
       !valid)
         co_return codec::failure(valid.error());
     metadata_writer writer{

@@ -1,10 +1,16 @@
 #pragma once
 
 #include "src/base/units.h"
+#include "src/runtime/first_failure.h"
+#include "src/storage/local_metadata.h"
 #include "src/storage/local_metadata_file.h"
+#include "src/storage/local_paths.h"
 #include "src/storage/local_publication.h"
 #include "src/storage/retry_format.h"
 #include "src/storage/sparse_index_format.h"
+
+#include <algorithm>
+#include <cstdint>
 
 namespace kwaque::storage {
 using local_bundle_context = std::
@@ -104,7 +110,6 @@ private:
     const local_bundle& bundle_;
     std::optional<sparse_index_verifier> index_;
     std::optional<retry_summary_verifier> retry_;
-    std::optional<model::batch_id> previous_retry_;
     std::optional<local_checkpoint_entry> previous_checkpoint_;
     std::uint32_t next_{0};
     bool failed_{false};
@@ -284,4 +289,102 @@ seastar::future<local_bundle_publication> publish_local_bundle(
         output.reference = bundle.reference();
     co_return output;
 }
+
+// At reopen, before any owner of the segment runs: removes every bundle in
+// the segment's objects directory that `publication`, its current one, does
+// not name. Such a bundle is an index a later one replaced and whose removal
+// a crash undid, or the bundle of a seal or index publication that did not
+// finish. Only the segment's own publication references a bundle there, and
+// sequences are never used twice, so none of them can become referenced. A
+// deleting segment is left to its deletion; temporaries and anything unknown
+// are left for their own owner. Returns how many bundles were removed; the
+// first removal that fails is returned instead.
+template<runtime::file_system_backend Backend, local_directory_owner Owner>
+seastar::future<runtime::result<std::uint32_t>> remove_unreferenced_objects(
+  Backend& files,
+  Owner& ownership,
+  const local_device_spec& spec,
+  std::uint32_t shard,
+  const local_object_publication& publication,
+  codec::cooperative_work& work) {
+    if (!spec.shard_owner(shard) || !spec.stores_data())
+        co_return runtime::failure(detail::path_error(errc::wrong_context));
+    if (publication.state == local_object_state::deleting) co_return 0U;
+    if (auto valid = co_await ownership.validate(spec); !valid)
+        co_return runtime::failure(valid.error());
+    const auto paths = local_paths::make(spec.root);
+    if (!paths) co_return runtime::failure(paths.error());
+    const auto first = paths->object(
+      shard,
+      {publication.segment.segment(), publication.segment.generation()},
+      local_object_sequence::make(1).value());
+    if (!first) co_return runtime::failure(first.error());
+    const auto directory = runtime::file_path::make(
+      first->value().substr(0, first->value().rfind('/')));
+    if (!directory) co_return runtime::failure(directory.error());
+    if (
+      auto inspected = co_await inspect_local_path(
+        files, spec.root, *directory, runtime::file_kind::directory, work);
+      !inspected)
+        co_return runtime::failure(inspected.error());
+    auto opened = co_await files.open_directory(*directory);
+    if (!opened) co_return runtime::failure(opened.error());
+    auto cursor = std::move(*opened);
+    std::uint32_t removed = 0;
+    runtime::first_failure failed;
+    try {
+        bool end = false;
+        while (!end && !failed.failed()) {
+            if (auto ready = co_await detail::path_checkpoint(work); !ready) {
+                failed.observe(ready);
+                break;
+            }
+            auto page = co_await cursor.next(
+              {.maximum_entries = item_count{16},
+               .maximum_name_bytes = byte_count{4_KiB}});
+            if (!page) {
+                failed.observe(page);
+                break;
+            }
+            end = page->end();
+            for (const auto& entry : page->entries()) {
+                const auto sequence = parse_local_sequence_name(
+                  entry.name.value(), false);
+                if (!sequence || entry.kind != runtime::file_kind::regular)
+                    continue;
+                const bool named = std::any_of(
+                  publication.roots.begin(),
+                  publication.roots.end(),
+                  [&sequence](const local_root_reference& root) {
+                      return root.sequence().value() == *sequence;
+                  });
+                if (named) continue;
+                auto path = local_child_path(*directory, entry.name);
+                if (!path) {
+                    failed.observe(path);
+                    break;
+                }
+                auto gone = co_await files.remove_file(*path);
+                if (!gone && gone.error().code() != errc::not_found) {
+                    failed.observe(gone);
+                    break;
+                }
+                ++removed;
+            }
+        }
+    } catch (...) {
+        failed.observe(std::current_exception());
+    }
+    try {
+        failed.observe(co_await cursor.close());
+    } catch (...) {
+        failed.observe(std::current_exception());
+    }
+    if (failed.failed()) {
+        auto error = failed.outcome();
+        co_return runtime::failure(error.error());
+    }
+    co_return removed;
+}
+
 } // namespace kwaque::storage

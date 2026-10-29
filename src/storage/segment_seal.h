@@ -19,9 +19,6 @@ struct segment_seal_outcome {
     // given no index, the extent is empty, or the index could not be
     // published: the segment is sealed all the same and is indexed later.
     std::optional<local_root_reference> index;
-    // The caller's snapshot/WAL-retention owner continues to own these facts.
-    // An empty completed summary never discharges unresolved obligations.
-    std::uint32_t unresolved{0};
 };
 struct segment_seal_progress final {
     bool data_synced{false}, root_written{false}, root_synced{false};
@@ -66,7 +63,7 @@ inline constexpr bool segment_seal_indexes
   = !std::same_as<Index, segment_no_index>;
 
 namespace detail {
-// The supplied source owns an immutable, already charged finite snapshot.
+// The source owns an immutable, already charged, finite summary.
 // read(first,count,work) returns exactly that slice in a bounded vector, whose
 // transient allocation is funded by this working budget. Replaying a slice
 // must return identical facts. No history is retained by the page adapter;

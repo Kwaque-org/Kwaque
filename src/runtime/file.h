@@ -368,6 +368,15 @@ enum class file_state : std::uint8_t {
     closed,
 };
 
+// What file::write_zeroes did. Unsupported is an answer, not a failure:
+// nothing changed and the file stays usable.
+enum class write_zeroes_outcome : std::uint8_t {
+    // The range reads as zeros, and the file's size reaches its end.
+    written,
+    // The file system or device does not offer the primitive.
+    unsupported,
+};
+
 class file_read_result final {
 public:
     [[nodiscard]] static result<file_read_result> make(
@@ -543,6 +552,17 @@ public:
     // failures, as for truncate.
     [[nodiscard]] seastar::future<result<void>>
     allocate(file_position position, byte_count length);
+    // Zeros [position, position + length) at or past the current end and
+    // extends the file to its end, without transferring data, through
+    // fallocate(FALLOC_FL_WRITE_ZEROES): later writes there are pure
+    // overwrites. A range starting before the current end is rejected before
+    // dispatch, so no content is zeroed. Writes on this handle are
+    // serialized; other handles keep their own view of the size. Unlike
+    // allocate(), a file system or device without the primitive answers
+    // `unsupported` and changes nothing. Other failures are mutation
+    // failures, as for truncate.
+    [[nodiscard]] seastar::future<result<write_zeroes_outcome>>
+    write_zeroes(file_position position, byte_count length);
     [[nodiscard]] seastar::future<result<std::uint64_t>> size();
     // Drains accepted work, cancelling nothing (request_abort() first to
     // cancel), then releases the native file once, even when its close fails;

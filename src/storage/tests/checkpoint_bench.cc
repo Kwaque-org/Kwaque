@@ -32,6 +32,7 @@
 #include <cinttypes>
 #include <cstdio>
 #include <filesystem>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <span>
@@ -67,6 +68,9 @@ struct native_driver final {
 model::range_routing_epoch routing() {
     return model::range_routing_epoch::make(1).value();
 }
+// The broker time every request is assigned at, as the segment fixture
+// stamps its blocks.
+constexpr runtime::wall_time request_time{1};
 
 // Handle credits of the append budget for everything but open segments: the
 // WAL writer and its rotation.
@@ -140,11 +144,8 @@ make_inputs(const store_shape& selected, codec::cooperative_work& work) {
         store.descriptors.push_back(descriptor);
         store.catalog.push_back(
           {descriptor,
-           take(
-             segment_header::make(
-               descriptor.segment,
-               descriptor.logical_origin,
-               descriptor.alignment))});
+           take(segment_header::make(descriptor.segment, descriptor.alignment)),
+           store.inputs.back().history.logical_origin});
     }
     co_return store;
 }
@@ -205,6 +206,7 @@ seastar::future<> open_stack(
             spec,
             0,
             store.inputs[f].descriptor,
+            store.inputs[f].history.logical_origin,
             writing,
             config)));
         auto& created = *s.segments.back();
@@ -222,6 +224,11 @@ seastar::future<> open_stack(
     config.maximum_segments = selected.segments;
     config.maximum_requests = 128;
     config.policy = work.policy();
+    // Every group in the WAL, whose checkpoints this measures, and written
+    // at once: the store's layout is the one its runs measure.
+    config.segment_placement_bytes = byte_count{
+      std::numeric_limits<std::uint64_t>::max()};
+    config.held_run_bytes = byte_count{};
     s.refused.reserve(16);
     s.append = take(
       append_type::make(
@@ -301,6 +308,7 @@ seastar::future<> append_request(
         std::move(backing),
         {history.segment.topic(), history.segment.range()},
         routing(),
+        request_time,
         std::nullopt},
       work);
     const auto acceptance = co_await std::move(stages.accepted);
@@ -313,6 +321,13 @@ seastar::future<> append_request(
       outcome.status == local_append_status::durable
         && outcome.receipt.has_value(),
       "a request did not become locally durable");
+}
+
+// Has every segment cover what was appended to it, as a stop would: a
+// checkpoint passes WAL-placed groups only once their segments synced them.
+seastar::future<> sync_all(stack& s) {
+    for (const auto& target : s.targets)
+        take(co_await s.append->sync(target));
 }
 
 // Native work of one interval, by the kind of file it touched.
@@ -532,6 +547,7 @@ seastar::future<> run_restart(
                        resume_from_checkpoint(loaded->entries, found, decided))
                        .raised;
     auto planner = take(recovery_planner::make(found.targets, budget));
+    recovery_tails tails;
     const auto merged = take(
       co_await reconcile_local_recovery(
         files,
@@ -545,7 +561,9 @@ seastar::future<> run_restart(
         budget,
         merge_limits(),
         work,
-        plan_view{&planner}));
+        plan_view{&planner},
+        std::nullopt,
+        &tails));
     take(planner.finish(merged));
     require(planner.ready(), "a store's restart plan stopped");
     // Only a plan that is ready removes anything: one that stops must find
@@ -577,6 +595,8 @@ seastar::future<> run_restart(
         0,
         planner,
         found,
+        tails,
+        spec,
         std::span<const recovery_visibility>{},
         budget,
         publication_configuration(),
@@ -766,6 +786,7 @@ checkpoint_cost(const environment& env, std::uint32_t segments) {
         std::uint32_t i = 0;
         for (; i != segments; ++i)
             co_await append_request(s, store, i, env.writing, work);
+        co_await sync_all(s);
         // The first checkpoint pins every segment once, unmeasured.
         const auto first = take(co_await s.checkpoint->request());
         require(
@@ -773,6 +794,7 @@ checkpoint_cost(const environment& env, std::uint32_t segments) {
           "the first checkpoint did not pin every segment");
         for (; i != selected.requests(); ++i)
             co_await append_request(s, store, i, env.writing, work);
+        co_await sync_all(s);
         require(
           s.writer->statistics().rotations != 0,
           "the store left no WAL file below its head");
@@ -878,7 +900,9 @@ append_latency(const environment& env, std::uint32_t segments, overlap mode) {
         perf_tests::stop_measuring_time();
         out.io = since(env.files, before);
         env.files.sample.measuring = false;
-        // A last run, also for the one a rotation may have left in flight.
+        // A last run once every segment synced, also for the one a
+        // rotation may have left in flight.
+        co_await sync_all(s);
         static_cast<void>(take(co_await s.checkpoint->request()));
         out.rotations = s.writer->statistics().rotations;
         out.refused = s.refused.size();
@@ -939,8 +963,9 @@ seastar::future<restart_sample> restart_after(
             store.wal_files = s.writer->statistics().rotations + 1;
             require(store.wal_files > 1, "the store's WAL stayed in one file");
             if (stop_checkpoint) {
-                // After the appends drained: an ordinary checkpoint that
-                // ends at the WAL-durable end.
+                // After the appends drained and synced: an ordinary
+                // checkpoint that ends at the WAL-durable end.
+                co_await sync_all(s);
                 const auto last = take(co_await s.checkpoint->request());
                 require(
                   last.published && last.end == s.writer->progress()->durable
