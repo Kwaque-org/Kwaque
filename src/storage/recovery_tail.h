@@ -1015,8 +1015,18 @@ walk_recovery_tail(
     } catch (...) {
         failed.observe(std::current_exception());
     }
-    failed.observe(co_await walk.close());
-    failed.observe(co_await reader.close());
+    // A close answers a failure it kept by throwing it: the reader is closed
+    // whatever the walk's close answers.
+    try {
+        failed.observe(co_await walk.close());
+    } catch (...) {
+        failed.observe(std::current_exception());
+    }
+    try {
+        failed.observe(co_await reader.close());
+    } catch (...) {
+        failed.observe(std::current_exception());
+    }
     if (failed.failed()) {
         auto error = failed.outcome();
         co_return runtime::failure(error.error());
