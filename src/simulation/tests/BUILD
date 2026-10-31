@@ -957,7 +957,7 @@ kwaque_cc_library(
         "//src/base",
         "//src/bytes:allocation_test_profile",
         "//src/resource:workload_class",
-        "//src/runtime:fault",
+        "//src/runtime:fault_api",
         "//src/runtime:file",
         "//src/runtime/testing:reactor_tasks",
         "//src/simulation:environment",
