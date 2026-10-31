@@ -17,6 +17,34 @@ kwaque_cc_library(
 )
 
 kwaque_cc_library(
+    name = "shard_set",
+    hdrs = ["shard_set.h"],
+    visibility = [
+        "//src/broker:__pkg__",
+        "//src/runtime/tests:__pkg__",
+    ],
+    deps = [
+        "//src/runtime:cross_shard",
+        "@seastar",
+    ],
+)
+
+kwaque_cc_library(
+    name = "alarm",
+    srcs = ["alarm.cc"],
+    hdrs = ["alarm.h"],
+    visibility = [
+        "//src/broker:__pkg__",
+        "//src/runtime/tests:__pkg__",
+    ],
+    deps = [
+        "//src/runtime:alarm",
+        "//src/runtime:time",
+        "@seastar",
+    ],
+)
+
+kwaque_cc_library(
     name = "timer",
     srcs = ["timer.cc"],
     hdrs = ["timer.h"],
@@ -46,6 +74,7 @@ kwaque_cc_library(
         "//src/runtime/tests:__pkg__",
     ],
     deps = [
+        "//src/base:invariant",
         "//src/runtime:error",
         "//src/runtime:random",
     ],
@@ -133,16 +162,19 @@ kwaque_cc_library(
         "//src/runtime/tests:__pkg__",
     ],
     deps = [
+        ":alarm",
         ":clocks",
         ":dns",
         ":file",
         ":network",
         ":random",
+        ":shard_set",
         ":timer",
         "//src/base:invariant",
         "//src/base:metric_schema",
         "//src/observability:event_sink",
         "//src/resource:resource_manager",
+        "//src/runtime:deadlines",
         "//src/runtime:environment",
         "//src/runtime:error",
         "//src/runtime:operation_statistics",

@@ -1,5 +1,8 @@
 #include "src/bytes/fragmented_buffer.h"
 #include "src/runtime/cross_shard.h"
+#include "src/runtime/production/shard_set.h"
+#include "src/runtime/shard_identity.h"
+#include "src/runtime/testing/contracts/contract_backends.h"
 
 #include <seastar/core/checked_ptr.hh>
 #include <seastar/core/coroutine.hh>
@@ -296,4 +299,40 @@ SEASTAR_TEST_CASE(cross_shard_fanout_waits_for_all_shards_before_failing) {
         BOOST_CHECK_EQUAL(
           value_fanout_calls[shard].load(std::memory_order_relaxed), 1U);
     }
+}
+
+namespace {
+
+// Suspends before reading its argument, so the call must keep the argument
+// alive until the target's future resolves.
+seastar::future<kwaque::runtime::test_types::scalar_id>
+add_shard_after_yield(const kwaque::runtime::test_types::scalar_id& value) {
+    co_await seastar::yield();
+    co_return kwaque::runtime::test_types::scalar_id{
+      value.value() + kwaque::runtime::current_shard()};
+}
+
+template<typename ShardSet>
+seastar::future<>
+expect_owner_answers(ShardSet& shards, kwaque::runtime::owner_shard owner) {
+    const auto answered = co_await kwaque::runtime::basic_invoke_on_owner(
+      shards,
+      owner,
+      seastar::default_smp_service_group(),
+      &add_shard_after_yield,
+      kwaque::runtime::test_types::scalar_id{40});
+    BOOST_CHECK_EQUAL(answered.value(), 40U + owner.value());
+}
+
+} // namespace
+
+SEASTAR_TEST_CASE(a_backend_shard_set_runs_the_call_on_its_owner) {
+    BOOST_REQUIRE_GE(seastar::this_smp_shard_count(), 2U);
+    const auto remote = co_await seastar::smp::submit_to(
+      1, [] { return kwaque::runtime::owner_shard{}; });
+    kwaque::runtime::production::shard_set production;
+    co_await expect_owner_answers(production, remote);
+    co_await expect_owner_answers(production, kwaque::runtime::owner_shard{});
+    kwaque::runtime::testing::contract_shard_set contract;
+    co_await expect_owner_answers(contract, kwaque::runtime::owner_shard{});
 }

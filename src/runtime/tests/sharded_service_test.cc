@@ -1,3 +1,5 @@
+#include "src/bytes/fragmented_buffer.h"
+#include "src/runtime/cross_shard.h"
 #include "src/runtime/sharded_service.h"
 #include "src/runtime/task_scope.h"
 
@@ -5,11 +7,13 @@
 #include <seastar/core/future.hh>
 #include <seastar/core/smp.hh>
 #include <seastar/testing/test_case.hh>
+#include <seastar/util/later.hh>
 
 #include <boost/test/unit_test.hpp>
 
 #include <atomic>
 #include <cstddef>
+#include <cstdint>
 #include <functional>
 #include <limits>
 #include <optional>
@@ -311,6 +315,68 @@ SEASTAR_TEST_CASE(sharded_service_enforces_state_and_returns_owned_identities) {
         rejected = true;
     }
     BOOST_REQUIRE(rejected);
+}
+
+namespace {
+
+using lent_buffer
+  = kwaque::runtime::cross_shard_view<const kwaque::bytes::fragmented_buffer>;
+
+// Suspends before reading, so the loan must stay open past the call's start.
+seastar::future<kwaque::runtime::owner_shard>
+read_lent(startup_probe& service, const lent_buffer& lent) {
+    co_await seastar::yield();
+    if (lent.get().size().value() != 0) {
+        throw std::logic_error("the lent buffer changed");
+    }
+    co_return service.owner();
+}
+
+seastar::future<>
+fail_on_the_first_shard(startup_probe& service, const lent_buffer& lent) {
+    if (service.owner().value() == 0) {
+        throw std::runtime_error("injected borrow failure");
+    }
+    co_await seastar::yield();
+    static_cast<void>(lent.get().size());
+}
+
+} // namespace
+
+// A service reads a lent buffer on the owner's shard and on every shard; the
+// loan stays open until every call resolves, a failed one included.
+SEASTAR_TEST_CASE(sharded_service_borrows_on_the_owner_and_on_every_shard) {
+    const auto shard_count = seastar::this_smp_shard_count();
+    lifecycle_counters counters{shard_count};
+    kwaque::runtime::sharded_service<startup_probe> services{
+      seastar::default_smp_service_group()};
+    co_await services.start(std::ref(counters), no_failed_shard);
+    const kwaque::runtime::lendable<kwaque::bytes::fragmented_buffer> lent{
+      kwaque::bytes::fragmented_buffer{}};
+    const auto owners = co_await services.invoke_on_all(
+      [](startup_probe& service) { return service.owner(); });
+
+    const auto one = co_await services.borrow_on_owner(
+      owners.back(), &read_lent, lent);
+    BOOST_CHECK(one == owners.back());
+    BOOST_CHECK_EQUAL(lent.loans(), 0U);
+
+    const auto every = co_await services.borrow_on_all(&read_lent, lent);
+    BOOST_REQUIRE_EQUAL(every.size(), shard_count);
+    for (std::size_t shard = 0; shard < every.size(); ++shard) {
+        BOOST_CHECK(every[shard] == owners[shard]);
+    }
+    BOOST_CHECK_EQUAL(lent.loans(), 0U);
+
+    bool failed = false;
+    try {
+        co_await services.borrow_on_all(&fail_on_the_first_shard, lent);
+    } catch (const std::runtime_error&) {
+        failed = true;
+    }
+    BOOST_REQUIRE(failed);
+    BOOST_CHECK_EQUAL(lent.loans(), 0U);
+    co_await services.stop();
 }
 
 SEASTAR_TEST_CASE(sharded_service_fanout_waits_for_all_shards_before_failing) {

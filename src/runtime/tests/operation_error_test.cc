@@ -147,4 +147,20 @@ TEST(OperationErrorTest, SchedulerBudgetVocabularyIsStableAndBounded) {
       "operation=scheduler error=kwaque:8 sequence=41 limit=40");
 }
 
+// Failures outside the outcome registry: journal recovery refusals, the
+// metadata group's own errors, a range engine's own errors.
+TEST(OperationErrorTest, ReplicatedStateKindsAreAppended) {
+    static_assert(static_cast<std::uint8_t>(operation_kind::journal) == 13);
+    static_assert(static_cast<std::uint8_t>(operation_kind::metadata) == 14);
+    static_assert(static_cast<std::uint8_t>(operation_kind::range) == 15);
+    static_assert(
+      kwaque::runtime::operation_kind_last == operation_kind::range);
+    EXPECT_EQ(kwaque::runtime::to_string(operation_kind::journal), "journal");
+    EXPECT_EQ(kwaque::runtime::to_string(operation_kind::metadata), "metadata");
+    EXPECT_EQ(kwaque::runtime::to_string(operation_kind::range), "range");
+    EXPECT_EQ(
+      operation_error(kwaque::errc::closed, operation_kind::metadata).render(),
+      "operation=metadata error=kwaque:6");
+}
+
 } // namespace

@@ -1,10 +1,12 @@
 #ifndef KWAQUE_SRC_RUNTIME_ENVIRONMENT_H_
 #define KWAQUE_SRC_RUNTIME_ENVIRONMENT_H_
 
+#include "src/runtime/buggify.h"
 #include "src/runtime/dns.h"
 #include "src/runtime/error.h"
 #include "src/runtime/fault.h"
 #include "src/runtime/file.h"
+#include "src/runtime/marks.h"
 #include "src/runtime/network.h"
 #include "src/runtime/random.h"
 #include "src/runtime/shard_affinity.h"
@@ -14,6 +16,7 @@
 #include <seastar/core/future.hh>
 #include <seastar/core/gate.hh>
 #include <seastar/core/shared_future.hh>
+#include <seastar/core/smp.hh>
 
 #include <array>
 #include <concepts>
@@ -94,41 +97,45 @@ concept fault_backend_contract
         } noexcept -> std::same_as<typename Backend::fault_injector_type&>;
     });
 
+// The shards a backend's code runs on: the current one, how many there are,
+// and a call that runs a function on one of them and answers here.
+template<typename ShardSet>
+concept shard_set_backend = requires(
+  ShardSet& shards, const ShardSet& view, seastar::smp_service_group group) {
+    { view.current() } noexcept -> std::same_as<seastar::shard_id>;
+    { view.count() } noexcept -> std::same_as<unsigned>;
+    {
+        shards.invoke_on(
+          seastar::shard_id{}, group, static_cast<void (*)()>(nullptr))
+    } -> std::same_as<seastar::future<>>;
+};
+
 template<typename Backend>
-concept runtime_backend = clock_backend<Backend>
-                          && requires {
-                                 typename Backend::timer_type;
-                                 typename Backend::random_type;
-                                 typename Backend::file_system_type;
-                                 typename Backend::network_type;
-                                 typename Backend::dns_type;
-                             } && timer_service<typename Backend::timer_type> && random_source<typename Backend::random_type> && file_system_backend<typename Backend::file_system_type> && network_backend<typename Backend::network_type> && dns_resolver_contract<typename Backend::dns_type> && fault_backend_contract<Backend> && requires(Backend& backend) {
-                                 {
-                                     backend.owner()
-                                 } noexcept -> std::same_as<owner_shard>;
-                                 {
-                                     backend.lifetime()
-                                 } -> std::same_as<runtime_lifetime&>;
-                                 {
-                                     backend.timer()
-                                 }
-                                 -> std::same_as<typename Backend::timer_type&>;
-                                 {
-                                     backend.random()
-                                 } -> std::same_as<
-                                   typename Backend::random_type&>;
-                                 {
-                                     backend.file_system()
-                                 } -> std::same_as<
-                                   typename Backend::file_system_type&>;
-                                 {
-                                     backend.network()
-                                 } -> std::same_as<
-                                   typename Backend::network_type&>;
-                                 {
-                                     backend.dns()
-                                 } -> std::same_as<typename Backend::dns_type&>;
-                             };
+concept runtime_backend = clock_backend<Backend> && requires {
+    typename Backend::timer_type;
+    typename Backend::random_type;
+    typename Backend::identity_entropy_type;
+    typename Backend::deadlines_type;
+    typename Backend::shard_set_type;
+    typename Backend::file_system_type;
+    typename Backend::network_type;
+    typename Backend::dns_type;
+} && timer_service<typename Backend::timer_type> && random_source<typename Backend::random_type> && identity_entropy_source<typename Backend::identity_entropy_type> && shard_set_backend<typename Backend::shard_set_type> && file_system_backend<typename Backend::file_system_type> && network_backend<typename Backend::network_type> && dns_resolver_contract<typename Backend::dns_type> && fault_backend_contract<Backend> && buggify_backend_contract<Backend> && marks_backend_contract<Backend> && requires(Backend& backend) {
+    { backend.owner() } noexcept -> std::same_as<owner_shard>;
+    { backend.lifetime() } -> std::same_as<runtime_lifetime&>;
+    { backend.timer() } -> std::same_as<typename Backend::timer_type&>;
+    { backend.random() } -> std::same_as<typename Backend::random_type&>;
+    {
+        backend.identity_entropy()
+    } -> std::same_as<typename Backend::identity_entropy_type&>;
+    { backend.deadlines() } -> std::same_as<typename Backend::deadlines_type&>;
+    { backend.shards() } -> std::same_as<typename Backend::shard_set_type&>;
+    {
+        backend.file_system()
+    } -> std::same_as<typename Backend::file_system_type&>;
+    { backend.network() } -> std::same_as<typename Backend::network_type&>;
+    { backend.dns() } -> std::same_as<typename Backend::dns_type&>;
+};
 
 // Runtime backend capability accessors enforce their own shard affinity. A
 // basic_runtime_view performs capability selection and lifetime ownership but
@@ -141,6 +148,9 @@ enum class runtime_capability : std::uint8_t {
     network,
     dns,
     fault,
+    identity,
+    deadlines,
+    shards,
 };
 
 namespace detail {
@@ -218,6 +228,27 @@ public:
       has_runtime_capability<runtime_capability::random, Capabilities...>
     {
         return backend_->random();
+    }
+
+    [[nodiscard]] typename Backend::identity_entropy_type& identity_entropy()
+    requires detail::
+      has_runtime_capability<runtime_capability::identity, Capabilities...>
+    {
+        return backend_->identity_entropy();
+    }
+
+    [[nodiscard]] typename Backend::shard_set_type& shards()
+    requires detail::
+      has_runtime_capability<runtime_capability::shards, Capabilities...>
+    {
+        return backend_->shards();
+    }
+
+    [[nodiscard]] typename Backend::deadlines_type& deadlines()
+    requires detail::
+      has_runtime_capability<runtime_capability::deadlines, Capabilities...>
+    {
+        return backend_->deadlines();
     }
 
     [[nodiscard]] typename Backend::file_system_type& file_system()

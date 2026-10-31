@@ -134,6 +134,31 @@ private:
         }
     }
 
+    template<typename Func, typename T, typename... Args>
+    using borrow_result =
+      typename detail::future_result<seastar::futurize_t<std::invoke_result_t<
+        Func&,
+        Service&,
+        const cross_shard_view<const T>&,
+        Args...>>>::type;
+
+    template<typename Func, typename T, typename... Args>
+    static consteval bool is_valid_borrow() {
+        if constexpr (
+          !detail::is_cross_shard_callable<Func>
+          || !cross_shard_view_referent<T> || !(cross_shard_value<Args> && ...)
+          || !std::invocable<
+             Func&,
+             Service&,
+             const cross_shard_view<const T>&,
+             Args...>) {
+            return false;
+        } else {
+            return detail::cross_shard_result_value<
+              borrow_result<Func, T, Args...>>;
+        }
+    }
+
 public:
     explicit sharded_service(seastar::smp_service_group service_group)
       : service_group_(service_group) {}
@@ -249,6 +274,15 @@ public:
         return state_;
     }
 
+    // The service on the owner's own shard, for synchronous work there.
+    [[nodiscard]] Service& local() {
+        assert_current();
+        if (state_ != sharded_service_state::started) {
+            throw std::logic_error("sharded service is not started");
+        }
+        return services_.local().service();
+    }
+
     template<typename Func, typename... Args>
     requires(is_valid_invocation<Func, Args...>())
     [[nodiscard]] auto
@@ -303,6 +337,54 @@ public:
         for (const auto shard : seastar::this_smp_all_shards()) {
             invocations.push_back(seastar::futurize_invoke([&] {
                 return invoke_one(shard, function, args...);
+            }));
+        }
+        co_return co_await seastar::when_all_succeed(std::move(invocations));
+    }
+
+    // Lends `lent` to one call on the target shard's service, as
+    // runtime::borrow_on_owner does: the loan stays open until the returned
+    // future resolves.
+    template<typename Func, typename T, typename... Args>
+    requires(is_valid_borrow<Func, T, Args...>())
+    [[nodiscard]] auto borrow_on_owner(
+      owner_shard target, Func function, const lendable<T>& lent, Args... args)
+      -> seastar::future<borrow_result<Func, T, Args...>> {
+        assert_invocable();
+        auto holder = invocations_.hold();
+        const detail::loan<T> held{lent};
+        co_return co_await invoke_one(
+          target.value(),
+          detail::borrow_service_call<Func, T>{std::move(function)},
+          held.view(),
+          std::move(args)...);
+    }
+
+    // Lends `lent` to one call on every service instance, as
+    // runtime::borrow_on_all does: every call resolves before the loan
+    // closes, and one failure is propagated.
+    template<typename Func, typename T, typename... Args>
+    requires(
+      is_valid_borrow<Func, T, Args...>() && std::copy_constructible<Func>
+      && (std::copy_constructible<Args> && ...))
+    [[nodiscard]] auto
+    borrow_on_all(Func function, const lendable<T>& lent, Args... args)
+      -> decltype(seastar::when_all_succeed(
+        std::declval<
+          std::vector<seastar::future<borrow_result<Func, T, Args...>>>>())) {
+        assert_invocable();
+        auto holder = invocations_.hold();
+        const detail::loan<T> held{lent};
+        using result_type = borrow_result<Func, T, Args...>;
+        std::vector<seastar::future<result_type>> invocations;
+        invocations.reserve(seastar::this_smp_shard_count());
+        for (const auto shard : seastar::this_smp_all_shards()) {
+            invocations.push_back(seastar::futurize_invoke([&] {
+                return invoke_one(
+                  shard,
+                  detail::borrow_service_call<Func, T>{function},
+                  held.view(),
+                  args...);
             }));
         }
         co_return co_await seastar::when_all_succeed(std::move(invocations));

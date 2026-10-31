@@ -1,14 +1,20 @@
 #ifndef KWAQUE_SRC_RUNTIME_PRODUCTION_RANDOM_H_
 #define KWAQUE_SRC_RUNTIME_PRODUCTION_RANDOM_H_
 
+#include "src/base/invariant.h"
 #include "src/runtime/error.h"
 #include "src/runtime/random.h"
 
+#include <sys/random.h>
+
 #include <array>
 #include <bit>
+#include <cerrno>
 #include <concepts>
+#include <cstddef>
 #include <cstdint>
 #include <limits>
+#include <span>
 #include <system_error>
 
 namespace kwaque::runtime::production {
@@ -99,6 +105,79 @@ private:
 };
 
 static_assert(kwaque::runtime::random_source<random_source>);
+
+namespace detail {
+
+// One call of the kernel's random source: the bytes written, or -1 with
+// errno set.
+template<typename Call>
+concept kernel_random_call = requires(
+  Call& call, void* buffer, std::size_t size, unsigned flags) {
+    { call(buffer, size, flags) } noexcept -> std::same_as<long>;
+};
+
+// Asks, without blocking, whether the kernel's pool is ready. Before it is,
+// a read would block the reactor, so the start refuses instead.
+template<kernel_random_call Call>
+[[nodiscard]] result<void> probe_identity_entropy(Call& call) noexcept {
+    std::array<std::uint8_t, identity_entropy_bytes> octets{};
+    for (;;) {
+        const auto read = call(octets.data(), octets.size(), GRND_NONBLOCK);
+        if (read == static_cast<long>(octets.size())) {
+            return {};
+        }
+        if (read < 0 && errno == EINTR) {
+            continue;
+        }
+        return failure(
+          operation_error{errc::unavailable, operation_kind::random});
+    }
+}
+
+// Repeats a call a signal interrupted and continues a short read where it
+// stopped. Once the pool is ready the kernel neither fails nor interrupts a
+// read of this size, so any other failure is a broken invariant.
+template<kernel_random_call Call>
+void fill_identity_octets(
+  Call& call, std::span<std::uint8_t, identity_entropy_bytes> octets) noexcept {
+    std::size_t offset = 0;
+    while (offset < octets.size()) {
+        const auto read = call(
+          octets.data() + offset, octets.size() - offset, 0U);
+        if (read < 0) {
+            const auto error = errno;
+            KWAQUE_INVARIANT(
+              invariant_id{"KQ-RUNTIME-IDENTITY-ENTROPY"},
+              error == EINTR,
+              "the kernel random source failed after its start probe");
+            continue;
+        }
+        offset += static_cast<std::size_t>(read);
+    }
+}
+
+} // namespace detail
+
+// Octets for object identities, one kernel call (getrandom) per identity. The
+// shard's random_source is never used for identities: its 64-bit seed bounds
+// the distinct streams a cluster can draw, and a cloned machine repeats one.
+class identity_entropy final {
+public:
+    // Fails with unavailable while the kernel's pool is not ready.
+    [[nodiscard]] static result<identity_entropy> make();
+
+    identity_entropy(identity_entropy&&) noexcept = default;
+    identity_entropy& operator=(identity_entropy&&) noexcept = default;
+    identity_entropy(const identity_entropy&) = delete;
+    identity_entropy& operator=(const identity_entropy&) = delete;
+
+    void fill(std::span<std::uint8_t, identity_entropy_bytes> octets) noexcept;
+
+private:
+    identity_entropy() noexcept = default;
+};
+
+static_assert(kwaque::runtime::identity_entropy_source<identity_entropy>);
 
 } // namespace kwaque::runtime::production
 

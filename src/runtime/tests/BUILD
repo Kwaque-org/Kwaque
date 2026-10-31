@@ -107,9 +107,13 @@ kwaque_cc_seastar_test(
     cpu = 1,
     memory = "128MiB",
     deps = [
+        "//src/model:identity_mint",
+        "//src/runtime:deadlines",
         "//src/runtime:random",
         "//src/runtime:time",
         "//src/runtime:timer",
+        "//src/runtime:waiting",
+        "//src/runtime/production:alarm",
         "//src/runtime/production:clocks",
         "//src/runtime/production:random",
         "//src/runtime/production:timer",
@@ -261,6 +265,7 @@ kwaque_cc_seastar_test(
     deps = [
         "//src/bytes:fragmented_buffer",
         "//src/runtime:environment",
+        "//src/runtime:random",
         "//src/runtime/testing/contracts:contract_backends",
     ],
 )
@@ -376,6 +381,88 @@ kwaque_cc_seastar_test(
     deps = [
         "//src/bytes:fragmented_buffer",
         "//src/runtime:cross_shard",
+        "//src/runtime:shard_identity",
+        "//src/runtime/production:shard_set",
+        "//src/runtime/testing/contracts:contract_backends",
+    ],
+)
+
+kwaque_cc_seastar_test(
+    name = "cross_shard_view_test",
+    srcs = ["cross_shard_view_test.cc"],
+    cpu = 2,
+    memory = "512MiB",
+    deps = [
+        "//src/base",
+        "//src/bytes:fragmented_buffer",
+        "//src/bytes:fragmented_buffer_builder",
+        "//src/runtime:cross_shard",
+        "//src/runtime:error",
+        "//src/runtime:shard_affinity",
+    ],
+)
+
+kwaque_cc_seastar_test(
+    name = "cross_shard_view_four_shard_test",
+    srcs = ["cross_shard_view_test.cc"],
+    cpu = 4,
+    memory = "512MiB",
+    deps = [
+        "//src/base",
+        "//src/bytes:fragmented_buffer",
+        "//src/bytes:fragmented_buffer_builder",
+        "//src/runtime:cross_shard",
+        "//src/runtime:error",
+        "//src/runtime:shard_affinity",
+    ],
+)
+
+kwaque_cc_seastar_gtest(
+    name = "cross_shard_view_invariant_test",
+    srcs = ["cross_shard_view_invariant_test.cc"],
+    cpu = 1,
+    memory = "128MiB",
+    deps = [
+        "//src/bytes:fragmented_buffer",
+        "//src/runtime:cross_shard",
+        "//src/runtime:shard_affinity",
+    ],
+)
+
+kwaque_cc_seastar_gtest(
+    name = "gcra_test",
+    srcs = ["gcra_test.cc"],
+    deps = [
+        "//src/runtime:gcra",
+        "//src/runtime:time",
+    ],
+)
+
+kwaque_cc_seastar_gtest(
+    name = "deadline_wheel_test",
+    srcs = ["deadline_wheel_test.cc"],
+    cpu = 1,
+    memory = "256MiB",
+    deps = [
+        "//src/runtime:deadline_wheel",
+        "//src/runtime:deadlines",
+        "//src/runtime:time",
+        "//src/runtime/testing/contracts:contract_backends",
+    ],
+)
+
+kwaque_cc_seastar_gtest(
+    name = "waiting_test",
+    srcs = ["waiting_test.cc"],
+    cpu = 1,
+    memory = "128MiB",
+    deps = [
+        "//src/runtime:alarm",
+        "//src/runtime:deadline_wheel",
+        "//src/runtime:deadlines",
+        "//src/runtime:time",
+        "//src/runtime:waiting",
+        "@boost//:intrusive",
     ],
 )
 
@@ -410,6 +497,8 @@ kwaque_cc_seastar_test(
     cpu = 2,
     memory = "128MiB",
     deps = [
+        "//src/bytes:fragmented_buffer",
+        "//src/runtime:cross_shard",
         "//src/runtime:sharded_service",
         "//src/runtime:task_scope",
     ],

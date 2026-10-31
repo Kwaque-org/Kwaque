@@ -3,13 +3,16 @@
 
 #include "src/observability/event_sink.h"
 #include "src/resource/resource_manager.h"
+#include "src/runtime/deadlines.h"
 #include "src/runtime/environment.h"
 #include "src/runtime/operation_statistics.h"
+#include "src/runtime/production/alarm.h"
 #include "src/runtime/production/clocks.h"
 #include "src/runtime/production/dns.h"
 #include "src/runtime/production/file.h"
 #include "src/runtime/production/network.h"
 #include "src/runtime/production/random.h"
+#include "src/runtime/production/shard_set.h"
 #include "src/runtime/production/timer.h"
 #include "src/runtime/sharded_service.h"
 #include "src/runtime/task_scope.h"
@@ -67,11 +70,19 @@ public:
     using wall_clock = production::wall_clock;
     using timer_type = production::timer;
     using random_type = production::random_source;
+    using identity_entropy_type = production::identity_entropy;
+    using deadlines_type
+      = basic_deadlines<production::alarm, production::monotonic_clock>;
+    using shard_set_type = production::shard_set;
     using file_system_type = production::file_system;
     using network_type = production::network;
     using dns_type = production::resolver;
 
     static constexpr bool faults_enabled = false;
+    // BUGGIFY sites and coverage marks exist only in simulation: every call
+    // in a production instantiation is a discarded branch.
+    static constexpr bool buggify_enabled = false;
+    static constexpr bool marks_enabled = false;
 
     explicit environment(environment_dependencies dependencies);
     ~environment();
@@ -96,6 +107,18 @@ public:
     [[nodiscard]] random_type& random() {
         assert_runtime_available(random_.has_value());
         return *random_;
+    }
+    [[nodiscard]] identity_entropy_type& identity_entropy() {
+        assert_runtime_available(identity_entropy_.has_value());
+        return *identity_entropy_;
+    }
+    [[nodiscard]] deadlines_type& deadlines() {
+        assert_runtime_available(deadlines_.has_value());
+        return *deadlines_;
+    }
+    [[nodiscard]] shard_set_type& shards() {
+        assert_current();
+        return shards_;
     }
     [[nodiscard]] file_system_type& file_system() {
         assert_runtime_available(file_system_.has_value());
@@ -146,7 +169,10 @@ private:
     operation_statistics_owner network_statistics_;
     operation_statistics_owner dns_statistics_;
     std::optional<random_type> random_;
+    std::optional<identity_entropy_type> identity_entropy_;
     std::optional<timer_type> timer_;
+    std::optional<deadlines_type> deadlines_;
+    shard_set_type shards_;
     std::optional<file_system_type> file_system_;
     std::optional<network_type> network_;
     std::optional<dns_type> dns_;
@@ -161,6 +187,7 @@ using environment_owner = sharded_service<environment>;
 static_assert(!std::is_copy_constructible_v<environment>);
 static_assert(!std::is_move_constructible_v<environment>);
 static_assert(runtime_backend<environment>);
+static_assert(!environment::buggify_enabled && !environment::marks_enabled);
 static_assert(environment_lifecycle<environment>);
 
 template<typename Checkpoint>
@@ -188,8 +215,14 @@ seastar::future<> environment::start_with(Checkpoint checkpoint) {
             throw std::system_error(make_error_code(source.error().code()));
         }
         random_.emplace(std::move(*source));
+        auto identities = identity_entropy_type::make();
+        if (!identities) {
+            throw std::system_error(make_error_code(identities.error().code()));
+        }
+        identity_entropy_.emplace(std::move(*identities));
         checkpoint(2);
         timer_.emplace(timer_statistics_);
+        deadlines_.emplace(deadlines_type::default_touches_per_task);
         checkpoint(3);
         file_system_.emplace(file_statistics_);
         checkpoint(4);

@@ -182,8 +182,9 @@ private:
 // of content belong to fragmented_buffer_builder; the operations here either
 // observe bytes or adjust which of the owned bytes this buffer presents.
 //
-// One owner at a time: the type is move-only and must not cross shards. Use an
-// explicit deep copy for that.
+// One owner at a time: the type is move-only and is never moved to another
+// shard; an explicit deep copy carries its bytes there. Its const view may be
+// lent for one awaited call on another shard, which reads it in place.
 class fragmented_buffer final {
 private:
     struct owned_fragment final {

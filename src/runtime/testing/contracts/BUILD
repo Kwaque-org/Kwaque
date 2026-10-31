@@ -136,9 +136,14 @@ kwaque_cc_library(
     hdrs = ["contract_backends.h"],
     visibility = ["//src/runtime/tests:__pkg__"],
     deps = [
+        "//src/base:invariant",
         "//src/bytes:fragmented_buffer",
+        "//src/runtime:alarm",
+        "//src/runtime:cross_shard",
+        "//src/runtime:deadlines",
         "//src/runtime:environment",
         "//src/runtime:fault",
+        "//src/runtime:shard_identity",
         "@seastar",
     ],
 )

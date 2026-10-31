@@ -1,4 +1,5 @@
 #include "src/runtime/environment.h"
+#include "src/runtime/random.h"
 #include "src/runtime/testing/contracts/contract_backends.h"
 
 #include <seastar/core/abort_source.hh>
@@ -10,7 +11,9 @@
 
 #include <boost/test/unit_test.hpp>
 
+#include <array>
 #include <cstddef>
+#include <cstdint>
 #include <optional>
 #include <span>
 #include <string_view>
@@ -73,6 +76,7 @@ seastar::future<> exercise_contract(Backend& backend) {
     auto acquired = root.template view<
       kwaque::runtime::runtime_capability::timer,
       kwaque::runtime::runtime_capability::random,
+      kwaque::runtime::runtime_capability::identity,
       kwaque::runtime::runtime_capability::file_system,
       kwaque::runtime::runtime_capability::network,
       kwaque::runtime::runtime_capability::dns,
@@ -83,6 +87,8 @@ seastar::future<> exercise_contract(Backend& backend) {
     static_cast<void>(Backend::monotonic_clock::now());
     static_cast<void>(Backend::wall_clock::now());
     static_cast<void>(view.random().next_u64());
+    std::array<std::uint8_t, kwaque::runtime::identity_entropy_bytes> octets{};
+    view.identity_entropy().fill(octets);
     seastar::abort_source abort_source;
     const auto timer_result = co_await view.timer().sleep_until(
       kwaque::runtime::monotonic_time{101}, abort_source);

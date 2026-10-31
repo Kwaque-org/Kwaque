@@ -99,6 +99,12 @@ std::string_view to_string(operation_kind operation) noexcept {
         return "trace";
     case operation_kind::observability:
         return "observability";
+    case operation_kind::journal:
+        return "journal";
+    case operation_kind::metadata:
+        return "metadata";
+    case operation_kind::range:
+        return "range";
     }
     return "unknown";
 }
