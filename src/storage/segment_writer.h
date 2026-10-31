@@ -335,15 +335,16 @@ public:
         output->entered_ = true;
         output->recovered_ = true;
         output->immutable_ = immutable;
-        // The metadata work of opening it.
-        auto metadata = budget.try_reserve(
-          byte_count{
-            config.metadata.operation_bytes.value()
-            + config.metadata.execution_bytes.value()});
-        if (!metadata)
-            output->lifetime_->failure.observe(metadata.error());
-        else
-            try {
+        try {
+            // The metadata work of opening it, taken where a failure to
+            // allocate it still closes the owner.
+            auto metadata = budget.try_reserve(
+              byte_count{
+                config.metadata.operation_bytes.value()
+                + config.metadata.execution_bytes.value()});
+            if (!metadata)
+                output->lifetime_->failure.observe(metadata.error());
+            else {
                 output->read_publication_ = expected.publication;
                 output->read_roots_.assign(
                   expected.roots.begin(), expected.roots.end());
@@ -381,9 +382,10 @@ public:
                               co_await output->verify_immutable(work));
                     }
                 }
-            } catch (...) {
-                output->lifetime_->failure.observe(std::current_exception());
             }
+        } catch (...) {
+            output->lifetime_->failure.observe(std::current_exception());
+        }
         if (output->lifetime_->failure.failed()) {
             // Cleanup all owned handles before returning either error channel.
             const auto failed = output->lifetime_->failure;
@@ -437,23 +439,25 @@ public:
         output->entered_ = true;
         output->recovered_ = true;
         output->recovered_seal_ = true;
-        // The metadata work of opening it.
-        auto metadata = budget.try_reserve(
-          byte_count{
-            config.metadata.operation_bytes.value()
-            + config.metadata.execution_bytes.value()});
-        if (!metadata)
-            output->lifetime_->failure.observe(metadata.error());
-        else
-            try {
+        try {
+            // The metadata work of opening it, taken where a failure to
+            // allocate it still closes the owner.
+            auto metadata = budget.try_reserve(
+              byte_count{
+                config.metadata.operation_bytes.value()
+                + config.metadata.execution_bytes.value()});
+            if (!metadata)
+                output->lifetime_->failure.observe(metadata.error());
+            else {
                 output->lifetime_->failure.observe(
                   co_await output->select_recovered(work));
                 if (!output->lifetime_->failure.failed())
                     output->lifetime_->failure.observe(
                       co_await output->open_data(false, work));
-            } catch (...) {
-                output->lifetime_->failure.observe(std::current_exception());
             }
+        } catch (...) {
+            output->lifetime_->failure.observe(std::current_exception());
+        }
         if (output->lifetime_->failure.failed()) {
             const auto failed = output->lifetime_->failure;
             try {
