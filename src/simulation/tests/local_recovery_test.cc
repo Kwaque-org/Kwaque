@@ -218,6 +218,14 @@ SEASTAR_TEST_CASE(local_recovery_decisions_fake) {
       }));
 }
 
+SEASTAR_TEST_CASE(local_recovery_decision_log_allocations_fake) {
+    co_await with_store_environment(
+      config(), on_one_device(51, [](auto&&... shared) {
+          return storage::testing::recovery_contract::decision_log_allocations(
+            shared...);
+      }));
+}
+
 SEASTAR_TEST_CASE(local_recovered_seal_fake) {
     co_await with_store_environment(
       config(), on_one_device(51, [](auto&&... shared) {

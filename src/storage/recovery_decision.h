@@ -14,6 +14,7 @@
 #include <array>
 #include <exception>
 #include <memory>
+#include <new>
 #include <optional>
 #include <span>
 #include <utility>
@@ -380,18 +381,25 @@ public:
         auto held = budget.try_reserve(
           byte_count{instance->value() + records->value()});
         if (!held) return runtime::failure(held.error());
-        auto output = std::unique_ptr<recovery_decision_log>(
-          new recovery_decision_log(
-            files,
-            ownership,
-            std::move(control),
-            shard,
-            ids,
-            budget,
-            limits,
-            std::move(*held)));
-        output->records_.reserve(limits.decisions);
-        return output;
+        try {
+            // Before the log exists: one that cannot be made leaves nothing
+            // unclosed behind.
+            std::vector<recovery_decision_record> records;
+            records.reserve(limits.decisions);
+            return std::unique_ptr<recovery_decision_log>(
+              new recovery_decision_log(
+                files,
+                ownership,
+                std::move(control),
+                shard,
+                ids,
+                budget,
+                limits,
+                std::move(*held),
+                std::move(records)));
+        } catch (const std::bad_alloc&) {
+            return runtime::failure(path_error(errc::resource_exhausted));
+        }
     }
     recovery_decision_log(const recovery_decision_log&) = delete;
     recovery_decision_log& operator=(const recovery_decision_log&) = delete;
@@ -603,7 +611,8 @@ private:
       allocator_type& ids,
       workload_budget& budget,
       recovery_decision_limits limits,
-      workload_reservation held) noexcept
+      workload_reservation held,
+      std::vector<recovery_decision_record> records) noexcept
       : held_(std::move(held))
       , files_(files)
       , ownership_(ownership)
@@ -611,7 +620,8 @@ private:
       , shard_(shard)
       , ids_(ids)
       , budget_(budget)
-      , limits_(limits) {}
+      , limits_(limits)
+      , records_(std::move(records)) {}
 
     static runtime::operation_error path_error(errc code) noexcept {
         return detail::path_error(code);

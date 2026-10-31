@@ -1641,6 +1641,84 @@ seastar::future<> decisions(
     take(failed.outcome());
 }
 
+// A decision log that fails to allocate is not made: the failure is thrown
+// before the log exists or refused as exhaustion, with nothing charged and
+// nothing left to close. Once no failure is reached it is made as before.
+template<typename Backend, typename Owner, typename Driver>
+seastar::future<> decision_log_allocations(
+  Backend& files,
+  Owner& owner,
+  const local_device_spec& spec,
+  workload_budget& budget,
+  Driver drive) {
+    using control_type = local_control_owner<Backend, Owner>;
+    using allocator_type = local_id_allocator<Backend, Owner>;
+    using log_type = recovery_decision_log<Backend, Owner>;
+    seastar::abort_source abort;
+    codec::cooperative_work work{codec::limits::defaults(), abort};
+    co_await seed_targets(files, owner, spec, budget, drive);
+    co_await put_wal(files, spec, wal(1), interleaved(), drive);
+    const auto paths = take(local_paths::make(spec.root));
+    co_await write_bytes(
+      files,
+      take(paths.control(0)),
+      local_fixture::read("control_head"),
+      drive);
+    auto control = take(
+      co_await drive.lifecycle(
+        control_type::open(
+          files, owner, spec, 0, true, budget, limits(), work)));
+    std::unique_ptr<allocator_type> ids;
+    std::unique_ptr<log_type> log;
+    runtime::first_failure failed;
+    try {
+        ids = take(allocator_type::make(*control, budget, 4));
+        const recovery_decision_limits sized{limits(), 8};
+#if defined(SEASTAR_ENABLE_ALLOC_FAILURE_INJECTION) && !defined(SEASTAR_DEBUG)
+        const auto baseline = budget.snapshot();
+        auto& injector = seastar::memory::local_failure_injector();
+        for (std::size_t at = 0; !log; ++at) {
+            require(at != 64, "making a decision log never passed its cuts");
+            // Copied before the cut, so that only the log's own allocations
+            // are counted.
+            auto copied = spec;
+            injector.fail_after(at);
+            std::optional<runtime::result<std::unique_ptr<log_type>>> made;
+            try {
+                made.emplace(
+                  log_type::make(
+                    files, owner, std::move(copied), 0, *ids, budget, sized));
+            } catch (const std::bad_alloc&) {
+            }
+            const auto injected = injector.failed();
+            injector.cancel();
+            if (made && *made) log = std::move(**made);
+            const auto now = budget.snapshot();
+            require(
+              injected
+                ? !log
+                    && (!made || made->error().code() == errc::resource_exhausted)
+                    && now.tasks == baseline.tasks
+                    && now.bytes == baseline.bytes
+                    && now.handles == baseline.handles
+                : log != nullptr,
+              "a decision log that failed to allocate was not refused clean");
+        }
+#else
+        log = take(log_type::make(files, owner, spec, 0, *ids, budget, sized));
+#endif
+    } catch (...) {
+        failed.observe(std::current_exception());
+    }
+    if (log) failed.observe(co_await drive.lifecycle(log->close()));
+    log.reset();
+    if (ids) failed.observe(co_await drive.lifecycle(ids->close()));
+    ids.reset();
+    failed.observe(co_await drive.lifecycle(control->close()));
+    control.reset();
+    take(failed.outcome());
+}
+
 // A segment tail leaves only inside a recovered seal that executes a durable
 // decision whose suffix plan the WAL still classifies: decision, sealed root,
 // truncation, flush, then the sealed publication. Every refusal changes
