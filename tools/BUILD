@@ -65,7 +65,6 @@ py_test(
     data = [
         "//:bazel_config",
         "//:ci_retention",
-        "//:ci_save_objects",
         "//:ci_setup",
         "//:ci_workflow",
         "//:fuzz_workflow",

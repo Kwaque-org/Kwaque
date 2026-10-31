@@ -11,18 +11,6 @@ import xml.etree.ElementTree as ET
 from pathlib import Path
 
 PRODUCTION_DATABASE_DIRECTORY = Path(".cache") / "clang-tidy-production"
-HEADER_SUFFIXES = frozenset({".h", ".hh", ".hpp", ".hxx", ".inc", ".ipp"})
-# A change to what is checked, or to how, is checked on every translation unit.
-# Build and toolchain changes are not: the complete run on main checks them.
-WHOLE_TREE_PATHS = frozenset(
-    {
-        ".clang-tidy",
-        ".clang-tidy-strict",
-        "tools/compilation_database.py",
-        "tools/run_clang_tidy.py",
-    }
-)
-QUOTED_INCLUDE = re.compile(r'^[ \t]*#[ \t]*include[ \t]*"([^"]+)"', re.MULTILINE)
 
 
 def workspace_root() -> Path:
@@ -123,82 +111,11 @@ def select_files(
     return sorted(selected)
 
 
-def changed_paths(root: Path, base: str) -> list[str]:
-    """Paths changed since HEAD left base, the working tree and new files included."""
-    paths = set()
-    for arguments in (
-        ["diff", "--name-only", "--no-renames", "-z", "--merge-base", base, "--"],
-        ["ls-files", "--others", "--exclude-standard", "-z"],
-    ):
-        output = subprocess.run(
-            ["git", *arguments], cwd=root, check=True, stdout=subprocess.PIPE
-        ).stdout
-        paths.update(os.fsdecode(value) for value in output.split(b"\0") if value)
-    return sorted(paths)
-
-
-def affected_files(
-    entries: list[dict], root: Path, changed: list[str]
-) -> list[str] | None:
-    """The database sources whose diagnostics a change can alter; None means all.
-
-    A changed source is checked itself. A changed header is checked through
-    every source that includes it directly, which reports both the header's own
-    diagnostics and those at the call sites it can change. Every include in
-    the tree names its file from the workspace root.
-    """
-    for path in changed:
-        if path in WHOLE_TREE_PATHS:
-            print(f"{path} changed: checking every translation unit")
-            return None
-    present = {path for path in changed if (root / path).is_file()}
-    headers = {path for path in present if Path(path).suffix in HEADER_SUFFIXES}
-    headers.update(
-        path.removesuffix(".proto") + ".pb.h"
-        for path in present
-        if path.endswith(".proto")
-    )
-    selected = set()
-    for entry in entries:
-        name = entry["file"]
-        if name in present:
-            selected.add(name)
-        elif headers and name not in selected:
-            try:
-                text = (Path(entry["directory"]) / name).read_text(errors="replace")
-            except OSError:
-                continue
-            if headers.intersection(QUOTED_INCLUDE.findall(text)):
-                selected.add(name)
-    return sorted(selected)
-
-
 def positive_jobs(value: str) -> int:
     jobs = int(value)
     if jobs <= 0:
         raise argparse.ArgumentTypeError("jobs must be a positive integer")
     return jobs
-
-
-def shard_spec(value: str) -> tuple[int, int]:
-    match = re.fullmatch(r"([0-9]+)/([0-9]+)", value)
-    if match is None:
-        raise argparse.ArgumentTypeError("shard must be INDEX/COUNT")
-    index, count = int(match.group(1)), int(match.group(2))
-    if count <= 0 or index >= count:
-        raise argparse.ArgumentTypeError("shard index must be below a positive count")
-    return index, count
-
-
-def shard_files(
-    files: set[str] | list[str], shard: tuple[int, int] | None
-) -> list[str]:
-    """The sorted files dealt round robin: each falls in exactly one shard."""
-    ordered = sorted(files)
-    if shard is None:
-        return ordered
-    index, count = shard
-    return [path for position, path in enumerate(ordered) if position % count == index]
 
 
 def command_key(entry: dict) -> tuple:
@@ -278,22 +195,6 @@ def main() -> int:
         help="maximum concurrent clang-tidy processes (default: 2)",
     )
     parser.add_argument(
-        "--shard",
-        type=shard_spec,
-        help="check only shard INDEX of COUNT, splitting the files between runners",
-    )
-    parser.add_argument(
-        "--scope",
-        choices=("all", "changed"),
-        default="all",
-        help="check every translation unit, or only those a change can affect",
-    )
-    parser.add_argument(
-        "--base",
-        default="HEAD",
-        help="with --scope=changed, the revision a branch is compared against",
-    )
-    parser.add_argument(
         "--profile", action="store_true", help="report native per-check timing totals"
     )
     parser.add_argument("files", nargs="*")
@@ -312,22 +213,6 @@ def main() -> int:
         return 2
 
     entries = json.loads(database.read_text())
-    requested = arguments.files
-    if arguments.scope == "changed" and not requested:
-        try:
-            affected = affected_files(
-                entries, root, changed_paths(root, arguments.base)
-            )
-        except (OSError, subprocess.CalledProcessError) as error:
-            print(
-                f"Cannot list the changed files; checking every translation unit: {error}"
-            )
-            affected = None
-        if affected is not None:
-            if not affected:
-                print("No translation unit can be affected by the change.")
-                return 0
-            requested = affected
     if arguments.production_config:
         production_entries = json.loads(
             (root / PRODUCTION_DATABASE_DIRECTORY / "compile_commands.json").read_text()
@@ -338,12 +223,7 @@ def main() -> int:
         select_files(
             production_entries, [], set().union(*production_targets(root).values())
         )
-        selected = set(
-            shard_files(select_files(entries, requested, None), arguments.shard)
-        )
-        if not selected:
-            print("No translation unit falls in this shard.")
-            return 0
+        selected = set(select_files(entries, arguments.files, None))
         result = 0
         with tempfile.TemporaryDirectory(prefix="kwaque-tidy-") as temporary:
             for name, commands, config in (
@@ -371,22 +251,15 @@ def main() -> int:
                 result = result or completed.returncode
         return result
 
-    selected = shard_files(
-        select_files(
-            entries,
-            requested,
-            (
-                set().union(*production_targets(root).values())
-                if arguments.production_only
-                else None
-            ),
+    selected = select_files(
+        entries,
+        arguments.files,
+        (
+            set().union(*production_targets(root).values())
+            if arguments.production_only
+            else None
         ),
-        arguments.shard,
     )
-    # The runner checks every database file when given none.
-    if not selected:
-        print("No translation unit falls in this shard.")
-        return 0
 
     command = runner_command(
         resolve_runfile(arguments.runner),

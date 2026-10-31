@@ -1,14 +1,5 @@
 name: Set up build environment
-description: Install the pinned Bazel driver, restore the shared download caches and, when asked, one configuration's compiled objects
-
-inputs:
-  objects:
-    description: >-
-      The configuration whose compiled objects to restore from main, or empty.
-      Links and test results are never cached: every binary is linked and
-      every test runs on every run.
-    required: false
-    default: ""
+description: Install the pinned Bazel driver and restore the shared download caches
 
 runs:
   using: composite
@@ -24,31 +15,10 @@ runs:
       uses: bazel-contrib/setup-bazel@c5acdfb288317d0b5c0bbd7a396a3dc868bb0f86 # 0.19.0
       with:
         bazelisk-cache: true
-        # Whole build outputs are not cached here: per-configuration snapshots
+        # Build outputs are not cached here: per-configuration snapshots
         # exceed the repository's cache budget and evict each other. Downloads
         # are cached, and only runs on main write them; pull requests and
         # merge queue runs restore what main saved.
         disk-cache: false
         repository-cache: true
         cache-save: ${{ github.ref == 'refs/heads/main' }}
-    - name: Restore compiled objects from main
-      if: inputs.objects != ''
-      uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-      with:
-        path: ~/.cache/bazel-objects
-        key: bazel-objects-${{ inputs.objects }}-${{ github.sha }}
-        restore-keys: bazel-objects-${{ inputs.objects }}-
-    - name: Use compiled objects as Bazel's disk cache
-      if: inputs.objects != ''
-      shell: bash
-      run: |
-        mkdir -p "${HOME}/.cache/bazel-objects"
-        # setup-bazel leaves its last line unterminated.
-        {
-          echo
-          echo "build --disk_cache=${HOME}/.cache/bazel-objects"
-          echo "build --modify_execution_info=CppLink=+no-cache,TestRunner=+no-cache"
-        } >> "${HOME}/.bazelrc"
-        # Every entry this run stores or reads is newer than this mark;
-        # save-objects keeps only those.
-        touch "${RUNNER_TEMP}/bazel-objects.started"

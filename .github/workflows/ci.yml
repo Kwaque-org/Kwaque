@@ -64,8 +64,6 @@ jobs:
         with:
           persist-credentials: false
       - uses: ./.github/actions/setup-build
-        with:
-          objects: release-x86_64
       - name: Allow concurrent linux-aio reactors
         run: sudo sysctl -w fs.aio-max-nr=1048576
       - name: Build all ordinary targets
@@ -104,12 +102,6 @@ jobs:
           --build_tag_filters=-fuzz,-manual
           --test_tag_filters=package,smoke,fuzz_replay
           //...
-
-      - name: Keep the compiled objects for later runs
-        if: github.ref == 'refs/heads/main' && !cancelled()
-        uses: ./.github/actions/save-objects
-        with:
-          objects: release-x86_64
 
       - name: Retain failed test diagnostics
         if: failure() && (steps.tests.outcome == 'failure' || steps.shipped.outcome == 'failure')
@@ -157,8 +149,6 @@ jobs:
         with:
           persist-credentials: false
       - uses: ./.github/actions/setup-build
-        with:
-          objects: debug
       - name: Allow concurrent linux-aio reactors
         run: sudo sysctl -w fs.aio-max-nr=1048576
       - name: Run unit and smoke tests
@@ -178,12 +168,6 @@ jobs:
           --runs_per_test=10 --cache_test_results=no
           //src/runtime/tests:hermetic_contracts
 
-      - name: Keep the compiled objects for later runs
-        if: github.ref == 'refs/heads/main' && !cancelled()
-        uses: ./.github/actions/save-objects
-        with:
-          objects: debug
-
       - name: Retain failed test diagnostics
         if: failure() && (steps.unit_tests.outcome == 'failure' || steps.hermetic_tests.outcome == 'failure')
         uses: ./.github/actions/retain-logs
@@ -202,8 +186,6 @@ jobs:
         with:
           persist-credentials: false
       - uses: ./.github/actions/setup-build
-        with:
-          objects: sanitizer
       - name: Execute tests with sanitizers
         id: tests
         run: >-
@@ -211,12 +193,6 @@ jobs:
           --build_tag_filters=-fuzz,-manual
           --test_tag_filters=-fuzz,-manual
           //...
-
-      - name: Keep the compiled objects for later runs
-        if: github.ref == 'refs/heads/main' && !cancelled()
-        uses: ./.github/actions/save-objects
-        with:
-          objects: sanitizer
 
       - name: Retain failed test diagnostics
         if: failure() && steps.tests.outcome == 'failure'
@@ -305,26 +281,17 @@ jobs:
           checksum: 1bfbb819b5d4f9af501748862276b60e412d336034d99387691a4d4bce7a6f13
 
   clang-tidy:
-    name: Clang tidy (${{ matrix.shard }} of 2)
+    name: Clang tidy
     needs: workflow-lint
     if: needs.workflow-lint.outputs.run_checks != 'false'
     runs-on: ubuntu-24.04
     timeout-minutes: 240
-    strategy:
-      fail-fast: false
-      # Two runners split the selected translation units between them.
-      matrix:
-        shard: [0, 1]
     steps:
       - name: Check out source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-          # A pull request's merge commit and the base it merges onto.
-          fetch-depth: 2
       - uses: ./.github/actions/setup-build
-        with:
-          objects: debug
       - name: Materialize generated analysis inputs
         run: >-
           bazel build --config=ci-debug
@@ -336,16 +303,10 @@ jobs:
         run: >-
           bazel run --config=ci-debug --lockfile_mode=error //tools:compile_commands --
           --config=ci-debug
-      # A pull request checks the translation units its change can affect;
-      # main and every other run check all of them.
       - name: Run baseline and strict production checks without overlap
-        env:
-          SHARD: ${{ matrix.shard }}
-          SCOPE: ${{ github.event_name == 'pull_request' && 'changed' || 'all' }}
         run: >-
-          bazel run --config=ci-debug --lockfile_mode=error //tools:clang_tidy -- --jobs=4
-          --scope="${SCOPE}" --base=HEAD~1
-          --shard="${SHARD}/2" --production-config=.clang-tidy-strict
+          bazel run --config=ci-debug --lockfile_mode=error //tools:clang_tidy -- --jobs=2
+          --production-config=.clang-tidy-strict
 
   clang-tidy-fuzz:
     name: Clang tidy for fuzz sources
@@ -358,8 +319,6 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-          # A pull request's merge commit and the base it merges onto.
-          fetch-depth: 2
       - uses: ./.github/actions/setup-build
       - name: Materialize fuzz analysis inputs
         run: >-
@@ -372,14 +331,8 @@ jobs:
         run: >-
           bazel run --config=ci --config=fuzz --lockfile_mode=error //tools:compile_commands --
           --fuzz-only --config=ci --config=fuzz
-      # A pull request checks the translation units its change can affect;
-      # main and every other run check all of them.
       - name: Check fuzz translation units and their dependencies
-        env:
-          SCOPE: ${{ github.event_name == 'pull_request' && 'changed' || 'all' }}
-        run: >-
-          bazel run --config=ci --config=fuzz --lockfile_mode=error //tools:clang_tidy -- --jobs=4
-          --scope="${SCOPE}" --base=HEAD~1
+        run: bazel run --config=ci --config=fuzz --lockfile_mode=error //tools:clang_tidy -- --jobs=2
 
   repository-checks:
     name: Repository integrity
@@ -459,8 +412,6 @@ jobs:
         with:
           persist-credentials: false
       - uses: ./.github/actions/setup-build
-        with:
-          objects: release-aarch64
       - name: Allow concurrent linux-aio reactors
         run: sudo sysctl -w fs.aio-max-nr=1048576
       - name: Build all ordinary targets
@@ -533,43 +484,11 @@ jobs:
           --test_tag_filters=package,smoke,fuzz_replay
           //...
 
-      - name: Keep the compiled objects for later runs
-        if: github.ref == 'refs/heads/main' && !cancelled()
-        uses: ./.github/actions/save-objects
-        with:
-          objects: release-aarch64
-
       - name: Retain failed test diagnostics
         if: failure() && (steps.tests.outcome == 'failure' || steps.shipped.outcome == 'failure')
         uses: ./.github/actions/retain-logs
         with:
           name: ci-${{ github.job }}-${{ runner.arch }}-${{ github.run_attempt }}
-
-  drop-superseded-objects:
-    # Each run on main saves one entry of compiled objects per configuration.
-    # The cache evicts by last access once the repository's budget is full, so
-    # the entries a run supersedes are deleted here before they can push the
-    # download caches or the fuzz corpora out. This job alone may write, and it
-    # runs nothing from the repository; it holds up no check.
-    # https://docs.github.com/en/actions/how-tos/manage-workflow-runs/manage-caches#force-deleting-cache-entries
-    name: Drop superseded compiled objects
-    needs: [workflow-lint, build, test, sanitizer, arm-build]
-    if: github.ref == 'refs/heads/main' && !cancelled()
-    runs-on: ubuntu-24.04
-    timeout-minutes: 5
-    permissions:
-      actions: write # deletes cache entries
-    steps:
-      - name: Keep only each configuration's newest objects
-        env:
-          GH_TOKEN: ${{ github.token }}
-          GH_REPO: ${{ github.repository }}
-        run: |
-          for scope in debug sanitizer release-x86_64 release-aarch64; do
-            gh cache list --ref refs/heads/main --key "bazel-objects-${scope}-" \
-              --sort created_at --order desc --limit 100 --json id --jq '.[1:][].id' |
-              while read -r id; do gh cache delete "${id}"; done
-          done
 
   ci-ok:
     # The one required status check. GitHub counts a skipped required job as
@@ -592,7 +511,6 @@ jobs:
       - repository-checks
       - fuzz-smoke
       - arm-build
-      - drop-superseded-objects
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
