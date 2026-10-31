@@ -42,6 +42,14 @@ if option("-minimize_crash") == "1":
     sys.exit(0)
 directories = [pathlib.Path(x) for x in args if not x.startswith("-")]
 assert directories and all(d.is_dir() for d in directories)
+# Coverage marks: the catalog at start, then each hit, as a simulation target
+# prints them; a merge prints the hits its inputs reach.
+for entry in filter(None, option("-mark_catalog").split(",")):
+    name, kind = entry.split(":")
+    print(f"kwaque-mark-catalog {name} {kind}", flush=True)
+hits = option("-merge_mark_hits" if option("-merge") == "1" else "-mark_hits")
+for name in filter(None, hits.split(",")):
+    print(f"kwaque-mark-hit {name}", flush=True)
 if option("-merge") == "1":
     # The union of the inputs, less those named redundant; an input that
     # fails is written as an artifact and left out, as libFuzzer's merge does.
@@ -418,6 +426,97 @@ if option("-fail"):
             (self.root / "diagnostic.log").read_bytes(), diagnostic.encode()
         )
         self.assertEqual(captured.getvalue(), diagnostic)
+
+    def mark_summary(self) -> str:
+        return next(self.outputs.glob("*/marks-summary.txt")).read_text()
+
+    def test_the_marks_gate_fails_a_campaign_that_missed_a_required_mark(
+        self,
+    ) -> None:
+        with mock.patch.dict(os.environ, {"KWAQUE_FUZZ_MARKS_GATE": "1"}):
+            self.assertEqual(
+                self.run_wrapper(
+                    "-mark_catalog=reached:required,planted:required,seldom:rare",
+                    "-mark_hits=reached",
+                ),
+                1,
+            )
+        self.assertEqual(
+            self.mark_summary(),
+            "planted required missed\nreached required hit\nseldom rare missed\n",
+        )
+
+    def test_a_rare_mark_never_hit_is_listed_and_fails_nothing(self) -> None:
+        with mock.patch.dict(os.environ, {"KWAQUE_FUZZ_MARKS_GATE": "1"}):
+            self.assertEqual(
+                self.run_wrapper(
+                    "-mark_catalog=reached:required,seldom:rare",
+                    "-mark_hits=reached",
+                ),
+                0,
+            )
+        self.assertEqual(
+            self.mark_summary(), "reached required hit\nseldom rare missed\n"
+        )
+
+    def test_without_the_gate_marks_neither_fail_nor_are_summarized(self) -> None:
+        self.assertEqual(self.run_wrapper("-mark_catalog=planted:required"), 0)
+        self.assertEqual(list(self.outputs.glob("*/marks-summary.txt")), [])
+
+    def test_a_mark_hit_only_by_the_corpus_merge_counts(self) -> None:
+        kept = self.root / "kept"
+        with mock.patch.dict(
+            os.environ,
+            {"KWAQUE_FUZZ_CORPUS_DIR": str(kept), "KWAQUE_FUZZ_MARKS_GATE": "1"},
+        ):
+            self.assertEqual(
+                self.run_wrapper(
+                    "-mark_catalog=late:required", "-merge_mark_hits=late"
+                ),
+                0,
+            )
+        self.assertEqual(self.mark_summary(), "late required hit\n")
+
+    def test_a_mark_owned_as_required_anywhere_is_required(self) -> None:
+        with mock.patch.dict(os.environ, {"KWAQUE_FUZZ_MARKS_GATE": "1"}):
+            self.assertEqual(
+                self.run_wrapper("-mark_catalog=both:rare,both:required"), 1
+            )
+        self.assertEqual(self.mark_summary(), "both required missed\n")
+
+    def test_a_log_the_gate_cannot_read_fails_a_passing_campaign(self) -> None:
+        artifacts = self.root / "gate"
+        artifacts.mkdir()
+        printed = io.StringIO()
+        with contextlib.redirect_stdout(printed):
+            self.assertEqual(
+                wrapper.gate_marks(artifacts, [artifacts / "campaign.log"], 0), 1
+            )
+            self.assertEqual(
+                wrapper.gate_marks(artifacts, [artifacts / "campaign.log"], 77), 77
+            )
+        self.assertIn("cannot read the campaign's marks", printed.getvalue())
+
+    def test_the_summary_is_printed_for_a_passing_campaign(self) -> None:
+        artifacts = self.root / "gate"
+        artifacts.mkdir()
+        (artifacts / "campaign.log").write_bytes(
+            b"kwaque-mark-catalog seldom rare\nkwaque-mark-catalog often required\n"
+            b"kwaque-mark-hit often\n"
+        )
+        printed = io.StringIO()
+        with contextlib.redirect_stdout(printed):
+            self.assertEqual(
+                wrapper.gate_marks(artifacts, [artifacts / "campaign.log"], 0), 0
+            )
+        self.assertEqual(printed.getvalue(), "often required hit\nseldom rare missed\n")
+
+    def test_a_failed_campaign_keeps_its_status_and_still_summarizes(self) -> None:
+        with mock.patch.dict(os.environ, {"KWAQUE_FUZZ_MARKS_GATE": "1"}):
+            self.assertEqual(
+                self.run_wrapper("-mark_catalog=planted:required", "-fail=1"), 77
+            )
+        self.assertEqual(self.mark_summary(), "planted required missed\n")
 
     def test_workspace_relative_and_absolute_runfiles_resolve(self) -> None:
         nested = self.runfiles / "workspace" / "nested"

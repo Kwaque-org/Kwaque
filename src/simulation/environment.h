@@ -6,9 +6,12 @@
 #include "src/resource/resource_config.h"
 #include "src/resource/resource_manager.h"
 #include "src/resource/resource_registry.h"
+#include "src/runtime/deadlines.h"
 #include "src/runtime/environment.h"
 #include "src/runtime/task_scope.h"
 #include "src/runtime/testing/failure_probe/failure_probe.h"
+#include "src/simulation/alarm.h"
+#include "src/simulation/buggify.h"
 #include "src/simulation/deterministic_random.h"
 #include "src/simulation/event_sink.h"
 #include "src/simulation/event_trace.h"
@@ -16,9 +19,12 @@
 #include "src/simulation/fake_file.h"
 #include "src/simulation/fake_network.h"
 #include "src/simulation/fault_schedule.h"
+#include "src/simulation/marks.h"
 #include "src/simulation/metrics.h"
 #include "src/simulation/scheduler.h"
+#include "src/simulation/shard_set.h"
 #include "src/simulation/timer.h"
+#include "src/simulation/virtual_shard.h"
 #include "src/simulation/virtual_time.h"
 
 #include <seastar/core/abort_source.hh>
@@ -34,6 +40,7 @@
 #include <stdexcept>
 #include <system_error>
 #include <type_traits>
+#include <vector>
 
 namespace kwaque::simulation {
 
@@ -54,6 +61,17 @@ struct environment_config_values final {
     std::uint32_t maximum_fault_rules;
     std::uint64_t master_seed;
     std::uint64_t runtime_stream_stable_id;
+    // Which life of the simulated broker this environment is. The caller
+    // gives each life its own, and environments given different ones never
+    // mint the same identity.
+    std::uint64_t identity_incarnation;
+    // Virtual shards hosted on the one reactor, and how calls between them
+    // behave. Shard 0 keeps every coordinate a one-shard simulation has.
+    std::uint16_t virtual_shards;
+    shard_set_config cross_shard_calls;
+    // Off unless a run asks for it. When on, the setting is folded into the
+    // configuration digest, so a trace replays only under the same setting.
+    buggify_config buggify;
     std::uint64_t event_epoch;
     trace_digest configuration_digest{};
     trace_digest input_digest{};
@@ -104,6 +122,18 @@ public:
     [[nodiscard]] std::uint64_t runtime_stream_stable_id() const noexcept {
         return runtime_stream_stable_id_;
     }
+    [[nodiscard]] std::uint64_t identity_incarnation() const noexcept {
+        return identity_incarnation_;
+    }
+    [[nodiscard]] std::uint16_t virtual_shards() const noexcept {
+        return virtual_shards_;
+    }
+    [[nodiscard]] const shard_set_config& cross_shard_calls() const noexcept {
+        return cross_shard_calls_;
+    }
+    [[nodiscard]] const buggify_config& buggify() const noexcept {
+        return buggify_;
+    }
     [[nodiscard]] const observability::event_sink_identity&
     event_identity() const noexcept {
         return event_identity_;
@@ -127,6 +157,10 @@ private:
       fault_schedule_limits fault_budget,
       std::uint64_t master_seed,
       std::uint64_t runtime_stream_stable_id,
+      std::uint64_t identity_incarnation,
+      std::uint16_t virtual_shards,
+      shard_set_config cross_shard_calls,
+      buggify_config buggify,
       observability::event_sink_identity event_identity,
       std::uint64_t lifecycle_event_bytes,
       trace_digest input_digest,
@@ -143,24 +177,36 @@ private:
     fault_schedule_limits fault_budget_;
     std::uint64_t master_seed_;
     std::uint64_t runtime_stream_stable_id_;
+    std::uint64_t identity_incarnation_;
+    std::uint16_t virtual_shards_;
+    shard_set_config cross_shard_calls_;
+    buggify_config buggify_;
     observability::event_sink_identity event_identity_;
     std::uint64_t lifecycle_event_bytes_;
     trace_digest input_digest_;
     seastar::chunked_vector<fault_rule> fault_rules_;
 };
 
-class environment final : public runtime::shard_affine {
+class environment final : public runtime::reactor_affine {
 public:
     using monotonic_clock = simulation::monotonic_clock;
     using wall_clock = simulation::wall_clock;
     using timer_type = simulation::timer;
     using random_type = sequential_random_source;
+    using identity_entropy_type = simulation::identity_entropy;
+    using deadlines_type = runtime::
+      basic_deadlines<simulation::alarm, simulation::monotonic_clock>;
+    using shard_set_type = simulation::shard_set;
     using file_system_type = fake_file_system;
     using network_type = fake_network;
     using dns_type = fake_dns;
     using fault_injector_type = environment;
+    using buggify_evaluator_type = buggify_evaluator;
+    using mark_counters_type = mark_counters;
 
     static constexpr bool faults_enabled = true;
+    static constexpr bool buggify_enabled = true;
+    static constexpr bool marks_enabled = true;
 
     [[nodiscard]] static runtime::result<std::unique_ptr<environment>>
     make(environment_config config);
@@ -180,17 +226,20 @@ public:
     void request_abort();
     [[nodiscard]] seastar::future<> stop();
 
-    [[nodiscard]] runtime::runtime_lifetime& lifetime() {
+    // The backend's per-shard parts answer for the virtual shard that asks;
+    // everything else is the world's, shared by every shard on the reactor.
+    [[nodiscard]] runtime::owner_shard owner() const noexcept;
+    [[nodiscard]] runtime::runtime_lifetime& lifetime();
+    [[nodiscard]] timer_type& timer();
+    [[nodiscard]] random_type& random();
+    [[nodiscard]] identity_entropy_type& identity_entropy();
+    [[nodiscard]] deadlines_type& deadlines();
+    [[nodiscard]] shard_set_type& shards() {
         assert_current();
-        return lifetime_;
+        return *shards_;
     }
-    [[nodiscard]] timer_type& timer() {
-        assert_runtime_available(timer_ != nullptr);
-        return *timer_;
-    }
-    [[nodiscard]] random_type& random() {
-        assert_runtime_available(true);
-        return runtime_random_;
+    [[nodiscard]] std::uint16_t virtual_shards() const noexcept {
+        return static_cast<std::uint16_t>(extra_shards_.size() + 1U);
     }
     [[nodiscard]] file_system_type& file_system() {
         assert_runtime_available(files_ != nullptr);
@@ -213,6 +262,15 @@ public:
     }
     [[nodiscard]] runtime::result<runtime::fault_decision>
     evaluate(const runtime::fault_request& request) noexcept;
+    // One run's BUGGIFY and coverage marks, shared by its virtual shards.
+    [[nodiscard]] buggify_evaluator_type& buggify() noexcept {
+        assert_current();
+        return *buggify_;
+    }
+    [[nodiscard]] mark_counters_type& marks() noexcept {
+        assert_current();
+        return marks_;
+    }
 
     [[nodiscard]] runtime::environment_state state() const;
     [[nodiscard]] bool abort_requested() const;
@@ -228,6 +286,8 @@ public:
 private:
     friend class environment_test_access;
 
+    struct extra_shard;
+
     environment(
       environment_config config,
       std::unique_ptr<event_trace> trace,
@@ -236,14 +296,48 @@ private:
       std::unique_ptr<clock_binding> binding,
       deterministic_random random,
       sequential_random_source runtime_random,
+      identity_entropy_type identities,
       std::unique_ptr<fault_schedule> faults,
+      std::unique_ptr<buggify_evaluator> buggify,
       std::unique_ptr<timer_type> control_timer,
       std::unique_ptr<timer_type> timer,
+      std::unique_ptr<deadlines_type> deadlines,
+      std::unique_ptr<shard_set_type> shards,
+      std::vector<std::unique_ptr<extra_shard>> extra_shards,
       std::unique_ptr<fake_file_system> files,
       std::unique_ptr<fake_network> network,
       std::unique_ptr<fake_dns> dns,
       std::unique_ptr<event_log_sink> event_sink,
       observability::event_log::reservation lifecycle_events);
+    // The parts of a virtual shard after the first, made and used as that
+    // shard.
+    struct extra_shard final {
+        extra_shard(
+          std::unique_ptr<timer_type> shard_timer,
+          sequential_random_source shard_draws,
+          identity_entropy_type shard_identities,
+          std::unique_ptr<deadlines_type> shard_deadlines,
+          std::unique_ptr<event_log_sink> shard_events) noexcept
+          : timer(std::move(shard_timer))
+          , draws(shard_draws)
+          , identities(shard_identities)
+          , deadlines(std::move(shard_deadlines))
+          , events(std::move(shard_events)) {}
+
+        runtime::runtime_lifetime lifetime;
+        std::unique_ptr<timer_type> timer;
+        sequential_random_source draws;
+        identity_entropy_type identities;
+        std::unique_ptr<deadlines_type> deadlines;
+        // The shard's own event log: its sequence numbers, its rate bounds
+        // and its shard on every event, as a broker shard's sink keeps them.
+        std::unique_ptr<event_log_sink> events;
+        std::optional<runtime::task_scope> tasks;
+    };
+
+    [[nodiscard]] std::size_t virtual_index() const noexcept;
+    [[nodiscard]] extra_shard* extra() noexcept;
+    [[nodiscard]] seastar::future<> stop_extra_shard(std::size_t index);
     void assert_runtime_available(bool owner_present) const;
     [[nodiscard]] seastar::future<> start_registry();
     [[nodiscard]] static runtime::result<std::unique_ptr<environment>>
@@ -285,9 +379,15 @@ private:
     std::unique_ptr<clock_binding> binding_;
     deterministic_random random_;
     sequential_random_source runtime_random_;
+    identity_entropy_type identity_entropy_;
     std::unique_ptr<fault_schedule> faults_;
+    std::unique_ptr<buggify_evaluator> buggify_;
+    mark_counters marks_;
     std::unique_ptr<timer_type> control_timer_;
     std::unique_ptr<timer_type> timer_;
+    std::unique_ptr<deadlines_type> deadlines_;
+    std::unique_ptr<shard_set_type> shards_;
+    std::vector<std::unique_ptr<extra_shard>> extra_shards_;
     std::unique_ptr<fake_file_system> files_;
     std::unique_ptr<fake_network> network_;
     std::unique_ptr<fake_dns> dns_;
@@ -358,6 +458,13 @@ seastar::future<> environment::start_with(Checkpoint checkpoint) {
           observability::event_public_text::operation_environment_start,
           observability::event_severity::info));
         lifetime_.activate();
+        for (std::size_t index = 0; index < extra_shards_.size(); ++index) {
+            const virtual_shard_turn turn{
+              seastar::this_shard_id() + index + 1U};
+            auto& shard = *extra_shards_[index];
+            shard.tasks.emplace();
+            shard.lifetime.activate();
+        }
     } catch (...) {
         startup_failure = std::current_exception();
     }

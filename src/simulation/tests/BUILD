@@ -482,6 +482,99 @@ kwaque_cc_seastar_test(
 )
 
 kwaque_cc_seastar_test(
+    name = "deadlines_test",
+    srcs = ["deadlines_test.cc"],
+    cpu = 1,
+    memory = "256MiB",
+    deps = [
+        "//src/runtime:time",
+        "//src/runtime:waiting",
+        "//src/simulation:alarm",
+        "//src/simulation:environment",
+        "//src/simulation:scheduler",
+        "//src/simulation:scheduler_driver",
+        "//src/simulation:virtual_time",
+    ],
+)
+
+kwaque_cc_seastar_test(
+    name = "virtual_shards_test",
+    srcs = ["virtual_shards_test.cc"],
+    cpu = 1,
+    memory = "256MiB",
+    deps = [
+        "//src/observability:event",
+        "//src/runtime:cross_shard",
+        "//src/runtime:random",
+        "//src/runtime:shard_affinity",
+        "//src/runtime:time",
+        "//src/runtime:waiting",
+        "//src/simulation:deterministic_random",
+        "//src/simulation:environment",
+        "//src/simulation:scheduler_driver",
+        "//src/simulation:virtual_time",
+    ],
+)
+
+kwaque_cc_seastar_gtest(
+    name = "buggify_test",
+    # Rates are measured over 2^20 seeds and keys.
+    timeout = "moderate",
+    srcs = ["buggify_test.cc"],
+    deps = [
+        "//src/runtime:buggify",
+        "//src/runtime:random",
+        "//src/simulation:buggify",
+        "//src/simulation:deterministic_random",
+        "//src/simulation:event_trace",
+        "//src/simulation:scheduler",
+    ],
+)
+
+kwaque_cc_library(
+    name = "fuzz_marks",
+    testonly = True,
+    srcs = ["fuzz_marks.cc"],
+    hdrs = ["fuzz_marks.h"],
+    deps = [
+        "//src/base:invariant",
+        "//src/runtime:buggify",
+        "//src/runtime:marks",
+        "//src/simulation:buggify",
+        "//src/simulation:marks",
+    ],
+)
+
+kwaque_cc_seastar_gtest(
+    name = "marks_test",
+    srcs = ["marks_test.cc"],
+    deps = [
+        ":fuzz_marks",
+        "//src/runtime:buggify",
+        "//src/runtime:marks",
+        "//src/simulation:buggify",
+        "//src/simulation:deterministic_random",
+        "//src/simulation:event_trace",
+        "//src/simulation:marks",
+        "//src/simulation:scheduler",
+    ],
+)
+
+# The release-seam check's positive control (//bazel/packaging).
+kwaque_cc_binary(
+    name = "seam_control",
+    testonly = True,
+    srcs = ["seam_control.cc"],
+    visibility = ["//bazel/packaging:__pkg__"],
+    deps = [
+        "//src/runtime:buggify",
+        "//src/runtime:marks",
+        "//src/simulation:buggify",
+        "//src/simulation:deterministic_random",
+    ],
+)
+
+kwaque_cc_seastar_test(
     name = "environment_test",
     srcs = ["environment_test.cc"],
     cpu = 1,
@@ -493,15 +586,18 @@ kwaque_cc_seastar_test(
         "//src/observability:event_log",
         "//src/resource:resource_manager",
         "//src/resource:workload_class",
+        "//src/runtime:buggify",
         "//src/runtime:dns",
         "//src/runtime:environment",
         "//src/runtime:fault",
         "//src/runtime:fault_api",
         "//src/runtime:file",
+        "//src/runtime:marks",
         "//src/runtime:network",
         "//src/runtime/testing/contracts:environment_contract",
         "//src/runtime/testing/contracts:environment_lifecycle_contract",
         "//src/runtime/testing/contracts:simulation_environment_component",
+        "//src/simulation:buggify",
         "//src/simulation:environment",
         "//src/simulation:environment_test_support",
         "//src/simulation:fake_dns",
@@ -615,6 +711,8 @@ kwaque_cc_test(
     name = "deterministic_random_test",
     srcs = ["deterministic_random_test.cc"],
     deps = [
+        "//src/model:identity",
+        "//src/model:identity_mint",
         "//src/simulation:deterministic_random",
         "//src/simulation:deterministic_random_test_support",
     ],

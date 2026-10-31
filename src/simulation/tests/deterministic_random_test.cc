@@ -1,8 +1,11 @@
+#include "src/model/identity.h"
+#include "src/model/identity_mint.h"
 #include "src/simulation/deterministic_random.h"
 #include "src/simulation/deterministic_random_test_support.h"
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <array>
 #include <cstddef>
 #include <cstdint>
@@ -276,4 +279,117 @@ TEST(DeterministicRandomTest, RecordedDecisionsRequireTheTraceMasterSeed) {
     ASSERT_FALSE(rejected.has_value());
     EXPECT_EQ(rejected.error().code(), kwaque::errc::invalid_argument);
     EXPECT_TRUE(trace.entries().empty());
+}
+
+namespace {
+
+using kwaque::simulation::identity_entropy;
+
+identity_entropy identities(
+  const deterministic_random& random,
+  std::uint64_t stable_id,
+  std::uint64_t incarnation) {
+    auto stream = random.stream(
+      random_domain::object_id_mint, stable_id, incarnation);
+    EXPECT_TRUE(stream.has_value());
+    return identity_entropy{*stream};
+}
+
+std::array<std::uint8_t, 16> mint_octets(identity_entropy& source) {
+    const auto minted = kwaque::model::mint_object_id<kwaque::model::topic_id>(
+      source);
+    std::array<std::uint8_t, 16> octets{};
+    const auto bytes = minted.bytes();
+    std::copy(bytes.begin(), bytes.end(), octets.begin());
+    return octets;
+}
+
+} // namespace
+
+TEST(DeterministicRandomTest, IdentityOctetsArePinnedForMasterSeedZero) {
+    const deterministic_random zero{0};
+    auto source = identities(zero, 1, 0);
+    // Pins the domain, the stream key and the octet order of each word.
+    const std::array<std::array<std::uint8_t, 16>, 3> expected{{
+      {0x08,
+       0xbc,
+       0x31,
+       0xbf,
+       0xb1,
+       0x9d,
+       0x44,
+       0xc5,
+       0x89,
+       0xaf,
+       0xc7,
+       0xc0,
+       0xba,
+       0x2f,
+       0x45,
+       0x4f},
+      {0xb7,
+       0xe4,
+       0xaa,
+       0xfb,
+       0x51,
+       0x75,
+       0x43,
+       0x0f,
+       0xbb,
+       0x2a,
+       0xb5,
+       0x5a,
+       0x81,
+       0x6a,
+       0xbd,
+       0xd0},
+      {0x68,
+       0xc7,
+       0x71,
+       0xe2,
+       0x36,
+       0xdd,
+       0x49,
+       0x30,
+       0xa7,
+       0x23,
+       0xff,
+       0x70,
+       0x14,
+       0xc7,
+       0x27,
+       0xc6},
+    }};
+    for (const auto& octets : expected) {
+        EXPECT_EQ(mint_octets(source), octets);
+    }
+}
+
+TEST(DeterministicRandomTest, IdentitiesNeverRepeatAcrossEnvironmentsOrLives) {
+    const deterministic_random random{0x6b77617175650004ULL};
+    std::vector<std::array<std::uint8_t, 16>> minted;
+    constexpr std::size_t per_stream = std::size_t{1} << 16U;
+    minted.reserve(4 * per_stream);
+    for (const std::uint64_t stable_id : {std::uint64_t{1}, std::uint64_t{2}}) {
+        for (const std::uint64_t incarnation :
+             {std::uint64_t{0}, std::uint64_t{1}}) {
+            auto source = identities(random, stable_id, incarnation);
+            for (std::size_t at = 0; at < per_stream; ++at)
+                minted.push_back(mint_octets(source));
+        }
+    }
+    std::sort(minted.begin(), minted.end());
+    EXPECT_EQ(std::adjacent_find(minted.begin(), minted.end()), minted.end());
+}
+
+TEST(DeterministicRandomTest, IdentityDrawsAreIndependentOfTheRuntimeStream) {
+    const deterministic_random random{11};
+    auto first = identities(random, 3, 0);
+    auto runtime = random.stream(random_domain::runtime_stream, 3, 0);
+    ASSERT_TRUE(runtime.has_value());
+    for (std::size_t at = 0; at < 100; ++at)
+        static_cast<void>(runtime->next_u64());
+    auto second = identities(random, 3, 0);
+    for (std::size_t at = 0; at < 8; ++at)
+        EXPECT_EQ(mint_octets(first), mint_octets(second));
 }

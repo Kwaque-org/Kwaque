@@ -33,6 +33,8 @@ enum class event_replay_difference : std::uint8_t {
     field_value_0 = 34,
 };
 
+// One shard's events, as its own sink would keep them: each virtual shard has
+// one.
 class event_log_sink final : public runtime::shard_affine {
 public:
     event_log_sink(

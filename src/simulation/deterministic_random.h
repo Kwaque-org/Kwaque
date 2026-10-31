@@ -10,6 +10,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <span>
 
 namespace kwaque::simulation {
 
@@ -24,6 +25,14 @@ enum class random_domain : std::uint32_t {
     storage_decision = UINT32_C(0x00000003),
     network_decision = UINT32_C(0x00000004),
     dns_decision = UINT32_C(0x00000005),
+    // A BUGGIFY site's activation for the run, keyed by the site alone.
+    buggify_activation = UINT32_C(0x00000006),
+    // A BUGGIFY firing, keyed by the caller's object and sequence.
+    buggify_decision = UINT32_C(0x00000007),
+    // A generated history's operations, keyed by the history's run seed.
+    history_generation = UINT32_C(0x00000008),
+    shard_delivery = UINT32_C(0x00000009),
+    object_id_mint = UINT32_C(0x0000000a),
 };
 
 inline constexpr std::array registered_random_domains{
@@ -32,6 +41,11 @@ inline constexpr std::array registered_random_domains{
   random_domain::storage_decision,
   random_domain::network_decision,
   random_domain::dns_decision,
+  random_domain::buggify_activation,
+  random_domain::buggify_decision,
+  random_domain::history_generation,
+  random_domain::shard_delivery,
+  random_domain::object_id_mint,
 };
 
 namespace detail {
@@ -69,6 +83,9 @@ split_u64(std::uint64_t value) noexcept {
 } // namespace detail
 
 static_assert(detail::random_domains_are_unique(registered_random_domains));
+static_assert(
+  static_cast<std::uint32_t>(random_domain::buggify_activation)
+  == buggify_activation_trace_domain);
 
 class random_coordinate final {
 public:
@@ -174,6 +191,28 @@ private:
 };
 
 static_assert(runtime::random_source<sequential_random_source>);
+
+// Identity octets from their own domain. The stable ID names the environment
+// that mints and the occurrence its incarnation and shard, so environments
+// given different incarnations never mint the same identity, and draws in
+// other domains never move one.
+class identity_entropy final {
+public:
+    explicit identity_entropy(sequential_random_source stream) noexcept
+      : stream_(stream) {}
+
+    // Two words, each written least significant octet first.
+    void fill(
+      std::span<std::uint8_t, runtime::identity_entropy_bytes>
+        octets) noexcept {
+        runtime::fill_bytes(stream_, std::as_writable_bytes(octets));
+    }
+
+private:
+    sequential_random_source stream_;
+};
+
+static_assert(runtime::identity_entropy_source<identity_entropy>);
 
 } // namespace kwaque::simulation
 

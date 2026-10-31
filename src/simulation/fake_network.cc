@@ -4,6 +4,7 @@
 #include "src/base/invariant.h"
 #include "src/bytes/fragmented_buffer_builder.h"
 #include "src/runtime/random.h"
+#include "src/runtime/shard_identity.h"
 #include "src/simulation/deterministic_random.h"
 #include "src/simulation/fault_schedule.h"
 
@@ -2590,6 +2591,12 @@ seastar::future<runtime::result<void>> fake_listener::close() {
 seastar::future<runtime::result<fake_listener>> fake_network::listen(
   runtime::network_endpoint endpoint, runtime::network_listen_options options) {
     assert_current();
+    // A connection's events run as the virtual shard that schedules them,
+    // not as the shard owning the end they complete, so both ends stay on
+    // the first virtual shard.
+    if (runtime::current_shard() != seastar::this_shard_id()) {
+        return ready_failure<fake_listener>(errc::unavailable);
+    }
     if (impl_->state_ != fake_network_state::open || impl_->abort_requested_) {
         return ready_failure<fake_listener>(errc::closed);
     }
@@ -2799,6 +2806,12 @@ seastar::future<runtime::result<fake_connection>> fake_network::connect(
   runtime::network_connection_limits limits,
   seastar::abort_source& caller_abort) {
     assert_current();
+    // A connection's events run as the virtual shard that schedules them,
+    // not as the shard owning the end they complete, so both ends stay on
+    // the first virtual shard.
+    if (runtime::current_shard() != seastar::this_shard_id()) {
+        return ready_failure<fake_connection>(errc::unavailable);
+    }
     if (impl_->state_ != fake_network_state::open || impl_->abort_requested_) {
         return ready_failure<fake_connection>(errc::closed);
     }

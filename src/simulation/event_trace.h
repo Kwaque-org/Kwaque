@@ -178,7 +178,21 @@ enum class trace_action : std::uint8_t {
     crash_started = 27,
     crash_completed = 28,
     storage_configuration = 29,
+    // A BUGGIFY site's first evaluation in a run, active or not: domain is
+    // buggify_activation, stable ID the site, value its activation word and
+    // result 1 when the site is active.
+    buggify_evaluated = 30,
 };
+
+// The keyed domain of BUGGIFY activation words.
+inline constexpr std::uint32_t buggify_activation_trace_domain{6};
+
+// A site is active for the run with probability 1/4: exactly when the top two
+// bits of its activation word are zero.
+[[nodiscard]] constexpr bool
+buggify_activation_word_is_active(std::uint64_t word) noexcept {
+    return (word >> 62U) == 0;
+}
 
 enum class trace_event_kind : std::uint8_t {
     generic = 0,

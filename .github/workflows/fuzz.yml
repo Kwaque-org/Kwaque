@@ -90,7 +90,8 @@ jobs:
           CORPUS: ${{ steps.corpus.outputs.directory }}
         run: mkdir -p "${CORPUS}"
       # The campaign's 600 s, which its first inputs run inside, a round of
-      # mutations past it, the merge's 1800 s and a reduction's 50 s.
+      # mutations past it, the merge's 1800 s and a reduction's 50 s. A
+      # campaign that never hits a required coverage mark fails.
       - name: Run a bounded fuzz campaign
         id: tests
         env:
@@ -101,6 +102,7 @@ jobs:
           bazel test --config=ci --config=fuzz
           --test_output=all --test_timeout=2520
           --test_env=KWAQUE_FUZZ_MINIMIZE_SECONDS=30
+          --test_env=KWAQUE_FUZZ_MARKS_GATE=1
           --test_env=KWAQUE_FUZZ_CORPUS_DIR="${CORPUS}"
           --sandbox_writable_path="${CORPUS}"
           --test_arg=-max_total_time=600

@@ -3,11 +3,14 @@
 #include "src/observability/event.h"
 #include "src/observability/event_log.h"
 #include "src/resource/workload_class.h"
+#include "src/runtime/buggify.h"
 #include "src/runtime/dns.h"
 #include "src/runtime/file.h"
+#include "src/runtime/marks.h"
 #include "src/runtime/network.h"
 #include "src/runtime/testing/contracts/environment_contract.h"
 #include "src/runtime/testing/contracts/environment_lifecycle_contract.h"
+#include "src/simulation/buggify.h"
 #include "src/simulation/environment.h"
 #include "src/simulation/environment_test_support.h"
 #include "src/simulation/scheduler_driver.h"
@@ -65,9 +68,11 @@ fault_rule rule(
     return *result;
 }
 
-environment_config
-config(std::optional<fault_rule> selected_rule = std::nullopt) {
+environment_config config(
+  std::optional<fault_rule> selected_rule = std::nullopt,
+  kwaque::simulation::buggify_config buggify = {}) {
     environment_config_values values;
+    values.buggify = buggify;
     values.master_seed = 71;
     values.runtime_stream_stable_id = 19;
     values.event_epoch = 23;
@@ -241,6 +246,63 @@ SEASTAR_TEST_CASE(simulation_environment_validates_aggregate_configuration) {
     BOOST_CHECK(
       rejected_aggregate.error().code() == kwaque::errc::out_of_range);
     co_return;
+}
+
+SEASTAR_TEST_CASE(simulation_environment_binds_its_buggify_setting) {
+    using kwaque::simulation::buggify_config;
+    using kwaque::simulation::buggify_firing;
+    static_assert(environment::buggify_enabled && environment::marks_enabled);
+
+    // Off, the caller's digest is kept, so every trace made before still
+    // replays; on, the setting is folded in, so a trace replays only under
+    // the setting that made it.
+    const auto off = config().event_identity().configuration_digest;
+    kwaque::simulation::trace_digest callers{};
+    callers[0] = 0x41;
+    BOOST_CHECK(off == callers);
+    BOOST_CHECK(
+      config(std::nullopt, buggify_config{.firing = buggify_firing::none})
+        .event_identity()
+        .configuration_digest
+      == off);
+    const auto on = config(std::nullopt, buggify_config{.enabled = true})
+                      .event_identity()
+                      .configuration_digest;
+    const auto neutral = config(
+                           std::nullopt,
+                           buggify_config{
+                             .enabled = true,
+                             .firing = buggify_firing::neutral_sites})
+                           .event_identity()
+                           .configuration_digest;
+    BOOST_CHECK(on != off);
+    BOOST_CHECK(neutral != on);
+    BOOST_CHECK(neutral != off);
+
+    environment_config_values unknown;
+    unknown.buggify.firing = static_cast<buggify_firing>(3);
+    auto refused = environment_config::make(std::move(unknown));
+    BOOST_REQUIRE(!refused.has_value());
+    BOOST_CHECK(refused.error().code() == kwaque::errc::out_of_range);
+
+    auto made = environment::make(
+      config(std::nullopt, buggify_config{.enabled = true}));
+    BOOST_REQUIRE(made.has_value());
+    auto target = std::move(*made);
+    BOOST_CHECK(target->trace().header().configuration_digest == on);
+    BOOST_CHECK(target->buggify().config().enabled);
+    BOOST_CHECK_EQUAL(
+      target->buggify().sites().size(), kwaque::runtime::buggify_sites.size());
+    BOOST_CHECK_EQUAL(
+      target->marks().catalog().size(), kwaque::runtime::coverage_marks.size());
+    auto starting = target->start();
+    co_await pump_until(target->event_scheduler(), starting);
+    co_await std::move(starting);
+    auto stopping = target->stop();
+    co_await pump_until(target->event_scheduler(), stopping);
+    co_await std::move(stopping);
+    BOOST_CHECK(!contains_trace_action(
+      *target, kwaque::simulation::trace_action::buggify_evaluated));
 }
 
 SEASTAR_TEST_CASE(

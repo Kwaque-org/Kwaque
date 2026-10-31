@@ -82,7 +82,7 @@ private:
     runtime::monotonic_time maximum_deadline_;
 };
 
-class virtual_time final : public runtime::shard_affine {
+class virtual_time final : public runtime::reactor_affine {
 public:
     virtual_time(scheduler& target, virtual_time_config config);
     ~virtual_time();

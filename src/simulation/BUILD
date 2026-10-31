@@ -26,6 +26,7 @@ kwaque_cc_library(
     deps = [
         "//src/base",
         "//src/base:invariant",
+        "//src/runtime:buggify",
         "//src/runtime:error",
         "//src/runtime:fault",
         "//src/runtime:fault_api",
@@ -49,6 +50,7 @@ kwaque_cc_library(
     deps = [
         "//src/base",
         "//src/base:invariant_test_support",
+        "//src/runtime:buggify",
         "//src/runtime:error",
         "//src/runtime:fault",
         "//src/runtime:fault_api",
@@ -104,24 +106,31 @@ kwaque_cc_library(
         "//src/simulation/tests:__pkg__",
     ],
     deps = [
+        ":alarm",
+        ":buggify",
         ":deterministic_random",
         ":event_trace",
         ":fake_dns",
         ":fake_file",
         ":fake_network",
         ":fault_schedule",
+        ":marks",
         ":metrics",
         ":scheduler",
+        ":shard_set",
         ":structured_event_sink",
         ":timer",
+        ":virtual_shard",
         ":virtual_time",
         "//src/base:invariant",
+        "//src/codec:sha256",
         "//src/observability:event",
         "//src/observability:event_log",
         "//src/resource:resource_config",
         "//src/resource:resource_manager",
         "//src/resource:resource_registry",
         "//src/resource:resource_test_support",
+        "//src/runtime:deadlines",
         "//src/runtime:environment",
         "//src/runtime:error",
         "//src/runtime:fault",
@@ -144,6 +153,18 @@ kwaque_cc_library(
     ],
 )
 
+# Runs the reactor thread as one virtual shard; only the simulation writes
+# Kwaque's shard identity.
+kwaque_cc_library(
+    name = "virtual_shard",
+    hdrs = ["virtual_shard.h"],
+    visibility = ["//src/simulation:__subpackages__"],
+    deps = [
+        "//src/runtime:shard_identity",
+        "@seastar",
+    ],
+)
+
 kwaque_cc_library(
     name = "scheduler",
     srcs = ["scheduler.cc"],
@@ -151,6 +172,7 @@ kwaque_cc_library(
     visibility = ["//src/simulation:__subpackages__"],
     deps = [
         ":event_trace",
+        ":virtual_shard",
         "//src/base:invariant",
         "//src/runtime:error",
         "//src/runtime:fault_api",
@@ -175,6 +197,7 @@ kwaque_cc_library(
     visibility = ["//src/simulation/tests:__pkg__"],
     deps = [
         ":scheduler",
+        ":virtual_shard",
         "//src/base:error",
         "//src/runtime/testing:reactor_tasks",
         "@seastar",
@@ -189,6 +212,7 @@ kwaque_cc_library(
     visibility = ["//src/simulation/tests:__pkg__"],
     deps = [
         ":event_trace_invariant_test_support",
+        ":virtual_shard",
         "//src/base:invariant_test_support",
         "//src/runtime:error",
         "//src/runtime:fault_api",
@@ -237,6 +261,65 @@ kwaque_cc_library(
         "//src/runtime:shard_affinity_test_support",
         "//src/runtime:time",
         "@seastar",
+    ],
+)
+
+kwaque_cc_library(
+    name = "shard_set",
+    srcs = ["shard_set.cc"],
+    hdrs = ["shard_set.h"],
+    visibility = ["//src/simulation:__subpackages__"],
+    deps = [
+        ":deterministic_random",
+        ":scheduler",
+        ":virtual_shard",
+        "//src/base:invariant",
+        "//src/runtime:cross_shard",
+        "//src/runtime:shard_affinity",
+        "//src/runtime:time",
+        "//src/runtime:waiting",
+        "@seastar",
+    ],
+)
+
+kwaque_cc_library(
+    name = "buggify",
+    srcs = ["buggify.cc"],
+    hdrs = ["buggify.h"],
+    visibility = ["//src/simulation:__subpackages__"],
+    deps = [
+        ":deterministic_random",
+        ":event_trace",
+        ":scheduler",
+        "//src/base:invariant",
+        "//src/runtime:buggify",
+        "//src/runtime:error",
+        "//src/runtime:random",
+        "//src/runtime:shard_affinity",
+    ],
+)
+
+kwaque_cc_library(
+    name = "marks",
+    hdrs = ["marks.h"],
+    visibility = ["//src/simulation:__subpackages__"],
+    deps = [
+        "//src/base:invariant",
+        "//src/runtime:marks",
+        "//src/runtime:shard_affinity",
+    ],
+)
+
+kwaque_cc_library(
+    name = "alarm",
+    srcs = ["alarm.cc"],
+    hdrs = ["alarm.h"],
+    visibility = ["//src/simulation:__subpackages__"],
+    deps = [
+        ":scheduler",
+        "//src/base:invariant",
+        "//src/runtime:alarm",
+        "//src/runtime:time",
     ],
 )
 
@@ -369,6 +452,7 @@ kwaque_cc_library(
         "//src/runtime:network",
         "//src/runtime:random",
         "//src/runtime:shard_affinity",
+        "//src/runtime:shard_identity",
         "//src/runtime:time",
         "@abseil-cpp//absl/container:btree",
         "@boost//:intrusive",

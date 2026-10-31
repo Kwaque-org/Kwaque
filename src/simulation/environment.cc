@@ -1,6 +1,7 @@
 #include "src/simulation/environment.h"
 
 #include "src/base/invariant.h"
+#include "src/codec/sha256.h"
 #include "src/resource/resource_test_support.h"
 
 #include <seastar/core/coroutine.hh>
@@ -10,7 +11,9 @@
 #include <array>
 #include <exception>
 #include <limits>
+#include <span>
 #include <stdexcept>
+#include <string_view>
 #include <system_error>
 #include <utility>
 
@@ -29,6 +32,52 @@ constexpr std::uint32_t lifecycle_event_count{4};
 
 [[nodiscard]] runtime::operation_error fault_error(errc code) noexcept {
     return runtime::operation_error{code, runtime::operation_kind::fault};
+}
+
+// A setting that changes what a run draws or delivers joins the
+// configuration digest the trace and event log are bound to, so a trace
+// replays only under the same setting. A run at the setting's default keeps
+// the caller's digest, and every trace made before the setting existed stays
+// valid.
+[[nodiscard]] trace_digest fold_setting(
+  const trace_digest& digest,
+  std::string_view tag,
+  std::span<const std::uint8_t> setting) {
+    codec::sha256_hasher hasher;
+    hasher.update(tag.data(), tag.size())
+      .update(digest.data(), digest.size())
+      .update(setting.data(), setting.size());
+    const auto folded = std::move(hasher).final();
+    trace_digest result{};
+    std::ranges::copy(folded, result.begin());
+    return result;
+}
+
+[[nodiscard]] trace_digest
+with_buggify(const trace_digest& digest, buggify_config config) {
+    const std::array<std::uint8_t, 2> setting{
+      1, static_cast<std::uint8_t>(config.firing)};
+    return fold_setting(digest, "kwaque simulation buggify setting", setting);
+}
+
+[[nodiscard]] trace_digest with_shards(
+  const trace_digest& digest,
+  std::uint16_t shards,
+  const shard_set_config& calls) {
+    std::array<std::uint8_t, 2 + 1 + 4 + 3 * 8> setting{};
+    std::size_t at = 0;
+    const auto put = [&setting, &at](std::uint64_t value, std::size_t bytes) {
+        for (std::size_t octet = 0; octet < bytes; ++octet) {
+            setting[at++] = static_cast<std::uint8_t>(value >> (octet * 8U));
+        }
+    };
+    put(shards, 2);
+    put(calls.reorder ? 1U : 0U, 1);
+    put(calls.units_per_pair, 4);
+    put(calls.minimum_nanoseconds, 8);
+    put(calls.fast_nanoseconds, 8);
+    put(calls.slow_nanoseconds, 8);
+    return fold_setting(digest, "kwaque simulation virtual shards", setting);
 }
 
 [[noreturn]] void throw_failure(const runtime::operation_error& error) {
@@ -190,6 +239,8 @@ environment_config_values::environment_config_values()
   , maximum_fault_rules{default_fault_schedule_rules}
   , master_seed{0}
   , runtime_stream_stable_id{1}
+  , identity_incarnation{0}
+  , virtual_shards{1}
   , event_epoch{1} {
     file.maximum_objects = 4'096;
     file.maximum_open_handles = 128;
@@ -229,6 +280,10 @@ environment_config::environment_config(
   fault_schedule_limits fault_budget,
   std::uint64_t master_seed,
   std::uint64_t runtime_stream_stable_id,
+  std::uint64_t identity_incarnation,
+  std::uint16_t virtual_shards,
+  shard_set_config cross_shard_calls,
+  buggify_config buggify,
   observability::event_sink_identity event_identity,
   std::uint64_t lifecycle_event_bytes,
   trace_digest input_digest,
@@ -244,6 +299,10 @@ environment_config::environment_config(
   , fault_budget_(fault_budget)
   , master_seed_(master_seed)
   , runtime_stream_stable_id_(runtime_stream_stable_id)
+  , identity_incarnation_(identity_incarnation)
+  , virtual_shards_(virtual_shards)
+  , cross_shard_calls_(cross_shard_calls)
+  , buggify_(buggify)
   , event_identity_(event_identity)
   , lifecycle_event_bytes_(lifecycle_event_bytes)
   , input_digest_(input_digest)
@@ -311,8 +370,32 @@ environment_config::make(environment_config_values values) {
     }
     if (
       values.runtime_stream_stable_id == 0
-      || values.fault_rules.size() > fault_budget->rules()) {
+      || values.fault_rules.size() > fault_budget->rules()
+      || values.virtual_shards == 0
+      || values.virtual_shards > shard_set_config::maximum_shards
+      || values.identity_incarnation > std::numeric_limits<std::uint64_t>::max()
+                                         / shard_set_config::maximum_shards
+      || values.cross_shard_calls.units_per_pair == 0
+      || values.cross_shard_calls.minimum_nanoseconds
+           > values.cross_shard_calls.fast_nanoseconds
+      || values.cross_shard_calls.fast_nanoseconds
+           > values.cross_shard_calls.slow_nanoseconds
+      || values.cross_shard_calls.slow_nanoseconds
+           > scheduler_budget->maximum_deadline().nanoseconds()) {
         return runtime::failure(environment_error(errc::out_of_range));
+    }
+    if (values.buggify.firing > buggify_firing::none) {
+        return runtime::failure(environment_error(errc::out_of_range));
+    }
+    if (values.buggify.enabled) {
+        values.configuration_digest = with_buggify(
+          values.configuration_digest, values.buggify);
+    }
+    if (values.virtual_shards > 1) {
+        values.configuration_digest = with_shards(
+          values.configuration_digest,
+          values.virtual_shards,
+          values.cross_shard_calls);
     }
     const auto cleanup_entries
       = std::uint64_t{2}
@@ -345,6 +428,10 @@ environment_config::make(environment_config_values values) {
       *fault_budget,
       values.master_seed,
       values.runtime_stream_stable_id,
+      values.identity_incarnation,
+      values.virtual_shards,
+      values.cross_shard_calls,
+      values.buggify,
       observability::event_sink_identity{
         .epoch = *epoch,
         .configuration_digest = values.configuration_digest,
@@ -427,6 +514,19 @@ runtime::result<std::unique_ptr<environment>> environment::make_composed(
     if (!runtime_random) {
         return runtime::failure(runtime_random.error());
     }
+    // Shard 0 keeps the runtime stream's coordinates; each later shard
+    // draws its own, so adding a shard moves no other shard's draws.
+    const auto identity_occurrence = [&config](std::size_t shard) {
+        return config.identity_incarnation() * shard_set_config::maximum_shards
+               + shard;
+    };
+    auto identity_stream = random.stream(
+      random_domain::object_id_mint,
+      config.runtime_stream_stable_id(),
+      identity_occurrence(0));
+    if (!identity_stream) {
+        return runtime::failure(identity_stream.error());
+    }
     auto faults = fault_schedule::make(
       *event_scheduler,
       *trace,
@@ -436,8 +536,47 @@ runtime::result<std::unique_ptr<environment>> environment::make_composed(
     if (!faults) {
         return runtime::failure(faults.error());
     }
+    auto buggify = buggify_evaluator::make(
+      config.buggify(), random, *trace, *event_scheduler);
+    if (!buggify) {
+        return runtime::failure(buggify.error());
+    }
     auto control_timer = std::make_unique<simulation::timer>(*event_scheduler);
     auto timer = std::make_unique<simulation::timer>(*event_scheduler);
+    auto deadlines = std::make_unique<deadlines_type>(
+      deadlines_type::default_touches_per_task, *event_scheduler);
+    auto shards = std::make_unique<shard_set_type>(
+      *event_scheduler,
+      random,
+      config.runtime_stream_stable_id(),
+      config.virtual_shards(),
+      config.cross_shard_calls());
+    std::vector<std::unique_ptr<extra_shard>> extra_shards;
+    extra_shards.reserve(config.virtual_shards() - 1U);
+    for (std::size_t shard = 1; shard < config.virtual_shards(); ++shard) {
+        const virtual_shard_turn turn{seastar::this_shard_id() + shard};
+        auto shard_random = random.stream(
+          random_domain::runtime_stream,
+          config.runtime_stream_stable_id(),
+          shard);
+        auto shard_identities = random.stream(
+          random_domain::object_id_mint,
+          config.runtime_stream_stable_id(),
+          identity_occurrence(shard));
+        if (!shard_random || !shard_identities) {
+            return runtime::failure(
+              !shard_random ? shard_random.error() : shard_identities.error());
+        }
+        extra_shards.push_back(
+          std::make_unique<extra_shard>(
+            std::make_unique<simulation::timer>(*event_scheduler),
+            *shard_random,
+            identity_entropy_type{*shard_identities},
+            std::make_unique<deadlines_type>(
+              deadlines_type::default_touches_per_task, *event_scheduler),
+            std::make_unique<event_log_sink>(
+              config.event_identity(), config.event_budget())));
+    }
     auto files = fake_file_system::make(
       config.file_config_, *event_scheduler, **faults);
     if (!files) {
@@ -460,21 +599,16 @@ runtime::result<std::unique_ptr<environment>> environment::make_composed(
     }
 
     auto result = std::unique_ptr<environment>{new environment{
-      std::move(config),
-      std::move(trace),
-      std::move(event_scheduler),
-      std::move(time),
-      std::move(binding),
-      random,
-      std::move(*runtime_random),
-      std::move(*faults),
-      std::move(control_timer),
-      std::move(timer),
-      std::move(*files),
-      std::move(*network),
-      std::move(*dns),
-      std::move(event_sink),
-      std::move(*lifecycle_events),
+      std::move(config),          std::move(trace),
+      std::move(event_scheduler), std::move(time),
+      std::move(binding),         random,
+      std::move(*runtime_random), identity_entropy_type{*identity_stream},
+      std::move(*faults),         std::move(*buggify),
+      std::move(control_timer),   std::move(timer),
+      std::move(deadlines),       std::move(shards),
+      std::move(extra_shards),    std::move(*files),
+      std::move(*network),        std::move(*dns),
+      std::move(event_sink),      std::move(*lifecycle_events),
     }};
     active_ = result.get();
     result->active_owner_ = true;
@@ -489,9 +623,14 @@ environment::environment(
   std::unique_ptr<clock_binding> binding,
   deterministic_random random,
   sequential_random_source runtime_random,
+  identity_entropy_type identities,
   std::unique_ptr<fault_schedule> faults,
+  std::unique_ptr<buggify_evaluator> buggify,
   std::unique_ptr<timer_type> control_timer,
   std::unique_ptr<timer_type> timer,
+  std::unique_ptr<deadlines_type> deadlines,
+  std::unique_ptr<shard_set_type> shards,
+  std::vector<std::unique_ptr<extra_shard>> extra_shards,
   std::unique_ptr<fake_file_system> files,
   std::unique_ptr<fake_network> network,
   std::unique_ptr<fake_dns> dns,
@@ -504,9 +643,14 @@ environment::environment(
   , binding_(std::move(binding))
   , random_(random)
   , runtime_random_(std::move(runtime_random))
+  , identity_entropy_(identities)
   , faults_(std::move(faults))
+  , buggify_(std::move(buggify))
   , control_timer_(std::move(control_timer))
   , timer_(std::move(timer))
+  , deadlines_(std::move(deadlines))
+  , shards_(std::move(shards))
+  , extra_shards_(std::move(extra_shards))
   , files_(std::move(files))
   , network_(std::move(network))
   , dns_(std::move(dns))
@@ -521,6 +665,82 @@ environment::~environment() {
       state_ == runtime::environment_state::stopped && !active_owner_
         && active_ != this && binding_ == nullptr,
       "simulation environment destroyed before explicit stop completed");
+    // Each shard's parts end as that shard.
+    for (std::size_t index = 0; index < extra_shards_.size(); ++index) {
+        const virtual_shard_turn turn{seastar::this_shard_id() + index + 1U};
+        extra_shards_[index].reset();
+    }
+}
+
+std::size_t environment::virtual_index() const noexcept {
+    const auto index = static_cast<std::size_t>(
+      runtime::current_shard() - seastar::this_shard_id());
+    KWAQUE_INVARIANT(
+      invariant_id{"KQ-SIM-VIRTUAL-SHARD"},
+      index <= extra_shards_.size(),
+      "code ran as a virtual shard the simulation does not host");
+    return index;
+}
+
+environment::extra_shard* environment::extra() noexcept {
+    const auto index = virtual_index();
+    return index == 0 ? nullptr : extra_shards_[index - 1U].get();
+}
+
+runtime::owner_shard environment::owner() const noexcept {
+    const auto index = virtual_index();
+    return index == 0 ? lifetime_.owner()
+                      : extra_shards_[index - 1U]->lifetime.owner();
+}
+
+runtime::runtime_lifetime& environment::lifetime() {
+    assert_current();
+    auto* shard = extra();
+    return shard == nullptr ? lifetime_ : shard->lifetime;
+}
+
+environment::timer_type& environment::timer() {
+    auto* shard = extra();
+    assert_runtime_available(timer_ != nullptr);
+    return shard == nullptr ? *timer_ : *shard->timer;
+}
+
+environment::random_type& environment::random() {
+    auto* shard = extra();
+    assert_runtime_available(true);
+    return shard == nullptr ? runtime_random_ : shard->draws;
+}
+
+environment::identity_entropy_type& environment::identity_entropy() {
+    auto* shard = extra();
+    assert_runtime_available(true);
+    return shard == nullptr ? identity_entropy_ : shard->identities;
+}
+
+environment::deadlines_type& environment::deadlines() {
+    auto* shard = extra();
+    assert_runtime_available(deadlines_ != nullptr);
+    return shard == nullptr ? *deadlines_ : *shard->deadlines;
+}
+
+seastar::future<> environment::stop_extra_shard(std::size_t index) {
+    auto& shard = *extra_shards_[index];
+    std::exception_ptr first_failure;
+    if (shard.tasks) {
+        co_await preserve_cleanup_failure(
+          first_failure, [&shard] { return shard.tasks->close(); });
+    }
+    co_await preserve_cleanup_failure(
+      first_failure, [&shard] { return shard.lifetime.close(); });
+    co_await preserve_cleanup_result(
+      first_failure, [&shard] { return shard.timer->stop(); });
+    if (auto stopped = shard.events->stop(); !stopped && !first_failure) {
+        first_failure = std::make_exception_ptr(
+          std::system_error(make_error_code(stopped.error().code())));
+    }
+    if (first_failure) {
+        std::rethrow_exception(first_failure);
+    }
 }
 
 seastar::future<> environment::start() {
@@ -528,7 +748,11 @@ seastar::future<> environment::start() {
 }
 
 void environment::assert_runtime_available(bool owner_present) const {
-    const auto lifetime_state = lifetime_.state();
+    // The asking shard's own lifetime decides.
+    const auto index = virtual_index();
+    const auto lifetime_state = index == 0
+                                  ? lifetime_.state()
+                                  : extra_shards_[index - 1U]->lifetime.state();
     if (
       !owner_present
       || (state_ != runtime::environment_state::started && state_ != runtime::environment_state::stopping)
@@ -608,6 +832,16 @@ void environment::request_abort_unchecked() noexcept {
         tasks_->request_abort();
     }
     timer_->request_abort();
+    for (std::size_t index = 0; index < extra_shards_.size(); ++index) {
+        const virtual_shard_turn turn{seastar::this_shard_id() + index + 1U};
+        auto& shard = *extra_shards_[index];
+        shard.lifetime.close_admission();
+        if (shard.tasks) {
+            shard.tasks->close_admission();
+            shard.tasks->request_abort();
+        }
+        shard.timer->request_abort();
+    }
     network_->request_abort();
     dns_->request_abort();
 }
@@ -749,6 +983,15 @@ seastar::future<> environment::stop_once(bool inject_stop) {
     if (!first_failure && time_failure) {
         first_failure = time_failure;
     }
+    // Each later shard stops as itself; the control call answers on this
+    // one, so the stop resumes as shard 0.
+    for (std::size_t index = 0; index < extra_shards_.size(); ++index) {
+        co_await preserve_cleanup_failure(first_failure, [this, index] {
+            return shards_->control(
+              static_cast<seastar::shard_id>(index + 1U),
+              [this, index] { return stop_extra_shard(index); });
+        });
+    }
     if (tasks_) {
         co_await preserve_cleanup_failure(
           first_failure, [this] { return tasks_->close(); });
@@ -838,10 +1081,12 @@ bool environment::abort_requested() const {
 
 runtime::task_scope& environment::tasks() {
     assert_current();
-    if (!tasks_) {
+    auto* shard = extra();
+    auto& scope = shard == nullptr ? tasks_ : shard->tasks;
+    if (!scope) {
         throw std::logic_error("simulation task scope is not ready");
     }
-    return *tasks_;
+    return *scope;
 }
 
 resource::resource_manager& environment::resource_manager() {
@@ -854,7 +1099,8 @@ resource::resource_manager& environment::resource_manager() {
 
 event_log_sink& environment::event_sink() {
     assert_current();
-    return *event_sink_;
+    auto* shard = extra();
+    return shard == nullptr ? *event_sink_ : *shard->events;
 }
 
 runtime::testing::failure_probe& environment::failure_probe() {

@@ -35,6 +35,16 @@ field_value(const observability::event_field_value& value) noexcept {
         return *value.as_boolean();
     case event_field_type::stable_id:
         return value.as_stable_id()->value();
+    case event_field_type::object_id: {
+        // Both halves folded into one word. Two identities whose halves
+        // cancel fold equal and report as a difference in the value.
+        std::uint64_t folded = 0;
+        for (std::size_t index = 0; index < 16; ++index) {
+            folded ^= std::uint64_t{value.as_object_id()->octets()[index]}
+                      << (index % 8U * 8U);
+        }
+        return folded;
+    }
     case event_field_type::bounded_string:
         for (const auto& text : observability::event_text_descriptors()) {
             if (
@@ -170,16 +180,21 @@ runtime::result<void> event_log_sink::emit_with(
     if (!prepared) {
         return runtime::failure(prepared.error());
     }
-    if (auto compared = compare_next(prepared->value()); !compared) {
+    if (!*prepared) {
+        // Dropped by its kind's rate bound and counted.
+        return {};
+    }
+    auto& reserved = **prepared;
+    if (auto compared = compare_next(reserved.value()); !compared) {
         return runtime::failure(compared.error());
     }
     const auto appended = reservation == nullptr
-                            ? events_.append(prepared->value())
-                            : events_.append(prepared->value(), *reservation);
+                            ? events_.append(reserved.value())
+                            : events_.append(reserved.value(), *reservation);
     if (!appended) {
         return runtime::failure(appended.error());
     }
-    prepared->commit();
+    reserved.commit();
     if (expected_) {
         ++replay_index_;
     }
