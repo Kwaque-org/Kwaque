@@ -147,12 +147,17 @@ def fuzz_coverage_errors(workflow: str, scheduled: str, config: str) -> list[str
             "--test_arg=-max_total_time=600",
             "--test_arg=-timeout=15",
             '--test_arg=-seed="${CAMPAIGN_SEED}"',
+            "--test_env=KWAQUE_FUZZ_MARKS_GATE=1",
             '--test_env=KWAQUE_FUZZ_CORPUS_DIR="${CORPUS}"',
             '--sandbox_writable_path="${CORPUS}"',
             '"${FUZZ_TARGET}"',
         ):
             if flag not in commands[0].split():
                 errors.append(f"scheduled campaign requires {flag}")
+    # The smoke runs take their settings from the workflow and from the
+    # configuration they name; only the scheduled campaign sets the gate.
+    if "KWAQUE_FUZZ_MARKS_GATE" in smoke or "KWAQUE_FUZZ_MARKS_GATE" in config:
+        errors.append("short smoke campaigns must not gate on coverage marks")
     if (
         "seed=$((16#${GITHUB_SHA:0:8}))" not in campaign
         or "          CAMPAIGN_SEED: ${{ steps.seed.outputs.value }}"
@@ -257,7 +262,11 @@ def analysis_coverage_errors(workflow: str) -> list[str]:
     if any("--config=fuzz" not in command.split() for command in fuzz):
         errors.append("keep fuzz analysis in its own build configuration")
     integrity = run_commands(jobs.get("repository-checks", ""))
-    for target in ("//tools:check_determinism",):
+    for target in (
+        "//tools:check_cross_shard_usage",
+        "//tools:check_determinism",
+        "//tools:check_package_edges",
+    ):
         if not any(target in command.split() for command in integrity):
             errors.append(f"repository integrity requires {target}")
     return errors
@@ -1048,6 +1057,7 @@ class CiCoverageTest(unittest.TestCase):
             "uses: actions/cache/restore@",
             "uses: actions/cache/save@",
             '--test_env=KWAQUE_FUZZ_CORPUS_DIR="${CORPUS}"',
+            "--test_env=KWAQUE_FUZZ_MARKS_GATE=1",
             '--test_arg=-seed="${CAMPAIGN_SEED}"',
             "seed=$((16#${GITHUB_SHA:0:8}))",
             "CAMPAIGN_SEED: ${{ steps.seed.outputs.value }}",
@@ -1061,6 +1071,29 @@ class CiCoverageTest(unittest.TestCase):
                         BAZEL_CONFIG.read_text(),
                     )
                 )
+
+    def test_a_smoke_campaign_that_gates_on_marks_fails(self) -> None:
+        gated = self.workflow.replace(
+            "--test_arg=-max_total_time=2",
+            "--test_arg=-max_total_time=2\n          --test_env=KWAQUE_FUZZ_MARKS_GATE=1",
+        )
+        self.assertNotEqual(gated, self.workflow)
+        self.assertIn(
+            "short smoke campaigns must not gate on coverage marks",
+            fuzz_coverage_errors(
+                gated, FUZZ_WORKFLOW.read_text(), BAZEL_CONFIG.read_text()
+            ),
+        )
+        # The fuzz configuration every smoke run names may not set it either.
+        self.assertIn(
+            "short smoke campaigns must not gate on coverage marks",
+            fuzz_coverage_errors(
+                self.workflow,
+                FUZZ_WORKFLOW.read_text(),
+                BAZEL_CONFIG.read_text()
+                + "test:fuzz --test_env=KWAQUE_FUZZ_MARKS_GATE=1\n",
+            ),
+        )
 
     def test_campaign_listing_or_wrong_target_binding_fail(self) -> None:
         scheduled = FUZZ_WORKFLOW.read_text()

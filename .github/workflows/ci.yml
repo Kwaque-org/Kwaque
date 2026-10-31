@@ -407,6 +407,8 @@ jobs:
         run: bazel run --lockfile_mode=error //tools:check_runtime_boundaries
       - name: Check deterministic source boundaries
         run: bazel run --lockfile_mode=error //tools:check_determinism
+      - name: Check replicated-state package edges
+        run: bazel run --lockfile_mode=error //tools:check_package_edges
       - name: Check module files and lock
         # Tidy rewrites use_repo lists and formatting; the lock must then match
         # every module and extension. Either change means a stale commit.
@@ -520,6 +522,7 @@ jobs:
           //src/simulation/tests:fake_file_test
           //src/simulation/tests:fake_file_runtime_test
           //src/simulation/tests:fake_file_replay_test
+          //src/codec/tests:xxh3_64_test
 
       - name: Test the shipped package, broker processes and fuzz replays
         id: shipped

@@ -106,6 +106,87 @@ RULES = (
     ),
 )
 
+# Pure metadata code (the objects, apply and commands of //src/metadata) is one
+# synchronous function of the state and a command, the same live and at
+# replay. Its rules take no allowance: whatever it needs travels in the
+# command, decided by the proposer.
+PURE_SOURCE = re.compile(
+    r"src/metadata/(?:objects|apply|commands)(?:_[a-z0-9_]+)?\.(?:h|cc)"
+)
+PURE_RULES = (
+    Rule(
+        "pure-time",
+        re.compile(
+            r"\bnow\s*\(|\b(?:monotonic_clock|wall_clock|clock_backend|timer_service|"
+            r"lowres_clock|lowres_system_clock|basic_deadlines|deadline_wheel)\b"
+        ),
+        "pure metadata code reads no clock; the proposer carries the time in the command",
+    ),
+    Rule(
+        "pure-random",
+        re.compile(
+            r"\b(?:random_source|identity_entropy\w*|object_id_entropy|mint_object_id|"
+            r"fill_bytes|uniform_u64|chance|next_u64|probability_ratio|"
+            r"deterministic_random|sequential_random_source)\b"
+        ),
+        "pure metadata code draws nothing; the proposer mints and draws into the command",
+    ),
+    Rule(
+        "pure-async",
+        re.compile(
+            r"\bco_(?:await|return|yield)\b|"
+            r"\bseastar\s*::\s*(?:future|promise|sleep|smp|thread|async|with_gate|"
+            r"with_semaphore|make_ready_future|make_exception_future|when_all\w*|"
+            r"parallel_for_each|do_with|repeat|yield)\b|"
+            r"(?:\.|->)\s*(?:then|then_wrapped|finally|handle_exception)\s*\(|"
+            r"\b(?:this_shard_id|current_shard|invoke_on\w*|submit_to)\s*\("
+        ),
+        "apply is one synchronous call on its shard; effects go to bounded queues",
+    ),
+    Rule(
+        "pure-config",
+        re.compile(r"\bconfig\s*::"),
+        "pure metadata code reads no configuration; the proposer resolves it into the command",
+    ),
+    Rule(
+        "pure-mutable-static",
+        re.compile(
+            r"\b(?:static|thread_local)\s+"
+            r"(?!constexpr\b|const\b|consteval\b|inline\s+constexpr\b)"
+            # The type, whose template arguments may hold parentheses, then
+            # the name and its initializer, array bound or literal argument.
+            r"(?:[^;(){}=<]|<[^;{}=]*>)*\b\w+\s*"
+            r"(?:[;={\[]|\((?=\s*[-\d'\"{]))"
+        ),
+        "pure metadata code keeps no state but the state it is given",
+    ),
+)
+# A variable defined at namespace scope without static: pure metadata code
+# keeps no state there either. Checked only outside class and function bodies.
+PURE_NAMESPACE_STATE = re.compile(
+    r"(?m)^[ \t]*(?:inline[ \t]+|extern[ \t]+)?"
+    r"(?!(?:constexpr|const|consteval|constinit|inline|extern|using|typedef|"
+    r"namespace|template|"
+    r"concept|static_assert|static|thread_local|enum|class|struct|union|return|"
+    r"friend|case|default|public|private|protected|else|do)\b)"
+    r"(?:[\w:]+(?:[ \t]*<[^;{}=()]*>)?[ \t*&]+)+\w+[ \t]*(?:=|\{|;|\[)"
+)
+PURE_NAMESPACE_STATE_REMEDIATION = (
+    "pure metadata code keeps no state but the state it is given"
+)
+# Matched on the raw text, because masked_code blanks every include line.
+PURE_INCLUDE = re.compile(
+    r"^[ \t]*#[ \t]*include[ \t]*[\"<](?:src/(?:"
+    r"(?:config|storage|raft|range|broker|simulation|resource|observability)/|"
+    r"runtime/(?!(?:time|error)\.h[\">]))|"
+    r"seastar/(?:coroutine/|core/(?:future|coroutine|sleep|smp|thread|gate|"
+    r"semaphore|when_all|loop|do_with|sharded|timer|lowres_clock)\b))"
+)
+PURE_INCLUDE_REMEDIATION = (
+    "pure metadata code includes only value types: no runtime service, storage, "
+    "configuration, resource, observability, engine or asynchronous Seastar header"
+)
+
 RANDOM_TYPES = r"(?:deterministic_random|sequential_random_source|keyed_random_source|random_engine)"
 RANDOM_DECLARATION = re.compile(
     rf"\b{RANDOM_TYPES}\s+\w+\s*(?:[={{;(])|"
@@ -137,6 +218,13 @@ def declaration_context(code: str, offset: int) -> tuple[bool, bool]:
             contexts.pop()
         boundary = token.end()
     return "body" in contexts, "class" in contexts
+
+
+def pure_namespace_state_matches(code: str):
+    for match in PURE_NAMESPACE_STATE.finditer(code):
+        in_body, in_class = declaration_context(code, match.start())
+        if not in_body and not in_class:
+            yield match
 
 
 def global_random_matches(code: str):
@@ -197,14 +285,17 @@ def hash_names(codes: list[str]) -> set[str]:
             )
             if alias:
                 aliases.add(alias.group(1))
-            variable = re.match(r"\s*[*&]*\s*(\w+)\s*(?:[;={,)])", code[end:])
+            # A variable, member or parameter, or a function returning one.
+            variable = re.match(
+                r"\s*(?:const\b\s*)?[*&]*\s*(\w+)\s*(?:[;={,)(])", code[end:]
+            )
             if variable:
                 names.add(variable.group(1))
     if aliases:
         pattern = re.compile(
             r"\b(?:"
             + "|".join(map(re.escape, sorted(aliases)))
-            + r")\b\s*[*&]*\s*(\w+)\s*(?:[;={,)])"
+            + r")\b\s*(?:const\b\s*)?[*&]*\s*(\w+)\s*(?:[;={,)(])"
         )
         for code in codes:
             names.update(match.group(1) for match in pattern.finditer(code))
@@ -217,12 +308,21 @@ def hash_iteration_rule(names: set[str]) -> Rule:
         if names
         else r"(?!)"
     )
+    call = r"(?:\s*\(\s*\))?"
     return Rule(
         "unordered-iteration",
         re.compile(
-            rf"{name}\s*(?:\.|->)\s*(?:begin|cbegin|rbegin|crbegin)\s*\(|"
+            # Directly, through a getter, or through an algorithm, including
+            # prefixed ones such as absl::c_for_each and std::erase_if.
+            rf"{name}{call}\s*(?:\.|->)\s*(?:begin|cbegin|rbegin|crbegin)\s*\(|"
             rf"\bfor\s*\([^;)]*:\s*[^;)]*{name}[^;)]*\)|"
-            rf"\b(?:begin|cbegin|rbegin|for_each|transform|copy)\s*\(\s*(?:\w+\s*\.\s*)?{name}\b"
+            rf"(?:\b|_)(?:begin|cbegin|rbegin|for_each|transform|copy|accumulate|"
+            rf"erase_if|find_if|min_element|max_element|minmax_element)\s*\(\s*"
+            rf"(?:[\w.>-]+\s*(?:\.|->)\s*)?{name}\b|"
+            # A copy, reference or pointer bound to one, which can then be
+            # iterated under another name.
+            rf"\b(?:auto|decltype\s*\([^)]*\))\s*(?:const\s*)?[&*]*\s*\w+\s*"
+            rf"(?:=|\{{)[^;]*{name}{call}\s*\}}?\s*;"
         ),
         "sort stable keys before observable traversal; review exact commutative cleanup or indexed export",
     )
@@ -395,6 +495,9 @@ ALLOWANCES = (
 # The copy patterns below are byte-buffer transfers, not object serialization.
 # Every occurrence is counted in its exact file; another copy must be reviewed.
 BYTE_COPIES = {
+    "src/simulation/deterministic_random.h": (
+        "runtime::fill_bytes(stream_, std::as_writable_bytes(octets));",
+    ),
     "src/simulation/event_trace.cc": (
         "std::memcpy(destination.data() + copied, chunk.data() + chunk_offset_, count);",
         "std::memcpy(destination.data() + copied, chunk.data() + chunk_offset, count);",
@@ -888,14 +991,25 @@ def is_deterministic_source(path: Path) -> bool:
         return False
     name = path.as_posix()
     return (
-        name.startswith("src/simulation/")
-        or name.startswith("src/runtime/testing/contracts/")
+        name.startswith(
+            (
+                "src/simulation/",
+                "src/runtime/testing/contracts/",
+                "src/metadata/",
+                "src/raft/",
+                "src/range/",
+            )
+        )
         or name.startswith("src/observability/")
         and path.name.startswith(("event", "capture_event"))
         or any("determin" in part for part in path.parts)
         or name.startswith("src/runtime/tests/")
         and path.name in {"time_random_contract_test.cc", "timer_contract_test.cc"}
     )
+
+
+def is_pure_source(path: Path) -> bool:
+    return PURE_SOURCE.fullmatch(path.as_posix()) is not None
 
 
 def masked_code(source: str) -> tuple[str, tuple[int, ...]]:
@@ -972,6 +1086,12 @@ def scan(
     approved: dict[tuple[str, str], list[tuple[int, int]]] = {}
     rule_names = {rule.name for rule in rules}
     for allowance in allowances:
+        if is_pure_source(Path(allowance.path)):
+            violations.append(
+                f"{allowance.path}:1: pure-allowance: pure metadata code takes no "
+                "allowance; use ordered state and inputs carried by the command"
+            )
+            continue
         if (
             allowance.rule not in rule_names
             or not allowance.reason
@@ -1009,7 +1129,9 @@ def scan(
             continue
         approved.setdefault((allowance.path, allowance.rule), []).extend(spans)
     for name, (code, offsets) in prepared.items():
-        for rule in rules if name in deterministic else test_rules:
+        pure = is_pure_source(Path(name))
+        active = rules if name in deterministic else test_rules
+        for rule in active + PURE_RULES if pure else active:
             spans = approved.get((name, rule.name), ())
             for match in rule.pattern.finditer(code):
                 if any(
@@ -1024,6 +1146,18 @@ def scan(
             violations.append(
                 f"{name}:{line}: global-random: keep random sources in explicit per-fixture owners"
             )
+        if pure:
+            for match in pure_namespace_state_matches(code):
+                line = line_number(sources[name], offsets[match.start()])
+                violations.append(
+                    f"{name}:{line}: pure-mutable-static: "
+                    f"{PURE_NAMESPACE_STATE_REMEDIATION}"
+                )
+            for line, text in enumerate(sources[name].splitlines(), start=1):
+                if PURE_INCLUDE.match(text):
+                    violations.append(
+                        f"{name}:{line}: pure-include: {PURE_INCLUDE_REMEDIATION}"
+                    )
     for writer in writers:
         code = prepared.get(writer.path, ("", ()))[0]
         if len(occurrences(code, writer.code)) != 1:

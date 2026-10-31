@@ -38,6 +38,26 @@ class CrossShardUsageTest(unittest.TestCase):
         with destination.open("w", encoding="utf-8", newline="") as source:
             source.write(content)
 
+    def test_rejects_seastar_shard_identity_only_in_simulated_code(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            body = (
+                "auto shard = seastar::this_shard_id();\n"
+                "auto count = seastar::this_smp_shard_count();\n"
+                "for (auto s : seastar::this_smp_all_shards()) {}\n"
+            )
+            self.write(root, "src/storage/owner.cc", body)
+            self.write(root, "src/broker/start.cc", body)
+            violations = scan_paths(root, [Path("src")], allowed_rules={})
+            self.assertEqual(
+                violations,
+                [
+                    f"src/storage/owner.cc:{line}: "
+                    "Seastar shard identity in simulated code"
+                    for line in (1, 2, 3)
+                ],
+            )
+
     def test_rejects_direct_primitives(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
