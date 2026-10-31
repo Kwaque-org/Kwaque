@@ -67,9 +67,17 @@ jobs:
       - name: Allow concurrent linux-aio reactors
         run: sudo sysctl -w fs.aio-max-nr=1048576
       - name: Build all ordinary targets
+        # The simulated storage tests are built next, apart: the largest of
+        # them take up to 4 GiB each to compile, and four at once with other
+        # compiles have run the runner out of memory.
         run: >-
           bazel build --config=ci-release
-          --build_tag_filters=-fuzz,-manual
+          --build_tag_filters=-fuzz,-manual,-simulated_storage
+          //...
+      - name: Build the simulated storage tests two at a time
+        run: >-
+          bazel build --config=ci-release --jobs=2
+          --build_tag_filters=simulated_storage
           //...
 
       - name: Verify optimized runtime, process policy, goldens and storage

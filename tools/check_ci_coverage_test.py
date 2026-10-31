@@ -330,6 +330,16 @@ PROFILE_TARGETS = {
 }
 
 
+def positively_tagged(command: str) -> bool:
+    """A command whose build tag filter selects a tag rather than leaving one out."""
+    return any(
+        tag and not tag.startswith("-")
+        for word in command.split()
+        if word.startswith("--build_tag_filters=")
+        for tag in word.split("=", 1)[1].split(",")
+    )
+
+
 def untagged_broad(command: str) -> bool:
     """A //... test command that no positive tag filter narrows."""
     words = command.split()
@@ -398,6 +408,7 @@ def coverage_errors(workflow: str) -> list[str]:
             if re.search(rf"\bbazel {action}\b", command)
             and f"--config={config}" in command
             and "//..." in command.split()
+            and not positively_tagged(command)
         ]
         if len(broad) != 1:
             errors.append(f"{name}: requires one broad {config} {action} command")
@@ -443,26 +454,40 @@ def coverage_errors(workflow: str) -> list[str]:
                 if command.startswith("bazel test ")
             ):
                 errors.append(f"{name}: execute the storage suite {suite}")
-    for name, excluded in (("build", False), ("arm-build", True)):
-        commands = [
-            command
-            for command in run_commands(jobs.get(name, ""))
-            if command.startswith(("bazel build ", "bazel test "))
-            and "//..." in command.split()
-        ]
-        if any(
-            (ARM_RELEASE_EXCLUSION in command.split()) != excluded
-            or ("simulated_storage" in command) != excluded
-            for command in commands
-        ):
-            errors.append(
-                f"{name}: "
-                + (
-                    "leave only the simulated storage tests out of aarch64 release"
-                    if excluded
-                    else "compile the simulated storage tests on x86-64 release"
-                )
-            )
+    arm_commands = [
+        command
+        for command in run_commands(jobs.get("arm-build", ""))
+        if command.startswith(("bazel build ", "bazel test "))
+        and "//..." in command.split()
+    ]
+    if any(ARM_RELEASE_EXCLUSION not in command.split() for command in arm_commands):
+        errors.append(
+            "arm-build: leave only the simulated storage tests out of aarch64 release"
+        )
+    # x86-64 release compiles the simulated storage tests in a build of their
+    # own, two compiles at a time: the largest take up to 4 GiB each.
+    builds = [
+        command
+        for command in run_commands(jobs.get("build", ""))
+        if command.startswith("bazel build ") and "//..." in command.split()
+    ]
+    alone = [
+        command
+        for command in builds
+        if "--build_tag_filters=simulated_storage" in command.split()
+    ]
+    if (
+        len(alone) != 1
+        or "--jobs=2" not in alone[0].split()
+        or any(
+            ARM_RELEASE_EXCLUSION not in command.split()
+            for command in builds
+            if command not in alone
+        )
+    ):
+        errors.append(
+            "build: compile the simulated storage tests on x86-64 release, alone"
+        )
     arm = jobs.get("arm-build", "")
     if "runs-on: ubuntu-24.04-arm" not in arm:
         errors.append("arm-build: use a native aarch64 runner")
@@ -1229,9 +1254,19 @@ class CiCoverageTest(unittest.TestCase):
             self.workflow.replace(
                 build,
                 build.replace(
-                    "--build_tag_filters=-fuzz,-manual", ARM_RELEASE_EXCLUSION, 1
+                    "--build_tag_filters=simulated_storage",
+                    "--build_tag_filters=-simulated_storage",
                 ),
             ),
+            # x86-64 release compiles them beside every other compile.
+            self.workflow.replace(
+                build,
+                build.replace(
+                    ARM_RELEASE_EXCLUSION, "--build_tag_filters=-fuzz,-manual"
+                ),
+            ),
+            # Its build of them runs as many compiles as the runner has cores.
+            self.workflow.replace(build, build.replace(" --jobs=2", "")),
             # aarch64 release leaves out more than the simulated tests.
             self.workflow.replace(
                 arm,
