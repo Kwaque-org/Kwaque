@@ -134,7 +134,7 @@ void register_routes(
         return liveness_response(local_state->live());
     });
     put_json_route(routes, "/v1/health/ready", [local_state] {
-        return readiness_response(local_state->ready());
+        return readiness_response(local_state->ready(), local_state->reasons());
     });
     put_json_route(routes, "/v1/version", [version_json] {
         return json_response{
@@ -155,6 +155,34 @@ void register_routes(
 
 } // namespace
 
+namespace detail {
+
+struct admin_shards final {
+    seastar::sharded<admin_state> states;
+};
+
+} // namespace detail
+
+namespace {
+
+// Every shard's latest statement reaches the owner before any shard starts,
+// so a reason held before the start finishes keeps the broker unready even
+// while that shard's own message is still on its way. Each shard starts with
+// the settled set.
+seastar::future<>
+start_every_shard(detail::admin_shards& shards, double seconds) {
+    auto& states = shards.states;
+    const auto statements = co_await states.map(
+      [](admin_state& state) { return state.latest_statement(); });
+    const auto settled = states.local().settle(statements);
+    co_await states.invoke_on_all([seconds, settled](admin_state& state) {
+        state.apply_reasons(settled.reasons, settled.version);
+        state.mark_started(seconds);
+    });
+}
+
+} // namespace
+
 class admin_server::impl final {
 public:
     impl()
@@ -162,7 +190,7 @@ public:
 
     enum class lifecycle { constructed, starting, started, stopping, stopped };
 
-    seastar::sharded<admin_state> states_;
+    detail::admin_shards shards_;
     seastar::httpd::http_server_control server_;
     std::string version_json_;
     seastar::shared_promise<> stop_done_;
@@ -225,10 +253,10 @@ seastar::future<> admin_server::start(
         impl_->scheduling_group_ = co_await seastar::create_scheduling_group(
           "admin", scheduling_shares);
         check_abort();
-        co_await impl_->states_.start();
+        co_await impl_->shards_.states.start();
         impl_->states_started_ = true;
         check_abort();
-        co_await impl_->states_.invoke_on_all(
+        co_await impl_->shards_.states.invoke_on_all(
           [](admin_state& state) { state.register_metrics(); });
         check_abort();
 
@@ -260,7 +288,7 @@ seastar::future<> admin_server::start(
                 });
           });
         check_abort();
-        auto* states = &impl_->states_;
+        auto* states = &impl_->shards_.states;
         const auto version_json = impl_->version_json_;
         co_await impl_->server_.set_routes(
           [states, version_json](seastar::httpd::routes& routes) {
@@ -292,7 +320,7 @@ seastar::future<> admin_server::start(
                 options);
           });
         check_abort();
-        co_await impl_->states_.invoke_on_all(
+        co_await impl_->shards_.states.invoke_on_all(
           [shard_count](admin_state& state) {
               state.listener_started(shard_count);
           });
@@ -310,7 +338,7 @@ seastar::future<> admin_server::start(
         }
         if (impl_->states_started_) {
             try {
-                co_await impl_->states_.stop();
+                co_await impl_->shards_.states.stop();
             } catch (...) {
             }
             impl_->states_started_ = false;
@@ -331,8 +359,38 @@ seastar::future<> admin_server::start(
     impl_->operation_active_ = false;
 }
 
-seastar::future<>
-admin_server::mark_ready(std::chrono::steady_clock::duration startup_duration) {
+void readiness_reporter::operator()(
+  readiness_reason reason, bool held) const noexcept {
+    shards_->states.local().report(reason, held);
+}
+
+readiness_reporter admin_server::reporter() {
+    assert_current();
+    if (impl_->state_ != impl::lifecycle::started) {
+        throw std::logic_error("admin server is not started");
+    }
+    return readiness_reporter{impl_->shards_};
+}
+
+void admin_server::observe_readiness(
+  std::function<void(bool ready, readiness_reasons reasons)> observer) {
+    assert_current();
+    if (impl_->state_ != impl::lifecycle::started) {
+        throw std::logic_error("admin server is not started");
+    }
+    impl_->shards_.states.local().observe_readiness(std::move(observer));
+}
+
+seastar::future<std::vector<std::pair<bool, readiness_reasons>>>
+admin_server::readiness_by_shard_for_testing() {
+    assert_current();
+    return impl_->shards_.states.map([](admin_state& state) {
+        return std::pair{state.ready(), state.reasons()};
+    });
+}
+
+seastar::future<> admin_server::mark_started(
+  std::chrono::steady_clock::duration startup_duration) {
     assert_current();
     if (impl_->state_ != impl::lifecycle::started || impl_->draining_) {
         return seastar::make_exception_future<>(
@@ -341,8 +399,7 @@ admin_server::mark_ready(std::chrono::steady_clock::duration startup_duration) {
     const auto seconds
       = std::chrono::duration<double>(startup_duration).count();
     return seastar::with_gate(impl_->operations_, [this, seconds] {
-        return impl_->states_.invoke_on_all(
-          [seconds](admin_state& state) { state.mark_ready(seconds); });
+        return start_every_shard(impl_->shards_, seconds);
     });
 }
 
@@ -354,9 +411,9 @@ seastar::future<> admin_server::begin_shutdown() {
     impl_->draining_ = true;
     // Publish local health before waiting for acknowledgements from other
     // shards.
-    impl_->states_.local().begin_shutdown();
+    impl_->shards_.states.local().begin_shutdown();
     return seastar::with_gate(impl_->operations_, [this] {
-        return impl_->states_.invoke_on_all(
+        return impl_->shards_.states.invoke_on_all(
           [](admin_state& state) { state.begin_shutdown(); });
     });
 }
@@ -405,7 +462,7 @@ seastar::future<> admin_server::stop_once() {
         failure = std::current_exception();
     }
     try {
-        co_await impl_->states_.invoke_on_all(
+        co_await impl_->shards_.states.invoke_on_all(
           [](admin_state& state) { state.begin_shutdown(); });
     } catch (...) {
         if (!failure) {
@@ -424,7 +481,7 @@ seastar::future<> admin_server::stop_once() {
     }
     if (impl_->states_started_) {
         try {
-            co_await impl_->states_.stop();
+            co_await impl_->shards_.states.stop();
         } catch (...) {
             if (!failure) {
                 failure = std::current_exception();

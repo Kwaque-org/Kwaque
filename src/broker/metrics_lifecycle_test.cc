@@ -186,9 +186,13 @@ SEASTAR_TEST_CASE(runtime_and_admin_metrics_follow_endpoint_lifecycle) {
       kwaque::metric_id::memory_configured_bytes,
       kwaque::metric_id::memory_waiters,
       2U);
+    co_await require_metric_range(
+      kwaque::metric_id::observability_events_suppressed_total,
+      kwaque::metric_id::observability_events_suppressed_total,
+      2U);
 
     co_await admin.start("127.0.0.1", 0, seastar::this_smp_shard_count());
-    co_await admin.mark_ready(std::chrono::steady_clock::duration::zero());
+    co_await admin.mark_started(std::chrono::steady_clock::duration::zero());
     co_await require_metric_range(
       kwaque::metric_id::broker_process_readiness,
       kwaque::metric_id::broker_start_time_seconds,
@@ -204,6 +208,28 @@ SEASTAR_TEST_CASE(runtime_and_admin_metrics_follow_endpoint_lifecycle) {
       usage.families * 4U, kwaque::admin::metrics_snapshot_families * 3U);
     BOOST_CHECK_LE(
       usage.series * 4U, kwaque::admin::metrics_snapshot_series * 3U);
+    // What is not Kwaque's is Seastar's, and the schema's budgets reserve it.
+    std::size_t kwaque_families = kwaque::metric_build_info_families;
+    std::size_t kwaque_series = kwaque::metric_build_info_series;
+    for (const auto& descriptor : kwaque::metric_descriptors()) {
+        for (const auto group :
+             {"runtime_task",
+              "resource_manager",
+              "runtime_timer",
+              "runtime_file",
+              "runtime_network",
+              "runtime_dns",
+              "observability",
+              "broker"}) {
+            if (descriptor.group == group) {
+                ++kwaque_families;
+                kwaque_series += kwaque::metric_series_count(descriptor.labels);
+            }
+        }
+    }
+    BOOST_CHECK_LE(
+      usage.families, kwaque::metric_native_families + kwaque_families);
+    BOOST_CHECK_LE(usage.series, kwaque::metric_native_series + kwaque_series);
 
     co_await admin.stop();
     co_await require_metric_range(

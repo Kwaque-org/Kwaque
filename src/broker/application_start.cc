@@ -8,8 +8,10 @@
 #include "src/broker/exit_code.h"
 #include "src/broker/host_checks.h"
 #include "src/broker/service_manager.h"
+#include "src/observability/event.h"
 #include "src/observability/event_identity.h"
 #include "src/resource/resource_config.h"
+#include "src/resource/workload_class.h"
 #include "src/runtime/production/random.h"
 
 #include <seastar/core/abort_source.hh>
@@ -242,13 +244,74 @@ application_state::start_admin(byte_count memory_reservation) {
       },
       [this] { return admin_server_->stop(); });
     stop_signal_->abort_source().check();
-    co_await admin_server_->mark_ready(
+    admin_server_->observe_readiness(
+      [this](bool ready, readiness_reasons reasons) {
+          emit_readiness_changed(ready, reasons);
+      });
+    co_await admin_server_->mark_started(
       std::chrono::steady_clock::now() - startup_started_at_);
     stop_signal_->abort_source().check();
     log::broker().info(
       "startup stage=admin state=ready address={} port={}",
       configuration_->admin_address,
       configuration_->admin_port);
+}
+
+void application_state::emit_readiness_changed(
+  bool ready, readiness_reasons reasons) noexcept {
+    using observability::event_field;
+    using observability::event_field_key;
+    using observability::event_field_value;
+    using observability::event_public_text;
+    // Building the event fails only if the event schema changed under it;
+    // either way the event is not recorded and readiness is unaffected.
+    const auto not_recorded =
+      [](const runtime::operation_error& error) noexcept {
+          try {
+              log::broker().warn(
+                "readiness event not recorded: {}",
+                make_error_code(error.code()).message());
+          } catch (...) {
+          }
+      };
+    auto state = observability::event_text::make(
+      ready ? event_public_text::state_ready
+            : event_public_text::state_not_ready);
+    if (!state) {
+        not_recorded(state.error());
+        return;
+    }
+    const std::array fields{
+      event_field{
+        .key = event_field_key::state,
+        .value = event_field_value::from_text(*state)},
+      event_field{
+        .key = event_field_key::reasons,
+        .value = event_field_value::from_unsigned(reasons)},
+    };
+    auto request = observability::event_request::make(
+      observability::event_request_context{
+        .kind = observability::event_kind::readiness_changed,
+        .severity = ready ? observability::event_severity::info
+                          : observability::event_severity::warning,
+        .monotonic = runtime::production::environment::monotonic_clock::now(),
+        .wall = runtime::production::environment::wall_clock::now(),
+        .workload = resource::workload_class::maintenance,
+      },
+      fields);
+    if (!request) {
+        not_recorded(request.error());
+        return;
+    }
+    try {
+        if (
+          auto emitted = environments_->local().event_sink().emit(*request);
+          !emitted) {
+            not_recorded(emitted.error());
+        }
+    } catch (...) {
+        // The environment has stopped; readiness itself is unaffected.
+    }
 }
 
 seastar::future<> application_state::start_services() {

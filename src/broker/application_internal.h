@@ -1,6 +1,7 @@
 #pragma once
 
 #include "src/admin/admin_server.h"
+#include "src/base/readiness.h"
 #include "src/broker/crash_limiter.h"
 #include "src/broker/crash_recorder.h"
 #include "src/broker/pid_file.h"
@@ -107,6 +108,9 @@ private:
     start_resource_registry(resource::resource_config configuration);
     [[nodiscard]] seastar::future<> start_environments();
     [[nodiscard]] seastar::future<> start_admin(byte_count memory_reservation);
+    // Records a change of the broker's readiness, or of the reasons it holds,
+    // as a state-change event on shard 0.
+    void emit_readiness_changed(bool ready, readiness_reasons reasons) noexcept;
     [[nodiscard]] seastar::future<>
     check_host(const seastar::app_template::seastar_options* runtime_options);
     template<typename Checkpoint>

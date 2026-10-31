@@ -1,5 +1,7 @@
 #pragma once
 
+#include "src/base/readiness.h"
+
 #include <cstddef>
 #include <cstdint>
 #include <string>
@@ -23,7 +25,9 @@ struct json_response final {
 };
 
 [[nodiscard]] json_response liveness_response(bool live);
-[[nodiscard]] json_response readiness_response(bool ready);
+// Not ready names the readiness reasons held across the broker, if any.
+[[nodiscard]] json_response
+readiness_response(bool ready, readiness_reasons held = 0);
 [[nodiscard]] json_response not_found_response();
 [[nodiscard]] json_response method_not_allowed_response();
 

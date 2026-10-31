@@ -9,7 +9,9 @@ kwaque_cc_library(
     hdrs = ["admin_state.h"],
     deps = [
         "//src/base:build_info",
+        "//src/base:invariant",
         "//src/base:metric_schema",
+        "//src/base:readiness",
         "//src/runtime:shard_affinity",
         "@seastar",
     ],
@@ -19,14 +21,20 @@ kwaque_cc_library(
     name = "admin_responses",
     srcs = ["admin_responses.cc"],
     hdrs = ["admin_responses.h"],
-    deps = ["//src/base:build_info"],
+    deps = [
+        "//src/base:build_info",
+        "//src/base:readiness",
+    ],
 )
 
 kwaque_cc_library(
     name = "admin_limits",
     hdrs = ["admin_limits.h"],
     visibility = ["//src/broker:__pkg__"],
-    deps = ["//src/base"],
+    deps = [
+        "//src/base",
+        "//src/base:metric_schema",
+    ],
 )
 
 kwaque_cc_library(
@@ -39,6 +47,7 @@ kwaque_cc_library(
         ":admin_responses",
         ":admin_state",
         "//src/base:invariant",
+        "//src/base:readiness",
         "//src/runtime:shard_affinity",
         "@seastar",
     ],
@@ -81,6 +90,7 @@ kwaque_cc_seastar_gtest(
         ":admin_server",
         ":admin_server_test_support",
         "//src/base",
+        "//src/base:readiness",
     ],
 )
 
@@ -101,5 +111,6 @@ kwaque_cc_test(
     deps = [
         ":admin_responses",
         "//src/base:build_info",
+        "//src/base:readiness",
     ],
 )
