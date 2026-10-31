@@ -432,9 +432,9 @@ def coverage_errors(workflow: str) -> list[str]:
 
     # The x86-64 debug goldens run inside the test job's //... suite.
     for name, config, runner in (
-        ("build", "ci-release", "blacksmith-4vcpu-ubuntu-2204"),
-        ("arm-build", "ci-release", "blacksmith-4vcpu-ubuntu-2204-arm"),
-        ("goldens", "ci-debug", "blacksmith-4vcpu-ubuntu-2204-arm"),
+        ("build", "ci-release", "blacksmith-4vcpu-ubuntu-2404"),
+        ("arm-build", "ci-release", "blacksmith-4vcpu-ubuntu-2404-arm"),
+        ("goldens", "ci-debug", "blacksmith-4vcpu-ubuntu-2404-arm"),
     ):
         job = jobs.get(name, "")
         if f"    runs-on: {runner}\n" not in job:
@@ -489,7 +489,7 @@ def coverage_errors(workflow: str) -> list[str]:
             "build: compile the simulated storage tests on x86-64 release, alone"
         )
     arm = jobs.get("arm-build", "")
-    if "runs-on: blacksmith-4vcpu-ubuntu-2204-arm" not in arm:
+    if "runs-on: blacksmith-4vcpu-ubuntu-2404-arm" not in arm:
         errors.append("arm-build: use a native aarch64 runner")
     if "//src/simulation/tests:fake_file_replay_test" not in arm:
         errors.append("arm-build: retain the wider release runtime coverage")
@@ -808,8 +808,8 @@ class CiCoverageTest(unittest.TestCase):
         self.assertIn("permissions:\n  contents: read\n", release)
         package = jobs["package"]
         for runner in (
-            "blacksmith-4vcpu-ubuntu-2204",
-            "blacksmith-4vcpu-ubuntu-2204-arm",
+            "blacksmith-4vcpu-ubuntu-2404",
+            "blacksmith-4vcpu-ubuntu-2404-arm",
         ):
             self.assertIn(f"          - {runner}\n", package)
         commands = run_commands(package)
@@ -1207,8 +1207,8 @@ class CiCoverageTest(unittest.TestCase):
                 self.workflow.replace(
                     goldens,
                     goldens.replace(
-                        "blacksmith-4vcpu-ubuntu-2204-arm",
-                        "blacksmith-4vcpu-ubuntu-2204",
+                        "blacksmith-4vcpu-ubuntu-2404-arm",
+                        "blacksmith-4vcpu-ubuntu-2404",
                     ),
                 )
             )

@@ -24,7 +24,7 @@ jobs:
     # attempt of its run checks nothing, and "Re-run all jobs" on that run
     # starts every check. Every other job needs this one.
     if: github.event.pull_request.user.login != 'dependabot[bot]' || github.run_attempt != '1'
-    runs-on: blacksmith-4vcpu-ubuntu-2204
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 10
     outputs:
       run_checks: ${{ steps.changes.outputs.run_checks }}
@@ -56,7 +56,7 @@ jobs:
     name: Release build and shipped-artifact tests
     needs: workflow-lint
     if: needs.workflow-lint.outputs.run_checks != 'false'
-    runs-on: blacksmith-4vcpu-ubuntu-2204
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 150
     steps:
       - name: Check out source
@@ -121,7 +121,7 @@ jobs:
     name: Native policy without allocation injection
     needs: workflow-lint
     if: needs.workflow-lint.outputs.run_checks != 'false'
-    runs-on: blacksmith-4vcpu-ubuntu-2204
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 90
     steps:
       - name: Check out source
@@ -149,7 +149,7 @@ jobs:
     name: Native allocation injection, unit and smoke tests
     needs: workflow-lint
     if: needs.workflow-lint.outputs.run_checks != 'false'
-    runs-on: blacksmith-4vcpu-ubuntu-2204
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 120
     steps:
       - name: Check out source
@@ -186,7 +186,7 @@ jobs:
     name: ASan and UBSan
     needs: workflow-lint
     if: needs.workflow-lint.outputs.run_checks != 'false'
-    runs-on: blacksmith-4vcpu-ubuntu-2204
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 150
     steps:
       - name: Check out source
@@ -214,7 +214,7 @@ jobs:
     name: Goldens and native storage (aarch64, debug)
     needs: workflow-lint
     if: needs.workflow-lint.outputs.run_checks != 'false'
-    runs-on: blacksmith-4vcpu-ubuntu-2204-arm
+    runs-on: blacksmith-4vcpu-ubuntu-2404-arm
     timeout-minutes: 90
     steps:
       - name: Check out source
@@ -251,7 +251,7 @@ jobs:
     name: C++ and Bazel formatting
     needs: workflow-lint
     if: needs.workflow-lint.outputs.run_checks != 'false'
-    runs-on: blacksmith-4vcpu-ubuntu-2204
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 15
     steps:
       - name: Check out source
@@ -268,7 +268,7 @@ jobs:
     name: Python formatting and lint
     needs: workflow-lint
     if: needs.workflow-lint.outputs.run_checks != 'false'
-    runs-on: blacksmith-4vcpu-ubuntu-2204
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 10
     steps:
       - name: Check out source
@@ -292,7 +292,7 @@ jobs:
     name: Clang tidy
     needs: workflow-lint
     if: needs.workflow-lint.outputs.run_checks != 'false'
-    runs-on: blacksmith-4vcpu-ubuntu-2204
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 240
     steps:
       - name: Check out source
@@ -327,7 +327,7 @@ jobs:
     name: Clang tidy for fuzz sources
     needs: workflow-lint
     if: needs.workflow-lint.outputs.run_checks != 'false'
-    runs-on: blacksmith-4vcpu-ubuntu-2204
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 240
     steps:
       - name: Check out source
@@ -361,7 +361,7 @@ jobs:
     name: Repository integrity
     needs: workflow-lint
     if: needs.workflow-lint.outputs.run_checks != 'false'
-    runs-on: blacksmith-4vcpu-ubuntu-2204
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 20
     steps:
       - name: Check out source
@@ -397,7 +397,7 @@ jobs:
     name: ASan and UBSan fuzz smoke
     needs: workflow-lint
     if: needs.workflow-lint.outputs.run_checks != 'false'
-    runs-on: blacksmith-4vcpu-ubuntu-2204
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 90
     steps:
       - name: Check out source
@@ -427,7 +427,7 @@ jobs:
     name: Linux aarch64 release build and tests
     needs: workflow-lint
     if: needs.workflow-lint.outputs.run_checks != 'false'
-    runs-on: blacksmith-4vcpu-ubuntu-2204-arm
+    runs-on: blacksmith-4vcpu-ubuntu-2404-arm
     timeout-minutes: 150
     steps:
       - name: Check out source
@@ -534,7 +534,7 @@ jobs:
       - repository-checks
       - fuzz-smoke
       - arm-build
-    runs-on: blacksmith-4vcpu-ubuntu-2204
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 5
     steps:
       - if: ${{ needs.workflow-lint.result == 'skipped' }}

@@ -15,7 +15,7 @@ concurrency:
 jobs:
   stress:
     name: Repeated smoke and lifecycle tests
-    runs-on: blacksmith-4vcpu-ubuntu-2204
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 120
     steps:
       - name: Check out source
@@ -45,7 +45,7 @@ jobs:
 
   coverage:
     name: LLVM line coverage
-    runs-on: blacksmith-4vcpu-ubuntu-2204
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 150
     steps:
       - name: Check out source
@@ -79,7 +79,7 @@ jobs:
 
   sweeps:
     name: Every cut of the storage crash sweeps (sanitizer)
-    runs-on: blacksmith-4vcpu-ubuntu-2204
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 300
     steps:
       - name: Check out source
@@ -114,7 +114,7 @@ jobs:
 
   scale:
     name: Every allocation point and the storage maxima (debug)
-    runs-on: blacksmith-4vcpu-ubuntu-2204
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 330
     steps:
       - name: Check out source
@@ -143,7 +143,7 @@ jobs:
   # byte-identical archives.
   reproducible-package-a:
     name: Release package, first build
-    runs-on: blacksmith-4vcpu-ubuntu-2204
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 120
     steps:
       - name: Check out source
@@ -169,7 +169,7 @@ jobs:
 
   reproducible-package-b:
     name: Release package, second build
-    runs-on: blacksmith-4vcpu-ubuntu-2204
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 120
     steps:
       - name: Check out source at another path
@@ -196,7 +196,7 @@ jobs:
   reproducible-package:
     name: Reproducible release package
     needs: [reproducible-package-a, reproducible-package-b]
-    runs-on: blacksmith-4vcpu-ubuntu-2204
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 15
     steps:
       - name: Download both builds
