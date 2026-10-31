@@ -718,7 +718,7 @@ class CiCoverageTest(unittest.TestCase):
                 if "//tools:clang_tidy" in command:
                     self.assertIn("-- --jobs=2", command)
 
-    def test_caches_hold_downloads_written_only_from_main(self) -> None:
+    def test_caches_hold_downloads_and_never_test_results(self) -> None:
         setup = SETUP_BUILD.read_text()
         self.assertIn("disk-cache: false", setup)
         self.assertIn("repository-cache: true", setup)
@@ -726,6 +726,15 @@ class CiCoverageTest(unittest.TestCase):
         self.assertIn("cache-save: ${{ github.ref == 'refs/heads/main' }}", setup)
         self.assertNotIn("--disk_cache", setup)
         self.assertNotIn("inputs:", setup)
+        # The runner's remote cache holds build outputs, never test results:
+        # every test runs on every run. setup-bazel rewrites ~/.bazelrc, so the
+        # rule is added after it.
+        rule = 'echo "build --modify_execution_info=TestRunner=+no-cache"'
+        self.assertIn(rule, setup)
+        self.assertGreater(
+            setup.find(rule), setup.find("uses: bazel-contrib/setup-bazel@")
+        )
+        self.assertIn('} >> "${HOME}/.bazelrc"', setup)
         for workflow in (
             self.workflow,
             FUZZ_WORKFLOW.read_text(),

@@ -15,10 +15,20 @@ runs:
       uses: bazel-contrib/setup-bazel@c5acdfb288317d0b5c0bbd7a396a3dc868bb0f86 # 0.19.0
       with:
         bazelisk-cache: true
-        # Build outputs are not cached here: per-configuration snapshots
-        # exceed the repository's cache budget and evict each other. Downloads
-        # are cached, and only runs on main write them; pull requests and
-        # merge queue runs restore what main saved.
+        # Build outputs are not cached here: Blacksmith's runners give Bazel a
+        # remote cache for them. Downloads are cached, and only runs on main
+        # write them; pull requests and merge queue runs restore what main
+        # saved.
         disk-cache: false
         repository-cache: true
         cache-save: ${{ github.ref == 'refs/heads/main' }}
+    # setup-bazel rewrites ~/.bazelrc, so this comes after it.
+    - name: Keep test results out of the remote cache
+      shell: bash
+      run: |
+        # Every test runs on every run.
+        # setup-bazel leaves its last line unterminated.
+        {
+          echo
+          echo "build --modify_execution_info=TestRunner=+no-cache"
+        } >> "${HOME}/.bazelrc"
