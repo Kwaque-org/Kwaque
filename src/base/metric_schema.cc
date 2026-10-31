@@ -1,5 +1,7 @@
 #include "src/base/metric_schema.h"
 
+#include "src/base/names.h"
+
 #include <array>
 
 namespace kwaque {
@@ -652,21 +654,18 @@ constexpr std::array descriptors{
     metric_value_kind::gauge,
     metric_label_domain::none,
     true},
+  metric_descriptor{
+    metric_id::observability_events_suppressed_total,
+    "observability",
+    "events_suppressed_total",
+    "Events of rate-bounded kinds dropped by their rate bound",
+    metric_value_kind::counter,
+    metric_label_domain::none,
+    true},
 };
 
 [[nodiscard]] consteval bool valid_name(std::string_view name) {
-    if (
-      name.empty() || name.size() > 64 || name.front() < 'a'
-      || name.front() > 'z') {
-        return false;
-    }
-    for (const char value : name) {
-        if (!((value >= 'a' && value <= 'z') || (value >= '0' && value <= '9')
-              || value == '_')) {
-            return false;
-        }
-    }
-    return true;
+    return is_lowercase_name(name, 64);
 }
 
 [[nodiscard]] consteval bool descriptors_are_valid() {
@@ -678,7 +677,7 @@ constexpr std::array descriptors{
           || !valid_name(descriptor.group) || !valid_name(descriptor.name)
           || descriptor.help.empty() || descriptor.help.size() > 160
           || (descriptor.kind != metric_value_kind::gauge && descriptor.kind != metric_value_kind::counter)
-          || (descriptor.labels != metric_label_domain::none && descriptor.labels != metric_label_domain::workload)
+          || metric_series_count(descriptor.labels) == 0
           || !descriptor.aggregate_shard) {
             return false;
         }
@@ -697,6 +696,93 @@ constexpr std::array descriptors{
 }
 
 static_assert(descriptors_are_valid());
+
+[[nodiscard]] consteval bool label_values_are_valid() {
+    // Each value appears once and passes `valid`.
+    const auto valid_set = [](auto values, auto valid) {
+        for (std::size_t index = 0; index < values.size(); ++index) {
+            if (!valid(values[index])) {
+                return false;
+            }
+            for (std::size_t other = index + 1U; other < values.size();
+                 ++other) {
+                if (values[index] == values[other]) {
+                    return false;
+                }
+            }
+        }
+        return true;
+    };
+    const auto digit = [](std::string_view value) {
+        return value.size() == 1 && value.front() >= '0'
+               && value.front() <= '9';
+    };
+    const auto name = [](std::string_view value) {
+        return is_lowercase_name(value, 64);
+    };
+    return valid_set(metric_device_label_values, digit)
+           && valid_set(metric_chain_step_label_values, name)
+           && valid_set(metric_refusal_label_values, name);
+}
+
+static_assert(label_values_are_valid());
+
+[[nodiscard]] consteval bool is_simulation_group(std::string_view group) {
+    for (const auto simulation : metric_simulation_groups) {
+        if (group == simulation) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// Every group a broker shard registers has a budget its descriptors fit, and
+// the budgets fit the shard's share of the scrape caps after Seastar's own
+// metrics and the build information series.
+[[nodiscard]] consteval bool budgets_hold() {
+    std::size_t families = metric_native_families + metric_io_queue_families
+                           + metric_build_info_families;
+    std::size_t series = metric_native_series + metric_build_info_series;
+    for (std::size_t index = 0; index < metric_group_budgets.size(); ++index) {
+        const auto& budget = metric_group_budgets[index];
+        families += budget.families;
+        series += budget.series;
+        for (std::size_t other = index + 1U;
+             other < metric_group_budgets.size();
+             ++other) {
+            if (budget.group == metric_group_budgets[other].group) {
+                return false;
+            }
+        }
+        std::size_t used_families = 0;
+        std::size_t used_series = 0;
+        for (const auto& descriptor : descriptors) {
+            if (descriptor.group == budget.group) {
+                ++used_families;
+                used_series += metric_series_count(descriptor.labels);
+            }
+        }
+        if (used_families > budget.families || used_series > budget.series) {
+            return false;
+        }
+    }
+    for (const auto& descriptor : descriptors) {
+        if (is_simulation_group(descriptor.group)) {
+            continue;
+        }
+        bool budgeted = false;
+        for (const auto& budget : metric_group_budgets) {
+            budgeted = budgeted || budget.group == descriptor.group;
+        }
+        if (!budgeted) {
+            return false;
+        }
+    }
+    return families <= metric_shard_families_cap
+           && series <= metric_shard_series_cap;
+}
+
+static_assert(budgets_hold());
 
 } // namespace
 

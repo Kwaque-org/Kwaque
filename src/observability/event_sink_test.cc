@@ -237,3 +237,58 @@ SEASTAR_TEST_CASE(capture_sink_is_reserved_bounded_and_stoppable) {
     BOOST_CHECK(after_stop.error().code() == kwaque::errc::closed);
     co_return;
 }
+
+SEASTAR_TEST_CASE(production_sink_prints_object_ids_and_bounds_refusals) {
+    using kwaque::observability::event_object_id;
+    std::ostringstream output;
+    ostream_guard restore_output{output};
+    seastar::logger logger{"kwaque-event-test"};
+    logger.set_level(seastar::log_level::trace);
+    production_event_sink sink{logger, identity()};
+
+    event_object_id::octets_type octets{};
+    for (std::size_t index = 0; index < octets.size(); ++index) {
+        octets[index] = static_cast<std::uint8_t>(0xa0 + index);
+    }
+    const auto identity_value = event_object_id::make(octets);
+    BOOST_REQUIRE(identity_value.has_value());
+    const auto refusal = [&identity_value](std::uint64_t monotonic) {
+        const std::array fields{
+          event_field{
+            .key = event_field_key::outcome,
+            .value = event_field_value::from_text(
+              text(event_public_text::outcome_no_space))},
+          event_field{
+            .key = event_field_key::topic_id,
+            .value = event_field_value::from_object_id(*identity_value)},
+        };
+        auto made = event_request::make(
+          event_request_context{
+            .kind = event_kind::append_refused,
+            .severity = event_severity::warning,
+            .monotonic = kwaque::runtime::monotonic_time{monotonic},
+            .wall = kwaque::runtime::wall_time{0},
+            .workload = kwaque::resource::workload_class::foreground_protocol,
+          },
+          fields);
+        BOOST_REQUIRE(made.has_value());
+        return *made;
+    };
+    BOOST_REQUIRE(sink.emit(refusal(0)).has_value());
+    // The RFC 9562 text form, octets in canonical order.
+    BOOST_CHECK(
+      output.str().find("topic_id=a0a1a2a3-a4a5-a6a7-a8a9-aaabacadaeaf")
+      != std::string::npos);
+    BOOST_CHECK(output.str().find("suppressed=") == std::string::npos);
+    // Two more inside the same second are dropped, counted and not printed;
+    // the next second's carries them.
+    BOOST_REQUIRE(sink.emit(refusal(1)).has_value());
+    BOOST_REQUIRE(sink.emit(refusal(2)).has_value());
+    BOOST_CHECK_EQUAL(sink.suppressed_total(), 2U);
+    BOOST_CHECK_EQUAL(sink.last_sequence(), 1U);
+    BOOST_REQUIRE(sink.emit(refusal(1'000'000'000)).has_value());
+    BOOST_CHECK(output.str().find("suppressed=2") != std::string::npos);
+    BOOST_CHECK_EQUAL(sink.last_sequence(), 2U);
+    BOOST_REQUIRE(sink.stop().has_value());
+    co_return;
+}

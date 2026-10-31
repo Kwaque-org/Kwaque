@@ -9,6 +9,8 @@ kwaque_cc_library(
     hdrs = ["event.h"],
     visibility = ["//visibility:public"],
     deps = [
+        "//src/base:invariant",
+        "//src/base:names",
         "//src/resource:workload_class",
         "//src/runtime:error",
         "//src/runtime:shard_affinity",
@@ -49,7 +51,9 @@ kwaque_cc_library(
         ":event_identity",
         "//src/base:invariant",
         "//src/runtime:error",
+        "//src/runtime:gcra",
         "//src/runtime:shard_affinity",
+        "//src/runtime:time",
     ],
 )
 
@@ -137,7 +141,10 @@ kwaque_cc_seastar_test(
     srcs = ["event_test.cc"],
     cpu = 1,
     memory = "128MiB",
-    deps = [":event"],
+    deps = [
+        ":event",
+        "//src/base:metric_schema",
+    ],
 )
 
 kwaque_cc_seastar_test(

@@ -42,6 +42,22 @@ append_text(log_iterator output, std::string_view value) noexcept {
     return output;
 }
 
+// The RFC 9562 text form: 32 lowercase hexadecimal digits in groups of 8, 4,
+// 4, 4 and 12, the octets in their canonical order.
+[[nodiscard]] log_iterator
+append_object_id(log_iterator output, const event_object_id& value) noexcept {
+    constexpr std::string_view digits{"0123456789abcdef"};
+    for (std::size_t index = 0; index < event_object_id_bytes; ++index) {
+        if (index == 4 || index == 6 || index == 8 || index == 10) {
+            *output++ = '-';
+        }
+        const auto octet = value.octets()[index];
+        *output++ = digits[octet >> 4U];
+        *output++ = digits[octet & 0x0fU];
+    }
+    return output;
+}
+
 [[nodiscard]] log_iterator
 append_value(log_iterator output, const event_field_value& value) {
     switch (value.type()) {
@@ -55,6 +71,8 @@ append_value(log_iterator output, const event_field_value& value) {
         return append_text(output, *value.as_text());
     case event_field_type::stable_id:
         return fmt::format_to(output, "{}", value.as_stable_id()->value());
+    case event_field_type::object_id:
+        return append_object_id(output, *value.as_object_id());
     }
     return output;
 }
@@ -96,7 +114,12 @@ production_event_sink::emit(const event_request& request) noexcept {
     if (!prepared) {
         return runtime::failure(prepared.error());
     }
-    const auto& value = prepared->value();
+    if (!*prepared) {
+        // Dropped by its kind's rate bound and counted.
+        return {};
+    }
+    auto& reserved = **prepared;
+    const auto& value = reserved.value();
     const auto level = native_level(value.severity());
     const auto epoch = sequence_.identity().epoch;
     auto append = [&value, epoch](log_iterator output) {
@@ -105,7 +128,7 @@ production_event_sink::emit(const event_request& request) noexcept {
     seastar::logger::lambda_log_writer<decltype(append)> writer{
       std::move(append)};
     logger_->log(level, writer);
-    prepared->commit();
+    reserved.commit();
     return {};
 }
 

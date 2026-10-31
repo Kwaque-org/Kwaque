@@ -33,6 +33,10 @@ public:
         assert_current();
         return sequence_.last_sequence();
     }
+    [[nodiscard]] std::uint64_t suppressed_total() const noexcept {
+        assert_current();
+        return sequence_.suppressed_total();
+    }
 
 private:
     seastar::logger* logger_;

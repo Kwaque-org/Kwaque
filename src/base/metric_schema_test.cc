@@ -35,9 +35,9 @@ std::uint64_t schema_fingerprint() {
     return value;
 }
 
-static_assert(kwaque::metric_inventory_size == 80U);
+static_assert(kwaque::metric_inventory_size == 81U);
 static_assert(kwaque::metric_workload_values == 8U);
-static_assert(kwaque::metric_series_per_shard == 108U);
+static_assert(kwaque::metric_series_per_shard == 109U);
 
 TEST(MetricSchemaTest, InventoryIsAppendOnlyBoundedAndLowCardinality) {
     const auto descriptors = kwaque::metric_descriptors();
@@ -70,8 +70,8 @@ TEST(MetricSchemaTest, InventoryIsAppendOnlyBoundedAndLowCardinality) {
         }
     }
     EXPECT_EQ(series, kwaque::metric_series_per_shard);
-    EXPECT_EQ(series, 108U);
-    EXPECT_EQ(schema_fingerprint(), UINT64_C(0x751b69823c0b44d3));
+    EXPECT_EQ(series, 109U);
+    EXPECT_EQ(schema_fingerprint(), UINT64_C(0xd4b64689fc2d4d3c));
     EXPECT_EQ(
       kwaque::metric_series_count(kwaque::metric_label_domain::none), 1U);
     EXPECT_EQ(
@@ -99,6 +99,57 @@ TEST(MetricSchemaTest, WorkloadLabelHasOneExactClosedValueSet) {
     };
     EXPECT_EQ(kwaque::metric_workload_label, "workload");
     EXPECT_EQ(kwaque::metric_workload_label_values, expected);
+}
+
+TEST(MetricSchemaTest, DeviceChainStepAndRefusalLabelsHaveClosedValueSets) {
+    EXPECT_EQ(kwaque::metric_device_label, "device");
+    EXPECT_EQ(
+      kwaque::metric_device_label_values,
+      (std::array<std::string_view, 8>{
+        "0", "1", "2", "3", "4", "5", "6", "7"}));
+    EXPECT_EQ(kwaque::metric_chain_step_label, "chain_step");
+    EXPECT_EQ(
+      kwaque::metric_chain_step_label_values,
+      (std::array<std::string_view, 7>{
+        "envelope_size",
+        "ingress_memory",
+        "stream_window",
+        "range_queue",
+        "shard_capacity",
+        "forwarded_traffic",
+        "storage_pressure"}));
+    EXPECT_EQ(kwaque::metric_refusal_label, "refusal");
+    // The definite append refusals, codes 203 to 223, in code order.
+    EXPECT_EQ(
+      kwaque::metric_refusal_label_values,
+      (std::array<std::string_view, 21>{
+        "batch_id_conflict",
+        "stale",
+        "sequence_gap",
+        "window_exceeded",
+        "unknown_stream",
+        "stream_sealed",
+        "stream_failed",
+        "producer_fenced",
+        "invalid_ack_floor",
+        "stream_limit",
+        "topic_sealed",
+        "not_found",
+        "misrouted_key",
+        "stale_route",
+        "no_space",
+        "too_large",
+        "invalid_batch",
+        "timed_out_before_acceptance",
+        "aborted_before_acceptance",
+        "closed",
+        "unknown_producer"}));
+    EXPECT_EQ(
+      kwaque::metric_series_count(kwaque::metric_label_domain::device), 8U);
+    EXPECT_EQ(
+      kwaque::metric_series_count(kwaque::metric_label_domain::chain_step), 7U);
+    EXPECT_EQ(
+      kwaque::metric_series_count(kwaque::metric_label_domain::refusal), 21U);
 }
 
 TEST(MetricSchemaTest, OnlyResourceMetricsUseTheWorkloadLabel) {
