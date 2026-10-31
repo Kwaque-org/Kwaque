@@ -5,6 +5,8 @@
 
 #include <cstdint>
 #include <memory>
+#include <optional>
+#include <utility>
 
 namespace kwaque::observability {
 
@@ -15,8 +17,27 @@ public:
         return std::unique_ptr<event_sequence>{new event_sequence{identity}};
     }
 
+    // For a kind with no rate bound, which always yields a reservation.
     [[nodiscard]] static runtime::result<event_sequence::reservation>
     prepare(event_sequence& sequence, const event_request& request) noexcept {
+        auto prepared = sequence.prepare(request);
+        if (!prepared) {
+            return runtime::failure(prepared.error());
+        }
+        if (!*prepared) {
+            return runtime::failure(
+              runtime::operation_error{
+                errc::invalid_argument,
+                runtime::operation_kind::observability});
+        }
+        return std::move(**prepared);
+    }
+
+    // No reservation means the rate bound dropped the event.
+    [[nodiscard]] static runtime::result<
+      std::optional<event_sequence::reservation>>
+    prepare_bounded(
+      event_sequence& sequence, const event_request& request) noexcept {
         return sequence.prepare(request);
     }
 

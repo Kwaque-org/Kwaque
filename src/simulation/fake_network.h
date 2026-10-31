@@ -205,8 +205,14 @@ private:
     bool moved_from_{false};
 };
 
-class fake_network final : public runtime::shard_affine {
+class fake_network final : public runtime::reactor_affine {
 public:
+    // The network is the world's: it answers whichever virtual shard asks.
+    [[nodiscard]] runtime::owner_shard owner() const noexcept {
+        assert_current();
+        return runtime::owner_shard{};
+    }
+
     using connection_type = fake_connection;
     using listener_type = fake_listener;
 

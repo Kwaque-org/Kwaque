@@ -26,7 +26,7 @@ event_sequence::~event_sequence() {
 
 event_sequence::reservation::~reservation() {
     if (owner_ != nullptr) {
-        owner_->release();
+        owner_->finish(value_, false);
     }
 }
 
@@ -40,11 +40,27 @@ void event_sequence::reservation::commit() noexcept {
     }
     owner_->assert_current();
     owner_->last_sequence_ = value_.sequence();
-    owner_->release();
+    owner_->finish(value_, true);
     owner_ = nullptr;
 }
 
-runtime::result<event_sequence::reservation>
+void event_sequence::finish(const event& value, bool committed) noexcept {
+    assert_current();
+    reserved_ = false;
+    if (!event_kind_is_rate_bounded(value.kind())) {
+        return;
+    }
+    auto& bound = bounds_[event_rate_bound_slot(value.kind())];
+    if (committed) {
+        // The event carried every drop so far.
+        bound.pending = 0;
+    } else {
+        // An event that was never emitted does not spend its kind's grant.
+        bound.word.refund(event_rate_bound_interval);
+    }
+}
+
+runtime::result<std::optional<event_sequence::reservation>>
 event_sequence::prepare(const event_request& request) noexcept {
     assert_current();
     if (reserved_) {
@@ -58,10 +74,28 @@ event_sequence::prepare(const event_request& request) noexcept {
           runtime::operation_context_key::limit, last_sequence_));
         return runtime::failure(std::move(error));
     }
+    std::uint64_t suppressed = 0;
+    if (event_kind_is_rate_bounded(request.kind())) {
+        auto& bound = bounds_[event_rate_bound_slot(request.kind())];
+        if (!bound.word
+               .try_take(
+                 request.monotonic(),
+                 event_rate_bound_interval,
+                 event_rate_bound_burst)
+               .granted) {
+            ++bound.pending;
+            ++suppressed_total_;
+            return std::optional<reservation>{};
+        }
+        suppressed = bound.pending;
+    }
     auto value = event::from_request(
-      request, event_shard::from_owner(owner()), last_sequence_ + 1U);
+      request,
+      event_shard::from_owner(owner()),
+      last_sequence_ + 1U,
+      suppressed);
     reserved_ = true;
-    return reservation{*this, std::move(value)};
+    return std::optional<reservation>{reservation{*this, std::move(value)}};
 }
 
 } // namespace kwaque::observability

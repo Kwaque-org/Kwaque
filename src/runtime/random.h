@@ -21,6 +21,18 @@ concept random_source = requires(Source& source) {
     { source.next_u64() } noexcept -> std::same_as<std::uint64_t>;
 };
 
+// Fresh octets for one 16-byte object identity. Identities are never drawn
+// from a random_source: production fills them from the kernel's random
+// source, so no seed width bounds how many distinct identities exist, and the
+// simulation from a stream of their own, so other draws never move them.
+inline constexpr std::size_t identity_entropy_bytes{16};
+
+template<typename Source>
+concept identity_entropy_source = requires(
+  Source& source, std::span<std::uint8_t, identity_entropy_bytes> octets) {
+    { source.fill(octets) } noexcept -> std::same_as<void>;
+};
+
 namespace detail {
 
 template<random_source Source>

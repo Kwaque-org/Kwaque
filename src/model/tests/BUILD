@@ -464,6 +464,26 @@ kwaque_cc_test(
 )
 
 kwaque_cc_test(
+    name = "outcome_test",
+    srcs = ["outcome_test.cc"],
+    data = ["testdata/outcome_registry.tsv"],
+    deps = [
+        "//src/base:metric_schema",
+        "//src/model:outcome",
+        "//src/observability:event",
+    ],
+)
+
+kwaque_cc_test(
+    name = "identity_mint_test",
+    srcs = ["identity_mint_test.cc"],
+    deps = [
+        "//src/model:identity",
+        "//src/model:identity_mint",
+    ],
+)
+
+kwaque_cc_test(
     name = "epoch_test",
     srcs = ["epoch_test.cc"],
     deps = [
@@ -673,6 +693,7 @@ test_suite(
         ":batch_identity_test",
         ":epoch_test",
         ":identity_dependency_test",
+        ":identity_mint_test",
         ":identity_test",
         ":keyspace_test",
         ":position_test",

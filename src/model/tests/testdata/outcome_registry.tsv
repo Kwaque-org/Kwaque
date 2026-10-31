@@ -1,0 +1,92 @@
+# The outcome registry, transcribed by hand from the outcome specification's
+# tables (metadata results, proposer outcomes, append outcomes, resolve
+# answers, read stops), never generated from outcome.h.
+#
+# effect: a success is happened; "definite refusal" and a definite metadata
+# refusal are refused; "indefinite" is indefinite; resolve answers and read
+# stops are not_applicable.
+# final: every metadata, proposer and append outcome is yes; a resolve
+# answer's "Final" and a read stop's "Terminal" column otherwise.
+# retry: "-" none, "no" never, "yes" later, "after re-read" after_reread,
+# "after a seal or delete" after_seal_or_delete, "after retention"
+# after_retention, "after resend" after_resend, "resend on the successor"
+# and a sealed range's successors on_successor, "resolve, then the
+# successor" resolve_then_successor,
+# "resend correctly routed" reroute, "re-initialize" reinitialize, "resolve"
+# resolve, "resolve after the seal" resolve_after_seal, "reopen at start"
+# reopen_at_start, "reopen at to" reopen_past_lost, "the caller may reopen"
+# reopen; a terminal read stop with no note is never, a cancelled one none.
+# payload: the "Carries" column; braces in a name are its payload.
+#
+# code	name	effect	final	retry	payload
+1	applied	happened	yes	none	command_value
+2	stale_epoch	refused	yes	after_reread	current_version
+3	illegal_transition	refused	yes	never	current_state
+4	name_taken	refused	yes	never	none
+5	name_being_released	refused	yes	later	none
+6	not_found	refused	yes	never	none
+7	active_ranges_exhausted	refused	yes	after_seal_or_delete	limit
+8	descriptors_exhausted	refused	yes	later	limit
+9	manifest_full	refused	yes	after_retention	none
+10	out_of_range	refused	yes	never	bound
+11	invalid_policy	refused	yes	never	policy_field
+12	invalid_name	refused	yes	never	none
+13	unknown_producer	refused	yes	never	none
+14	producer_fenced	refused	yes	never	current_epoch
+15	epoch_exhausted	refused	yes	never	none
+16	same_request	happened	yes	none	original_object
+100	concurrent_init	refused	yes	later	none
+101	timed_out_before_acceptance	refused	yes	later	none
+102	closed_before_acceptance	refused	yes	later	none
+103	aborted_before_acceptance	refused	yes	later	none
+104	timed_out_after_acceptance	indefinite	yes	resolve	none
+105	closed_after_acceptance	indefinite	yes	resolve	none
+106	aborted_after_acceptance	indefinite	yes	resolve	none
+200	committed	happened	yes	none	span
+201	duplicate	happened	yes	none	span
+202	duplicate_outside_window	happened	yes	none	none
+203	batch_id_conflict	refused	yes	never	none
+204	stale	refused	yes	never	floor
+205	sequence_gap	refused	yes	after_resend	expected_sequence
+206	window_exceeded	refused	yes	later	floor_and_window
+207	unknown_stream	refused	yes	never	none
+208	stream_sealed	refused	yes	on_successor	seal_notice
+209	stream_failed	refused	yes	resolve_then_successor	committed_point
+210	producer_fenced	refused	yes	never	current_epoch
+211	invalid_ack_floor	refused	yes	never	committed_point
+212	stream_limit	refused	yes	later	stream_bound
+213	topic_sealed	refused	yes	never	none
+214	not_found	refused	yes	never	none
+215	misrouted_key	refused	yes	reroute	record_index
+216	stale_route	refused	yes	later	current_leaf
+217	no_space	refused	yes	later	next_sample
+218	too_large	refused	yes	never	bound
+219	invalid_batch	refused	yes	never	codec_error
+220	timed_out_before_acceptance	refused	yes	later	none
+221	aborted_before_acceptance	refused	yes	later	none
+222	closed	refused	yes	later	none
+223	unknown_producer	refused	yes	reinitialize	none
+230	timed_out_after_acceptance	indefinite	yes	resolve	binding_and_sequence
+231	aborted_after_acceptance	indefinite	yes	resolve	binding_and_sequence
+232	storage_uncertain	indefinite	yes	resolve_after_seal	binding_and_sequence
+300	active	not_applicable	no	none	committed_and_next
+301	sealed	not_applicable	no	none	committed_and_successors
+302	committed	not_applicable	yes	none	span
+303	not_committed	not_applicable	yes	none	none
+304	committed_position_unavailable	not_applicable	yes	none	none
+305	batch_id_conflict	not_applicable	yes	none	none
+306	retry_window_expired	not_applicable	yes	none	none
+307	unavailable	not_applicable	no	later	none
+308	generation_lost	not_applicable	yes	none	none
+400	window	not_applicable	no	none	none
+401	caught_up	not_applicable	no	none	none
+402	range_sealed	not_applicable	yes	on_successor	end_and_successors
+403	below_start	not_applicable	no	reopen_at_start	range_start
+404	cancelled	not_applicable	yes	none	none
+405	lost	not_applicable	no	reopen_past_lost	lost_span
+410	failed_damage	not_applicable	yes	never	none
+411	failed_device	not_applicable	yes	never	none
+412	failed_resource	not_applicable	yes	reopen	none
+413	failed_closed	not_applicable	yes	never	none
+414	failed_deleted	not_applicable	yes	never	none
+415	failed_internal	not_applicable	yes	never	none

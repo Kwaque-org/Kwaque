@@ -80,6 +80,25 @@ TEST(AdminResponsesTest, HealthResponsesReflectLifecycleState) {
       R"({"type":"about:blank","title":"Service Unavailable","status":503,"detail":"broker is not live","code":"broker_not_live"})");
 }
 
+TEST(AdminResponsesTest, AWithdrawnReadinessNamesItsReasons) {
+    using kwaque::readiness_bit;
+    using kwaque::readiness_reason;
+    const auto one = kwaque::admin::readiness_response(
+      false, readiness_bit(readiness_reason::no_space));
+    EXPECT_EQ(one.status, 503);
+    EXPECT_EQ(
+      one.body,
+      R"({"type":"about:blank","title":"Service Unavailable","status":503,"detail":"broker withdrew its readiness","code":"broker_not_ready","reasons":["no_space"]})");
+    const auto both = kwaque::admin::readiness_response(
+      false,
+      static_cast<kwaque::readiness_reasons>(
+        readiness_bit(readiness_reason::no_space)
+        | readiness_bit(readiness_reason::wal_ceiling)));
+    EXPECT_NE(
+      both.body.find(R"("reasons":["wal_ceiling","no_space"])"),
+      std::string::npos);
+}
+
 TEST(AdminResponsesTest, RoutingProblemsUseTheirHttpStatusTitles) {
     const auto missing = kwaque::admin::not_found_response();
     EXPECT_EQ(missing.status, 404);

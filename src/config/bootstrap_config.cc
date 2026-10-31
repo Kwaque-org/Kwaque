@@ -13,9 +13,11 @@
 #include <limits>
 #include <optional>
 #include <regex>
+#include <span>
 #include <sstream>
 #include <string>
 #include <system_error>
+#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -160,11 +162,10 @@ validation_result check_structure(const std::string& yaml) {
     return {};
 }
 
-template<std::size_t Size>
 validation_result validate_keys(
   const YAML::Node& mapping,
   std::string_view field,
-  const std::array<std::string_view, Size>& allowed_keys) {
+  std::span<const std::string_view> allowed_keys) {
     if (!mapping.IsMap()) {
         return std::unexpected(make_error(
           config_errc::invalid_type, std::string(field), "expected a mapping"));
@@ -350,6 +351,451 @@ void append_escaped(
     if (value.size() > maximum_input) {
         output += "<truncated>";
     }
+}
+
+// The bounds of an unsigned integer key, both inclusive.
+struct integer_bounds final {
+    std::uint64_t minimum;
+    std::uint64_t maximum;
+    bool power_of_two{false};
+};
+
+constexpr std::uint64_t unbounded = std::numeric_limits<std::int64_t>::max();
+
+std::string describe_bounds(const integer_bounds& bounds) {
+    std::string text = "must be ";
+    if (bounds.power_of_two) {
+        text += "a power of two ";
+    }
+    if (bounds.maximum == unbounded) {
+        return text + "at least " + std::to_string(bounds.minimum);
+    }
+    return text + "between " + std::to_string(bounds.minimum) + " and "
+           + std::to_string(bounds.maximum);
+}
+
+// An absent key keeps its default; a null is refused unless the key allows
+// it, which the caller checks first. The refusal names the key and its bounds.
+std::expected<std::optional<std::uint64_t>, config_error> bounded_integer(
+  const YAML::Node& mapping,
+  std::string_view key,
+  const std::string& group,
+  const integer_bounds& bounds) {
+    if (!mapping[std::string(key)]) {
+        return std::nullopt;
+    }
+    const std::string field = group + "." + std::string(key);
+    const auto value = required_integer(mapping, key, field);
+    if (!value) {
+        return std::unexpected(value.error());
+    }
+    // The refusal names the value too, so a value that is close to a bound
+    // is told from one that is far.
+    const auto refused = describe_bounds(bounds) + ", not "
+                         + std::to_string(*value);
+    if (
+      *value < 0 || static_cast<std::uint64_t>(*value) < bounds.minimum
+      || static_cast<std::uint64_t>(*value) > bounds.maximum) {
+        return std::unexpected(
+          make_error(config_errc::out_of_range, field, refused));
+    }
+    const auto unsigned_value = static_cast<std::uint64_t>(*value);
+    if (bounds.power_of_two && (unsigned_value & (unsigned_value - 1U)) != 0) {
+        return std::unexpected(
+          make_error(config_errc::invalid_value, field, refused));
+    }
+    return unsigned_value;
+}
+
+// Reads `key` into `target` when present; with no key, `target` keeps its
+// default, which for an optional target is the derived value's absence.
+template<typename Target>
+validation_result read_integer_key(
+  const YAML::Node& mapping,
+  std::string_view key,
+  const std::string& group,
+  const integer_bounds& bounds,
+  Target& target) {
+    auto value = bounded_integer(mapping, key, group, bounds);
+    if (!value) {
+        return std::unexpected(std::move(value.error()));
+    }
+    if (*value) {
+        target = **value;
+    }
+    return {};
+}
+
+// A configured value, null for unbounded, or with no key the default.
+validation_result read_nullable_key(
+  const YAML::Node& mapping,
+  std::string_view key,
+  const std::string& group,
+  const integer_bounds& bounds,
+  std::optional<std::uint64_t>& target) {
+    const YAML::Node node = mapping[std::string(key)];
+    if (node && node.IsNull()) {
+        target.reset();
+        return {};
+    }
+    return read_integer_key(mapping, key, group, bounds, target);
+}
+
+std::expected<YAML::Node, config_error> group_mapping(
+  const YAML::Node& settings,
+  std::string_view key,
+  std::span<const std::string_view> allowed) {
+    const std::string field = "kwaque." + std::string(key);
+    YAML::Node group = settings[std::string(key)];
+    if (auto valid = validate_keys(group, field, allowed); !valid) {
+        return std::unexpected(std::move(valid.error()));
+    }
+    return group;
+}
+
+// A single file name: no directory part, never "." or "..".
+bool is_file_name(std::string_view value) {
+    return !value.empty() && value.size() <= 255 && value != "."
+           && value != ".." && value.find('/') == std::string_view::npos
+           && value.find('\0') == std::string_view::npos;
+}
+
+std::expected<storage_config, config_error>
+decode_storage(const YAML::Node& settings, bool developer_mode) {
+    const auto group = group_mapping(
+      settings, "storage", bootstrap_storage_keys);
+    if (!group) {
+        return std::unexpected(group.error());
+    }
+    storage_config storage;
+    if (
+      auto read = read_integer_key(
+        *group,
+        "metadata_alignment_bytes",
+        "kwaque.storage",
+        {.minimum = 512, .maximum = 65'536, .power_of_two = true},
+        storage.metadata_alignment_bytes);
+      !read) {
+        return std::unexpected(read.error());
+    }
+
+    const YAML::Node devices = (*group)["devices"];
+    if (!devices) {
+        return std::unexpected(make_error(
+          config_errc::missing_key,
+          "kwaque.storage.devices",
+          "required configuration key is missing"));
+    }
+    if (!devices.IsSequence()) {
+        return std::unexpected(make_error(
+          config_errc::invalid_type,
+          "kwaque.storage.devices",
+          "expected a list of devices"));
+    }
+    if (devices.size() == 0 || devices.size() > max_bootstrap_devices) {
+        return std::unexpected(make_error(
+          config_errc::invalid_device_set,
+          "kwaque.storage.devices",
+          "must list between 1 and " + std::to_string(max_bootstrap_devices)
+            + " devices"));
+    }
+    std::size_t controls = 0;
+    for (std::size_t index = 0; index < devices.size(); ++index) {
+        const std::string field = "kwaque.storage.devices["
+                                  + std::to_string(index) + "]";
+        const YAML::Node device = devices[index];
+        if (
+          auto valid = validate_keys(device, field, bootstrap_device_keys);
+          !valid) {
+            return std::unexpected(std::move(valid.error()));
+        }
+        const auto path = required_string(device, "path", field + ".path");
+        if (!path) {
+            return std::unexpected(path.error());
+        }
+        const std::filesystem::path device_path{*path};
+        if (
+          is_blank(*path) || path->find('\0') != std::string::npos
+          || path->starts_with('~')
+          || (!developer_mode && !device_path.is_absolute())) {
+            return std::unexpected(make_error(
+              config_errc::invalid_device_set,
+              field + ".path",
+              "a device path must be absolute unless developer_mode is true, "
+              "and never start with '~'"));
+        }
+        const auto role = required_string(device, "role", field + ".role");
+        if (!role) {
+            return std::unexpected(role.error());
+        }
+        device_config configured{.path = device_path};
+        if (*role == "data") {
+            configured.role = device_role::data;
+        } else if (*role == "wal_control") {
+            configured.role = device_role::wal_control;
+        } else if (*role == "all") {
+            configured.role = device_role::all;
+        } else {
+            return std::unexpected(make_error(
+              config_errc::invalid_device_set,
+              field + ".role",
+              "role must be data, wal_control or all"));
+        }
+        if (configured.role != device_role::data) {
+            ++controls;
+        }
+        if (device["mount_marker"]) {
+            const auto marker = required_string(
+              device, "mount_marker", field + ".mount_marker");
+            if (!marker) {
+                return std::unexpected(marker.error());
+            }
+            if (!is_file_name(*marker)) {
+                return std::unexpected(make_error(
+                  config_errc::invalid_device_set,
+                  field + ".mount_marker",
+                  "a mount marker is one file name"));
+            }
+            configured.mount_marker = *marker;
+        }
+        // "/d", "/d/" and "/x/../d" name one directory.
+        for (const auto& earlier : storage.devices) {
+            if (
+              (earlier.path / "").lexically_normal()
+              == (configured.path / "").lexically_normal()) {
+                return std::unexpected(make_error(
+                  config_errc::invalid_device_set,
+                  field + ".path",
+                  "two devices name the same path"));
+            }
+        }
+        storage.devices.push_back(std::move(configured));
+    }
+    if (controls != 1) {
+        return std::unexpected(make_error(
+          config_errc::invalid_device_set,
+          "kwaque.storage.devices",
+          "exactly one device must have the wal_control or all role"));
+    }
+    return storage;
+}
+
+std::expected<metadata_config, config_error>
+decode_metadata(const YAML::Node& settings) {
+    metadata_config metadata;
+    if (!settings["metadata"]) {
+        return metadata;
+    }
+    const auto group = group_mapping(
+      settings, "metadata", bootstrap_metadata_keys);
+    if (!group) {
+        return std::unexpected(group.error());
+    }
+    const std::string field = "kwaque.metadata";
+    const std::array keys{
+      std::tuple{
+        "ring_size",
+        integer_bounds{.minimum = 1, .maximum = 4'096, .power_of_two = true},
+        &metadata.ring_size},
+      std::tuple{
+        "journal_file_bytes",
+        integer_bounds{.minimum = 1_MiB, .maximum = 256_MiB},
+        &metadata.journal_file_bytes},
+      std::tuple{
+        "journal_retained_files",
+        integer_bounds{.minimum = 4, .maximum = 1'024},
+        &metadata.journal_retained_files},
+      std::tuple{
+        "snapshot_floor_bytes",
+        integer_bounds{.minimum = 1_MiB, .maximum = 256_MiB},
+        &metadata.snapshot_floor_bytes},
+      std::tuple{
+        "pending_proposals",
+        integer_bounds{.minimum = 64, .maximum = 65'536},
+        &metadata.pending_proposals},
+      std::tuple{
+        "pending_proposal_bytes",
+        integer_bounds{.minimum = 1_MiB, .maximum = 64_MiB},
+        &metadata.pending_proposal_bytes},
+      std::tuple{
+        "cohort_records",
+        integer_bounds{.minimum = 1, .maximum = 1'024},
+        &metadata.cohort_records},
+      std::tuple{
+        "cohort_bytes",
+        integer_bounds{.minimum = 64_KiB, .maximum = 16_MiB},
+        &metadata.cohort_bytes},
+      std::tuple{
+        "producer_expiration_ms",
+        integer_bounds{.minimum = 60'000, .maximum = unbounded},
+        &metadata.producer_expiration_ms},
+    };
+    for (const auto& [key, bounds, target] : keys) {
+        if (
+          auto read = read_integer_key(*group, key, field, bounds, *target);
+          !read) {
+            return std::unexpected(read.error());
+        }
+    }
+    return metadata;
+}
+
+std::expected<topic_defaults_config, config_error>
+decode_topic_defaults(const YAML::Node& settings) {
+    topic_defaults_config defaults;
+    if (!settings["topic_defaults"]) {
+        return defaults;
+    }
+    const auto group = group_mapping(
+      settings, "topic_defaults", bootstrap_topic_default_keys);
+    if (!group) {
+        return std::unexpected(group.error());
+    }
+    const std::string field = "kwaque.topic_defaults";
+    // The record, batch, segment and retention byte bounds belong to the
+    // topic policy table, which is not checked yet; here only a positive
+    // count.
+    const integer_bounds positive{.minimum = 1, .maximum = unbounded};
+    const std::array keys{
+      std::tuple{
+        "maximum_record_bytes", positive, &defaults.maximum_record_bytes},
+      std::tuple{
+        "maximum_batch_bytes", positive, &defaults.maximum_batch_bytes},
+      std::tuple{"segment_bytes", positive, &defaults.segment_bytes},
+      std::tuple{
+        "segment_lifetime_ms",
+        integer_bounds{.minimum = 60'000, .maximum = 31'536'000'000},
+        &defaults.segment_lifetime_ms},
+      std::tuple{
+        "retry_window_ms",
+        integer_bounds{.minimum = 60'000, .maximum = unbounded},
+        &defaults.retry_window_ms},
+      std::tuple{
+        "retry_depth",
+        integer_bounds{.minimum = 1, .maximum = 32},
+        &defaults.retry_depth},
+      std::tuple{
+        "active_leaf_cap",
+        integer_bounds{.minimum = 1, .maximum = 4'096},
+        &defaults.active_leaf_cap},
+    };
+    for (const auto& [key, bounds, target] : keys) {
+        if (
+          auto read = read_integer_key(*group, key, field, bounds, *target);
+          !read) {
+            return std::unexpected(read.error());
+        }
+    }
+    if (
+      auto read = read_nullable_key(
+        *group, "retention_ms", field, positive, defaults.retention_ms);
+      !read) {
+        return std::unexpected(read.error());
+    }
+    if (
+      auto read = read_integer_key(
+        *group, "retention_bytes", field, positive, defaults.retention_bytes);
+      !read) {
+        return std::unexpected(read.error());
+    }
+    // A retried batch must still be held when its retry arrives.
+    if (
+      defaults.retention_ms
+      && defaults.retry_window_ms > *defaults.retention_ms) {
+        return std::unexpected(make_error(
+          config_errc::invalid_value,
+          field + ".retry_window_ms",
+          "must not exceed retention_ms"));
+    }
+    return defaults;
+}
+
+std::expected<range_config, config_error>
+decode_range(const YAML::Node& settings) {
+    range_config range;
+    if (!settings["range"]) {
+        return range;
+    }
+    const auto group = group_mapping(settings, "range", bootstrap_range_keys);
+    if (!group) {
+        return std::unexpected(group.error());
+    }
+    const std::string field = "kwaque.range";
+    const integer_bounds positive{.minimum = 1, .maximum = unbounded};
+    const std::array keys{
+      std::tuple{
+        "stop_deadline_ms",
+        integer_bounds{.minimum = 1'000, .maximum = 840'000},
+        &range.stop_deadline_ms},
+      std::tuple{
+        "unsealed_bytes",
+        integer_bounds{.minimum = 128_MiB, .maximum = 1'024_GiB},
+        &range.unsealed_bytes},
+      std::tuple{
+        "retention_sweep_interval_ms",
+        integer_bounds{.minimum = 1'000, .maximum = 3'600'000},
+        &range.retention_sweep_interval_ms},
+      std::tuple{
+        "maximum_expiring_per_range",
+        integer_bounds{.minimum = 1, .maximum = 1'024},
+        &range.maximum_expiring_per_range},
+      std::tuple{
+        "queue_requests",
+        integer_bounds{.minimum = 1, .maximum = 4'096},
+        &range.queue_requests},
+      std::tuple{
+        "queue_bytes",
+        integer_bounds{.minimum = 64_KiB, .maximum = 64_MiB},
+        &range.queue_bytes},
+      std::tuple{
+        "roll_rate_per_range_per_minute",
+        integer_bounds{.minimum = 1, .maximum = 60},
+        &range.roll_rate_per_range_per_minute},
+      std::tuple{
+        "roll_burst_per_range",
+        integer_bounds{.minimum = 1, .maximum = 16},
+        &range.roll_burst_per_range},
+      std::tuple{
+        "roll_rate_per_shard_per_second",
+        integer_bounds{.minimum = 1, .maximum = 1'000},
+        &range.roll_rate_per_shard_per_second},
+      std::tuple{
+        "roll_burst_per_shard",
+        integer_bounds{.minimum = 1, .maximum = 1'024},
+        &range.roll_burst_per_shard},
+      std::tuple{
+        "placement_threshold_percent",
+        integer_bounds{.minimum = 0, .maximum = 100},
+        &range.placement_threshold_percent},
+      std::tuple{
+        "placement_byte_cost_ps", positive, &range.placement_byte_cost_ps},
+      std::tuple{
+        "placement_batch_cost_ns", positive, &range.placement_batch_cost_ns},
+      std::tuple{
+        "placement_minimum_load", positive, &range.placement_minimum_load},
+      std::tuple{
+        "wheel_touches_per_task",
+        integer_bounds{.minimum = 1, .maximum = 65'536},
+        &range.wheel_touches_per_task},
+    };
+    for (const auto& [key, bounds, target] : keys) {
+        if (
+          auto read = read_integer_key(*group, key, field, bounds, *target);
+          !read) {
+            return std::unexpected(read.error());
+        }
+    }
+    if (
+      auto read = read_integer_key(
+        *group,
+        "maximum_consume_streams",
+        field,
+        integer_bounds{.minimum = 1, .maximum = 1'000'000},
+        range.maximum_consume_streams);
+      !read) {
+        return std::unexpected(read.error());
+    }
+    return range;
 }
 
 bool is_numeric_address(std::string_view value) {
@@ -557,6 +1003,35 @@ bootstrap_config_result decode_bootstrap_config(const YAML::Node& root) {
           "true"));
     }
 
+    // The groups after every other key, so a file missing the device list
+    // reports what else is wrong with it first.
+    auto metadata = decode_metadata(settings);
+    if (!metadata) {
+        return std::unexpected(metadata.error());
+    }
+    configuration.metadata = *metadata;
+    auto topic_defaults = decode_topic_defaults(settings);
+    if (!topic_defaults) {
+        return std::unexpected(topic_defaults.error());
+    }
+    configuration.topic_defaults = *topic_defaults;
+    auto range = decode_range(settings);
+    if (!range) {
+        return std::unexpected(range.error());
+    }
+    configuration.range = *range;
+    if (!settings["storage"]) {
+        return std::unexpected(make_error(
+          config_errc::missing_key,
+          "kwaque.storage",
+          "required configuration key is missing"));
+    }
+    auto storage = decode_storage(settings, configuration.developer_mode);
+    if (!storage) {
+        return std::unexpected(storage.error());
+    }
+    configuration.storage = std::move(*storage);
+
     return configuration;
 }
 
@@ -650,7 +1125,99 @@ std::string render_config(const bootstrap_config& configuration) {
       = configuration.diagnostic_memory_per_shard_bytes
           ? std::to_string(*configuration.diagnostic_memory_per_shard_bytes)
           : "unspecified";
-    const std::array values{
+    // Names and values of the groups, owned here; the rendered pairs borrow
+    // them.
+    std::vector<std::pair<std::string, std::string>> owned;
+    const auto add = [&owned](std::string name, std::string value) {
+        owned.emplace_back(std::move(name), std::move(value));
+    };
+    const auto number = [](std::uint64_t value) {
+        return std::to_string(value);
+    };
+    for (std::size_t index = 0; index < configuration.storage.devices.size();
+         ++index) {
+        const auto& device = configuration.storage.devices[index];
+        const auto prefix = "storage.devices[" + std::to_string(index) + "].";
+        add(prefix + "path", device.path.string());
+        add(
+          prefix + "role",
+          device.role == device_role::data          ? "data"
+          : device.role == device_role::wal_control ? "wal_control"
+                                                    : "all");
+        // A marker is never empty, so an empty value means none.
+        add(prefix + "mount_marker", device.mount_marker.value_or(""));
+    }
+    add(
+      "storage.metadata_alignment_bytes",
+      number(configuration.storage.metadata_alignment_bytes));
+    const auto& metadata = configuration.metadata;
+    add("metadata.ring_size", number(metadata.ring_size));
+    add("metadata.journal_file_bytes", number(metadata.journal_file_bytes));
+    add(
+      "metadata.journal_retained_files",
+      number(metadata.journal_retained_files));
+    add("metadata.snapshot_floor_bytes", number(metadata.snapshot_floor_bytes));
+    add("metadata.pending_proposals", number(metadata.pending_proposals));
+    add(
+      "metadata.pending_proposal_bytes",
+      number(metadata.pending_proposal_bytes));
+    add("metadata.cohort_records", number(metadata.cohort_records));
+    add("metadata.cohort_bytes", number(metadata.cohort_bytes));
+    add(
+      "metadata.producer_expiration_ms",
+      number(metadata.producer_expiration_ms));
+    const auto& defaults = configuration.topic_defaults;
+    add(
+      "topic_defaults.maximum_record_bytes",
+      number(defaults.maximum_record_bytes));
+    add(
+      "topic_defaults.maximum_batch_bytes",
+      number(defaults.maximum_batch_bytes));
+    add("topic_defaults.segment_bytes", number(defaults.segment_bytes));
+    add(
+      "topic_defaults.segment_lifetime_ms",
+      number(defaults.segment_lifetime_ms));
+    add(
+      "topic_defaults.retention_ms",
+      defaults.retention_ms ? number(*defaults.retention_ms) : "null");
+    add(
+      "topic_defaults.retention_bytes",
+      defaults.retention_bytes ? number(*defaults.retention_bytes) : "derived");
+    add("topic_defaults.retry_window_ms", number(defaults.retry_window_ms));
+    add("topic_defaults.retry_depth", number(defaults.retry_depth));
+    add("topic_defaults.active_leaf_cap", number(defaults.active_leaf_cap));
+    const auto& range = configuration.range;
+    add("range.stop_deadline_ms", number(range.stop_deadline_ms));
+    add("range.unsealed_bytes", number(range.unsealed_bytes));
+    add(
+      "range.retention_sweep_interval_ms",
+      number(range.retention_sweep_interval_ms));
+    add(
+      "range.maximum_expiring_per_range",
+      number(range.maximum_expiring_per_range));
+    add("range.queue_requests", number(range.queue_requests));
+    add("range.queue_bytes", number(range.queue_bytes));
+    add(
+      "range.roll_rate_per_range_per_minute",
+      number(range.roll_rate_per_range_per_minute));
+    add("range.roll_burst_per_range", number(range.roll_burst_per_range));
+    add(
+      "range.roll_rate_per_shard_per_second",
+      number(range.roll_rate_per_shard_per_second));
+    add("range.roll_burst_per_shard", number(range.roll_burst_per_shard));
+    add(
+      "range.placement_threshold_percent",
+      number(range.placement_threshold_percent));
+    add("range.placement_byte_cost_ps", number(range.placement_byte_cost_ps));
+    add("range.placement_batch_cost_ns", number(range.placement_batch_cost_ns));
+    add("range.placement_minimum_load", number(range.placement_minimum_load));
+    add(
+      "range.maximum_consume_streams",
+      range.maximum_consume_streams ? number(*range.maximum_consume_streams)
+                                    : "derived");
+    add("range.wheel_touches_per_task", number(range.wheel_touches_per_task));
+
+    std::vector<config_value> values{
       config_value{"schema_version", schema_version, config_visibility::safe},
       config_value{"data_directory", data_directory, config_visibility::safe},
       config_value{
@@ -668,6 +1235,10 @@ std::string render_config(const bootstrap_config& configuration) {
         diagnostic_memory,
         config_visibility::safe},
     };
+    values.reserve(values.size() + owned.size());
+    for (const auto& [name, value] : owned) {
+        values.push_back(config_value{name, value, config_visibility::safe});
+    }
     return render_config(values);
 }
 

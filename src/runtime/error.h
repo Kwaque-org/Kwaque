@@ -27,7 +27,14 @@ enum class operation_kind : std::uint8_t {
     clock = 10,
     trace = 11,
     observability = 12,
+    journal = 13,
+    metadata = 14,
+    range = 15,
 };
+
+// The highest kind. Reproduction files keep a kind as a byte: append new kinds
+// after it and move this marker, never renumber.
+inline constexpr operation_kind operation_kind_last = operation_kind::range;
 
 enum class operation_context_key : std::uint8_t {
     shard = 0,

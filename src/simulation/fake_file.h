@@ -222,7 +222,7 @@ enum class fake_file_system_state : std::uint8_t {
     stopped,
 };
 
-class fake_file_system final : public runtime::shard_affine {
+class fake_file_system final : public runtime::reactor_affine {
 public:
     using directory_cursor_type = fake_directory_cursor;
     [[nodiscard]] seastar::future<runtime::result<fake_directory_cursor>>
@@ -381,7 +381,7 @@ private:
         visible_page_map::node_type tail_node;
     };
 
-    struct inode final : runtime::shard_affine {
+    struct inode final : runtime::reactor_affine {
         inode(
           fake_object_id object_id,
           fake_file_kind object_kind,
@@ -619,7 +619,7 @@ private:
 
     static_assert(!std::is_move_constructible_v<inode>);
     static_assert(!std::is_copy_constructible_v<inode>);
-    static_assert(std::derived_from<inode, runtime::shard_affine>);
+    static_assert(std::derived_from<inode, runtime::reactor_affine>);
     static_assert(!std::is_move_constructible_v<pending_operation>);
     static_assert(!std::is_copy_constructible_v<pending_operation>);
     static_assert(std::derived_from<pending_operation, runtime::shard_affine>);

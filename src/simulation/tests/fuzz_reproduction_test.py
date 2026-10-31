@@ -201,6 +201,15 @@ class FuzzReproductionTest(unittest.TestCase):
         return "\n".join(lines) + "\n"
 
     @staticmethod
+    def with_metadata(block: str, key: str, value: str) -> str:
+        lines = block.splitlines()
+        index = next(
+            index for index, line in enumerate(lines) if line.startswith(f"{key} ")
+        )
+        lines[index] = f"{key} {value}"
+        return FuzzReproductionTest.refresh_envelope_integrity(lines)
+
+    @staticmethod
     def other_harness_with_valid_integrity(block: str) -> str:
         lines = block.splitlines()
         version = next(
@@ -263,6 +272,16 @@ class FuzzReproductionTest(unittest.TestCase):
         bad_header = block.replace("KQREPRO 01", "KQREPRO 02", 1)
         self.assert_replay_exit(bad_header, 2)
         self.assert_replay_exit(self.other_harness_with_valid_integrity(block), 2)
+        # Operation kinds and error codes are read up to their last markers: an
+        # envelope naming the newest is read, one past them is refused.
+        for key, newest, beyond in (
+            ("OUTCOME_OPERATION", "0f", "10"),
+            ("OUTCOME_CODE", "0000001a", "0000001b"),
+        ):
+            with self.subTest(key=key):
+                read = self.replay_block(self.with_metadata(block, key, newest))
+                self.assertNotEqual(read.returncode, 2, self.process_output(read))
+                self.assert_replay_exit(self.with_metadata(block, key, beyond), 2)
 
         for key in (
             "HARNESS",

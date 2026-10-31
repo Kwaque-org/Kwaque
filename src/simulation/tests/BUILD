@@ -55,7 +55,13 @@ test_suite(
     tests = [
         ":engine_history_test",
         ":local_append_test",
+        ":local_engine_test",
         ":local_publication_test",
+        ":local_recovery_test",
+        ":local_segment_history_test",
+        ":local_segment_lifecycle_test",
+        ":local_segment_reader_test",
+        ":local_segment_writer_test",
         ":local_store_test",
         ":storage_completion_test",
         ":storage_history_fuzz_cases_test",
@@ -482,6 +488,99 @@ kwaque_cc_seastar_test(
 )
 
 kwaque_cc_seastar_test(
+    name = "deadlines_test",
+    srcs = ["deadlines_test.cc"],
+    cpu = 1,
+    memory = "256MiB",
+    deps = [
+        "//src/runtime:time",
+        "//src/runtime:waiting",
+        "//src/simulation:alarm",
+        "//src/simulation:environment",
+        "//src/simulation:scheduler",
+        "//src/simulation:scheduler_driver",
+        "//src/simulation:virtual_time",
+    ],
+)
+
+kwaque_cc_seastar_test(
+    name = "virtual_shards_test",
+    srcs = ["virtual_shards_test.cc"],
+    cpu = 1,
+    memory = "256MiB",
+    deps = [
+        "//src/observability:event",
+        "//src/runtime:cross_shard",
+        "//src/runtime:random",
+        "//src/runtime:shard_affinity",
+        "//src/runtime:time",
+        "//src/runtime:waiting",
+        "//src/simulation:deterministic_random",
+        "//src/simulation:environment",
+        "//src/simulation:scheduler_driver",
+        "//src/simulation:virtual_time",
+    ],
+)
+
+kwaque_cc_seastar_gtest(
+    name = "buggify_test",
+    # Rates are measured over 2^20 seeds and keys.
+    timeout = "moderate",
+    srcs = ["buggify_test.cc"],
+    deps = [
+        "//src/runtime:buggify",
+        "//src/runtime:random",
+        "//src/simulation:buggify",
+        "//src/simulation:deterministic_random",
+        "//src/simulation:event_trace",
+        "//src/simulation:scheduler",
+    ],
+)
+
+kwaque_cc_library(
+    name = "fuzz_marks",
+    testonly = True,
+    srcs = ["fuzz_marks.cc"],
+    hdrs = ["fuzz_marks.h"],
+    deps = [
+        "//src/base:invariant",
+        "//src/runtime:buggify",
+        "//src/runtime:marks",
+        "//src/simulation:buggify",
+        "//src/simulation:marks",
+    ],
+)
+
+kwaque_cc_seastar_gtest(
+    name = "marks_test",
+    srcs = ["marks_test.cc"],
+    deps = [
+        ":fuzz_marks",
+        "//src/runtime:buggify",
+        "//src/runtime:marks",
+        "//src/simulation:buggify",
+        "//src/simulation:deterministic_random",
+        "//src/simulation:event_trace",
+        "//src/simulation:marks",
+        "//src/simulation:scheduler",
+    ],
+)
+
+# The release-seam check's positive control (//bazel/packaging).
+kwaque_cc_binary(
+    name = "seam_control",
+    testonly = True,
+    srcs = ["seam_control.cc"],
+    visibility = ["//bazel/packaging:__pkg__"],
+    deps = [
+        "//src/runtime:buggify",
+        "//src/runtime:marks",
+        "//src/simulation:buggify",
+        "//src/simulation:deterministic_random",
+    ],
+)
+
+kwaque_cc_seastar_test(
     name = "environment_test",
     srcs = ["environment_test.cc"],
     cpu = 1,
@@ -493,15 +592,18 @@ kwaque_cc_seastar_test(
         "//src/observability:event_log",
         "//src/resource:resource_manager",
         "//src/resource:workload_class",
+        "//src/runtime:buggify",
         "//src/runtime:dns",
         "//src/runtime:environment",
         "//src/runtime:fault",
         "//src/runtime:fault_api",
         "//src/runtime:file",
+        "//src/runtime:marks",
         "//src/runtime:network",
         "//src/runtime/testing/contracts:environment_contract",
         "//src/runtime/testing/contracts:environment_lifecycle_contract",
         "//src/runtime/testing/contracts:simulation_environment_component",
+        "//src/simulation:buggify",
         "//src/simulation:environment",
         "//src/simulation:environment_test_support",
         "//src/simulation:fake_dns",
@@ -615,6 +717,8 @@ kwaque_cc_test(
     name = "deterministic_random_test",
     srcs = ["deterministic_random_test.cc"],
     deps = [
+        "//src/model:identity",
+        "//src/model:identity_mint",
         "//src/simulation:deterministic_random",
         "//src/simulation:deterministic_random_test_support",
     ],
@@ -846,6 +950,30 @@ kwaque_cc_library(
 )
 
 kwaque_cc_library(
+    name = "local_store_environment",
+    testonly = True,
+    hdrs = ["local_store_environment.h"],
+    deps = [
+        "//src/base",
+        "//src/bytes:allocation_test_profile",
+        "//src/resource:workload_class",
+        "//src/runtime:fault_api",
+        "//src/runtime:file",
+        "//src/runtime/testing:reactor_tasks",
+        "//src/simulation:environment",
+        "//src/simulation:fake_file",
+        "//src/simulation:fake_file_test_support",
+        "//src/simulation:fault_schedule",
+        "//src/simulation:scheduler",
+        "//src/simulation:scheduler_driver",
+        "//src/storage:workload_budget",
+        "//src/storage/tests:local_store_contract",
+        "@boost//:test.so",
+        "@seastar",
+    ],
+)
+
+kwaque_cc_library(
     name = "engine_history_fixture",
     testonly = True,
     hdrs = ["engine_history_fixture.h"],
@@ -1040,7 +1168,7 @@ kwaque_cc_seastar_test(
 
 kwaque_cc_seastar_test(
     name = "local_append_test",
-    # Three crash sweeps run one store per cut.
+    # Two sweeps run one store per cut.
     timeout = "long",
     srcs = ["local_append_test.cc"],
     data = ["//src/storage/tests:local_metadata_fixture_data"],
@@ -1049,23 +1177,119 @@ kwaque_cc_seastar_test(
     deps = [
         ":local_store_fixture",
         "//src/base",
-        "//src/base:error",
-        "//src/bytes:allocation_test_profile",
-        "//src/resource:resource_manager",
-        "//src/resource:workload_class",
-        "//src/runtime:file",
-        "//src/runtime/testing:reactor_tasks",
-        "//src/simulation:environment",
-        "//src/simulation:fake_file",
+        "//src/simulation:fake_file_test_support",
+        "//src/simulation:virtual_time",
+        "//src/storage/tests:local_append_contract",
+        "//src/storage/tests:local_store_contract",
+        "//src/storage/tests:recovery_successor_contract",
+    ],
+)
+
+kwaque_cc_seastar_test(
+    name = "local_engine_test",
+    # A crash sweep runs one store per cut.
+    timeout = "long",
+    srcs = ["local_engine_test.cc"],
+    data = ["//src/storage/tests:local_metadata_fixture_data"],
+    memory = "256MiB",
+    tags = ["simulated_storage"],
+    deps = [
+        ":local_store_fixture",
+        "//src/simulation:fake_file_test_support",
+        "//src/simulation:virtual_time",
+        "//src/storage/tests:local_engine_contract",
+        "//src/storage/tests:local_store_contract",
+    ],
+)
+
+kwaque_cc_seastar_test(
+    name = "local_recovery_test",
+    timeout = "moderate",
+    srcs = ["local_recovery_test.cc"],
+    data = ["//src/storage/tests:local_metadata_fixture_data"],
+    tags = ["simulated_storage"],
+    deps = [
+        ":local_store_environment",
         "//src/simulation:fake_file_test_support",
         "//src/simulation:scheduler_driver",
         "//src/simulation:virtual_time",
-        "//src/storage:workload_budget",
-        "//src/storage/tests:local_append_contract",
-        "//src/storage/tests:local_engine_contract",
         "//src/storage/tests:local_store_contract",
-        "//src/storage/tests:recovery_successor_contract",
+        "//src/storage/tests:recovery_contract",
+        "//src/storage/tests:segment_scan_contract",
+        "//src/storage/tests:wal_scan_contract",
+    ],
+)
+
+kwaque_cc_seastar_test(
+    name = "local_segment_history_test",
+    timeout = "moderate",
+    srcs = ["local_segment_history_test.cc"],
+    data = ["//src/storage/tests:local_metadata_fixture_data"],
+    tags = ["simulated_storage"],
+    deps = [
+        ":local_store_environment",
+        "//src/base",
+        "//src/runtime/testing:reactor_tasks",
+        "//src/simulation:environment",
+        "//src/simulation:fake_file_test_support",
+        "//src/simulation:scheduler_driver",
+        "//src/simulation:virtual_time",
+        "//src/storage/tests:local_installation_contract",
+        "//src/storage/tests:local_store_contract",
+        "//src/storage/tests:segment_qualification_contract",
+        "//src/storage/tests:segment_writer_contract",
+        "//src/storage/tests:sparse_index_contract",
+    ],
+)
+
+kwaque_cc_seastar_test(
+    name = "local_segment_lifecycle_test",
+    timeout = "long",
+    srcs = ["local_segment_lifecycle_test.cc"],
+    data = ["//src/storage/tests:local_metadata_fixture_data"],
+    memory = "256MiB",
+    tags = ["simulated_storage"],
+    deps = [
+        ":local_store_fixture",
+        "//src/simulation:fake_file_test_support",
+        "//src/simulation:virtual_time",
+        "//src/storage/tests:local_store_contract",
         "//src/storage/tests:segment_lifecycle_contract",
+    ],
+)
+
+kwaque_cc_seastar_test(
+    name = "local_segment_reader_test",
+    timeout = "moderate",
+    srcs = ["local_segment_reader_test.cc"],
+    data = ["//src/storage/tests:local_metadata_fixture_data"],
+    tags = ["simulated_storage"],
+    deps = [
+        ":local_store_environment",
+        "//src/base",
+        "//src/simulation:fake_file_test_support",
+        "//src/simulation:virtual_time",
+        "//src/storage/tests:local_store_contract",
+        "//src/storage/tests:segment_reader_contract",
+        "//src/storage/tests:sparse_index_contract",
+    ],
+)
+
+kwaque_cc_seastar_test(
+    name = "local_segment_writer_test",
+    timeout = "moderate",
+    srcs = ["local_segment_writer_test.cc"],
+    data = ["//src/storage/tests:local_metadata_fixture_data"],
+    tags = ["simulated_storage"],
+    deps = [
+        ":local_store_environment",
+        "//src/base",
+        "//src/simulation:fake_file_test_support",
+        "//src/simulation:virtual_time",
+        "//src/storage/tests:local_installation_contract",
+        "//src/storage/tests:local_store_contract",
+        "//src/storage/tests:segment_qualification_contract",
+        "//src/storage/tests:segment_writer_contract",
     ],
 )
 
@@ -1076,41 +1300,15 @@ kwaque_cc_seastar_test(
     data = ["//src/storage/tests:local_metadata_fixture_data"],
     tags = ["simulated_storage"],
     deps = [
+        ":local_store_environment",
         "//src/base",
-        "//src/base:error",
-        "//src/bytes:allocation_test_profile",
-        "//src/codec:cooperative",
-        "//src/resource:resource_manager",
-        "//src/resource:workload_class",
-        "//src/runtime:fault",
-        "//src/runtime:file",
-        "//src/runtime:first_failure",
-        "//src/runtime/testing:reactor_tasks",
         "//src/simulation:environment",
-        "//src/simulation:fake_file",
         "//src/simulation:fake_file_test_support",
-        "//src/simulation:fault_schedule",
         "//src/simulation:scheduler_driver",
-        "//src/simulation:virtual_time",
-        "//src/storage:local_control",
-        "//src/storage:local_id_allocator",
-        "//src/storage:local_metadata_file",
-        "//src/storage:local_paths",
-        "//src/storage:local_store_bootstrap",
-        "//src/storage:local_store_config",
-        "//src/storage:local_store_inspection",
-        "//src/storage:workload_budget",
         "//src/storage/tests:local_installation_contract",
         "//src/storage/tests:local_qualification_contract",
         "//src/storage/tests:local_reader_contract",
         "//src/storage/tests:local_store_contract",
-        "//src/storage/tests:recovery_contract",
-        "//src/storage/tests:segment_qualification_contract",
-        "//src/storage/tests:segment_reader_contract",
-        "//src/storage/tests:segment_scan_contract",
-        "//src/storage/tests:segment_writer_contract",
-        "//src/storage/tests:sparse_index_contract",
-        "//src/storage/tests:wal_scan_contract",
     ],
 )
 

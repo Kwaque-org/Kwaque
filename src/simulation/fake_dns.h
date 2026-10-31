@@ -60,7 +60,7 @@ enum class fake_dns_state : std::uint8_t {
     stopped,
 };
 
-class fake_dns final : public runtime::shard_affine {
+class fake_dns final : public runtime::reactor_affine {
 public:
     [[nodiscard]] static runtime::result<std::unique_ptr<fake_dns>> make(
       fake_dns_config config,
@@ -93,8 +93,10 @@ public:
     [[nodiscard]] std::size_t pending_queries() const;
     [[nodiscard]] std::size_t waiting_queries() const;
     [[nodiscard]] bool active() const;
+    // The resolver is the world's: it answers whichever virtual shard asks.
     [[nodiscard]] runtime::owner_shard owner() const noexcept {
-        return shard_affine::owner();
+        assert_current();
+        return runtime::owner_shard{};
     }
 
 private:

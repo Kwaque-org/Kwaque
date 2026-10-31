@@ -24,6 +24,19 @@ MAXIMUM_INPUT_BYTES = 1 << 20
 # failure as from an input that passed.
 VERDICT_LINE = re.compile(rb"^kwaque-fuzz-verdict ([a-z_]{1,32})$", re.MULTILINE)
 REQUIRED_VERDICT = "KWAQUE_FUZZ_REQUIRED_VERDICT"
+# A simulation target prints the coverage marks its campaign owns when it
+# starts, and each mark the first time an input in its process hits it. With
+# MARKS_GATE set to 1, as the scheduled campaigns set it, the wrapper writes
+# what the campaign and its merge reached to MARKS_SUMMARY and fails a
+# campaign that otherwise passed but never hit a required mark. A rare mark
+# that was never hit is listed and fails nothing. Short pull-request campaigns
+# leave the gate off: two seconds measure nothing.
+MARK_CATALOG_LINE = re.compile(
+    rb"^kwaque-mark-catalog ([a-z0-9_]{1,56}) (required|rare)$", re.MULTILINE
+)
+MARK_HIT_LINE = re.compile(rb"^kwaque-mark-hit ([a-z0-9_]{1,56})$", re.MULTILINE)
+MARKS_GATE = "KWAQUE_FUZZ_MARKS_GATE"
+MARKS_SUMMARY = "marks-summary.txt"
 # libFuzzer runs every input it is given before it first looks at the clock,
 # so a campaign that continues a kept corpus starts from the seeds and a sample
 # of the kept inputs, its size one of these; the campaign's seed chooses both.
@@ -48,6 +61,53 @@ def failure_verdict(log: Path) -> str | None:
     except OSError:
         return None
     return found[-1].decode("ascii") if found else None
+
+
+def reached_marks(logs: list[Path]) -> tuple[dict[str, str], set[str]]:
+    """The marks the logs' targets owned, required or rare, and those hit.
+
+    A mark owned as required anywhere is required. A log that cannot be read
+    raises, since a summary without it would not say what the campaign hit.
+    """
+    catalog: dict[str, str] = {}
+    hits: set[str] = set()
+    for log in logs:
+        text = log.read_bytes()
+        for name, kind in MARK_CATALOG_LINE.findall(text):
+            mark = name.decode("ascii")
+            if catalog.get(mark) != "required":
+                catalog[mark] = kind.decode("ascii")
+        hits.update(name.decode("ascii") for name in MARK_HIT_LINE.findall(text))
+    return catalog, hits
+
+
+def gate_marks(artifacts: Path, logs: list[Path], status: int) -> int:
+    """Writes and prints the campaign's mark summary, and fails the campaign on
+    a missed required mark or a log it cannot read."""
+    try:
+        catalog, hits = reached_marks(logs)
+    except OSError as error:
+        print(f"fuzz wrapper: cannot read the campaign's marks: {error}", flush=True)
+        return status or 1
+    missed = sorted(
+        mark
+        for mark, kind in catalog.items()
+        if kind == "required" and mark not in hits
+    )
+    summary = "".join(
+        f"{mark} {kind} {'hit' if mark in hits else 'missed'}\n"
+        for mark, kind in sorted(catalog.items())
+    )
+    (artifacts / MARKS_SUMMARY).write_text(summary, encoding="ascii")
+    # A passing campaign keeps no artifacts, so its rare misses are read here.
+    print(summary, end="", flush=True)
+    if status == 0 and missed:
+        print(
+            "fuzz wrapper: the campaign never hit required marks: " + " ".join(missed),
+            flush=True,
+        )
+        return 1
+    return status
 
 
 def normalized_arguments(arguments: list[str]) -> list[str]:
@@ -265,11 +325,15 @@ def main(argv: list[str] | None = None) -> int:
         artifacts / "campaign.log",
         seconds + input_timeout * (1 + given + MUTATIONS_PER_ROUND) + 5,
     )
+    logs = [artifacts / "campaign.log"]
     if kept is not None and not explicit and status == 0:
         # The subset is a copy of kept inputs, which the merge reads in place.
         status = merge_kept_corpus(
             options, kept, directories[:2], work, environment, artifacts
         )
+        logs.append(artifacts / "merge.log")
+    if environment.get(MARKS_GATE) == "1":
+        status = gate_marks(artifacts, logs, status)
     if status and minimize_seconds:
         # libFuzzer owns crash reduction; keep the original even if reduction times out.
         failures = sorted(artifacts.glob("crash-*")) + sorted(

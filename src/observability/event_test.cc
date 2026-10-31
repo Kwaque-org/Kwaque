@@ -1,3 +1,4 @@
+#include "src/base/metric_schema.h"
 #include "src/observability/event.h"
 
 #include <seastar/core/coroutine.hh>
@@ -121,6 +122,8 @@ SEASTAR_TEST_CASE(event_descriptor_registries_are_stable_and_bounded) {
       std::string_view{"network_delivery"},
       std::string_view{"dns_completion"},
       std::string_view{"fault_decision"},
+      std::string_view{"readiness_changed"},
+      std::string_view{"append_refused"},
     };
     constexpr std::array expected_event_fields{
       kwaque::observability::event_field_mask_of(
@@ -180,6 +183,16 @@ SEASTAR_TEST_CASE(event_descriptor_registries_are_stable_and_bounded) {
         event_field_key::actual,
         event_field_key::delta,
         event_field_key::enabled),
+      kwaque::observability::event_field_mask_of(
+        event_field_key::state, event_field_key::reasons),
+      kwaque::observability::event_field_mask_of(
+        event_field_key::outcome,
+        event_field_key::operation,
+        event_field_key::bytes,
+        event_field_key::items,
+        event_field_key::suppressed,
+        event_field_key::topic_id,
+        event_field_key::range_id),
     };
     const auto events = kwaque::observability::event_descriptors();
     BOOST_REQUIRE(events.size() == expected_event_names.size());
@@ -195,6 +208,11 @@ SEASTAR_TEST_CASE(event_descriptor_registries_are_stable_and_bounded) {
           == &events[index]);
         BOOST_CHECK(
           events[index].allowed_fields == expected_event_fields[index]);
+        // Only per-request samples are rate-bounded, and only they carry the
+        // count of what their bound dropped.
+        BOOST_CHECK(
+          kwaque::observability::event_kind_is_rate_bounded(events[index].kind)
+          == (events[index].kind == event_kind::append_refused));
     }
     BOOST_CHECK(
       kwaque::observability::descriptor_for(static_cast<event_kind>(0))
@@ -218,6 +236,10 @@ SEASTAR_TEST_CASE(event_descriptor_registries_are_stable_and_bounded) {
       std::string_view{"actual"},
       std::string_view{"delta"},
       std::string_view{"enabled"},
+      std::string_view{"suppressed"},
+      std::string_view{"topic_id"},
+      std::string_view{"range_id"},
+      std::string_view{"reasons"},
     };
     constexpr std::array expected_field_types{
       event_field_type::bounded_string,
@@ -234,6 +256,10 @@ SEASTAR_TEST_CASE(event_descriptor_registries_are_stable_and_bounded) {
       event_field_type::unsigned_integer,
       event_field_type::signed_integer,
       event_field_type::boolean,
+      event_field_type::unsigned_integer,
+      event_field_type::object_id,
+      event_field_type::object_id,
+      event_field_type::unsigned_integer,
     };
     const auto fields = kwaque::observability::event_field_descriptors();
     BOOST_REQUIRE(fields.size() == expected_field_names.size());
@@ -278,7 +304,7 @@ SEASTAR_TEST_CASE(event_descriptor_registries_are_stable_and_bounded) {
       long_field_name, event_field_name_bytes_max));
 
     const auto texts = kwaque::observability::event_text_descriptors();
-    BOOST_REQUIRE(texts.size() == 60U);
+    BOOST_REQUIRE(texts.size() == 89U);
     for (std::size_t index = 0; index < texts.size(); ++index) {
         BOOST_CHECK(static_cast<std::uint16_t>(texts[index].id) == index + 1U);
         BOOST_CHECK(
@@ -601,5 +627,96 @@ SEASTAR_TEST_CASE(event_construction_allocates_nothing) {
     });
     BOOST_CHECK(attempts == 1U);
     BOOST_CHECK(every_attempt_succeeded);
+    co_return;
+}
+
+SEASTAR_TEST_CASE(
+  chain_steps_and_refusals_read_the_same_in_events_and_metrics) {
+    using kwaque::observability::descriptor_for;
+    const auto step = static_cast<std::uint16_t>(
+      event_public_text::operation_envelope_size);
+    for (std::size_t index = 0;
+         index < kwaque::metric_chain_step_label_values.size();
+         ++index) {
+        const auto* text = descriptor_for(
+          static_cast<event_public_text>(step + index));
+        if (text == nullptr) {
+            BOOST_ERROR("a chain step has no event text");
+            continue;
+        }
+        BOOST_CHECK(text->role == event_field_key::operation);
+        BOOST_CHECK(
+          text->value == kwaque::metric_chain_step_label_values[index]);
+    }
+    const auto refusal = static_cast<std::uint16_t>(
+      event_public_text::outcome_batch_id_conflict);
+    for (std::size_t index = 0;
+         index < kwaque::metric_refusal_label_values.size();
+         ++index) {
+        const auto* text = descriptor_for(
+          static_cast<event_public_text>(refusal + index));
+        if (text == nullptr) {
+            BOOST_ERROR("a refusal has no event text");
+            continue;
+        }
+        BOOST_CHECK(text->role == event_field_key::outcome);
+        BOOST_CHECK(text->value == kwaque::metric_refusal_label_values[index]);
+    }
+    co_return;
+}
+
+SEASTAR_TEST_CASE(rate_bounded_requests_leave_room_for_the_suppressed_count) {
+    using kwaque::observability::event_field;
+    using kwaque::observability::event_field_value;
+    using kwaque::observability::event_object_id;
+    using kwaque::observability::event_request;
+
+    event_object_id::octets_type octets{};
+    octets[15] = 1;
+    const auto identity = event_object_id::make(octets);
+    BOOST_REQUIRE(identity.has_value());
+    BOOST_CHECK(!event_object_id::make(event_object_id::octets_type{}));
+    const auto value = event_field_value::from_object_id(*identity);
+    BOOST_CHECK(value.type() == event_field_type::object_id);
+    BOOST_CHECK(value.encoded_payload_size() == 16U);
+    BOOST_CHECK(value.as_object_id() == *identity);
+    BOOST_CHECK(!value.as_text());
+    BOOST_CHECK(!value.as_unsigned());
+
+    const event_field topic{.key = event_field_key::topic_id, .value = value};
+    const event_field suppressed{
+      .key = event_field_key::suppressed,
+      .value = event_field_value::from_unsigned(3)};
+    // Only the event sequence adds the count.
+    BOOST_CHECK(!event_request::make(
+      context(event_kind::append_refused), std::array{topic, suppressed}));
+    BOOST_CHECK(
+      event_request::make(
+        context(event_kind::append_refused), std::array{topic}));
+    // Every field but the count is the emitter's, and they all fit.
+    const std::array all_but_the_count{
+      event_field{
+        .key = event_field_key::outcome,
+        .value = event_field_value::from_text(
+          text(event_public_text::outcome_no_space))},
+      event_field{
+        .key = event_field_key::operation,
+        .value = event_field_value::from_text(
+          text(event_public_text::operation_storage_pressure))},
+      event_field{
+        .key = event_field_key::bytes,
+        .value = event_field_value::from_unsigned(1)},
+      event_field{
+        .key = event_field_key::items,
+        .value = event_field_value::from_unsigned(1)},
+      topic,
+      event_field{.key = event_field_key::range_id, .value = value},
+    };
+    BOOST_CHECK(
+      event_request::make(
+        context(event_kind::append_refused), all_but_the_count));
+    // A kind that is not rate-bounded never carries the count.
+    BOOST_CHECK(!event_request::make(
+      context(event_kind::readiness_changed), std::array{suppressed}));
     co_return;
 }

@@ -131,6 +131,14 @@ private:
         return writer.append_text(*value.as_text());
     case event_field_type::stable_id:
         return writer.append_integer(value.as_stable_id()->value());
+    case event_field_type::object_id: {
+        for (const auto octet : value.as_object_id()->octets()) {
+            if (!writer.append_byte(octet)) {
+                return false;
+            }
+        }
+        return true;
+    }
     }
     return false;
 }
@@ -205,6 +213,22 @@ append_field(event_encoding_writer& writer, const event_field& field) noexcept {
             return runtime::failure(codec_error(errc::malformed_data));
         }
         return event_field_value::from_stable_id(*stable);
+    }
+    case event_field_type::object_id: {
+        if (payload_size != event_object_id_bytes) {
+            return runtime::failure(codec_error(errc::malformed_data));
+        }
+        event_object_id::octets_type octets{};
+        for (auto& octet : octets) {
+            if (!reader.read_integer(octet)) {
+                return runtime::failure(codec_error(errc::malformed_data));
+            }
+        }
+        auto identity = event_object_id::make(octets);
+        if (!identity) {
+            return runtime::failure(codec_error(errc::malformed_data));
+        }
+        return event_field_value::from_object_id(*identity);
     }
     }
     return runtime::failure(codec_error(errc::malformed_data));

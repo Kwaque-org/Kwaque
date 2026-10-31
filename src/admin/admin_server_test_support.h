@@ -24,6 +24,10 @@ struct admin_server_test_access final {
     native_server(admin_server& server) {
         return server.native_server_for_testing();
     }
+    static seastar::future<std::vector<std::pair<bool, readiness_reasons>>>
+    readiness_by_shard(admin_server& server) {
+        return server.readiness_by_shard_for_testing();
+    }
 };
 
 struct leased_endpoint final {

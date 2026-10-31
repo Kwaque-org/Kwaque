@@ -234,7 +234,7 @@ private:
     std::uint64_t next_draw_{0};
 };
 
-class fault_schedule final : public runtime::shard_affine {
+class fault_schedule final : public runtime::reactor_affine {
 public:
     // Canonicalizes the caller-owned rule list before validating overlaps.
     [[nodiscard]] static runtime::result<void> validate_rules(

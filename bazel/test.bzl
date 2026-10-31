@@ -46,7 +46,8 @@ def kwaque_py_native_test(
         size = "small",
         timeout = None,
         tags = [],
-        deps = []):
+        deps = [],
+        target_compatible_with = []):
     """Defines a Python test that runs native binaries.
 
     Every test that starts a native process uses this macro, so the process
@@ -65,6 +66,7 @@ def kwaque_py_native_test(
       timeout: Bazel test timeout.
       tags: Test tags.
       deps: Python libraries the test imports.
+      target_compatible_with: Constraints the test needs, such as an optimized build.
     """
     py_test(
         name = name,
@@ -76,6 +78,7 @@ def kwaque_py_native_test(
         main = main,
         size = size,
         tags = tags,
+        target_compatible_with = target_compatible_with,
         timeout = timeout,
     )
 

@@ -5,7 +5,6 @@ import json
 import os
 import re
 import shlex
-import shutil
 import subprocess
 import sys
 import tempfile
@@ -36,37 +35,6 @@ def write_python_executable(
         f'#!/bin/sh\nexec {shlex.quote(interpreter)} {shlex.quote(str(script))} "$@"\n'
     )
     path.chmod(0o700)
-
-
-def isolated_git_environment(root: Path) -> dict[str, str]:
-    environment = {
-        name: value for name, value in os.environ.items() if not name.startswith("GIT_")
-    }
-    environment.update(
-        {
-            "GIT_CONFIG_GLOBAL": str(root / "missing-global-config"),
-            "GIT_CONFIG_SYSTEM": str(root / "missing-system-config"),
-            "GIT_CONFIG_COUNT": "1",
-            "GIT_CONFIG_KEY_0": "core.excludesFile",
-            "GIT_CONFIG_VALUE_0": str(root / "missing-global-excludes"),
-            "GIT_AUTHOR_NAME": "test",
-            "GIT_AUTHOR_EMAIL": "test@example.invalid",
-            "GIT_COMMITTER_NAME": "test",
-            "GIT_COMMITTER_EMAIL": "test@example.invalid",
-        }
-    )
-    return environment
-
-
-def checked_names(run: mock.Mock, root: Path, names: tuple[str, ...]) -> set[str]:
-    patterns = [arg for arg in run.call_args.args[0] if arg.startswith("^")]
-    return {
-        name
-        for name in names
-        if any(
-            re.fullmatch(pattern, str(root / f"src/{name}.cc")) for pattern in patterns
-        )
-    }
 
 
 class ClangTidySelectionTest(unittest.TestCase):
@@ -110,216 +78,6 @@ class ClangTidySelectionTest(unittest.TestCase):
             ):
                 driver.positive_jobs(value)
         self.assertEqual(driver.positive_jobs("3"), 3)
-
-    def test_shards_split_the_files_exactly_once(self) -> None:
-        files = {f"src/{name}.cc" for name in "edcbagf"}
-        for count in (1, 2, 3, 7, 9):
-            with self.subTest(count=count):
-                shards = [
-                    driver.shard_files(files, (index, count)) for index in range(count)
-                ]
-                together = [path for shard in shards for path in shard]
-                self.assertEqual(sorted(together), sorted(files))
-                self.assertEqual(len(together), len(set(together)))
-                sizes = [len(shard) for shard in shards]
-                self.assertLessEqual(max(sizes) - min(sizes), 1)
-        self.assertEqual(driver.shard_files(files, None), sorted(files))
-        self.assertEqual(driver.shard_spec("1/2"), (1, 2))
-        for value in ("2/2", "0/0", "1", "-1/2", "a/b", "1/2/3"):
-            with (
-                self.subTest(value=value),
-                self.assertRaises(argparse.ArgumentTypeError),
-            ):
-                driver.shard_spec(value)
-
-    def test_wrapper_checks_only_its_shard(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            names = ("a", "b", "c", "d", "e")
-            entries = [
-                {"directory": str(root), "file": f"src/{name}.cc"} for name in names
-            ]
-            (root / "compile_commands.json").write_text(json.dumps(entries))
-            checked = []
-            for shard in ("0/2", "1/2"):
-                with (
-                    mock.patch.object(driver, "workspace_root", return_value=root),
-                    mock.patch.object(
-                        driver.subprocess, "run", return_value=mock.Mock(returncode=0)
-                    ) as run,
-                    mock.patch.object(
-                        sys,
-                        "argv",
-                        [
-                            "clang_tidy",
-                            "--tool=/tidy",
-                            "--runner=/runner",
-                            "--config=.clang-tidy",
-                            f"--shard={shard}",
-                        ],
-                    ),
-                ):
-                    self.assertEqual(driver.main(), 0)
-                checked.append(checked_names(run, root, names))
-            self.assertEqual(checked, [{"a", "c", "e"}, {"b", "d"}])
-
-    def test_changed_scope_checks_sources_and_direct_includers_of_headers(
-        self,
-    ) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            sources = {
-                "src/a.cc": '#include "src/a.h"\n',
-                "src/spaced.cc": '  #  include  "src/a.h"\n',
-                "src/mentions.cc": '// "src/a.h" is not included here\n',
-                "src/b.cc": '#include "src/c.h"\n',
-                "src/c.h": '#include "src/a.h"\n',
-                "src/a.h": "",
-                "src/d.cc": '#include "proto/x.pb.h"\n',
-                "src/e.cc": "",
-                "proto/x.proto": "",
-            }
-            for name, text in sources.items():
-                (root / name).parent.mkdir(parents=True, exist_ok=True)
-                (root / name).write_text(text)
-            entries = [
-                {"directory": str(root), "file": name}
-                for name in sources
-                if name.endswith(".cc")
-            ]
-            for changed, expected in (
-                # Includers through another header are not the header's users.
-                (["src/a.h"], ["src/a.cc", "src/spaced.cc"]),
-                (["src/c.h"], ["src/b.cc"]),
-                (["src/e.cc", "README.md", "tools/ci_changes.py"], ["src/e.cc"]),
-                (
-                    [
-                        "src/e.cc",
-                        ".bazelrc",
-                        "MODULE.bazel",
-                        "MODULE.bazel.lock",
-                        "bazel/build.bzl",
-                        "bazel/thirdparty/seastar/fix.patch",
-                        "src/BUILD",
-                    ],
-                    ["src/e.cc"],
-                ),
-                (["proto/x.proto"], ["src/d.cc"]),
-                (["src/removed.cc", "src/removed.h"], []),
-                (["docs/guide.md"], []),
-            ):
-                with self.subTest(changed=changed):
-                    self.assertEqual(
-                        driver.affected_files(entries, root, changed), expected
-                    )
-            for widening in (
-                ".clang-tidy",
-                ".clang-tidy-strict",
-                "tools/compilation_database.py",
-                "tools/run_clang_tidy.py",
-            ):
-                with self.subTest(widening=widening):
-                    self.assertIsNone(
-                        driver.affected_files(entries, root, ["src/e.cc", widening])
-                    )
-
-    def test_changed_paths_of_a_shallow_pull_request_merge_are_its_own(self) -> None:
-        git = shutil.which("git")
-        self.assertIsNotNone(git)
-        with tempfile.TemporaryDirectory() as directory:
-            origin = Path(directory) / "origin"
-            clone = Path(directory) / "clone"
-            with mock.patch.dict(
-                os.environ, isolated_git_environment(Path(directory)), clear=True
-            ):
-
-                def run(*arguments: str) -> None:
-                    subprocess.run([git, *arguments], cwd=origin, check=True)
-
-                origin.mkdir()
-                run("init", "--template=", "-q", "-b", "main")
-                (origin / "base.cc").write_text("")
-                run("add", "base.cc")
-                run("commit", "-q", "-m", "base")
-                run("checkout", "-q", "-b", "topic")
-                (origin / "change.cc").write_text("")
-                (origin / "change.h").write_text("")
-                run("add", "change.cc", "change.h")
-                run("commit", "-q", "-m", "change")
-                run("checkout", "-q", "main")
-                (origin / "later.cc").write_text("")
-                run("add", "later.cc")
-                run("commit", "-q", "-m", "later")
-                # A branch compared with a base that moved on since it left.
-                run("checkout", "-q", "topic")
-                self.assertEqual(
-                    driver.changed_paths(origin, "main"), ["change.cc", "change.h"]
-                )
-                run("checkout", "-q", "main")
-                run("merge", "-q", "--no-ff", "topic", "-m", "merge")
-                # The checkout of a pull request: its merge commit and parents.
-                subprocess.run(
-                    [git, "clone", "-q", "--depth=2", origin.as_uri(), str(clone)],
-                    check=True,
-                )
-                (clone / "new.cc").write_text("")
-                self.assertEqual(
-                    driver.changed_paths(clone, "HEAD~1"),
-                    ["change.cc", "change.h", "new.cc"],
-                )
-
-    def test_wrapper_checks_only_what_the_change_affects(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            names = ("a", "b", "c")
-            (root / "src").mkdir()
-            for name in names:
-                (root / f"src/{name}.cc").write_text("")
-            entries = [
-                {"directory": str(root), "file": f"src/{name}.cc"} for name in names
-            ]
-            (root / "compile_commands.json").write_text(json.dumps(entries))
-            failure = subprocess.CalledProcessError(128, ["git"])
-            for changed, shard, expected in (
-                (["src/b.cc"], [], {"b"}),
-                (["src/b.cc"], ["--shard=0/2"], {"b"}),
-                # The runner would check every file if handed none.
-                (["src/b.cc"], ["--shard=1/2"], None),
-                (["README.md"], [], None),
-                ([".clang-tidy"], [], {"a", "b", "c"}),
-                (failure, [], {"a", "b", "c"}),
-            ):
-                with (
-                    self.subTest(changed=changed, shard=shard),
-                    mock.patch.object(driver, "workspace_root", return_value=root),
-                    mock.patch.object(
-                        driver,
-                        "changed_paths",
-                        side_effect=[changed],
-                    ) as listed,
-                    mock.patch.object(
-                        driver.subprocess, "run", return_value=mock.Mock(returncode=0)
-                    ) as run,
-                    mock.patch.object(
-                        sys,
-                        "argv",
-                        [
-                            "clang_tidy",
-                            "--tool=/tidy",
-                            "--runner=/runner",
-                            "--config=.clang-tidy",
-                            "--scope=changed",
-                            "--base=HEAD~1",
-                            *shard,
-                        ],
-                    ),
-                ):
-                    self.assertEqual(driver.main(), 0)
-                    listed.assert_called_once_with(root, "HEAD~1")
-                    if expected is None:
-                        run.assert_not_called()
-                    else:
-                        self.assertEqual(checked_names(run, root, names), expected)
 
     def test_wrapper_propagates_runner_failure_and_uses_two_workers_by_default(
         self,
@@ -393,6 +151,66 @@ class ClangTidySelectionTest(unittest.TestCase):
         ):
             with self.subTest(entries=entries), self.assertRaises(ValueError):
                 select_files(entries, requested, production)
+
+
+class ChangedScopeTest(unittest.TestCase):
+    entries = [
+        {"file": "src/model/a.cc"},
+        {"file": "src/model/b.cc"},
+        {"file": "src/runtime/c.cc"},
+    ]
+
+    def test_only_the_changed_translation_units_are_checked(self) -> None:
+        self.assertEqual(
+            driver.changed_sources(
+                self.entries,
+                [
+                    "src/model/a.cc",
+                    "src/model/a.h",
+                    "src/model/BUILD",
+                    "src/removed.cc",
+                    "tools/other.py",
+                ],
+            ),
+            ["src/model/a.cc"],
+        )
+        self.assertEqual(driver.changed_sources(self.entries, ["src/model/a.h"]), [])
+
+    def test_a_change_to_the_check_itself_checks_everything(self) -> None:
+        for path in sorted(driver.WHOLE_TREE_PATHS):
+            with self.subTest(path=path):
+                with mock.patch("builtins.print"):
+                    self.assertIsNone(
+                        driver.changed_sources(self.entries, ["src/model/a.cc", path])
+                    )
+
+    def test_changed_paths_include_the_working_tree_and_new_files(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+
+            def git(*arguments: str) -> None:
+                subprocess.run(
+                    ["git", *arguments],
+                    cwd=root,
+                    check=True,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+
+            git("init", "-q")
+            git("config", "user.email", "test@example.invalid")
+            git("config", "user.name", "test")
+            (root / "kept.cc").write_text("int kept;\n")
+            (root / "edited.cc").write_text("int edited;\n")
+            git("add", ".")
+            git("commit", "-q", "-m", "base")
+            git("branch", "base")
+            (root / "edited.cc").write_text("int edited = 1;\n")
+            git("commit", "-q", "-am", "change")
+            (root / "new.cc").write_text("int added;\n")
+            self.assertEqual(
+                driver.changed_paths(root, "base"), ["edited.cc", "new.cc"]
+            )
 
 
 class PartitionedAnalysisTest(unittest.TestCase):

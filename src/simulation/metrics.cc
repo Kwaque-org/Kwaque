@@ -36,12 +36,12 @@ simulation_metrics::simulation_metrics(
   , files_(&files)
   , network_(&network)
   , dns_(&dns) {
-    const auto owner = events.owner();
+    const auto reactor = events.reactor();
     KWAQUE_INVARIANT(
       invariant_id{"KQ-SIMULATION-METRIC-SHARD"},
-      events.uses_trace(trace) && faults.owner() == owner
-        && files.owner() == owner && network.owner() == owner
-        && dns.owner() == owner,
+      events.uses_trace(trace) && faults.reactor() == reactor
+        && files.reactor() == reactor && network.reactor() == reactor
+        && dns.reactor() == reactor,
       "simulation metric sources have different owners");
 }
 

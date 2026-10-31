@@ -1,6 +1,7 @@
 #ifndef KWAQUE_SRC_OBSERVABILITY_EVENT_H_
 #define KWAQUE_SRC_OBSERVABILITY_EVENT_H_
 
+#include "src/base/names.h"
 #include "src/resource/workload_class.h"
 #include "src/runtime/error.h"
 #include "src/runtime/shard_affinity.h"
@@ -37,7 +38,35 @@ enum class event_kind : std::uint16_t {
     network_delivery = 6,
     dns_completion = 7,
     fault_decision = 8,
+    // State changes: never dropped.
+    readiness_changed = 9,
+    // Samples of one request each: at most one a second of each kind on a
+    // shard, the next one admitted carrying how many were dropped.
+    append_refused = 10,
 };
+
+[[nodiscard]] constexpr bool
+event_kind_is_rate_bounded(event_kind kind) noexcept {
+    return kind == event_kind::append_refused;
+}
+
+// The highest event kind; kinds are numbered from 1 with no gap.
+inline constexpr std::uint16_t event_kind_count{10};
+
+// Each rate-bounded kind's place among them, in kind order.
+[[nodiscard]] constexpr std::size_t
+event_rate_bound_slot(event_kind kind) noexcept {
+    std::size_t slot = 0;
+    for (std::uint16_t value = 1; value < static_cast<std::uint16_t>(kind);
+         ++value) {
+        slot += event_kind_is_rate_bounded(static_cast<event_kind>(value)) ? 1U
+                                                                           : 0U;
+    }
+    return slot;
+}
+
+inline constexpr std::size_t event_rate_bounded_kinds{
+  event_rate_bound_slot(static_cast<event_kind>(event_kind_count + 1U))};
 
 enum class event_severity : std::uint8_t {
     trace = 1,
@@ -53,6 +82,8 @@ enum class event_field_type : std::uint8_t {
     boolean = 3,
     bounded_string = 4,
     stable_id = 5,
+    // A 16-octet object identity, printed in the RFC 9562 text form.
+    object_id = 6,
 };
 
 enum class event_field_key : std::uint16_t {
@@ -70,6 +101,13 @@ enum class event_field_key : std::uint16_t {
     actual = 12,
     delta = 13,
     enabled = 14,
+    // How many events of this kind the shard dropped since the last one it
+    // emitted. Only the event sequence adds it.
+    suppressed = 15,
+    topic_id = 16,
+    range_id = 17,
+    // A set of readiness reasons, one bit each.
+    reasons = 18,
 };
 
 [[nodiscard]] constexpr std::optional<event_field_type>
@@ -87,9 +125,14 @@ event_field_type_for(event_field_key key) noexcept {
     case event_field_key::limit:
     case event_field_key::expected:
     case event_field_key::actual:
+    case event_field_key::suppressed:
+    case event_field_key::reasons:
         return event_field_type::unsigned_integer;
     case event_field_key::stable_id:
         return event_field_type::stable_id;
+    case event_field_key::topic_id:
+    case event_field_key::range_id:
+        return event_field_type::object_id;
     case event_field_key::delta:
         return event_field_type::signed_integer;
     case event_field_key::enabled:
@@ -98,12 +141,13 @@ event_field_type_for(event_field_key key) noexcept {
     return std::nullopt;
 }
 
-using event_field_mask = std::uint16_t;
+// The mask is never encoded: an event names each field by its key.
+using event_field_mask = std::uint32_t;
 
 [[nodiscard]] constexpr event_field_mask
 event_field_bit(event_field_key key) noexcept {
     const auto value = static_cast<std::uint16_t>(key);
-    return value == 0 || value > 16U ? event_field_mask{0}
+    return value == 0 || value > 32U ? event_field_mask{0}
                                      : static_cast<event_field_mask>(
                                          event_field_mask{1} << (value - 1U));
 }
@@ -175,6 +219,18 @@ allowed_event_fields(event_kind kind) noexcept {
           event_field_key::actual,
           event_field_key::delta,
           event_field_key::enabled);
+    case event_kind::readiness_changed:
+        return event_field_mask_of(
+          event_field_key::state, event_field_key::reasons);
+    case event_kind::append_refused:
+        return event_field_mask_of(
+          event_field_key::outcome,
+          event_field_key::operation,
+          event_field_key::bytes,
+          event_field_key::items,
+          event_field_key::suppressed,
+          event_field_key::topic_id,
+          event_field_key::range_id);
     }
     return 0;
 }
@@ -246,6 +302,37 @@ enum class event_public_text : std::uint16_t {
     reason_corrupt_data = 58,
     reason_wrong_context = 59,
     reason_unsupported_format = 60,
+    state_not_ready = 61,
+    // The steps of the append admission chain, in chain order.
+    operation_envelope_size = 62,
+    operation_ingress_memory = 63,
+    operation_stream_window = 64,
+    operation_range_queue = 65,
+    operation_shard_capacity = 66,
+    operation_forwarded_traffic = 67,
+    operation_storage_pressure = 68,
+    // The definite append refusals, in code order (203 to 223).
+    outcome_batch_id_conflict = 69,
+    outcome_stale = 70,
+    outcome_sequence_gap = 71,
+    outcome_window_exceeded = 72,
+    outcome_unknown_stream = 73,
+    outcome_stream_sealed = 74,
+    outcome_stream_failed = 75,
+    outcome_producer_fenced = 76,
+    outcome_invalid_ack_floor = 77,
+    outcome_stream_limit = 78,
+    outcome_topic_sealed = 79,
+    outcome_not_found = 80,
+    outcome_misrouted_key = 81,
+    outcome_stale_route = 82,
+    outcome_no_space = 83,
+    outcome_too_large = 84,
+    outcome_invalid_batch = 85,
+    outcome_timed_out_before_acceptance = 86,
+    outcome_aborted_before_acceptance = 87,
+    outcome_closed = 88,
+    outcome_unknown_producer = 89,
 };
 
 struct event_text_descriptor final {
@@ -274,18 +361,7 @@ struct event_field_descriptor final {
 
 [[nodiscard]] constexpr bool
 event_name_is_valid(std::string_view name, std::size_t maximum_bytes) noexcept {
-    if (name.empty() || name.size() > maximum_bytes) {
-        return false;
-    }
-    for (std::size_t index = 0; index < name.size(); ++index) {
-        const char character = name[index];
-        const bool lower = character >= 'a' && character <= 'z';
-        const bool digit = character >= '0' && character <= '9';
-        if ((!lower && !digit && character != '_') || (index == 0 && !lower)) {
-            return false;
-        }
-    }
-    return true;
+    return is_lowercase_name(name, maximum_bytes);
 }
 
 [[nodiscard]] const event_descriptor* descriptor_for(event_kind kind) noexcept;
@@ -349,6 +425,32 @@ private:
     std::uint64_t value_;
 };
 
+inline constexpr std::size_t event_object_id_bytes{16};
+
+// An object identity as its 16 octets in canonical order. The nil identity is
+// never an object's.
+class event_object_id final {
+public:
+    using octets_type = std::array<std::uint8_t, event_object_id_bytes>;
+
+    [[nodiscard]] static runtime::result<event_object_id>
+    make(std::span<const std::uint8_t, event_object_id_bytes> octets) noexcept;
+
+    [[nodiscard]] constexpr const octets_type& octets() const noexcept {
+        return octets_;
+    }
+
+    auto operator<=>(const event_object_id&) const = default;
+
+private:
+    friend class event_field_value;
+
+    constexpr explicit event_object_id(const octets_type& octets) noexcept
+      : octets_(octets) {}
+
+    octets_type octets_;
+};
+
 class event_field_value final {
 public:
     constexpr event_field_value() noexcept = default;
@@ -376,6 +478,16 @@ public:
     from_stable_id(event_stable_id value) noexcept {
         return event_field_value{event_field_type::stable_id, value.value()};
     }
+    // The octets live in the text storage, so no field grows.
+    [[nodiscard]] static constexpr event_field_value
+    from_object_id(const event_object_id& value) noexcept {
+        event_field_value result{event_field_type::object_id, 0};
+        for (std::size_t index = 0; index < event_object_id_bytes; ++index) {
+            result.text_.storage_[index] = static_cast<char>(
+              value.octets()[index]);
+        }
+        return result;
+    }
 
     [[nodiscard]] constexpr event_field_type type() const noexcept {
         return type_;
@@ -390,6 +502,8 @@ public:
         case event_field_type::unsigned_integer:
         case event_field_type::stable_id:
             return sizeof(std::uint64_t);
+        case event_field_type::object_id:
+            return event_object_id_bytes;
         }
         return 0;
     }
@@ -427,6 +541,17 @@ public:
                  ? std::optional{event_stable_id{numeric_}}
                  : std::nullopt;
     }
+    [[nodiscard]] constexpr std::optional<event_object_id>
+    as_object_id() const noexcept {
+        if (type_ != event_field_type::object_id) {
+            return std::nullopt;
+        }
+        event_object_id::octets_type octets{};
+        for (std::size_t index = 0; index < event_object_id_bytes; ++index) {
+            octets[index] = static_cast<std::uint8_t>(text_.storage_[index]);
+        }
+        return event_object_id{octets};
+    }
 
     bool operator==(const event_field_value&) const = default;
 
@@ -461,9 +586,10 @@ make_event_field(std::int64_t value) noexcept {
       .key = Key, .value = event_field_value::from_signed(value)};
 }
 
+// The sequence alone writes `suppressed`, so an emitter cannot.
 template<event_kind Kind, event_field_key Key>
 requires(
-  event_field_is_allowed(Kind, Key)
+  event_field_is_allowed(Kind, Key) && Key != event_field_key::suppressed
   && event_field_type_for(Key) == event_field_type::unsigned_integer)
 [[nodiscard]] constexpr event_field
 make_event_field(std::uint64_t value) noexcept {
@@ -488,6 +614,16 @@ requires(
 make_event_field(event_stable_id value) noexcept {
     return event_field{
       .key = Key, .value = event_field_value::from_stable_id(value)};
+}
+
+template<event_kind Kind, event_field_key Key>
+requires(
+  event_field_is_allowed(Kind, Key)
+  && event_field_type_for(Key) == event_field_type::object_id)
+[[nodiscard]] constexpr event_field
+make_event_field(const event_object_id& value) noexcept {
+    return event_field{
+      .key = Key, .value = event_field_value::from_object_id(value)};
 }
 
 template<event_kind Kind, event_field_key Key>
@@ -597,10 +733,13 @@ private:
       event_shard shard,
       std::uint64_t sequence,
       std::span<const event_field> fields) noexcept;
+    // A rate-bounded kind carries the count of the events of its kind the
+    // shard dropped before it, when there were any.
     [[nodiscard]] static event from_request(
       const event_request& request,
       event_shard shard,
-      std::uint64_t sequence) noexcept;
+      std::uint64_t sequence,
+      std::uint64_t suppressed = 0) noexcept;
 
     event(
       const event_request_context& context,
@@ -653,6 +792,8 @@ public:
     fields() const noexcept {
         return {fields_.data(), field_count_};
     }
+    // The event's size before its sequence adds a suppressed count: the
+    // event of a rate-bounded kind may be that field's size larger.
     [[nodiscard]] constexpr std::size_t encoded_size() const noexcept {
         return encoded_size_;
     }
@@ -664,6 +805,13 @@ private:
 
     explicit event_request(const event_request_context& context) noexcept
       : context_(context) {}
+
+    // An emitter's request leaves room for a suppressed count and may not
+    // carry one; a decoded event carries what its sequence added.
+    [[nodiscard]] static runtime::result<event_request> build(
+      const event_request_context& context,
+      std::span<const event_field> fields,
+      bool decoded) noexcept;
 
     event_request_context context_;
     std::array<event_field, event_fields_max> fields_{};

@@ -62,10 +62,23 @@ kwaque_cc_library(
 )
 
 kwaque_cc_library(
+    name = "names",
+    hdrs = ["names.h"],
+    visibility = ["//visibility:public"],
+)
+
+kwaque_cc_library(
+    name = "readiness",
+    hdrs = ["readiness.h"],
+    visibility = ["//visibility:public"],
+)
+
+kwaque_cc_library(
     name = "metric_schema",
     srcs = ["metric_schema.cc"],
     hdrs = ["metric_schema.h"],
     visibility = ["//visibility:public"],
+    deps = [":names"],
 )
 
 stamp_template(

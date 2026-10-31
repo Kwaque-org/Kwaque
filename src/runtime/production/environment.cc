@@ -216,11 +216,13 @@ seastar::future<> environment::stop_once(bool start_failed) {
     }
     network_.reset();
     file_system_.reset();
+    deadlines_.reset();
     if (timer_) {
         co_await preserve_cleanup_result(
           first_failure, [this] { return timer_->stop(); });
         timer_.reset();
     }
+    identity_entropy_.reset();
     random_.reset();
     dns_options_.reset();
     metrics_.reset();
@@ -431,6 +433,16 @@ void environment::register_metrics() {
           metric_id::dns_completed_total,
           metric_id::dns_rejected_total,
           std::nullopt);
+
+        const auto& suppressed = metric(
+          metric_id::observability_events_suppressed_total);
+        metrics_->add_group(
+          seastar::sstring{suppressed.group},
+          {metrics::make_counter(
+             seastar::sstring{suppressed.name},
+             [this] { return event_sink_.suppressed_total(); },
+             metrics::description(seastar::sstring{suppressed.help}))
+             .aggregate(aggregate)});
     } catch (...) {
         metrics_.reset();
         throw;

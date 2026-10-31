@@ -558,6 +558,34 @@ kwaque_cc_test(
     ],
 )
 
+kwaque_cc_library(
+    name = "xxh3_static_kernel",
+    testonly = True,
+    srcs = ["xxh3_static_kernel.cc"],
+    hdrs = ["xxh3_static_kernel.h"],
+    deps = ["@xxhash"],
+)
+
+kwaque_cc_seastar_gtest(
+    name = "xxh3_64_test",
+    srcs = ["xxh3_64_test.cc"],
+    data = ["testdata/xxh3_64_vectors.tsv"],
+    deps = [
+        ":xxh3_static_kernel",
+        "//src/codec:xxh3",
+        "//src/codec:xxh3_64_inline",
+    ],
+)
+
+kwaque_cc_benchmark(
+    name = "xxh3_64_bench",
+    srcs = ["xxh3_64_bench.cc"],
+    deps = [
+        "//src/codec:xxh3",
+        "//src/codec:xxh3_64_inline",
+    ],
+)
+
 kwaque_cc_seastar_gtest(
     name = "transaction_test",
     srcs = ["transaction_test.cc"],

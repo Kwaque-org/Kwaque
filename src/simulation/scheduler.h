@@ -118,7 +118,7 @@ private:
     scheduler_limit_values values_;
 };
 
-class scheduler final : public runtime::shard_affine {
+class scheduler final : public runtime::reactor_affine {
 public:
     using callback = seastar::noncopyable_function<void() noexcept>;
 
@@ -242,6 +242,18 @@ public:
     // teardown callback. Such a callback must release ownership and must not
     // apply the event's normal simulated effect.
     [[nodiscard]] bool discarding_failed_event() const;
+    // The virtual shard the last batch of run_ready_batch ran as. Such a
+    // batch never mixes shards, so the reactor tasks it woke all belong to
+    // this one; the other runners do not stop at a shard change.
+    [[nodiscard]] std::uint16_t last_batch_shard() const;
+    // Schedules as virtual shard `shard`; schedule() uses the current one.
+    [[nodiscard]] runtime::result<event_id> schedule_on(
+      std::uint16_t shard,
+      runtime::monotonic_time deadline,
+      event_priority priority,
+      callback&& completion,
+      trace_event_descriptor descriptor = {},
+      event_cleanup_policy cleanup = event_cleanup_policy::drop);
     [[nodiscard]] const scheduler_limits& limits() const {
         assert_current();
         return limits_;
@@ -254,6 +266,9 @@ private:
         runtime::monotonic_time deadline;
         event_priority priority;
         event_cleanup_policy cleanup;
+        // The virtual shard the event runs as: the one that scheduled it
+        // unless a target was named.
+        std::uint16_t shard{0};
         event_id id;
         callback completion;
         trace_event_descriptor descriptor;
@@ -390,6 +405,15 @@ private:
     observe_time_advance(runtime::monotonic_time target) noexcept;
     [[nodiscard]] runtime::operation_error
     limit_error(std::uint64_t observed, std::uint64_t limit) const noexcept;
+    [[nodiscard]] std::uint16_t current_virtual_shard() const noexcept;
+    [[nodiscard]] runtime::result<event_id> schedule_as(
+      std::uint16_t shard,
+      runtime::monotonic_time deadline,
+      event_priority priority,
+      callback&& completion,
+      trace_event_descriptor descriptor,
+      event_cleanup_policy cleanup,
+      event_trace::reservation trace_reservation);
 
     scheduler_limits limits_;
     event_trace* trace_;
@@ -403,6 +427,7 @@ private:
     bool event_ids_exhausted_{false};
     bool pumping_{false};
     bool discarding_failed_event_{false};
+    std::uint16_t last_batch_shard_{0};
 };
 
 [[nodiscard]] constexpr trace_scheduler_budget

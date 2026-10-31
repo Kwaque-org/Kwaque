@@ -2570,16 +2570,17 @@ SEASTAR_TEST_CASE(fake_filesystem_has_one_nontransportable_shard_owner) {
     auto opened = co_await std::move(opening);
     BOOST_REQUIRE(opened.has_value());
     auto file = std::move(*opened);
-    const auto filesystem_owner = environment.files->owner();
+    const auto filesystem_reactor = environment.files->reactor();
     const auto handle_owner = file.owner();
-    BOOST_CHECK(filesystem_owner.is_current());
+    BOOST_CHECK_EQUAL(filesystem_reactor, seastar::this_shard_id());
     BOOST_CHECK(handle_owner.is_current());
     const auto before = fake_file_test_access::snapshot(*environment.files);
     BOOST_REQUIRE(before.has_value());
     BOOST_REQUIRE_GE(seastar::this_smp_shard_count(), 2U);
     const auto rejected = co_await seastar::smp::submit_to(
-      1, [filesystem_owner, handle_owner] {
-          return !filesystem_owner.is_current() && !handle_owner.is_current();
+      1, [filesystem_reactor, handle_owner] {
+          return filesystem_reactor != seastar::this_shard_id()
+                 && !handle_owner.is_current();
       });
     BOOST_CHECK(rejected);
     const auto after = fake_file_test_access::snapshot(*environment.files);

@@ -52,7 +52,7 @@ private:
 } // namespace
 
 owner_shard::owner_shard() noexcept
-  : shard_(seastar::this_shard_id()) {}
+  : shard_(current_shard()) {}
 
 void owner_shard::fail_wrong_shard(
   seastar::shard_id expected,
@@ -61,7 +61,19 @@ void owner_shard::fail_wrong_shard(
     const shard_context context{expected, current};
     invariant_failed(
       wrong_shard_invariant,
-      "this_shard_id() == owner_shard",
+      "current_shard() == owner_shard",
+      context.view(),
+      location);
+}
+
+void detail::fail_wrong_reactor(
+  seastar::shard_id expected,
+  seastar::shard_id current,
+  std::source_location location) {
+    const shard_context context{expected, current};
+    invariant_failed(
+      wrong_shard_invariant,
+      "this_shard_id() == reactor",
       context.view(),
       location);
 }

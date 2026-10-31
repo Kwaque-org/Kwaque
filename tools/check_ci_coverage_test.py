@@ -72,7 +72,6 @@ SETUP_BUILD = (
     else WORKFLOW.parents[1] / "actions/setup-build/action.yml"
 )
 RETAIN_LOGS = SETUP_BUILD.parents[1] / "retain-logs/action.yml"
-SAVE_OBJECTS = SETUP_BUILD.parents[1] / "save-objects/action.yml"
 REACTOR_WORKFLOW = WORKFLOW.with_name("reactor-backends.yml")
 NIGHTLY_WORKFLOW = WORKFLOW.with_name("nightly.yml")
 RELEASE_WORKFLOW = WORKFLOW.with_name("release.yml")
@@ -147,12 +146,17 @@ def fuzz_coverage_errors(workflow: str, scheduled: str, config: str) -> list[str
             "--test_arg=-max_total_time=600",
             "--test_arg=-timeout=15",
             '--test_arg=-seed="${CAMPAIGN_SEED}"',
+            "--test_env=KWAQUE_FUZZ_MARKS_GATE=1",
             '--test_env=KWAQUE_FUZZ_CORPUS_DIR="${CORPUS}"',
             '--sandbox_writable_path="${CORPUS}"',
             '"${FUZZ_TARGET}"',
         ):
             if flag not in commands[0].split():
                 errors.append(f"scheduled campaign requires {flag}")
+    # The smoke runs take their settings from the workflow and from the
+    # configuration they name; only the scheduled campaign sets the gate.
+    if "KWAQUE_FUZZ_MARKS_GATE" in smoke or "KWAQUE_FUZZ_MARKS_GATE" in config:
+        errors.append("short smoke campaigns must not gate on coverage marks")
     if (
         "seed=$((16#${GITHUB_SHA:0:8}))" not in campaign
         or "          CAMPAIGN_SEED: ${{ steps.seed.outputs.value }}"
@@ -257,7 +261,11 @@ def analysis_coverage_errors(workflow: str) -> list[str]:
     if any("--config=fuzz" not in command.split() for command in fuzz):
         errors.append("keep fuzz analysis in its own build configuration")
     integrity = run_commands(jobs.get("repository-checks", ""))
-    for target in ("//tools:check_determinism",):
+    for target in (
+        "//tools:check_cross_shard_usage",
+        "//tools:check_determinism",
+        "//tools:check_package_edges",
+    ):
         if not any(target in command.split() for command in integrity):
             errors.append(f"repository integrity requires {target}")
     return errors
@@ -320,6 +328,16 @@ PROFILE_TARGETS = {
     "//src/broker:failure_policy_test",
     "//src/broker:crash_recorder_process_test",
 }
+
+
+def positively_tagged(command: str) -> bool:
+    """A command whose build tag filter selects a tag rather than leaving one out."""
+    return any(
+        tag and not tag.startswith("-")
+        for word in command.split()
+        if word.startswith("--build_tag_filters=")
+        for tag in word.split("=", 1)[1].split(",")
+    )
 
 
 def untagged_broad(command: str) -> bool:
@@ -390,6 +408,7 @@ def coverage_errors(workflow: str) -> list[str]:
             if re.search(rf"\bbazel {action}\b", command)
             and f"--config={config}" in command
             and "//..." in command.split()
+            and not positively_tagged(command)
         ]
         if len(broad) != 1:
             errors.append(f"{name}: requires one broad {config} {action} command")
@@ -413,9 +432,9 @@ def coverage_errors(workflow: str) -> list[str]:
 
     # The x86-64 debug goldens run inside the test job's //... suite.
     for name, config, runner in (
-        ("build", "ci-release", "ubuntu-24.04"),
-        ("arm-build", "ci-release", "ubuntu-24.04-arm"),
-        ("goldens", "ci-debug", "ubuntu-24.04-arm"),
+        ("build", "ci-release", "blacksmith-4vcpu-ubuntu-2404"),
+        ("arm-build", "ci-release", "blacksmith-4vcpu-ubuntu-2404-arm"),
+        ("goldens", "ci-debug", "blacksmith-4vcpu-ubuntu-2404-arm"),
     ):
         job = jobs.get(name, "")
         if f"    runs-on: {runner}\n" not in job:
@@ -435,28 +454,42 @@ def coverage_errors(workflow: str) -> list[str]:
                 if command.startswith("bazel test ")
             ):
                 errors.append(f"{name}: execute the storage suite {suite}")
-    for name, excluded in (("build", False), ("arm-build", True)):
-        commands = [
-            command
-            for command in run_commands(jobs.get(name, ""))
-            if command.startswith(("bazel build ", "bazel test "))
-            and "//..." in command.split()
-        ]
-        if any(
-            (ARM_RELEASE_EXCLUSION in command.split()) != excluded
-            or ("simulated_storage" in command) != excluded
-            for command in commands
-        ):
-            errors.append(
-                f"{name}: "
-                + (
-                    "leave only the simulated storage tests out of aarch64 release"
-                    if excluded
-                    else "compile the simulated storage tests on x86-64 release"
-                )
-            )
+    arm_commands = [
+        command
+        for command in run_commands(jobs.get("arm-build", ""))
+        if command.startswith(("bazel build ", "bazel test "))
+        and "//..." in command.split()
+    ]
+    if any(ARM_RELEASE_EXCLUSION not in command.split() for command in arm_commands):
+        errors.append(
+            "arm-build: leave only the simulated storage tests out of aarch64 release"
+        )
+    # x86-64 release compiles the simulated storage tests in a build of their
+    # own, two compiles at a time: the largest take up to 4 GiB each.
+    builds = [
+        command
+        for command in run_commands(jobs.get("build", ""))
+        if command.startswith("bazel build ") and "//..." in command.split()
+    ]
+    alone = [
+        command
+        for command in builds
+        if "--build_tag_filters=simulated_storage" in command.split()
+    ]
+    if (
+        len(alone) != 1
+        or "--jobs=2" not in alone[0].split()
+        or any(
+            ARM_RELEASE_EXCLUSION not in command.split()
+            for command in builds
+            if command not in alone
+        )
+    ):
+        errors.append(
+            "build: compile the simulated storage tests on x86-64 release, alone"
+        )
     arm = jobs.get("arm-build", "")
-    if "runs-on: ubuntu-24.04-arm" not in arm:
+    if "runs-on: blacksmith-4vcpu-ubuntu-2404-arm" not in arm:
         errors.append("arm-build: use a native aarch64 runner")
     if "//src/simulation/tests:fake_file_replay_test" not in arm:
         errors.append("arm-build: retain the wider release runtime coverage")
@@ -543,14 +576,8 @@ class CiCoverageTest(unittest.TestCase):
             "python3 -m unittest tools.ci_changes_test tools.check_ci_coverage_test",
             run_commands(gate),
         )
-        # No check waits for another job's build; all start from the change
-        # check. Dropping superseded objects on main follows the saves and
-        # holds up no check.
-        for name in set(jobs_section(self.workflow)) - {
-            "workflow-lint",
-            "ci-ok",
-            "drop-superseded-objects",
-        }:
+        # No job waits for another job's build; all start from the change check.
+        for name in set(jobs_section(self.workflow)) - {"workflow-lint", "ci-ok"}:
             with self.subTest(job=name):
                 self.assertIn(
                     "    if: needs.workflow-lint.outputs.run_checks != 'false'\n",
@@ -681,134 +708,24 @@ class CiCoverageTest(unittest.TestCase):
                     report.write_text(xml)
                     self.assertTrue(failed_report(report))
 
-    def test_analysis_is_independent_parallel_and_complete_outside_pull_requests(
-        self,
-    ) -> None:
+    def test_analysis_is_independent_and_parallel_without_reducing_scope(self) -> None:
         jobs = job_blocks(self.workflow)
         for name in ("clang-tidy", "clang-tidy-fuzz"):
             job = jobs[name]
             self.assertIn("needs: workflow-lint", job)
             self.assertNotIn("needs: [workflow-lint, build]", job)
-            checks = [
-                command
-                for command in run_commands(job)
-                if "//tools:clang_tidy" in command
-            ]
-            self.assertEqual(len(checks), 1)
-            self.assertIn("-- --jobs=4", checks[0])
-            # A pull request is compared with the base its merge commit
-            # merges onto; every other run checks the whole tree.
-            self.assertIn('--scope="${SCOPE}" --base=HEAD~1', checks[0])
-            self.assertIn(
-                "          SCOPE: ${{ github.event_name == 'pull_request'"
-                " && 'changed' || 'all' }}\n",
-                job,
-            )
-            self.assertIn(
-                "          persist-credentials: false\n"
-                "          # A pull request's merge commit and the base it merges onto.\n"
-                "          fetch-depth: 2\n",
-                job,
-            )
-        # The ordinary sources are split between runners, and together the
-        # shards check every one of them.
-        ordinary = jobs["clang-tidy"]
-        listed = re.search(r"^        shard: \[([0-9, ]+)\]$", ordinary, re.MULTILINE)
-        self.assertIsNotNone(listed)
-        shards = [int(value) for value in listed.group(1).split(",")]
-        checks = [
-            command
-            for command in run_commands(ordinary)
-            if "//tools:clang_tidy" in command
-        ]
-        self.assertEqual(len(checks), 1)
-        count = re.search(r'--shard="\$\{SHARD\}/([0-9]+)"', checks[0])
-        self.assertIsNotNone(count)
-        self.assertEqual(shards, list(range(int(count.group(1)))))
-        self.assertIn("SHARD: ${{ matrix.shard }}", ordinary)
-        self.assertIn("fail-fast: false", ordinary)
+            for command in run_commands(job):
+                if "//tools:clang_tidy" in command:
+                    self.assertIn("-- --jobs=2", command)
 
-    def test_caches_hold_downloads_and_objects_written_only_from_main(self) -> None:
+    def test_caches_hold_downloads_written_only_from_main(self) -> None:
         setup = SETUP_BUILD.read_text()
         self.assertIn("disk-cache: false", setup)
         self.assertIn("repository-cache: true", setup)
         self.assertIn("bazelisk-cache: true", setup)
         self.assertIn("cache-save: ${{ github.ref == 'refs/heads/main' }}", setup)
-        # One configuration's compiled objects are restored here and never
-        # saved. Links and test results stay out of the cache, so every binary
-        # is linked and every test runs on every run.
-        self.assertIn("uses: actions/cache/restore@", setup)
-        self.assertNotIn("actions/cache/save@", setup)
-        self.assertIn('echo "build --disk_cache=${HOME}/.cache/bazel-objects"', setup)
-        self.assertIn(
-            'echo "build --modify_execution_info='
-            'CppLink=+no-cache,TestRunner=+no-cache"',
-            setup,
-        )
-        marked = setup.find('touch "${RUNNER_TEMP}/bazel-objects.started"')
-        self.assertGreater(marked, setup.find("uses: actions/cache/restore@"))
-        # What is saved is exactly what the run stored or read.
-        saving = SAVE_OBJECTS.read_text()
-        pruned = saving.find('! -newer "${RUNNER_TEMP}/bazel-objects.started" -delete')
-        saved = saving.find("uses: actions/cache/save@")
-        self.assertTrue(0 <= pruned < saved)
-        # Only main writes, each configuration from one job, which restored it.
-        writers = {}
-        for name, job in jobs_section(self.workflow).items():
-            for scope in re.findall(
-                r"        uses: \./\.github/actions/save-objects\n"
-                r"        with:\n          objects: ([a-z0-9_-]+)\n",
-                job,
-            ):
-                self.assertIn(
-                    "        if: github.ref == 'refs/heads/main' && !cancelled()\n"
-                    "        uses: ./.github/actions/save-objects\n",
-                    job,
-                )
-                self.assertIn(
-                    "      - uses: ./.github/actions/setup-build\n"
-                    f"        with:\n          objects: {scope}\n",
-                    job,
-                )
-                self.assertNotIn(scope, writers)
-                writers[scope] = name
-        self.assertEqual(
-            set(writers), {"debug", "sanitizer", "release-x86_64", "release-aarch64"}
-        )
-        for name, job in jobs_section(self.workflow).items():
-            for scope in re.findall(
-                r"setup-build\n        with:\n          objects: ([a-z0-9_-]+)\n", job
-            ):
-                self.assertIn(scope, writers, name)
-        # After the saves on main, each configuration keeps only its newest
-        # entry, so superseded objects never evict other caches. Only that
-        # job may write, and it runs nothing from the repository.
-        dropping = jobs_section(self.workflow)["drop-superseded-objects"]
-        needed = re.search(r"^    needs: \[([a-z0-9, -]+)\]$", dropping, re.MULTILINE)
-        self.assertIsNotNone(needed)
-        self.assertEqual(
-            {job.strip() for job in needed.group(1).split(",")},
-            {"workflow-lint", *writers.values()},
-        )
-        self.assertIn(
-            "    if: github.ref == 'refs/heads/main' && !cancelled()\n", dropping
-        )
-        self.assertIn("    permissions:\n      actions: write #", dropping)
-        self.assertNotIn("uses:", dropping)
-        dropped = re.search(r"for scope in ([a-z0-9_ -]+); do", dropping)
-        self.assertIsNotNone(dropped)
-        self.assertEqual(set(dropped.group(1).split()), set(writers))
-        self.assertIn(
-            'gh cache list --ref refs/heads/main --key "bazel-objects-${scope}-"',
-            dropping,
-        )
-        self.assertIn(
-            "--sort created_at --order desc --limit 100 --json id --jq '.[1:][].id'",
-            dropping,
-        )
-        for name, job in jobs_section(self.workflow).items():
-            if name != "drop-superseded-objects":
-                self.assertNotIn("permissions:", job, name)
+        self.assertNotIn("--disk_cache", setup)
+        self.assertNotIn("inputs:", setup)
         for workflow in (
             self.workflow,
             FUZZ_WORKFLOW.read_text(),
@@ -817,13 +734,6 @@ class CiCoverageTest(unittest.TestCase):
         ):
             for value in ("cache-scope:", "cache-write:", "--disk_cache"):
                 self.assertNotIn(value, workflow)
-        for workflow in (
-            FUZZ_WORKFLOW.read_text(),
-            REACTOR_WORKFLOW.read_text(),
-            NIGHTLY_WORKFLOW.read_text(),
-        ):
-            self.assertNotIn("save-objects", workflow)
-            self.assertNotIn("objects:", workflow)
         # The only other cache is each scheduled fuzz target's corpus.
         for workflow in (
             self.workflow,
@@ -897,7 +807,10 @@ class CiCoverageTest(unittest.TestCase):
         self.assertIn("  push:\n    tags:\n", release)
         self.assertIn("permissions:\n  contents: read\n", release)
         package = jobs["package"]
-        for runner in ("ubuntu-24.04", "ubuntu-24.04-arm"):
+        for runner in (
+            "blacksmith-4vcpu-ubuntu-2404",
+            "blacksmith-4vcpu-ubuntu-2404-arm",
+        ):
             self.assertIn(f"          - {runner}\n", package)
         commands = run_commands(package)
         tests = [command for command in commands if command.startswith("bazel test ")]
@@ -1048,6 +961,7 @@ class CiCoverageTest(unittest.TestCase):
             "uses: actions/cache/restore@",
             "uses: actions/cache/save@",
             '--test_env=KWAQUE_FUZZ_CORPUS_DIR="${CORPUS}"',
+            "--test_env=KWAQUE_FUZZ_MARKS_GATE=1",
             '--test_arg=-seed="${CAMPAIGN_SEED}"',
             "seed=$((16#${GITHUB_SHA:0:8}))",
             "CAMPAIGN_SEED: ${{ steps.seed.outputs.value }}",
@@ -1061,6 +975,29 @@ class CiCoverageTest(unittest.TestCase):
                         BAZEL_CONFIG.read_text(),
                     )
                 )
+
+    def test_a_smoke_campaign_that_gates_on_marks_fails(self) -> None:
+        gated = self.workflow.replace(
+            "--test_arg=-max_total_time=2",
+            "--test_arg=-max_total_time=2\n          --test_env=KWAQUE_FUZZ_MARKS_GATE=1",
+        )
+        self.assertNotEqual(gated, self.workflow)
+        self.assertIn(
+            "short smoke campaigns must not gate on coverage marks",
+            fuzz_coverage_errors(
+                gated, FUZZ_WORKFLOW.read_text(), BAZEL_CONFIG.read_text()
+            ),
+        )
+        # The fuzz configuration every smoke run names may not set it either.
+        self.assertIn(
+            "short smoke campaigns must not gate on coverage marks",
+            fuzz_coverage_errors(
+                self.workflow,
+                FUZZ_WORKFLOW.read_text(),
+                BAZEL_CONFIG.read_text()
+                + "test:fuzz --test_env=KWAQUE_FUZZ_MARKS_GATE=1\n",
+            ),
+        )
 
     def test_campaign_listing_or_wrong_target_binding_fail(self) -> None:
         scheduled = FUZZ_WORKFLOW.read_text()
@@ -1268,7 +1205,11 @@ class CiCoverageTest(unittest.TestCase):
         self.assertTrue(
             coverage_errors(
                 self.workflow.replace(
-                    goldens, goldens.replace("ubuntu-24.04-arm", "ubuntu-24.04")
+                    goldens,
+                    goldens.replace(
+                        "blacksmith-4vcpu-ubuntu-2404-arm",
+                        "blacksmith-4vcpu-ubuntu-2404",
+                    ),
                 )
             )
         )
@@ -1320,9 +1261,19 @@ class CiCoverageTest(unittest.TestCase):
             self.workflow.replace(
                 build,
                 build.replace(
-                    "--build_tag_filters=-fuzz,-manual", ARM_RELEASE_EXCLUSION, 1
+                    "--build_tag_filters=simulated_storage",
+                    "--build_tag_filters=-simulated_storage",
                 ),
             ),
+            # x86-64 release compiles them beside every other compile.
+            self.workflow.replace(
+                build,
+                build.replace(
+                    ARM_RELEASE_EXCLUSION, "--build_tag_filters=-fuzz,-manual"
+                ),
+            ),
+            # Its build of them runs as many compiles as the runner has cores.
+            self.workflow.replace(build, build.replace(" --jobs=2", "")),
             # aarch64 release leaves out more than the simulated tests.
             self.workflow.replace(
                 arm,

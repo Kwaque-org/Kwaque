@@ -42,6 +42,7 @@ using kwaque::observability::event_kind;
 using kwaque::observability::event_log;
 using kwaque::observability::event_log_limit_values;
 using kwaque::observability::event_log_limits;
+using kwaque::observability::event_object_id;
 using kwaque::observability::event_public_text;
 using kwaque::observability::event_request;
 using kwaque::observability::event_request_context;
@@ -854,4 +855,270 @@ SEASTAR_TEST_CASE(
     BOOST_REQUIRE(decoded.has_value());
     BOOST_CHECK_EQUAL((*decoded)->entries().size(), count);
     BOOST_CHECK((*decoded)->entries()[count - 1U] == log.entries()[count - 1U]);
+}
+
+namespace {
+
+event_object_id object_id(std::uint8_t first) {
+    event_object_id::octets_type octets{};
+    for (std::size_t index = 0; index < octets.size(); ++index) {
+        octets[index] = static_cast<std::uint8_t>(first + index);
+    }
+    auto made = event_object_id::make(octets);
+    BOOST_REQUIRE(made.has_value());
+    return *made;
+}
+
+event_request make_readiness_request() {
+    const std::array fields{
+      event_field{
+        .key = event_field_key::reasons,
+        .value = event_field_value::from_unsigned(3)},
+      event_field{
+        .key = event_field_key::state,
+        .value = event_field_value::from_text(
+          text(event_public_text::state_not_ready))},
+    };
+    auto made = event_request::make(
+      event_request_context{
+        .kind = event_kind::readiness_changed,
+        .severity = event_severity::warning,
+        .monotonic = kwaque::runtime::monotonic_time{UINT64_C(
+          0x2122232425262728)},
+        .wall = kwaque::runtime::wall_time{7},
+        .workload = kwaque::resource::workload_class::maintenance,
+      },
+      fields);
+    BOOST_REQUIRE(made.has_value());
+    return *made;
+}
+
+event_request make_refusal_request(std::uint64_t monotonic) {
+    const std::array fields{
+      event_field{
+        .key = event_field_key::range_id,
+        .value = event_field_value::from_object_id(object_id(0x20))},
+      event_field{
+        .key = event_field_key::topic_id,
+        .value = event_field_value::from_object_id(object_id(0x10))},
+      event_field{
+        .key = event_field_key::items,
+        .value = event_field_value::from_unsigned(12)},
+      event_field{
+        .key = event_field_key::bytes,
+        .value = event_field_value::from_unsigned(4'096)},
+      event_field{
+        .key = event_field_key::operation,
+        .value = event_field_value::from_text(
+          text(event_public_text::operation_forwarded_traffic))},
+      event_field{
+        .key = event_field_key::outcome,
+        .value = event_field_value::from_text(
+          text(event_public_text::outcome_stale_route))},
+    };
+    auto made = event_request::make(
+      event_request_context{
+        .kind = event_kind::append_refused,
+        .severity = event_severity::warning,
+        .monotonic = kwaque::runtime::monotonic_time{monotonic},
+        .wall = kwaque::runtime::wall_time{8},
+        .workload = kwaque::resource::workload_class::foreground_protocol,
+      },
+      fields);
+    BOOST_REQUIRE(made.has_value());
+    return *made;
+}
+
+} // namespace
+
+SEASTAR_TEST_CASE(event_log_of_readiness_and_refusals_matches_golden_bytes) {
+    // Written by an encoder independent of this one, from the format: a
+    // readiness change, a refusal, and after five dropped refusals one that
+    // carries the count. Object identities are sixteen octets as they are.
+    static constexpr std::array<std::uint8_t, 598> expected_bytes{
+      0x4b, 0x51, 0x45, 0x4c, 0x01, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00,
+      0x00, 0x00, 0x00, 0x00, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17,
+      0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e, 0x1f, 0x20, 0x21, 0x22, 0x23,
+      0x24, 0x25, 0x26, 0x27, 0x28, 0x29, 0x2a, 0x2b, 0x2c, 0x2d, 0x2e, 0x2f,
+      0x03, 0x00, 0x00, 0x00, 0x1a, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+      0x60, 0x00, 0x01, 0x00, 0x00, 0x00, 0x09, 0x00, 0x11, 0x72, 0x65, 0x61,
+      0x64, 0x69, 0x6e, 0x65, 0x73, 0x73, 0x5f, 0x63, 0x68, 0x61, 0x6e, 0x67,
+      0x65, 0x64, 0x04, 0x28, 0x27, 0x26, 0x25, 0x24, 0x23, 0x22, 0x21, 0x07,
+      0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x07,
+      0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0x01, 0x00, 0x05,
+      0x04, 0x09, 0x00, 0x73, 0x74, 0x61, 0x74, 0x65, 0x6e, 0x6f, 0x74, 0x5f,
+      0x72, 0x65, 0x61, 0x64, 0x79, 0x12, 0x00, 0x07, 0x02, 0x08, 0x00, 0x72,
+      0x65, 0x61, 0x73, 0x6f, 0x6e, 0x73, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00,
+      0x00, 0x00, 0xce, 0x00, 0x01, 0x00, 0x00, 0x00, 0x0a, 0x00, 0x0e, 0x61,
+      0x70, 0x70, 0x65, 0x6e, 0x64, 0x5f, 0x72, 0x65, 0x66, 0x75, 0x73, 0x65,
+      0x64, 0x04, 0x00, 0xf2, 0x05, 0x2a, 0x01, 0x00, 0x00, 0x00, 0x08, 0x00,
+      0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02,
+      0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x06, 0x02, 0x00, 0x07, 0x04,
+      0x0b, 0x00, 0x6f, 0x75, 0x74, 0x63, 0x6f, 0x6d, 0x65, 0x73, 0x74, 0x61,
+      0x6c, 0x65, 0x5f, 0x72, 0x6f, 0x75, 0x74, 0x65, 0x03, 0x00, 0x09, 0x04,
+      0x11, 0x00, 0x6f, 0x70, 0x65, 0x72, 0x61, 0x74, 0x69, 0x6f, 0x6e, 0x66,
+      0x6f, 0x72, 0x77, 0x61, 0x72, 0x64, 0x65, 0x64, 0x5f, 0x74, 0x72, 0x61,
+      0x66, 0x66, 0x69, 0x63, 0x05, 0x00, 0x05, 0x02, 0x08, 0x00, 0x62, 0x79,
+      0x74, 0x65, 0x73, 0x00, 0x10, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x06,
+      0x00, 0x05, 0x02, 0x08, 0x00, 0x69, 0x74, 0x65, 0x6d, 0x73, 0x0c, 0x00,
+      0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x10, 0x00, 0x08, 0x06, 0x10, 0x00,
+      0x74, 0x6f, 0x70, 0x69, 0x63, 0x5f, 0x69, 0x64, 0x10, 0x11, 0x12, 0x13,
+      0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e, 0x1f,
+      0x11, 0x00, 0x08, 0x06, 0x10, 0x00, 0x72, 0x61, 0x6e, 0x67, 0x65, 0x5f,
+      0x69, 0x64, 0x20, 0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27, 0x28, 0x29,
+      0x2a, 0x2b, 0x2c, 0x2d, 0x2e, 0x2f, 0xe6, 0x00, 0x01, 0x00, 0x00, 0x00,
+      0x0a, 0x00, 0x0e, 0x61, 0x70, 0x70, 0x65, 0x6e, 0x64, 0x5f, 0x72, 0x65,
+      0x66, 0x75, 0x73, 0x65, 0x64, 0x04, 0x00, 0xbc, 0xa0, 0x65, 0x01, 0x00,
+      0x00, 0x00, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+      0x00, 0x00, 0x00, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x07,
+      0x02, 0x00, 0x07, 0x04, 0x0b, 0x00, 0x6f, 0x75, 0x74, 0x63, 0x6f, 0x6d,
+      0x65, 0x73, 0x74, 0x61, 0x6c, 0x65, 0x5f, 0x72, 0x6f, 0x75, 0x74, 0x65,
+      0x03, 0x00, 0x09, 0x04, 0x11, 0x00, 0x6f, 0x70, 0x65, 0x72, 0x61, 0x74,
+      0x69, 0x6f, 0x6e, 0x66, 0x6f, 0x72, 0x77, 0x61, 0x72, 0x64, 0x65, 0x64,
+      0x5f, 0x74, 0x72, 0x61, 0x66, 0x66, 0x69, 0x63, 0x05, 0x00, 0x05, 0x02,
+      0x08, 0x00, 0x62, 0x79, 0x74, 0x65, 0x73, 0x00, 0x10, 0x00, 0x00, 0x00,
+      0x00, 0x00, 0x00, 0x06, 0x00, 0x05, 0x02, 0x08, 0x00, 0x69, 0x74, 0x65,
+      0x6d, 0x73, 0x0c, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x0f, 0x00,
+      0x0a, 0x02, 0x08, 0x00, 0x73, 0x75, 0x70, 0x70, 0x72, 0x65, 0x73, 0x73,
+      0x65, 0x64, 0x05, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x10, 0x00,
+      0x08, 0x06, 0x10, 0x00, 0x74, 0x6f, 0x70, 0x69, 0x63, 0x5f, 0x69, 0x64,
+      0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b,
+      0x1c, 0x1d, 0x1e, 0x1f, 0x11, 0x00, 0x08, 0x06, 0x10, 0x00, 0x72, 0x61,
+      0x6e, 0x67, 0x65, 0x5f, 0x69, 0x64, 0x20, 0x21, 0x22, 0x23, 0x24, 0x25,
+      0x26, 0x27, 0x28, 0x29, 0x2a, 0x2b, 0x2c, 0x2d, 0x2e, 0x2f,
+    };
+    constexpr std::uint64_t second = 1'000'000'000;
+    const auto sink_identity = identity();
+    const auto fixture_limits = limits(3, expected_bytes.size());
+    event_log source{sink_identity, fixture_limits};
+    auto sequence = event_sequence_test_access::make(sink_identity);
+    BOOST_REQUIRE(
+      source.append(stamp(*sequence, make_readiness_request())).has_value());
+    const auto admit = [&](std::uint64_t at) {
+        auto prepared = event_sequence_test_access::prepare_bounded(
+          *sequence, make_refusal_request(at));
+        BOOST_REQUIRE(prepared.has_value());
+        if (!*prepared) {
+            return false;
+        }
+        BOOST_REQUIRE(source.append((*prepared)->value()).has_value());
+        (*prepared)->commit();
+        return true;
+    };
+    BOOST_CHECK(admit(5 * second));
+    for (int dropped = 0; dropped < 5; ++dropped) {
+        BOOST_CHECK(!admit(5 * second + 1'000U));
+    }
+    BOOST_CHECK(admit(6 * second));
+    BOOST_CHECK_EQUAL(sequence->suppressed_total(), 5U);
+
+    const auto encoded = source.encode();
+    BOOST_REQUIRE(encoded.has_value());
+    BOOST_REQUIRE_EQUAL(encoded->size(), expected_bytes.size());
+    std::array<std::uint8_t, expected_bytes.size()> actual_bytes{};
+    BOOST_REQUIRE(encoded->copy_to(0, actual_bytes));
+    BOOST_CHECK(actual_bytes == expected_bytes);
+
+    const auto decoded = event_log::decode(
+      std::span<const std::uint8_t>{expected_bytes}, fixture_limits);
+    BOOST_REQUIRE(decoded.has_value());
+    BOOST_REQUIRE_EQUAL((*decoded)->entries().size(), 3U);
+    const auto& carried = (*decoded)->entries()[2];
+    BOOST_CHECK_EQUAL(carried.sequence(), 3U);
+    BOOST_REQUIRE_EQUAL(carried.fields().size(), 7U);
+    BOOST_CHECK(carried.fields()[4].key == event_field_key::suppressed);
+    BOOST_CHECK(carried.fields()[4].value.as_unsigned() == 5U);
+    BOOST_CHECK(carried.fields()[5].value.as_object_id() == object_id(0x10));
+    BOOST_CHECK(carried.fields()[6].value.as_object_id() == object_id(0x20));
+    BOOST_CHECK((*decoded)->entries()[0] == source.entries()[0]);
+    BOOST_CHECK((*decoded)->entries()[2] == source.entries()[2]);
+    co_return;
+}
+
+// A sequence writes a suppressed count only when it dropped something, so a
+// decoded count of zero is refused.
+SEASTAR_TEST_CASE(a_suppressed_count_decodes_only_when_it_is_not_zero) {
+    constexpr std::uint64_t second = 1'000'000'000;
+    auto sequence = event_sequence_test_access::make(identity());
+    const auto take = [&](std::uint64_t at) {
+        auto prepared = event_sequence_test_access::prepare_bounded(
+          *sequence, make_refusal_request(at));
+        BOOST_REQUIRE(prepared.has_value());
+        return std::move(*prepared);
+    };
+    take(0)->commit();
+    BOOST_REQUIRE(!take(1).has_value());
+    auto carrying = take(second);
+    BOOST_REQUIRE(carrying.has_value());
+    const auto value = carrying->value();
+    carrying->commit();
+    const auto encoded = encode_event(value);
+    BOOST_REQUIRE(encoded.has_value());
+    const auto bytes = encoded->bytes();
+    const std::vector<std::uint8_t> original(bytes.begin(), bytes.end());
+    BOOST_REQUIRE(decode_event(original).has_value());
+
+    std::size_t offset = 0;
+    for (; offset + 3U < original.size(); ++offset) {
+        if (
+          original[offset]
+            == static_cast<std::uint8_t>(event_field_key::suppressed)
+          && original[offset + 1U] == 0
+          && original[offset + 3U]
+               == static_cast<std::uint8_t>(
+                 event_field_type::unsigned_integer)) {
+            break;
+        }
+    }
+    BOOST_REQUIRE(offset + 3U < original.size());
+    const auto payload = offset + 6U + std::string_view{"suppressed"}.size();
+    BOOST_REQUIRE_EQUAL(original[payload], 1U);
+    auto zero = original;
+    zero[payload] = 0;
+    BOOST_CHECK(!decode_event(zero).has_value());
+    co_return;
+}
+
+SEASTAR_TEST_CASE(object_identities_decode_only_as_sixteen_nonzero_octets) {
+    auto sequence = event_sequence_test_access::make(identity());
+    auto prepared = event_sequence_test_access::prepare_bounded(
+      *sequence, make_refusal_request(1));
+    BOOST_REQUIRE(prepared.has_value() && prepared->has_value());
+    const auto value = (*prepared)->value();
+    (*prepared)->commit();
+    const auto encoded = encode_event(value);
+    BOOST_REQUIRE(encoded.has_value());
+    const auto bytes = encoded->bytes();
+    const std::vector<std::uint8_t> original(bytes.begin(), bytes.end());
+    BOOST_REQUIRE(decode_event(original).has_value());
+
+    // Find the topic identity: its key, then its name and payload.
+    std::size_t offset = 0;
+    for (; offset + 1U < original.size(); ++offset) {
+        if (
+          original[offset]
+            == static_cast<std::uint8_t>(event_field_key::topic_id)
+          && original[offset + 1U] == 0
+          && original[offset + 3U]
+               == static_cast<std::uint8_t>(event_field_type::object_id)) {
+            break;
+        }
+    }
+    BOOST_REQUIRE(offset + 1U < original.size());
+    const auto payload = offset + 6U + std::string_view{"topic_id"}.size();
+
+    // A nil identity is refused.
+    auto nil = original;
+    for (std::size_t index = 0; index < 16; ++index) {
+        nil[payload + index] = 0;
+    }
+    BOOST_CHECK(!decode_event(nil).has_value());
+
+    // Any other payload size is refused, longer or shorter.
+    for (const std::uint8_t size : {std::uint8_t{15}, std::uint8_t{17}}) {
+        auto resized = original;
+        resized[offset + 4U] = size;
+        BOOST_CHECK(!decode_event(resized).has_value());
+    }
+    co_return;
 }

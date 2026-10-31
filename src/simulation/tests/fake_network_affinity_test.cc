@@ -31,13 +31,13 @@ SEASTAR_TEST_CASE(fake_network_has_one_nontransportable_shard_owner) {
     auto made = kwaque::simulation::fake_network::make({}, events);
     BOOST_REQUIRE(made.has_value());
     auto network = std::move(*made);
-    const auto owner = network->owner();
-    BOOST_REQUIRE(owner.is_current());
-    BOOST_CHECK(owner == events.owner());
+    const auto reactor = network->reactor();
+    BOOST_REQUIRE_EQUAL(reactor, seastar::this_shard_id());
+    BOOST_CHECK_EQUAL(reactor, events.reactor());
     BOOST_REQUIRE_GE(seastar::this_smp_shard_count(), 2U);
 
     const auto rejected = co_await seastar::smp::submit_to(
-      1, [owner] { return !owner.is_current(); });
+      1, [reactor] { return reactor != seastar::this_shard_id(); });
     BOOST_REQUIRE(rejected);
 }
 
@@ -46,12 +46,12 @@ SEASTAR_TEST_CASE(fake_dns_has_one_nontransportable_shard_owner) {
     auto made = kwaque::simulation::fake_dns::make({}, events);
     BOOST_REQUIRE(made.has_value());
     auto resolver = std::move(*made);
-    const auto owner = resolver->owner();
-    BOOST_REQUIRE(owner.is_current());
-    BOOST_CHECK(owner == events.owner());
+    const auto reactor = resolver->reactor();
+    BOOST_REQUIRE_EQUAL(reactor, seastar::this_shard_id());
+    BOOST_CHECK_EQUAL(reactor, events.reactor());
     BOOST_REQUIRE_GE(seastar::this_smp_shard_count(), 2U);
 
     const auto rejected = co_await seastar::smp::submit_to(
-      1, [owner] { return !owner.is_current(); });
+      1, [reactor] { return reactor != seastar::this_shard_id(); });
     BOOST_REQUIRE(rejected);
 }

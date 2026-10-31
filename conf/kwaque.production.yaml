@@ -16,3 +16,10 @@ kwaque:
   # When enabled, .kwaque_data_dir must already exist in data_directory, so
   # an unmounted filesystem is not mistaken for an empty data directory.
   storage_strict_data_init: false
+  storage:
+    # One to eight absolute device paths; exactly one holds the WAL and
+    # control records (role wal_control or all), the rest hold data (role
+    # data). A device may be the data directory itself.
+    devices:
+      - path: "/var/lib/kwaque"
+        role: all

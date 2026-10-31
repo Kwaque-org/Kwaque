@@ -1,17 +1,26 @@
+#include "src/model/identity_mint.h"
+#include "src/runtime/deadlines.h"
+#include "src/runtime/production/alarm.h"
 #include "src/runtime/production/clocks.h"
 #include "src/runtime/production/random.h"
 #include "src/runtime/production/timer.h"
 #include "src/runtime/random.h"
 #include "src/runtime/time.h"
 #include "src/runtime/timer.h"
+#include "src/runtime/waiting.h"
 
 #include <seastar/core/abort_source.hh>
 #include <seastar/core/coroutine.hh>
+#include <seastar/core/memory.hh>
+#include <seastar/core/sleep.hh>
 #include <seastar/testing/test_case.hh>
 
 #include <boost/test/unit_test.hpp>
+#include <sys/random.h>
 
+#include <algorithm>
 #include <array>
+#include <cerrno>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -23,6 +32,7 @@
 #include <system_error>
 #include <type_traits>
 #include <utility>
+#include <vector>
 
 namespace {
 
@@ -312,4 +322,138 @@ SEASTAR_TEST_CASE(production_random_statistical_smoke_covers_every_bucket) {
         BOOST_CHECK_LT(count, 11'000U);
     }
     co_return;
+}
+
+namespace {
+
+// Answers each kernel call from a script of {result, errno} steps and
+// writes the requested bytes with a running counter.
+class scripted_kernel_random final {
+public:
+    struct step {
+        long result;
+        int error;
+    };
+
+    explicit scripted_kernel_random(std::vector<step> steps) noexcept
+      : steps_(std::move(steps)) {}
+
+    long operator()(void* buffer, std::size_t size, unsigned flags) noexcept {
+        flags_.push_back(flags);
+        const auto current = steps_.at(calls_++);
+        if (current.result < 0) {
+            errno = current.error;
+            return -1;
+        }
+        auto* bytes = static_cast<std::uint8_t*>(buffer);
+        const auto written = std::min(
+          size, static_cast<std::size_t>(current.result));
+        for (std::size_t at = 0; at < written; ++at)
+            bytes[at] = next_++;
+        return static_cast<long>(written);
+    }
+
+    [[nodiscard]] std::size_t calls() const noexcept { return calls_; }
+    [[nodiscard]] const std::vector<unsigned>& flags() const noexcept {
+        return flags_;
+    }
+
+private:
+    std::vector<step> steps_;
+    std::vector<unsigned> flags_;
+    std::size_t calls_{0};
+    std::uint8_t next_{1};
+};
+
+static_assert(kwaque::runtime::identity_entropy_source<
+              kwaque::runtime::production::identity_entropy>);
+// The mint, which may not see the runtime's concept, takes it too.
+static_assert(kwaque::model::object_id_entropy<
+              kwaque::runtime::production::identity_entropy>);
+
+} // namespace
+
+SEASTAR_TEST_CASE(production_identity_entropy_refuses_an_unready_pool) {
+    namespace detail = kwaque::runtime::production::detail;
+    scripted_kernel_random unready{{{-1, EAGAIN}}};
+    const auto refused = detail::probe_identity_entropy(unready);
+    BOOST_REQUIRE(!refused.has_value());
+    BOOST_CHECK(refused.error().code() == kwaque::errc::unavailable);
+    BOOST_REQUIRE_EQUAL(unready.flags().size(), 1U);
+    BOOST_CHECK_EQUAL(unready.flags().front(), unsigned{GRND_NONBLOCK});
+
+    scripted_kernel_random missing{{{-1, ENOSYS}}};
+    BOOST_CHECK(!detail::probe_identity_entropy(missing).has_value());
+
+    scripted_kernel_random interrupted{{{-1, EINTR}, {16, 0}}};
+    BOOST_CHECK(detail::probe_identity_entropy(interrupted).has_value());
+    BOOST_CHECK_EQUAL(interrupted.calls(), 2U);
+
+    scripted_kernel_random short_read{{{8, 0}}};
+    BOOST_CHECK(!detail::probe_identity_entropy(short_read).has_value());
+    co_return;
+}
+
+SEASTAR_TEST_CASE(
+  production_identity_entropy_retries_interrupts_and_short_reads) {
+    namespace detail = kwaque::runtime::production::detail;
+    scripted_kernel_random kernel{{{5, 0}, {-1, EINTR}, {3, 0}, {16, 0}}};
+    std::array<std::uint8_t, 16> octets{};
+    detail::fill_identity_octets(kernel, octets);
+    BOOST_CHECK_EQUAL(kernel.calls(), 4U);
+    for (std::size_t at = 0; at < octets.size(); ++at)
+        BOOST_CHECK_EQUAL(octets[at], static_cast<std::uint8_t>(at + 1));
+    for (const auto flags : kernel.flags())
+        BOOST_CHECK_EQUAL(flags, 0U);
+    co_return;
+}
+
+SEASTAR_TEST_CASE(
+  production_identity_entropy_fills_from_the_kernel_without_allocating) {
+    auto source = kwaque::runtime::production::identity_entropy::make();
+    BOOST_REQUIRE(source.has_value());
+    std::array<std::uint8_t, 16> first{};
+    std::array<std::uint8_t, 16> second{};
+#if !defined(SEASTAR_DEFAULT_ALLOCATOR)
+    const auto before = seastar::memory::stats().mallocs();
+#endif
+    source->fill(first);
+    source->fill(second);
+#if !defined(SEASTAR_DEFAULT_ALLOCATOR)
+    BOOST_CHECK_EQUAL(seastar::memory::stats().mallocs() - before, 0U);
+#endif
+    BOOST_CHECK(first != second);
+    const auto minted = kwaque::model::mint_object_id<kwaque::model::topic_id>(
+      *source);
+    BOOST_CHECK_EQUAL(minted.bytes()[6] >> 4U, 4U);
+    BOOST_CHECK_EQUAL(minted.bytes()[8] >> 6U, 2U);
+    co_return;
+}
+
+SEASTAR_TEST_CASE(production_alarm_rings_at_its_time_and_drives_deadlines) {
+    using kwaque::runtime::production::monotonic_clock;
+    bool rang = false;
+    kwaque::runtime::production::alarm alarm{
+      [&rang]() noexcept { rang = true; }};
+    const auto armed_for = monotonic_clock::now().nanoseconds() + 3'000'000;
+    alarm.arm(kwaque::runtime::monotonic_time{armed_for});
+    while (!rang) {
+        co_await seastar::sleep(std::chrono::milliseconds(1));
+    }
+    BOOST_CHECK_GE(monotonic_clock::now().nanoseconds(), armed_for);
+
+    kwaque::runtime::
+      basic_deadlines<kwaque::runtime::production::alarm, monotonic_clock>
+        deadlines{kwaque::runtime::basic_deadlines<
+          kwaque::runtime::production::alarm,
+          monotonic_clock>::default_touches_per_task};
+    kwaque::runtime::unit_queue queue{0};
+    const kwaque::runtime::monotonic_time deadline{
+      monotonic_clock::now().nanoseconds() + 5'000'000};
+    const auto outcome = co_await queue.wait(1, nullptr, deadlines, deadline);
+    BOOST_REQUIRE(!outcome.has_value());
+    BOOST_CHECK(outcome.error().code() == kwaque::errc::timed_out);
+    BOOST_CHECK_GE(
+      monotonic_clock::now().nanoseconds(), deadline.nanoseconds());
+    BOOST_CHECK(!deadlines.armed());
 }

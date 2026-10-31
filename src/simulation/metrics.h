@@ -16,7 +16,7 @@ class fake_network;
 class fault_schedule;
 class scheduler;
 
-class simulation_metrics final : public runtime::shard_affine {
+class simulation_metrics final : public runtime::reactor_affine {
 public:
     simulation_metrics(
       scheduler& events,

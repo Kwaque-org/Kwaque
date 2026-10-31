@@ -65,7 +65,6 @@ py_test(
     data = [
         "//:bazel_config",
         "//:ci_retention",
-        "//:ci_save_objects",
         "//:ci_setup",
         "//:ci_workflow",
         "//:fuzz_workflow",
@@ -157,6 +156,39 @@ py_library(
     name = "determinism_lib",
     srcs = ["check_determinism.py"],
     deps = [":cross_shard_usage_lib"],
+)
+
+py_binary(
+    name = "check_package_edges",
+    srcs = ["check_package_edges.py"],
+    main = "check_package_edges.py",
+    visibility = ["//visibility:public"],
+    deps = [
+        ":determinism_lib",
+        ":package_cycles_lib",
+    ],
+)
+
+py_library(
+    name = "package_edges_lib",
+    srcs = ["check_package_edges.py"],
+    deps = [
+        ":determinism_lib",
+        ":package_cycles_lib",
+    ],
+)
+
+py_library(
+    name = "package_cycles_lib",
+    srcs = ["check_bazel_package_cycles.py"],
+)
+
+py_test(
+    name = "check_package_edges_test",
+    size = "small",
+    srcs = ["check_package_edges_test.py"],
+    main = "check_package_edges_test.py",
+    deps = [":package_edges_lib"],
 )
 
 py_test(
@@ -272,6 +304,21 @@ py_test(
     srcs = ["check_dependency_inventory_test.py"],
     main = "check_dependency_inventory_test.py",
     deps = [":dependency_inventory_lib"],
+)
+
+py_library(
+    name = "release_seams_lib",
+    srcs = ["check_release_seams.py"],
+    visibility = ["//bazel/packaging:__pkg__"],
+    deps = ["//bazel:native_test_environment"],
+)
+
+py_test(
+    name = "check_release_seams_test",
+    size = "small",
+    srcs = ["check_release_seams_test.py"],
+    main = "check_release_seams_test.py",
+    deps = [":release_seams_lib"],
 )
 
 py_test(

@@ -4,3 +4,7 @@ kwaque:
   admin: {address: "::1", port: 9644}
   developer_mode: False
   crash_loop_limit: 5
+  storage:
+    devices:
+      - {path: /var/lib/kwaque, role: wal_control}
+      - {path: /mnt/kwaque-data-0, role: data, mount_marker: .kwaque_mounted}

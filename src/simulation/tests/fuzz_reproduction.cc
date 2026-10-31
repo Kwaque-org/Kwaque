@@ -42,12 +42,12 @@ template<typename T>
 }
 
 [[nodiscard]] bool known_error(errc value) noexcept {
-    return value >= errc::success && value <= errc::not_a_directory;
+    return value >= errc::success && value <= errc_last;
 }
 
 [[nodiscard]] bool known_operation(runtime::operation_kind value) noexcept {
     return value >= runtime::operation_kind::generic
-           && value <= runtime::operation_kind::observability;
+           && value <= runtime::operation_kind_last;
 }
 
 template<typename Integer>

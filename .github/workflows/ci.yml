@@ -24,7 +24,7 @@ jobs:
     # attempt of its run checks nothing, and "Re-run all jobs" on that run
     # starts every check. Every other job needs this one.
     if: github.event.pull_request.user.login != 'dependabot[bot]' || github.run_attempt != '1'
-    runs-on: ubuntu-24.04
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 10
     outputs:
       run_checks: ${{ steps.changes.outputs.run_checks }}
@@ -56,7 +56,7 @@ jobs:
     name: Release build and shipped-artifact tests
     needs: workflow-lint
     if: needs.workflow-lint.outputs.run_checks != 'false'
-    runs-on: ubuntu-24.04
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 150
     steps:
       - name: Check out source
@@ -64,14 +64,20 @@ jobs:
         with:
           persist-credentials: false
       - uses: ./.github/actions/setup-build
-        with:
-          objects: release-x86_64
       - name: Allow concurrent linux-aio reactors
         run: sudo sysctl -w fs.aio-max-nr=1048576
       - name: Build all ordinary targets
+        # The simulated storage tests are built next, apart: the largest of
+        # them take up to 4 GiB each to compile, and four at once with other
+        # compiles have run the runner out of memory.
         run: >-
           bazel build --config=ci-release
-          --build_tag_filters=-fuzz,-manual
+          --build_tag_filters=-fuzz,-manual,-simulated_storage
+          //...
+      - name: Build the simulated storage tests two at a time
+        run: >-
+          bazel build --config=ci-release --jobs=2
+          --build_tag_filters=simulated_storage
           //...
 
       - name: Verify optimized runtime, process policy, goldens and storage
@@ -105,12 +111,6 @@ jobs:
           --test_tag_filters=package,smoke,fuzz_replay
           //...
 
-      - name: Keep the compiled objects for later runs
-        if: github.ref == 'refs/heads/main' && !cancelled()
-        uses: ./.github/actions/save-objects
-        with:
-          objects: release-x86_64
-
       - name: Retain failed test diagnostics
         if: failure() && (steps.tests.outcome == 'failure' || steps.shipped.outcome == 'failure')
         uses: ./.github/actions/retain-logs
@@ -121,7 +121,7 @@ jobs:
     name: Native policy without allocation injection
     needs: workflow-lint
     if: needs.workflow-lint.outputs.run_checks != 'false'
-    runs-on: ubuntu-24.04
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 90
     steps:
       - name: Check out source
@@ -149,7 +149,7 @@ jobs:
     name: Native allocation injection, unit and smoke tests
     needs: workflow-lint
     if: needs.workflow-lint.outputs.run_checks != 'false'
-    runs-on: ubuntu-24.04
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 120
     steps:
       - name: Check out source
@@ -157,8 +157,6 @@ jobs:
         with:
           persist-credentials: false
       - uses: ./.github/actions/setup-build
-        with:
-          objects: debug
       - name: Allow concurrent linux-aio reactors
         run: sudo sysctl -w fs.aio-max-nr=1048576
       - name: Run unit and smoke tests
@@ -178,12 +176,6 @@ jobs:
           --runs_per_test=10 --cache_test_results=no
           //src/runtime/tests:hermetic_contracts
 
-      - name: Keep the compiled objects for later runs
-        if: github.ref == 'refs/heads/main' && !cancelled()
-        uses: ./.github/actions/save-objects
-        with:
-          objects: debug
-
       - name: Retain failed test diagnostics
         if: failure() && (steps.unit_tests.outcome == 'failure' || steps.hermetic_tests.outcome == 'failure')
         uses: ./.github/actions/retain-logs
@@ -194,7 +186,7 @@ jobs:
     name: ASan and UBSan
     needs: workflow-lint
     if: needs.workflow-lint.outputs.run_checks != 'false'
-    runs-on: ubuntu-24.04
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 150
     steps:
       - name: Check out source
@@ -202,8 +194,6 @@ jobs:
         with:
           persist-credentials: false
       - uses: ./.github/actions/setup-build
-        with:
-          objects: sanitizer
       - name: Execute tests with sanitizers
         id: tests
         run: >-
@@ -211,12 +201,6 @@ jobs:
           --build_tag_filters=-fuzz,-manual
           --test_tag_filters=-fuzz,-manual
           //...
-
-      - name: Keep the compiled objects for later runs
-        if: github.ref == 'refs/heads/main' && !cancelled()
-        uses: ./.github/actions/save-objects
-        with:
-          objects: sanitizer
 
       - name: Retain failed test diagnostics
         if: failure() && steps.tests.outcome == 'failure'
@@ -230,7 +214,7 @@ jobs:
     name: Goldens and native storage (aarch64, debug)
     needs: workflow-lint
     if: needs.workflow-lint.outputs.run_checks != 'false'
-    runs-on: ubuntu-24.04-arm
+    runs-on: blacksmith-4vcpu-ubuntu-2404-arm
     timeout-minutes: 90
     steps:
       - name: Check out source
@@ -267,7 +251,7 @@ jobs:
     name: C++ and Bazel formatting
     needs: workflow-lint
     if: needs.workflow-lint.outputs.run_checks != 'false'
-    runs-on: ubuntu-24.04
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 15
     steps:
       - name: Check out source
@@ -284,7 +268,7 @@ jobs:
     name: Python formatting and lint
     needs: workflow-lint
     if: needs.workflow-lint.outputs.run_checks != 'false'
-    runs-on: ubuntu-24.04
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 10
     steps:
       - name: Check out source
@@ -305,16 +289,11 @@ jobs:
           checksum: 1bfbb819b5d4f9af501748862276b60e412d336034d99387691a4d4bce7a6f13
 
   clang-tidy:
-    name: Clang tidy (${{ matrix.shard }} of 2)
+    name: Clang tidy
     needs: workflow-lint
     if: needs.workflow-lint.outputs.run_checks != 'false'
-    runs-on: ubuntu-24.04
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 240
-    strategy:
-      fail-fast: false
-      # Two runners split the selected translation units between them.
-      matrix:
-        shard: [0, 1]
     steps:
       - name: Check out source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -323,8 +302,6 @@ jobs:
           # A pull request's merge commit and the base it merges onto.
           fetch-depth: 2
       - uses: ./.github/actions/setup-build
-        with:
-          objects: debug
       - name: Materialize generated analysis inputs
         run: >-
           bazel build --config=ci-debug
@@ -336,22 +313,21 @@ jobs:
         run: >-
           bazel run --config=ci-debug --lockfile_mode=error //tools:compile_commands --
           --config=ci-debug
-      # A pull request checks the translation units its change can affect;
-      # main and every other run check all of them.
+      # A pull request checks the translation units it changes; main and
+      # every other run check all of them.
       - name: Run baseline and strict production checks without overlap
         env:
-          SHARD: ${{ matrix.shard }}
           SCOPE: ${{ github.event_name == 'pull_request' && 'changed' || 'all' }}
         run: >-
-          bazel run --config=ci-debug --lockfile_mode=error //tools:clang_tidy -- --jobs=4
+          bazel run --config=ci-debug --lockfile_mode=error //tools:clang_tidy -- --jobs=2
           --scope="${SCOPE}" --base=HEAD~1
-          --shard="${SHARD}/2" --production-config=.clang-tidy-strict
+          --production-config=.clang-tidy-strict
 
   clang-tidy-fuzz:
     name: Clang tidy for fuzz sources
     needs: workflow-lint
     if: needs.workflow-lint.outputs.run_checks != 'false'
-    runs-on: ubuntu-24.04
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 240
     steps:
       - name: Check out source
@@ -372,20 +348,20 @@ jobs:
         run: >-
           bazel run --config=ci --config=fuzz --lockfile_mode=error //tools:compile_commands --
           --fuzz-only --config=ci --config=fuzz
-      # A pull request checks the translation units its change can affect;
-      # main and every other run check all of them.
+      # A pull request checks the translation units it changes; main and
+      # every other run check all of them.
       - name: Check fuzz translation units and their dependencies
         env:
           SCOPE: ${{ github.event_name == 'pull_request' && 'changed' || 'all' }}
         run: >-
-          bazel run --config=ci --config=fuzz --lockfile_mode=error //tools:clang_tidy -- --jobs=4
+          bazel run --config=ci --config=fuzz --lockfile_mode=error //tools:clang_tidy -- --jobs=2
           --scope="${SCOPE}" --base=HEAD~1
 
   repository-checks:
     name: Repository integrity
     needs: workflow-lint
     if: needs.workflow-lint.outputs.run_checks != 'false'
-    runs-on: ubuntu-24.04
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 20
     steps:
       - name: Check out source
@@ -407,6 +383,8 @@ jobs:
         run: bazel run --lockfile_mode=error //tools:check_runtime_boundaries
       - name: Check deterministic source boundaries
         run: bazel run --lockfile_mode=error //tools:check_determinism
+      - name: Check replicated-state package edges
+        run: bazel run --lockfile_mode=error //tools:check_package_edges
       - name: Check module files and lock
         # Tidy rewrites use_repo lists and formatting; the lock must then match
         # every module and extension. Either change means a stale commit.
@@ -419,7 +397,7 @@ jobs:
     name: ASan and UBSan fuzz smoke
     needs: workflow-lint
     if: needs.workflow-lint.outputs.run_checks != 'false'
-    runs-on: ubuntu-24.04
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 90
     steps:
       - name: Check out source
@@ -449,7 +427,7 @@ jobs:
     name: Linux aarch64 release build and tests
     needs: workflow-lint
     if: needs.workflow-lint.outputs.run_checks != 'false'
-    runs-on: ubuntu-24.04-arm
+    runs-on: blacksmith-4vcpu-ubuntu-2404-arm
     timeout-minutes: 150
     steps:
       - name: Check out source
@@ -457,8 +435,6 @@ jobs:
         with:
           persist-credentials: false
       - uses: ./.github/actions/setup-build
-        with:
-          objects: release-aarch64
       - name: Allow concurrent linux-aio reactors
         run: sudo sysctl -w fs.aio-max-nr=1048576
       - name: Build all ordinary targets
@@ -520,6 +496,7 @@ jobs:
           //src/simulation/tests:fake_file_test
           //src/simulation/tests:fake_file_runtime_test
           //src/simulation/tests:fake_file_replay_test
+          //src/codec/tests:xxh3_64_test
 
       - name: Test the shipped package, broker processes and fuzz replays
         id: shipped
@@ -530,43 +507,11 @@ jobs:
           --test_tag_filters=package,smoke,fuzz_replay
           //...
 
-      - name: Keep the compiled objects for later runs
-        if: github.ref == 'refs/heads/main' && !cancelled()
-        uses: ./.github/actions/save-objects
-        with:
-          objects: release-aarch64
-
       - name: Retain failed test diagnostics
         if: failure() && (steps.tests.outcome == 'failure' || steps.shipped.outcome == 'failure')
         uses: ./.github/actions/retain-logs
         with:
           name: ci-${{ github.job }}-${{ runner.arch }}-${{ github.run_attempt }}
-
-  drop-superseded-objects:
-    # Each run on main saves one entry of compiled objects per configuration.
-    # The cache evicts by last access once the repository's budget is full, so
-    # the entries a run supersedes are deleted here before they can push the
-    # download caches or the fuzz corpora out. This job alone may write, and it
-    # runs nothing from the repository; it holds up no check.
-    # https://docs.github.com/en/actions/how-tos/manage-workflow-runs/manage-caches#force-deleting-cache-entries
-    name: Drop superseded compiled objects
-    needs: [workflow-lint, build, test, sanitizer, arm-build]
-    if: github.ref == 'refs/heads/main' && !cancelled()
-    runs-on: ubuntu-24.04
-    timeout-minutes: 5
-    permissions:
-      actions: write # deletes cache entries
-    steps:
-      - name: Keep only each configuration's newest objects
-        env:
-          GH_TOKEN: ${{ github.token }}
-          GH_REPO: ${{ github.repository }}
-        run: |
-          for scope in debug sanitizer release-x86_64 release-aarch64; do
-            gh cache list --ref refs/heads/main --key "bazel-objects-${scope}-" \
-              --sort created_at --order desc --limit 100 --json id --jq '.[1:][].id' |
-              while read -r id; do gh cache delete "${id}"; done
-          done
 
   ci-ok:
     # The one required status check. GitHub counts a skipped required job as
@@ -589,8 +534,7 @@ jobs:
       - repository-checks
       - fuzz-smoke
       - arm-build
-      - drop-superseded-objects
-    runs-on: ubuntu-24.04
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 5
     steps:
       - if: ${{ needs.workflow-lint.result == 'skipped' }}

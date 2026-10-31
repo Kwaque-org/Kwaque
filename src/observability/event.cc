@@ -1,5 +1,8 @@
 #include "src/observability/event.h"
 
+#include "src/base/invariant.h"
+
+#include <algorithm>
 #include <array>
 
 namespace kwaque::observability {
@@ -47,6 +50,16 @@ constexpr std::array descriptors{
     .kind = event_kind::fault_decision,
     .name = "fault_decision",
     .allowed_fields = allowed_event_fields(event_kind::fault_decision),
+  },
+  event_descriptor{
+    .kind = event_kind::readiness_changed,
+    .name = "readiness_changed",
+    .allowed_fields = allowed_event_fields(event_kind::readiness_changed),
+  },
+  event_descriptor{
+    .kind = event_kind::append_refused,
+    .name = "append_refused",
+    .allowed_fields = allowed_event_fields(event_kind::append_refused),
   },
 };
 
@@ -120,6 +133,26 @@ constexpr std::array field_descriptors{
     .key = event_field_key::enabled,
     .name = "enabled",
     .type = event_field_type::boolean,
+  },
+  event_field_descriptor{
+    .key = event_field_key::suppressed,
+    .name = "suppressed",
+    .type = event_field_type::unsigned_integer,
+  },
+  event_field_descriptor{
+    .key = event_field_key::topic_id,
+    .name = "topic_id",
+    .type = event_field_type::object_id,
+  },
+  event_field_descriptor{
+    .key = event_field_key::range_id,
+    .name = "range_id",
+    .type = event_field_type::object_id,
+  },
+  event_field_descriptor{
+    .key = event_field_key::reasons,
+    .name = "reasons",
+    .type = event_field_type::unsigned_integer,
   },
 };
 
@@ -364,6 +397,122 @@ constexpr std::array text_descriptors{
     .id = event_public_text::reason_unsupported_format,
     .role = event_field_key::reason,
     .value = "unsupported_format"},
+  event_text_descriptor{
+    .id = event_public_text::state_not_ready,
+    .role = event_field_key::state,
+    .value = "not_ready"},
+  event_text_descriptor{
+    .id = event_public_text::operation_envelope_size,
+    .role = event_field_key::operation,
+    .value = "envelope_size"},
+  event_text_descriptor{
+    .id = event_public_text::operation_ingress_memory,
+    .role = event_field_key::operation,
+    .value = "ingress_memory"},
+  event_text_descriptor{
+    .id = event_public_text::operation_stream_window,
+    .role = event_field_key::operation,
+    .value = "stream_window"},
+  event_text_descriptor{
+    .id = event_public_text::operation_range_queue,
+    .role = event_field_key::operation,
+    .value = "range_queue"},
+  event_text_descriptor{
+    .id = event_public_text::operation_shard_capacity,
+    .role = event_field_key::operation,
+    .value = "shard_capacity"},
+  event_text_descriptor{
+    .id = event_public_text::operation_forwarded_traffic,
+    .role = event_field_key::operation,
+    .value = "forwarded_traffic"},
+  event_text_descriptor{
+    .id = event_public_text::operation_storage_pressure,
+    .role = event_field_key::operation,
+    .value = "storage_pressure"},
+  event_text_descriptor{
+    .id = event_public_text::outcome_batch_id_conflict,
+    .role = event_field_key::outcome,
+    .value = "batch_id_conflict"},
+  event_text_descriptor{
+    .id = event_public_text::outcome_stale,
+    .role = event_field_key::outcome,
+    .value = "stale"},
+  event_text_descriptor{
+    .id = event_public_text::outcome_sequence_gap,
+    .role = event_field_key::outcome,
+    .value = "sequence_gap"},
+  event_text_descriptor{
+    .id = event_public_text::outcome_window_exceeded,
+    .role = event_field_key::outcome,
+    .value = "window_exceeded"},
+  event_text_descriptor{
+    .id = event_public_text::outcome_unknown_stream,
+    .role = event_field_key::outcome,
+    .value = "unknown_stream"},
+  event_text_descriptor{
+    .id = event_public_text::outcome_stream_sealed,
+    .role = event_field_key::outcome,
+    .value = "stream_sealed"},
+  event_text_descriptor{
+    .id = event_public_text::outcome_stream_failed,
+    .role = event_field_key::outcome,
+    .value = "stream_failed"},
+  event_text_descriptor{
+    .id = event_public_text::outcome_producer_fenced,
+    .role = event_field_key::outcome,
+    .value = "producer_fenced"},
+  event_text_descriptor{
+    .id = event_public_text::outcome_invalid_ack_floor,
+    .role = event_field_key::outcome,
+    .value = "invalid_ack_floor"},
+  event_text_descriptor{
+    .id = event_public_text::outcome_stream_limit,
+    .role = event_field_key::outcome,
+    .value = "stream_limit"},
+  event_text_descriptor{
+    .id = event_public_text::outcome_topic_sealed,
+    .role = event_field_key::outcome,
+    .value = "topic_sealed"},
+  event_text_descriptor{
+    .id = event_public_text::outcome_not_found,
+    .role = event_field_key::outcome,
+    .value = "not_found"},
+  event_text_descriptor{
+    .id = event_public_text::outcome_misrouted_key,
+    .role = event_field_key::outcome,
+    .value = "misrouted_key"},
+  event_text_descriptor{
+    .id = event_public_text::outcome_stale_route,
+    .role = event_field_key::outcome,
+    .value = "stale_route"},
+  event_text_descriptor{
+    .id = event_public_text::outcome_no_space,
+    .role = event_field_key::outcome,
+    .value = "no_space"},
+  event_text_descriptor{
+    .id = event_public_text::outcome_too_large,
+    .role = event_field_key::outcome,
+    .value = "too_large"},
+  event_text_descriptor{
+    .id = event_public_text::outcome_invalid_batch,
+    .role = event_field_key::outcome,
+    .value = "invalid_batch"},
+  event_text_descriptor{
+    .id = event_public_text::outcome_timed_out_before_acceptance,
+    .role = event_field_key::outcome,
+    .value = "timed_out_before_acceptance"},
+  event_text_descriptor{
+    .id = event_public_text::outcome_aborted_before_acceptance,
+    .role = event_field_key::outcome,
+    .value = "aborted_before_acceptance"},
+  event_text_descriptor{
+    .id = event_public_text::outcome_closed,
+    .role = event_field_key::outcome,
+    .value = "closed"},
+  event_text_descriptor{
+    .id = event_public_text::outcome_unknown_producer,
+    .role = event_field_key::outcome,
+    .value = "unknown_producer"},
 };
 
 constexpr std::array forbidden_text_fragments{
@@ -379,7 +528,7 @@ constexpr std::array forbidden_text_fragments{
 [[nodiscard]] constexpr bool
 field_type_is_valid(event_field_type type) noexcept {
     return type >= event_field_type::signed_integer
-           && type <= event_field_type::stable_id;
+           && type <= event_field_type::object_id;
 }
 
 consteval bool descriptors_are_valid() {
@@ -389,8 +538,11 @@ consteval bool descriptors_are_valid() {
           static_cast<std::size_t>(descriptor.kind) != index + 1U
           || !event_name_is_valid(descriptor.name, event_name_bytes_max)
           || descriptor.allowed_fields == 0
-          || descriptor.allowed_fields
-               != allowed_event_fields(descriptor.kind)) {
+          || descriptor.allowed_fields != allowed_event_fields(descriptor.kind)
+          // A rate-bounded kind alone carries the count its bound dropped.
+          || event_kind_is_rate_bounded(descriptor.kind)
+               != event_field_is_allowed(
+                 descriptor.kind, event_field_key::suppressed)) {
             return false;
         }
         for (std::size_t other = index + 1U; other < descriptors.size();
@@ -456,6 +608,7 @@ consteval bool field_descriptors_are_valid() {
 }
 
 static_assert(descriptors_are_valid());
+static_assert(descriptors.size() == event_kind_count);
 static_assert(field_descriptors_are_valid());
 static_assert(text_descriptors_are_valid());
 static_assert(
@@ -463,6 +616,12 @@ static_assert(
     + event_fields_max
         * (canonical_event_field_fixed_encoded_size + event_field_name_bytes_max + event_text_bytes_max)
   > event_encoded_bytes_max);
+
+// What the sequence adds to a rate-bounded event: the key, name length, type,
+// payload size, name and an unsigned payload.
+constexpr std::size_t suppressed_field_encoded_size
+  = canonical_event_field_fixed_encoded_size
+    + std::string_view{"suppressed"}.size() + sizeof(std::uint64_t);
 
 [[nodiscard]] runtime::operation_error event_error(errc code) noexcept {
     return runtime::operation_error{
@@ -623,6 +782,18 @@ event_stable_id::make(std::uint64_t value) noexcept {
     return event_stable_id{value};
 }
 
+runtime::result<event_object_id> event_object_id::make(
+  std::span<const std::uint8_t, event_object_id_bytes> octets) noexcept {
+    for (const auto octet : octets) {
+        if (octet != 0) {
+            octets_type copied{};
+            std::ranges::copy(octets, copied.begin());
+            return event_object_id{copied};
+        }
+    }
+    return runtime::failure(event_error(errc::invalid_argument));
+}
+
 runtime::result<void> validate_event_encoded_size(std::size_t bytes) noexcept {
     if (bytes == 0) {
         return runtime::failure(event_error(errc::invalid_argument));
@@ -657,7 +828,7 @@ runtime::result<event> event::make(
     if (sequence == 0) {
         return runtime::failure(event_error(errc::invalid_argument));
     }
-    auto request = event_request::make(context, fields);
+    auto request = event_request::build(context, fields, true);
     if (!request) {
         return runtime::failure(request.error());
     }
@@ -667,17 +838,48 @@ runtime::result<event> event::make(
 event event::from_request(
   const event_request& request,
   event_shard shard,
-  std::uint64_t sequence) noexcept {
+  std::uint64_t sequence,
+  std::uint64_t suppressed) noexcept {
     event result{request.context_, shard, sequence};
     result.fields_ = request.fields_;
     result.encoded_size_ = request.encoded_size_;
     result.field_count_ = request.field_count_;
+    if (suppressed == 0) {
+        return result;
+    }
+    // A rate-bounded request left room for this field (event_request::make),
+    // so the event stays inside its bounds. Fields stay ordered by key.
+    KWAQUE_INVARIANT(
+      invariant_id{"KQ-EVENT-SUPPRESSED"},
+      event_kind_is_rate_bounded(request.kind())
+        && result.field_count_ < event_fields_max,
+      "a suppressed count was added to an event with no room for it");
+    auto position = std::size_t{result.field_count_};
+    while (position != 0
+           && static_cast<std::uint16_t>(result.fields_[position - 1U].key)
+                > static_cast<std::uint16_t>(event_field_key::suppressed)) {
+        result.fields_[position] = result.fields_[position - 1U];
+        --position;
+    }
+    result.fields_[position] = event_field{
+      .key = event_field_key::suppressed,
+      .value = event_field_value::from_unsigned(suppressed)};
+    ++result.field_count_;
+    result.encoded_size_ = static_cast<std::uint16_t>(
+      result.encoded_size_ + suppressed_field_encoded_size);
     return result;
 }
 
 runtime::result<event_request> event_request::make(
   const event_request_context& context,
   std::span<const event_field> fields) noexcept {
+    return build(context, fields, false);
+}
+
+runtime::result<event_request> event_request::build(
+  const event_request_context& context,
+  std::span<const event_field> fields,
+  bool decoded) noexcept {
     const auto* event_descriptor = descriptor_for(context.kind);
     if (
       event_descriptor == nullptr || !severity_is_valid(context.severity)
@@ -685,12 +887,17 @@ runtime::result<event_request> event_request::make(
            >= resource::workload_class_count) {
         return runtime::failure(event_error(errc::invalid_argument));
     }
-    if (fields.size() > event_fields_max) {
+    // A rate-bounded event keeps room for the suppressed count the sequence
+    // may add.
+    const bool bounded = event_kind_is_rate_bounded(context.kind) && !decoded;
+    const std::size_t fields_max = bounded ? event_fields_max - 1U
+                                           : event_fields_max;
+    if (fields.size() > fields_max) {
         return runtime::failure(event_limit_error(
           errc::out_of_range,
           runtime::operation_context_key::items,
           fields.size(),
-          event_fields_max));
+          fields_max));
     }
 
     event_request result{context};
@@ -701,6 +908,9 @@ runtime::result<event_request> event_request::make(
         if (
           field_descriptor == nullptr
           || !event_field_is_allowed(context.kind, fields[index].key)
+          // Only a sequence writes the count, and only when it is not zero.
+          || (fields[index].key == event_field_key::suppressed
+              && (!decoded || fields[index].value.as_unsigned().value_or(0) == 0))
           || field_descriptor->type != fields[index].value.type()
           || (fields[index].value.type() == event_field_type::bounded_string
               && (!text || text->empty() || !text_role
@@ -750,7 +960,10 @@ runtime::result<event_request> event_request::make(
               event_encoded_bytes_max));
         }
     }
-    if (auto valid = validate_event_encoded_size(encoded_size); !valid) {
+    if (
+      auto valid = validate_event_encoded_size(
+        bounded ? encoded_size + suppressed_field_encoded_size : encoded_size);
+      !valid) {
         return runtime::failure(valid.error());
     }
     result.encoded_size_ = static_cast<std::uint16_t>(encoded_size);

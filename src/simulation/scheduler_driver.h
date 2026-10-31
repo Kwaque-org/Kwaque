@@ -4,6 +4,7 @@
 #include "src/base/error.h"
 #include "src/runtime/testing/reactor_tasks.h"
 #include "src/simulation/scheduler.h"
+#include "src/simulation/virtual_shard.h"
 
 #include <seastar/core/coroutine.hh>
 #include <seastar/core/future.hh>
@@ -12,6 +13,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cstdint>
+#include <exception>
 #include <stdexcept>
 #include <system_error>
 #include <type_traits>
@@ -56,6 +58,28 @@ inline void run_next_batch(scheduler& events, std::uint64_t maximum_batch) {
     }
 }
 
+// Runs one batch, then drains the reactor tasks it woke as the batch's
+// shard, since a batch never mixes shards. A batch that fails part way has
+// still woken the tasks of the events it ran, so they drain as their shard
+// before the failure is reported.
+inline seastar::future<>
+run_next_turn(scheduler& events, std::uint64_t maximum_batch) {
+    std::exception_ptr failure;
+    try {
+        run_next_batch(events, maximum_batch);
+    } catch (...) {
+        failure = std::current_exception();
+    }
+    {
+        const virtual_shard_turn turn{
+          seastar::this_shard_id() + events.last_batch_shard()};
+        co_await runtime::testing::drain_reactor_tasks();
+    }
+    if (failure) {
+        std::rethrow_exception(failure);
+    }
+}
+
 } // namespace scheduler_driver_detail
 
 // Every pump tests its future, reports a stall and steps virtual time only
@@ -77,7 +101,7 @@ pump_deterministic_until(scheduler& events, seastar::future<T>& waiting) {
         if (events.pending_events() == 0U) {
             throw scheduler_liveness_error{};
         }
-        scheduler_driver_detail::run_next_batch(events, maximum_batch);
+        co_await scheduler_driver_detail::run_next_turn(events, maximum_batch);
     }
 }
 
@@ -98,7 +122,7 @@ seastar::future<> pump_until(scheduler& events, seastar::future<T>& waiting) {
         if (events.pending_events() == 0U) {
             continue;
         }
-        scheduler_driver_detail::run_next_batch(events, maximum_batch);
+        co_await scheduler_driver_detail::run_next_turn(events, maximum_batch);
     }
 }
 
@@ -123,7 +147,7 @@ seastar::future<> pump_registered_until(
             }
             continue;
         }
-        scheduler_driver_detail::run_next_batch(events, maximum_batch);
+        co_await scheduler_driver_detail::run_next_turn(events, maximum_batch);
     }
 }
 

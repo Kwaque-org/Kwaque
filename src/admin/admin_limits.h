@@ -1,5 +1,6 @@
 #pragma once
 
+#include "src/base/metric_schema.h"
 #include "src/base/units.h"
 
 #include <chrono>
@@ -17,10 +18,12 @@ inline constexpr std::chrono::seconds header_timeout{5};
 inline constexpr std::chrono::seconds exchange_timeout{15};
 inline constexpr std::size_t metrics_snapshot_bytes = 640_KiB;
 // Snapshot caps count only enabled series, so they do not grow with the shard
-// count. A broker shard registers about 300 enabled series in about 120
-// families; the composition test keeps both at most three quarters of a cap.
+// count. The metric schema budgets each shard at three quarters of each cap.
 inline constexpr std::size_t metrics_snapshot_families = 256;
 inline constexpr std::size_t metrics_snapshot_series = 1024;
+// The metric schema budgets every shard against these three quarters.
+static_assert(metric_shard_families_cap * 4U == metrics_snapshot_families * 3U);
+static_assert(metric_shard_series_cap * 4U == metrics_snapshot_series * 3U);
 // Unaggregated exposition is about 18 KiB per shard and is streamed rather
 // than retained, so the response cap scales with the shard count.
 inline constexpr std::size_t metrics_response_bytes_per_shard = 128_KiB;

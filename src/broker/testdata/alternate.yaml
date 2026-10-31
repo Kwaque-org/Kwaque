@@ -6,3 +6,7 @@ kwaque:
     port: 19644
   developer_mode: false
   crash_loop_limit: 5
+  storage:
+    devices:
+      - path: "/var/lib/kwaque-alternate"
+        role: all

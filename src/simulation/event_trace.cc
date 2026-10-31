@@ -1,6 +1,7 @@
 #include "src/simulation/event_trace.h"
 
 #include "src/base/invariant.h"
+#include "src/runtime/buggify.h"
 #include "src/runtime/fault.h"
 
 #include <seastar/coroutine/maybe_yield.hh>
@@ -320,7 +321,7 @@ effect_position_is_valid(const trace_entry& entry) noexcept {
     const auto kind = static_cast<std::uint8_t>(entry.kind);
     if (
       entry.sequence == 0 || action == 0
-      || action > static_cast<std::uint8_t>(trace_action::storage_configuration)
+      || action > static_cast<std::uint8_t>(trace_action::buggify_evaluated)
       || kind > static_cast<std::uint8_t>(trace_event_kind::dns)
       || entry.context_size > entry.context.size()
       || !trace_event_domain_is_valid(entry.kind, entry.domain)
@@ -643,6 +644,21 @@ effect_position_is_valid(const trace_entry& entry) noexcept {
           || entry.result != 0)
             return invalid_trace(errc::malformed_data);
         break;
+    case trace_action::buggify_evaluated:
+        // A site ID is checked against the table's bound, not looked up: an
+        // evaluator runs over the table it is given, which tests choose.
+        // Replay still compares each first evaluation with the run's own.
+        if (
+          entry.event_id != 0 || entry.kind != trace_event_kind::keyed_random
+          || entry.deadline.nanoseconds() != 0 || entry.priority != 0
+          || entry.domain != buggify_activation_trace_domain
+          || entry.stable_id == 0
+          || entry.stable_id > runtime::maximum_buggify_sites
+          || entry.coordinate_a != 0 || entry.coordinate_b != 0
+          || entry.result
+               != (buggify_activation_word_is_active(entry.value) ? 1U : 0U))
+            return invalid_trace(errc::malformed_data);
+        break;
     case trace_action::none:
         return invalid_trace(errc::malformed_data);
     }
@@ -894,7 +910,8 @@ bool trace_descriptor_is_valid(trace_event_descriptor descriptor) noexcept {
           || descriptor.effect == trace_action::selected
           || descriptor.effect == trace_action::time_advanced
           || descriptor.effect == trace_action::keyed_decision
-          || descriptor.effect == trace_action::fault_evaluated)
+          || descriptor.effect == trace_action::fault_evaluated
+          || descriptor.effect == trace_action::buggify_evaluated)
             return false;
         entry.action = descriptor.effect;
         return validate_entry_shape(entry, header).has_value();

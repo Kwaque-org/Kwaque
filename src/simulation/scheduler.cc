@@ -2,6 +2,7 @@
 
 #include "src/base/invariant.h"
 #include "src/runtime/fault.h"
+#include "src/simulation/virtual_shard.h"
 
 #include <algorithm>
 #include <bit>
@@ -352,6 +353,51 @@ runtime::result<event_id> scheduler::schedule(
   trace_event_descriptor descriptor,
   event_cleanup_policy cleanup,
   event_trace::reservation trace_reservation) {
+    return schedule_as(
+      current_virtual_shard(),
+      deadline,
+      priority,
+      std::move(completion),
+      descriptor,
+      cleanup,
+      std::move(trace_reservation));
+}
+
+runtime::result<event_id> scheduler::schedule_on(
+  std::uint16_t shard,
+  runtime::monotonic_time deadline,
+  event_priority priority,
+  callback&& completion,
+  trace_event_descriptor descriptor,
+  event_cleanup_policy cleanup) {
+    return schedule_as(
+      shard,
+      deadline,
+      priority,
+      std::move(completion),
+      descriptor,
+      cleanup,
+      {});
+}
+
+std::uint16_t scheduler::current_virtual_shard() const noexcept {
+    return static_cast<std::uint16_t>(
+      runtime::current_shard() - seastar::this_shard_id());
+}
+
+std::uint16_t scheduler::last_batch_shard() const {
+    assert_current();
+    return last_batch_shard_;
+}
+
+runtime::result<event_id> scheduler::schedule_as(
+  std::uint16_t shard,
+  runtime::monotonic_time deadline,
+  event_priority priority,
+  callback&& completion,
+  trace_event_descriptor descriptor,
+  event_cleanup_policy cleanup,
+  event_trace::reservation trace_reservation) {
     assert_current();
     if (!completion) {
         return runtime::failure(scheduler_error(errc::invalid_argument));
@@ -390,6 +436,7 @@ runtime::result<event_id> scheduler::schedule(
           .deadline = deadline,
           .priority = priority,
           .cleanup = cleanup,
+          .shard = shard,
           .id = id,
           .completion = callback{},
           .descriptor = descriptor,
@@ -407,6 +454,7 @@ runtime::result<event_id> scheduler::schedule(
         .deadline = deadline,
         .priority = priority,
         .cleanup = cleanup,
+        .shard = shard,
         .id = id,
         .completion = std::move(completion),
         .descriptor = descriptor,
@@ -703,6 +751,13 @@ scheduler::run_ready_batch(std::uint64_t maximum_events) {
 
     std::uint64_t executed = 0;
     while (has_ready_event() && executed < maximum_events) {
+        // One shard a batch: the reactor tasks a batch wakes run as its
+        // shard, so a batch stops where the next event is another shard's.
+        if (
+          executed != 0
+          && heap_[scheduler_heap_root_index].shard != last_batch_shard_) {
+            break;
+        }
         if (auto available = check_lifetime_budget(); !available) {
             return runtime::failure(available.error());
         }
@@ -877,6 +932,8 @@ bool scheduler::discard_failed() noexcept {
         auto discarded = remove_at(scheduler_heap_root_index);
         if (discarded.cleanup == event_cleanup_policy::invoke) {
             discard_scope scope{discarding_failed_event_};
+            const virtual_shard_turn turn{
+              seastar::this_shard_id() + discarded.shard};
             discarded.completion();
         }
     }
@@ -1028,7 +1085,13 @@ runtime::result<void> scheduler::execute_ready_unchecked() noexcept {
     }
     auto selected = remove_at(scheduler_heap_root_index);
     ++executed_events_;
-    selected.completion();
+    last_batch_shard_ = selected.shard;
+    {
+        // The callback runs as the shard that owns the event.
+        const virtual_shard_turn turn{
+          seastar::this_shard_id() + selected.shard};
+        selected.completion();
+    }
     if (auto healthy = check_trace_failure(); !healthy) {
         return runtime::failure(healthy.error());
     }

@@ -1,7 +1,12 @@
 #ifndef KWAQUE_SRC_RUNTIME_TESTING_CONTRACTS_CONTRACT_BACKENDS_H_
 #define KWAQUE_SRC_RUNTIME_TESTING_CONTRACTS_CONTRACT_BACKENDS_H_
 
+#include "src/base/invariant.h"
+#include "src/runtime/alarm.h"
+#include "src/runtime/cross_shard.h"
+#include "src/runtime/deadlines.h"
 #include "src/runtime/environment.h"
+#include "src/runtime/shard_identity.h"
 
 #include <seastar/core/abort_source.hh>
 #include <seastar/core/coroutine.hh>
@@ -9,6 +14,7 @@
 #include <seastar/core/gate.hh>
 #include <seastar/core/semaphore.hh>
 #include <seastar/core/shared_future.hh>
+#include <seastar/core/smp.hh>
 #include <seastar/util/defer.hh>
 
 #include <algorithm>
@@ -16,6 +22,7 @@
 #include <cstdint>
 #include <deque>
 #include <optional>
+#include <span>
 #include <string_view>
 #include <utility>
 #include <vector>
@@ -61,9 +68,69 @@ public:
     seastar::future<result<void>> stop() { return detail::success(); }
 };
 
+// Records the time it is armed for; a contract test rings it by hand.
+class contract_alarm final {
+public:
+    explicit contract_alarm(alarm_callback callback) noexcept
+      : callback_(std::move(callback)) {}
+
+    void arm(monotonic_time at) noexcept { armed_at_ = at; }
+    void cancel() noexcept { armed_at_.reset(); }
+    void ring() noexcept {
+        armed_at_.reset();
+        callback_();
+    }
+    [[nodiscard]] std::optional<monotonic_time> armed_at() const noexcept {
+        return armed_at_;
+    }
+
+private:
+    alarm_callback callback_;
+    std::optional<monotonic_time> armed_at_;
+};
+
+// One shard: every call names it and runs inline, as Seastar runs a call to
+// the current shard.
+class contract_shard_set final {
+public:
+    [[nodiscard]] seastar::shard_id current() const noexcept {
+        return runtime::current_shard();
+    }
+    [[nodiscard]] unsigned count() const noexcept { return 1; }
+
+    template<typename Func, typename... Args>
+    auto invoke_on(
+      seastar::shard_id target,
+      seastar::smp_service_group,
+      Func func,
+      Args... args) {
+        KWAQUE_INVARIANT(
+          invariant_id{"KQ-CONTRACT-SHARD-TARGET"},
+          target == current(),
+          "a one-shard backend was asked to call another shard");
+        return runtime::detail::invoke_inline(
+          runtime::detail::bind_arguments(std::move(func), std::move(args)...));
+    }
+};
+
 class contract_random final {
 public:
     std::uint64_t next_u64() noexcept { return next_++; }
+
+private:
+    std::uint64_t next_{1};
+};
+
+// Distinct octets per call, in a fixed order, so contract runs replay.
+class contract_identity_entropy final {
+public:
+    void fill(std::span<std::uint8_t, identity_entropy_bytes> octets) noexcept {
+        for (auto& octet : octets) {
+            octet = static_cast<std::uint8_t>(next_ >> 56U);
+            next_ = next_ * UINT64_C(6364136223846793005)
+                    + UINT64_C(1442695040888963407);
+        }
+    }
 
 private:
     std::uint64_t next_{1};
@@ -570,9 +637,17 @@ public:
     using wall_clock = contract_wall_clock;
     using timer_type = contract_timer;
     using random_type = contract_random;
+    using identity_entropy_type = contract_identity_entropy;
+    using deadlines_type
+      = basic_deadlines<contract_alarm, contract_monotonic_clock>;
+    using shard_set_type = contract_shard_set;
     using file_system_type = contract_file_system;
     using network_type = contract_network;
     using dns_type = contract_dns;
+
+    // Contract backends run no BUGGIFY site and count no mark.
+    static constexpr bool buggify_enabled = false;
+    static constexpr bool marks_enabled = false;
 
     contract_backend_common() { lifetime_.activate(); }
 
@@ -597,6 +672,18 @@ public:
         lifetime_.assert_current();
         return random_;
     }
+    identity_entropy_type& identity_entropy() {
+        lifetime_.assert_current();
+        return identity_entropy_;
+    }
+    deadlines_type& deadlines() {
+        lifetime_.assert_current();
+        return deadlines_;
+    }
+    shard_set_type& shards() {
+        lifetime_.assert_current();
+        return shards_;
+    }
     file_system_type& file_system() {
         lifetime_.assert_current();
         return file_system_;
@@ -614,6 +701,9 @@ private:
     runtime_lifetime lifetime_;
     timer_type timer_;
     random_type random_;
+    identity_entropy_type identity_entropy_;
+    deadlines_type deadlines_{deadlines_type::default_touches_per_task};
+    shard_set_type shards_;
     file_system_type file_system_;
     network_type network_;
     dns_type dns_;

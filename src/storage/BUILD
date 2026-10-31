@@ -461,7 +461,12 @@ kwaque_cc_library(
     name = "metrics",
     srcs = ["metrics.cc"],
     hdrs = ["metrics.h"],
-    visibility = ["//src/storage/tests:__pkg__"],
+    visibility = [
+        "//src/range:__pkg__",
+        "//src/range/tests:__pkg__",
+        "//src/simulation/tests:__pkg__",
+        "//src/storage/tests:__pkg__",
+    ],
     deps = [
         ":placement_statistics",
         ":statistics",
@@ -582,6 +587,7 @@ kwaque_cc_library(
     hdrs = ["local_paths.h"],
     visibility = [
         "//src/broker:__pkg__",
+        "//src/raft:__pkg__",
         "//src/simulation/tests:__pkg__",
         "//src/storage/tests:__pkg__",
     ],
@@ -603,6 +609,7 @@ kwaque_cc_library(
     name = "local_publication",
     hdrs = ["local_publication.h"],
     visibility = [
+        "//src/raft:__pkg__",
         "//src/simulation/tests:__pkg__",
         "//src/storage/tests:__pkg__",
     ],
@@ -1276,7 +1283,12 @@ kwaque_cc_library(
 kwaque_cc_library(
     name = "device_placement",
     hdrs = ["device_placement.h"],
-    visibility = ["//src/storage/tests:__pkg__"],
+    visibility = [
+        "//src/range:__pkg__",
+        "//src/range/tests:__pkg__",
+        "//src/simulation/tests:__pkg__",
+        "//src/storage/tests:__pkg__",
+    ],
     deps = [
         ":local_paths",
         ":local_store_config",
@@ -1294,7 +1306,12 @@ kwaque_cc_library(
 kwaque_cc_library(
     name = "space_sampler",
     hdrs = ["space_sampler.h"],
-    visibility = ["//src/storage/tests:__pkg__"],
+    visibility = [
+        "//src/range:__pkg__",
+        "//src/range/tests:__pkg__",
+        "//src/simulation/tests:__pkg__",
+        "//src/storage/tests:__pkg__",
+    ],
     deps = [
         ":device_placement",
         ":local_paths",
@@ -1314,7 +1331,12 @@ kwaque_cc_library(
 kwaque_cc_library(
     name = "segment_lifecycle",
     hdrs = ["segment_lifecycle.h"],
-    visibility = ["//src/storage/tests:__pkg__"],
+    visibility = [
+        "//src/range:__pkg__",
+        "//src/range/tests:__pkg__",
+        "//src/simulation/tests:__pkg__",
+        "//src/storage/tests:__pkg__",
+    ],
     deps = [
         ":checkpoint",
         ":device_placement",
@@ -1368,7 +1390,12 @@ kwaque_cc_library(
 kwaque_cc_library(
     name = "local_engine",
     hdrs = ["local_engine.h"],
-    visibility = ["//src/storage/tests:__pkg__"],
+    visibility = [
+        "//src/range:__pkg__",
+        "//src/range/tests:__pkg__",
+        "//src/simulation/tests:__pkg__",
+        "//src/storage/tests:__pkg__",
+    ],
     deps = [
         ":checkpoint",
         ":device_placement",
@@ -1408,7 +1435,12 @@ kwaque_cc_library(
     name = "segment_reader",
     srcs = ["segment_reader.cc"],
     hdrs = ["segment_reader.h"],
-    visibility = ["//src/storage/tests:__pkg__"],
+    visibility = [
+        "//src/range:__pkg__",
+        "//src/range/tests:__pkg__",
+        "//src/simulation/tests:__pkg__",
+        "//src/storage/tests:__pkg__",
+    ],
     deps = [
         ":page_cache",
         ":segment_run",
@@ -1746,7 +1778,12 @@ kwaque_cc_library(
     name = "local_append",
     srcs = ["local_append.cc"],
     hdrs = ["local_append.h"],
-    visibility = ["//src/storage/tests:__pkg__"],
+    visibility = [
+        "//src/range:__pkg__",
+        "//src/range/tests:__pkg__",
+        "//src/simulation/tests:__pkg__",
+        "//src/storage/tests:__pkg__",
+    ],
     deps = [
         ":completed_retry",
         ":encoded_batch",

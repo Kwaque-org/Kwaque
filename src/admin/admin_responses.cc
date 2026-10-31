@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <string>
+#include <utility>
 
 namespace kwaque::admin {
 
@@ -92,12 +93,34 @@ json_response liveness_response(bool live) {
       .body = R"({"status":"live"})"};
 }
 
-json_response readiness_response(bool ready) {
+json_response readiness_response(bool ready, readiness_reasons held) {
     if (!ready) {
+        auto body = problem_json(
+          503,
+          "broker_not_ready",
+          held != 0 ? "broker withdrew its readiness" : "broker is not ready");
+        if (held != 0) {
+            // An extension member naming each held reason, before the
+            // document's closing brace.
+            body.pop_back();
+            body += R"(,"reasons":[)";
+            bool first = true;
+            for (const auto reason : readiness_reason_values) {
+                if ((held & readiness_bit(reason)) == 0) {
+                    continue;
+                }
+                if (!first) {
+                    body.push_back(',');
+                }
+                first = false;
+                append_json_string(body, readiness_reason_name(reason), 64);
+            }
+            body += "]}";
+        }
         return {
           .status = 503,
           .content_type = problem_content_type,
-          .body = problem_json(503, "broker_not_ready", "broker is not ready")};
+          .body = std::move(body)};
     }
     return {
       .status = 200,

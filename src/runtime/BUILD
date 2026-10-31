@@ -24,6 +24,13 @@ kwaque_cc_library(
 )
 
 kwaque_cc_library(
+    name = "gcra",
+    hdrs = ["gcra.h"],
+    visibility = ["//visibility:public"],
+    deps = [":time"],
+)
+
+kwaque_cc_library(
     name = "timer",
     hdrs = ["timer.h"],
     visibility = ["//visibility:public"],
@@ -210,15 +217,84 @@ kwaque_cc_library(
 )
 
 kwaque_cc_library(
+    name = "deadline_wheel",
+    srcs = ["deadline_wheel.cc"],
+    hdrs = ["deadline_wheel.h"],
+    visibility = ["//visibility:public"],
+    deps = [
+        ":shard_affinity",
+        ":time",
+        "//src/base:invariant",
+    ],
+)
+
+kwaque_cc_library(
+    name = "alarm",
+    hdrs = ["alarm.h"],
+    visibility = ["//visibility:public"],
+    deps = [
+        ":time",
+        "@seastar",
+    ],
+)
+
+kwaque_cc_library(
+    name = "waiting",
+    srcs = ["waiting.cc"],
+    hdrs = ["waiting.h"],
+    visibility = ["//visibility:public"],
+    deps = [
+        ":deadline_wheel",
+        ":error",
+        ":shard_affinity",
+        ":time",
+        "//src/base:invariant",
+        "@boost//:intrusive",
+        "@seastar",
+    ],
+)
+
+kwaque_cc_library(
+    name = "buggify",
+    hdrs = ["buggify.h"],
+    visibility = ["//visibility:public"],
+    deps = ["//src/base:names"],
+)
+
+kwaque_cc_library(
+    name = "marks",
+    hdrs = ["marks.h"],
+    visibility = ["//visibility:public"],
+    deps = ["//src/base:names"],
+)
+
+kwaque_cc_library(
+    name = "deadlines",
+    hdrs = ["deadlines.h"],
+    visibility = ["//visibility:public"],
+    deps = [
+        ":alarm",
+        ":deadline_wheel",
+        ":shard_affinity",
+        ":time",
+        ":waiting",
+        "//src/base:invariant",
+    ],
+)
+
+kwaque_cc_library(
     name = "environment",
     srcs = ["environment.cc"],
     hdrs = ["environment.h"],
     visibility = ["//visibility:public"],
     deps = [
+        ":buggify",
+        ":deadlines",
         ":dns",
         ":error",
         ":fault_api",
         ":file",
+        ":marks",
         ":network",
         ":random",
         ":shard_affinity",
@@ -230,11 +306,19 @@ kwaque_cc_library(
 )
 
 kwaque_cc_library(
+    name = "shard_identity",
+    hdrs = ["shard_identity.h"],
+    visibility = ["//visibility:public"],
+    deps = ["@seastar"],
+)
+
+kwaque_cc_library(
     name = "shard_affinity",
     srcs = ["shard_affinity.cc"],
     hdrs = ["shard_affinity.h"],
     visibility = ["//visibility:public"],
     deps = [
+        ":shard_identity",
         "//src/base:invariant",
         "@seastar",
     ],
@@ -251,6 +335,7 @@ kwaque_cc_library(
         "//src/simulation:__pkg__",
     ],
     deps = [
+        ":shard_identity",
         "//src/base:invariant_test_support",
         "@seastar",
     ],
@@ -265,6 +350,7 @@ kwaque_cc_library(
         ":error",
         ":shard_affinity",
         "//src/base",
+        "//src/base:invariant",
         "@seastar",
     ],
 )

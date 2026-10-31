@@ -202,3 +202,123 @@ SEASTAR_TEST_CASE(new_sink_epochs_restart_sequences_and_change_reproduction) {
     BOOST_REQUIRE(second.stop().has_value());
     co_return;
 }
+
+namespace {
+
+using kwaque::observability::event_field;
+using kwaque::observability::event_field_key;
+using kwaque::observability::event_field_value;
+using kwaque::observability::event_public_text;
+using kwaque::observability::event_text;
+
+event_text text(event_public_text value) {
+    auto made = event_text::make(value);
+    BOOST_REQUIRE(made.has_value());
+    return *made;
+}
+
+event_request kind_at(event_kind kind, std::uint64_t monotonic) {
+    std::array<event_field, 1> fields{};
+    if (kind == event_kind::append_refused) {
+        fields[0] = event_field{
+          .key = event_field_key::outcome,
+          .value = event_field_value::from_text(
+            text(event_public_text::outcome_no_space))};
+    } else {
+        fields[0] = event_field{
+          .key = event_field_key::state,
+          .value = event_field_value::from_text(
+            text(event_public_text::state_not_ready))};
+    }
+    auto made = event_request::make(
+      event_request_context{
+        .kind = kind,
+        .severity = event_severity::warning,
+        .monotonic = kwaque::runtime::monotonic_time{monotonic},
+        .wall = kwaque::runtime::wall_time{0},
+        .workload = kwaque::resource::workload_class::foreground_protocol,
+      },
+      fields);
+    BOOST_REQUIRE(made.has_value());
+    return *made;
+}
+
+} // namespace
+
+SEASTAR_TEST_CASE(a_refusal_storm_keeps_one_event_a_second_and_every_change) {
+    // 1,000 refusals a second for ten seconds, and a readiness change every
+    // tenth of a second.
+    constexpr std::uint64_t millisecond = 1'000'000;
+    auto made = event_log_limits::make(
+      event_log_limit_values{.entries = 1'024, .encoded_bytes = 1'048'576});
+    BOOST_REQUIRE(made.has_value());
+    capture_event_sink sink{identity(31), *made};
+    for (std::uint64_t at = 0; at < 10'000; ++at) {
+        BOOST_REQUIRE(
+          sink.emit(kind_at(event_kind::append_refused, at * millisecond))
+            .has_value());
+        if (at % 100 == 0) {
+            BOOST_REQUIRE(
+              sink
+                .emit(kind_at(event_kind::readiness_changed, at * millisecond))
+                .has_value());
+        }
+    }
+    std::uint64_t refusals = 0;
+    std::uint64_t changes = 0;
+    std::uint64_t carried = 0;
+    std::uint64_t expected_sequence = 1;
+    for (const auto& value : sink.events().entries()) {
+        // No sequence number is skipped by a dropped event.
+        BOOST_CHECK_EQUAL(value.sequence(), expected_sequence++);
+        if (value.kind() == event_kind::readiness_changed) {
+            ++changes;
+            continue;
+        }
+        BOOST_REQUIRE(value.kind() == event_kind::append_refused);
+        // One a second, from the first, each after the first carrying the
+        // 999 dropped since.
+        BOOST_CHECK_EQUAL(
+          value.monotonic().nanoseconds(), refusals * 1'000U * millisecond);
+        std::uint64_t suppressed = 0;
+        for (const auto& field : value.fields()) {
+            if (field.key == event_field_key::suppressed) {
+                suppressed = *field.value.as_unsigned();
+            }
+        }
+        BOOST_CHECK_EQUAL(suppressed, refusals == 0 ? 0U : 999U);
+        carried += suppressed;
+        ++refusals;
+    }
+    BOOST_CHECK_EQUAL(refusals, 10U);
+    BOOST_CHECK_EQUAL(changes, 100U);
+    // The counter counts every drop; the last second's 999 wait for the next
+    // admitted refusal.
+    BOOST_CHECK_EQUAL(sink.suppressed_total(), 9'990U);
+    BOOST_CHECK_EQUAL(carried + 999U, 9'990U);
+    BOOST_REQUIRE(sink.stop().has_value());
+    co_return;
+}
+
+SEASTAR_TEST_CASE(an_event_never_emitted_spends_no_grant) {
+    auto sequence = event_sequence_test_access::make(identity(33));
+    {
+        auto prepared = event_sequence_test_access::prepare_bounded(
+          *sequence, kind_at(event_kind::append_refused, 0));
+        BOOST_REQUIRE(prepared.has_value() && prepared->has_value());
+        // Released without a commit, as a sink that failed to write does.
+    }
+    auto again = event_sequence_test_access::prepare_bounded(
+      *sequence, kind_at(event_kind::append_refused, 0));
+    BOOST_REQUIRE(again.has_value());
+    BOOST_REQUIRE(again->has_value());
+    BOOST_CHECK_EQUAL((*again)->value().sequence(), 1U);
+    (*again)->commit();
+    auto dropped = event_sequence_test_access::prepare_bounded(
+      *sequence, kind_at(event_kind::append_refused, 0));
+    BOOST_REQUIRE(dropped.has_value());
+    BOOST_CHECK(!dropped->has_value());
+    BOOST_CHECK_EQUAL(sequence->suppressed_total(), 1U);
+    BOOST_CHECK_EQUAL(sequence->last_sequence(), 1U);
+    co_return;
+}

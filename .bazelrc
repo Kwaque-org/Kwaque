@@ -50,8 +50,13 @@ build:ci --per_file_copt=^(bazel|proto|src)/.*@-Werror
 # A cold CI build reports every failing target, not only the first.
 build:ci --keep_going
 
+# The debug-mode configurations share compilation_mode=dbg, and fuzz shares
+# fastbuild with the default build. Each keeps its own output directory, so
+# switching between them does not overwrite the other's objects and rebuild
+# everything.
 build:ci-debug --config=ci
 build:ci-debug --compilation_mode=dbg
+build:ci-debug --platform_suffix=ci-debug
 build:ci-debug --copt=-gline-tables-only
 build:ci-debug --@seastar//:system_allocator=False
 build:ci-debug --@seastar//:allocation_failure_injection=True
@@ -63,6 +68,7 @@ test:ci-debug --test_env=KWAQUE_EXPECT_TEST_SANITIZED=false
 
 build:ci-native --config=ci
 build:ci-native --compilation_mode=dbg
+build:ci-native --platform_suffix=ci-native
 build:ci-native --copt=-gline-tables-only
 build:ci-native --@seastar//:system_allocator=False
 build:ci-native --@seastar//:allocation_failure_injection=False
@@ -80,6 +86,7 @@ test:ci-release --test_env=KWAQUE_EXPECT_TEST_SANITIZED=false
 
 build:ci-sanitizer --config=ci
 build:ci-sanitizer --config=debug
+build:ci-sanitizer --platform_suffix=ci-sanitizer
 test:ci-sanitizer --test_env=KWAQUE_EXPECT_TEST_ALLOCATOR=system
 test:ci-sanitizer --test_env=KWAQUE_EXPECT_TEST_INJECTION=false
 test:ci-sanitizer --test_env=KWAQUE_EXPECT_TEST_OPTIMIZED=true
@@ -102,6 +109,7 @@ build:debug --copt=-O1
 # libFuzzer replays and minimizes one input at a time, so the reactor must run
 # tasks in a reproducible order.
 build:fuzz --config=san-all
+build:fuzz --platform_suffix=fuzz
 build:fuzz --@seastar//:shuffle_task_queue=false
 build:fuzz --define=kwaque_fuzz=1
 build:fuzz --copt=-O1

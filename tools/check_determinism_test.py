@@ -12,6 +12,7 @@ try:
         Allowance,
         Writer,
         is_deterministic_source,
+        is_pure_source,
         is_test_source,
         masked_code,
         occurrences,
@@ -24,6 +25,7 @@ except ModuleNotFoundError:
         Allowance,
         Writer,
         is_deterministic_source,
+        is_pure_source,
         is_test_source,
         masked_code,
         occurrences,
@@ -172,6 +174,9 @@ class DeterminismSourceTest(unittest.TestCase):
             "src/runtime/tests/time_random_contract_test.cc",
             "src/observability/event_codec.cc",
             "src/observability/event_bench.cc",
+            "src/metadata/proposer.cc",
+            "src/raft/journal.h",
+            "src/range/engine.cc",
         ):
             self.assertTrue(is_deterministic_source(Path(path)), path)
         for path in (
@@ -181,6 +186,164 @@ class DeterminismSourceTest(unittest.TestCase):
             "src/simulation/tests/testdata/input.script",
         ):
             self.assertFalse(is_deterministic_source(Path(path)), path)
+
+    def test_pure_sources_are_the_metadata_objects_apply_and_commands(self) -> None:
+        for path in (
+            "src/metadata/objects.h",
+            "src/metadata/objects_topic.cc",
+            "src/metadata/apply.cc",
+            "src/metadata/apply_range_roll.cc",
+            "src/metadata/commands.h",
+        ):
+            self.assertTrue(is_pure_source(Path(path)), path)
+        for path in (
+            "src/metadata/proposer.cc",
+            "src/metadata/applied.cc",
+            "src/metadata/tests/apply_test.cc",
+            "src/range/apply.cc",
+            "src/metadata/apply.py",
+        ):
+            self.assertFalse(is_pure_source(Path(path)), path)
+
+    def test_iteration_through_getters_aliases_and_algorithms_is_rejected(
+        self,
+    ) -> None:
+        path = "src/range/streams.h"
+        declaration = (
+            "absl::flat_hash_map<std::uint64_t, entry> streams_;\n"
+            "const absl::flat_hash_map<std::uint64_t, entry>& streams() const;\n"
+        )
+        allowances = (
+            Allowance(
+                path,
+                "unordered-state",
+                "absl::flat_hash_map<std::uint64_t, entry> streams_;",
+                1,
+                "Lookup by stream; the ordered stream list is iterated instead.",
+            ),
+            Allowance(
+                path,
+                "unordered-state",
+                "const absl::flat_hash_map<std::uint64_t, entry>& streams() const;",
+                1,
+                "Lookup by stream; the ordered stream list is iterated instead.",
+            ),
+        )
+        for body in (
+            "void f() { for (const auto& [id, e] : streams_) { use(e); } }",
+            "void f(owner& s) { for (const auto& [id, e] : s.streams()) { use(e); } }",
+            "void f(owner& s) { auto it = s.streams().begin(); }",
+            "void f() { auto& alias = streams_; }",
+            "void f(owner& s) { const auto& alias = s.streams(); }",
+            "void f() { absl::c_for_each(streams_, use); }",
+            "void f(owner& s) { std::ranges::for_each(s.streams_, use); }",
+            "void f() { std::erase_if(streams_, stale); }",
+            "void f() { auto copy = &streams_; }",
+            "void f() { const auto& alias{streams_}; }",
+            "void f() { auto first = absl::c_find_if(streams_, live); }",
+            "void f() { auto low = std::ranges::min_element(streams_); }",
+        ):
+            with self.subTest(body=body):
+                self.write(declaration + body, path)
+                failures = self.scan(allowances)
+                self.assertEqual(len(failures), 1, failures)
+                self.assertIn("unordered-iteration:", failures[0])
+        for body in (
+            "void f(std::uint64_t id) { auto found = streams_.find(id); }",
+            "void f(std::uint64_t id) { auto& e = streams_[id]; }",
+            "void f() { auto count = streams_.size(); }",
+        ):
+            with self.subTest(body=body):
+                self.write(declaration + body, path)
+                self.assertEqual(self.scan(allowances), [])
+
+    def test_pure_sources_refuse_time_draws_suspension_configuration_and_state(
+        self,
+    ) -> None:
+        path = "src/metadata/apply.cc"
+        for code, rule in (
+            ("void f() { auto at = env.clock().now(); }", "pure-time"),
+            ("void f() { auto at = wall_clock::now(); }", "pure-time"),
+            (
+                "void f() { auto pick = runtime::uniform_u64(source, 10); }",
+                "pure-random",
+            ),
+            (
+                "void f() { auto id = model::mint_object_id<topic_id>(entropy); }",
+                "pure-random",
+            ),
+            ("seastar::future<> f();", "pure-async"),
+            ("void f() { co_await yield(); }", "pure-async"),
+            ("void f() { auto shard = runtime::current_shard(); }", "pure-async"),
+            ("void f() { auto limit = config::default_limit; }", "pure-config"),
+            ("static std::uint64_t applied = 0;", "pure-mutable-static"),
+            ("thread_local int scratch;", "pure-mutable-static"),
+            ("static std::uint64_t applied(0);", "pure-mutable-static"),
+            ("static std::uint64_t counts[4];", "pure-mutable-static"),
+            ("static std::uint64_t counts[4] = {};", "pure-mutable-static"),
+            ("static std::function<void()> hook;", "pure-mutable-static"),
+            ("int counter = 0;", "pure-mutable-static"),
+            ("inline std::uint64_t counter{0};", "pure-mutable-static"),
+            ("namespace m {\ntopic_id last;\n}", "pure-mutable-static"),
+            ("auto f() { return seastar::make_ready_future<>(); }", "pure-async"),
+            ("void f(future_type f) { f.then(use); }", "pure-async"),
+            ("void f() { seastar::when_all(a(), b()); }", "pure-async"),
+            ("#include <seastar/core/future.hh>", "pure-include"),
+            ("#include <seastar/coroutine/maybe_yield.hh>", "pure-include"),
+            ("struct s { std::unordered_map<int, int> topics; };", "unordered-state"),
+            ('#include "src/runtime/random.h"', "pure-include"),
+            ('#include "src/storage/local_engine.h"', "pure-include"),
+            ('#include "src/config/bootstrap_config.h"', "pure-include"),
+            ("#include <src/simulation/environment.h>", "pure-include"),
+        ):
+            with self.subTest(code=code):
+                self.write(code + "\n", path)
+                failures = self.scan()
+                self.assertTrue(failures, code)
+                self.assertTrue(
+                    all(f"{rule}:" in failure for failure in failures), failures
+                )
+
+    def test_pure_sources_accept_value_types_and_constants(self) -> None:
+        self.write(
+            '#include "src/runtime/time.h"\n'
+            '#include "src/runtime/error.h"\n'
+            '#include "src/model/identity.h"\n'
+            "#include <seastar/core/chunked_vector.hh>\n"
+            "struct state {\n"
+            "    static result<state> make(limits values);\n"
+            "    static constexpr std::size_t window = 4096;\n"
+            "    static const int table[3];\n"
+            "    absl::btree_map<topic_id, topic> topics;\n"
+            "};\n"
+            "inline constexpr int version = 1;\n"
+            "static_assert(sizeof(state) > 0);\n"
+            "auto created(const command& c) { return c.proposed_at; }\n"
+            "static int helper(int value);\n"
+            "static auto lookup(const state& s) -> int;\n"
+            "using topics_type = absl::btree_map<topic_id, topic>;\n"
+            "enum class kind : std::uint8_t { a, b };\n"
+            "int apply_one(state& s) { int applied = 0; return applied; }\n",
+            "src/metadata/objects.h",
+        )
+        self.assertEqual(self.scan(), [])
+
+    def test_an_allowance_on_a_pure_source_is_itself_a_violation(self) -> None:
+        code = "absl::flat_hash_map<topic_id, topic> topics;"
+        self.write(code + "\n", "src/metadata/objects.h")
+        failures = self.scan(
+            (
+                Allowance(
+                    "src/metadata/objects.h",
+                    "unordered-state",
+                    code,
+                    1,
+                    "Lookup only.",
+                ),
+            )
+        )
+        self.assertTrue(any("pure-allowance:" in failure for failure in failures))
+        self.assertTrue(any("unordered-state:" in failure for failure in failures))
 
     def test_every_test_source_rejects_host_randomness_but_not_clocks(self) -> None:
         for path in (

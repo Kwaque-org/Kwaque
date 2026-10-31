@@ -1,6 +1,7 @@
 #include "src/admin/admin_limits.h"
 #include "src/admin/admin_server.h"
 #include "src/admin/admin_server_test_support.h"
+#include "src/base/readiness.h"
 #include "src/base/units.h"
 
 #include <seastar/core/coroutine.hh>
@@ -15,6 +16,7 @@
 #include <seastar/core/shard_id.hh>
 #include <seastar/core/sharded.hh>
 #include <seastar/core/sleep.hh>
+#include <seastar/core/smp.hh>
 #include <seastar/core/sstring.hh>
 #include <seastar/http/function_handlers.hh>
 #include <seastar/http/httpd.hh>
@@ -525,7 +527,7 @@ TEST(AdminResourceTest, HealthRoutesFollowTheLifecycleOverHttp) {
         EXPECT_NE(starting.find("503 Service Unavailable"), std::string::npos);
         EXPECT_NE(starting.find("application/problem+json"), std::string::npos);
 
-        server.mark_ready(std::chrono::seconds{1}).get();
+        server.mark_started(std::chrono::seconds{1}).get();
         EXPECT_NE(
           request("GET /v1/health/ready").find("200 OK"), std::string::npos);
         const auto head = request("HEAD /v1/health/ready");
@@ -545,6 +547,88 @@ TEST(AdminResourceTest, HealthRoutesFollowTheLifecycleOverHttp) {
         EXPECT_NE(
           request("GET /v1/health/ready").find("503 Service Unavailable"),
           std::string::npos);
+    } catch (...) {
+        failure = std::current_exception();
+    }
+    server.stop().get();
+    if (failure) {
+        std::rethrow_exception(failure);
+    }
+}
+
+TEST(AdminResourceTest, ReadinessIsWithdrawnAndRestoredAcrossShards) {
+    using kwaque::readiness_bit;
+    using kwaque::readiness_reason;
+    using kwaque::readiness_reasons;
+    using access = kwaque::admin::detail::admin_server_test_access;
+    ASSERT_EQ(seastar::this_smp_shard_count(), 2U);
+    const auto endpoint = kwaque::admin::detail::lease_loopback_endpoint();
+    kwaque::admin::admin_server server;
+    const auto request = [&endpoint](std::string_view line) {
+        client connection(endpoint.socket());
+        connection.send(std::string{line} + " HTTP/1.1\r\n\r\n");
+        return connection.response();
+    };
+    // Statements and broadcasts are messages; wait until every shard has
+    // heard the expected set.
+    const auto settle = [&server](bool ready, readiness_reasons reasons) {
+        for (int attempt = 0; attempt < 1'000; ++attempt) {
+            const auto shards = access::readiness_by_shard(server).get();
+            if (std::ranges::all_of(shards, [&](const auto& shard) {
+                    return shard.first == ready && shard.second == reasons;
+                })) {
+                return true;
+            }
+            seastar::yield().get();
+        }
+        return false;
+    };
+    const auto space = readiness_bit(readiness_reason::no_space);
+    const auto wal = readiness_bit(readiness_reason::wal_ceiling);
+    // The observer is called until the server stops; its draining is a change.
+    std::vector<std::pair<bool, readiness_reasons>> seen;
+    std::exception_ptr failure;
+    try {
+        server
+          .start(
+            endpoint.address, endpoint.port, seastar::this_smp_shard_count())
+          .get();
+        server.observe_readiness(
+          [&seen](bool ready, readiness_reasons reasons) {
+              seen.emplace_back(ready, reasons);
+          });
+        const auto reporter = server.reporter();
+        // Shard 1 holds a reason before the start finishes.
+        seastar::smp::submit_to(1, [reporter] {
+            reporter(readiness_reason::no_space, true);
+        }).get();
+        server.mark_started(std::chrono::seconds{1}).get();
+        EXPECT_TRUE(settle(false, space));
+        const auto withdrawn = request("GET /v1/health/ready");
+        EXPECT_NE(withdrawn.find("503 Service Unavailable"), std::string::npos);
+        EXPECT_NE(
+          withdrawn.find(R"("reasons":["no_space"])"), std::string::npos);
+        EXPECT_NE(
+          request("GET /v1/health/live").find("200 OK"), std::string::npos);
+
+        // Shard 0 holds another; shard 1's restore keeps it unready.
+        reporter(readiness_reason::wal_ceiling, true);
+        EXPECT_TRUE(settle(false, static_cast<readiness_reasons>(wal | space)));
+        seastar::smp::submit_to(1, [reporter] {
+            reporter(readiness_reason::no_space, false);
+        }).get();
+        EXPECT_TRUE(settle(false, wal));
+        reporter(readiness_reason::wal_ceiling, false);
+        EXPECT_TRUE(settle(true, 0));
+        EXPECT_NE(
+          request("GET /v1/health/ready").find("200 OK"), std::string::npos);
+        const std::vector<std::pair<bool, readiness_reasons>> expected{
+          {false, space},
+          {false, static_cast<readiness_reasons>(wal | space)},
+          {false, wal},
+          {true, 0},
+        };
+        EXPECT_EQ(seen, expected);
     } catch (...) {
         failure = std::current_exception();
     }

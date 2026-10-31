@@ -1,5 +1,8 @@
 #include "src/runtime/production/random.h"
 
+#include <sys/random.h>
+
+#include <cstddef>
 #include <cstdint>
 #include <limits>
 #include <random>
@@ -23,6 +26,29 @@ result<random_source> random_source::make() {
         return failure(
           operation_error{errc::unavailable, operation_kind::random});
     }
+}
+
+namespace {
+
+long kernel_random(void* buffer, std::size_t size, unsigned flags) noexcept {
+    return static_cast<long>(::getrandom(buffer, size, flags));
+}
+
+} // namespace
+
+result<identity_entropy> identity_entropy::make() {
+    auto call = kernel_random;
+    auto probed = detail::probe_identity_entropy(call);
+    if (!probed) {
+        return failure(probed.error());
+    }
+    return identity_entropy{};
+}
+
+void identity_entropy::fill(
+  std::span<std::uint8_t, identity_entropy_bytes> octets) noexcept {
+    auto call = kernel_random;
+    detail::fill_identity_octets(call, octets);
 }
 
 } // namespace kwaque::runtime::production

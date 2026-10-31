@@ -350,3 +350,29 @@ kwaque_py_native_test(
     ],
     deps = ["//tests/smoke:broker_test_support"],
 )
+
+# The release-built broker carries no BUGGIFY site, coverage mark or other
+# simulation code; a simulation binary built the same way is the control.
+kwaque_py_native_test(
+    name = "release_seams_test",
+    srcs = ["release_seams_test.py"],
+    args = [
+        "--nm=$(rlocationpath @current_llvm_toolchain_llvm//:nm)",
+        "--objcopy=$(rlocationpath @current_llvm_toolchain_llvm//:objcopy)",
+        "--release=$(rootpath //src/broker:kwaque_native)",
+        "--control=$(rootpath //src/simulation/tests:seam_control)",
+    ],
+    data = [
+        "//src/broker:kwaque_native",
+        "//src/simulation/tests:seam_control",
+        "@current_llvm_toolchain_llvm//:nm",
+        "@current_llvm_toolchain_llvm//:objcopy",
+    ],
+    main = "release_seams_test.py",
+    tags = ["package"],
+    target_compatible_with = select({
+        "//bazel:optimized_build": [],
+        "//conditions:default": ["@platforms//:incompatible"],
+    }),
+    deps = ["//tools:release_seams_lib"],
+)

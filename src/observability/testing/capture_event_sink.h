@@ -27,10 +27,13 @@ public:
         if (!prepared) {
             return runtime::failure(prepared.error());
         }
-        if (auto appended = events_.append(prepared->value()); !appended) {
+        if (!*prepared) {
+            return {};
+        }
+        if (auto appended = events_.append((*prepared)->value()); !appended) {
             return runtime::failure(appended.error());
         }
-        prepared->commit();
+        (*prepared)->commit();
         return {};
     }
 
@@ -47,6 +50,10 @@ public:
     [[nodiscard]] std::uint64_t last_sequence() const noexcept {
         assert_current();
         return sequence_.last_sequence();
+    }
+    [[nodiscard]] std::uint64_t suppressed_total() const noexcept {
+        assert_current();
+        return sequence_.suppressed_total();
     }
 
 private:

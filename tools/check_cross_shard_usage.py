@@ -17,6 +17,24 @@ EXCLUDED_PARTS = frozenset({"testing", "tests", "testdata"})
 class Rule:
     name: str
     pattern: re.Pattern[str]
+    # Path prefixes the rule applies to; empty means every source.
+    scope: tuple[str, ...] = ()
+
+
+# Code the deterministic simulation runs as one of several virtual shards on
+# one reactor. It reads its shard through runtime::current_shard() and calls
+# other shards through its backend's shard set; Seastar's own shard identity
+# would name the reactor, not the virtual shard.
+SIMULATED_PACKAGES = (
+    "src/bytes/",
+    "src/codec/",
+    "src/compression/",
+    "src/metadata/",
+    "src/model/",
+    "src/raft/",
+    "src/range/",
+    "src/storage/",
+)
 
 
 RULES = (
@@ -35,6 +53,13 @@ RULES = (
     Rule(
         "foreign pointer",
         re.compile(r"\b(?:foreign_ptr|make_foreign)\b"),
+    ),
+    Rule(
+        "Seastar shard identity in simulated code",
+        re.compile(
+            r"\b(?:this_shard_id|this_smp_shard_count|this_smp_all_shards)\s*\("
+        ),
+        SIMULATED_PACKAGES,
     ),
 )
 
@@ -183,6 +208,8 @@ def scan_paths(
         code, physical_offsets = code_view(text)
         permitted = allowed.get(relative.as_posix(), {})
         for rule in RULES:
+            if rule.scope and not relative.as_posix().startswith(rule.scope):
+                continue
             matches = tuple(rule.pattern.finditer(code))
             allowed_count = permitted.get(rule.name, 0)
             for match in matches[allowed_count:]:
