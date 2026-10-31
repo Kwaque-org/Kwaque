@@ -2,13 +2,65 @@ load("//bazel:build.bzl", "kwaque_cc_library")
 
 package(default_visibility = ["//visibility:private"])
 
+# Minting stays apart from :identity, which must keep no compiled
+# dependency. The entropy source is a template parameter, so the model takes
+# no runtime service.
+kwaque_cc_library(
+    name = "identity_mint",
+    hdrs = ["identity_mint.h"],
+    visibility = [
+        "//src/metadata:__pkg__",
+        "//src/metadata/tests:__pkg__",
+        "//src/model/tests:__pkg__",
+        "//src/raft:__pkg__",
+        "//src/raft/tests:__pkg__",
+        "//src/range:__pkg__",
+        "//src/range/tests:__pkg__",
+        "//src/runtime/tests:__pkg__",
+        "//src/simulation/tests:__pkg__",
+    ],
+    deps = [
+        ":identity",
+        "//src/base:invariant",
+    ],
+)
+
+# Every package that answers or reads an outcome shares these codes, so the
+# header keeps no dependency.
+kwaque_cc_library(
+    name = "outcome",
+    hdrs = ["outcome.h"],
+    visibility = [
+        "//src/metadata:__pkg__",
+        "//src/metadata/tests:__pkg__",
+        "//src/model/tests:__pkg__",
+        "//src/protocol:__pkg__",
+        "//src/protocol/tests:__pkg__",
+        "//src/raft:__pkg__",
+        "//src/raft/tests:__pkg__",
+        "//src/range:__pkg__",
+        "//src/range/tests:__pkg__",
+        "//src/simulation/tests:__pkg__",
+        "//src/storage:__pkg__",
+        "//src/storage/tests:__pkg__",
+    ],
+    deps = ["//src/base:names"],
+)
+
 kwaque_cc_library(
     name = "identity",
     hdrs = ["identity.h"],
     visibility = [
+        "//src/metadata:__pkg__",
+        "//src/metadata/tests:__pkg__",
         "//src/model/tests:__pkg__",
         "//src/protocol:__pkg__",
         "//src/protocol/tests:__pkg__",
+        "//src/raft:__pkg__",
+        "//src/raft/tests:__pkg__",
+        "//src/range:__pkg__",
+        "//src/range/tests:__pkg__",
+        "//src/simulation/tests:__pkg__",
         "//src/storage:__pkg__",
         "//src/storage/tests:__pkg__",
     ],
