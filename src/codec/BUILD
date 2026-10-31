@@ -7,10 +7,16 @@ kwaque_cc_library(
     hdrs = ["crc32c.h"],
     visibility = [
         "//src/codec/tests:__pkg__",
+        "//src/metadata:__pkg__",
+        "//src/metadata/tests:__pkg__",
         "//src/model:__pkg__",
         "//src/model/tests:__pkg__",
         "//src/protocol:__pkg__",
         "//src/protocol/tests:__pkg__",
+        "//src/raft:__pkg__",
+        "//src/raft/tests:__pkg__",
+        "//src/range:__pkg__",
+        "//src/range/tests:__pkg__",
         "//src/storage:__pkg__",
         "//src/storage/tests:__pkg__",
     ],
@@ -24,10 +30,16 @@ kwaque_cc_library(
         "//src/codec/tests:__pkg__",
         "//src/compression:__pkg__",
         "//src/compression/tests:__pkg__",
+        "//src/metadata:__pkg__",
+        "//src/metadata/tests:__pkg__",
         "//src/model:__pkg__",
         "//src/model/tests:__pkg__",
         "//src/protocol:__pkg__",
         "//src/protocol/tests:__pkg__",
+        "//src/raft:__pkg__",
+        "//src/raft/tests:__pkg__",
+        "//src/range:__pkg__",
+        "//src/range/tests:__pkg__",
         "//src/simulation:__pkg__",
         "//src/simulation/tests:__pkg__",
         "//src/storage:__pkg__",
@@ -173,9 +185,15 @@ kwaque_cc_library(
     hdrs = ["xxh3.h"],
     visibility = [
         "//src/codec/tests:__pkg__",
+        "//src/metadata:__pkg__",
+        "//src/metadata/tests:__pkg__",
         "//src/model:__pkg__",
         "//src/model/tests:__pkg__",
         "//src/protocol/tests:__pkg__",
+        "//src/raft:__pkg__",
+        "//src/raft/tests:__pkg__",
+        "//src/range:__pkg__",
+        "//src/range/tests:__pkg__",
         "//src/simulation:__pkg__",
         "//src/simulation/tests:__pkg__",
         "//src/storage:__pkg__",
@@ -184,6 +202,18 @@ kwaque_cc_library(
     deps = [
         ":digest",
         "//src/base:invariant",
+        "@xxhash",
+    ],
+)
+
+# Compiles XXH3's short-input path into the including unit. Include it only
+# from source files that include no other xxHash header.
+kwaque_cc_library(
+    name = "xxh3_64_inline",
+    hdrs = ["xxh3_64_inline.h"],
+    visibility = ["//src/codec/tests:__pkg__"],
+    deps = [
+        ":xxh3",
         "@xxhash",
     ],
 )
