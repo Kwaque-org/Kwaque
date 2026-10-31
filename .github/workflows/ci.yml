@@ -291,6 +291,8 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+          # A pull request's merge commit and the base it merges onto.
+          fetch-depth: 2
       - uses: ./.github/actions/setup-build
       - name: Materialize generated analysis inputs
         run: >-
@@ -303,9 +305,14 @@ jobs:
         run: >-
           bazel run --config=ci-debug --lockfile_mode=error //tools:compile_commands --
           --config=ci-debug
+      # A pull request checks the translation units it changes; main and
+      # every other run check all of them.
       - name: Run baseline and strict production checks without overlap
+        env:
+          SCOPE: ${{ github.event_name == 'pull_request' && 'changed' || 'all' }}
         run: >-
           bazel run --config=ci-debug --lockfile_mode=error //tools:clang_tidy -- --jobs=2
+          --scope="${SCOPE}" --base=HEAD~1
           --production-config=.clang-tidy-strict
 
   clang-tidy-fuzz:
@@ -319,6 +326,8 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+          # A pull request's merge commit and the base it merges onto.
+          fetch-depth: 2
       - uses: ./.github/actions/setup-build
       - name: Materialize fuzz analysis inputs
         run: >-
@@ -331,8 +340,14 @@ jobs:
         run: >-
           bazel run --config=ci --config=fuzz --lockfile_mode=error //tools:compile_commands --
           --fuzz-only --config=ci --config=fuzz
+      # A pull request checks the translation units it changes; main and
+      # every other run check all of them.
       - name: Check fuzz translation units and their dependencies
-        run: bazel run --config=ci --config=fuzz --lockfile_mode=error //tools:clang_tidy -- --jobs=2
+        env:
+          SCOPE: ${{ github.event_name == 'pull_request' && 'changed' || 'all' }}
+        run: >-
+          bazel run --config=ci --config=fuzz --lockfile_mode=error //tools:clang_tidy -- --jobs=2
+          --scope="${SCOPE}" --base=HEAD~1
 
   repository-checks:
     name: Repository integrity

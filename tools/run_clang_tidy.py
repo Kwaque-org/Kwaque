@@ -11,6 +11,15 @@ import xml.etree.ElementTree as ET
 from pathlib import Path
 
 PRODUCTION_DATABASE_DIRECTORY = Path(".cache") / "clang-tidy-production"
+# A change to what is checked, or to how, is checked on every translation unit.
+WHOLE_TREE_PATHS = frozenset(
+    {
+        ".clang-tidy",
+        ".clang-tidy-strict",
+        "tools/compilation_database.py",
+        "tools/run_clang_tidy.py",
+    }
+)
 
 
 def workspace_root() -> Path:
@@ -111,6 +120,35 @@ def select_files(
     return sorted(selected)
 
 
+def changed_paths(root: Path, base: str) -> list[str]:
+    """Paths changed since HEAD left base, the working tree and new files included."""
+    paths = set()
+    for arguments in (
+        ["diff", "--name-only", "--no-renames", "-z", "--merge-base", base, "--"],
+        ["ls-files", "--others", "--exclude-standard", "-z"],
+    ):
+        output = subprocess.run(
+            ["git", *arguments], cwd=root, check=True, stdout=subprocess.PIPE
+        ).stdout
+        paths.update(os.fsdecode(value) for value in output.split(b"\0") if value)
+    return sorted(paths)
+
+
+def changed_sources(entries: list[dict], changed: list[str]) -> list[str] | None:
+    """The translation units a change holds; None means every one.
+
+    Only the change's own sources are checked. A changed header is checked
+    through the changed sources that include it, and with every other header
+    by the complete run on main.
+    """
+    for path in changed:
+        if path in WHOLE_TREE_PATHS:
+            print(f"{path} changed: checking every translation unit")
+            return None
+    available = {entry["file"] for entry in entries}
+    return sorted(available.intersection(changed))
+
+
 def positive_jobs(value: str) -> int:
     jobs = int(value)
     if jobs <= 0:
@@ -195,6 +233,17 @@ def main() -> int:
         help="maximum concurrent clang-tidy processes (default: 2)",
     )
     parser.add_argument(
+        "--scope",
+        choices=("all", "changed"),
+        default="all",
+        help="check every translation unit, or only those the change holds",
+    )
+    parser.add_argument(
+        "--base",
+        default="HEAD",
+        help="with --scope=changed, the revision a branch is compared against",
+    )
+    parser.add_argument(
         "--profile", action="store_true", help="report native per-check timing totals"
     )
     parser.add_argument("files", nargs="*")
@@ -213,6 +262,20 @@ def main() -> int:
         return 2
 
     entries = json.loads(database.read_text())
+    requested = arguments.files
+    if arguments.scope == "changed" and not requested:
+        try:
+            changed = changed_sources(entries, changed_paths(root, arguments.base))
+        except (OSError, subprocess.CalledProcessError) as error:
+            print(
+                f"Cannot list the changed files; checking every translation unit: {error}"
+            )
+            changed = None
+        if changed is not None:
+            if not changed:
+                print("The change holds no translation unit.")
+                return 0
+            requested = changed
     if arguments.production_config:
         production_entries = json.loads(
             (root / PRODUCTION_DATABASE_DIRECTORY / "compile_commands.json").read_text()
@@ -223,7 +286,7 @@ def main() -> int:
         select_files(
             production_entries, [], set().union(*production_targets(root).values())
         )
-        selected = set(select_files(entries, arguments.files, None))
+        selected = set(select_files(entries, requested, None))
         result = 0
         with tempfile.TemporaryDirectory(prefix="kwaque-tidy-") as temporary:
             for name, commands, config in (
@@ -253,7 +316,7 @@ def main() -> int:
 
     selected = select_files(
         entries,
-        arguments.files,
+        requested,
         (
             set().union(*production_targets(root).values())
             if arguments.production_only

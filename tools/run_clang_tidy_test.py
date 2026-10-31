@@ -153,6 +153,66 @@ class ClangTidySelectionTest(unittest.TestCase):
                 select_files(entries, requested, production)
 
 
+class ChangedScopeTest(unittest.TestCase):
+    entries = [
+        {"file": "src/model/a.cc"},
+        {"file": "src/model/b.cc"},
+        {"file": "src/runtime/c.cc"},
+    ]
+
+    def test_only_the_changed_translation_units_are_checked(self) -> None:
+        self.assertEqual(
+            driver.changed_sources(
+                self.entries,
+                [
+                    "src/model/a.cc",
+                    "src/model/a.h",
+                    "src/model/BUILD",
+                    "src/removed.cc",
+                    "tools/other.py",
+                ],
+            ),
+            ["src/model/a.cc"],
+        )
+        self.assertEqual(driver.changed_sources(self.entries, ["src/model/a.h"]), [])
+
+    def test_a_change_to_the_check_itself_checks_everything(self) -> None:
+        for path in sorted(driver.WHOLE_TREE_PATHS):
+            with self.subTest(path=path):
+                with mock.patch("builtins.print"):
+                    self.assertIsNone(
+                        driver.changed_sources(self.entries, ["src/model/a.cc", path])
+                    )
+
+    def test_changed_paths_include_the_working_tree_and_new_files(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+
+            def git(*arguments: str) -> None:
+                subprocess.run(
+                    ["git", *arguments],
+                    cwd=root,
+                    check=True,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+
+            git("init", "-q")
+            git("config", "user.email", "test@example.invalid")
+            git("config", "user.name", "test")
+            (root / "kept.cc").write_text("int kept;\n")
+            (root / "edited.cc").write_text("int edited;\n")
+            git("add", ".")
+            git("commit", "-q", "-m", "base")
+            git("branch", "base")
+            (root / "edited.cc").write_text("int edited = 1;\n")
+            git("commit", "-q", "-am", "change")
+            (root / "new.cc").write_text("int added;\n")
+            self.assertEqual(
+                driver.changed_paths(root, "base"), ["edited.cc", "new.cc"]
+            )
+
+
 class PartitionedAnalysisTest(unittest.TestCase):
     def entries(self, root: Path) -> list[dict]:
         return [
