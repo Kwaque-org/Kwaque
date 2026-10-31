@@ -26,8 +26,8 @@ jobs:
     strategy:
       matrix:
         runner:
-          - ubuntu-24.04
-          - ubuntu-24.04-arm
+          - blacksmith-4vcpu-ubuntu-2204
+          - blacksmith-4vcpu-ubuntu-2204-arm
     steps:
       - name: Check out source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -89,7 +89,7 @@ jobs:
   publish:
     name: Draft the GitHub release
     needs: package
-    runs-on: ubuntu-24.04
+    runs-on: blacksmith-4vcpu-ubuntu-2204
     timeout-minutes: 15
     permissions:
       contents: write

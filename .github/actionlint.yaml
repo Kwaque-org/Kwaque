@@ -1,0 +1,5 @@
+# Jobs run on Blacksmith's runners, which actionlint does not know by name.
+self-hosted-runner:
+  labels:
+    - blacksmith-4vcpu-ubuntu-2204
+    - blacksmith-4vcpu-ubuntu-2204-arm
