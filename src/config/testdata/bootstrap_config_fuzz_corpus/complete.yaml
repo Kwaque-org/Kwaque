@@ -8,3 +8,47 @@ kwaque:
   storage_strict_data_init: false
   crash_loop_limit: ~
   diagnostic_memory_per_shard_bytes: 134217728
+  storage:
+    metadata_alignment_bytes: 4096
+    devices:
+      - path: "./fuzz-data"
+        role: wal_control
+        mount_marker: .kwaque_mounted
+      - {path: ./fuzz-data-1, role: data}
+  metadata:
+    ring_size: 256
+    journal_file_bytes: 16777216
+    journal_retained_files: 64
+    snapshot_floor_bytes: 4194304
+    pending_proposals: 1024
+    pending_proposal_bytes: 4194304
+    cohort_records: 128
+    cohort_bytes: 1048576
+    producer_expiration_ms: 86400000
+  topic_defaults:
+    maximum_record_bytes: 1048576
+    maximum_batch_bytes: 1052672
+    segment_bytes: 1000000000
+    segment_lifetime_ms: 3600000
+    retention_ms: ~
+    retention_bytes: 4000000000
+    retry_window_ms: 86400000
+    retry_depth: 8
+    active_leaf_cap: 4096
+  range:
+    stop_deadline_ms: 20000
+    unsealed_bytes: 10737418240
+    retention_sweep_interval_ms: 300000
+    maximum_expiring_per_range: 64
+    queue_requests: 64
+    queue_bytes: 4194304
+    roll_rate_per_range_per_minute: 1
+    roll_burst_per_range: 2
+    roll_rate_per_shard_per_second: 8
+    roll_burst_per_shard: 16
+    placement_threshold_percent: 1
+    placement_byte_cost_ps: 500
+    placement_batch_cost_ns: 5000
+    placement_minimum_load: 100
+    maximum_consume_streams: 100000
+    wheel_touches_per_task: 256

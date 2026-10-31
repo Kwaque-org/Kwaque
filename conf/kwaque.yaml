@@ -13,3 +13,10 @@ kwaque:
   diagnostic_memory_per_shard_bytes: 134217728
   # When enabled, .kwaque_data_dir must already exist in data_directory.
   storage_strict_data_init: false
+  storage:
+    # One to eight devices; exactly one holds the WAL and control records
+    # (role wal_control or all), the rest hold data. A device may be the data
+    # directory itself.
+    devices:
+      - path: "./data"
+        role: all

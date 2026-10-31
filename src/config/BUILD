@@ -18,6 +18,8 @@ kwaque_cc_test(
     name = "bootstrap_config_test",
     srcs = ["bootstrap_config_test.cc"],
     data = [
+        "bootstrap_config_fuzz.dict",
+        "testdata/bootstrap_config_fuzz_corpus/complete.yaml",
         "//conf:kwaque_config",
         "//conf:kwaque_production_config",
     ],

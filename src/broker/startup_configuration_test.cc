@@ -29,7 +29,8 @@ using namespace kwaque::broker::detail;
 
 constexpr std::string_view original_configuration{
   "kwaque:\n  schema_version: 1\n  developer_mode: true\n"
-  "  data_directory: ./data\n  admin:\n    port: 19001\n"};
+  "  data_directory: ./data\n  admin:\n    port: 19001\n"
+  "  storage:\n    devices: [{path: ./data, role: all}]\n"};
 
 class parked_source final : public seastar::data_source_impl {
 public:

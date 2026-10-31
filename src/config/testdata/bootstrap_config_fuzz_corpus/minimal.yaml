@@ -1,2 +1,5 @@
 kwaque:
   schema_version: 1
+  data_directory: /var/lib/kwaque/data
+  storage:
+    devices: [{path: /var/lib/kwaque, role: all}]

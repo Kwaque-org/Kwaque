@@ -38,6 +38,11 @@ REACTOR_ARGUMENTS = (
     "--overprovisioned",
 )
 ADMIN_EXPOSURE_WARNING = "admin API is exposed without authentication or TLS"
+# A configuration that is valid up to its range group.
+RANGE_TEMPLATE = (
+    "kwaque: {{schema_version: 1, developer_mode: true, "
+    "storage: {{devices: [{{path: ./data, role: all}}]}}, range: {{{}}}}}"
+)
 
 ADMIN_METRICS = frozenset(
     {
@@ -371,6 +376,25 @@ def verify_configuration_rejections(
             "oversized",
             "x" * (64 * 1024 + 1),
             "configuration exceeds the maximum supported size",
+        ),
+        # Each range bound with a starting value refuses the start beyond it.
+        (
+            "stop-deadline-above-bound",
+            RANGE_TEMPLATE.format("stop_deadline_ms: 840001"),
+            "field=kwaque.range.stop_deadline_ms "
+            "message=must be between 1000 and 840000",
+        ),
+        (
+            "unsealed-bytes-below-bound",
+            RANGE_TEMPLATE.format("unsealed_bytes: 134217727"),
+            "field=kwaque.range.unsealed_bytes "
+            "message=must be between 134217728 and 1099511627776",
+        ),
+        (
+            "consume-streams-below-bound",
+            RANGE_TEMPLATE.format("maximum_consume_streams: 0"),
+            "field=kwaque.range.maximum_consume_streams "
+            "message=must be between 1 and 1000000",
         ),
     )
     for name, contents, expected in cases:
